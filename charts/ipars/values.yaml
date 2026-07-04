@@ -20,6 +20,7 @@ agent:
   apiService:
     enabled: false
     exposureAcknowledged: false
+    allowUnrestrictedLoadBalancer: false
     type: ClusterIP
     annotations: {}
     loadBalancerSourceRanges: []
@@ -39,6 +40,7 @@ agent:
   relayService:
     enabled: false
     exposureAcknowledged: false
+    allowUnrestrictedLoadBalancer: false
     type: LoadBalancer
     annotations: {}
     loadBalancerSourceRanges: []

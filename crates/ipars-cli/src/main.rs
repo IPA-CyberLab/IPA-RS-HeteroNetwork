@@ -295,6 +295,8 @@ struct K8sInstallArgs {
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
     allow_public_service_exposure: bool,
+    #[arg(long, default_value_t = false)]
+    allow_unrestricted_load_balancer: bool,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
@@ -1481,6 +1483,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 args.agent_api_external_traffic_policy
             ));
         }
+        if args.agent_api_service_type == "LoadBalancer"
+            && args.agent_api_allow_source_cidrs.is_empty()
+            && args.allow_unrestricted_load_balancer
+        {
+            helm_command.push_str(" --set agent.apiService.allowUnrestrictedLoadBalancer=true");
+        }
         append_helm_ipnet_list(
             &mut helm_command,
             "agent.apiService.loadBalancerSourceRanges",
@@ -1519,6 +1527,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.externalTrafficPolicy={}",
                 args.relay_external_traffic_policy
             ));
+        }
+        if args.relay_service_type == "LoadBalancer"
+            && args.relay_allow_source_cidrs.is_empty()
+            && args.allow_unrestricted_load_balancer
+        {
+            helm_command.push_str(" --set agent.relayService.allowUnrestrictedLoadBalancer=true");
         }
         append_helm_ipnet_list(
             &mut helm_command,
@@ -1579,7 +1593,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
-            "LoadBalancer exposure should use --agent-api-allow-source-cidr or --relay-allow-source-cidr to constrain allowed clients".to_string(),
+            "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
@@ -1617,6 +1631,24 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if !args.relay_allow_source_cidrs.is_empty() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-allow-source-cidr only applies to LoadBalancer services");
+    }
+    if args.expose_agent_api
+        && args.agent_api_service_type == "LoadBalancer"
+        && args.agent_api_allow_source_cidrs.is_empty()
+        && !args.allow_unrestricted_load_balancer
+    {
+        anyhow::bail!(
+            "--expose-agent-api with LoadBalancer requires --agent-api-allow-source-cidr or --allow-unrestricted-load-balancer"
+        );
+    }
+    if args.expose_relay
+        && args.relay_service_type == "LoadBalancer"
+        && args.relay_allow_source_cidrs.is_empty()
+        && !args.allow_unrestricted_load_balancer
+    {
+        anyhow::bail!(
+            "--expose-relay with LoadBalancer requires --relay-allow-source-cidr or --allow-unrestricted-load-balancer"
+        );
     }
     Ok(())
 }
@@ -2360,6 +2392,7 @@ mod tests {
             join_token_key: "signed-token".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2481,6 +2514,7 @@ mod tests {
             "--join-token-key",
             "signed-token",
             "--allow-public-service-exposure",
+            "--allow-unrestricted-load-balancer",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -2513,6 +2547,7 @@ mod tests {
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
             assert!(args.allow_public_service_exposure);
+            assert!(args.allow_unrestricted_load_balancer);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(
@@ -2568,6 +2603,7 @@ mod tests {
             join_token_key: "signed-token".to_string(),
             expose_agent_api: false,
             allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: true,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2604,6 +2640,7 @@ mod tests {
             join_token_key: "signed-token".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
+            allow_unrestricted_load_balancer: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2630,6 +2667,7 @@ mod tests {
             join_token_key: "signed-token".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
+            allow_unrestricted_load_balancer: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2644,6 +2682,62 @@ mod tests {
             relay_status_url: None,
         });
         assert!(plan.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_requires_load_balancer_source_ranges_or_explicit_unrestricted_ack(
+    ) -> anyhow::Result<()> {
+        let without_ranges = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: false,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_external_traffic_policy: "Local".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: false,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
+        });
+        assert!(without_ranges.is_err());
+
+        let unrestricted = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: true,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_external_traffic_policy: "Local".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: true,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
+            relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_status_url: None,
+        })?;
+        assert!(unrestricted.commands[2]
+            .contains("--set agent.apiService.allowUnrestrictedLoadBalancer=true"));
+        assert!(unrestricted.commands[2]
+            .contains("--set agent.relayService.allowUnrestrictedLoadBalancer=true"));
         Ok(())
     }
 

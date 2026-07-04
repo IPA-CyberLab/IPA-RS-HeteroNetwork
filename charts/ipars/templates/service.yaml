@@ -3,8 +3,14 @@
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not .Values.agent.apiService.exposureAcknowledged) -}}
 {{- fail "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (eq .Values.agent.apiService.type "LoadBalancer") (not .Values.agent.apiService.loadBalancerSourceRanges) (not .Values.agent.apiService.allowUnrestrictedLoadBalancer) -}}
+{{- fail "agent.apiService LoadBalancer exposure requires agent.apiService.loadBalancerSourceRanges or agent.apiService.allowUnrestrictedLoadBalancer=true" -}}
+{{- end -}}
 {{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
 {{- fail "agent.relayService external exposure requires agent.relayService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled (eq .Values.agent.relayService.type "LoadBalancer") (not .Values.agent.relayService.loadBalancerSourceRanges) (not .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
+{{- fail "agent.relayService LoadBalancer exposure requires agent.relayService.loadBalancerSourceRanges or agent.relayService.allowUnrestrictedLoadBalancer=true" -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled }}
 apiVersion: v1
