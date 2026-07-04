@@ -26,10 +26,10 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
-- Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
-- Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
+- Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
+- Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
-- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through Linux WireGuard/route backends when explicitly enabled, and retries without stopping the agent when the control plane is temporarily unavailable.
+- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through Linux WireGuard/route backends when explicitly enabled, supports `--linux-netns` namespace placement, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -38,7 +38,7 @@ This file tracks the gap between the requested final system and the current repo
 
 - Runtime backend selection and hardening for production deployments.
 - Kernel WireGuard netlink/wgctrl backend.
-- Linux policy routing netlink backend and namespace execution hardening.
+- Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - Full STUN protocol support and NAT classification.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay abuse prevention with authenticated sessions and rate limits.

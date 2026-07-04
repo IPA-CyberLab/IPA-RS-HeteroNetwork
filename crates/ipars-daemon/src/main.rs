@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
-    AgentError, AgentRuntime, FileAgentStateStore, LinuxWireGuardBackend, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, SystemCommandRunner, UdpHolePuncher,
+    AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
+    NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
+    SystemCommandRunner, UdpHolePuncher,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -18,7 +19,10 @@ use ipars_control_plane::{
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
-use ipars_route_manager::{LinuxRouteManager, SystemRouteCommandRunner};
+use ipars_route_manager::{
+    LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
+    NamespacedLinuxRouteCommandRunner, SystemRouteCommandRunner,
+};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
@@ -192,6 +196,8 @@ struct AgentArgs {
         default_value = "ipars0"
     )]
     wireguard_interface: String,
+    #[arg(long, env = "IPARS_AGENT_LINUX_NETNS")]
+    linux_netns: Option<String>,
 }
 
 #[tokio::main]
@@ -409,10 +415,46 @@ async fn start_peer_map_sync(
     node_id: NodeId,
     control_plane_url: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let wireguard =
-        LinuxWireGuardBackend::new(args.wireguard_interface.clone(), SystemCommandRunner);
+    let namespace = args
+        .linux_netns
+        .as_deref()
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()?;
+    if let Some(namespace) = namespace {
+        start_peer_map_sync_with_runners(
+            args,
+            node_id,
+            control_plane_url,
+            NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
+            NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
+        )
+        .await
+    } else {
+        start_peer_map_sync_with_runners(
+            args,
+            node_id,
+            control_plane_url,
+            SystemCommandRunner,
+            SystemRouteCommandRunner,
+        )
+        .await
+    }
+}
+
+async fn start_peer_map_sync_with_runners<W, R>(
+    args: &AgentArgs,
+    node_id: NodeId,
+    control_plane_url: String,
+    wireguard_runner: W,
+    route_runner: R,
+) -> anyhow::Result<tokio::task::JoinHandle<()>>
+where
+    W: LinuxCommandRunner + 'static,
+    R: LinuxRouteCommandRunner + 'static,
+{
+    let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
-    let route_manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+    let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let sync = PeerMapSync::new(node_id, HttpPeerMapSource::new(control_plane_url), applier);
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
@@ -997,6 +1039,18 @@ mod tests {
             database_kind(Some("postgresql://ipars@localhost/ipars")),
             DatabaseKind::Postgres
         );
+    }
+
+    #[test]
+    fn agent_args_accepts_linux_netns() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--linux-netns", "node-a"])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]

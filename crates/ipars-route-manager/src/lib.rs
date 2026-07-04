@@ -12,6 +12,8 @@ pub enum RouteManagerError {
     Io(#[from] std::io::Error),
     #[error("route manager backend failed: {0}")]
     Backend(String),
+    #[error("invalid linux network namespace name: {0}")]
+    InvalidNamespace(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,43 @@ pub struct PolicyRule {
     pub from: Option<IpNet>,
     pub to: Option<IpNet>,
     pub fwmark: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxNetworkNamespace {
+    name: String,
+}
+
+impl LinuxNetworkNamespace {
+    pub fn from_name(name: impl Into<String>) -> Result<Self, RouteManagerError> {
+        let name = name.into();
+        if !is_valid_namespace_name(&name) {
+            return Err(RouteManagerError::InvalidNamespace(name));
+        }
+        Ok(Self { name })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn wrap_program_args(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
+        let mut wrapped = Vec::with_capacity(args.len() + 4);
+        wrapped.push("netns".to_string());
+        wrapped.push("exec".to_string());
+        wrapped.push(self.name.clone());
+        wrapped.push(program.to_string());
+        wrapped.extend(args.iter().cloned());
+        ("ip".to_string(), wrapped)
+    }
+}
+
+fn is_valid_namespace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +174,11 @@ impl LinuxRouteCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
+
+    pub fn in_namespace(self, namespace: &LinuxNetworkNamespace) -> Self {
+        let (program, args) = namespace.wrap_program_args(&self.program, &self.args);
+        Self { program, args }
+    }
 }
 
 #[async_trait]
@@ -162,6 +206,28 @@ impl LinuxRouteCommandRunner for SystemRouteCommandRunner {
             command.args.join(" "),
             stderr.trim()
         )))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespacedLinuxRouteCommandRunner<R> {
+    namespace: LinuxNetworkNamespace,
+    inner: R,
+}
+
+impl<R> NamespacedLinuxRouteCommandRunner<R> {
+    pub fn new(namespace: LinuxNetworkNamespace, inner: R) -> Self {
+        Self { namespace, inner }
+    }
+}
+
+#[async_trait]
+impl<R> LinuxRouteCommandRunner for NamespacedLinuxRouteCommandRunner<R>
+where
+    R: LinuxRouteCommandRunner,
+{
+    async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
+        self.inner.run(command.in_namespace(&self.namespace)).await
     }
 }
 
@@ -404,6 +470,46 @@ mod tests {
                 fwmark: Some(0x6473),
             }],
         })
+    }
+
+    #[test]
+    fn linux_network_namespace_validates_name() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a_1.prod")?;
+
+        assert_eq!(namespace.name(), "node-a_1.prod");
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name(""),
+            Err(RouteManagerError::InvalidNamespace(name)) if name.is_empty()
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("../node-a"),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "../node-a"
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("node a"),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "node a"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn namespaced_route_runner_wraps_command() -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let namespaced_runner = NamespacedLinuxRouteCommandRunner::new(namespace, runner.clone());
+
+        namespaced_runner
+            .run(LinuxRouteCommand::new("ip", ["route", "show"]))
+            .await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![LinuxRouteCommand::new(
+                "ip",
+                ["netns", "exec", "node-a", "ip", "route", "show"],
+            )]
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -114,7 +114,7 @@ Docker support targets:
 - host-to-container reachability
 - container-to-remote-node reachability
 
-The route manager works from explicit network namespace, capability, and routing intents. The design avoids treating iptables-only rewrites as the primary integration mechanism. Rootful deployments use `NET_ADMIN` and `/dev/net/tun`. Rootless deployments require a userspace WireGuard backend once implemented.
+The route manager works from explicit network namespace, capability, and routing intents. The design avoids treating iptables-only rewrites as the primary integration mechanism. Rootful deployments use `NET_ADMIN` and `/dev/net/tun`; `iparsd agent --linux-netns` runs the Linux WireGuard and route command backends through validated `ip netns exec` placement. Rootless deployments require a userspace WireGuard backend once implemented.
 
 The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an agent.
 
@@ -230,6 +230,6 @@ Target: no full mesh. Agents subscribe to relevant peer/route deltas by tag, rol
 2. Control-plane store trait plus in-memory, SQLite, and PostgreSQL backends.
 3. Long-running control-plane, signal, STUN, relay, and agent daemons.
 4. Kernel WireGuard backend: initial Linux `ip`/`wg` command runner exists; add netlink/wgctrl-equivalent calls for production control.
-5. Route manager for Linux policy routing, Docker namespaces, and Kubernetes node underlay: initial `ip route`/`ip rule` command backend exists; add netlink and namespace execution hardening.
+5. Route manager for Linux policy routing, Docker namespaces, and Kubernetes node underlay: initial `ip route`/`ip rule` command backend and validated namespace command execution exist; add netlink and namespace lifecycle hardening.
 6. NAT traversal integration tests with network namespaces.
 7. Relay abuse controls, metrics, and production hardening.

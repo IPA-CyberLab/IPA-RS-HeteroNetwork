@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
-use ipars_route_manager::{RouteManager, RouteManagerError, RoutePlan};
+use ipars_route_manager::{LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{AgentStatusResponse, PeerMap, SignalHolePunchPlanResponse};
 use ipars_types::{
@@ -212,6 +212,11 @@ impl LinuxCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
+
+    pub fn in_namespace(self, namespace: &LinuxNetworkNamespace) -> Self {
+        let (program, args) = namespace.wrap_program_args(&self.program, &self.args);
+        Self { program, args }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +332,28 @@ impl LinuxCommandRunner for SystemCommandRunner {
             command.args.join(" "),
             stderr.trim()
         )))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespacedLinuxCommandRunner<R> {
+    namespace: LinuxNetworkNamespace,
+    inner: R,
+}
+
+impl<R> NamespacedLinuxCommandRunner<R> {
+    pub fn new(namespace: LinuxNetworkNamespace, inner: R) -> Self {
+        Self { namespace, inner }
+    }
+}
+
+#[async_trait]
+impl<R> LinuxCommandRunner for NamespacedLinuxCommandRunner<R>
+where
+    R: LinuxCommandRunner,
+{
+    async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
+        self.inner.run(command.in_namespace(&self.namespace)).await
     }
 }
 
@@ -1020,6 +1047,26 @@ mod tests {
             error,
             Err(AgentError::HolePunch(message)) if message == "target reflexive candidate missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn namespaced_wireguard_runner_wraps_command() -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let namespaced_runner = NamespacedLinuxCommandRunner::new(namespace, runner.clone());
+
+        namespaced_runner
+            .run(LinuxCommand::new("wg", ["show", "ipars0"]))
+            .await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![LinuxCommand::new(
+                "ip",
+                ["netns", "exec", "node-a", "wg", "show", "ipars0"],
+            )]
+        );
+        Ok(())
     }
 
     #[tokio::test]

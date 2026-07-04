@@ -25,10 +25,10 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent` signal path negotiation loop that records pair-scoped path state and reports it in heartbeat payloads
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
-- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`
-- Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`
+- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
+- Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
-- `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends with retry on control-plane errors
+- `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends, including `--linux-netns` namespace placement, with retry on control-plane errors
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
