@@ -50,7 +50,10 @@ use ipars_types::{
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
     TransportProtocol,
 };
-use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr as NetlinkSocketAddr};
+use netlink_sys::{
+    protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
+    Socket, SocketAddr as NetlinkSocketAddr,
+};
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge};
 use opentelemetry::trace::TracerProvider as _;
@@ -655,6 +658,9 @@ impl PacketFlowDetector {
 struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
+    route_netlink: bool,
+    generic_netlink: bool,
+    netfilter_netlink: bool,
     cap_net_admin: bool,
     cap_net_raw: bool,
     cap_sys_admin: bool,
@@ -666,10 +672,71 @@ impl RuntimePreflightNeeds {
         Self {
             ip_command: false,
             wg_command: false,
+            route_netlink: false,
+            generic_netlink: false,
+            netfilter_netlink: false,
             cap_net_admin: false,
             cap_net_raw: false,
             cap_sys_admin: false,
             linux_netns: false,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.ip_command
+            && !self.wg_command
+            && !self.route_netlink
+            && !self.generic_netlink
+            && !self.netfilter_netlink
+            && !self.cap_net_admin
+            && !self.cap_net_raw
+            && !self.cap_sys_admin
+            && !self.linux_netns
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeNetlinkProtocol {
+    Route,
+    Generic,
+    Netfilter,
+}
+
+impl RuntimeNetlinkProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Route => "NETLINK_ROUTE",
+            Self::Generic => "NETLINK_GENERIC",
+            Self::Netfilter => "NETLINK_NETFILTER",
+        }
+    }
+
+    fn protocol(self) -> isize {
+        match self {
+            Self::Route => NETLINK_ROUTE,
+            Self::Generic => NETLINK_GENERIC,
+            Self::Netfilter => NETLINK_NETFILTER,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimePreflightChecks {
+    cap_net_admin: fn() -> anyhow::Result<()>,
+    cap_net_raw: fn() -> anyhow::Result<()>,
+    cap_sys_admin: fn() -> anyhow::Result<()>,
+    linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
+    netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
+}
+
+impl RuntimePreflightChecks {
+    const fn system() -> Self {
+        Self {
+            cap_net_admin: ensure_cap_net_admin_if_known,
+            cap_net_raw: ensure_cap_net_raw_if_known,
+            cap_sys_admin: ensure_cap_sys_admin_if_known,
+            linux_netns: ensure_linux_netns_ready,
+            netlink: ensure_netlink_protocol_ready,
         }
     }
 }
@@ -791,6 +858,14 @@ fn otlp_http_signal_endpoint(base_endpoint: &str, signal: &str) -> String {
 }
 
 fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> anyhow::Result<()> {
+    preflight_agent_runtime_with_path_and_checks(args, path, RuntimePreflightChecks::system())
+}
+
+fn preflight_agent_runtime_with_path_and_checks(
+    args: &AgentArgs,
+    path: Option<&OsStr>,
+    checks: RuntimePreflightChecks,
+) -> anyhow::Result<()> {
     validate_agent_runtime_config(args)?;
     if args.skip_runtime_preflight {
         tracing::warn!(
@@ -801,13 +876,7 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     }
 
     let needs = runtime_preflight_needs(args);
-    if !needs.ip_command
-        && !needs.wg_command
-        && !needs.cap_net_admin
-        && !needs.cap_net_raw
-        && !needs.cap_sys_admin
-        && !needs.linux_netns
-    {
+    if needs.is_empty() {
         return Ok(());
     }
     if needs.ip_command {
@@ -816,14 +885,23 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     if needs.wg_command {
         ensure_program_in_path("wg", path)?;
     }
+    if needs.route_netlink {
+        (checks.netlink)(RuntimeNetlinkProtocol::Route)?;
+    }
+    if needs.generic_netlink {
+        (checks.netlink)(RuntimeNetlinkProtocol::Generic)?;
+    }
+    if needs.netfilter_netlink {
+        (checks.netlink)(RuntimeNetlinkProtocol::Netfilter)?;
+    }
     if needs.cap_net_admin {
-        ensure_cap_net_admin_if_known()?;
+        (checks.cap_net_admin)()?;
     }
     if needs.cap_net_raw {
-        ensure_cap_net_raw_if_known()?;
+        (checks.cap_net_raw)()?;
     }
     if needs.cap_sys_admin {
-        ensure_cap_sys_admin_if_known()?;
+        (checks.cap_sys_admin)()?;
     }
     if needs.linux_netns {
         let namespace_name = args
@@ -831,7 +909,7 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
             .as_deref()
             .context("linux namespace preflight requested without --linux-netns")?;
         let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
-        ensure_linux_netns_ready(&namespace)?;
+        (checks.linux_netns)(&namespace)?;
     }
 
     tracing::info!(
@@ -840,6 +918,9 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
         route_backend = args.route_backend.as_str(),
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
+        needs_route_netlink = needs.route_netlink,
+        needs_generic_netlink = needs.generic_netlink,
+        needs_netfilter_netlink = needs.netfilter_netlink,
         needs_cap_net_admin = needs.cap_net_admin,
         needs_cap_net_raw = needs.cap_net_raw,
         needs_cap_sys_admin = needs.cap_sys_admin,
@@ -869,6 +950,17 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
 }
 
 fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
+    if args.runtime_backend == AgentRuntimeBackend::DryRun {
+        let netfilter_netlink = matches!(
+            args.packet_flow_detector,
+            PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
+        );
+        return RuntimePreflightNeeds {
+            netfilter_netlink,
+            cap_net_admin: netfilter_netlink,
+            ..RuntimePreflightNeeds::none()
+        };
+    }
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
         return RuntimePreflightNeeds::none();
     }
@@ -879,10 +971,21 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_routes && args.route_backend == RouteApplyBackend::Command;
     let applies_wireguard_with_command =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::Command;
+    let applies_routes_with_netlink =
+        applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
+    let applies_wireguard_with_netlink =
+        applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::KernelNetlink;
+    let netfilter_netlink = matches!(
+        args.packet_flow_detector,
+        PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
+    );
     RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
         wg_command: applies_wireguard_with_command,
-        cap_net_admin: applies_routes || applies_wireguard,
+        route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
+        generic_netlink: applies_wireguard_with_netlink,
+        netfilter_netlink,
+        cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
         cap_net_raw: applies_wireguard,
         cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
@@ -938,7 +1041,9 @@ fn is_executable_file(path: &Path) -> bool {
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
     if let Some(false) = process_has_capability(CAP_NET_ADMIN_BIT)? {
-        anyhow::bail!("linux-command runtime backend requires CAP_NET_ADMIN");
+        anyhow::bail!(
+            "agent runtime preflight requires CAP_NET_ADMIN for kernel networking or conntrack netlink access"
+        );
     }
     Ok(())
 }
@@ -981,6 +1086,18 @@ fn process_status_has_capability(status: &str, bit: u8) -> anyhow::Result<Option
     let mask = u64::from_str_radix(cap_eff, 16)
         .with_context(|| format!("failed to parse CapEff from /proc/self/status: {cap_eff}"))?;
     Ok(Some(mask & (1_u64 << bit) != 0))
+}
+
+fn ensure_netlink_protocol_ready(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
+    let mut socket = Socket::new(protocol.protocol())
+        .with_context(|| format!("failed to open {} socket", protocol.as_str()))?;
+    socket
+        .bind_auto()
+        .with_context(|| format!("failed to bind {} socket", protocol.as_str()))?;
+    socket
+        .connect(&NetlinkSocketAddr::new(0, 0))
+        .with_context(|| format!("failed to connect {} socket to kernel", protocol.as_str()))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7227,6 +7344,9 @@ invalid no-destination-here
             let needs = runtime_preflight_needs(&args);
             assert!(needs.ip_command);
             assert!(!needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -7257,6 +7377,9 @@ invalid no-destination-here
             let needs = runtime_preflight_needs(&args);
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -7286,6 +7409,9 @@ invalid no-destination-here
             let needs = runtime_preflight_needs(&args);
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(needs.cap_sys_admin);
@@ -7312,9 +7438,109 @@ invalid no-destination-here
             let needs = runtime_preflight_needs(&args);
             assert!(needs.ip_command);
             assert!(!needs.wg_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    fn preflight_noop() -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn preflight_noop_netns(_namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn preflight_fail_generic_netlink(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
+        if protocol == RuntimeNetlinkProtocol::Generic {
+            anyhow::bail!("blocked test {}", protocol.as_str());
+        }
+        Ok(())
+    }
+
+    fn preflight_fail_netfilter_netlink(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
+        if protocol == RuntimeNetlinkProtocol::Netfilter {
+            anyhow::bail!("blocked test {}", protocol.as_str());
+        }
+        Ok(())
+    }
+
+    fn test_preflight_checks(
+        netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
+    ) -> RuntimePreflightChecks {
+        RuntimePreflightChecks {
+            cap_net_admin: preflight_noop,
+            cap_net_raw: preflight_noop,
+            cap_sys_admin: preflight_noop,
+            linux_netns: preflight_noop_netns,
+            netlink,
+        }
+    }
+
+    #[test]
+    fn runtime_preflight_probes_kernel_netlink_backends() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "kernel-netlink",
+            "--route-backend",
+            "kernel-netlink",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                test_preflight_checks(preflight_fail_generic_netlink),
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("blocked test NETLINK_GENERIC"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_probes_conntrack_netlink_even_for_dry_run() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "conntrack-netlink",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(needs.netfilter_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                test_preflight_checks(preflight_fail_netfilter_netlink),
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("blocked test NETLINK_NETFILTER"));
             return Ok(());
         }
 
