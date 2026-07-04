@@ -164,6 +164,7 @@ pub struct AgentRuntime {
     relay_admission_attempt_count: AtomicU64,
     relay_admission_success_count: AtomicU64,
     relay_admission_failure_count: AtomicU64,
+    path_probe_record_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
@@ -379,6 +380,7 @@ impl AgentRuntime {
             relay_admission_attempt_count: AtomicU64::new(0),
             relay_admission_success_count: AtomicU64::new(0),
             relay_admission_failure_count: AtomicU64::new(0),
+            path_probe_record_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
@@ -525,6 +527,7 @@ impl AgentRuntime {
                 .map(|(state, count)| PathStateCount { state, count })
                 .collect(),
             lazy_connect: lazy_connect.metrics(),
+            path_probe_record_count: self.path_probe_record_count.load(Ordering::Relaxed),
             peer_activity_record_count: self.peer_activity_record_count.load(Ordering::Relaxed),
             packet_flow_observation_count: self
                 .packet_flow_observation_count
@@ -562,6 +565,7 @@ impl AgentRuntime {
             updated_at: recorded_at,
             pinned: request.pin,
         };
+        self.path_probe_record_count.fetch_add(1, Ordering::Relaxed);
         self.upsert_path_state(path.clone()).await;
         path
     }
@@ -2215,6 +2219,7 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "jitter_ms=5.0"));
+        assert_eq!(runtime.metrics().await.path_probe_record_count, 1);
         assert!(runtime.should_connect_peer(&peer).await);
         assert_eq!(
             runtime.path_record_for_peer(&peer.node_id).await,
@@ -3084,6 +3089,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 3);
         assert_eq!(metrics.packet_flow_match_count, 2);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);
         Ok(())
     }

@@ -402,6 +402,19 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_path_probe_records_total Path probe records accepted by the agent."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_path_probe_records_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_path_probe_records_total{{node_id=\"{node_id}\"}} {}",
+        metrics.path_probe_record_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_packet_flow_observations_total Packet-flow observations submitted to lazy-connect resolution."
     );
     prometheus_line!(
@@ -653,6 +666,7 @@ mod tests {
         assert_eq!(metrics.relay_admission_failure_count, 0);
         assert_eq!(metrics.lazy_connect.active_peer_count, 1);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 1);
+        assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 1);
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 0);
@@ -688,6 +702,7 @@ mod tests {
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 32"));
         assert!(body.contains("ipars_agent_active_peers"));
         assert!(body.contains("ipars_agent_pinned_peers"));
+        assert!(body.contains("ipars_agent_path_probe_records_total"));
         assert!(body.contains("ipars_agent_peer_activity_records_total"));
         assert!(body.contains("ipars_agent_packet_flow_observations_total"));
         assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
@@ -730,6 +745,7 @@ mod tests {
             ClusterPolicy::default(),
         ));
         let local = runtime.state().node_id.clone();
+        let metrics_runtime = Arc::clone(&runtime);
         let app = router(AgentHttpState::new(runtime));
         let request = AgentPathProbeRequest {
             peer: NodeId::from_string("peer-probed"),
@@ -771,6 +787,8 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "latency_ms=35.0"));
+        let metrics = metrics_runtime.metrics().await;
+        assert_eq!(metrics.path_probe_record_count, 1);
 
         let paths_response = app
             .clone()

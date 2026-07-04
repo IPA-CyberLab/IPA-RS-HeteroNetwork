@@ -1710,6 +1710,7 @@ struct AgentOtelSnapshot {
     relay_admission_attempt_count: u64,
     relay_admission_success_count: u64,
     relay_admission_failure_count: u64,
+    path_probe_record_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
     packet_flow_match_count: u64,
@@ -1733,6 +1734,7 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
             relay_admission_attempt_count: metrics.relay_admission_attempt_count,
             relay_admission_success_count: metrics.relay_admission_success_count,
             relay_admission_failure_count: metrics.relay_admission_failure_count,
+            path_probe_record_count: metrics.path_probe_record_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
             packet_flow_match_count: metrics.packet_flow_match_count,
@@ -1757,6 +1759,7 @@ struct AgentOtelMetrics {
     relay_admission_attempts: Counter<u64>,
     relay_admission_success: Counter<u64>,
     relay_admission_failures: Counter<u64>,
+    path_probe_records: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
     packet_flow_matches: Counter<u64>,
@@ -1829,6 +1832,10 @@ impl AgentOtelMetrics {
             relay_admission_failures: meter
                 .u64_counter("ipars.agent.relay.admission.failures")
                 .with_description("Relay admission candidate attempts rejected or unreachable.")
+                .build(),
+            path_probe_records: meter
+                .u64_counter("ipars.agent.path_probe.records")
+                .with_description("Path probe records accepted by the agent.")
                 .build(),
             peer_activity_records: meter
                 .u64_counter("ipars.agent.peer_activity.records")
@@ -1930,6 +1937,13 @@ impl AgentOtelMetrics {
                 .add(relay_admission_failure_delta, &node_attrs);
         }
 
+        let path_probe_delta = counter_delta(
+            metrics.path_probe_record_count,
+            previous.map(|previous| previous.path_probe_record_count),
+        );
+        if path_probe_delta > 0 {
+            self.path_probe_records.add(path_probe_delta, &node_attrs);
+        }
         let peer_activity_delta = counter_delta(
             metrics.peer_activity_record_count,
             previous.map(|previous| previous.peer_activity_record_count),
@@ -6170,6 +6184,7 @@ mod tests {
                 observed_route_peer_count: 1,
                 observed_route_count: 2,
             },
+            path_probe_record_count: 4,
             peer_activity_record_count: 2,
             packet_flow_observation_count: 3,
             packet_flow_match_count: 2,
