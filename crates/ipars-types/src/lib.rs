@@ -761,6 +761,18 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RevokeTokenRequest {
+        pub cluster_id: ClusterId,
+        pub nonce: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RevokeTokenResponse {
+        pub record: TokenLedgerRecord,
+        pub status: TokenStatus,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ControlPlaneMetricsResponse {
         pub cluster_id: ClusterId,
         pub node_count: usize,

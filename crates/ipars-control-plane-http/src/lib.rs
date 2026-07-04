@@ -12,7 +12,7 @@ use ipars_control_plane::{
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeResponse,
+    RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{NodeId, PathState};
 use serde::Serialize;
@@ -62,6 +62,7 @@ where
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/metrics", get(metrics::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
+        .route("/v1/tokens/revoke", post(revoke_token::<S, L>))
         .with_state(state)
 }
 
@@ -109,6 +110,22 @@ where
         .join(request.token, request.registration, Utc::now())
         .await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn revoke_token<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<RevokeTokenRequest>,
+) -> Result<Json<RevokeTokenResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let record = state
+        .join_service
+        .revoke_token(&request.cluster_id, &request.nonce, Utc::now())
+        .await?;
+    let status = record.status(Utc::now());
+    Ok(Json(RevokeTokenResponse { record, status }))
 }
 
 async fn peers<S, L>(
@@ -282,11 +299,11 @@ mod tests {
     use ipars_crypto::IdentityKeyPair;
     use ipars_types::api::{
         ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-        RegisterNodeRequest, RegisterNodeResponse,
+        RegisterNodeRequest, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
     };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState, JoinTokenClaims, KeyId,
-        NodeHealth, NodeId, Role, Tag, TokenPolicy,
+        NodeHealth, NodeId, Role, Tag, TokenPolicy, TokenStatus,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -367,6 +384,40 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RegisterNodeResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.node.node_id, NodeId::from_string("node-http"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens/revoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&RevokeTokenRequest {
+                        cluster_id: request_body.token.claims.cluster_id.clone(),
+                        nonce: request_body.token.claims.nonce.clone(),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: RevokeTokenResponse = serde_json::from_slice(&body)?;
+        assert_eq!(response.status, TokenStatus::Revoked);
+
+        let rejected_join = JoinNodeRequest {
+            token: request_body.token.clone(),
+            registration: registration("node-revoked"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&rejected_join)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let heartbeat = HeartbeatRequest {
             node_id: NodeId::from_string("node-http"),

@@ -11,7 +11,7 @@ This file tracks the gap between the requested final system and the current repo
 - Pair-scoped path scoring with direct/IPv6/NAT traversal/relay/unreachable states.
 - In-memory control-plane registration and VPN IP allocation.
 - SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
-- Token ledger records, revocation state, and max-use enforcement for in-memory and SQL stores.
+- Token ledger records, control-plane revocation API, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, cluster/time constraints, ledger admission, and node registration.
 - Control-plane HTTP crate with typed health, join, peer-map, and JSON/Prometheus metrics routes backed by the join service.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.

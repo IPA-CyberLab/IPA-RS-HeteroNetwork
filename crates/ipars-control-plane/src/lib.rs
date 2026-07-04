@@ -292,6 +292,17 @@ where
             .record_token_use(&claims.cluster_id, &claims.nonce, now)
             .await
     }
+
+    pub async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        self.ledger
+            .revoke_token(cluster_id, nonce, revoked_at)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -360,6 +371,17 @@ where
         )?;
         self.admission.admit_join(&token.claims, now).await?;
         self.plane.register_with_claims(token.claims, request).await
+    }
+
+    pub async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        self.admission
+            .revoke_token(cluster_id, nonce, revoked_at)
+            .await
     }
 }
 

@@ -165,6 +165,7 @@ Initial control-plane HTTP routes:
 - `POST /v1/heartbeat`
 - `GET /v1/metrics`
 - `GET /v1/peers/{node_id}`
+- `POST /v1/tokens/revoke`
 
 Initial signal HTTP routes:
 
@@ -206,7 +207,7 @@ The control plane exposes JSON and Prometheus metrics for registered nodes, rela
 
 ## Security Model
 
-- Join tokens are signed, scoped, expiring, and revocable by key ID/nonce.
+- Join tokens are signed, scoped, expiring, and revocable through the token ledger by cluster ID/nonce.
 - Identity keys authenticate nodes to the control plane.
 - WireGuard keys provide data-plane confidentiality.
 - Relays cannot decrypt payload.
