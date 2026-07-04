@@ -33,7 +33,7 @@ The node ID is derived from the identity verifying key. WireGuard keys can rotat
 - issuer node ID and key ID
 - Ed25519 signature over typed claims
 
-Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, and `ipars token create` can later sign additional join tokens with that same key.
+Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, and `ipars token create` can later sign additional join tokens with that same key. Both commands expose token-policy inputs for relay permission, route allowlists, and max-use or unlimited-use admission.
 
 ## Control Plane HA
 
@@ -217,6 +217,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 ## Security Model
 
 - Join tokens are signed, scoped, expiring, and revocable through the token ledger by cluster ID/nonce.
+- Token policy constrains relay permission, permitted route advertisements, allowed tags, and max-use admission.
 - Identity keys authenticate nodes to the control plane.
 - WireGuard keys provide data-plane confidentiality.
 - Relays cannot decrypt payload.

@@ -73,6 +73,14 @@ struct InitArgs {
     default_role: String,
     #[arg(long = "tag")]
     tags: Vec<String>,
+    #[arg(long = "allowed-route")]
+    allowed_routes: Vec<ipnet::IpNet>,
+    #[arg(long, default_value_t = false)]
+    allow_relay: bool,
+    #[arg(long, conflicts_with = "unlimited_uses")]
+    max_uses: Option<u32>,
+    #[arg(long, default_value_t = false)]
+    unlimited_uses: bool,
 }
 
 #[derive(Debug, Args)]
@@ -126,12 +134,18 @@ struct TokenCreateArgs {
     role: String,
     #[arg(long = "tag")]
     tags: Vec<String>,
+    #[arg(long = "allowed-route")]
+    allowed_routes: Vec<ipnet::IpNet>,
     #[arg(long, default_value_t = 86_400)]
     ttl_seconds: i64,
     #[arg(long = "bootstrap")]
     bootstrap_endpoints: Vec<String>,
     #[arg(long, default_value_t = false)]
     allow_relay: bool,
+    #[arg(long, conflicts_with = "unlimited_uses")]
+    max_uses: Option<u32>,
+    #[arg(long, default_value_t = false)]
+    unlimited_uses: bool,
 }
 
 #[derive(Debug, Args)]
@@ -246,7 +260,11 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         args.tags,
         args.token_ttl_seconds,
         bootstrap_endpoints.clone(),
-        false,
+        TokenPolicyInput {
+            allow_relay: args.allow_relay,
+            allowed_routes: args.allowed_routes,
+            max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
+        },
     );
     let token = identity.sign_join_token(claims)?;
 
@@ -351,7 +369,11 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.tags,
         args.ttl_seconds,
         bootstrap_endpoints,
-        args.allow_relay,
+        TokenPolicyInput {
+            allow_relay: args.allow_relay,
+            allowed_routes: args.allowed_routes,
+            max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
+        },
     ))?;
     Ok(token)
 }
@@ -542,6 +564,21 @@ struct TokenIssuer {
     key_id: KeyId,
 }
 
+#[derive(Debug, Clone)]
+struct TokenPolicyInput {
+    allow_relay: bool,
+    allowed_routes: Vec<ipnet::IpNet>,
+    max_token_uses: Option<u32>,
+}
+
+fn max_token_uses(max_uses: Option<u32>, unlimited_uses: bool) -> Option<u32> {
+    if unlimited_uses {
+        None
+    } else {
+        max_uses.or(TokenPolicy::default().max_token_uses)
+    }
+}
+
 fn claims(
     cluster_id: ClusterId,
     issuer: TokenIssuer,
@@ -549,7 +586,7 @@ fn claims(
     tags: Vec<String>,
     ttl_seconds: i64,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
-    allow_relay: bool,
+    policy_input: TokenPolicyInput,
 ) -> JoinTokenClaims {
     let now = Utc::now();
     let tag_set = tags
@@ -557,8 +594,10 @@ fn claims(
         .map(Tag::from_string)
         .collect::<BTreeSet<_>>();
     let policy = TokenPolicy {
-        allow_relay,
+        allow_relay: policy_input.allow_relay,
+        allowed_routes: policy_input.allowed_routes,
         allowed_tags: tag_set.clone(),
+        max_token_uses: policy_input.max_token_uses,
         ..TokenPolicy::default()
     };
 
@@ -744,7 +783,11 @@ mod tests {
                 Vec::new(),
                 300,
                 endpoints,
-                false,
+                TokenPolicyInput {
+                    allow_relay: false,
+                    allowed_routes: Vec::new(),
+                    max_token_uses: Some(1),
+                },
             ),
             signature: "signature".to_string(),
         }
@@ -807,14 +850,22 @@ mod tests {
             issuer_private_key_path: None,
             role: "edge".to_string(),
             tags: vec!["edge".to_string()],
+            allowed_routes: vec!["10.42.0.0/16".parse()?],
             ttl_seconds: 300,
             bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
             allow_relay: true,
+            max_uses: Some(7),
+            unlimited_uses: false,
         })?;
 
         assert_eq!(token.claims.issuer, issuer.node_id());
         assert_eq!(token.claims.key_id, KeyId::from_string("join-2026q3"));
         assert!(token.claims.policy.allow_relay);
+        assert_eq!(
+            token.claims.policy.allowed_routes,
+            vec!["10.42.0.0/16".parse()?]
+        );
+        assert_eq!(token.claims.policy.max_token_uses, Some(7));
         verify_join_token(
             &token,
             &issuer.public_key_b64(),
@@ -822,6 +873,48 @@ mod tests {
             &ClusterId::from_string("cluster-a"),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn token_policy_flags_parse_from_cli() -> anyhow::Result<()> {
+        let init = Cli::try_parse_from([
+            "ipars",
+            "init",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--allowed-route",
+            "10.43.0.0/16",
+            "--allow-relay",
+            "--unlimited-uses",
+        ])?;
+        if let Command::Init(args) = init.command {
+            assert_eq!(args.allowed_routes, vec!["10.43.0.0/16".parse()?]);
+            assert!(args.allow_relay);
+            assert!(args.unlimited_uses);
+        } else {
+            anyhow::bail!("expected init command");
+        }
+
+        let token = Cli::try_parse_from([
+            "ipars",
+            "token",
+            "create",
+            "--allowed-route",
+            "10.42.0.0/16",
+            "--max-uses",
+            "7",
+        ])?;
+        if let Command::Token {
+            command: TokenCommand::Create(args),
+        } = token.command
+        {
+            assert_eq!(args.allowed_routes, vec!["10.42.0.0/16".parse()?]);
+            assert_eq!(args.max_uses, Some(7));
+            assert!(!args.unlimited_uses);
+            return Ok(());
+        }
+
+        anyhow::bail!("expected token create command")
     }
 
     #[test]
@@ -836,6 +929,10 @@ mod tests {
             token_ttl_seconds: 300,
             default_role: "edge".to_string(),
             tags: Vec::new(),
+            allowed_routes: vec!["10.43.0.0/16".parse()?],
+            allow_relay: true,
+            max_uses: None,
+            unlimited_uses: true,
         })?;
 
         assert_eq!(output.issuer_private_key_path, Some(key_path.clone()));
@@ -844,6 +941,12 @@ mod tests {
             IdentityKeyPair::from_signing_key_b64(std::fs::read_to_string(&key_path)?.trim())?;
         assert_eq!(output.issuer_node_id, restored.node_id());
         assert_eq!(output.issuer_public_key, restored.public_key_b64());
+        assert_eq!(
+            output.join_token.claims.policy.allowed_routes,
+            vec!["10.43.0.0/16".parse()?]
+        );
+        assert_eq!(output.join_token.claims.policy.max_token_uses, None);
+        assert!(output.join_token.claims.policy.allow_relay);
         verify_join_token(
             &output.join_token,
             &output.issuer_public_key,

@@ -1060,6 +1060,7 @@ dependencies = [
  "clap",
  "ipars-crypto",
  "ipars-types",
+ "ipnet",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
