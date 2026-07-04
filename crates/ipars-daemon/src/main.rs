@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -4942,6 +4944,15 @@ async fn record_packet_flow_observations(
     let now = chrono::Utc::now();
     let mut matched_count = 0_usize;
     for flow in flows {
+        if let Some(reason) = packet_flow_destination_drop_reason(flow.destination) {
+            tracing::debug!(
+                destination = %flow.destination,
+                reason = reason.as_str(),
+                source,
+                "ignored packet-flow observation before lazy-connect resolution"
+            );
+            continue;
+        }
         let mut observation = flow.observation;
         if observation.detector.is_none() {
             observation.detector = Some(source.to_string());
@@ -4985,6 +4996,57 @@ fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
 struct PacketFlowRecord {
     destination: IpAddr,
     observation: AgentPacketFlowObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketFlowDestinationDropReason {
+    Unspecified,
+    Loopback,
+    Multicast,
+    Broadcast,
+    LinkLocal,
+}
+
+impl PacketFlowDestinationDropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Loopback => "loopback",
+            Self::Multicast => "multicast",
+            Self::Broadcast => "broadcast",
+            Self::LinkLocal => "link-local",
+        }
+    }
+}
+
+fn packet_flow_destination_drop_reason(
+    destination: IpAddr,
+) -> Option<PacketFlowDestinationDropReason> {
+    if destination.is_unspecified() {
+        return Some(PacketFlowDestinationDropReason::Unspecified);
+    }
+    if destination.is_loopback() {
+        return Some(PacketFlowDestinationDropReason::Loopback);
+    }
+    if destination.is_multicast() {
+        return Some(PacketFlowDestinationDropReason::Multicast);
+    }
+    match destination {
+        IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
+            Some(PacketFlowDestinationDropReason::Broadcast)
+        }
+        IpAddr::V4(address) if address.is_link_local() => {
+            Some(PacketFlowDestinationDropReason::LinkLocal)
+        }
+        IpAddr::V6(address) if is_ipv6_unicast_link_local(address) => {
+            Some(PacketFlowDestinationDropReason::LinkLocal)
+        }
+        _ => None,
+    }
+}
+
+fn is_ipv6_unicast_link_local(address: Ipv6Addr) -> bool {
+    address.segments()[0] & 0xffc0 == 0xfe80
 }
 
 async fn read_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>> {
@@ -6672,6 +6734,112 @@ invalid no-destination-here
         assert_eq!(first.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(first.observation.source_port, Some(54321));
         assert_eq!(first.observation.destination_port, Some(51820));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_destination_classifier_keeps_overlay_unicast_targets() -> anyhow::Result<()> {
+        for destination in [
+            "100.64.0.11",
+            "10.42.7.25",
+            "172.20.1.10",
+            "fd00::42",
+            "2001:db8::42",
+        ] {
+            assert_eq!(
+                packet_flow_destination_drop_reason(destination.parse()?),
+                None,
+                "{destination} should remain eligible"
+            );
+        }
+
+        assert_eq!(
+            packet_flow_destination_drop_reason("0.0.0.0".parse()?),
+            Some(PacketFlowDestinationDropReason::Unspecified)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("::".parse()?),
+            Some(PacketFlowDestinationDropReason::Unspecified)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("127.0.0.1".parse()?),
+            Some(PacketFlowDestinationDropReason::Loopback)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("::1".parse()?),
+            Some(PacketFlowDestinationDropReason::Loopback)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("224.0.0.1".parse()?),
+            Some(PacketFlowDestinationDropReason::Multicast)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("ff02::1".parse()?),
+            Some(PacketFlowDestinationDropReason::Multicast)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("255.255.255.255".parse()?),
+            Some(PacketFlowDestinationDropReason::Broadcast)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("169.254.10.20".parse()?),
+            Some(PacketFlowDestinationDropReason::LinkLocal)
+        );
+        assert_eq!(
+            packet_flow_destination_drop_reason("fe80::1".parse()?),
+            Some(PacketFlowDestinationDropReason::LinkLocal)
+        );
+        assert_eq!(
+            PacketFlowDestinationDropReason::LinkLocal.as_str(),
+            "link-local"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_detector_filters_non_unicast_before_default_route_match(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let mut peer = node_record("default-route-peer");
+        peer.routes.push(Route {
+            id: "default-v4".to_string(),
+            cidr: "0.0.0.0/0".parse()?,
+            advertised_by: peer.node_id.clone(),
+            via: Some(peer.node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        });
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let flows = vec![
+            PacketFlowRecord {
+                destination: "224.0.0.1".parse()?,
+                observation: AgentPacketFlowObservation::default(),
+            },
+            PacketFlowRecord {
+                destination: "255.255.255.255".parse()?,
+                observation: AgentPacketFlowObservation::default(),
+            },
+            PacketFlowRecord {
+                destination: "10.42.7.25".parse()?,
+                observation: AgentPacketFlowObservation::default(),
+            },
+        ];
+
+        let matched =
+            record_packet_flow_observations(&runtime, flows, false, "test-detector").await;
+        let metrics = runtime.metrics().await;
+
+        assert_eq!(matched, 1);
+        assert_eq!(metrics.packet_flow_observation_count, 1);
+        assert_eq!(metrics.packet_flow_match_count, 1);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert!(runtime.should_connect_peer(&peer).await);
         Ok(())
     }
 
