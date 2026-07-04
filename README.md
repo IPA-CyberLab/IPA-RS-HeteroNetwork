@@ -12,6 +12,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - SQLite and PostgreSQL control-plane store implementations
 - token ledger primitives for revocation and max-use enforcement
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, and token-ledger admission before registration
+- typed control-plane HTTP routes for health, join registration, and peer-map retrieval
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -39,4 +40,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to expose the join service through long-running daemon RPC/HTTP handlers and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to run the HTTP routers from long-running daemon binaries and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

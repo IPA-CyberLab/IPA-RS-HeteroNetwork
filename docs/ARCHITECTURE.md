@@ -134,6 +134,7 @@ CNI-owned pod networking remains the responsibility of the cluster CNI.
 The shared `ipars-types` crate defines typed request and response models for:
 
 - node registration
+- join registration with signed token claims
 - heartbeat/health reporting
 - peer map and relay map retrieval
 - route publication
@@ -141,6 +142,12 @@ The shared `ipars-types` crate defines typed request and response models for:
 - relay admission and status
 
 The wire protocol can be exposed as gRPC or HTTP. The schema is Rust-first and serializes cleanly to JSON for CLI diagnostics and tests.
+
+Initial control-plane HTTP routes:
+
+- `GET /healthz`
+- `POST /v1/join`
+- `GET /v1/peers/{node_id}`
 
 ## Observability
 

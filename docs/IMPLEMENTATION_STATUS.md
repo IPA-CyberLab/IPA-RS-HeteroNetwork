@@ -13,6 +13,7 @@ This file tracks the gap between the requested final system and the current repo
 - SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
 - Token ledger records, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, cluster/time constraints, ledger admission, and node registration.
+- Control-plane HTTP crate with typed health, join, and peer-map routes backed by the join service.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -20,7 +21,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Daemon-backed `join` registration RPC/HTTP handlers that call the join service.
+- Long-running daemon binaries that serve the HTTP routers.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.
