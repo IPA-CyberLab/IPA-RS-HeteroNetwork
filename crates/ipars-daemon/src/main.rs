@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
-use ipars_agent::{AgentRuntime, FileAgentStateStore};
+use ipars_agent::{
+    AgentRuntime, FileAgentStateStore, LinuxWireGuardBackend, PeerMapApplier, SystemCommandRunner,
+};
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
@@ -13,10 +15,12 @@ use ipars_control_plane::{
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
+use ipars_route_manager::{LinuxRouteManager, SystemRouteCommandRunner};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
+use ipars_types::api::PeerMap;
 use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId, RelayCapability};
 
 #[derive(Debug, Parser)]
@@ -116,6 +120,16 @@ struct AgentArgs {
     stun_server: Option<SocketAddr>,
     #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:0")]
     stun_bind: SocketAddr,
+    #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
+    apply_peer_map: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_WIREGUARD_INTERFACE",
+        default_value = "ipars0"
+    )]
+    wireguard_interface: String,
 }
 
 #[tokio::main]
@@ -250,8 +264,41 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     if let Some(stun_server) = args.stun_server {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
+    if args.apply_peer_map {
+        let control_plane_url = args
+            .control_plane_url
+            .as_deref()
+            .context("--control-plane-url is required when --apply-peer-map is set")?;
+        let peer_map = fetch_peer_map(control_plane_url, &runtime.state().node_id).await?;
+        let wireguard =
+            LinuxWireGuardBackend::new(args.wireguard_interface.clone(), SystemCommandRunner);
+        wireguard.ensure_interface().await?;
+        let route_manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+        let applier =
+            PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+        let summary = applier.apply_peer_map(peer_map).await?;
+        tracing::info!(
+            peers_applied = summary.peers_applied,
+            routes_applied = summary.routes_applied,
+            interface = %args.wireguard_interface,
+            "applied control-plane peer map"
+        );
+    }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await
+}
+
+async fn fetch_peer_map(control_plane_url: &str, node_id: &NodeId) -> anyhow::Result<PeerMap> {
+    let url = peer_map_url(control_plane_url, node_id);
+    Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
+}
+
+fn peer_map_url(control_plane_url: &str, node_id: &NodeId) -> String {
+    format!(
+        "{}/v1/peers/{}",
+        control_plane_url.trim_end_matches('/'),
+        node_id
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +333,14 @@ mod tests {
         assert_eq!(
             database_kind(Some("postgresql://ipars@localhost/ipars")),
             DatabaseKind::Postgres
+        );
+    }
+
+    #[test]
+    fn peer_map_url_trims_control_plane_base_url() {
+        assert_eq!(
+            peer_map_url("http://127.0.0.1:8443/", &NodeId::from_string("node-a")),
+            "http://127.0.0.1:8443/v1/peers/node-a"
         );
     }
 }

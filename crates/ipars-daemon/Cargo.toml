@@ -22,11 +22,13 @@ ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-relay-http = { path = "../ipars-relay-http" }
+ipars-route-manager = { path = "../ipars-route-manager" }
 ipars-signal = { path = "../ipars-signal" }
 ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-store = { path = "../ipars-store" }
 ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }
+reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
