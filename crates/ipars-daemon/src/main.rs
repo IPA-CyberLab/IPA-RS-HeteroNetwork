@@ -1004,11 +1004,36 @@ fn inspect_linux_netns_path(
             path.display()
         );
     }
+    ensure_linux_netns_nsfs(namespace, path)?;
 
     let same_as_current = current_netns_path
         .map(|current_netns_path| same_file_identity(path, current_netns_path))
         .transpose()?;
     Ok(LinuxNetnsPathReport { same_as_current })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_netns_nsfs(namespace: &LinuxNetworkNamespace, path: &Path) -> anyhow::Result<()> {
+    if !is_linux_nsfs_path(path)? {
+        anyhow::bail!(
+            "linux network namespace `{}` at {} must be an nsfs namespace bind mount",
+            namespace.name(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_linux_netns_nsfs(_namespace: &LinuxNetworkNamespace, _path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_nsfs_path(path: &Path) -> anyhow::Result<bool> {
+    let stat = nix::sys::statfs::statfs(path)
+        .with_context(|| format!("failed to stat filesystem for {}", path.display()))?;
+    Ok(stat.filesystem_type() == nix::sys::statfs::NSFS_MAGIC)
 }
 
 #[cfg(unix)]
@@ -6441,21 +6466,41 @@ invalid no-destination-here
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_netns_path_preflight_detects_current_namespace_identity() -> anyhow::Result<()> {
+    fn linux_netns_path_preflight_rejects_regular_file() -> anyhow::Result<()> {
         let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("netns-preflight-regular-file")?;
+        let path = base.join("node-a");
+        std::fs::write(&path, b"netns")?;
+
+        let error = match inspect_linux_netns_path(&namespace, &path, None) {
+            Ok(_) => anyhow::bail!("unexpected successful netns path inspection"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("nsfs namespace bind mount"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_netns_filesystem_probe_accepts_proc_namespace_target() -> anyhow::Result<()> {
+        let path = current_process_netns_path().context("missing current process net namespace")?;
+
+        assert!(is_linux_nsfs_path(&path)?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_netns_path_identity_helper_detects_same_file() -> anyhow::Result<()> {
         let base = unique_test_dir("netns-preflight-current")?;
         let path = base.join("node-a");
         std::fs::write(&path, b"netns")?;
 
-        let report = inspect_linux_netns_path(&namespace, &path, Some(&path))?;
-
-        assert_eq!(
-            report,
-            LinuxNetnsPathReport {
-                same_as_current: Some(true)
-            }
-        );
+        assert!(same_file_identity(&path, &path)?);
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }

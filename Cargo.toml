@@ -42,7 +42,7 @@ netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-wireguard = "0.4"
 netlink-sys = "0.8"
-nix = { version = "0.30", default-features = false, features = ["sched"] }
+nix = { version = "0.30", default-features = false, features = ["fs", "sched"] }
 opentelemetry = { version = "0.32", features = ["logs", "metrics", "trace"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }

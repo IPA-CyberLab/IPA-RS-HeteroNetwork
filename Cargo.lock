@@ -1135,6 +1135,7 @@ dependencies = [
  "ipars-types",
  "ipnet",
  "netlink-sys",
+ "nix",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
