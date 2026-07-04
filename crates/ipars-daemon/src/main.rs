@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -34,19 +35,23 @@ use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
-    SignalHolePunchPlanResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
+    RelayStatusResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
     NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
 };
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Gauge};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
-use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
+use opentelemetry_sdk::{
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
+};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -89,6 +94,12 @@ struct ObservabilityArgs {
     otel_endpoint: Option<String>,
     #[arg(long, env = "IPARS_OTEL_SERVICE_NAME")]
     otel_service_name: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS",
+        default_value_t = 15
+    )]
+    otel_metrics_poll_interval_seconds: u64,
     #[arg(long, env = "IPARS_LOG_FILTER", default_value = "info")]
     log_filter: String,
 }
@@ -109,11 +120,15 @@ impl ObservabilityArgs {
 struct ObservabilityGuard {
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
         if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.shutdown();
+        }
+        if let Some(provider) = self.meter_provider.take() {
             let _ = provider.shutdown();
         }
         if let Some(provider) = self.tracer_provider.take() {
@@ -460,11 +475,18 @@ fn init_observability(
 
     let log_exporter = build_log_exporter(args.otel_endpoint.as_deref())?;
     let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .with_batch_exporter(log_exporter)
         .build();
     let logs_layer = OpenTelemetryTracingBridge::new(&logger_provider)
         .with_filter(EnvFilter::try_new(args.log_filter.as_str())?);
+
+    let metric_exporter = build_metric_exporter(args.otel_endpoint.as_deref())?;
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(metric_exporter)
+        .build();
+    global::set_meter_provider(meter_provider.clone());
 
     tracing_subscriber::registry()
         .with(fmt_layer)
@@ -476,6 +498,7 @@ fn init_observability(
     Ok(ObservabilityGuard {
         tracer_provider: Some(tracer_provider),
         logger_provider: Some(logger_provider),
+        meter_provider: Some(meter_provider),
     })
 }
 
@@ -503,6 +526,22 @@ fn build_log_exporter(endpoint: Option<&str>) -> anyhow::Result<opentelemetry_ot
         builder
     };
     builder.build().context("failed to build OTLP log exporter")
+}
+
+fn build_metric_exporter(
+    endpoint: Option<&str>,
+) -> anyhow::Result<opentelemetry_otlp::MetricExporter> {
+    let builder = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary);
+    let builder = if let Some(endpoint) = endpoint {
+        builder.with_endpoint(otlp_http_signal_endpoint(endpoint, "metrics"))
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .context("failed to build OTLP metric exporter")
 }
 
 fn otlp_http_signal_endpoint(base_endpoint: &str, signal: &str) -> String {
@@ -660,6 +699,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let component = cli.command.component();
     let _observability = init_observability(&cli.observability, component)?;
+    let otel_metrics_enabled = cli.observability.otel_active();
+    let otel_metrics_interval =
+        Duration::from_secs(cli.observability.otel_metrics_poll_interval_seconds.max(1));
     tracing::info!(
         component,
         otel_enabled = cli.observability.otel_active(),
@@ -669,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ControlPlane(args) => run_control_plane(args).await,
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
-        Command::Relay(args) => run_relay(args).await,
+        Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Agent(args) => run_agent(*args).await,
     }
 }
@@ -763,7 +805,228 @@ async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RelayOtelSnapshot {
+    dataplane: RelayDataplaneMetrics,
+}
+
+impl From<&RelayStatusResponse> for RelayOtelSnapshot {
+    fn from(status: &RelayStatusResponse) -> Self {
+        Self {
+            dataplane: status.dataplane.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RelayOtelMetrics {
+    datagrams_received: Counter<u64>,
+    datagram_bytes_received: Counter<u64>,
+    datagrams_forwarded: Counter<u64>,
+    datagrams_dropped: Counter<u64>,
+    datagrams_dropped_by_reason: Counter<u64>,
+    datagram_bytes_dropped: Counter<u64>,
+    payload_bytes_forwarded: Counter<u64>,
+    active_sessions: Gauge<u64>,
+    max_sessions: Gauge<u64>,
+    available_sessions: Gauge<u64>,
+    max_mbps: Gauge<u64>,
+    enabled_by_policy: Gauge<u64>,
+    health: Gauge<u64>,
+}
+
+impl RelayOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.relay");
+        Self {
+            datagrams_received: meter
+                .u64_counter("ipars.relay.datagrams.received")
+                .with_description("UDP relay datagrams received.")
+                .build(),
+            datagram_bytes_received: meter
+                .u64_counter("ipars.relay.datagram.bytes.received")
+                .with_description("UDP relay datagram bytes received, including relay metadata.")
+                .with_unit("By")
+                .build(),
+            datagrams_forwarded: meter
+                .u64_counter("ipars.relay.datagrams.forwarded")
+                .with_description("UDP relay datagrams accepted for forwarding.")
+                .build(),
+            datagrams_dropped: meter
+                .u64_counter("ipars.relay.datagrams.dropped")
+                .with_description("UDP relay datagrams dropped before forwarding.")
+                .build(),
+            datagrams_dropped_by_reason: meter
+                .u64_counter("ipars.relay.datagrams.dropped_by_reason")
+                .with_description("UDP relay datagrams dropped before forwarding, by reason.")
+                .build(),
+            datagram_bytes_dropped: meter
+                .u64_counter("ipars.relay.datagram.bytes.dropped")
+                .with_description("UDP relay datagram bytes dropped, including relay metadata.")
+                .with_unit("By")
+                .build(),
+            payload_bytes_forwarded: meter
+                .u64_counter("ipars.relay.payload.bytes.forwarded")
+                .with_description("Opaque payload bytes accepted for relay forwarding.")
+                .with_unit("By")
+                .build(),
+            active_sessions: meter
+                .u64_gauge("ipars.relay.sessions.active")
+                .with_description("Active relay sessions.")
+                .build(),
+            max_sessions: meter
+                .u64_gauge("ipars.relay.sessions.max")
+                .with_description("Configured relay session capacity.")
+                .build(),
+            available_sessions: meter
+                .u64_gauge("ipars.relay.sessions.available")
+                .with_description("Available relay session capacity.")
+                .build(),
+            max_mbps: meter
+                .u64_gauge("ipars.relay.max_mbps")
+                .with_description("Configured relay throughput budget.")
+                .with_unit("Mbit/s")
+                .build(),
+            enabled_by_policy: meter
+                .u64_gauge("ipars.relay.enabled_by_policy")
+                .with_description("Whether relay admission is enabled by policy.")
+                .build(),
+            health: meter
+                .u64_gauge("ipars.relay.health")
+                .with_description("Relay health state as a labeled gauge.")
+                .build(),
+        }
+    }
+
+    fn record_status(&self, status: &RelayStatusResponse, previous: Option<&RelayOtelSnapshot>) {
+        let delta = relay_dataplane_delta(
+            &status.dataplane,
+            previous.map(|snapshot| &snapshot.dataplane),
+        );
+        let relay_node = status.relay_node.as_str().to_string();
+        let relay_attrs = [KeyValue::new("relay_node", relay_node.clone())];
+        self.datagrams_received
+            .add(delta.datagrams_received, &relay_attrs);
+        self.datagram_bytes_received
+            .add(delta.datagram_bytes_received, &relay_attrs);
+        self.datagrams_forwarded
+            .add(delta.datagrams_forwarded, &relay_attrs);
+        self.datagrams_dropped
+            .add(delta.datagrams_dropped, &relay_attrs);
+        self.datagram_bytes_dropped
+            .add(delta.datagram_bytes_dropped, &relay_attrs);
+        self.payload_bytes_forwarded
+            .add(delta.payload_bytes_forwarded, &relay_attrs);
+        for (reason, count) in delta.drops_by_reason {
+            let attrs = [
+                KeyValue::new("relay_node", relay_node.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.datagrams_dropped_by_reason.add(count, &attrs);
+        }
+
+        self.active_sessions
+            .record(status.capability.active_sessions as u64, &relay_attrs);
+        self.max_sessions
+            .record(status.capability.max_sessions as u64, &relay_attrs);
+        self.available_sessions
+            .record(status.capability.available_capacity() as u64, &relay_attrs);
+        self.max_mbps
+            .record(status.capability.max_mbps as u64, &relay_attrs);
+        self.enabled_by_policy
+            .record(u64::from(status.capability.enabled_by_policy), &relay_attrs);
+        for state in [
+            HealthState::Healthy,
+            HealthState::Degraded,
+            HealthState::Unhealthy,
+        ] {
+            let attrs = [
+                KeyValue::new("relay_node", relay_node.clone()),
+                KeyValue::new("state", health_label(state)),
+            ];
+            self.health
+                .record(u64::from(status.health == state), &attrs);
+        }
+    }
+}
+
+fn relay_dataplane_delta(
+    current: &RelayDataplaneMetrics,
+    previous: Option<&RelayDataplaneMetrics>,
+) -> RelayDataplaneMetrics {
+    let mut drops_by_reason = BTreeMap::new();
+    for (reason, current_count) in &current.drops_by_reason {
+        let previous_count = previous
+            .and_then(|previous| previous.drops_by_reason.get(reason))
+            .copied()
+            .unwrap_or(0);
+        let delta = current_count.saturating_sub(previous_count);
+        if delta > 0 {
+            drops_by_reason.insert(*reason, delta);
+        }
+    }
+    RelayDataplaneMetrics {
+        datagrams_received: counter_delta(
+            current.datagrams_received,
+            previous.map(|previous| previous.datagrams_received),
+        ),
+        datagrams_forwarded: counter_delta(
+            current.datagrams_forwarded,
+            previous.map(|previous| previous.datagrams_forwarded),
+        ),
+        datagrams_dropped: counter_delta(
+            current.datagrams_dropped,
+            previous.map(|previous| previous.datagrams_dropped),
+        ),
+        datagram_bytes_received: counter_delta(
+            current.datagram_bytes_received,
+            previous.map(|previous| previous.datagram_bytes_received),
+        ),
+        payload_bytes_forwarded: counter_delta(
+            current.payload_bytes_forwarded,
+            previous.map(|previous| previous.payload_bytes_forwarded),
+        ),
+        datagram_bytes_dropped: counter_delta(
+            current.datagram_bytes_dropped,
+            previous.map(|previous| previous.datagram_bytes_dropped),
+        ),
+        drops_by_reason,
+    }
+}
+
+fn counter_delta(current: u64, previous: Option<u64>) -> u64 {
+    current.saturating_sub(previous.unwrap_or(0))
+}
+
+fn health_label(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Healthy => "healthy",
+        HealthState::Degraded => "degraded",
+        HealthState::Unhealthy => "unhealthy",
+    }
+}
+
+fn start_relay_otel_metrics_export(
+    service: Arc<RelayService>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let metrics = RelayOtelMetrics::new();
+        let mut previous = None;
+        loop {
+            let status = service.status().await;
+            metrics.record_status(&status, previous.as_ref());
+            previous = Some(RelayOtelSnapshot::from(&status));
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+async fn run_relay(
+    args: RelayArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
     let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
@@ -786,10 +1049,19 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
+    let otel_metrics_task = otel_metrics_enabled.then(|| {
+        start_relay_otel_metrics_export(
+            service.clone(),
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        )
+    });
     tracing::info!(%udp_addr, http_listen = %args.http_listen, "relay listening");
     let http_result =
         serve_router(args.http_listen, relay_router(RelayHttpState::new(service))).await;
     udp_task.abort();
+    if let Some(task) = otel_metrics_task {
+        task.abort();
+    }
     http_result
 }
 
@@ -2387,6 +2659,7 @@ mod tests {
 
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
+    use ipars_types::api::RelayDataplaneDropReason;
     use ipars_types::{
         BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
         JoinTokenClaims, PathScore, PeerPathKey, Role, TokenPolicy, VpnIp,
@@ -2455,6 +2728,7 @@ mod tests {
             otel_enabled: false,
             otel_endpoint: None,
             otel_service_name: None,
+            otel_metrics_poll_interval_seconds: 15,
             log_filter: "info".to_string(),
         };
 
@@ -2468,6 +2742,7 @@ mod tests {
             otel_enabled: false,
             otel_endpoint: Some("http://collector:4318/".to_string()),
             otel_service_name: Some("custom-ipars".to_string()),
+            otel_metrics_poll_interval_seconds: 5,
             log_filter: "ipars=debug".to_string(),
         };
 
@@ -2492,6 +2767,8 @@ mod tests {
             "http://collector:4318",
             "--otel-service-name",
             "ipars-agent-prod",
+            "--otel-metrics-poll-interval-seconds",
+            "3",
             "--log-filter",
             "ipars=debug",
             "agent",
@@ -2509,8 +2786,93 @@ mod tests {
             cli.observability.otel_service_name.as_deref(),
             Some("ipars-agent-prod")
         );
+        assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 3);
         assert_eq!(cli.observability.log_filter, "ipars=debug");
         assert_eq!(cli.command.component(), "agent");
+    }
+
+    #[test]
+    fn relay_otel_delta_records_first_snapshot_as_counter_increment() {
+        let mut current = RelayDataplaneMetrics {
+            datagrams_received: 10,
+            datagrams_forwarded: 8,
+            datagrams_dropped: 2,
+            datagram_bytes_received: 1000,
+            payload_bytes_forwarded: 640,
+            datagram_bytes_dropped: 360,
+            ..RelayDataplaneMetrics::default()
+        };
+        current
+            .drops_by_reason
+            .insert(RelayDataplaneDropReason::MalformedFrame, 2);
+
+        let delta = relay_dataplane_delta(&current, None);
+
+        assert_eq!(delta.datagrams_received, 10);
+        assert_eq!(delta.datagrams_forwarded, 8);
+        assert_eq!(delta.datagrams_dropped, 2);
+        assert_eq!(delta.datagram_bytes_received, 1000);
+        assert_eq!(delta.payload_bytes_forwarded, 640);
+        assert_eq!(delta.datagram_bytes_dropped, 360);
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn relay_otel_delta_records_only_increments_since_previous_snapshot() {
+        let mut previous = RelayDataplaneMetrics {
+            datagrams_received: 10,
+            datagrams_forwarded: 8,
+            datagrams_dropped: 2,
+            datagram_bytes_received: 1000,
+            payload_bytes_forwarded: 640,
+            datagram_bytes_dropped: 360,
+            ..RelayDataplaneMetrics::default()
+        };
+        previous
+            .drops_by_reason
+            .insert(RelayDataplaneDropReason::MalformedFrame, 2);
+
+        let mut current = RelayDataplaneMetrics {
+            datagrams_received: 14,
+            datagrams_forwarded: 11,
+            datagrams_dropped: 3,
+            datagram_bytes_received: 1550,
+            payload_bytes_forwarded: 900,
+            datagram_bytes_dropped: 410,
+            drops_by_reason: previous.drops_by_reason.clone(),
+        };
+        current
+            .drops_by_reason
+            .insert(RelayDataplaneDropReason::MalformedFrame, 3);
+        current
+            .drops_by_reason
+            .insert(RelayDataplaneDropReason::RateLimited, 4);
+
+        let delta = relay_dataplane_delta(&current, Some(&previous));
+
+        assert_eq!(delta.datagrams_received, 4);
+        assert_eq!(delta.datagrams_forwarded, 3);
+        assert_eq!(delta.datagrams_dropped, 1);
+        assert_eq!(delta.datagram_bytes_received, 550);
+        assert_eq!(delta.payload_bytes_forwarded, 260);
+        assert_eq!(delta.datagram_bytes_dropped, 50);
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&1)
+        );
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::RateLimited),
+            Some(&4)
+        );
     }
 
     async fn insert_dead_forwarder(

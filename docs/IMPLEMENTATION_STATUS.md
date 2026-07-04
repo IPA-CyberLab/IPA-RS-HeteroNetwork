@@ -30,7 +30,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings; relay forwarders support namespace placement checks, capacity limits, dead-task reaping, stale endpoint removal, restart backoff, and configurable crash-loop cooldown policy.
 - Agent HTTP JSON/Prometheus metrics export and bounded structured path-change event export.
 - Agent relay forwarder per-peer dataplane metrics for outbound/inbound packets and opaque payload bytes, exported through JSON and Prometheus metrics.
-- Shared `iparsd` observability bootstrap with formatted tracing output and optional OTLP HTTP/protobuf trace/log export to OpenTelemetry collectors.
+- Shared `iparsd` observability bootstrap with formatted tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to OpenTelemetry collectors, including relay capacity and dataplane metric recording.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - `iparsd agent` Kubernetes underlay route application for Service/API CIDRs, with Helm DaemonSet wiring for node-name discovery and explicit route-provider configuration.
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents, with Docker Compose wiring for rootful bridge deployments.
@@ -54,7 +54,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
-- OpenTelemetry metrics exporter plus relay dataplane metrics beyond current session, byte, packet, and drop-reason counters.
+- OpenTelemetry metrics coverage beyond current relay capacity/session, byte, packet, and drop-reason counters.
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.
