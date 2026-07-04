@@ -14,6 +14,7 @@ This file tracks the gap between the requested final system and the current repo
 - Token ledger records, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, cluster/time constraints, ledger admission, and node registration.
 - Control-plane HTTP crate with typed health, join, and peer-map routes backed by the join service.
+- `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -21,7 +22,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Long-running daemon binaries that serve the HTTP routers.
+- Long-running daemon binaries for signal, relay, STUN, and agent.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.

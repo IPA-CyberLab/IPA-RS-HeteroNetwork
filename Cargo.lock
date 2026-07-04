@@ -984,6 +984,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipars-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "ipars-control-plane",
+ "ipars-control-plane-http",
+ "ipars-store",
+ "ipars-types",
+ "ipnet",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ipars-relay"
 version = "0.1.0"
 dependencies = [

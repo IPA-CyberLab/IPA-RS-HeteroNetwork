@@ -14,8 +14,20 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
     command:
-      - status
+      - control-plane
+      - --listen
+      - 0.0.0.0:8443
+      - --cluster-id
+      - ipars-dev
+      - --issuer-node-id
+      - node-dev-issuer
+      - --issuer-key-id
+      - root
+      - --issuer-public-key
+      - CHANGE_ME_BASE64_ED25519_PUBLIC_KEY
     environment:
       IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
       IPARS_ROLE: control-plane

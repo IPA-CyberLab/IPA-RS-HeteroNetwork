@@ -8,4 +8,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iproute2 wireguard-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/ipars /usr/local/bin/ipars
+COPY --from=build /src/target/release/iparsd /usr/local/bin/iparsd
 ENTRYPOINT ["/usr/local/bin/ipars"]
