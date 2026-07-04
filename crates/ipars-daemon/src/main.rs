@@ -42,11 +42,20 @@ use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
     NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
 };
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::{logs::SdkLoggerProvider, trace::SdkTracerProvider, Resource};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, Layer};
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
 #[command(about = "IPA-RS-HeteroNetwork daemon processes")]
 struct Cli {
+    #[command(flatten)]
+    observability: ObservabilityArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,6 +67,59 @@ enum Command {
     Stun(StunArgs),
     Relay(RelayArgs),
     Agent(Box<AgentArgs>),
+}
+
+impl Command {
+    fn component(&self) -> &'static str {
+        match self {
+            Self::ControlPlane(_) => "control-plane",
+            Self::Signal(_) => "signal",
+            Self::Stun(_) => "stun",
+            Self::Relay(_) => "relay",
+            Self::Agent(_) => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone)]
+struct ObservabilityArgs {
+    #[arg(long, env = "IPARS_OTEL_ENABLED", default_value_t = false)]
+    otel_enabled: bool,
+    #[arg(long, env = "IPARS_OTEL_ENDPOINT")]
+    otel_endpoint: Option<String>,
+    #[arg(long, env = "IPARS_OTEL_SERVICE_NAME")]
+    otel_service_name: Option<String>,
+    #[arg(long, env = "IPARS_LOG_FILTER", default_value = "info")]
+    log_filter: String,
+}
+
+impl ObservabilityArgs {
+    fn otel_active(&self) -> bool {
+        self.otel_enabled || self.otel_endpoint.is_some()
+    }
+
+    fn service_name(&self, component: &str) -> String {
+        self.otel_service_name
+            .clone()
+            .unwrap_or_else(|| format!("iparsd-{component}"))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObservabilityGuard {
+    tracer_provider: Option<SdkTracerProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
+}
+
+impl Drop for ObservabilityGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.shutdown();
+        }
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown();
+        }
+    }
 }
 
 #[derive(Debug, Args, Clone)]
@@ -360,6 +422,93 @@ fn preflight_agent_runtime(args: &AgentArgs) -> anyhow::Result<()> {
     preflight_agent_runtime_with_path(args, path.as_deref())
 }
 
+fn init_observability(
+    args: &ObservabilityArgs,
+    component: &str,
+) -> anyhow::Result<ObservabilityGuard> {
+    let filter = EnvFilter::try_new(args.log_filter.as_str())
+        .with_context(|| format!("invalid tracing filter `{}`", args.log_filter))?;
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_names(true)
+        .with_filter(filter);
+
+    if !args.otel_active() {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .try_init()
+            .context("failed to initialize tracing subscriber")?;
+        return Ok(ObservabilityGuard::default());
+    }
+
+    let service_name = args.service_name(component);
+    let resource = Resource::builder()
+        .with_service_name(service_name)
+        .with_attribute(KeyValue::new("service.namespace", "ipars"))
+        .with_attribute(KeyValue::new("ipars.component", component.to_string()))
+        .build();
+
+    let span_exporter = build_span_exporter(args.otel_endpoint.as_deref())?;
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(span_exporter)
+        .build();
+    let tracer = tracer_provider.tracer("iparsd");
+    let traces_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(EnvFilter::try_new(args.log_filter.as_str())?);
+
+    let log_exporter = build_log_exporter(args.otel_endpoint.as_deref())?;
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(log_exporter)
+        .build();
+    let logs_layer = OpenTelemetryTracingBridge::new(&logger_provider)
+        .with_filter(EnvFilter::try_new(args.log_filter.as_str())?);
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(traces_layer)
+        .with(logs_layer)
+        .try_init()
+        .context("failed to initialize tracing subscriber")?;
+
+    Ok(ObservabilityGuard {
+        tracer_provider: Some(tracer_provider),
+        logger_provider: Some(logger_provider),
+    })
+}
+
+fn build_span_exporter(endpoint: Option<&str>) -> anyhow::Result<opentelemetry_otlp::SpanExporter> {
+    let builder = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary);
+    let builder = if let Some(endpoint) = endpoint {
+        builder.with_endpoint(otlp_http_signal_endpoint(endpoint, "traces"))
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .context("failed to build OTLP span exporter")
+}
+
+fn build_log_exporter(endpoint: Option<&str>) -> anyhow::Result<opentelemetry_otlp::LogExporter> {
+    let builder = opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary);
+    let builder = if let Some(endpoint) = endpoint {
+        builder.with_endpoint(otlp_http_signal_endpoint(endpoint, "logs"))
+    } else {
+        builder
+    };
+    builder.build().context("failed to build OTLP log exporter")
+}
+
+fn otlp_http_signal_endpoint(base_endpoint: &str, signal: &str) -> String {
+    format!("{}/v1/{signal}", base_endpoint.trim_end_matches('/'))
+}
+
 fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.wireguard_interface)?;
     if let Some(namespace) = args.linux_netns.as_deref() {
@@ -509,6 +658,13 @@ fn ensure_linux_netns_exists(namespace: &LinuxNetworkNamespace) -> anyhow::Resul
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let component = cli.command.component();
+    let _observability = init_observability(&cli.observability, component)?;
+    tracing::info!(
+        component,
+        otel_enabled = cli.observability.otel_active(),
+        "observability initialized"
+    );
     match cli.command {
         Command::ControlPlane(args) => run_control_plane(args).await,
         Command::Signal(args) => run_signal(args).await,
@@ -2291,6 +2447,70 @@ mod tests {
             max_crashes_per_window: 3,
             cooldown: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn observability_defaults_service_name_to_command_component() {
+        let args = ObservabilityArgs {
+            otel_enabled: false,
+            otel_endpoint: None,
+            otel_service_name: None,
+            log_filter: "info".to_string(),
+        };
+
+        assert!(!args.otel_active());
+        assert_eq!(args.service_name("relay"), "iparsd-relay");
+    }
+
+    #[test]
+    fn observability_endpoint_implies_otel_and_uses_signal_paths() {
+        let args = ObservabilityArgs {
+            otel_enabled: false,
+            otel_endpoint: Some("http://collector:4318/".to_string()),
+            otel_service_name: Some("custom-ipars".to_string()),
+            log_filter: "ipars=debug".to_string(),
+        };
+
+        assert!(args.otel_active());
+        assert_eq!(args.service_name("agent"), "custom-ipars");
+        assert_eq!(
+            otlp_http_signal_endpoint(args.otel_endpoint.as_deref().unwrap_or_default(), "traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            otlp_http_signal_endpoint(args.otel_endpoint.as_deref().unwrap_or_default(), "logs"),
+            "http://collector:4318/v1/logs"
+        );
+    }
+
+    #[test]
+    fn daemon_root_observability_args_parse_before_subcommand() {
+        let cli = Cli::parse_from([
+            "iparsd",
+            "--otel-enabled",
+            "--otel-endpoint",
+            "http://collector:4318",
+            "--otel-service-name",
+            "ipars-agent-prod",
+            "--log-filter",
+            "ipars=debug",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+        ]);
+
+        assert!(cli.observability.otel_active());
+        assert_eq!(
+            cli.observability.otel_endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
+        assert_eq!(
+            cli.observability.otel_service_name.as_deref(),
+            Some("ipars-agent-prod")
+        );
+        assert_eq!(cli.observability.log_filter, "ipars=debug");
+        assert_eq!(cli.command.component(), "agent");
     }
 
     async fn insert_dead_forwarder(

@@ -28,6 +28,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
 - relay-aware peer-map application and daemon-supervised per-peer forwarder endpoints with namespace placement checks, capacity limits, dead-task reaping, and restart backoff for active relay sessions
 - agent JSON and Prometheus metrics plus bounded structured path-change event export
+- `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log export to an OpenTelemetry collector
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - Kubernetes underlay Service/API route application from Helm-provided CIDRs through the Linux route backend
 - Docker container CIDR route application from explicit Compose/agent route intents through the Linux route backend
@@ -86,5 +87,7 @@ ipars k8s install
 ```
 
 `iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
+
+`iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces and logs through OTLP HTTP/protobuf; `--otel-service-name` overrides the default `iparsd-<component>` service name and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, and `IPARS_LOG_FILTER`.
 
 The next production milestone is to extend network-namespace integration tests from route-backend validation into direct, NAT traversal, and relay fallback path validation.
