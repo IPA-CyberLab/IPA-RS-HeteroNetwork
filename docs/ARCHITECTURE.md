@@ -108,6 +108,8 @@ Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an oute
 
 Relay candidates advertise both a public UDP relay endpoint and an HTTP admission URL. When signal negotiation selects `RELAY`, the agent admits a relay session directly with that relay and keeps the returned credential in transient runtime state rather than reporting it back through control-plane heartbeat.
 
+The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Inbound relay payloads remain opaque and are forwarded toward the local WireGuard endpoint.
+
 ## Docker Support
 
 Docker support targets:

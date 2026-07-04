@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 ipars-crypto = { path = "../ipars-crypto" }
+ipars-relay = { path = "../ipars-relay" }
 ipars-route-manager = { path = "../ipars-route-manager" }
 ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }

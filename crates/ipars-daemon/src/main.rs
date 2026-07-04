@@ -779,6 +779,8 @@ async fn admit_relay_session(
         peer: peer.node_id.clone(),
         relay_node: response.relay_node,
         relay_endpoint,
+        admitted_local_addr: response.left_addr,
+        admitted_peer_addr: response.right_addr,
         session_id: response.session_id,
         session_token: response.session_token,
         expires_at: response.expires_at,

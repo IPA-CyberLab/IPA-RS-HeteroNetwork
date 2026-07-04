@@ -967,6 +967,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ipars-crypto",
+ "ipars-relay",
  "ipars-route-manager",
  "ipars-stun",
  "ipars-types",
