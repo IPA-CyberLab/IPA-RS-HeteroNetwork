@@ -92,7 +92,7 @@ ipars docker install --project-name ipars --compose-file docker/compose.yaml
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
-`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`.
+`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover.
 
 Join tokens are single-use by default. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, relay permission with `--allow-relay`, and admission limits with `--max-uses` or `--unlimited-uses`.
 

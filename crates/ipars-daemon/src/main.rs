@@ -1389,6 +1389,12 @@ fn start_agent_otel_metrics_export(
     })
 }
 
+#[derive(Debug, Clone)]
+struct AgentRegistration {
+    control_plane_url: String,
+    response: RegisterNodeResponse,
+}
+
 async fn run_relay(
     args: RelayArgs,
     otel_metrics_enabled: bool,
@@ -1452,8 +1458,9 @@ async fn run_agent(
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
     let join_token = agent_join_token(&args)?;
+    let mut registered_control_plane_base = None;
     let registered_node = if let Some(token) = &join_token {
-        let response = register_agent(
+        let registration = register_agent(
             runtime.as_ref(),
             token,
             args.control_plane_url.as_deref(),
@@ -1461,6 +1468,8 @@ async fn run_agent(
         )
         .await
         .context("failed to register agent with control plane")?;
+        let response = registration.response;
+        registered_control_plane_base = Some(registration.control_plane_url);
         let registered_node = response.node.clone();
         tracing::info!(
             node_id = %response.node.node_id,
@@ -1473,8 +1482,11 @@ async fn run_agent(
     } else {
         None
     };
-    let control_plane_base =
-        control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref()).ok();
+    let control_plane_base = args
+        .control_plane_url
+        .clone()
+        .or(registered_control_plane_base)
+        .or_else(|| control_plane_base_url(join_token.as_ref(), None).ok());
     let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
     preflight_agent_runtime(&args)?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
@@ -3070,8 +3082,8 @@ async fn register_agent(
     token: &SignedJoinToken,
     control_plane_url: Option<&str>,
     relay_capability: Option<RelayCapability>,
-) -> anyhow::Result<RegisterNodeResponse> {
-    let join_url = control_plane_join_url(token, control_plane_url)?;
+) -> anyhow::Result<AgentRegistration> {
+    let control_plane_urls = control_plane_base_urls(Some(token), control_plane_url)?;
     let status = runtime.status().await;
     let request = JoinNodeRequest {
         token: token.clone(),
@@ -3085,17 +3097,39 @@ async fn register_agent(
         },
     };
 
-    reqwest::Client::new()
-        .post(join_url)
-        .json(&request)
-        .send()
-        .await
-        .context("failed to send agent join request")?
-        .error_for_status()
-        .context("control plane rejected agent join request")?
-        .json()
-        .await
-        .context("failed to decode agent join response")
+    let client = reqwest::Client::new();
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let join_url = control_plane_join_url_from_base(&control_plane_url);
+        let response = match client.post(&join_url).json(&request).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{join_url}: send failed: {error}"));
+                continue;
+            }
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{join_url}: rejected: {error}"));
+                continue;
+            }
+        };
+        match response.json().await {
+            Ok(response) => {
+                return Ok(AgentRegistration {
+                    control_plane_url,
+                    response,
+                });
+            }
+            Err(error) => failures.push(format!("{join_url}: decode failed: {error}")),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "all control-plane join endpoints failed: {}",
+        failures.join("; ")
+    ))
 }
 
 fn start_heartbeat_reporting(
@@ -3883,33 +3917,56 @@ fn signal_hole_punch_url(signal_url: &str, source: &NodeId, target: &NodeId) -> 
     )
 }
 
+#[cfg(test)]
 fn control_plane_join_url(
     token: &SignedJoinToken,
     override_url: Option<&str>,
 ) -> anyhow::Result<String> {
-    Ok(format!(
-        "{}/v1/join",
-        control_plane_base_url(Some(token), override_url)?
-    ))
+    Ok(control_plane_join_url_from_base(&control_plane_base_url(
+        Some(token),
+        override_url,
+    )?))
+}
+
+fn control_plane_join_url_from_base(base_url: &str) -> String {
+    format!("{}/v1/join", base_url.trim_end_matches('/'))
 }
 
 fn control_plane_base_url(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<String> {
-    let base_url = override_url.map(ToOwned::to_owned).or_else(|| {
-        token.and_then(|token| {
+    control_plane_base_urls(token, override_url)?
+        .into_iter()
+        .next()
+        .context("control-plane URL is required and no control-plane bootstrap exists")
+}
+
+fn control_plane_base_urls(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
+        token.map(|token| {
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
-                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
                 .map(|endpoint| endpoint.url.clone())
+                .collect::<Vec<_>>()
         })
     });
-    let base_url =
-        base_url.context("control-plane URL is required and no control-plane bootstrap exists")?;
-    Ok(base_url.trim_end_matches('/').to_string())
+    let base_urls =
+        base_urls.context("control-plane URL is required and no control-plane bootstrap exists")?;
+    let base_urls = base_urls
+        .into_iter()
+        .map(|base_url| base_url.trim_end_matches('/').to_string())
+        .collect::<Vec<_>>();
+    if base_urls.is_empty() {
+        anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
+    }
+    Ok(base_urls)
 }
 
 fn signal_base_url(
@@ -5572,6 +5629,33 @@ mod tests {
         assert_eq!(
             control_plane_join_url(&token, None)?,
             "https://203.0.113.10:8443/v1/join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_base_urls_include_all_token_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ]);
+
+        assert_eq!(
+            control_plane_base_urls(Some(&token), None)?,
+            vec![
+                "https://203.0.113.10:8443".to_string(),
+                "https://203.0.113.11:8443".to_string(),
+            ]
         );
         Ok(())
     }

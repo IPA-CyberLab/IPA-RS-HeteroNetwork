@@ -42,7 +42,7 @@ The control plane is designed for multiple public nodes. Durable state lives in 
 - Durable: node records, VPN IP leases, identity public keys, WireGuard public keys, policy, ACL, routes, relay policy, token revocation, and latest accepted path state.
 - Ephemeral: active signal sessions, transient endpoint candidates, probe windows, relay session counters, and short-lived health samples.
 
-Control-plane nodes use the same durable store and advertise themselves through the bootstrap endpoint list. Relay/STUN/signal instances are separately discoverable and can be added or drained without invalidating existing WireGuard peers.
+Control-plane nodes use the same durable store and advertise themselves through the bootstrap endpoint list. CLI and agent join registration try control-plane bootstrap endpoints in token order, so additional public control-plane nodes can take over initial registration when an earlier endpoint is unavailable. Relay/STUN/signal instances are separately discoverable and can be added or drained without invalidating existing WireGuard peers.
 
 ## VPN IP Allocation
 
