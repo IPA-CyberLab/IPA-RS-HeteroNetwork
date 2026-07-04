@@ -15,6 +15,8 @@ const NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces";
 const FIXED_PORT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_fixed_port_snat_network_namespaces";
+const ONE_SIDED_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -203,6 +205,31 @@ async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
     )
 }
 
+#[tokio::test]
+async fn udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping one-sided public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_one_sided_snat_hole_punch_topology(ONE_SIDED_NAT_TEST_NAME)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TwoSidedSnatTopology {
     private_second_octet: u8,
@@ -378,6 +405,138 @@ fn run_two_sided_snat_hole_punch_topology(
 
     assert_success("nat-left", left.wait_with_output()?)?;
     assert_success("nat-right", right.wait_with_output()?)?;
+
+    let _ = fs::remove_file(left_ready);
+    let _ = fs::remove_file(right_ready);
+    let _ = fs::remove_file(start_file);
+    Ok(())
+}
+
+fn run_one_sided_snat_hole_punch_topology(
+    test_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suffix = unique_suffix()?;
+    let left_namespace = format!("ipars-hp-left-{suffix}");
+    let left_nat_namespace = format!("ipars-hp-lnat-{suffix}");
+    let right_namespace = format!("ipars-hp-pub-{suffix}");
+    let _left_guard = NamespaceGuard::create(left_namespace.clone())?;
+    let _left_nat_guard = NamespaceGuard::create(left_nat_namespace.clone())?;
+    let _right_guard = NamespaceGuard::create(right_namespace.clone())?;
+
+    let left_if = format!("ihpol{suffix}");
+    let left_nat_private_if = format!("ihponp{suffix}");
+    let left_nat_public_if = format!("ihponu{suffix}");
+    let right_if = format!("ihpop{suffix}");
+    let _left_nat_veth = VethGuard::create(&left_if, &left_nat_private_if)?;
+    let _public_veth = VethGuard::create(&left_nat_public_if, &right_if)?;
+
+    move_link_to_namespace(&left_if, &left_namespace)?;
+    move_link_to_namespace(&left_nat_private_if, &left_nat_namespace)?;
+    move_link_to_namespace(&left_nat_public_if, &left_nat_namespace)?;
+    move_link_to_namespace(&right_if, &right_namespace)?;
+
+    let left_ip = "10.244.0.2";
+    let left_gateway = "10.244.0.1";
+    let left_public_ip = "198.18.2.1";
+    let right_public_ip = "198.18.2.2";
+    let left_bind_port = 40101;
+    let left_reflexive_port = 50101;
+    let right_bind_port = 40102;
+
+    configure_namespace_interface(&left_namespace, &left_if, &format!("{left_ip}/30"))?;
+    configure_namespace_interface(
+        &left_nat_namespace,
+        &left_nat_private_if,
+        &format!("{left_gateway}/30"),
+    )?;
+    configure_namespace_interface(
+        &left_nat_namespace,
+        &left_nat_public_if,
+        &format!("{left_public_ip}/30"),
+    )?;
+    configure_namespace_interface(
+        &right_namespace,
+        &right_if,
+        &format!("{right_public_ip}/30"),
+    )?;
+    command(
+        "ip",
+        [
+            "-n",
+            left_namespace.as_str(),
+            "route",
+            "replace",
+            "default",
+            "via",
+            left_gateway,
+        ],
+    )?;
+
+    enable_snat_namespace(
+        &left_nat_namespace,
+        &left_nat_public_if,
+        &format!("{left_ip}/32"),
+        left_public_ip,
+        Some(left_reflexive_port),
+    )?;
+
+    let left_ready = temp_file(format!("ipars-hp-onesnat-ready-left-{suffix}"));
+    let right_ready = temp_file(format!("ipars-hp-onesnat-ready-right-{suffix}"));
+    let start_file = temp_file(format!("ipars-hp-onesnat-start-{suffix}"));
+    let left_ready_str = left_ready.to_string_lossy().into_owned();
+    let right_ready_str = right_ready.to_string_lossy().into_owned();
+    let start_file_str = start_file.to_string_lossy().into_owned();
+    let left_bind = format!("{left_ip}:{left_bind_port}");
+    let right_bind = format!("{right_public_ip}:{right_bind_port}");
+    let source_reflexive = format!("{left_public_ip}:{left_reflexive_port}");
+    let target_reflexive = right_bind.clone();
+
+    let left = spawn_child(
+        test_name,
+        &left_namespace,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+            ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
+            (
+                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+                source_reflexive.as_str(),
+            ),
+            (
+                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+                target_reflexive.as_str(),
+            ),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+            ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
+            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ],
+    )?;
+    let right = spawn_child(
+        test_name,
+        &right_namespace,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+            ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
+            (
+                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+                source_reflexive.as_str(),
+            ),
+            (
+                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+                target_reflexive.as_str(),
+            ),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+            ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
+            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ],
+    )?;
+    wait_for_file(&left_ready)?;
+    wait_for_file(&right_ready)?;
+    fs::write(&start_file, b"start")?;
+
+    assert_success("one-sided-nat-left", left.wait_with_output()?)?;
+    assert_success("one-sided-nat-right", right.wait_with_output()?)?;
 
     let _ = fs::remove_file(left_ready);
     let _ = fs::remove_file(right_ready);
