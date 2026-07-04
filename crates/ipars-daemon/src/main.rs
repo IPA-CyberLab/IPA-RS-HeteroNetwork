@@ -1891,11 +1891,11 @@ async fn run_agent(
     } else {
         None
     };
-    let control_plane_base = args
-        .control_plane_url
-        .clone()
-        .or(registered_control_plane_base)
-        .or_else(|| control_plane_base_url(join_token.as_ref(), None).ok());
+    let control_plane_bases = agent_control_plane_base_urls(
+        join_token.as_ref(),
+        args.control_plane_url.as_deref(),
+        registered_control_plane_base.as_deref(),
+    )?;
     let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
     preflight_agent_runtime(&args)?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
@@ -1906,21 +1906,20 @@ async fn run_agent(
             otel_metrics_interval.max(Duration::from_secs(1)),
         ));
     }
-    if !args.disable_heartbeat {
-        if let Some(control_plane_url) = control_plane_base.clone() {
-            background_tasks.push(start_heartbeat_reporting(
-                runtime.clone(),
-                control_plane_url,
-                Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
-                relay_capability_reporter.clone(),
-            ));
-        }
+    if !args.disable_heartbeat && !control_plane_bases.is_empty() {
+        background_tasks.push(start_heartbeat_reporting(
+            runtime.clone(),
+            control_plane_bases.clone(),
+            Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
+            relay_capability_reporter.clone(),
+        ));
     }
     let peer_map_task = if args.apply_peer_map {
-        let control_plane_url = control_plane_base
-            .clone()
-            .context("control-plane URL is required when --apply-peer-map is set")?;
-        Some(start_peer_map_sync(&args, runtime.clone(), control_plane_url).await?)
+        anyhow::ensure!(
+            !control_plane_bases.is_empty(),
+            "control-plane URL is required when --apply-peer-map is set"
+        );
+        Some(start_peer_map_sync(&args, runtime.clone(), control_plane_bases.clone()).await?)
     } else {
         None
     };
@@ -1960,19 +1959,21 @@ async fn run_agent(
         }
     }
     if !args.disable_signal_paths {
-        if let (Some(control_plane_url), Some(signal_url)) = (control_plane_base, signal_base) {
+        if let Some(signal_url) = signal_base {
             let hole_puncher = UdpHolePuncher::new(args.hole_punch_bind)
                 .with_attempts(args.hole_punch_attempts)
                 .with_interval(Duration::from_millis(args.hole_punch_interval_millis));
-            background_tasks.push(start_signal_path_negotiation(
-                runtime.clone(),
-                control_plane_url,
-                signal_url,
-                hole_puncher,
-                relay_forwarder_supervisor.clone(),
-                Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
-                Duration::from_secs(args.signal_path_interval_seconds.max(1)),
-            ));
+            if !control_plane_bases.is_empty() {
+                background_tasks.push(start_signal_path_negotiation(
+                    runtime.clone(),
+                    control_plane_bases,
+                    signal_url,
+                    hole_puncher,
+                    relay_forwarder_supervisor.clone(),
+                    Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
+                    Duration::from_secs(args.signal_path_interval_seconds.max(1)),
+                ));
+            }
         }
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
@@ -1993,7 +1994,7 @@ async fn run_agent(
 async fn start_peer_map_sync(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
@@ -2007,7 +2008,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_runners(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
                         NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
                     )
@@ -2017,7 +2018,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_runners(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         SystemCommandRunner,
                         SystemRouteCommandRunner,
                     )
@@ -2031,7 +2032,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_command_wireguard_netlink_routes(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
                         Some(namespace),
                     )
@@ -2041,7 +2042,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_command_wireguard_netlink_routes(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         SystemCommandRunner,
                         None,
                     )
@@ -2055,7 +2056,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_kernel_wireguard(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         NamespacedLinuxRouteCommandRunner::new(
                             namespace.clone(),
                             SystemRouteCommandRunner,
@@ -2068,7 +2069,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_kernel_wireguard(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         SystemRouteCommandRunner,
                         None,
                     )
@@ -2082,7 +2083,7 @@ async fn start_peer_map_sync(
                     start_peer_map_sync_with_kernel_backends(
                         args,
                         runtime,
-                        control_plane_url,
+                        control_plane_urls,
                         namespace,
                     )
                     .await
@@ -2109,7 +2110,7 @@ async fn start_peer_map_sync(
             Ok(start_peer_map_sync_with_sink(
                 args,
                 runtime,
-                control_plane_url,
+                control_plane_urls,
                 applier,
             ))
         }
@@ -2881,7 +2882,7 @@ async fn run_kubernetes_underlay_route_loop<M>(
 async fn start_peer_map_sync_with_runners<W, R>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     wireguard_runner: W,
     route_runner: R,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>>
@@ -2904,7 +2905,7 @@ where
     Ok(start_peer_map_sync_with_sink(
         args,
         runtime,
-        control_plane_url,
+        control_plane_urls,
         applier,
     ))
 }
@@ -2912,7 +2913,7 @@ where
 async fn start_peer_map_sync_with_kernel_wireguard<R>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     route_runner: R,
     namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>>
@@ -2934,7 +2935,7 @@ where
     Ok(start_peer_map_sync_with_sink(
         args,
         runtime,
-        control_plane_url,
+        control_plane_urls,
         applier,
     ))
 }
@@ -2942,7 +2943,7 @@ where
 async fn start_peer_map_sync_with_command_wireguard_netlink_routes<W>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     wireguard_runner: W,
     namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>>
@@ -2964,7 +2965,7 @@ where
     Ok(start_peer_map_sync_with_sink(
         args,
         runtime,
-        control_plane_url,
+        control_plane_urls,
         applier,
     ))
 }
@@ -2972,7 +2973,7 @@ where
 async fn start_peer_map_sync_with_kernel_backends(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace.clone());
@@ -2990,7 +2991,7 @@ async fn start_peer_map_sync_with_kernel_backends(
     Ok(start_peer_map_sync_with_sink(
         args,
         runtime,
-        control_plane_url,
+        control_plane_urls,
         applier,
     ))
 }
@@ -3041,7 +3042,7 @@ where
 fn start_peer_map_sync_with_sink<A>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     sink: A,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -3049,7 +3050,7 @@ where
 {
     let sync = PeerMapSync::new(
         runtime.state().node_id.clone(),
-        HttpPeerMapSource::new(control_plane_url),
+        HttpPeerMapSource::new(control_plane_urls),
         sink,
     );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
@@ -3558,14 +3559,14 @@ async fn register_agent(
 
 fn start_heartbeat_reporting(
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_heartbeat_loop(
             runtime,
-            control_plane_url,
+            control_plane_urls,
             interval,
             relay_capability_reporter,
         )
@@ -3575,7 +3576,7 @@ fn start_heartbeat_reporting(
 
 async fn run_heartbeat_loop(
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
@@ -3584,7 +3585,7 @@ async fn run_heartbeat_loop(
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let request = heartbeat_request(runtime.as_ref(), relay_capability.clone()).await;
-        match send_heartbeat(&client, &control_plane_url, request).await {
+        match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
             Ok(response) => tracing::info!(
                 accepted = response.accepted,
                 policy_version = response.policy_version,
@@ -3598,6 +3599,28 @@ async fn run_heartbeat_loop(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn send_heartbeat_to_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    request: HeartbeatRequest,
+) -> anyhow::Result<HeartbeatResponse> {
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "control-plane URL is required for heartbeat reporting"
+    );
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        match send_heartbeat(client, control_plane_url, request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error) => failures.push(format!("{}: {error:#}", heartbeat_url(control_plane_url))),
+        }
+    }
+    anyhow::bail!(
+        "all control-plane heartbeat endpoints failed: {}",
+        failures.join("; ")
+    )
 }
 
 async fn send_heartbeat(
@@ -3712,7 +3735,7 @@ async fn signal_node_upsert_request(
 
 fn start_signal_path_negotiation(
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
     relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
@@ -3722,7 +3745,7 @@ fn start_signal_path_negotiation(
     tokio::spawn(async move {
         run_signal_path_negotiation_loop(
             runtime,
-            control_plane_url,
+            control_plane_urls,
             signal_url,
             hole_puncher,
             relay_forwarder_supervisor,
@@ -3735,7 +3758,7 @@ fn start_signal_path_negotiation(
 
 async fn run_signal_path_negotiation_loop(
     runtime: Arc<AgentRuntime>,
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
     relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
@@ -3747,7 +3770,7 @@ async fn run_signal_path_negotiation_loop(
         if let Err(error) = negotiate_signal_paths(
             &client,
             runtime.as_ref(),
-            &control_plane_url,
+            &control_plane_urls,
             &signal_url,
             &hole_puncher,
             relay_forwarder_supervisor.as_ref(),
@@ -3764,23 +3787,16 @@ async fn run_signal_path_negotiation_loop(
 async fn negotiate_signal_paths(
     client: &reqwest::Client,
     runtime: &AgentRuntime,
-    control_plane_url: &str,
+    control_plane_urls: &[String],
     signal_url: &str,
     hole_puncher: &UdpHolePuncher,
     relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
-    let peer_map = client
-        .get(peer_map_url(control_plane_url, &status.node_id))
-        .send()
+    let peer_map = fetch_peer_map_from_control_planes(client, control_plane_urls, &status.node_id)
         .await
-        .context("failed to fetch peer map for signal negotiation")?
-        .error_for_status()
-        .context("control plane rejected peer-map request for signal negotiation")?
-        .json::<PeerMap>()
-        .await
-        .context("failed to decode peer map for signal negotiation")?;
+        .context("failed to fetch peer map for signal negotiation")?;
 
     let peer_set = signal_negotiation_peer_set(runtime, peer_map).await;
     for peer in peer_set.skipped {
@@ -4434,14 +4450,14 @@ fn parse_conntrack_line_destination_ips(line: &str) -> BTreeSet<IpAddr> {
 
 #[derive(Debug, Clone)]
 struct HttpPeerMapSource {
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     client: reqwest::Client,
 }
 
 impl HttpPeerMapSource {
-    fn new(control_plane_url: String) -> Self {
+    fn new(control_plane_urls: Vec<String>) -> Self {
         Self {
-            control_plane_url,
+            control_plane_urls,
             client: reqwest::Client::new(),
         }
     }
@@ -4450,18 +4466,47 @@ impl HttpPeerMapSource {
 #[async_trait]
 impl PeerMapSource for HttpPeerMapSource {
     async fn fetch_peer_map(&self, node_id: &NodeId) -> Result<PeerMap, AgentError> {
-        let url = peer_map_url(&self.control_plane_url, node_id);
-        self.client
-            .get(url)
-            .send()
+        fetch_peer_map_from_control_planes(&self.client, &self.control_plane_urls, node_id)
             .await
-            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))
+            .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))
     }
+}
+
+async fn fetch_peer_map_from_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    node_id: &NodeId,
+) -> anyhow::Result<PeerMap> {
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "control-plane URL is required for peer-map fetch"
+    );
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let url = peer_map_url(control_plane_url, node_id);
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: send failed: {error}"));
+                continue;
+            }
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: rejected: {error}"));
+                continue;
+            }
+        };
+        match response.json::<PeerMap>().await {
+            Ok(peer_map) => return Ok(peer_map),
+            Err(error) => failures.push(format!("{url}: decode failed: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "all control-plane peer-map endpoints failed: {}",
+        failures.join("; ")
+    )
 }
 
 fn peer_map_url(control_plane_url: &str, node_id: &NodeId) -> String {
@@ -4517,6 +4562,7 @@ fn control_plane_join_url_from_base(base_url: &str) -> String {
     format!("{}/v1/join", base_url.trim_end_matches('/'))
 }
 
+#[cfg(test)]
 fn control_plane_base_url(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
@@ -4525,6 +4571,25 @@ fn control_plane_base_url(
         .into_iter()
         .next()
         .context("control-plane URL is required and no control-plane bootstrap exists")
+}
+
+fn agent_control_plane_base_urls(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+    registered_url: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    if override_url.is_some() {
+        return control_plane_base_urls(token, override_url);
+    }
+
+    let mut base_urls = Vec::new();
+    if let Some(registered_url) = registered_url {
+        base_urls.push(normalize_base_url(registered_url));
+    }
+    if let Some(token) = token {
+        base_urls.extend(control_plane_base_urls(Some(token), None)?);
+    }
+    Ok(dedupe_urls_preserve_order(base_urls))
 }
 
 fn control_plane_base_urls(
@@ -4544,14 +4609,30 @@ fn control_plane_base_urls(
     });
     let base_urls =
         base_urls.context("control-plane URL is required and no control-plane bootstrap exists")?;
-    let base_urls = base_urls
-        .into_iter()
-        .map(|base_url| base_url.trim_end_matches('/').to_string())
-        .collect::<Vec<_>>();
+    let base_urls = dedupe_urls_preserve_order(
+        base_urls
+            .into_iter()
+            .map(|base_url| normalize_base_url(&base_url)),
+    );
     if base_urls.is_empty() {
         anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
     }
     Ok(base_urls)
+}
+
+fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim_end_matches('/').to_string()
+}
+
+fn dedupe_urls_preserve_order(base_urls: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for base_url in base_urls {
+        if seen.insert(base_url.clone()) {
+            deduped.push(base_url);
+        }
+    }
+    deduped
 }
 
 fn signal_base_url(
@@ -6566,6 +6647,56 @@ invalid no-destination-here
         assert_eq!(
             control_plane_base_url(Some(&token), Some("http://127.0.0.1:8443/"))?,
             "http://127.0.0.1:8443"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_control_plane_base_urls_prefer_registration_and_dedupe() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ]);
+
+        assert_eq!(
+            agent_control_plane_base_urls(Some(&token), None, Some("https://203.0.113.11:8443/"))?,
+            vec![
+                "https://203.0.113.11:8443".to_string(),
+                "https://203.0.113.10:8443".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_control_plane_base_urls_override_takes_precedence() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+
+        assert_eq!(
+            agent_control_plane_base_urls(
+                Some(&token),
+                Some("http://127.0.0.1:8443/"),
+                Some("https://203.0.113.10:8443")
+            )?,
+            vec!["http://127.0.0.1:8443".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_control_plane_base_urls_can_be_empty_without_source() -> anyhow::Result<()> {
+        assert_eq!(
+            agent_control_plane_base_urls(None, None, None)?,
+            Vec::<String>::new()
         );
         Ok(())
     }

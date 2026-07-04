@@ -18,12 +18,12 @@ The repository is being built toward a complete system rather than an MVP. The c
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
-- `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
+- `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoints with ordered failover
 - persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`
-- `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
-- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying on control-plane errors
+- `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery with ordered failover
+- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying across known control-plane endpoints
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates when a signal endpoint is known
-- `iparsd agent` signal path negotiation loop that records pair-scoped path state and reports it in heartbeat payloads
+- `iparsd agent` signal path negotiation loop that fetches peer maps across known control-plane endpoints, records pair-scoped path state, and reports it in heartbeat payloads
 - `iparsd agent` relay admission for signal-selected relay paths, storing expiring relay credentials only in transient agent runtime state
 - relay session renewal window handling and stale relay credential removal when paths return to direct/non-relay states
 - agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
@@ -94,7 +94,7 @@ ipars docker install --project-name ipars --compose-file docker/compose.yaml
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
-`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover.
+`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover. After agent registration, heartbeat reporting, peer-map polling, and signal path peer-map fetches keep an ordered control-plane endpoint list, prioritizing the registered endpoint and falling back to token bootstraps unless `--control-plane-url` is explicitly set.
 
 Join tokens are single-use by default. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, relay permission with `--allow-relay`, and admission limits with `--max-uses` or `--unlimited-uses`.
 
