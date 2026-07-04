@@ -17,6 +17,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
+- control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
@@ -100,6 +101,8 @@ Join tokens are single-use by default. `ipars init` and `ipars token create` can
 For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`.
 
 Control-plane ACLs can be loaded with repeated `iparsd control-plane --acl-rule '<json>'` values, or semicolon-separated JSON objects in `IPARS_ACL_RULES`. Each object uses the typed `AclRule` shape with `id`, `from_roles`, `from_tags`, `to_roles`, `to_tags`, `routes`, `protocol`, and `action`; an empty ACL list keeps default allow-all peer visibility, while configured deny rules take precedence over allow rules.
+
+Relay candidates also require a fresh healthy heartbeat. `iparsd control-plane --relay-health-ttl-seconds` or `IPARS_RELAY_HEALTH_TTL_SECONDS` controls how long a healthy relay heartbeat remains eligible for relay maps and relay-candidate metrics.
 
 Operators can inspect the active control-plane cluster policy, VPN pool, and loaded ACL rules with `GET /v1/policy` on the control-plane HTTP service.
 

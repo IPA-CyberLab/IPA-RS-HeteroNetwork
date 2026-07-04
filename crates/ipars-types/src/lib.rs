@@ -618,6 +618,8 @@ pub struct ClusterPolicy {
     pub allow_nat_traversal: bool,
     pub allow_relay_fallback: bool,
     pub idle_timeout_seconds: u64,
+    #[serde(default = "default_relay_health_ttl_seconds")]
+    pub relay_health_ttl_seconds: u64,
     pub pinned_roles: BTreeSet<Role>,
     pub pinned_tags: BTreeSet<Tag>,
     #[serde(default)]
@@ -633,11 +635,16 @@ impl Default for ClusterPolicy {
             allow_nat_traversal: true,
             allow_relay_fallback: true,
             idle_timeout_seconds: 300,
+            relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             pinned_roles,
             pinned_tags: BTreeSet::new(),
             acl_rules: Vec::new(),
         }
     }
+}
+
+fn default_relay_health_ttl_seconds() -> u64 {
+    90
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

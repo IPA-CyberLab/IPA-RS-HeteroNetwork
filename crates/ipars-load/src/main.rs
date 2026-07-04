@@ -19,14 +19,15 @@ use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
-    AgentStatusResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentStatusResponse, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
-    EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathState,
-    RelayCapability, Role, Route, Tag, TokenPolicy,
+    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
+    NodeId, NodeRecord, PathState, RelayCapability, Role, Route, Tag, TokenPolicy,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::net::UdpSocket;
@@ -302,7 +303,6 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
 
     let registration_started = Instant::now();
     let mut nodes = Vec::with_capacity(scenario.node_count);
-    let mut relay_candidates = 0;
     for index in 0..scenario.node_count {
         let token = issuer.sign_join_token(join_claims(
             &cluster_id,
@@ -322,7 +322,16 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         )
         .await
         .with_context(|| format!("failed to join synthetic node {index} over HTTP"))?;
-        relay_candidates = response.relay_map.relays.len();
+        if index < scenario.relay_count {
+            let _: HeartbeatResponse = post_json(
+                &client,
+                format!("{}/v1/heartbeat", services.control_plane_url),
+                &heartbeat_request(&response.node),
+                "control-plane heartbeat",
+            )
+            .await
+            .with_context(|| format!("failed to heartbeat synthetic relay {index} over HTTP"))?;
+        }
         let upsert_url = format!("{}/v1/nodes/{}", services.signal_url, response.node.node_id);
         let _: SignalNodeUpsertResponse = put_json(
             &client,
@@ -337,6 +346,13 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         .with_context(|| format!("failed to upsert synthetic node {index} to signal over HTTP"))?;
         nodes.push(response.node);
     }
+    let metrics: ControlPlaneMetricsResponse = get_json(
+        &client,
+        format!("{}/v1/metrics", services.control_plane_url),
+        "control-plane metrics",
+    )
+    .await?;
+    let relay_candidates = metrics.relay_candidate_count;
     let registration_millis = registration_started.elapsed().as_millis();
 
     let peer_map_started = Instant::now();
@@ -394,7 +410,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: nodes.len() * 2,
+        control_plane_http_requests: nodes.len() * 2 + scenario.relay_count + 1,
         signal_http_requests: nodes.len() + scenario.active_pair_count,
         relay_http_requests: 0,
         relay_udp_sessions: 0,
@@ -1214,6 +1230,22 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
     })
 }
 
+fn heartbeat_request(node: &NodeRecord) -> HeartbeatRequest {
+    HeartbeatRequest {
+        node_id: node.node_id.clone(),
+        health: NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: Some(1.0),
+            relay_load: Some(0.10),
+            message: None,
+        },
+        candidates: node.endpoint_candidates.clone(),
+        relay_capability: None,
+        path_state: Vec::new(),
+    }
+}
+
 fn join_claims(
     cluster_id: &ClusterId,
     issuer: &NodeId,
@@ -1372,7 +1404,7 @@ mod tests {
         assert_eq!(report.advertised_routes, 1);
         assert_eq!(report.peer_map_edges_seen, 6);
         assert_eq!(report.signal_negotiations, 6);
-        assert_eq!(report.control_plane_http_requests, 6);
+        assert_eq!(report.control_plane_http_requests, 8);
         assert_eq!(report.signal_http_requests, 9);
         Ok(())
     }

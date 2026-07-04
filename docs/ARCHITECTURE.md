@@ -105,7 +105,7 @@ Agents include their latest NAT classification when registering with signal and 
 
 ## Relay Design
 
-Public nodes are relay candidates only when policy, health, and capacity permit it. Relay admission checks include:
+Public nodes are relay candidates only when policy, health, and capacity permit it. The control plane includes a node in relay maps and relay-candidate metrics only after it has a healthy heartbeat newer than `relay_health_ttl_seconds` in the active cluster policy; `iparsd control-plane --relay-health-ttl-seconds` controls that freshness window. Relay admission checks include:
 
 - explicit relay permission in policy
 - public UDP endpoint availability

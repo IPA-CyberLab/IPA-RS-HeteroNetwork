@@ -183,6 +183,8 @@ struct ControlPlaneArgs {
     cluster_id: String,
     #[arg(long, env = "IPARS_VPN_POOL", default_value = "100.64.0.0/10")]
     vpn_pool: ipnet::Ipv4Net,
+    #[arg(long, env = "IPARS_RELAY_HEALTH_TTL_SECONDS", default_value_t = 90)]
+    relay_health_ttl_seconds: u64,
     #[arg(long, env = "IPARS_DATABASE_URL")]
     database_url: Option<String>,
     #[arg(long, env = "IPARS_ISSUER_NODE_ID")]
@@ -940,6 +942,7 @@ where
 {
     let mut config =
         ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
+    config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
     let mut key_ring = IssuerKeyRing::default();
@@ -4333,6 +4336,8 @@ mod tests {
             "root",
             "--issuer-public-key",
             "pub-a",
+            "--relay-health-ttl-seconds",
+            "45",
             "--acl-rule",
             r#"{"id":"edge-to-db","from_roles":["edge"],"from_tags":["app"],"to_roles":["database"],"to_tags":["db"],"routes":["10.42.0.0/16"],"protocol":"any","action":"allow"}"#,
         ])?;
@@ -4340,6 +4345,7 @@ mod tests {
         let Command::ControlPlane(args) = cli.command else {
             anyhow::bail!("expected control-plane command");
         };
+        assert_eq!(args.relay_health_ttl_seconds, 45);
         assert_eq!(args.acl_rules.len(), 1);
         let rule = &args.acl_rules[0];
         assert_eq!(rule.id, "edge-to-db");

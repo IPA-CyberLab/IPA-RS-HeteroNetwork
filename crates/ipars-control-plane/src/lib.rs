@@ -469,8 +469,9 @@ where
 
         self.store.insert_node(node.clone()).await?;
         let peers = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&peers).await?;
         let peer_map = self.filtered_peer_map_for_node(&node, &peers, now);
-        let relay_map = self.filtered_relay_map_for_node(&node, &peers, now);
+        let relay_map = self.filtered_relay_map_for_node(&node, &peers, &health_by_node, now);
 
         Ok(RegisterNodeResponse {
             node,
@@ -533,22 +534,26 @@ where
 
     pub async fn metrics(&self) -> Result<ControlPlaneMetricsResponse, ControlPlaneError> {
         let nodes = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&nodes).await?;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
+        let now = Utc::now();
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {
-                node.relay_capability
-                    .as_ref()
-                    .map(|capability| capability.can_admit())
-                    .unwrap_or(false)
+                relay_candidate_allowed(
+                    node,
+                    health_by_node.get(&node.node_id),
+                    now,
+                    &self.config.cluster_policy,
+                )
             })
             .count();
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
         for node in &nodes {
-            if let Some(health) = self.store.get_health(&node.node_id).await? {
+            if let Some(health) = health_by_node.get(&node.node_id) {
                 match health.state {
                     HealthState::Healthy => healthy_node_count += 1,
                     HealthState::Degraded => degraded_node_count += 1,
@@ -581,6 +586,19 @@ where
         })
     }
 
+    async fn health_by_node(
+        &self,
+        nodes: &[NodeRecord],
+    ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let mut health_by_node = BTreeMap::new();
+        for node in nodes {
+            if let Some(health) = self.store.get_health(&node.node_id).await? {
+                health_by_node.insert(node.node_id.clone(), health);
+            }
+        }
+        Ok(health_by_node)
+    }
+
     fn filtered_peer_map_for_node(
         &self,
         source: &NodeRecord,
@@ -602,6 +620,7 @@ where
         &self,
         source: &NodeRecord,
         peers: &[NodeRecord],
+        health_by_node: &BTreeMap<NodeId, NodeHealth>,
         generated_at: chrono::DateTime<Utc>,
     ) -> RelayMap {
         RelayMap {
@@ -609,10 +628,12 @@ where
             relays: peers
                 .iter()
                 .filter(|peer| {
-                    peer.relay_capability
-                        .as_ref()
-                        .map(|capability| capability.can_admit())
-                        .unwrap_or(false)
+                    relay_candidate_allowed(
+                        peer,
+                        health_by_node.get(&peer.node_id),
+                        generated_at,
+                        &self.config.cluster_policy,
+                    )
                 })
                 .filter_map(|peer| {
                     if peer.node_id == source.node_id {
@@ -624,6 +645,35 @@ where
                 .collect(),
             generated_at,
         }
+    }
+}
+
+fn relay_candidate_allowed(
+    node: &NodeRecord,
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> bool {
+    node.relay_capability
+        .as_ref()
+        .is_some_and(|capability| capability.can_admit())
+        && relay_health_allows(health, now, policy.relay_health_ttl_seconds)
+}
+
+fn relay_health_allows(
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    let Some(health) = health else {
+        return false;
+    };
+    if health.state != HealthState::Healthy {
+        return false;
+    }
+    match now.signed_duration_since(health.last_seen_at).to_std() {
+        Ok(age) => age <= std::time::Duration::from_secs(ttl_seconds),
+        Err(_) => true,
     }
 }
 
@@ -982,7 +1032,90 @@ mod tests {
                 .map(|capability| capability.enabled_by_policy),
             Some(true)
         );
-        assert_eq!(response.relay_map.relays.len(), 1);
+        assert!(
+            response.relay_map.relays.is_empty(),
+            "relay candidates require a fresh healthy heartbeat"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_map_and_metrics_require_fresh_healthy_relay(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+
+        let relay_registration = plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        assert!(relay_registration.relay_map.relays.is_empty());
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
+
+        plane
+            .heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("relay-a"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.10),
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                path_state: Vec::new(),
+            })
+            .await?;
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
+
+        let source_registration = plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        assert_eq!(source_registration.relay_map.relays.len(), 1);
+        assert_eq!(
+            source_registration.relay_map.relays[0].node_id,
+            NodeId::from_string("relay-a")
+        );
+
+        store
+            .upsert_health(
+                NodeId::from_string("relay-a"),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now() - Duration::seconds(120),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.10),
+                    message: None,
+                },
+            )
+            .await?;
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
+
+        store
+            .upsert_health(
+                NodeId::from_string("relay-a"),
+                NodeHealth {
+                    state: HealthState::Unhealthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: Some("overloaded".to_string()),
+                },
+            )
+            .await?;
+        let late_registration = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
+            .await?;
+        assert!(late_registration.relay_map.relays.is_empty());
         Ok(())
     }
 
