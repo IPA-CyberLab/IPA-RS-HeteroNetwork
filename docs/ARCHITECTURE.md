@@ -33,6 +33,8 @@ The node ID is derived from the identity verifying key. WireGuard keys can rotat
 - issuer node ID and key ID
 - Ed25519 signature over typed claims
 
+Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, and `ipars token create` can later sign additional join tokens with that same key.
+
 ## Control Plane HA
 
 The control plane is designed for multiple public nodes. Durable state lives in PostgreSQL in production and SQLite in tests/dev. Ephemeral session state is separated from durable cluster state:

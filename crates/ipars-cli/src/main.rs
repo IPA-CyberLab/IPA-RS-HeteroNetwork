@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
@@ -57,6 +59,14 @@ enum Command {
 struct InitArgs {
     #[arg(long)]
     public_endpoint: SocketAddr,
+    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    issuer_key_id: String,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    issuer_private_key_b64: Option<String>,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    issuer_private_key_path: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    emit_issuer_private_key: bool,
     #[arg(long, default_value_t = 86_400)]
     token_ttl_seconds: i64,
     #[arg(long, default_value = "edge")]
@@ -106,6 +116,12 @@ enum TokenCommand {
 struct TokenCreateArgs {
     #[arg(long)]
     cluster_id: Option<String>,
+    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    issuer_key_id: String,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    issuer_private_key_b64: Option<String>,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    issuer_private_key_path: Option<PathBuf>,
     #[arg(long, default_value = "edge")]
     role: String,
     #[arg(long = "tag")]
@@ -211,13 +227,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
-    let identity = IdentityKeyPair::generate();
+    let identity = issuer_key_from_source(
+        args.issuer_private_key_b64.as_deref(),
+        args.issuer_private_key_path.as_deref(),
+        MissingIssuerPath::GenerateAndWrite,
+    )?;
     let wireguard = WireGuardKeyPair::generate();
     let cluster_id = ClusterId::new();
     let bootstrap_endpoints = bootstrap_from_public_endpoint(args.public_endpoint);
+    let issuer = TokenIssuer {
+        node_id: identity.node_id(),
+        key_id: KeyId::from_string(args.issuer_key_id.clone()),
+    };
     let claims = claims(
         cluster_id.clone(),
-        identity.node_id(),
+        issuer.clone(),
         args.default_role,
         args.tags,
         args.token_ttl_seconds,
@@ -229,6 +253,13 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     Ok(InitOutput {
         cluster_id,
         node_id: identity.node_id(),
+        issuer_node_id: identity.node_id(),
+        issuer_key_id: KeyId::from_string(args.issuer_key_id),
+        issuer_public_key: identity.public_key_b64(),
+        issuer_private_key_b64: args
+            .emit_issuer_private_key
+            .then(|| identity.signing_key_b64()),
+        issuer_private_key_path: args.issuer_private_key_path,
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard.public_key_b64,
         bootstrap_endpoints,
@@ -293,7 +324,11 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
 }
 
 fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
-    let issuer = IdentityKeyPair::generate();
+    let issuer = issuer_key_from_source(
+        args.issuer_private_key_b64.as_deref(),
+        args.issuer_private_key_path.as_deref(),
+        MissingIssuerPath::GenerateEphemeral,
+    )?;
     let cluster_id = args
         .cluster_id
         .map(ClusterId::from_string)
@@ -308,7 +343,10 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         .collect();
     let token = issuer.sign_join_token(claims(
         cluster_id,
-        issuer.node_id(),
+        TokenIssuer {
+            node_id: issuer.node_id(),
+            key_id: KeyId::from_string(args.issuer_key_id),
+        },
         args.role,
         args.tags,
         args.ttl_seconds,
@@ -316,6 +354,85 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.allow_relay,
     ))?;
     Ok(token)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingIssuerPath {
+    GenerateEphemeral,
+    GenerateAndWrite,
+}
+
+fn issuer_key_from_source(
+    private_key_b64: Option<&str>,
+    private_key_path: Option<&Path>,
+    missing_path: MissingIssuerPath,
+) -> anyhow::Result<IdentityKeyPair> {
+    if private_key_b64.is_some() && private_key_path.is_some() {
+        anyhow::bail!("use only one of --issuer-private-key-b64 or --issuer-private-key-path");
+    }
+    if let Some(private_key_b64) = private_key_b64 {
+        return IdentityKeyPair::from_signing_key_b64(private_key_b64.trim())
+            .context("failed to load issuer private key from --issuer-private-key-b64");
+    }
+    if let Some(path) = private_key_path {
+        return issuer_key_from_path(path, missing_path);
+    }
+    Ok(IdentityKeyPair::generate())
+}
+
+fn issuer_key_from_path(
+    path: &Path,
+    missing_path: MissingIssuerPath,
+) -> anyhow::Result<IdentityKeyPair> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => IdentityKeyPair::from_signing_key_b64(value.trim())
+            .with_context(|| format!("failed to load issuer private key from {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match missing_path {
+            MissingIssuerPath::GenerateEphemeral => Err(error).with_context(|| {
+                format!("issuer private key path {} does not exist", path.display())
+            }),
+            MissingIssuerPath::GenerateAndWrite => {
+                let key = IdentityKeyPair::generate();
+                write_issuer_private_key(path, &key)?;
+                Ok(key)
+            }
+        },
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read issuer private key from {}", path.display())),
+    }
+}
+
+fn write_issuer_private_key(path: &Path, key: &IdentityKeyPair) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create issuer private key directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create issuer private key {}", path.display()))?;
+    file.write_all(key.signing_key_b64().as_bytes())
+        .with_context(|| format!("failed to write issuer private key {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to finish issuer private key {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to restrict issuer private key permissions for {}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenResponse> {
@@ -419,9 +536,15 @@ fn routes_output(node_id: NodeId, peer_map: PeerMap) -> RoutesOutput {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TokenIssuer {
+    node_id: NodeId,
+    key_id: KeyId,
+}
+
 fn claims(
     cluster_id: ClusterId,
-    issuer: NodeId,
+    issuer: TokenIssuer,
     role: String,
     tags: Vec<String>,
     ttl_seconds: i64,
@@ -446,8 +569,8 @@ fn claims(
         not_before: now - Duration::seconds(5),
         role: Role::from_string(role),
         tags: tag_set,
-        issuer,
-        key_id: KeyId::from_string("ephemeral-cli"),
+        issuer: issuer.node_id,
+        key_id: issuer.key_id,
         policy,
         nonce: format!("nonce-{}", now.timestamp_nanos_opt().unwrap_or_default()),
     }
@@ -514,6 +637,11 @@ fn print_manifest_hint(path: &str) -> anyhow::Result<()> {
 struct InitOutput {
     cluster_id: ClusterId,
     node_id: NodeId,
+    issuer_node_id: NodeId,
+    issuer_key_id: KeyId,
+    issuer_public_key: String,
+    issuer_private_key_b64: Option<String>,
+    issuer_private_key_path: Option<PathBuf>,
     identity_public_key: String,
     wireguard_public_key: String,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
@@ -600,13 +728,18 @@ impl StaticStatus<'static> {
 
 #[cfg(test)]
 mod tests {
+    use ipars_crypto::verify_join_token;
+
     use super::*;
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
         SignedJoinToken {
             claims: claims(
                 ClusterId::from_string("cluster-a"),
-                NodeId::from_string("issuer"),
+                TokenIssuer {
+                    node_id: NodeId::from_string("issuer"),
+                    key_id: KeyId::from_string("root"),
+                },
                 "edge".to_string(),
                 Vec::new(),
                 300,
@@ -662,6 +795,63 @@ mod tests {
             control_plane_token_revoke_url("http://127.0.0.1:8443/"),
             "http://127.0.0.1:8443/v1/tokens/revoke"
         );
+    }
+
+    #[test]
+    fn token_create_uses_supplied_issuer_key_and_key_id() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let token = create_token(TokenCreateArgs {
+            cluster_id: Some("cluster-a".to_string()),
+            issuer_key_id: "join-2026q3".to_string(),
+            issuer_private_key_b64: Some(issuer.signing_key_b64()),
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: vec!["edge".to_string()],
+            ttl_seconds: 300,
+            bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+            allow_relay: true,
+        })?;
+
+        assert_eq!(token.claims.issuer, issuer.node_id());
+        assert_eq!(token.claims.key_id, KeyId::from_string("join-2026q3"));
+        assert!(token.claims.policy.allow_relay);
+        verify_join_token(
+            &token,
+            &issuer.public_key_b64(),
+            Utc::now(),
+            &ClusterId::from_string("cluster-a"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn init_can_persist_generated_issuer_key() -> anyhow::Result<()> {
+        let key_path = temp_path("issuer.key");
+        let output = init(InitArgs {
+            public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: Some(key_path.clone()),
+            emit_issuer_private_key: false,
+            token_ttl_seconds: 300,
+            default_role: "edge".to_string(),
+            tags: Vec::new(),
+        })?;
+
+        assert_eq!(output.issuer_private_key_path, Some(key_path.clone()));
+        assert!(output.issuer_private_key_b64.is_none());
+        let restored =
+            IdentityKeyPair::from_signing_key_b64(std::fs::read_to_string(&key_path)?.trim())?;
+        assert_eq!(output.issuer_node_id, restored.node_id());
+        assert_eq!(output.issuer_public_key, restored.public_key_b64());
+        verify_join_token(
+            &output.join_token,
+            &output.issuer_public_key,
+            Utc::now(),
+            &output.cluster_id,
+        )?;
+        let _ = std::fs::remove_file(key_path);
+        Ok(())
     }
 
     #[test]
@@ -797,5 +987,13 @@ mod tests {
         assert_eq!(output.routes[0].peer, peer);
         assert_eq!(output.routes[0].route, route);
         Ok(())
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ipars-cli-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
     }
 }
