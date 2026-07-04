@@ -121,6 +121,7 @@ impl FileAgentStateStore {
 pub struct AgentRuntime {
     state: AgentNodeState,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
+    path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
 }
 
@@ -129,6 +130,7 @@ impl AgentRuntime {
         Self {
             state,
             candidates: tokio::sync::RwLock::new(Vec::new()),
+            path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
         }
     }
@@ -159,6 +161,17 @@ impl AgentRuntime {
             .await?;
         self.candidates.write().await.push(candidate.clone());
         Ok(candidate)
+    }
+
+    pub async fn path_state(&self) -> Vec<PathRecord> {
+        self.path_state.read().await.values().cloned().collect()
+    }
+
+    pub async fn upsert_path_state(&self, record: PathRecord) {
+        self.path_state.write().await.insert(
+            (record.key.local.clone(), record.key.remote.clone()),
+            record,
+        );
     }
 
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -831,6 +844,21 @@ mod tests {
     fn score_helper_keeps_metrics_type_in_scope() {
         let score = PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0);
         assert!(score.value > 0.0);
+    }
+
+    #[tokio::test]
+    async fn runtime_stores_latest_path_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let first = path("peer-a", PathState::Relay, 70.0);
+        let latest = path("peer-a", PathState::DirectPublic, 115.0);
+
+        runtime.upsert_path_state(first).await;
+        runtime.upsert_path_state(latest.clone()).await;
+
+        assert_eq!(runtime.path_state().await, vec![latest]);
     }
 
     #[tokio::test]

@@ -21,8 +21,9 @@ This file tracks the gap between the requested final system and the current repo
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
 - `iparsd agent --join-token` startup registration that uses persisted agent identity/WireGuard keys, current candidates, and token bootstrap control-plane discovery.
-- `iparsd agent` heartbeat reporting that posts current node health, candidates, and path-state placeholder data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.
+- `iparsd agent` heartbeat reporting that posts current node health, candidates, and negotiated path-state data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.
 - `iparsd agent` signal-service node registration that upserts the registered `NodeRecord` with refreshed endpoint candidates when a signal endpoint is known.
+- `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
@@ -34,7 +35,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Agent daemon signal path negotiation, UDP hole-punch execution, and runtime backend selection.
+- Agent daemon UDP hole-punch execution and runtime backend selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace execution hardening.
 - Full STUN protocol support and NAT classification.

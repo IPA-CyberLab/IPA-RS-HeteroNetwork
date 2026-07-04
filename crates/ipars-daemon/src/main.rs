@@ -25,11 +25,12 @@ use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    RegisterNodeResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest,
+    SignalPathResponse,
 };
 use ipars_types::{
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, KeyId, NodeHealth, NodeId,
-    NodeRecord, RelayCapability, SignedJoinToken,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
+    NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
 };
 
 #[derive(Debug, Parser)]
@@ -163,6 +164,18 @@ struct AgentArgs {
         default_value_t = false
     )]
     disable_signal_registration: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_SIGNAL_PATH_INTERVAL_SECONDS",
+        default_value_t = 30
+    )]
+    signal_path_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_DISABLE_SIGNAL_PATHS",
+        default_value_t = false
+    )]
+    disable_signal_paths: bool,
     #[arg(
         long,
         env = "IPARS_AGENT_WIREGUARD_INTERFACE",
@@ -350,12 +363,22 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
         background_tasks.push(task);
     }
     if !args.disable_signal_registration {
-        if let (Some(node), Some(signal_url)) = (registered_node, signal_base) {
+        if let (Some(node), Some(signal_url)) = (registered_node.clone(), signal_base.clone()) {
             background_tasks.push(start_signal_registration(
                 runtime.clone(),
                 node,
                 signal_url,
                 Duration::from_secs(args.signal_registration_interval_seconds.max(1)),
+            ));
+        }
+    }
+    if !args.disable_signal_paths {
+        if let (Some(control_plane_url), Some(signal_url)) = (control_plane_base, signal_base) {
+            background_tasks.push(start_signal_path_negotiation(
+                runtime.clone(),
+                control_plane_url,
+                signal_url,
+                Duration::from_secs(args.signal_path_interval_seconds.max(1)),
             ));
         }
     }
@@ -471,6 +494,7 @@ async fn send_heartbeat(
 
 async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
     let status = runtime.status().await;
+    let path_state = runtime.path_state().await;
     HeartbeatRequest {
         node_id: status.node_id,
         health: NodeHealth {
@@ -481,7 +505,7 @@ async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
             message: Some("agent heartbeat".to_string()),
         },
         candidates: status.candidates,
-        path_state: Vec::new(),
+        path_state,
     }
 }
 
@@ -544,6 +568,143 @@ async fn signal_node_upsert_request(
     let status = runtime.status().await;
     node.endpoint_candidates = status.candidates;
     SignalNodeUpsertRequest { node }
+}
+
+fn start_signal_path_negotiation(
+    runtime: Arc<AgentRuntime>,
+    control_plane_url: String,
+    signal_url: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_signal_path_negotiation_loop(runtime, control_plane_url, signal_url, interval).await;
+    })
+}
+
+async fn run_signal_path_negotiation_loop(
+    runtime: Arc<AgentRuntime>,
+    control_plane_url: String,
+    signal_url: String,
+    interval: Duration,
+) {
+    let client = reqwest::Client::new();
+    loop {
+        if let Err(error) =
+            negotiate_signal_paths(&client, runtime.as_ref(), &control_plane_url, &signal_url).await
+        {
+            tracing::warn!(%error, "failed to negotiate signal paths; will retry");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn negotiate_signal_paths(
+    client: &reqwest::Client,
+    runtime: &AgentRuntime,
+    control_plane_url: &str,
+    signal_url: &str,
+) -> anyhow::Result<()> {
+    let status = runtime.status().await;
+    let peer_map = client
+        .get(peer_map_url(control_plane_url, &status.node_id))
+        .send()
+        .await
+        .context("failed to fetch peer map for signal negotiation")?
+        .error_for_status()
+        .context("control plane rejected peer-map request for signal negotiation")?
+        .json::<PeerMap>()
+        .await
+        .context("failed to decode peer map for signal negotiation")?;
+
+    for peer in peer_map.peers {
+        let request = signal_path_request(&status, &peer);
+        let response = send_signal_path_request(client, signal_url, request).await?;
+        runtime
+            .upsert_path_state(signal_path_record(response, chrono::Utc::now()))
+            .await;
+    }
+    Ok(())
+}
+
+async fn send_signal_path_request(
+    client: &reqwest::Client,
+    signal_url: &str,
+    request: SignalPathRequest,
+) -> anyhow::Result<SignalPathResponse> {
+    client
+        .post(signal_path_url(signal_url))
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send signal path negotiation")?
+        .error_for_status()
+        .context("signal service rejected path negotiation")?
+        .json()
+        .await
+        .context("failed to decode signal path response")
+}
+
+fn signal_path_request(
+    status: &ipars_types::api::AgentStatusResponse,
+    peer: &NodeRecord,
+) -> SignalPathRequest {
+    SignalPathRequest {
+        source: status.node_id.clone(),
+        target: peer.node_id.clone(),
+        source_candidates: status.candidates.clone(),
+        desired_routes: peer.routes.iter().map(|route| route.cidr).collect(),
+    }
+}
+
+fn signal_path_record(
+    response: SignalPathResponse,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> PathRecord {
+    let selected_candidate =
+        selected_path_candidate(response.preferred_state, &response.target_candidates);
+    let relay_node = if response.preferred_state == PathState::Relay {
+        response
+            .relay_candidates
+            .first()
+            .map(|node| node.node_id.clone())
+    } else {
+        None
+    };
+
+    PathRecord {
+        key: response.key,
+        selected_state: response.preferred_state,
+        selected_candidate,
+        relay_node,
+        score: response.score,
+        updated_at,
+        pinned: false,
+    }
+}
+
+fn selected_path_candidate(
+    state: PathState,
+    target_candidates: &[EndpointCandidate],
+) -> Option<EndpointCandidate> {
+    let kind_rank = |candidate: &EndpointCandidate| match (state, candidate.kind) {
+        (PathState::DirectIpv6, ipars_types::EndpointCandidateKind::Ipv6) => Some(0_u8),
+        (PathState::DirectPublic, ipars_types::EndpointCandidateKind::PublicUdp) => Some(0_u8),
+        (PathState::DirectNatTraversal, ipars_types::EndpointCandidateKind::StunReflexive) => {
+            Some(0_u8)
+        }
+        (_, _) if state.is_direct() => Some(1_u8),
+        _ => None,
+    };
+    target_candidates
+        .iter()
+        .filter_map(|candidate| kind_rank(candidate).map(|rank| (rank, candidate)))
+        .min_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.cost.cmp(&right.cost))
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+        .map(|(_, candidate)| candidate.clone())
 }
 
 async fn run_peer_map_sync_loop<S, A>(
@@ -620,6 +781,10 @@ fn signal_node_url(signal_url: &str, node_id: &NodeId) -> String {
     format!("{}/v1/nodes/{}", signal_url.trim_end_matches('/'), node_id)
 }
 
+fn signal_path_url(signal_url: &str) -> String {
+    format!("{}/v1/paths/negotiate", signal_url.trim_end_matches('/'))
+}
+
 fn control_plane_join_url(
     token: &SignedJoinToken,
     override_url: Option<&str>,
@@ -686,11 +851,14 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
-    use ipars_types::{BootstrapEndpoint, JoinTokenClaims, Role, TokenPolicy, VpnIp};
+    use ipars_types::{
+        BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
+        JoinTokenClaims, PathScore, PeerPathKey, Role, TokenPolicy, VpnIp,
+    };
 
     use super::*;
 
@@ -709,6 +877,18 @@ mod tests {
                 nonce: "nonce-a".to_string(),
             },
             signature: "signature".to_string(),
+        }
+    }
+
+    fn candidate(node_id: &str, kind: EndpointCandidateKind, cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: NodeId::from_string(node_id),
+            kind,
+            addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost,
+            source: CandidateSource::ControlPlane,
         }
     }
 
@@ -767,6 +947,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signal_path_url_trims_signal_base_url() {
+        assert_eq!(
+            signal_path_url("http://127.0.0.1:9443/"),
+            "http://127.0.0.1:9443/v1/paths/negotiate"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_request_uses_runtime_state() {
         let runtime = AgentRuntime::new(
@@ -774,13 +962,26 @@ mod tests {
             ClusterPolicy::default(),
         );
         let node_id = runtime.state().node_id.clone();
+        let path = PathRecord {
+            key: PeerPathKey::new(node_id.clone(), NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore {
+                value: 100.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+        runtime.upsert_path_state(path.clone()).await;
 
         let request = heartbeat_request(&runtime).await;
 
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.candidates.is_empty());
-        assert!(request.path_state.is_empty());
+        assert_eq!(request.path_state, vec![path]);
     }
 
     #[tokio::test]
@@ -795,6 +996,64 @@ mod tests {
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
+    }
+
+    #[test]
+    fn signal_path_record_selects_direct_candidate() {
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![
+                candidate("peer-a", EndpointCandidateKind::StunReflexive, 1),
+                candidate("peer-a", EndpointCandidateKind::PublicUdp, 50),
+            ],
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectPublic,
+            score: PathScore {
+                value: 115.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::DirectPublic);
+        assert_eq!(
+            record
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.kind),
+            Some(EndpointCandidateKind::PublicUdp)
+        );
+        assert_eq!(record.relay_node, None);
+    }
+
+    #[test]
+    fn signal_path_record_selects_relay_node() {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51820))),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![candidate("peer-a", EndpointCandidateKind::Relay, 100)],
+            relay_candidates: vec![relay],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.selected_candidate, None);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-a")));
     }
 
     #[test]
