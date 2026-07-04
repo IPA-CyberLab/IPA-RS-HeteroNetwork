@@ -116,7 +116,7 @@ Agents renew relay sessions before expiry and remove relay credentials when path
 
 When the agent is started with relay forwarder binding enabled, the daemon supervises per-peer local UDP forwarders for active relay sessions. Peer-map application consults negotiated path state, transient relay sessions, and the runtime forwarder endpoint table before configuring kernel WireGuard peers. Relay-selected peers with active credentials use their local forwarder endpoint as the WireGuard endpoint, allowing the forwarder to wrap opaque WireGuard packets before they leave for the public relay.
 
-Relay forwarders default to the agent's `--linux-netns` placement when one is configured, or can be pinned with `--relay-forwarder-netns`. Because the workspace forbids unsafe code, the daemon validates that the process is already running in the requested Linux network namespace before binding the UDP socket instead of calling `setns` internally. Supervisors enforce a maximum number of per-peer forwarders, reap dead forwarder tasks, remove stale runtime endpoints, and apply restart backoff after bind/start/runtime failures.
+Relay forwarders default to the agent's `--linux-netns` placement when one is configured, or can be pinned with `--relay-forwarder-netns`. Because the workspace forbids unsafe code, the daemon validates that the process is already running in the requested Linux network namespace before binding the UDP socket instead of calling `setns` internally. Supervisors enforce a maximum number of per-peer forwarders, reap dead forwarder tasks, remove stale runtime endpoints, apply restart backoff after bind/start/runtime failures, and place repeatedly failing peers into a configurable crash-loop cooldown window.
 
 ## Docker Support
 

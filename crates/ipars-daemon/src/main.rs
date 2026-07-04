@@ -237,6 +237,24 @@ struct AgentArgs {
     relay_forwarder_restart_backoff_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS",
+        default_value_t = 60
+    )]
+    relay_forwarder_crash_window_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW",
+        default_value_t = 3
+    )]
+    relay_forwarder_max_crashes_per_window: u32,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS",
+        default_value_t = 60
+    )]
+    relay_forwarder_crash_cooldown_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_AGENT_APPLY_KUBERNETES_UNDERLAY",
         default_value_t = false
     )]
@@ -757,6 +775,11 @@ fn relay_forwarder_supervisor(
             placement,
             max_sessions: args.relay_forwarder_max_sessions,
             restart_backoff: Duration::from_secs(args.relay_forwarder_restart_backoff_seconds),
+            crash_policy: RelayForwarderCrashPolicy {
+                window: Duration::from_secs(args.relay_forwarder_crash_window_seconds),
+                max_crashes_per_window: args.relay_forwarder_max_crashes_per_window,
+                cooldown: Duration::from_secs(args.relay_forwarder_crash_cooldown_seconds),
+            },
         },
     ))))
 }
@@ -782,6 +805,27 @@ struct RelayForwarderConfig {
     placement: RelayForwarderPlacement,
     max_sessions: usize,
     restart_backoff: Duration,
+    crash_policy: RelayForwarderCrashPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayForwarderCrashPolicy {
+    window: Duration,
+    max_crashes_per_window: u32,
+    cooldown: Duration,
+}
+
+impl RelayForwarderCrashPolicy {
+    fn enabled(&self) -> bool {
+        !self.window.is_zero() && self.max_crashes_per_window > 0 && !self.cooldown.is_zero()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RelayForwarderCrashState {
+    window_started_at: chrono::DateTime<chrono::Utc>,
+    crashes_in_window: u32,
+    cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,6 +862,7 @@ struct RelayForwarderSupervisor {
     handles: tokio::sync::Mutex<std::collections::BTreeMap<NodeId, RelayForwarderTask>>,
     restart_backoff_until:
         tokio::sync::Mutex<std::collections::BTreeMap<NodeId, chrono::DateTime<chrono::Utc>>>,
+    crash_state: tokio::sync::Mutex<std::collections::BTreeMap<NodeId, RelayForwarderCrashState>>,
 }
 
 impl RelayForwarderSupervisor {
@@ -826,6 +871,7 @@ impl RelayForwarderSupervisor {
             config,
             handles: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
             restart_backoff_until: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+            crash_state: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -855,8 +901,8 @@ impl RelayForwarderSupervisor {
         }
 
         self.ensure_capacity(&session.peer).await?;
-        self.ensure_not_backing_off(&session.peer).await?;
-        self.remove(runtime, &session.peer).await;
+        self.ensure_start_allowed(&session.peer).await?;
+        self.remove_forwarder(runtime, &session.peer, false).await;
         let socket = match self.bind_socket().await {
             Ok(socket) => socket,
             Err(error) => {
@@ -959,36 +1005,121 @@ impl RelayForwarderSupervisor {
         );
     }
 
-    async fn ensure_not_backing_off(&self, peer: &NodeId) -> anyhow::Result<()> {
+    async fn ensure_start_allowed(&self, peer: &NodeId) -> anyhow::Result<()> {
         let now = chrono::Utc::now();
         let mut backoff = self.restart_backoff_until.lock().await;
-        match backoff.get(peer).copied() {
-            Some(until) if now < until => anyhow::bail!(
-                "relay forwarder restart backoff active until {until} for peer {peer}"
-            ),
-            Some(_) => {
+        if let Some(until) = backoff.get(peer).copied() {
+            if now < until {
+                anyhow::bail!(
+                    "relay forwarder restart backoff active until {until} for peer {peer}"
+                );
+            } else {
                 backoff.remove(peer);
-                Ok(())
             }
-            None => Ok(()),
         }
+        drop(backoff);
+
+        if !self.config.crash_policy.enabled() {
+            return Ok(());
+        }
+
+        let mut crash_state = self.crash_state.lock().await;
+        match crash_state.get(peer) {
+            Some(state) if state.cooldown_until.is_some_and(|until| now < until) => {
+                let until = state.cooldown_until.unwrap_or(now);
+                anyhow::bail!(
+                    "relay forwarder crash-loop cooldown active until {until} for peer {peer}"
+                );
+            }
+            Some(state) if state.cooldown_until.is_some() => {
+                if let Some(until) = state.cooldown_until {
+                    tracing::info!(
+                        peer = %peer,
+                        cooldown_until = %until,
+                        "relay forwarder crash-loop cooldown expired"
+                    );
+                }
+                crash_state.remove(peer);
+            }
+            Some(state)
+                if now.signed_duration_since(state.window_started_at)
+                    > chrono::Duration::from_std(self.config.crash_policy.window)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX)) =>
+            {
+                crash_state.remove(peer);
+            }
+            _ => {}
+        };
+        Ok(())
     }
 
     async fn record_start_failure(&self, peer: &NodeId) {
+        let now = chrono::Utc::now();
         if self.config.restart_backoff.is_zero() {
+            self.restart_backoff_until.lock().await.remove(peer);
+        } else {
+            let backoff = chrono::Duration::from_std(self.config.restart_backoff)
+                .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
+            self.restart_backoff_until
+                .lock()
+                .await
+                .insert(peer.clone(), now + backoff);
+        }
+
+        if !self.config.crash_policy.enabled() {
             return;
         }
-        let backoff = chrono::Duration::from_std(self.config.restart_backoff)
+
+        let window = chrono::Duration::from_std(self.config.crash_policy.window)
             .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
-        self.restart_backoff_until
-            .lock()
-            .await
-            .insert(peer.clone(), chrono::Utc::now() + backoff);
+        let cooldown = chrono::Duration::from_std(self.config.crash_policy.cooldown)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
+        let mut crash_state = self.crash_state.lock().await;
+        let state = crash_state
+            .entry(peer.clone())
+            .and_modify(|state| {
+                if now.signed_duration_since(state.window_started_at) > window
+                    || state.cooldown_until.is_some_and(|until| now >= until)
+                {
+                    state.window_started_at = now;
+                    state.crashes_in_window = 0;
+                    state.cooldown_until = None;
+                }
+            })
+            .or_insert(RelayForwarderCrashState {
+                window_started_at: now,
+                crashes_in_window: 0,
+                cooldown_until: None,
+            });
+        state.crashes_in_window = state.crashes_in_window.saturating_add(1);
+        if state.crashes_in_window >= self.config.crash_policy.max_crashes_per_window {
+            let until = now + cooldown;
+            state.cooldown_until = Some(until);
+            tracing::warn!(
+                peer = %peer,
+                crashes = state.crashes_in_window,
+                window_seconds = self.config.crash_policy.window.as_secs(),
+                cooldown_until = %until,
+                "relay forwarder entered crash-loop cooldown"
+            );
+        }
     }
 
     async fn remove(&self, runtime: &AgentRuntime, peer: &NodeId) {
+        self.remove_forwarder(runtime, peer, true).await;
+    }
+
+    async fn remove_forwarder(
+        &self,
+        runtime: &AgentRuntime,
+        peer: &NodeId,
+        clear_failure_policy: bool,
+    ) {
         runtime.remove_relay_forwarder_endpoint(peer).await;
-        self.restart_backoff_until.lock().await.remove(peer);
+        if clear_failure_policy {
+            self.restart_backoff_until.lock().await.remove(peer);
+            self.crash_state.lock().await.remove(peer);
+        }
         let handle = self.handles.lock().await.remove(peer);
         if let Some(handle) = handle {
             if let Err(error) = handle.stop().await {
@@ -1003,6 +1134,7 @@ impl RelayForwarderSupervisor {
             std::mem::take(&mut *handles)
         };
         self.restart_backoff_until.lock().await.clear();
+        self.crash_state.lock().await.clear();
         for (peer, handle) in handles {
             runtime.remove_relay_forwarder_endpoint(&peer).await;
             if let Err(error) = handle.stop().await {
@@ -1858,6 +1990,43 @@ mod tests {
         }
     }
 
+    fn test_crash_policy() -> RelayForwarderCrashPolicy {
+        RelayForwarderCrashPolicy {
+            window: Duration::from_secs(60),
+            max_crashes_per_window: 3,
+            cooldown: Duration::from_secs(60),
+        }
+    }
+
+    async fn insert_dead_forwarder(
+        supervisor: &RelayForwarderSupervisor,
+        runtime: &AgentRuntime,
+        peer: &NodeId,
+        session_id: &str,
+    ) {
+        let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 42_000));
+        runtime
+            .upsert_relay_forwarder_endpoint(peer.clone(), local_endpoint)
+            .await;
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async {
+            Err(AgentError::RelaySession(
+                "synthetic forwarder death".to_string(),
+            ))
+        });
+        supervisor.handles.lock().await.insert(
+            peer.clone(),
+            RelayForwarderTask {
+                session_id: session_id.to_string(),
+                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                local_endpoint,
+                shutdown_tx,
+                task,
+            },
+        );
+        tokio::task::yield_now().await;
+    }
+
     #[test]
     fn database_kind_selects_backend_from_url() {
         assert_eq!(database_kind(None), DatabaseKind::Memory);
@@ -1891,6 +2060,12 @@ mod tests {
             "7",
             "--relay-forwarder-restart-backoff-seconds",
             "11",
+            "--relay-forwarder-crash-window-seconds",
+            "22",
+            "--relay-forwarder-max-crashes-per-window",
+            "4",
+            "--relay-forwarder-crash-cooldown-seconds",
+            "33",
             "--apply-kubernetes-underlay",
             "--kubernetes-node-name",
             "worker-a",
@@ -1921,9 +2096,21 @@ mod tests {
             );
             assert_eq!(args.relay_forwarder_max_sessions, 7);
             assert_eq!(args.relay_forwarder_restart_backoff_seconds, 11);
+            assert_eq!(args.relay_forwarder_crash_window_seconds, 22);
+            assert_eq!(args.relay_forwarder_max_crashes_per_window, 4);
+            assert_eq!(args.relay_forwarder_crash_cooldown_seconds, 33);
             let supervisor = relay_forwarder_supervisor(&args)?.context("expected supervisor")?;
             assert_eq!(supervisor.config.max_sessions, 7);
             assert_eq!(supervisor.config.restart_backoff, Duration::from_secs(11));
+            assert_eq!(
+                supervisor.config.crash_policy.window,
+                Duration::from_secs(22)
+            );
+            assert_eq!(supervisor.config.crash_policy.max_crashes_per_window, 4);
+            assert_eq!(
+                supervisor.config.crash_policy.cooldown,
+                Duration::from_secs(33)
+            );
             assert_eq!(
                 supervisor.config.placement,
                 RelayForwarderPlacement::LinuxNetns(LinuxNetworkNamespace::from_name("node-a")?)
@@ -1961,6 +2148,7 @@ mod tests {
             placement: RelayForwarderPlacement::CurrentProcess,
             max_sessions: 0,
             restart_backoff: Duration::from_secs(1),
+            crash_policy: test_crash_policy(),
         });
         let session = RelaySessionState {
             peer: NodeId::from_string("peer-a"),
@@ -1995,6 +2183,7 @@ mod tests {
             placement: RelayForwarderPlacement::CurrentProcess,
             max_sessions: 10,
             restart_backoff: Duration::from_secs(30),
+            crash_policy: test_crash_policy(),
         });
         let peer = NodeId::from_string("peer-dead");
         let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 42_000));
@@ -2038,6 +2227,103 @@ mod tests {
         };
 
         assert!(error.to_string().contains("restart backoff active"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_forwarder_supervisor_enters_crash_loop_cooldown() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 10,
+            restart_backoff: Duration::ZERO,
+            crash_policy: RelayForwarderCrashPolicy {
+                window: Duration::from_secs(60),
+                max_crashes_per_window: 2,
+                cooldown: Duration::from_secs(30),
+            },
+        });
+        let peer = NodeId::from_string("peer-crash-loop");
+
+        insert_dead_forwarder(&supervisor, &runtime, &peer, "session-dead-1").await;
+        assert_eq!(supervisor.reap_finished(&runtime).await, 1);
+        insert_dead_forwarder(&supervisor, &runtime, &peer, "session-dead-2").await;
+        assert_eq!(supervisor.reap_finished(&runtime).await, 1);
+
+        let session = RelaySessionState {
+            peer,
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-new".to_string(),
+            session_token: "token-new".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        };
+        let error = match supervisor.upsert(&runtime, session).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("crash-loop cooldown active"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_forwarder_supervisor_counts_repeated_bind_failures() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let occupied_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: occupied_socket.local_addr()?,
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 10,
+            restart_backoff: Duration::ZERO,
+            crash_policy: RelayForwarderCrashPolicy {
+                window: Duration::from_secs(60),
+                max_crashes_per_window: 2,
+                cooldown: Duration::from_secs(30),
+            },
+        });
+        let peer = NodeId::from_string("peer-bind-loop");
+        let session = || RelaySessionState {
+            peer: peer.clone(),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-new".to_string(),
+            session_token: "token-new".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        };
+
+        let first_error = match supervisor.upsert(&runtime, session()).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+        assert!(first_error.to_string().contains("failed to bind"));
+        let second_error = match supervisor.upsert(&runtime, session()).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+        assert!(second_error.to_string().contains("failed to bind"));
+        let third_error = match supervisor.upsert(&runtime, session()).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+
+        assert!(third_error
+            .to_string()
+            .contains("crash-loop cooldown active"));
         Ok(())
     }
 

@@ -27,7 +27,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` relay admission for `RELAY` paths selected by signal negotiation, using relay-advertised admission URLs and keeping expiring relay credentials in transient agent runtime state.
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
 - Agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames and preserves opaque WireGuard payloads.
-- Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings; relay forwarders support namespace placement checks, capacity limits, dead-task reaping, stale endpoint removal, and restart backoff.
+- Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings; relay forwarders support namespace placement checks, capacity limits, dead-task reaping, stale endpoint removal, restart backoff, and configurable crash-loop cooldown policy.
 - Agent HTTP JSON/Prometheus metrics export and bounded structured path-change event export.
 - Agent relay forwarder per-peer dataplane metrics for outbound/inbound packets and opaque payload bytes, exported through JSON and Prometheus metrics.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
@@ -51,7 +51,6 @@ This file tracks the gap between the requested final system and the current repo
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - NAT filtering classification, extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS, and topology validation.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
-- Crash-loop policy tuning beyond current relay forwarder dead-task reaping and restart backoff.
 - OpenTelemetry exporters plus deeper relay dataplane metrics coverage.
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
