@@ -5,8 +5,9 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatTraversalStrategy, NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey,
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
+    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathScore, PathState,
+    PeerPathKey,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -22,6 +23,7 @@ pub struct SignalRegistry {
     coordinator: SignalCoordinator,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
+    health: RwLock<BTreeMap<NodeId, NodeHealth>>,
 }
 
 impl SignalRegistry {
@@ -30,6 +32,7 @@ impl SignalRegistry {
             coordinator: SignalCoordinator::new(policy),
             nodes: RwLock::new(BTreeMap::new()),
             nat_classifications: RwLock::new(BTreeMap::new()),
+            health: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -42,6 +45,16 @@ impl SignalRegistry {
         node: NodeRecord,
         nat_classification: Option<NatClassification>,
     ) -> SignalNodeUpsertResponse {
+        self.upsert_node_with_nat_and_health(node, nat_classification, None)
+            .await
+    }
+
+    pub async fn upsert_node_with_nat_and_health(
+        &self,
+        node: NodeRecord,
+        nat_classification: Option<NatClassification>,
+        health: Option<NodeHealth>,
+    ) -> SignalNodeUpsertResponse {
         let registered_at = Utc::now();
         match nat_classification {
             Some(classification) => {
@@ -52,6 +65,17 @@ impl SignalRegistry {
             }
             None => {
                 self.nat_classifications.write().await.remove(&node.node_id);
+            }
+        }
+        match health {
+            Some(health) => {
+                self.health
+                    .write()
+                    .await
+                    .insert(node.node_id.clone(), health);
+            }
+            None => {
+                self.health.write().await.remove(&node.node_id);
             }
         }
         self.nodes
@@ -119,15 +143,18 @@ impl SignalRegistry {
     }
 
     pub async fn relay_candidates(&self) -> Vec<NodeRecord> {
-        self.nodes
-            .read()
-            .await
+        let nodes = self.nodes.read().await;
+        let health = self.health.read().await;
+        let now = Utc::now();
+        nodes
             .values()
             .filter(|node| {
-                node.relay_capability
-                    .as_ref()
-                    .map(|capability| capability.can_admit())
-                    .unwrap_or(false)
+                relay_candidate_allowed(
+                    node,
+                    health.get(&node.node_id),
+                    now,
+                    &self.coordinator.policy,
+                )
             })
             .cloned()
             .collect()
@@ -287,6 +314,35 @@ fn nat_classification_allows_hole_punch(classification: Option<&NatClassificatio
     }
 }
 
+fn relay_candidate_allowed(
+    node: &NodeRecord,
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> bool {
+    node.relay_capability
+        .as_ref()
+        .is_some_and(|capability| capability.can_admit())
+        && relay_health_allows(health, now, policy.relay_health_ttl_seconds)
+}
+
+fn relay_health_allows(
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    let Some(health) = health else {
+        return false;
+    };
+    if health.state != HealthState::Healthy {
+        return false;
+    }
+    match now.signed_duration_since(health.last_seen_at).to_std() {
+        Ok(age) => age <= std::time::Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HolePunchPlan {
     pub source_reflexive: Option<EndpointCandidate>,
@@ -301,8 +357,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use ipars_types::{
-        CandidateSource, ClusterId, NatMappingBehavior, NodeId, RelayCapability, Role, TokenPolicy,
-        VpnIp,
+        CandidateSource, ClusterId, HealthState, NatMappingBehavior, NodeHealth, NodeId,
+        RelayCapability, Role, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -361,6 +417,16 @@ mod tests {
         }
     }
 
+    fn healthy_health() -> NodeHealth {
+        NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: Some(1.0),
+            relay_load: Some(0.1),
+            message: None,
+        }
+    }
+
     #[test]
     fn direct_public_is_preferred_when_target_has_public_udp() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
@@ -384,7 +450,9 @@ mod tests {
     async fn registry_uses_relay_fallback_when_direct_is_unreachable() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
         registry.upsert_node(target(Vec::new())).await;
-        registry.upsert_node(relay()).await;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -409,7 +477,9 @@ mod tests {
             capability.admission_url = None;
         }
         registry.upsert_node(target(Vec::new())).await;
-        registry.upsert_node(relay).await;
+        registry
+            .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+            .await;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -436,7 +506,9 @@ mod tests {
         registry
             .upsert_node_with_nat(target, Some(relay_preferred_nat()))
             .await;
-        registry.upsert_node(relay()).await;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -448,6 +520,47 @@ mod tests {
             })
             .await?;
 
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_requires_fresh_healthy_relay_health() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        registry.upsert_node(target(Vec::new())).await;
+
+        registry.upsert_node(relay()).await;
+        assert!(registry.relay_candidates().await.is_empty());
+
+        let mut unhealthy = healthy_health();
+        unhealthy.state = HealthState::Unhealthy;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(unhealthy))
+            .await;
+        assert!(registry.relay_candidates().await.is_empty());
+
+        let mut stale = healthy_health();
+        stale.last_seen_at = Utc::now() - chrono::Duration::seconds(120);
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(stale))
+            .await;
+        assert!(registry.relay_candidates().await.is_empty());
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await;
+        assert_eq!(registry.relay_candidates().await.len(), 1);
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
         Ok(())

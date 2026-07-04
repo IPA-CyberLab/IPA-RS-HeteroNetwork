@@ -222,7 +222,13 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
             )
             .await
             .with_context(|| format!("failed to register synthetic node {index}"))?;
-        registry.upsert_node(response.node.clone()).await;
+        registry
+            .upsert_node_with_nat_and_health(
+                response.node.clone(),
+                None,
+                Some(healthy_node_health()),
+            )
+            .await;
         nodes.push(response.node);
     }
     let registration_millis = registration_started.elapsed().as_millis();
@@ -339,6 +345,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
             &SignalNodeUpsertRequest {
                 node: response.node.clone(),
                 nat_classification: None,
+                health: Some(healthy_node_health()),
             },
             "signal node upsert",
         )
@@ -595,6 +602,7 @@ async fn run_daemon_scenario(
             &SignalNodeUpsertRequest {
                 node: peer.clone(),
                 nat_classification: None,
+                health: Some(healthy_node_health()),
             },
             "daemon signal node upsert",
         )
@@ -1233,16 +1241,20 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
 fn heartbeat_request(node: &NodeRecord) -> HeartbeatRequest {
     HeartbeatRequest {
         node_id: node.node_id.clone(),
-        health: NodeHealth {
-            state: HealthState::Healthy,
-            last_seen_at: Utc::now(),
-            latency_ms: Some(1.0),
-            relay_load: Some(0.10),
-            message: None,
-        },
+        health: healthy_node_health(),
         candidates: node.endpoint_candidates.clone(),
         relay_capability: None,
         path_state: Vec::new(),
+    }
+}
+
+fn healthy_node_health() -> NodeHealth {
+    NodeHealth {
+        state: HealthState::Healthy,
+        last_seen_at: Utc::now(),
+        latency_ms: Some(1.0),
+        relay_load: Some(0.10),
+        message: None,
     }
 }
 

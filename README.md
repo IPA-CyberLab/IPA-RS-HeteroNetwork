@@ -102,7 +102,7 @@ For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-i
 
 Control-plane ACLs can be loaded with repeated `iparsd control-plane --acl-rule '<json>'` values, or semicolon-separated JSON objects in `IPARS_ACL_RULES`. Each object uses the typed `AclRule` shape with `id`, `from_roles`, `from_tags`, `to_roles`, `to_tags`, `routes`, `protocol`, and `action`; an empty ACL list keeps default allow-all peer visibility, while configured deny rules take precedence over allow rules.
 
-Relay candidates also require a fresh healthy heartbeat. `iparsd control-plane --relay-health-ttl-seconds` or `IPARS_RELAY_HEALTH_TTL_SECONDS` controls how long a healthy relay heartbeat remains eligible for relay maps and relay-candidate metrics.
+Relay candidates also require fresh healthy status. `iparsd control-plane --relay-health-ttl-seconds` or `IPARS_RELAY_HEALTH_TTL_SECONDS` controls how long a healthy relay heartbeat remains eligible for relay maps and relay-candidate metrics. `iparsd signal --relay-health-ttl-seconds` or `IPARS_SIGNAL_RELAY_HEALTH_TTL_SECONDS` applies the same freshness window to relay candidates offered during signal path negotiation.
 
 Operators can inspect the active control-plane cluster policy, VPN pool, and loaded ACL rules with `GET /v1/policy` on the control-plane HTTP service.
 

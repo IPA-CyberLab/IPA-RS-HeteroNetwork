@@ -50,7 +50,11 @@ async fn upsert_node(
     Ok(Json(
         state
             .registry
-            .upsert_node_with_nat(request.node, request.nat_classification)
+            .upsert_node_with_nat_and_health(
+                request.node,
+                request.nat_classification,
+                request.health,
+            )
             .await,
     ))
 }
@@ -180,6 +184,7 @@ mod tests {
                     .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
                         node: target,
                         nat_classification: None,
+                        health: None,
                     })?))?,
             )
             .await?;

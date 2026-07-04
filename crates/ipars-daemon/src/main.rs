@@ -224,6 +224,12 @@ struct SignalArgs {
     idle_timeout_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_SIGNAL_RELAY_HEALTH_TTL_SECONDS",
+        default_value_t = 90
+    )]
+    relay_health_ttl_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
         default_value_t = false
     )]
@@ -1022,6 +1028,7 @@ async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
         allow_nat_traversal: !args.disable_nat_traversal,
         allow_relay_fallback: !args.disable_relay_fallback,
         idle_timeout_seconds: args.idle_timeout_seconds,
+        relay_health_ttl_seconds: args.relay_health_ttl_seconds,
         ..ClusterPolicy::default()
     };
     let registry = Arc::new(SignalRegistry::new(policy));
@@ -3492,6 +3499,13 @@ async fn signal_node_upsert_request(
     SignalNodeUpsertRequest {
         node,
         nat_classification: status.nat_classification,
+        health: Some(NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: chrono::Utc::now(),
+            latency_ms: None,
+            relay_load: None,
+            message: Some("agent signal registration".to_string()),
+        }),
     }
 }
 
@@ -4532,6 +4546,24 @@ mod tests {
         assert_eq!(rule.routes, vec!["10.42.0.0/16".parse()?]);
         assert_eq!(rule.protocol, TransportProtocol::Any);
         assert_eq!(rule.action, AclAction::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn signal_args_accept_relay_health_ttl() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "signal",
+            "--relay-health-ttl-seconds",
+            "45",
+            "--disable-relay-fallback",
+        ])?;
+
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        assert_eq!(args.relay_health_ttl_seconds, 45);
+        assert!(args.disable_relay_fallback);
         Ok(())
     }
 
@@ -5925,6 +5957,10 @@ mod tests {
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
+        assert_eq!(
+            request.health.as_ref().map(|health| health.state),
+            Some(HealthState::Healthy)
+        );
     }
 
     #[tokio::test]

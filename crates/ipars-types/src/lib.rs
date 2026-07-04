@@ -928,6 +928,8 @@ pub mod api {
         pub node: NodeRecord,
         #[serde(default)]
         pub nat_classification: Option<NatClassification>,
+        #[serde(default)]
+        pub health: Option<NodeHealth>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1442,6 +1444,7 @@ mod tests {
         let upsert_request: api::SignalNodeUpsertRequest =
             serde_json::from_value(serde_json::json!({ "node": node }))?;
         assert!(upsert_request.nat_classification.is_none());
+        assert!(upsert_request.health.is_none());
 
         Ok(())
     }
