@@ -1080,6 +1080,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipars-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ipars-control-plane",
+ "ipars-signal",
+ "ipars-types",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ipars-relay"
 version = "0.1.0"
 dependencies = [

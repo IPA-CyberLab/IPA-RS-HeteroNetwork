@@ -248,6 +248,8 @@ Target: lazy connections only for active flows/pins. Peer-map updates are delta-
 
 Target: no full mesh. Agents subscribe to relevant peer/route deltas by tag, role, and route interest. Control-plane state is partitionable by cluster ID and node ID. Relay maps are ranked by region/cost/load. Load tests must measure registration rate, peer-map fanout, signal negotiation concurrency, relay throughput, and path-state churn.
 
+The `ipars-load` harness provides executable `three`, `ten`, and `thousand` scenarios against in-memory control-plane and signal components. It reports registration count/time, peer-map fanout, advertised route count, sampled active pair negotiations, relay candidate count, and selected path-state totals as JSON. The 1000-node scenario samples active pairs rather than negotiating all possible pairs so the harness exercises the lazy-connect assumption while still measuring current peer-map fanout.
+
 ## Implementation Roadmap
 
 1. Shared typed models, CLI surface, and signed-token primitives.

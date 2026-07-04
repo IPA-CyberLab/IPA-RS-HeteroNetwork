@@ -38,7 +38,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends, including `--linux-netns` namespace placement, with retry on control-plane errors
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
-- architecture, operations, security, and load-test plan
+- architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete target design and implementation roadmap.
 
@@ -52,6 +52,14 @@ Linux network namespace integration tests are gated because they create host net
 
 ```bash
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
+```
+
+Scale/load harness scenarios run against in-memory control-plane and signal components:
+
+```bash
+cargo run -p ipars-load -- --scenario three
+cargo run -p ipars-load -- --scenario ten
+cargo run -p ipars-load -- --scenario thousand
 ```
 
 ## CLI Surface
