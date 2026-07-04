@@ -18,6 +18,7 @@ This file tracks the gap between the requested final system and the current repo
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - Continuous UDP STUN echo loop and `iparsd stun` daemon for public endpoint detection.
 - Relay admission/status HTTP API, opaque UDP forwarding loop, and `iparsd relay`.
+- CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -25,7 +26,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Agent daemon and real WireGuard/route-manager backends.
+- Agent daemon, persistent node state, and real WireGuard/route-manager backends.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.

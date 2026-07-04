@@ -5,6 +5,7 @@ use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
+use ipars_types::api::{JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse};
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, JoinTokenClaims, KeyId, NodeId, Role,
     SignedJoinToken, Tag, TokenPolicy,
@@ -63,6 +64,10 @@ struct InitArgs {
 #[derive(Debug, Args)]
 struct JoinArgs {
     token: String,
+    #[arg(long)]
+    control_plane_url: Option<String>,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -111,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => print_json(&init(args)?)?,
-        Command::Join(args) => print_json(&join(args)?)?,
+        Command::Join(args) => print_json(&join(args).await?)?,
         Command::Status => print_json(&StaticStatus::status())?,
         Command::Peers => print_json(&StaticStatus::peers())?,
         Command::Routes => print_json(&StaticStatus::routes())?,
@@ -166,11 +171,41 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     })
 }
 
-fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
+async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
     let token: SignedJoinToken =
         serde_json::from_str(&args.token).context("join token must be JSON signed token")?;
     let identity = IdentityKeyPair::generate();
     let wireguard = WireGuardKeyPair::generate();
+    let control_plane_url = control_plane_join_url(&token, args.control_plane_url.as_deref())?;
+    let registration = RegisterNodeRequest {
+        node_id: identity.node_id(),
+        identity_public_key: identity.public_key_b64(),
+        wireguard_public_key: wireguard.public_key_b64.clone(),
+        candidates: Vec::new(),
+        relay_capability: None,
+        requested_routes: Vec::new(),
+    };
+    let join_request = JoinNodeRequest {
+        token: token.clone(),
+        registration,
+    };
+    let registration_response = if args.dry_run {
+        None
+    } else {
+        Some(
+            reqwest::Client::new()
+                .post(&control_plane_url)
+                .json(&join_request)
+                .send()
+                .await
+                .context("failed to send join request")?
+                .error_for_status()
+                .context("control plane rejected join request")?
+                .json::<RegisterNodeResponse>()
+                .await
+                .context("failed to decode join response")?,
+        )
+    };
 
     Ok(JoinOutput {
         cluster_id: token.claims.cluster_id,
@@ -180,7 +215,9 @@ fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
         bootstrap_endpoints: token.claims.bootstrap_endpoints,
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard.public_key_b64,
-        next_step: "register_with_control_plane".to_string(),
+        control_plane_url,
+        registered: registration_response.is_some(),
+        registration: registration_response,
     })
 }
 
@@ -266,6 +303,22 @@ fn bootstrap_from_public_endpoint(public_endpoint: SocketAddr) -> Vec<BootstrapE
     ]
 }
 
+fn control_plane_join_url(
+    token: &SignedJoinToken,
+    override_url: Option<&str>,
+) -> anyhow::Result<String> {
+    let base_url = override_url.map(ToOwned::to_owned).or_else(|| {
+        token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.clone())
+    });
+    let base_url = base_url.context("join token does not contain a control-plane bootstrap URL")?;
+    Ok(format!("{}/v1/join", base_url.trim_end_matches('/')))
+}
+
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -298,7 +351,9 @@ struct JoinOutput {
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
     identity_public_key: String,
     wireguard_public_key: String,
-    next_step: String,
+    control_plane_url: String,
+    registered: bool,
+    registration: Option<RegisterNodeResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,5 +402,64 @@ impl StaticStatus<'static> {
             status: "empty",
             detail: "path state is created lazily on first flow or pinned peer",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
+        SignedJoinToken {
+            claims: claims(
+                ClusterId::from_string("cluster-a"),
+                NodeId::from_string("issuer"),
+                "edge".to_string(),
+                Vec::new(),
+                300,
+                endpoints,
+                false,
+            ),
+            signature: "signature".to_string(),
+        }
+    }
+
+    #[test]
+    fn join_url_uses_control_plane_bootstrap_endpoint() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "udp://203.0.113.10:51820".to_string(),
+                kind: BootstrapEndpointKind::Relay,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ]);
+
+        assert_eq!(
+            control_plane_join_url(&token, None)?,
+            "https://203.0.113.10:8443/v1/join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn join_url_override_takes_precedence() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(Vec::new());
+
+        assert_eq!(
+            control_plane_join_url(&token, Some("http://127.0.0.1:8443"))?,
+            "http://127.0.0.1:8443/v1/join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn join_url_requires_control_plane_endpoint() {
+        let token = token_with_bootstrap(Vec::new());
+        let result = control_plane_join_url(&token, None);
+
+        assert!(result.is_err());
     }
 }

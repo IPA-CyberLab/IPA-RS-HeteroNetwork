@@ -34,6 +34,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
 ipnet = { version = "2.10", features = ["serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -17,6 +17,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - continuous UDP STUN echo server and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API, opaque UDP payload forwarding, and `iparsd relay`
+- `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
