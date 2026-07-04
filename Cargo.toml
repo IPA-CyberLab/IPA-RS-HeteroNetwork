@@ -30,6 +30,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
+bytes = "1.12"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
@@ -40,6 +41,8 @@ ipnet = { version = "2.10", features = ["serde"] }
 netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-wireguard = "0.4"
+netlink-sys = "0.8"
+nix = { version = "0.30", default-features = false, features = ["sched"] }
 opentelemetry = { version = "0.32", features = ["logs", "metrics", "trace"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }

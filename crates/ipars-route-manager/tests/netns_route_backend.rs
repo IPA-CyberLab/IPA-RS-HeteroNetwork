@@ -2,8 +2,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipars_route_manager::{
-    LinuxNetworkNamespace, LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager,
-    RoutePlan, SystemRouteCommandRunner,
+    LinuxNetlinkRouteManager, LinuxNetworkNamespace, LinuxRouteManager,
+    NamespacedLinuxRouteCommandRunner, RouteManager, RoutePlan, SystemRouteCommandRunner,
 };
 use ipars_types::{NodeId, Route};
 
@@ -64,6 +64,67 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
             "route",
             "show",
             "198.51.100.0/24",
+        ],
+    )?;
+    assert!(route_after_remove.trim().is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_namespace(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping netns integration test; set IPARS_RUN_NETNS_TESTS=1 to run it");
+        return Ok(());
+    }
+
+    let namespace_name = unique_namespace_name()?;
+    let _guard = NamespaceGuard::create(namespace_name.clone())?;
+    command(
+        "ip",
+        ["-n", namespace_name.as_str(), "link", "set", "lo", "up"],
+    )?;
+
+    let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
+    let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
+    let plan = RoutePlan {
+        interface: "lo".to_string(),
+        routes: vec![Route {
+            id: "netns-netlink-smoke".to_string(),
+            cidr: "198.51.101.0/24".parse()?,
+            advertised_by: NodeId::from_string("peer-netns"),
+            via: None,
+            metric: 78,
+            tags: Default::default(),
+        }],
+        policy_rules: Vec::new(),
+    };
+
+    manager.apply_routes(plan.clone()).await?;
+    let route_after_apply = command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "route",
+            "show",
+            "198.51.101.0/24",
+        ],
+    )?;
+    assert!(route_after_apply.contains("198.51.101.0/24"));
+    assert!(route_after_apply.contains("dev lo"));
+    assert!(route_after_apply.contains("metric 78"));
+
+    manager.remove_routes(plan).await?;
+    let route_after_remove = command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "route",
+            "show",
+            "198.51.101.0/24",
         ],
     )?;
     assert!(route_after_remove.trim().is_empty());

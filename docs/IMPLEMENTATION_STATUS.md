@@ -36,12 +36,12 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents or Docker Engine API bridge-network discovery, with network name/ID filters, rootless socket discovery, and Docker Compose wiring for rootful bridge deployments.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
-- Selectable current-namespace kernel WireGuard netlink backend for peer-map application, using rtnetlink for interface creation/up state and WireGuard generic netlink for peer upsert/removal without invoking `wg`.
+- Selectable Linux kernel WireGuard netlink backend for peer-map application, using rtnetlink for interface creation/up state and WireGuard generic netlink for peer upsert/removal without invoking `wg`, in either the current namespace or validated `--linux-netns` placement.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
-- Selectable current-namespace Linux route-manager rtnetlink backend for peer-map, Docker, and Kubernetes route plans, including route replacement/removal and policy-rule add/delete without invoking `ip`.
-- Gated Linux network namespace integration smoke test for applying and removing routes through the namespaced route backend.
+- Selectable Linux route-manager rtnetlink backend for peer-map, Docker, and Kubernetes route plans, including route replacement/removal and policy-rule add/delete without invoking `ip`, in either the current namespace or validated `--linux-netns` placement.
+- Gated Linux network namespace integration smoke tests for applying and removing routes through the namespaced command and rtnetlink route backends.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
-- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command execution, and retries without stopping the agent when the control plane is temporarily unavailable.
+- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command and kernel-netlink execution, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Linux command runtime preflight for `iparsd agent` that validates interface names, required `ip`/`wg` commands, `CAP_NET_ADMIN` when host networking will be mutated, and requested `/var/run/netns` namespace placement before starting data-plane application loops.
 - `iparsd agent --runtime-backend dry-run` for peer-map, Docker route, and Kubernetes underlay loops using in-memory WireGuard state and dry-run route application without mutating host networking.
 - Lazy connect and pinning primitives in the agent crate.
@@ -51,8 +51,8 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Runtime backend hardening beyond current Linux command/current-namespace kernel-netlink/dry-run selection and startup preflight.
-- Namespace-aware WireGuard/route netlink placement and privileged integration coverage beyond current current-namespace netlink backends.
+- Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
+- Privileged integration coverage beyond current namespace-aware route rtnetlink smoke tests, especially WireGuard netlink namespace coverage.
 - Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
 - NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.

@@ -1291,60 +1291,90 @@ async fn start_peer_map_sync(
                 .as_deref()
                 .map(LinuxNetworkNamespace::from_name)
                 .transpose()?;
-            if args.wireguard_backend == WireGuardApplyBackend::KernelNetlink && namespace.is_some()
-            {
-                anyhow::bail!(
-                    "--wireguard-backend kernel-netlink currently manages the current network namespace; use --wireguard-backend command with --linux-netns"
-                );
-            }
-            if args.route_backend == RouteApplyBackend::KernelNetlink && namespace.is_some() {
-                anyhow::bail!(
-                    "--route-backend kernel-netlink currently manages the current network namespace; use --route-backend command with --linux-netns"
-                );
-            }
-            if let Some(namespace) = namespace {
-                start_peer_map_sync_with_runners(
-                    args,
-                    runtime,
-                    control_plane_url,
-                    NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
-                    NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
-                )
-                .await
-            } else {
-                match (args.wireguard_backend, args.route_backend) {
-                    (WireGuardApplyBackend::Command, RouteApplyBackend::Command) => {
-                        start_peer_map_sync_with_runners(
-                            args,
-                            runtime,
-                            control_plane_url,
-                            SystemCommandRunner,
+            match (args.wireguard_backend, args.route_backend, namespace) {
+                (WireGuardApplyBackend::Command, RouteApplyBackend::Command, Some(namespace)) => {
+                    start_peer_map_sync_with_runners(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
+                        NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::Command, RouteApplyBackend::Command, None) => {
+                    start_peer_map_sync_with_runners(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        SystemCommandRunner,
+                        SystemRouteCommandRunner,
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::Command,
+                    RouteApplyBackend::KernelNetlink,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_command_wireguard_netlink_routes(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
+                        Some(namespace),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::Command, RouteApplyBackend::KernelNetlink, None) => {
+                    start_peer_map_sync_with_command_wireguard_netlink_routes(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        SystemCommandRunner,
+                        None,
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::KernelNetlink,
+                    RouteApplyBackend::Command,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_kernel_wireguard(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        NamespacedLinuxRouteCommandRunner::new(
+                            namespace.clone(),
                             SystemRouteCommandRunner,
-                        )
-                        .await
-                    }
-                    (WireGuardApplyBackend::Command, RouteApplyBackend::KernelNetlink) => {
-                        start_peer_map_sync_with_command_wireguard_netlink_routes(
-                            args,
-                            runtime,
-                            control_plane_url,
-                            SystemCommandRunner,
-                        )
-                        .await
-                    }
-                    (WireGuardApplyBackend::KernelNetlink, RouteApplyBackend::Command) => {
-                        start_peer_map_sync_with_kernel_wireguard(
-                            args,
-                            runtime,
-                            control_plane_url,
-                            SystemRouteCommandRunner,
-                        )
-                        .await
-                    }
-                    (WireGuardApplyBackend::KernelNetlink, RouteApplyBackend::KernelNetlink) => {
-                        start_peer_map_sync_with_kernel_backends(args, runtime, control_plane_url)
-                            .await
-                    }
+                        ),
+                        Some(namespace),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::KernelNetlink, RouteApplyBackend::Command, None) => {
+                    start_peer_map_sync_with_kernel_wireguard(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        SystemRouteCommandRunner,
+                        None,
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::KernelNetlink,
+                    RouteApplyBackend::KernelNetlink,
+                    namespace,
+                ) => {
+                    start_peer_map_sync_with_kernel_backends(
+                        args,
+                        runtime,
+                        control_plane_url,
+                        namespace,
+                    )
+                    .await
                 }
             }
         }
@@ -1612,19 +1642,25 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
                 .as_deref()
                 .map(LinuxNetworkNamespace::from_name)
                 .transpose()?;
-            if args.route_backend == RouteApplyBackend::KernelNetlink && namespace.is_some() {
-                anyhow::bail!(
-                    "--route-backend kernel-netlink currently manages the current network namespace; use --route-backend command with --linux-netns"
-                );
-            }
             if let Some(namespace) = namespace {
-                let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
-                    namespace,
-                    SystemRouteCommandRunner,
-                ));
-                Ok(tokio::spawn(async move {
-                    run_docker_route_loop(manager, source, interval).await;
-                }))
+                match args.route_backend {
+                    RouteApplyBackend::Command => {
+                        let manager =
+                            LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                                namespace,
+                                SystemRouteCommandRunner,
+                            ));
+                        Ok(tokio::spawn(async move {
+                            run_docker_route_loop(manager, source, interval).await;
+                        }))
+                    }
+                    RouteApplyBackend::KernelNetlink => {
+                        let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
+                        Ok(tokio::spawn(async move {
+                            run_docker_route_loop(manager, source, interval).await;
+                        }))
+                    }
+                }
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
@@ -1722,19 +1758,25 @@ async fn start_kubernetes_underlay_routes(
                 .as_deref()
                 .map(LinuxNetworkNamespace::from_name)
                 .transpose()?;
-            if args.route_backend == RouteApplyBackend::KernelNetlink && namespace.is_some() {
-                anyhow::bail!(
-                    "--route-backend kernel-netlink currently manages the current network namespace; use --route-backend command with --linux-netns"
-                );
-            }
             if let Some(namespace) = namespace {
-                let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
-                    namespace,
-                    SystemRouteCommandRunner,
-                ));
-                Ok(tokio::spawn(async move {
-                    run_kubernetes_underlay_route_loop(manager, source, interval).await;
-                }))
+                match args.route_backend {
+                    RouteApplyBackend::Command => {
+                        let manager =
+                            LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                                namespace,
+                                SystemRouteCommandRunner,
+                            ));
+                        Ok(tokio::spawn(async move {
+                            run_kubernetes_underlay_route_loop(manager, source, interval).await;
+                        }))
+                    }
+                    RouteApplyBackend::KernelNetlink => {
+                        let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
+                        Ok(tokio::spawn(async move {
+                            run_kubernetes_underlay_route_loop(manager, source, interval).await;
+                        }))
+                    }
+                }
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
@@ -2161,11 +2203,12 @@ async fn start_peer_map_sync_with_kernel_wireguard<R>(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     route_runner: R,
+    namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>>
 where
     R: LinuxRouteCommandRunner + 'static,
 {
-    let wireguard = KernelWireGuardBackend::new(args.wireguard_interface.clone());
+    let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace);
     wireguard.ensure_interface().await?;
     let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
@@ -2190,13 +2233,14 @@ async fn start_peer_map_sync_with_command_wireguard_netlink_routes<W>(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     wireguard_runner: W,
+    namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>>
 where
     W: LinuxCommandRunner + 'static,
 {
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
-    let route_manager = LinuxNetlinkRouteManager::new();
+    let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
     tracing::info!(
@@ -2218,10 +2262,11 @@ async fn start_peer_map_sync_with_kernel_backends(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
+    namespace: Option<LinuxNetworkNamespace>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let wireguard = KernelWireGuardBackend::new(args.wireguard_interface.clone());
+    let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace.clone());
     wireguard.ensure_interface().await?;
-    let route_manager = LinuxNetlinkRouteManager::new();
+    let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
     tracing::info!(
@@ -2237,6 +2282,25 @@ async fn start_peer_map_sync_with_kernel_backends(
         control_plane_url,
         applier,
     ))
+}
+
+fn kernel_wireguard_backend(
+    interface: String,
+    namespace: Option<LinuxNetworkNamespace>,
+) -> KernelWireGuardBackend {
+    match namespace {
+        Some(namespace) => KernelWireGuardBackend::new_in_namespace(interface, namespace),
+        None => KernelWireGuardBackend::new(interface),
+    }
+}
+
+fn linux_netlink_route_manager(
+    namespace: Option<LinuxNetworkNamespace>,
+) -> LinuxNetlinkRouteManager {
+    match namespace {
+        Some(namespace) => LinuxNetlinkRouteManager::new_in_namespace(namespace),
+        None => LinuxNetlinkRouteManager::new(),
+    }
 }
 
 fn configure_peer_map_endpoint_resolver<W, R>(
@@ -3928,6 +3992,34 @@ mod tests {
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_allows_namespaced_full_kernel_netlink_without_ip_or_wg_commands(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--linux-netns",
+            "node-a",
+            "--wireguard-backend",
+            "kernel-netlink",
+            "--route-backend",
+            "kernel-netlink",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(needs.cap_net_admin);
+            assert!(needs.linux_netns);
             return Ok(());
         }
 

@@ -13,7 +13,10 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram;
-use ipars_route_manager::{LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan};
+use ipars_route_manager::{
+    with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
+    RouteManagerError, RoutePlan,
+};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
     AgentMetricsResponse, AgentRelayForwarderMetrics, AgentStatusResponse, PathStateCount, PeerMap,
@@ -946,6 +949,7 @@ where
 #[derive(Debug)]
 pub struct KernelWireGuardBackend {
     interface: String,
+    namespace: Option<LinuxNetworkNamespace>,
     peer_public_keys: tokio::sync::RwLock<BTreeMap<NodeId, [u8; 32]>>,
 }
 
@@ -953,16 +957,36 @@ impl KernelWireGuardBackend {
     pub fn new(interface: impl Into<String>) -> Self {
         Self {
             interface: interface.into(),
+            namespace: None,
             peer_public_keys: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
+    pub fn new_in_namespace(
+        interface: impl Into<String>,
+        namespace: LinuxNetworkNamespace,
+    ) -> Self {
+        Self {
+            interface: interface.into(),
+            namespace: Some(namespace),
+            peer_public_keys: tokio::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn namespace(&self) -> Option<&LinuxNetworkNamespace> {
+        self.namespace.as_ref()
+    }
+
     #[cfg(target_os = "linux")]
     pub async fn ensure_interface(&self) -> Result<(), AgentError> {
-        let (connection, handle, _) = rtnetlink::new_connection().map_err(|error| {
+        let (connection, handle, _) = with_netlink_namespace(self.namespace.as_ref(), || {
+            rtnetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+        })
+        .map_err(|error| {
             AgentError::WireGuard(format!(
-                "failed to open route netlink connection for WireGuard interface {}: {error}",
-                self.interface
+                "failed to open route netlink connection for WireGuard interface {}{}: {error}",
+                self.interface,
+                wireguard_namespace_suffix(self.namespace.as_ref())
             ))
         })?;
         tokio::spawn(connection);
@@ -1019,8 +1043,12 @@ impl WireGuardBackend for KernelWireGuardBackend {
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
         let public_key = parse_wireguard_public_key(&config.public_key)?;
         let peer = netlink_peer_config(&config, public_key)?;
-        apply_wireguard_netlink(&self.interface, vec![WireguardAttribute::Peers(vec![peer])])
-            .await?;
+        apply_wireguard_netlink(
+            &self.interface,
+            self.namespace.as_ref(),
+            vec![WireguardAttribute::Peers(vec![peer])],
+        )
+        .await?;
         self.peer_public_keys
             .write()
             .await
@@ -1038,6 +1066,7 @@ impl WireGuardBackend for KernelWireGuardBackend {
             .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
         apply_wireguard_netlink(
             &self.interface,
+            self.namespace.as_ref(),
             vec![WireguardAttribute::Peers(vec![WireguardPeer(vec![
                 WireguardPeerAttribute::PublicKey(public_key),
                 WireguardPeerAttribute::Flags(WireguardPeerFlags::RemoveMe),
@@ -1077,6 +1106,13 @@ async fn find_link_index(
         ))
     })?;
     Ok(link.map(|link| link.header.index))
+}
+
+#[cfg(target_os = "linux")]
+fn wireguard_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> String {
+    namespace
+        .map(|namespace| format!(" in linux network namespace `{}`", namespace.name()))
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]
@@ -1143,12 +1179,17 @@ fn netlink_allowed_ips(allowed_ips: &[String]) -> Result<Vec<WireguardAllowedIp>
 #[cfg(target_os = "linux")]
 async fn apply_wireguard_netlink(
     interface: &str,
+    namespace: Option<&LinuxNetworkNamespace>,
     mut attributes: Vec<WireguardAttribute>,
 ) -> Result<(), AgentError> {
     attributes.insert(0, WireguardAttribute::IfName(interface.to_string()));
-    let (connection, mut handle, _) = genetlink::new_connection().map_err(|error| {
+    let (connection, mut handle, _) = with_netlink_namespace(namespace, || {
+        genetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+    })
+    .map_err(|error| {
         AgentError::WireGuard(format!(
-            "failed to open generic netlink connection for WireGuard interface {interface}: {error}"
+            "failed to open generic netlink connection for WireGuard interface {interface}{}: {error}",
+            wireguard_namespace_suffix(namespace)
         ))
     })?;
     tokio::spawn(connection);
@@ -2223,6 +2264,16 @@ mod tests {
                 LinuxCommand::new("ip", ["link", "set", "up", "dev", "ipars0"]),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_wireguard_backend_tracks_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let backend = KernelWireGuardBackend::new_in_namespace("ipars0", namespace.clone());
+
+        assert_eq!(backend.namespace(), Some(&namespace));
+        assert_eq!(KernelWireGuardBackend::new("ipars0").namespace(), None);
         Ok(())
     }
 

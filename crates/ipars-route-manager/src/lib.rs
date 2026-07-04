@@ -1,11 +1,18 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::Command;
+use std::task::{ready, Context, Poll};
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use ipars_types::{NodeId, Route};
 use ipnet::IpNet;
+use netlink_sys::{AsyncSocket, Socket, SocketAddr};
+use nix::sched::CloneFlags;
 use rtnetlink::packet_route::{
     route::RouteMessage,
     rule::{RuleAction, RuleAttribute, RuleMessage},
@@ -13,6 +20,7 @@ use rtnetlink::packet_route::{
 };
 use rtnetlink::{Handle, RouteMessageBuilder};
 use thiserror::Error;
+use tokio::io::unix::AsyncFd;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -60,6 +68,10 @@ impl LinuxNetworkNamespace {
         &self.name
     }
 
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from("/var/run/netns").join(&self.name)
+    }
+
     pub fn wrap_program_args(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
         let mut wrapped = Vec::with_capacity(args.len() + 4);
         wrapped.push("netns".to_string());
@@ -77,6 +89,174 @@ fn is_valid_namespace_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+thread_local! {
+    static NETLINK_NAMESPACE: RefCell<Option<LinuxNetworkNamespace>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug)]
+struct NetlinkNamespaceGuard {
+    previous: Option<LinuxNetworkNamespace>,
+}
+
+impl Drop for NetlinkNamespaceGuard {
+    fn drop(&mut self) {
+        NETLINK_NAMESPACE.with(|namespace| {
+            namespace.replace(self.previous.take());
+        });
+    }
+}
+
+pub fn with_netlink_namespace<T>(
+    namespace: Option<&LinuxNetworkNamespace>,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let previous = NETLINK_NAMESPACE.with(|current| current.replace(namespace.cloned()));
+    let _guard = NetlinkNamespaceGuard { previous };
+    operation()
+}
+
+#[derive(Debug)]
+pub struct LinuxNetlinkSocket {
+    socket: AsyncFd<Socket>,
+}
+
+impl LinuxNetlinkSocket {
+    pub fn from_socket(socket: Socket) -> io::Result<Self> {
+        socket.set_non_blocking(true)?;
+        Ok(Self {
+            socket: AsyncFd::new(socket)?,
+        })
+    }
+}
+
+impl AsyncSocket for LinuxNetlinkSocket {
+    fn socket_ref(&self) -> &Socket {
+        self.socket.get_ref()
+    }
+
+    fn socket_mut(&mut self) -> &mut Socket {
+        self.socket.get_mut()
+    }
+
+    fn new(protocol: isize) -> io::Result<Self> {
+        let namespace = NETLINK_NAMESPACE.with(|current| current.borrow().clone());
+        let socket = match namespace {
+            Some(namespace) => open_netlink_socket_in_namespace(protocol, &namespace)?,
+            None => Socket::new(protocol)?,
+        };
+        Self::from_socket(socket)
+    }
+
+    fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.socket.poll_write_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().send(buf, 0)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.socket.poll_write_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().send_to(buf, addr, 0)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_recv<B>(&self, cx: &mut Context<'_>, buf: &mut B) -> Poll<io::Result<()>>
+    where
+        B: bytes::BufMut,
+    {
+        loop {
+            let mut guard = ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().recv(buf, 0)) {
+                Ok(result) => return Poll::Ready(result.map(|_| ())),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_recv_from<B>(&self, cx: &mut Context<'_>, buf: &mut B) -> Poll<io::Result<SocketAddr>>
+    where
+        B: bytes::BufMut,
+    {
+        loop {
+            let mut guard = ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().recv_from(buf, 0)) {
+                Ok(result) => return Poll::Ready(result.map(|(_len, addr)| addr)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_recv_from_full(&self, cx: &mut Context<'_>) -> Poll<io::Result<(Vec<u8>, SocketAddr)>> {
+        loop {
+            let mut guard = ready!(self.socket.poll_read_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().recv_from_full()) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+fn open_netlink_socket_in_namespace(
+    protocol: isize,
+    namespace: &LinuxNetworkNamespace,
+) -> io::Result<Socket> {
+    let current_namespace = open_current_thread_netns()?;
+    let namespace_path = namespace.path();
+    let target_namespace = File::open(&namespace_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open linux network namespace `{}` at {}: {error}",
+                namespace.name(),
+                namespace_path.display()
+            ),
+        )
+    })?;
+
+    nix::sched::setns(&target_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from)?;
+    let socket = Socket::new(protocol);
+    let restore =
+        nix::sched::setns(&current_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from);
+
+    match (socket, restore) {
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(socket), Ok(())) => Ok(socket),
+    }
+}
+
+fn open_current_thread_netns() -> io::Result<File> {
+    File::open("/proc/thread-self/ns/net").or_else(|thread_self_error| {
+        File::open("/proc/self/ns/net").map_err(|self_error| {
+            io::Error::new(
+                self_error.kind(),
+                format!(
+                    "failed to open current thread network namespace at /proc/thread-self/ns/net ({thread_self_error}) or /proc/self/ns/net ({self_error})"
+                ),
+            )
+        })
+    })
+}
+
+fn netlink_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> String {
+    namespace
+        .map(|namespace| format!(" in linux network namespace `{}`", namespace.name()))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,16 +569,34 @@ where
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct LinuxNetlinkRouteManager;
+pub struct LinuxNetlinkRouteManager {
+    namespace: Option<LinuxNetworkNamespace>,
+}
 
 impl LinuxNetlinkRouteManager {
     pub fn new() -> Self {
-        Self
+        Self { namespace: None }
     }
 
-    async fn open_handle() -> Result<Handle, RouteManagerError> {
-        let (connection, handle, _) = rtnetlink::new_connection().map_err(|error| {
-            RouteManagerError::Backend(format!("failed to open route netlink connection: {error}"))
+    pub fn new_in_namespace(namespace: LinuxNetworkNamespace) -> Self {
+        Self {
+            namespace: Some(namespace),
+        }
+    }
+
+    pub fn namespace(&self) -> Option<&LinuxNetworkNamespace> {
+        self.namespace.as_ref()
+    }
+
+    async fn open_handle(&self) -> Result<Handle, RouteManagerError> {
+        let (connection, handle, _) = with_netlink_namespace(self.namespace.as_ref(), || {
+            rtnetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+        })
+        .map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "failed to open route netlink connection{}: {error}",
+                netlink_namespace_suffix(self.namespace.as_ref())
+            ))
         })?;
         tokio::spawn(connection);
         Ok(handle)
@@ -492,7 +690,7 @@ impl LinuxNetlinkRouteManager {
 #[async_trait]
 impl RouteManager for LinuxNetlinkRouteManager {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
-        let handle = Self::open_handle().await?;
+        let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for table in LinuxRouteManager::<SystemRouteCommandRunner>::route_tables(&plan) {
             for route in &plan.routes {
@@ -507,7 +705,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
     }
 
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
-        let handle = Self::open_handle().await?;
+        let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for rule in &plan.policy_rules {
             Self::delete_rule(&handle, rule).await?;
@@ -714,6 +912,10 @@ mod tests {
         let namespace = LinuxNetworkNamespace::from_name("node-a_1.prod")?;
 
         assert_eq!(namespace.name(), "node-a_1.prod");
+        assert_eq!(
+            namespace.path(),
+            PathBuf::from("/var/run/netns/node-a_1.prod")
+        );
         assert!(matches!(
             LinuxNetworkNamespace::from_name(""),
             Err(RouteManagerError::InvalidNamespace(name)) if name.is_empty()
@@ -726,6 +928,16 @@ mod tests {
             LinuxNetworkNamespace::from_name("node a"),
             Err(RouteManagerError::InvalidNamespace(name)) if name == "node a"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn linux_netlink_route_manager_tracks_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace.clone());
+
+        assert_eq!(manager.namespace(), Some(&namespace));
+        assert_eq!(LinuxNetlinkRouteManager::new().namespace(), None);
         Ok(())
     }
 
