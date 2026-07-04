@@ -1111,6 +1111,34 @@ pub mod api {
         pub pinned: bool,
     }
 
+    fn default_policy_allowed() -> bool {
+        true
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentPathProbeRequest {
+        pub peer: NodeId,
+        pub selected_state: PathState,
+        #[serde(default)]
+        pub selected_candidate: Option<EndpointCandidate>,
+        #[serde(default)]
+        pub relay_node: Option<NodeId>,
+        #[serde(default)]
+        pub metrics: PathMetrics,
+        #[serde(default = "default_policy_allowed")]
+        pub policy_allowed: bool,
+        #[serde(default)]
+        pub cost: u32,
+        #[serde(default)]
+        pub pin: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentPathProbeResponse {
+        pub path: PathRecord,
+        pub recorded_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum AgentPacketFlowMatchKind {

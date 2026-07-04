@@ -87,7 +87,7 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 - Kubernetes/API/service exposure needs an underlay path
 - an operator runs an explicit path probe
 
-The agent runtime records peer activity through typed peer-activity and packet-flow APIs so packet detectors, probes, or operators can mark a peer active and optionally pin it. Packet-flow observations resolve the destination IP against the latest peer VPN IPs and advertised routes, using peer VPN IP matches before longest-prefix route matches, and can carry optional source IP, protocol, source/destination ports, and detector metadata for audit/debug output. The daemon can poll Linux conntrack procfs tables with `--packet-flow-detector proc-net-conntrack`, dump the conntrack table through `NETLINK_NETFILTER` with `--packet-flow-detector conntrack-netlink`, or subscribe to conntrack NEW/UPDATE multicast events with `--packet-flow-detector conntrack-netlink-events`, then feed observed destination addresses plus conntrack tuple metadata into the same resolver. Signal path negotiation and peer-map application operate only on active peers, policy-pinned peers, relay-capable peers, and route providers. Idle unpinned peers close after a configurable timeout and are removed from WireGuard and relay-forwarder runtime state; pinned peers stay connected by role, tag, route ownership, relay capability, path pinning, or explicit activity pinning.
+The agent runtime records peer activity through typed peer-activity and packet-flow APIs so packet detectors, probes, or operators can mark a peer active and optionally pin it. `POST /v1/path-probe` records operator or probe results as a pair-scoped `PathRecord` with the selected path state, selected candidate, relay node, recalculated `PathScore` from measured latency/loss/jitter/relay load/stability plus policy/cost, and optional path pin. Packet-flow observations resolve the destination IP against the latest peer VPN IPs and advertised routes, using peer VPN IP matches before longest-prefix route matches, and can carry optional source IP, protocol, source/destination ports, and detector metadata for audit/debug output. The daemon can poll Linux conntrack procfs tables with `--packet-flow-detector proc-net-conntrack`, dump the conntrack table through `NETLINK_NETFILTER` with `--packet-flow-detector conntrack-netlink`, or subscribe to conntrack NEW/UPDATE multicast events with `--packet-flow-detector conntrack-netlink-events`, then feed observed destination addresses plus conntrack tuple metadata into the same resolver. Signal path negotiation and peer-map application operate only on active peers, policy-pinned peers, relay-capable peers, and route providers. Idle unpinned peers close after a configurable timeout and are removed from WireGuard and relay-forwarder runtime state; pinned peers stay connected by role, tag, route ownership, relay capability, path pinning, or explicit activity pinning.
 
 ## NAT Traversal
 
@@ -211,6 +211,7 @@ Initial agent HTTP routes:
 - `GET /v1/metrics`
 - `GET /v1/paths`
 - `GET /v1/path-events`
+- `POST /v1/path-probe`
 - `POST /v1/stun-probe`
 - `POST /v1/nat-classification`
 - `POST /v1/peer-activity`

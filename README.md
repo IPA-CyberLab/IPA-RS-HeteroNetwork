@@ -19,7 +19,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoints with ordered failover
-- persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`
+- persistent agent node state, agent status/path/path-probe/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery with ordered failover
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying across known control-plane endpoints
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates across known signal endpoints

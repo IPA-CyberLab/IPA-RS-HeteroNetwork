@@ -9,9 +9,9 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime};
 use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
-    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse, AgentPathsResponse,
-    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    AgentStunProbeRequest, AgentStunProbeResponse,
+    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
 };
 use ipars_types::PathState;
 use serde::Serialize;
@@ -41,6 +41,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/metrics", get(metrics))
         .route("/v1/paths", get(paths))
         .route("/v1/path-events", get(path_events))
+        .route("/v1/path-probe", post(path_probe))
         .route("/v1/stun-probe", post(stun_probe))
         .route("/v1/nat-classification", post(nat_classification))
         .route("/v1/peer-activity", post(peer_activity))
@@ -83,6 +84,18 @@ async fn paths(State(state): State<AgentHttpState>) -> Json<AgentPathsResponse> 
         paths: state.runtime.path_state().await,
         generated_at: chrono::Utc::now(),
     })
+}
+
+async fn path_probe(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentPathProbeRequest>,
+) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
+    let recorded_at = chrono::Utc::now();
+    let path = state.runtime.record_path_probe(request, recorded_at).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AgentPathProbeResponse { path, recorded_at }),
+    ))
 }
 
 async fn stun_probe(
@@ -510,8 +523,8 @@ mod tests {
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
     use ipars_types::api::{AgentPacketFlowMatchKind, AgentPacketFlowObservation};
     use ipars_types::{
-        ClusterId, ClusterPolicy, NodeId, NodeRecord, PathRecord, PathScore, PathState,
-        PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+        ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
+        PathState, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -707,6 +720,85 @@ mod tests {
         let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
         assert_eq!(events.events.len(), 1);
         assert_eq!(events.events[0].new_state, PathState::Relay);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_records_path_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local = runtime.state().node_id.clone();
+        let app = router(AgentHttpState::new(runtime));
+        let request = AgentPathProbeRequest {
+            peer: NodeId::from_string("peer-probed"),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: None,
+            relay_node: None,
+            metrics: PathMetrics {
+                latency_ms: Some(35.0),
+                loss_ppm: 100,
+                jitter_ms: Some(4.0),
+                relay_load: None,
+                stability: 0.9,
+            },
+            policy_allowed: true,
+            cost: 25,
+            pin: true,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: AgentPathProbeResponse = serde_json::from_slice(&body)?;
+        assert_eq!(response.path.key.local, local);
+        assert_eq!(response.path.key.remote, request.peer);
+        assert_eq!(response.path.selected_state, PathState::DirectNatTraversal);
+        assert!(response.path.pinned);
+        assert!(response
+            .path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "latency_ms=35.0"));
+
+        let paths_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/paths")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(paths_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(paths_response.into_body(), usize::MAX).await?;
+        let paths: AgentPathsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(paths.paths, vec![response.path.clone()]);
+
+        let events_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/path-events")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(events_response.into_body(), usize::MAX).await?;
+        let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].new_state, PathState::DirectNatTraversal);
         Ok(())
     }
 

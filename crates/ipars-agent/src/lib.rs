@@ -20,8 +20,8 @@ use ipars_route_manager::{
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
     AgentMetricsResponse, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentPacketFlowObservation, AgentRelayForwarderMetrics, AgentStatusResponse,
-    LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
+    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -541,6 +541,29 @@ impl AgentRuntime {
             .await
             .get(&(self.state.node_id.clone(), peer.clone()))
             .cloned()
+    }
+
+    pub async fn record_path_probe(
+        &self,
+        request: AgentPathProbeRequest,
+        recorded_at: DateTime<Utc>,
+    ) -> PathRecord {
+        let path = PathRecord {
+            key: ipars_types::PeerPathKey::new(self.state.node_id.clone(), request.peer),
+            selected_state: request.selected_state,
+            selected_candidate: request.selected_candidate,
+            relay_node: request.relay_node,
+            score: PathScore::calculate(
+                request.selected_state,
+                &request.metrics,
+                request.policy_allowed,
+                request.cost,
+            ),
+            updated_at: recorded_at,
+            pinned: request.pin,
+        };
+        self.upsert_path_state(path.clone()).await;
+        path
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) {
@@ -2132,6 +2155,70 @@ mod tests {
                 state: PathState::DirectPublic,
                 count: 1,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_records_path_probe_metrics_and_pins_peer() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        let metrics = PathMetrics {
+            latency_ms: Some(42.0),
+            loss_ppm: 250,
+            jitter_ms: Some(5.0),
+            relay_load: None,
+            stability: 0.8,
+        };
+        let request = AgentPathProbeRequest {
+            peer: peer.node_id.clone(),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(EndpointCandidate {
+                node_id: peer_id,
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }),
+            relay_node: None,
+            metrics,
+            policy_allowed: true,
+            cost: 10,
+            pin: true,
+        };
+        let path = runtime.record_path_probe(request, Utc::now()).await;
+
+        assert_eq!(path.selected_state, PathState::DirectPublic);
+        assert!(path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "latency_ms=42.0"));
+        assert!(path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "loss_ppm=250"));
+        assert!(path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "jitter_ms=5.0"));
+        assert!(runtime.should_connect_peer(&peer).await);
+        assert_eq!(
+            runtime.path_record_for_peer(&peer.node_id).await,
+            Some(path)
         );
     }
 
