@@ -95,8 +95,16 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
     command:
-      - status
+      - agent
+      - --listen
+      - 0.0.0.0:9780
+      - --state-path
+      - /var/lib/ipars/agent.json
+      - --stun-server
+      - 127.0.0.1:3478
     environment:
       IPARS_ROLE: agent
       IPARS_CONTROL_PLANE_URL: https://control-plane:8443
@@ -106,6 +114,9 @@ services:
       - NET_RAW
     devices:
       - /dev/net/tun:/dev/net/tun
+    volumes:
+      - agent-data:/var/lib/ipars
 
 volumes:
   postgres-data:
+  agent-data:

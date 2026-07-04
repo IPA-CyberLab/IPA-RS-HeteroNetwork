@@ -4,6 +4,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
+use ipars_agent::{AgentRuntime, FileAgentStateStore};
+use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
@@ -31,6 +33,7 @@ enum Command {
     Signal(SignalArgs),
     Stun(StunArgs),
     Relay(RelayArgs),
+    Agent(AgentArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -99,6 +102,22 @@ struct RelayArgs {
     max_mbps: u32,
 }
 
+#[derive(Debug, Args, Clone)]
+struct AgentArgs {
+    #[arg(long, env = "IPARS_AGENT_LISTEN", default_value = "0.0.0.0:9780")]
+    listen: SocketAddr,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_STATE_PATH",
+        default_value = "/var/lib/ipars/agent.json"
+    )]
+    state_path: std::path::PathBuf,
+    #[arg(long, env = "IPARS_AGENT_STUN_SERVER")]
+    stun_server: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:0")]
+    stun_bind: SocketAddr,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -107,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
         Command::Relay(args) => run_relay(args).await,
+        Command::Agent(args) => run_agent(args).await,
     }
 }
 
@@ -221,6 +241,17 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
         serve_router(args.http_listen, relay_router(RelayHttpState::new(service))).await;
     udp_task.abort();
     http_result
+}
+
+async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
+    let store = FileAgentStateStore::new(args.state_path);
+    let state = store.load_or_create(chrono::Utc::now())?;
+    let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+    if let Some(stun_server) = args.stun_server {
+        runtime.probe_stun(args.stun_bind, stun_server).await?;
+    }
+    tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
+    serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -13,8 +13,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 ipnet.workspace = true
+ipars-agent = { path = "../ipars-agent" }
+ipars-agent-http = { path = "../ipars-agent-http" }
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-relay = { path = "../ipars-relay" }

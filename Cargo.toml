@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ipars-agent",
+    "crates/ipars-agent-http",
     "crates/ipars-cli",
     "crates/ipars-control-plane",
     "crates/ipars-control-plane-http",

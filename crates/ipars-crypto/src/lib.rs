@@ -45,6 +45,14 @@ impl IdentityKeyPair {
         }
     }
 
+    pub fn from_signing_key_b64(value: &str) -> Result<Self, CryptoError> {
+        Ok(Self::from_signing_bytes(decode_32(value)?))
+    }
+
+    pub fn signing_key_b64(&self) -> String {
+        encode_bytes(&self.signing_key.to_bytes())
+    }
+
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
     }
@@ -172,5 +180,15 @@ mod tests {
 
         assert_ne!(first.private_key_b64, second.private_key_b64);
         assert_ne!(first.public_key_b64, second.public_key_b64);
+    }
+
+    #[test]
+    fn identity_key_round_trips_from_private_key_b64() -> Result<(), CryptoError> {
+        let key = IdentityKeyPair::generate();
+        let restored = IdentityKeyPair::from_signing_key_b64(&key.signing_key_b64())?;
+
+        assert_eq!(key.node_id(), restored.node_id());
+        assert_eq!(key.public_key_b64(), restored.public_key_b64());
+        Ok(())
     }
 }

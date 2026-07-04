@@ -162,6 +162,12 @@ Initial relay HTTP routes:
 - `GET /v1/status`
 - `POST /v1/sessions`
 
+Initial agent HTTP routes:
+
+- `GET /healthz`
+- `GET /v1/status`
+- `POST /v1/stun-probe`
+
 ## Observability
 
 All daemons emit:

@@ -657,6 +657,27 @@ pub mod api {
         pub left_addr: SocketAddr,
         pub right_addr: SocketAddr,
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentStatusResponse {
+        pub node_id: NodeId,
+        pub identity_public_key: String,
+        pub wireguard_public_key: String,
+        pub candidate_count: usize,
+        pub candidates: Vec<EndpointCandidate>,
+        pub state_updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentStunProbeRequest {
+        pub local_bind: SocketAddr,
+        pub stun_server: SocketAddr,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentStunProbeResponse {
+        pub candidate: EndpointCandidate,
+    }
 }
 
 #[cfg(test)]

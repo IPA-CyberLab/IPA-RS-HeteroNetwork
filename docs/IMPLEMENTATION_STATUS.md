@@ -19,6 +19,7 @@ This file tracks the gap between the requested final system and the current repo
 - Continuous UDP STUN echo loop and `iparsd stun` daemon for public endpoint detection.
 - Relay admission/status HTTP API, opaque UDP forwarding loop, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
+- Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -26,7 +27,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Agent daemon, persistent node state, and real WireGuard/route-manager backends.
+- Real WireGuard/route-manager backends and agent registration/signal-loop wiring.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.

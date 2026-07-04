@@ -966,9 +966,27 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "ipars-crypto",
+ "ipars-stun",
  "ipars-types",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "ipars-agent-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "ipars-agent",
+ "ipars-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -1037,7 +1055,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
+ "ipars-agent",
+ "ipars-agent-http",
  "ipars-control-plane",
  "ipars-control-plane-http",
  "ipars-relay",
