@@ -23,9 +23,13 @@ agent:
 
 serviceExposure:
   enabled: true
+  discoverServices: false
   apiServer: true
+  discoverApiServer: true
   apiServerCidrs: []
   serviceCidrs:
     - 10.96.0.0/12
+  namespaces: []
+  serviceLabelSelector: ""
   routeProviderNodeId: ""
   routeIntervalSeconds: 60

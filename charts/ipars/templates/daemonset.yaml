@@ -41,6 +41,9 @@ spec:
             - --apply-kubernetes-underlay
             - --kubernetes-route-interval-seconds
             - {{ .Values.serviceExposure.routeIntervalSeconds | quote }}
+            {{- if .Values.serviceExposure.discoverServices }}
+            - --kubernetes-discover-services
+            {{- end }}
             {{- range .Values.serviceExposure.apiServerCidrs }}
             - --kubernetes-api-server-cidr
             - {{ . | quote }}
@@ -48,6 +51,14 @@ spec:
             {{- range .Values.serviceExposure.serviceCidrs }}
             - --kubernetes-service-cidr
             - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.serviceExposure.namespaces }}
+            - --kubernetes-namespace
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.serviceExposure.serviceLabelSelector }}
+            - --kubernetes-service-label-selector
+            - {{ .Values.serviceExposure.serviceLabelSelector | quote }}
             {{- end }}
             {{- if .Values.serviceExposure.routeProviderNodeId }}
             - --kubernetes-route-provider
@@ -59,6 +70,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if .Values.serviceExposure.enabled }}
+            - name: IPARS_KUBERNETES_DISCOVER_API_SERVER
+              value: {{ .Values.serviceExposure.discoverApiServer | quote }}
+            {{- end }}
             - name: IPARS_CONTROL_PLANE_URL
               value: {{ .Values.cluster.controlPlaneUrl | quote }}
             - name: IPARS_SIGNAL_URL

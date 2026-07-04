@@ -30,7 +30,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - agent JSON and Prometheus metrics plus bounded structured path-change event export
 - `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to an OpenTelemetry collector
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
-- Kubernetes underlay Service/API route application from Helm-provided CIDRs through the Linux route backend
+- Kubernetes underlay Service/API route application from explicit Helm CIDRs or RBAC-backed Kubernetes API Service discovery through the Linux route backend
 - Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through the Linux route backend
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
@@ -87,6 +87,8 @@ ipars k8s install
 ```
 
 `iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
+
+For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent query the Kubernetes API with its ServiceAccount token, optionally constrained by `--kubernetes-namespace` and `--kubernetes-service-label-selector`, and convert Service cluster IPs plus the in-cluster API server address into overlay host routes. Explicit `--kubernetes-service-cidr` and `--kubernetes-api-server-cidr` values remain supported for static deployments.
 
 Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. `--docker-api-socket` overrides socket placement, otherwise `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, and rootless `$XDG_RUNTIME_DIR/docker.sock` are checked in order. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments.
 

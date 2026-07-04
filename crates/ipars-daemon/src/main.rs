@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +53,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -387,6 +389,36 @@ struct AgentArgs {
     docker_route_interval_seconds: u64,
     #[arg(long, env = "IPARS_KUBERNETES_NODE_NAME")]
     kubernetes_node_name: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_KUBERNETES_DISCOVER_SERVICES",
+        default_value_t = false
+    )]
+    kubernetes_discover_services: bool,
+    #[arg(long, env = "IPARS_KUBERNETES_API_URL")]
+    kubernetes_api_url: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH",
+        default_value = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    )]
+    kubernetes_service_account_token_path: PathBuf,
+    #[arg(long, env = "IPARS_KUBERNETES_CA_CERT_PATH")]
+    kubernetes_ca_cert_path: Option<PathBuf>,
+    #[arg(
+        long = "kubernetes-namespace",
+        env = "IPARS_KUBERNETES_NAMESPACES",
+        value_delimiter = ','
+    )]
+    kubernetes_namespaces: Vec<String>,
+    #[arg(long, env = "IPARS_KUBERNETES_SERVICE_LABEL_SELECTOR")]
+    kubernetes_service_label_selector: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_KUBERNETES_DISCOVER_API_SERVER",
+        default_value_t = true
+    )]
+    kubernetes_discover_api_server: bool,
     #[arg(
         long = "kubernetes-api-server-cidr",
         env = "IPARS_KUBERNETES_API_SERVER_CIDRS",
@@ -1564,7 +1596,7 @@ async fn start_kubernetes_underlay_routes(
     args: &AgentArgs,
     local_node_id: NodeId,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let intent = kubernetes_underlay_intent(args, local_node_id)?;
+    let source = kubernetes_route_source(args, local_node_id)?;
     let interval = Duration::from_secs(args.kubernetes_route_interval_seconds.max(1));
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
@@ -1579,12 +1611,12 @@ async fn start_kubernetes_underlay_routes(
                     SystemRouteCommandRunner,
                 ));
                 Ok(tokio::spawn(async move {
-                    run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+                    run_kubernetes_underlay_route_loop(manager, source, interval).await;
                 }))
             } else {
                 let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
                 Ok(tokio::spawn(async move {
-                    run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+                    run_kubernetes_underlay_route_loop(manager, source, interval).await;
                 }))
             }
         }
@@ -1594,14 +1626,309 @@ async fn start_kubernetes_underlay_routes(
             }
             tracing::info!(
                 backend = args.runtime_backend.as_str(),
-                node_name = %intent.node_name,
+                route_source = source.source_label(),
                 "starting Kubernetes underlay route loop with dry-run runtime backend"
             );
             Ok(tokio::spawn(async move {
-                run_kubernetes_underlay_route_loop(DryRunLinuxRouteManager, intent, interval).await;
+                run_kubernetes_underlay_route_loop(DryRunLinuxRouteManager, source, interval).await;
             }))
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum KubernetesRouteSource {
+    Explicit(KubernetesUnderlayIntent),
+    Api(KubernetesApiRouteDiscovery),
+}
+
+impl KubernetesRouteSource {
+    async fn resolve_intent(&self) -> anyhow::Result<KubernetesUnderlayIntent> {
+        match self {
+            Self::Explicit(intent) => Ok(intent.clone()),
+            Self::Api(discovery) => discovery.discover_intent().await,
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "explicit",
+            Self::Api(_) => "kubernetes-api",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KubernetesApiRouteDiscovery {
+    client: reqwest::Client,
+    api_url: String,
+    namespaces: Vec<String>,
+    service_label_selector: Option<String>,
+    include_api_server: bool,
+    node_name: String,
+    overlay_interface: String,
+    route_provider: NodeId,
+    explicit_api_server_cidrs: Vec<ipnet::IpNet>,
+    explicit_service_cidrs: Vec<ipnet::IpNet>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct KubernetesServiceList {
+    #[serde(default)]
+    items: Vec<KubernetesService>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct KubernetesService {
+    #[serde(default)]
+    spec: KubernetesServiceSpec,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct KubernetesServiceSpec {
+    #[serde(rename = "clusterIP", default)]
+    cluster_ip: Option<String>,
+    #[serde(rename = "clusterIPs", default)]
+    cluster_ips: Vec<String>,
+}
+
+impl KubernetesApiRouteDiscovery {
+    fn new(args: &AgentArgs, local_node_id: NodeId) -> anyhow::Result<Self> {
+        let api_url = kubernetes_api_base_url(
+            args.kubernetes_api_url.as_deref(),
+            std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
+            std::env::var_os("KUBERNETES_SERVICE_PORT").as_deref(),
+        )?;
+        let token = std::fs::read_to_string(&args.kubernetes_service_account_token_path)
+            .with_context(|| {
+                format!(
+                    "failed to read Kubernetes service account token from {}",
+                    args.kubernetes_service_account_token_path.display()
+                )
+            })?;
+        let token = token.trim();
+        if token.is_empty() {
+            anyhow::bail!(
+                "Kubernetes service account token at {} is empty",
+                args.kubernetes_service_account_token_path.display()
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("Kubernetes service account token is not a valid HTTP header value")?,
+        );
+        let ca_cert_path = args
+            .kubernetes_ca_cert_path
+            .clone()
+            .or_else(default_kubernetes_service_account_ca_cert);
+        let mut client = reqwest::Client::builder().default_headers(headers);
+        if let Some(ca_cert_path) = ca_cert_path.as_deref() {
+            let ca = std::fs::read(ca_cert_path).with_context(|| {
+                format!(
+                    "failed to read Kubernetes CA certificate from {}",
+                    ca_cert_path.display()
+                )
+            })?;
+            client = client.add_root_certificate(
+                reqwest::Certificate::from_pem(&ca)
+                    .context("failed to parse Kubernetes CA certificate")?,
+            );
+        }
+        let route_provider = args
+            .kubernetes_route_provider
+            .clone()
+            .map(NodeId::from_string)
+            .unwrap_or(local_node_id);
+        Ok(Self {
+            client: client
+                .build()
+                .context("failed to build Kubernetes API client")?,
+            api_url,
+            namespaces: args.kubernetes_namespaces.clone(),
+            service_label_selector: args.kubernetes_service_label_selector.clone(),
+            include_api_server: args.kubernetes_discover_api_server,
+            node_name: args
+                .kubernetes_node_name
+                .clone()
+                .unwrap_or_else(|| "unknown-node".to_string()),
+            overlay_interface: args.wireguard_interface.clone(),
+            route_provider,
+            explicit_api_server_cidrs: args.kubernetes_api_server_cidrs.clone(),
+            explicit_service_cidrs: args.kubernetes_service_cidrs.clone(),
+        })
+    }
+
+    async fn discover_intent(&self) -> anyhow::Result<KubernetesUnderlayIntent> {
+        let mut service_cidrs = self.explicit_service_cidrs.clone();
+        for namespace in kubernetes_service_namespaces(&self.namespaces) {
+            let services = self.fetch_services(namespace.as_deref()).await?;
+            service_cidrs.extend(kubernetes_service_route_cidrs(&services)?);
+        }
+        service_cidrs.sort();
+        service_cidrs.dedup();
+
+        let mut api_server_cidrs = self.explicit_api_server_cidrs.clone();
+        if self.include_api_server {
+            if let Some(api_server_cidr) = kubernetes_api_server_env_cidr(
+                std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
+            )? {
+                api_server_cidrs.push(api_server_cidr);
+                api_server_cidrs.sort();
+                api_server_cidrs.dedup();
+            }
+        }
+        if api_server_cidrs.is_empty() && service_cidrs.is_empty() {
+            anyhow::bail!("Kubernetes API discovery found no service or API server routes");
+        }
+        Ok(KubernetesUnderlayIntent {
+            node_name: self.node_name.clone(),
+            overlay_interface: self.overlay_interface.clone(),
+            api_server_cidrs,
+            service_cidrs,
+            route_provider: self.route_provider.clone(),
+        })
+    }
+
+    async fn fetch_services(
+        &self,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<KubernetesServiceList> {
+        let mut request = self
+            .client
+            .get(kubernetes_services_url(&self.api_url, namespace));
+        if let Some(selector) = self.service_label_selector.as_deref() {
+            request = request.query(&[("labelSelector", selector)]);
+        }
+        request
+            .send()
+            .await
+            .context("failed to query Kubernetes services")?
+            .error_for_status()
+            .context("Kubernetes services API returned an error")?
+            .json()
+            .await
+            .context("failed to decode Kubernetes services response")
+    }
+}
+
+fn kubernetes_route_source(
+    args: &AgentArgs,
+    local_node_id: NodeId,
+) -> anyhow::Result<KubernetesRouteSource> {
+    if args.kubernetes_discover_services {
+        Ok(KubernetesRouteSource::Api(
+            KubernetesApiRouteDiscovery::new(args, local_node_id)?,
+        ))
+    } else {
+        Ok(KubernetesRouteSource::Explicit(kubernetes_underlay_intent(
+            args,
+            local_node_id,
+        )?))
+    }
+}
+
+fn kubernetes_service_namespaces(namespaces: &[String]) -> Vec<Option<String>> {
+    if namespaces.is_empty() {
+        vec![None]
+    } else {
+        namespaces.iter().cloned().map(Some).collect()
+    }
+}
+
+fn kubernetes_services_url(api_url: &str, namespace: Option<&str>) -> String {
+    let api_url = api_url.trim_end_matches('/');
+    if let Some(namespace) = namespace {
+        format!("{api_url}/api/v1/namespaces/{namespace}/services")
+    } else {
+        format!("{api_url}/api/v1/services")
+    }
+}
+
+fn kubernetes_api_base_url(
+    configured: Option<&str>,
+    service_host: Option<&OsStr>,
+    service_port: Option<&OsStr>,
+) -> anyhow::Result<String> {
+    if let Some(configured) = configured {
+        return Ok(configured.trim_end_matches('/').to_string());
+    }
+    let host = service_host
+        .and_then(OsStr::to_str)
+        .filter(|host| !host.is_empty())
+        .context("--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST")?;
+    let port = service_port
+        .and_then(OsStr::to_str)
+        .filter(|port| !port.is_empty())
+        .unwrap_or("443");
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
+        _ => host.to_string(),
+    };
+    Ok(format!("https://{host}:{port}"))
+}
+
+fn default_kubernetes_service_account_ca_cert() -> Option<PathBuf> {
+    let path = PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+    path.exists().then_some(path)
+}
+
+fn kubernetes_service_route_cidrs(
+    services: &KubernetesServiceList,
+) -> anyhow::Result<Vec<ipnet::IpNet>> {
+    let mut cidrs = Vec::new();
+    for service in &services.items {
+        for cluster_ip in kubernetes_service_cluster_ips(service) {
+            cidrs.push(ip_addr_to_host_cidr(cluster_ip)?);
+        }
+    }
+    cidrs.sort();
+    cidrs.dedup();
+    Ok(cidrs)
+}
+
+fn kubernetes_service_cluster_ips(service: &KubernetesService) -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
+    for value in service
+        .spec
+        .cluster_ips
+        .iter()
+        .chain(service.spec.cluster_ip.iter())
+    {
+        if value == "None" || value.is_empty() {
+            continue;
+        }
+        if let Ok(addr) = value.parse::<IpAddr>() {
+            addresses.push(addr);
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+fn kubernetes_api_server_env_cidr(
+    service_host: Option<&OsStr>,
+) -> anyhow::Result<Option<ipnet::IpNet>> {
+    let Some(host) = service_host.and_then(OsStr::to_str) else {
+        return Ok(None);
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ip_addr_to_host_cidr(
+        host.parse::<IpAddr>()
+            .with_context(|| format!("KUBERNETES_SERVICE_HOST `{host}` is not an IP address"))?,
+    )?))
+}
+
+fn ip_addr_to_host_cidr(addr: IpAddr) -> anyhow::Result<ipnet::IpNet> {
+    let prefix_len = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    ipnet::IpNet::new(addr, prefix_len).context("failed to build host route CIDR")
 }
 
 fn kubernetes_underlay_intent(
@@ -1632,24 +1959,33 @@ fn kubernetes_underlay_intent(
 
 async fn run_kubernetes_underlay_route_loop<M>(
     manager: M,
-    intent: KubernetesUnderlayIntent,
+    source: KubernetesRouteSource,
     interval: Duration,
 ) where
     M: RouteManager + 'static,
 {
     loop {
-        match manager.apply_kubernetes_intent(intent.clone()).await {
-            Ok(plan) => tracing::info!(
-                node_name = %intent.node_name,
-                route_provider = %intent.route_provider,
-                routes = plan.routes.len(),
-                policy_rules = plan.policy_rules.len(),
-                "applied Kubernetes underlay routes"
-            ),
+        match source.resolve_intent().await {
+            Ok(intent) => match manager.apply_kubernetes_intent(intent.clone()).await {
+                Ok(plan) => tracing::info!(
+                    route_source = source.source_label(),
+                    node_name = %intent.node_name,
+                    route_provider = %intent.route_provider,
+                    routes = plan.routes.len(),
+                    policy_rules = plan.policy_rules.len(),
+                    "applied Kubernetes underlay routes"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    route_source = source.source_label(),
+                    node_name = %intent.node_name,
+                    "failed to apply Kubernetes underlay routes; will retry"
+                ),
+            },
             Err(error) => tracing::warn!(
                 %error,
-                node_name = %intent.node_name,
-                "failed to apply Kubernetes underlay routes; will retry"
+                route_source = source.source_label(),
+                "failed to resolve Kubernetes underlay routes; will retry"
             ),
         }
         tokio::time::sleep(interval).await;
@@ -3570,6 +3906,96 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_service_discovery_builds_host_route_cidrs() -> anyhow::Result<()> {
+        let services = KubernetesServiceList {
+            items: vec![
+                kubernetes_service(Some("10.96.0.1"), &[]),
+                kubernetes_service(None, &["10.96.0.20", "10.96.0.20", "fd00::20"]),
+                kubernetes_service(Some("None"), &[]),
+            ],
+        };
+
+        assert_eq!(
+            kubernetes_service_route_cidrs(&services)?,
+            vec![
+                "10.96.0.1/32".parse::<ipnet::IpNet>()?,
+                "10.96.0.20/32".parse::<ipnet::IpNet>()?,
+                "fd00::20/128".parse::<ipnet::IpNet>()?,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_api_discovery_helpers_build_urls_and_api_server_routes() -> anyhow::Result<()> {
+        assert_eq!(
+            kubernetes_api_base_url(
+                None,
+                Some(std::ffi::OsStr::new("10.96.0.1")),
+                Some(std::ffi::OsStr::new("6443")),
+            )?,
+            "https://10.96.0.1:6443"
+        );
+        assert_eq!(
+            kubernetes_api_base_url(None, Some(std::ffi::OsStr::new("fd00::1")), None)?,
+            "https://[fd00::1]:443"
+        );
+        assert_eq!(
+            kubernetes_api_base_url(Some("https://kubernetes.default.svc/"), None, None)?,
+            "https://kubernetes.default.svc"
+        );
+        assert_eq!(
+            kubernetes_services_url("https://10.96.0.1:443", None),
+            "https://10.96.0.1:443/api/v1/services"
+        );
+        assert_eq!(
+            kubernetes_services_url("https://10.96.0.1:443", Some("platform")),
+            "https://10.96.0.1:443/api/v1/namespaces/platform/services"
+        );
+        assert_eq!(
+            kubernetes_api_server_env_cidr(Some(std::ffi::OsStr::new("10.96.0.1")))?,
+            Some("10.96.0.1/32".parse::<ipnet::IpNet>()?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_api_discovery_args_parse_without_explicit_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-services",
+            "--kubernetes-api-url",
+            "https://kubernetes.default.svc",
+            "--kubernetes-namespace",
+            "default",
+            "--kubernetes-service-label-selector",
+            "ipars.io/expose=true",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert!(args.apply_kubernetes_underlay);
+            assert!(args.kubernetes_discover_services);
+            assert!(args.kubernetes_api_server_cidrs.is_empty());
+            assert!(args.kubernetes_service_cidrs.is_empty());
+            assert_eq!(
+                args.kubernetes_api_url.as_deref(),
+                Some("https://kubernetes.default.svc")
+            );
+            assert_eq!(args.kubernetes_namespaces, vec!["default"]);
+            assert_eq!(
+                args.kubernetes_service_label_selector.as_deref(),
+                Some("ipars.io/expose=true")
+            );
+            assert!(args.kubernetes_discover_api_server);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn docker_network_intent_uses_explicit_container_routes() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -3761,6 +4187,15 @@ mod tests {
                         subnet: Some((*subnet).to_string()),
                     })
                     .collect(),
+            },
+        }
+    }
+
+    fn kubernetes_service(cluster_ip: Option<&str>, cluster_ips: &[&str]) -> KubernetesService {
+        KubernetesService {
+            spec: KubernetesServiceSpec {
+                cluster_ip: cluster_ip.map(str::to_string),
+                cluster_ips: cluster_ips.iter().map(|ip| (*ip).to_string()).collect(),
             },
         }
     }
