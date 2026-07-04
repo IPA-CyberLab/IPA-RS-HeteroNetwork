@@ -54,12 +54,14 @@ Linux network namespace integration tests are gated because they create host net
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
 ```
 
-Scale/load harness scenarios run against in-memory control-plane and signal components:
+Scale/load harness scenarios run against in-memory control-plane and signal components by default,
+or against loopback HTTP control-plane/signal endpoints with `--transport http`:
 
 ```bash
 cargo run -p ipars-load -- --scenario three
 cargo run -p ipars-load -- --scenario ten
 cargo run -p ipars-load -- --scenario thousand
+cargo run -p ipars-load -- --transport http --scenario ten
 ```
 
 ## CLI Surface

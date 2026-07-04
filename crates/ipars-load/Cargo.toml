@@ -12,12 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ipnet.workspace = true
 ipars-control-plane = { path = "../ipars-control-plane" }
+ipars-control-plane-http = { path = "../ipars-control-plane-http" }
+ipars-crypto = { path = "../ipars-crypto" }
 ipars-signal = { path = "../ipars-signal" }
+ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-types = { path = "../ipars-types" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

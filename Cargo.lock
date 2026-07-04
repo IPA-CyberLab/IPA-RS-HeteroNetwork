@@ -1084,12 +1084,17 @@ name = "ipars-load"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "ipars-control-plane",
+ "ipars-control-plane-http",
+ "ipars-crypto",
  "ipars-signal",
+ "ipars-signal-http",
  "ipars-types",
  "ipnet",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
