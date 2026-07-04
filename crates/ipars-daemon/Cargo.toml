@@ -20,6 +20,7 @@ ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-signal = { path = "../ipars-signal" }
 ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-store = { path = "../ipars-store" }
+ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }
 tokio.workspace = true
 tracing.workspace = true

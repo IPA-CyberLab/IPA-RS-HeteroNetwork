@@ -995,6 +995,7 @@ dependencies = [
  "ipars-signal",
  "ipars-signal-http",
  "ipars-store",
+ "ipars-stun",
  "ipars-types",
  "ipnet",
  "tokio",

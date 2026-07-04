@@ -5,6 +5,7 @@ use chrono::Utc;
 use ipars_types::{CandidateSource, EndpointCandidate, EndpointCandidateKind, NodeId};
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 #[derive(Debug, Error)]
 pub enum StunError {
@@ -79,6 +80,25 @@ impl EchoStunServer {
             .await?;
         Ok(())
     }
+
+    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+        let mut buffer = [0_u8; 128];
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                packet = self.socket.recv_from(&mut buffer) => {
+                    let (_len, peer) = packet?;
+                    self.socket
+                        .send_to(peer.to_string().as_bytes(), peer)
+                        .await?;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +128,27 @@ mod tests {
         assert_eq!(candidate.kind, EndpointCandidateKind::StunReflexive);
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_ne!(candidate.addr.port(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn echo_server_serves_until_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+        let server = EchoStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+        let candidate = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                server_addr,
+            )
+            .await?;
+        assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
         Ok(())
     }
 }

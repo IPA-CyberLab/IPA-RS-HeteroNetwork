@@ -12,6 +12,7 @@ use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
+use ipars_stun::EchoStunServer;
 use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId};
 
 #[derive(Debug, Parser)]
@@ -26,6 +27,7 @@ struct Cli {
 enum Command {
     ControlPlane(ControlPlaneArgs),
     Signal(SignalArgs),
+    Stun(StunArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -72,12 +74,19 @@ struct SignalArgs {
     disable_relay_fallback: bool,
 }
 
+#[derive(Debug, Args, Clone)]
+struct StunArgs {
+    #[arg(long, env = "IPARS_STUN_LISTEN", default_value = "0.0.0.0:3478")]
+    listen: SocketAddr,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ControlPlane(args) => run_control_plane(args).await,
         Command::Signal(args) => run_signal(args).await,
+        Command::Stun(args) => run_stun(args).await,
     }
 }
 
@@ -153,6 +162,21 @@ async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
     };
     let registry = Arc::new(SignalRegistry::new(policy));
     serve_router(args.listen, signal_router(SignalHttpState::new(registry))).await
+}
+
+async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
+    let server = EchoStunServer::bind(args.listen).await?;
+    let listen = server.local_addr()?;
+    tracing::info!(%listen, "stun listening");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let result = server.serve(shutdown_rx).await;
+    shutdown_task.abort();
+    result?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

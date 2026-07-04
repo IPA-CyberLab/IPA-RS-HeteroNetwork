@@ -55,8 +55,12 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
     command:
-      - status
+      - stun
+      - --listen
+      - 0.0.0.0:3478
     environment:
       IPARS_ROLE: stun
     ports:

@@ -16,6 +16,7 @@ This file tracks the gap between the requested final system and the current repo
 - Control-plane HTTP crate with typed health, join, and peer-map routes backed by the join service.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
+- Continuous UDP STUN echo loop and `iparsd stun` daemon for public endpoint detection.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -23,7 +24,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Long-running daemon binaries for relay, STUN, and agent.
+- Long-running daemon binaries for relay and agent.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.
