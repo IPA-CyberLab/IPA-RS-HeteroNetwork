@@ -38,8 +38,8 @@ use ipars_types::api::{
     AgentMetricsResponse, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
     RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
-    RelayStatusResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
@@ -906,7 +906,9 @@ async fn main() -> anyhow::Result<()> {
         Command::ControlPlane(args) => {
             run_control_plane(args, otel_metrics_enabled, otel_metrics_interval).await
         }
-        Command::Signal(args) => run_signal(args).await,
+        Command::Signal(args) => {
+            run_signal(args, otel_metrics_enabled, otel_metrics_interval).await
+        }
         Command::Stun(args) => run_stun(args).await,
         Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Agent(args) => run_agent(*args, otel_metrics_enabled, otel_metrics_interval).await,
@@ -1022,7 +1024,11 @@ async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
+async fn run_signal(
+    args: SignalArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
     let policy = ClusterPolicy {
         allow_ipv6_direct: !args.disable_ipv6_direct,
         allow_nat_traversal: !args.disable_nat_traversal,
@@ -1032,7 +1038,17 @@ async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
         ..ClusterPolicy::default()
     };
     let registry = Arc::new(SignalRegistry::new(policy));
-    serve_router(args.listen, signal_router(SignalHttpState::new(registry))).await
+    let otel_metrics_task = otel_metrics_enabled.then(|| {
+        start_signal_otel_metrics_export(
+            registry.clone(),
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        )
+    });
+    let result = serve_router(args.listen, signal_router(SignalHttpState::new(registry))).await;
+    if let Some(task) = otel_metrics_task {
+        task.abort();
+    }
+    result
 }
 
 async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
@@ -1155,6 +1171,143 @@ where
                     tracing::warn!(%error, "failed to collect control-plane OTLP metrics")
                 }
             }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SignalOtelSnapshot {
+    node_upsert_count: u64,
+    path_negotiation_count: u64,
+    hole_punch_plan_count: u64,
+}
+
+impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
+    fn from(metrics: &SignalMetricsResponse) -> Self {
+        Self {
+            node_upsert_count: metrics.node_upsert_count,
+            path_negotiation_count: metrics.path_negotiation_count,
+            hole_punch_plan_count: metrics.hole_punch_plan_count,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SignalOtelMetrics {
+    nodes: Gauge<u64>,
+    relay_candidates: Gauge<u64>,
+    nat_classifications: Gauge<u64>,
+    health_reports: Gauge<u64>,
+    stale_health_reports: Gauge<u64>,
+    relay_health_ttl_seconds: Gauge<u64>,
+    node_upserts: Counter<u64>,
+    path_negotiations: Counter<u64>,
+    hole_punch_plans: Counter<u64>,
+}
+
+impl SignalOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.signal");
+        Self {
+            nodes: meter
+                .u64_gauge("ipars.signal.nodes")
+                .with_description("Nodes registered with the signal service.")
+                .build(),
+            relay_candidates: meter
+                .u64_gauge("ipars.signal.relay_candidates")
+                .with_description("Relay candidates available for signal path negotiation.")
+                .build(),
+            nat_classifications: meter
+                .u64_gauge("ipars.signal.nat_classifications")
+                .with_description("Nodes with NAT classification registered in signal.")
+                .build(),
+            health_reports: meter
+                .u64_gauge("ipars.signal.health_reports")
+                .with_description("Signal health reports by state.")
+                .build(),
+            stale_health_reports: meter
+                .u64_gauge("ipars.signal.stale_health_reports")
+                .with_description("Signal health reports older than the relay health TTL.")
+                .build(),
+            relay_health_ttl_seconds: meter
+                .u64_gauge("ipars.signal.relay_health_ttl_seconds")
+                .with_description("Relay health freshness window used by signal.")
+                .build(),
+            node_upserts: meter
+                .u64_counter("ipars.signal.node_upserts")
+                .with_description("Signal node upsert requests handled.")
+                .build(),
+            path_negotiations: meter
+                .u64_counter("ipars.signal.path_negotiations")
+                .with_description("Signal path negotiation requests handled.")
+                .build(),
+            hole_punch_plans: meter
+                .u64_counter("ipars.signal.hole_punch_plans")
+                .with_description("Signal hole-punch plan requests handled.")
+                .build(),
+        }
+    }
+
+    fn record_status(
+        &self,
+        metrics: &SignalMetricsResponse,
+        previous: Option<&SignalOtelSnapshot>,
+    ) {
+        self.nodes.record(metrics.node_count as u64, &[]);
+        self.relay_candidates
+            .record(metrics.relay_candidate_count as u64, &[]);
+        self.nat_classifications
+            .record(metrics.nat_classification_count as u64, &[]);
+        self.stale_health_reports
+            .record(metrics.stale_health_report_count as u64, &[]);
+        self.relay_health_ttl_seconds
+            .record(metrics.relay_health_ttl_seconds, &[]);
+
+        for (state, count) in [
+            (HealthState::Healthy, metrics.healthy_node_count),
+            (HealthState::Degraded, metrics.degraded_node_count),
+            (HealthState::Unhealthy, metrics.unhealthy_node_count),
+        ] {
+            let attrs = [KeyValue::new("state", health_label(state))];
+            self.health_reports.record(count as u64, &attrs);
+        }
+
+        self.node_upserts.add(
+            counter_delta(
+                metrics.node_upsert_count,
+                previous.map(|previous| previous.node_upsert_count),
+            ),
+            &[],
+        );
+        self.path_negotiations.add(
+            counter_delta(
+                metrics.path_negotiation_count,
+                previous.map(|previous| previous.path_negotiation_count),
+            ),
+            &[],
+        );
+        self.hole_punch_plans.add(
+            counter_delta(
+                metrics.hole_punch_plan_count,
+                previous.map(|previous| previous.hole_punch_plan_count),
+            ),
+            &[],
+        );
+    }
+}
+
+fn start_signal_otel_metrics_export(
+    registry: Arc<SignalRegistry>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let metrics = SignalOtelMetrics::new();
+        let mut previous = None;
+        loop {
+            let status = registry.metrics().await;
+            metrics.record_status(&status, previous.as_ref());
+            previous = Some(SignalOtelSnapshot::from(&status));
             tokio::time::sleep(interval).await;
         }
     })

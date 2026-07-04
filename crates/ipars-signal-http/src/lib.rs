@@ -1,17 +1,24 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use ipars_signal::{SignalError, SignalRegistry};
 use ipars_types::api::{
-    SignalHolePunchPlanResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::NodeId;
 use serde::Serialize;
+
+macro_rules! prometheus_line {
+    ($body:expr, $($arg:tt)*) => {{
+        let _ = writeln!($body, $($arg)*);
+    }};
+}
 
 #[derive(Debug, Clone)]
 pub struct SignalHttpState {
@@ -27,6 +34,8 @@ impl SignalHttpState {
 pub fn router(state: SignalHttpState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/v1/metrics", get(metrics))
         .route("/v1/nodes/{node_id}", put(upsert_node))
         .route("/v1/paths/negotiate", post(negotiate))
         .route("/v1/hole-punch/{source}/{target}", get(hole_punch_plan))
@@ -35,6 +44,21 @@ pub fn router(state: SignalHttpState) -> Router {
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn metrics(State(state): State<SignalHttpState>) -> Json<SignalMetricsResponse> {
+    Json(state.registry.metrics().await)
+}
+
+async fn prometheus_metrics(State(state): State<SignalHttpState>) -> impl IntoResponse {
+    let metrics = state.registry.metrics().await;
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_prometheus_metrics(&metrics),
+    )
 }
 
 async fn upsert_node(
@@ -83,6 +107,116 @@ struct HealthResponse {
     status: &'static str,
 }
 
+fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
+    let mut body = String::new();
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_nodes Number of nodes registered with the signal service."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_nodes gauge");
+    prometheus_line!(&mut body, "ipars_signal_nodes {}", metrics.node_count);
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_relay_candidates Number of relay candidates available for signal path negotiation."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_relay_candidates gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_relay_candidates {}",
+        metrics.relay_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_nat_classifications Number of nodes with NAT classification registered in signal."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_nat_classifications gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_nat_classifications {}",
+        metrics.nat_classification_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_health_reports Number of signal health reports stored by state."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_health_reports gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_health_reports{{state=\"healthy\"}} {}",
+        metrics.healthy_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_health_reports{{state=\"degraded\"}} {}",
+        metrics.degraded_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_health_reports{{state=\"unhealthy\"}} {}",
+        metrics.unhealthy_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_stale_health_reports Number of signal health reports older than the relay health TTL."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_stale_health_reports gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_stale_health_reports {}",
+        metrics.stale_health_report_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_node_upserts_total Total signal node upsert requests handled."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_signal_node_upserts_total counter");
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_node_upserts_total {}",
+        metrics.node_upsert_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_path_negotiations_total Total signal path negotiation requests handled."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_negotiations_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_path_negotiations_total {}",
+        metrics.path_negotiation_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_hole_punch_plans_total Total signal hole-punch plan requests handled."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_plans_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_hole_punch_plans_total {}",
+        metrics.hole_punch_plan_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_relay_health_ttl_seconds Relay health freshness window used by signal."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_relay_health_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_relay_health_ttl_seconds {}",
+        metrics.relay_health_ttl_seconds
+    );
+    body
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     Signal(SignalError),
@@ -126,7 +260,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use chrono::Utc;
-    use ipars_types::api::{SignalNodeUpsertRequest, SignalPathRequest, SignalPathResponse};
+    use ipars_types::api::{
+        SignalMetricsResponse, SignalNodeUpsertRequest, SignalPathRequest, SignalPathResponse,
+    };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
         NodeRecord, Role, TokenPolicy, VpnIp,
@@ -191,6 +327,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -216,6 +353,37 @@ mod tests {
             response.preferred_state,
             ipars_types::PathState::DirectPublic
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let metrics: SignalMetricsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(metrics.node_count, 1);
+        assert_eq!(metrics.relay_candidate_count, 0);
+        assert_eq!(metrics.node_upsert_count, 1);
+        assert_eq!(metrics.path_negotiation_count, 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("ipars_signal_nodes 1"));
+        assert!(body.contains("ipars_signal_path_negotiations_total 1"));
         Ok(())
     }
 }

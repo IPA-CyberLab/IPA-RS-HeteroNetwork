@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use ipars_types::api::{
-    SignalHolePunchPlanResponse, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
@@ -24,6 +26,9 @@ pub struct SignalRegistry {
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
+    node_upserts: AtomicU64,
+    path_negotiations: AtomicU64,
+    hole_punch_plans: AtomicU64,
 }
 
 impl SignalRegistry {
@@ -33,6 +38,9 @@ impl SignalRegistry {
             nodes: RwLock::new(BTreeMap::new()),
             nat_classifications: RwLock::new(BTreeMap::new()),
             health: RwLock::new(BTreeMap::new()),
+            node_upserts: AtomicU64::new(0),
+            path_negotiations: AtomicU64::new(0),
+            hole_punch_plans: AtomicU64::new(0),
         }
     }
 
@@ -82,6 +90,7 @@ impl SignalRegistry {
             .write()
             .await
             .insert(node.node_id.clone(), node.clone());
+        self.node_upserts.fetch_add(1, Ordering::Relaxed);
         SignalNodeUpsertResponse {
             node,
             registered_at,
@@ -96,6 +105,7 @@ impl SignalRegistry {
         &self,
         request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
+        self.path_negotiations.fetch_add(1, Ordering::Relaxed);
         let target = self
             .get_node(&request.target)
             .await
@@ -120,6 +130,7 @@ impl SignalRegistry {
         source: NodeId,
         target: NodeId,
     ) -> Result<SignalHolePunchPlanResponse, SignalError> {
+        self.hole_punch_plans.fetch_add(1, Ordering::Relaxed);
         let source_node = self
             .get_node(&source)
             .await
@@ -158,6 +169,57 @@ impl SignalRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    pub async fn metrics(&self) -> SignalMetricsResponse {
+        let nodes = self.nodes.read().await;
+        let nat_classifications = self.nat_classifications.read().await;
+        let health = self.health.read().await;
+        let now = Utc::now();
+        let relay_health_ttl_seconds = self.coordinator.policy.relay_health_ttl_seconds;
+        let mut healthy_node_count = 0;
+        let mut degraded_node_count = 0;
+        let mut unhealthy_node_count = 0;
+        let mut stale_health_report_count = 0;
+
+        for report in health.values() {
+            match report.state {
+                HealthState::Healthy => healthy_node_count += 1,
+                HealthState::Degraded => degraded_node_count += 1,
+                HealthState::Unhealthy => unhealthy_node_count += 1,
+            }
+            if !health_report_is_fresh(report, now, relay_health_ttl_seconds) {
+                stale_health_report_count += 1;
+            }
+        }
+
+        let relay_candidate_count = nodes
+            .values()
+            .filter(|node| {
+                relay_candidate_allowed(
+                    node,
+                    health.get(&node.node_id),
+                    now,
+                    &self.coordinator.policy,
+                )
+            })
+            .count();
+
+        SignalMetricsResponse {
+            node_count: nodes.len(),
+            relay_candidate_count,
+            nat_classification_count: nat_classifications.len(),
+            health_report_count: health.len(),
+            healthy_node_count,
+            degraded_node_count,
+            unhealthy_node_count,
+            stale_health_report_count,
+            node_upsert_count: self.node_upserts.load(Ordering::Relaxed),
+            path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
+            hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
+            relay_health_ttl_seconds,
+            generated_at: now,
+        }
     }
 }
 
@@ -337,6 +399,14 @@ fn relay_health_allows(
     if health.state != HealthState::Healthy {
         return false;
     }
+    health_report_is_fresh(health, now, ttl_seconds)
+}
+
+fn health_report_is_fresh(
+    health: &NodeHealth,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
     match now.signed_duration_since(health.last_seen_at).to_std() {
         Ok(age) => age <= std::time::Duration::from_secs(ttl_seconds),
         Err(_) => true,
@@ -563,6 +633,65 @@ mod tests {
             .await?;
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_metrics_report_signal_state() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            relay_health_ttl_seconds: 30,
+            ..ClusterPolicy::default()
+        });
+        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        source.node_id = NodeId::from_string("node-a");
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat_and_health(
+                source.clone(),
+                Some(relay_preferred_nat()),
+                Some(healthy_health()),
+            )
+            .await;
+        registry
+            .upsert_node_with_nat_and_health(target.clone(), None, Some(healthy_health()))
+            .await;
+        let mut stale = healthy_health();
+        stale.last_seen_at = Utc::now() - chrono::Duration::seconds(60);
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(stale))
+            .await;
+        registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: Some(relay_preferred_nat()),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+        registry
+            .hole_punch_plan(source.node_id.clone(), target.node_id.clone())
+            .await?;
+
+        let stale_metrics = registry.metrics().await;
+        assert_eq!(stale_metrics.node_count, 3);
+        assert_eq!(stale_metrics.relay_candidate_count, 0);
+        assert_eq!(stale_metrics.nat_classification_count, 1);
+        assert_eq!(stale_metrics.health_report_count, 3);
+        assert_eq!(stale_metrics.healthy_node_count, 3);
+        assert_eq!(stale_metrics.stale_health_report_count, 1);
+        assert_eq!(stale_metrics.node_upsert_count, 3);
+        assert_eq!(stale_metrics.path_negotiation_count, 1);
+        assert_eq!(stale_metrics.hole_punch_plan_count, 1);
+        assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await;
+        let fresh_metrics = registry.metrics().await;
+        assert_eq!(fresh_metrics.relay_candidate_count, 1);
+        assert_eq!(fresh_metrics.stale_health_report_count, 0);
+        assert_eq!(fresh_metrics.node_upsert_count, 4);
         Ok(())
     }
 

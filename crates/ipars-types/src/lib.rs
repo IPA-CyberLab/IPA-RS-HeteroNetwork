@@ -913,6 +913,23 @@ pub mod api {
         pub generated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SignalMetricsResponse {
+        pub node_count: usize,
+        pub relay_candidate_count: usize,
+        pub nat_classification_count: usize,
+        pub health_report_count: usize,
+        pub healthy_node_count: usize,
+        pub degraded_node_count: usize,
+        pub unhealthy_node_count: usize,
+        pub stale_health_report_count: usize,
+        pub node_upsert_count: u64,
+        pub path_negotiation_count: u64,
+        pub hole_punch_plan_count: u64,
+        pub relay_health_ttl_seconds: u64,
+        pub generated_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalPathRequest {
         pub source: NodeId,

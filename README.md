@@ -14,7 +14,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, and relay-capability policy before registration
 - typed control-plane HTTP routes for health, join registration, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
-- signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
+- signal registry, typed signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
@@ -30,7 +30,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - agent relay capability advertisement for public nodes with explicit relay endpoint/admission URL settings, still gated by join-token relay policy at control-plane registration
 - relay-aware peer-map application and daemon-supervised per-peer forwarder endpoints with namespace placement checks, capacity limits, dead-task reaping, and restart backoff for active relay sessions
 - agent JSON and Prometheus metrics plus bounded structured path-change event export
-- `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to an OpenTelemetry collector
+- `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to an OpenTelemetry collector across control-plane, signal, relay, and agent components
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - Kubernetes underlay Service/API route application from explicit Helm CIDRs or RBAC-backed Kubernetes API Service discovery through command or kernel netlink Linux route backends
 - Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through command or kernel netlink Linux route backends
@@ -120,6 +120,6 @@ The bundled Docker Compose and Helm examples use plain HTTP between private depl
 
 `ipars docker install` and `ipars k8s install` emit JSON install plans with the manifest path, validation/apply commands, privilege requirements, and exposure/security notes. The Kubernetes plan includes the join-token Secret wiring and optional flags for agent API and relay Service exposure, including Service type and annotation overrides; relay exposure requires the public UDP endpoint and relay admission URL that peers should use.
 
-`iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; control-plane node/path/health gauges, relay dataplane counters, and agent path/relay-forwarder metrics are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls control-plane, relay, and agent snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
+`iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; control-plane node/path/health gauges, signal node/relay/NAT/health/request metrics, relay dataplane counters, and agent path/relay-forwarder metrics are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls control-plane, signal, relay, and agent snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 
 The next production milestone is to extend network-namespace integration tests from route-backend and relay fallback smoke coverage into reproducible NAT topology and full path validation.
