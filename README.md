@@ -20,6 +20,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - persistent agent node state, agent status/STUN probe HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
+- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health and endpoint candidates, retrying on control-plane errors
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`
@@ -52,4 +53,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to wire the agent daemon into signal negotiation, heartbeat reporting, and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to wire the agent daemon into signal negotiation and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

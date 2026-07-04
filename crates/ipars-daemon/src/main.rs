@@ -23,10 +23,13 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
-use ipars_types::api::{JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse};
+use ipars_types::api::{
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse,
+};
 use ipars_types::{
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, KeyId, NodeId, RelayCapability,
-    SignedJoinToken,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, KeyId, NodeHealth, NodeId,
+    RelayCapability, SignedJoinToken,
 };
 
 #[derive(Debug, Parser)]
@@ -138,6 +141,14 @@ struct AgentArgs {
         default_value_t = 30
     )]
     peer_map_poll_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_HEARTBEAT_INTERVAL_SECONDS",
+        default_value_t = 15
+    )]
+    heartbeat_interval_seconds: u64,
+    #[arg(long, env = "IPARS_AGENT_DISABLE_HEARTBEAT", default_value_t = false)]
+    disable_heartbeat: bool,
     #[arg(
         long,
         env = "IPARS_AGENT_WIREGUARD_INTERFACE",
@@ -296,16 +307,32 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
             "registered agent with control plane"
         );
     }
+    let control_plane_base =
+        control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref()).ok();
+    let mut background_tasks = Vec::new();
+    if !args.disable_heartbeat {
+        if let Some(control_plane_url) = control_plane_base.clone() {
+            background_tasks.push(start_heartbeat_reporting(
+                runtime.clone(),
+                control_plane_url,
+                Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
+            ));
+        }
+    }
     let peer_map_task = if args.apply_peer_map {
-        let control_plane_url =
-            control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref())?;
+        let control_plane_url = control_plane_base
+            .clone()
+            .context("control-plane URL is required when --apply-peer-map is set")?;
         Some(start_peer_map_sync(&args, runtime.state().node_id.clone(), control_plane_url).await?)
     } else {
         None
     };
+    if let Some(task) = peer_map_task {
+        background_tasks.push(task);
+    }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     let result = serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await;
-    if let Some(task) = peer_map_task {
+    for task in background_tasks {
         task.abort();
     }
     result
@@ -359,6 +386,74 @@ async fn register_agent(
         .json()
         .await
         .context("failed to decode agent join response")
+}
+
+fn start_heartbeat_reporting(
+    runtime: Arc<AgentRuntime>,
+    control_plane_url: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_heartbeat_loop(runtime, control_plane_url, interval).await;
+    })
+}
+
+async fn run_heartbeat_loop(
+    runtime: Arc<AgentRuntime>,
+    control_plane_url: String,
+    interval: Duration,
+) {
+    let client = reqwest::Client::new();
+    loop {
+        let request = heartbeat_request(runtime.as_ref()).await;
+        match send_heartbeat(&client, &control_plane_url, request).await {
+            Ok(response) => tracing::info!(
+                accepted = response.accepted,
+                policy_version = response.policy_version,
+                peer_delta_available = response.peer_delta_available,
+                "reported agent heartbeat"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to report agent heartbeat; will retry"
+            ),
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn send_heartbeat(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    request: HeartbeatRequest,
+) -> anyhow::Result<HeartbeatResponse> {
+    client
+        .post(heartbeat_url(control_plane_url))
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send heartbeat request")?
+        .error_for_status()
+        .context("control plane rejected heartbeat request")?
+        .json()
+        .await
+        .context("failed to decode heartbeat response")
+}
+
+async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
+    let status = runtime.status().await;
+    HeartbeatRequest {
+        node_id: status.node_id,
+        health: NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: chrono::Utc::now(),
+            latency_ms: None,
+            relay_load: None,
+            message: Some("agent heartbeat".to_string()),
+        },
+        candidates: status.candidates,
+        path_state: Vec::new(),
+    }
 }
 
 async fn run_peer_map_sync_loop<S, A>(
@@ -427,6 +522,10 @@ fn peer_map_url(control_plane_url: &str, node_id: &NodeId) -> String {
     )
 }
 
+fn heartbeat_url(control_plane_url: &str) -> String {
+    format!("{}/v1/heartbeat", control_plane_url.trim_end_matches('/'))
+}
+
 fn control_plane_join_url(
     token: &SignedJoinToken,
     override_url: Option<&str>,
@@ -476,6 +575,7 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
+    use ipars_agent::AgentNodeState;
     use ipars_types::{BootstrapEndpoint, JoinTokenClaims, Role, TokenPolicy};
 
     use super::*;
@@ -518,6 +618,30 @@ mod tests {
             peer_map_url("http://127.0.0.1:8443/", &NodeId::from_string("node-a")),
             "http://127.0.0.1:8443/v1/peers/node-a"
         );
+    }
+
+    #[test]
+    fn heartbeat_url_trims_control_plane_base_url() {
+        assert_eq!(
+            heartbeat_url("http://127.0.0.1:8443/"),
+            "http://127.0.0.1:8443/v1/heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_uses_runtime_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id.clone();
+
+        let request = heartbeat_request(&runtime).await;
+
+        assert_eq!(request.node_id, node_id);
+        assert_eq!(request.health.state, HealthState::Healthy);
+        assert!(request.candidates.is_empty());
+        assert!(request.path_state.is_empty());
     }
 
     #[test]
