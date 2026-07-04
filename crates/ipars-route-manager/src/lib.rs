@@ -532,6 +532,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kubernetes_intent_builds_service_and_api_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let plan = manager
+            .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                node_name: "worker-a".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                api_server_cidrs: vec!["10.0.0.1/32".parse()?],
+                service_cidrs: vec!["10.96.0.0/12".parse()?],
+                route_provider: NodeId::from_string("route-provider-a"),
+            })
+            .await?;
+
+        assert_eq!(plan.interface, "ipars0");
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].id, "k8s-0");
+        assert_eq!(plan.routes[0].cidr, "10.0.0.1/32".parse::<IpNet>()?);
+        assert_eq!(
+            plan.routes[0].via,
+            Some(NodeId::from_string("route-provider-a"))
+        );
+        assert_eq!(plan.routes[1].id, "k8s-1");
+        assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        assert_eq!(plan.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn linux_route_manager_generates_apply_and_remove_commands(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runner = RecordingRunner::default();

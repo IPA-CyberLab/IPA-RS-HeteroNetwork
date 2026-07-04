@@ -21,8 +21,8 @@ use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
-    NamespacedLinuxRouteCommandRunner, SystemRouteCommandRunner,
+    KubernetesUnderlayIntent, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
+    NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
@@ -216,6 +216,34 @@ struct AgentArgs {
     relay_forwarder_bind: Option<SocketAddr>,
     #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT")]
     relay_forwarder_wireguard_endpoint: Option<SocketAddr>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_APPLY_KUBERNETES_UNDERLAY",
+        default_value_t = false
+    )]
+    apply_kubernetes_underlay: bool,
+    #[arg(long, env = "IPARS_KUBERNETES_NODE_NAME")]
+    kubernetes_node_name: Option<String>,
+    #[arg(
+        long = "kubernetes-api-server-cidr",
+        env = "IPARS_KUBERNETES_API_SERVER_CIDRS",
+        value_delimiter = ','
+    )]
+    kubernetes_api_server_cidrs: Vec<ipnet::IpNet>,
+    #[arg(
+        long = "kubernetes-service-cidr",
+        env = "IPARS_KUBERNETES_SERVICE_CIDRS",
+        value_delimiter = ','
+    )]
+    kubernetes_service_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long, env = "IPARS_KUBERNETES_ROUTE_PROVIDER")]
+    kubernetes_route_provider: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_KUBERNETES_ROUTE_INTERVAL_SECONDS",
+        default_value_t = 60
+    )]
+    kubernetes_route_interval_seconds: u64,
 }
 
 #[tokio::main]
@@ -403,6 +431,10 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     if let Some(task) = peer_map_task {
         background_tasks.push(task);
     }
+    if args.apply_kubernetes_underlay {
+        background_tasks
+            .push(start_kubernetes_underlay_routes(&args, runtime.state().node_id.clone()).await?);
+    }
     if !args.disable_signal_registration {
         if let (Some(node), Some(signal_url)) = (registered_node.clone(), signal_base.clone()) {
             background_tasks.push(start_signal_registration(
@@ -472,6 +504,85 @@ async fn start_peer_map_sync(
             SystemRouteCommandRunner,
         )
         .await
+    }
+}
+
+async fn start_kubernetes_underlay_routes(
+    args: &AgentArgs,
+    local_node_id: NodeId,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let namespace = args
+        .linux_netns
+        .as_deref()
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()?;
+    let intent = kubernetes_underlay_intent(args, local_node_id)?;
+    let interval = Duration::from_secs(args.kubernetes_route_interval_seconds.max(1));
+    if let Some(namespace) = namespace {
+        let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+            namespace,
+            SystemRouteCommandRunner,
+        ));
+        Ok(tokio::spawn(async move {
+            run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+        }))
+    } else {
+        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+        Ok(tokio::spawn(async move {
+            run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+        }))
+    }
+}
+
+fn kubernetes_underlay_intent(
+    args: &AgentArgs,
+    local_node_id: NodeId,
+) -> anyhow::Result<KubernetesUnderlayIntent> {
+    if args.kubernetes_api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
+        anyhow::bail!(
+            "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
+        );
+    }
+    let route_provider = args
+        .kubernetes_route_provider
+        .clone()
+        .map(NodeId::from_string)
+        .unwrap_or(local_node_id);
+    Ok(KubernetesUnderlayIntent {
+        node_name: args
+            .kubernetes_node_name
+            .clone()
+            .unwrap_or_else(|| "unknown-node".to_string()),
+        overlay_interface: args.wireguard_interface.clone(),
+        api_server_cidrs: args.kubernetes_api_server_cidrs.clone(),
+        service_cidrs: args.kubernetes_service_cidrs.clone(),
+        route_provider,
+    })
+}
+
+async fn run_kubernetes_underlay_route_loop<R>(
+    manager: LinuxRouteManager<R>,
+    intent: KubernetesUnderlayIntent,
+    interval: Duration,
+) where
+    R: LinuxRouteCommandRunner + 'static,
+{
+    loop {
+        match manager.apply_kubernetes_intent(intent.clone()).await {
+            Ok(plan) => tracing::info!(
+                node_name = %intent.node_name,
+                route_provider = %intent.route_provider,
+                routes = plan.routes.len(),
+                policy_rules = plan.policy_rules.len(),
+                "applied Kubernetes underlay routes"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                node_name = %intent.node_name,
+                "failed to apply Kubernetes underlay routes; will retry"
+            ),
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1467,6 +1578,17 @@ mod tests {
             "127.0.0.1:0",
             "--relay-forwarder-wireguard-endpoint",
             "127.0.0.1:51820",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-node-name",
+            "worker-a",
+            "--kubernetes-api-server-cidr",
+            "10.0.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-route-provider",
+            "route-provider-a",
+            "--kubernetes-route-interval-seconds",
+            "15",
         ])?;
 
         if let Command::Agent(args) = cli.command {
@@ -1484,6 +1606,62 @@ mod tests {
                 args.relay_forwarder_wireguard_endpoint,
                 Some(SocketAddr::from(([127, 0, 0, 1], 51_820)))
             );
+            assert!(args.apply_kubernetes_underlay);
+            assert_eq!(args.kubernetes_node_name.as_deref(), Some("worker-a"));
+            assert_eq!(
+                args.kubernetes_api_server_cidrs,
+                vec!["10.0.0.1/32".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.kubernetes_service_cidrs,
+                vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.kubernetes_route_provider.as_deref(),
+                Some("route-provider-a")
+            );
+            assert_eq!(args.kubernetes_route_interval_seconds, 15);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_intent_uses_local_node_as_default_provider() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-node-name",
+            "worker-a",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let local = NodeId::from_string("local-node");
+            let intent = kubernetes_underlay_intent(&args, local.clone())?;
+            assert_eq!(intent.node_name, "worker-a");
+            assert_eq!(intent.overlay_interface, "ipars0");
+            assert_eq!(intent.route_provider, local);
+            assert!(intent.api_server_cidrs.is_empty());
+            assert_eq!(
+                intent.service_cidrs,
+                vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_intent_requires_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-kubernetes-underlay"])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert!(kubernetes_underlay_intent(&args, NodeId::from_string("local")).is_err());
             return Ok(());
         }
 

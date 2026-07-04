@@ -19,9 +19,46 @@ spec:
         - name: agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/iparsd
           args:
-            - status
+            - agent
+            - --listen
+            - 0.0.0.0:9780
+            - --state-path
+            - /var/lib/ipars/agent.json
+            - --wireguard-interface
+            - {{ .Values.agent.interfaceName | quote }}
+            - --control-plane-url
+            - {{ .Values.cluster.controlPlaneUrl | quote }}
+            - --signal-url
+            - {{ .Values.cluster.signalUrl | quote }}
+            {{- if .Values.cluster.stunEndpoint }}
+            - --stun-server
+            - {{ .Values.cluster.stunEndpoint | quote }}
+            {{- end }}
+            {{- if .Values.serviceExposure.enabled }}
+            - --apply-kubernetes-underlay
+            - --kubernetes-route-interval-seconds
+            - {{ .Values.serviceExposure.routeIntervalSeconds | quote }}
+            {{- range .Values.serviceExposure.apiServerCidrs }}
+            - --kubernetes-api-server-cidr
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.serviceExposure.serviceCidrs }}
+            - --kubernetes-service-cidr
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.serviceExposure.routeProviderNodeId }}
+            - --kubernetes-route-provider
+            - {{ .Values.serviceExposure.routeProviderNodeId | quote }}
+            {{- end }}
+            {{- end }}
           env:
+            - name: IPARS_KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: IPARS_CONTROL_PLANE_URL
               value: {{ .Values.cluster.controlPlaneUrl | quote }}
             - name: IPARS_SIGNAL_URL
@@ -30,7 +67,7 @@ spec:
               value: {{ .Values.cluster.stunEndpoint | quote }}
             - name: IPARS_RELAY_ENDPOINT
               value: {{ .Values.cluster.relayEndpoint | quote }}
-            - name: IPARS_INTERFACE
+            - name: IPARS_AGENT_WIREGUARD_INTERFACE
               value: {{ .Values.agent.interfaceName | quote }}
             - name: IPARS_ROUTE_PROVIDER
               value: {{ .Values.agent.routeProvider | quote }}

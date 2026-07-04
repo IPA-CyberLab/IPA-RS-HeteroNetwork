@@ -6,7 +6,7 @@ image:
 cluster:
   controlPlaneUrl: "https://ipars-control-plane:8443"
   signalUrl: "https://ipars-signal:9443"
-  stunEndpoint: "ipars-stun:3478"
+  stunEndpoint: ""
   relayEndpoint: "ipars-relay:51820"
   relayAdmissionUrl: "https://ipars-relay:9580"
 
@@ -18,6 +18,10 @@ agent:
   privileged: false
 
 serviceExposure:
+  enabled: true
   apiServer: true
+  apiServerCidrs: []
   serviceCidrs:
     - 10.96.0.0/12
+  routeProviderNodeId: ""
+  routeIntervalSeconds: 60

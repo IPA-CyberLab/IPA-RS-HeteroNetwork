@@ -29,6 +29,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - relay-aware peer-map application and daemon-supervised per-peer forwarder endpoints for active relay sessions
 - agent JSON metrics and bounded structured path-change event export
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
+- Kubernetes underlay Service/API route application from Helm-provided CIDRs through the Linux route backend
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution

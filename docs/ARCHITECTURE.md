@@ -135,6 +135,8 @@ This project implements Kubernetes node underlay VPN support and does not claim 
 - optional Service/API Server exposure helpers
 - routing-peer configuration for node-to-node and node-to-service overlay routes
 
+When Kubernetes underlay routing is enabled, the DaemonSet starts `iparsd agent` with explicit Service/API CIDRs and the node name from the Downward API. The agent periodically applies those routes through the Linux route backend, optionally through `ip netns exec`, using either an explicit route-provider node ID or the local node identity.
+
 CNI-owned pod networking remains the responsibility of the cluster CNI.
 
 ## API Schema
