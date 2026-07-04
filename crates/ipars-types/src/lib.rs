@@ -1176,6 +1176,28 @@ pub mod api {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowConntrackStatus {
+        Unreplied,
+        Assured,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowTcpState {
+        SynSent,
+        SynRecv,
+        Established,
+        FinWait,
+        TimeWait,
+        Close,
+        CloseWait,
+        LastAck,
+        Listen,
+        SynSent2,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowRequest {
         pub destination: IpAddr,
@@ -1197,6 +1219,10 @@ pub mod api {
         pub destination_port: Option<u16>,
         #[serde(default)]
         pub detector: Option<String>,
+        #[serde(default)]
+        pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
+        #[serde(default)]
+        pub tcp_state: Option<AgentPacketFlowTcpState>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

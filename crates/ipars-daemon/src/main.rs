@@ -37,12 +37,12 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowDropReason, AgentPacketFlowObservation,
-    AgentRelayForwarderMetrics, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentMetricsResponse, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
+    AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayForwarderMetrics,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
@@ -5032,6 +5032,8 @@ async fn record_packet_flow_observations(
                 protocol = ?observation.protocol,
                 source_port = ?observation.source_port,
                 destination_port = ?observation.destination_port,
+                conntrack_status = ?observation.conntrack_status,
+                tcp_state = ?observation.tcp_state,
                 peer = %matched.peer,
                 kind = ?matched.kind,
                 route = ?matched.route,
@@ -5329,6 +5331,8 @@ struct ConntrackTupleFields {
     protocol: Option<TransportProtocol>,
     source_port: Option<u16>,
     destination_port: Option<u16>,
+    conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
+    tcp_state: Option<AgentPacketFlowTcpState>,
 }
 
 impl ConntrackTupleFields {
@@ -5341,6 +5345,8 @@ impl ConntrackTupleFields {
                 source_port: self.source_port,
                 destination_port: self.destination_port,
                 detector: None,
+                conntrack_status: self.conntrack_status,
+                tcp_state: self.tcp_state,
             },
         })
     }
@@ -5565,9 +5571,18 @@ fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
     let protocol = line
         .split_whitespace()
         .find_map(transport_protocol_from_conntrack_token);
+    let conntrack_status = line
+        .split_whitespace()
+        .filter_map(conntrack_status_from_conntrack_token)
+        .collect::<Vec<_>>();
+    let tcp_state = line
+        .split_whitespace()
+        .find_map(tcp_state_from_conntrack_token);
     let mut flows = Vec::new();
     let mut tuple = ConntrackTupleFields {
         protocol,
+        conntrack_status: conntrack_status.clone(),
+        tcp_state,
         ..ConntrackTupleFields::default()
     };
 
@@ -5579,6 +5594,8 @@ fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
                 }
                 tuple = ConntrackTupleFields {
                     protocol,
+                    conntrack_status: conntrack_status.clone(),
+                    tcp_state,
                     ..ConntrackTupleFields::default()
                 };
             }
@@ -5603,6 +5620,30 @@ fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProto
         "tcp" => Some(TransportProtocol::Tcp),
         "udp" => Some(TransportProtocol::Udp),
         "icmp" | "icmpv6" => Some(TransportProtocol::Icmp),
+        _ => None,
+    }
+}
+
+fn conntrack_status_from_conntrack_token(token: &str) -> Option<AgentPacketFlowConntrackStatus> {
+    match token {
+        "[UNREPLIED]" => Some(AgentPacketFlowConntrackStatus::Unreplied),
+        "[ASSURED]" => Some(AgentPacketFlowConntrackStatus::Assured),
+        _ => None,
+    }
+}
+
+fn tcp_state_from_conntrack_token(token: &str) -> Option<AgentPacketFlowTcpState> {
+    match token {
+        "SYN_SENT" => Some(AgentPacketFlowTcpState::SynSent),
+        "SYN_RECV" => Some(AgentPacketFlowTcpState::SynRecv),
+        "ESTABLISHED" => Some(AgentPacketFlowTcpState::Established),
+        "FIN_WAIT" => Some(AgentPacketFlowTcpState::FinWait),
+        "TIME_WAIT" => Some(AgentPacketFlowTcpState::TimeWait),
+        "CLOSE" => Some(AgentPacketFlowTcpState::Close),
+        "CLOSE_WAIT" => Some(AgentPacketFlowTcpState::CloseWait),
+        "LAST_ACK" => Some(AgentPacketFlowTcpState::LastAck),
+        "LISTEN" => Some(AgentPacketFlowTcpState::Listen),
+        "SYN_SENT2" => Some(AgentPacketFlowTcpState::SynSent2),
         _ => None,
     }
 }
@@ -6757,8 +6798,8 @@ mod tests {
     #[test]
     fn conntrack_parser_extracts_destination_ips() -> anyhow::Result<()> {
         let contents = "\
-ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321
-ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
+ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321 [ASSURED]
+ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 [UNREPLIED] src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
 invalid no-destination-here
 ";
         let flows = parse_conntrack_packet_flows(contents);
@@ -6781,6 +6822,24 @@ invalid no-destination-here
         assert_eq!(first.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(first.observation.source_port, Some(54321));
         assert_eq!(first.observation.destination_port, Some(51820));
+        assert_eq!(
+            first.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            first.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
+        let udp_destination: IpAddr = "fd00::42".parse()?;
+        let udp = flows
+            .iter()
+            .find(|flow| flow.destination == udp_destination)
+            .context("missing udp conntrack flow")?;
+        assert_eq!(
+            udp.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Unreplied]
+        );
+        assert_eq!(udp.observation.tcp_state, None);
         Ok(())
     }
 

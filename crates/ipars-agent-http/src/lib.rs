@@ -564,7 +564,8 @@ mod tests {
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
     use ipars_types::api::{
-        AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
+        AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowMatchKind,
+        AgentPacketFlowObservation, AgentPacketFlowTcpState,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -936,6 +937,8 @@ mod tests {
                             source_port: Some(50_000),
                             destination_port: Some(51820),
                             detector: Some("unit-test".to_string()),
+                            conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
+                            tcp_state: Some(AgentPacketFlowTcpState::Established),
                         },
                     })?))?,
             )
@@ -953,6 +956,14 @@ mod tests {
         assert_eq!(
             packet_flow.observation.detector.as_deref(),
             Some("unit-test")
+        );
+        assert_eq!(
+            packet_flow.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            packet_flow.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
         );
         let matched = packet_flow
             .matched
