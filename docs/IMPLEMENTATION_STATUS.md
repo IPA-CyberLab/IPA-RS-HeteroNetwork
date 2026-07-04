@@ -24,14 +24,14 @@ This file tracks the gap between the requested final system and the current repo
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
-- `iparsd agent --apply-peer-map` startup path that fetches the control-plane peer map and applies it through Linux WireGuard/route backends when explicitly enabled.
+- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through Linux WireGuard/route backends when explicitly enabled, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
 
 ## Remaining For Full Production Completion
 
-- Agent daemon registration, continuous peer-map polling, signal loop, and runtime backend selection.
+- Agent daemon registration, signal loop, and runtime backend selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace execution hardening.
 - Full STUN protocol support and NAT classification.

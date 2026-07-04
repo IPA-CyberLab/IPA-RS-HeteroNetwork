@@ -1,11 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
-    AgentRuntime, FileAgentStateStore, LinuxWireGuardBackend, PeerMapApplier, SystemCommandRunner,
+    AgentError, AgentRuntime, FileAgentStateStore, LinuxWireGuardBackend, PeerMapApplier,
+    PeerMapSink, PeerMapSource, PeerMapSync, SystemCommandRunner,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -124,6 +127,12 @@ struct AgentArgs {
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
     apply_peer_map: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
+        default_value_t = 30
+    )]
+    peer_map_poll_interval_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_WIREGUARD_INTERFACE",
@@ -258,39 +267,102 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
 }
 
 async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
-    let store = FileAgentStateStore::new(args.state_path);
+    let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
     if let Some(stun_server) = args.stun_server {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
-    if args.apply_peer_map {
-        let control_plane_url = args
-            .control_plane_url
-            .as_deref()
-            .context("--control-plane-url is required when --apply-peer-map is set")?;
-        let peer_map = fetch_peer_map(control_plane_url, &runtime.state().node_id).await?;
-        let wireguard =
-            LinuxWireGuardBackend::new(args.wireguard_interface.clone(), SystemCommandRunner);
-        wireguard.ensure_interface().await?;
-        let route_manager = LinuxRouteManager::new(SystemRouteCommandRunner);
-        let applier =
-            PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-        let summary = applier.apply_peer_map(peer_map).await?;
-        tracing::info!(
-            peers_applied = summary.peers_applied,
-            routes_applied = summary.routes_applied,
-            interface = %args.wireguard_interface,
-            "applied control-plane peer map"
-        );
-    }
+    let peer_map_task = if args.apply_peer_map {
+        Some(start_peer_map_sync(&args, runtime.state().node_id.clone()).await?)
+    } else {
+        None
+    };
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
-    serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await
+    let result = serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await;
+    if let Some(task) = peer_map_task {
+        task.abort();
+    }
+    result
 }
 
-async fn fetch_peer_map(control_plane_url: &str, node_id: &NodeId) -> anyhow::Result<PeerMap> {
-    let url = peer_map_url(control_plane_url, node_id);
-    Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
+async fn start_peer_map_sync(
+    args: &AgentArgs,
+    node_id: NodeId,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let control_plane_url = args
+        .control_plane_url
+        .clone()
+        .context("--control-plane-url is required when --apply-peer-map is set")?;
+    let wireguard =
+        LinuxWireGuardBackend::new(args.wireguard_interface.clone(), SystemCommandRunner);
+    wireguard.ensure_interface().await?;
+    let route_manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    let sync = PeerMapSync::new(node_id, HttpPeerMapSource::new(control_plane_url), applier);
+    let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
+    let interface = args.wireguard_interface.clone();
+    Ok(tokio::spawn(async move {
+        run_peer_map_sync_loop(sync, interval, interface).await;
+    }))
+}
+
+async fn run_peer_map_sync_loop<S, A>(
+    sync: PeerMapSync<S, A>,
+    interval: Duration,
+    interface: String,
+) where
+    S: PeerMapSource + 'static,
+    A: PeerMapSink + 'static,
+{
+    loop {
+        match sync.sync_once().await {
+            Ok(summary) => tracing::info!(
+                peers_applied = summary.peers_applied,
+                routes_applied = summary.routes_applied,
+                interface = %interface,
+                "applied control-plane peer map"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                interface = %interface,
+                "failed to apply control-plane peer map; will retry"
+            ),
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpPeerMapSource {
+    control_plane_url: String,
+    client: reqwest::Client,
+}
+
+impl HttpPeerMapSource {
+    fn new(control_plane_url: String) -> Self {
+        Self {
+            control_plane_url,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl PeerMapSource for HttpPeerMapSource {
+    async fn fetch_peer_map(&self, node_id: &NodeId) -> Result<PeerMap, AgentError> {
+        let url = peer_map_url(&self.control_plane_url, node_id);
+        self.client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| AgentError::ControlPlaneClient(error.to_string()))
+    }
 }
 
 fn peer_map_url(control_plane_url: &str, node_id: &NodeId) -> String {

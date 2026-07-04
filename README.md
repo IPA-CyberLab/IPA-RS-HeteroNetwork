@@ -23,7 +23,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
-- `iparsd agent --apply-peer-map` startup hook for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends
+- `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends with retry on control-plane errors
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -51,4 +51,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to wire the agent daemon into registration, continuous peer-map polling, signal negotiation, and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to wire the agent daemon into registration, signal negotiation, and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

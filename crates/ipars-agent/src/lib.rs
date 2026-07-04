@@ -30,6 +30,8 @@ pub enum AgentError {
     RouteManager(#[from] RouteManagerError),
     #[error("route planning error: {0}")]
     RoutePlanning(String),
+    #[error("control-plane client error: {0}")]
+    ControlPlaneClient(String),
     #[error("wireguard backend error: {0}")]
     WireGuard(String),
     #[error("peer path does not exist: {0}")]
@@ -358,6 +360,19 @@ impl WireGuardBackend for MemoryWireGuardBackend {
     }
 }
 
+#[async_trait]
+pub trait PeerMapSource: Send + Sync {
+    async fn fetch_peer_map(&self, node_id: &NodeId) -> Result<PeerMap, AgentError>;
+}
+
+#[async_trait]
+pub trait PeerMapSink: Send + Sync {
+    async fn apply_peer_map_update(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerMapApplySummary {
     pub peers_applied: usize,
@@ -424,6 +439,46 @@ where
             peers_applied,
             routes_applied,
         })
+    }
+}
+
+#[async_trait]
+impl<W, R> PeerMapSink for PeerMapApplier<W, R>
+where
+    W: WireGuardBackend,
+    R: RouteManager,
+{
+    async fn apply_peer_map_update(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError> {
+        self.apply_peer_map(peer_map).await
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerMapSync<S, A> {
+    node_id: NodeId,
+    source: S,
+    sink: A,
+}
+
+impl<S, A> PeerMapSync<S, A>
+where
+    S: PeerMapSource,
+    A: PeerMapSink,
+{
+    pub fn new(node_id: NodeId, source: S, sink: A) -> Self {
+        Self {
+            node_id,
+            source,
+            sink,
+        }
+    }
+
+    pub async fn sync_once(&self) -> Result<PeerMapApplySummary, AgentError> {
+        let peer_map = self.source.fetch_peer_map(&self.node_id).await?;
+        self.sink.apply_peer_map_update(peer_map).await
     }
 }
 
@@ -692,6 +747,63 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct StaticPeerMapSource {
+        expected_node_id: NodeId,
+        peer_map: PeerMap,
+        requests: Arc<tokio::sync::RwLock<Vec<NodeId>>>,
+    }
+
+    impl StaticPeerMapSource {
+        fn new(expected_node_id: NodeId, peer_map: PeerMap) -> Self {
+            Self {
+                expected_node_id,
+                peer_map,
+                requests: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PeerMapSource for StaticPeerMapSource {
+        async fn fetch_peer_map(&self, node_id: &NodeId) -> Result<PeerMap, AgentError> {
+            self.requests.write().await.push(node_id.clone());
+            if node_id == &self.expected_node_id {
+                Ok(self.peer_map.clone())
+            } else {
+                Err(AgentError::ControlPlaneClient(format!(
+                    "unexpected node id {node_id}"
+                )))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingPeerMapSink {
+        summary: PeerMapApplySummary,
+        applied: Arc<tokio::sync::RwLock<Vec<PeerMap>>>,
+    }
+
+    impl RecordingPeerMapSink {
+        fn new(summary: PeerMapApplySummary) -> Self {
+            Self {
+                summary,
+                applied: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PeerMapSink for RecordingPeerMapSink {
+        async fn apply_peer_map_update(
+            &self,
+            peer_map: PeerMap,
+        ) -> Result<PeerMapApplySummary, AgentError> {
+            self.applied.write().await.push(peer_map);
+            Ok(self.summary.clone())
+        }
+    }
+
     #[test]
     fn lazy_manager_keeps_pinned_peers_open() {
         let mut manager = LazyConnectManager::new(ClusterPolicy {
@@ -888,6 +1000,35 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_sync_fetches_and_applies_once() -> Result<(), AgentError> {
+        let node_id = NodeId::from_string("local");
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let source = StaticPeerMapSource::new(node_id.clone(), peer_map.clone());
+        let sink = RecordingPeerMapSink::new(PeerMapApplySummary {
+            peers_applied: 3,
+            routes_applied: 5,
+        });
+        let sync = PeerMapSync::new(node_id.clone(), source.clone(), sink.clone());
+
+        let summary = sync.sync_once().await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 3,
+                routes_applied: 5,
+            }
+        );
+        assert_eq!(source.requests.read().await.as_slice(), &[node_id]);
+        assert_eq!(sink.applied.read().await.as_slice(), &[peer_map]);
         Ok(())
     }
 

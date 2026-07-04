@@ -197,7 +197,7 @@ Critical events include path promotion/demotion, relay fallback, relay abuse ref
 - Signal down: existing paths remain active; new NAT traversal and path renegotiation wait for signal recovery.
 - Relay down: affected pairs demote to probing/direct candidates or another relay if available; otherwise `UNREACHABLE`.
 - STUN down: known candidates remain usable; new NAT classification is degraded.
-- Agent restart: identity and WireGuard keys are read from disk; pinned routes and current peer map are rehydrated through explicit backend application.
+- Agent restart: identity and WireGuard keys are read from disk; pinned routes and current peer map are rehydrated through explicit backend application and refreshed by continuous peer-map polling.
 
 ## Integration Tests
 
