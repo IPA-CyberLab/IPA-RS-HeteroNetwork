@@ -56,6 +56,7 @@ Linux network namespace integration tests are gated because they create host net
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
 IPARS_RUN_WG_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_wireguard_backend
 IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_punch
+IPARS_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallback
 ```
 
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support.
@@ -109,4 +110,4 @@ The bundled Docker Compose and Helm examples use plain HTTP between private depl
 
 `iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; relay dataplane counters and agent path/relay-forwarder metrics are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls relay and agent snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 
-The next production milestone is to extend network-namespace integration tests from route-backend validation into direct, NAT traversal, and relay fallback path validation.
+The next production milestone is to extend network-namespace integration tests from route-backend and relay fallback smoke coverage into reproducible NAT topology and full path validation.

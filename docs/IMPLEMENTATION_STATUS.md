@@ -44,6 +44,7 @@ This file tracks the gap between the requested final system and the current repo
 - Gated Linux network namespace integration smoke tests for applying and removing routes through the namespaced command and rtnetlink route backends.
 - Gated Linux network namespace integration smoke test for creating a WireGuard interface and upserting/removing a peer through the kernel WireGuard netlink backend inside a target namespace.
 - Gated Linux network namespace integration smoke test for signal-plan driven UDP hole-punch datagrams across direct-routed isolated namespaces.
+- Gated Linux network namespace integration smoke test for relay fallback dataplane forwarding between isolated client, relay, and peer namespaces.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command and kernel-netlink execution, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Linux command runtime preflight for `iparsd agent` that validates interface names, required `ip`/`wg` commands, `CAP_NET_ADMIN` when host networking will be mutated, and requested `/var/run/netns` namespace placement before starting data-plane application loops.
@@ -56,12 +57,12 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
-- Privileged integration coverage beyond current namespace-aware route and WireGuard netlink smoke tests.
+- Privileged integration coverage beyond current namespace-aware route, WireGuard netlink, hole-punch, and relay fallback smoke tests.
 - Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
 - NAT topology validation beyond current mapping/filtering probes and classification-aware signal selection across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies beyond the current direct-routed namespace smoke test.
 - OpenTelemetry metrics coverage beyond current relay capacity/session, byte, packet, drop-reason counters, and agent path/relay-forwarder metrics.
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.
 - Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery.
-- Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.
+- Full direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests beyond current focused smoke coverage.
 - External multi-process daemon load orchestration hardening beyond current loopback `iparsd` control-plane/signal/STUN/relay/dry-run-agent transport.
