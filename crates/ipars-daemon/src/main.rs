@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +52,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
+use serde::Deserialize;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -354,6 +355,18 @@ struct AgentArgs {
     apply_kubernetes_underlay: bool,
     #[arg(long, env = "IPARS_AGENT_APPLY_DOCKER_ROUTES", default_value_t = false)]
     apply_docker_routes: bool,
+    #[arg(long, env = "IPARS_DOCKER_DISCOVER_NETWORKS", default_value_t = false)]
+    docker_discover_networks: bool,
+    #[arg(long, env = "IPARS_DOCKER_API_SOCKET")]
+    docker_api_socket: Option<PathBuf>,
+    #[arg(long, env = "IPARS_DOCKER_API_VERSION", default_value = "v1.43")]
+    docker_api_version: String,
+    #[arg(
+        long = "docker-network",
+        env = "IPARS_DOCKER_NETWORKS",
+        value_delimiter = ','
+    )]
+    docker_networks: Vec<String>,
     #[arg(long, env = "IPARS_DOCKER_CONTAINER_NAMESPACE")]
     docker_container_namespace: Option<String>,
     #[arg(long, env = "IPARS_DOCKER_HOST_INTERFACE", default_value = "docker0")]
@@ -1229,8 +1242,235 @@ async fn start_peer_map_sync(
     }
 }
 
+#[derive(Debug, Clone)]
+enum DockerRouteSource {
+    Explicit(DockerNetworkIntent),
+    Api(DockerApiNetworkDiscovery),
+}
+
+impl DockerRouteSource {
+    async fn resolve_intent(&self) -> anyhow::Result<DockerNetworkIntent> {
+        match self {
+            Self::Explicit(intent) => Ok(intent.clone()),
+            Self::Api(discovery) => discovery.discover_intent().await,
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "explicit",
+            Self::Api(_) => "docker-api",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DockerApiNetworkDiscovery {
+    client: reqwest::Client,
+    api_version: String,
+    network_filters: Vec<String>,
+    container_namespace: Option<String>,
+    host_interface: String,
+    overlay_interface: String,
+    expose_host_routes: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DockerApiNetwork {
+    #[serde(rename = "Id", default)]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Driver", default)]
+    driver: String,
+    #[serde(rename = "IPAM", default)]
+    ipam: DockerApiIpam,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DockerApiIpam {
+    #[serde(rename = "Config", default)]
+    config: Vec<DockerApiIpamConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DockerApiIpamConfig {
+    #[serde(rename = "Subnet", default)]
+    subnet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerDiscoveredRoutes {
+    network_names: Vec<String>,
+    cidrs: Vec<ipnet::IpNet>,
+}
+
+impl DockerApiNetworkDiscovery {
+    fn new(args: &AgentArgs) -> anyhow::Result<Self> {
+        let socket = docker_api_socket_path(args);
+        let client = reqwest::Client::builder()
+            .unix_socket(socket)
+            .build()
+            .context("failed to build Docker API client")?;
+        Ok(Self {
+            client,
+            api_version: args.docker_api_version.clone(),
+            network_filters: args.docker_networks.clone(),
+            container_namespace: args.docker_container_namespace.clone(),
+            host_interface: args.docker_host_interface.clone(),
+            overlay_interface: args.wireguard_interface.clone(),
+            expose_host_routes: args.docker_expose_host_routes,
+        })
+    }
+
+    async fn discover_intent(&self) -> anyhow::Result<DockerNetworkIntent> {
+        let networks: Vec<DockerApiNetwork> = self
+            .client
+            .get(docker_api_networks_url(&self.api_version))
+            .send()
+            .await
+            .context("failed to query Docker networks")?
+            .error_for_status()
+            .context("Docker networks API returned an error")?
+            .json()
+            .await
+            .context("failed to decode Docker networks response")?;
+        let discovered = docker_discovered_routes(&networks, &self.network_filters)?;
+        let container_namespace = self
+            .container_namespace
+            .clone()
+            .unwrap_or_else(|| docker_namespace_from_networks(&discovered.network_names));
+        Ok(DockerNetworkIntent {
+            container_namespace,
+            host_interface: self.host_interface.clone(),
+            overlay_interface: self.overlay_interface.clone(),
+            container_cidrs: discovered.cidrs,
+            expose_host_routes: self.expose_host_routes,
+        })
+    }
+}
+
+fn docker_route_source(args: &AgentArgs) -> anyhow::Result<DockerRouteSource> {
+    if args.docker_discover_networks {
+        Ok(DockerRouteSource::Api(DockerApiNetworkDiscovery::new(
+            args,
+        )?))
+    } else {
+        Ok(DockerRouteSource::Explicit(docker_network_intent(args)?))
+    }
+}
+
+fn docker_api_networks_url(api_version: &str) -> String {
+    let version = api_version.trim_matches('/');
+    if version.is_empty() {
+        "http://docker/networks".to_string()
+    } else {
+        format!("http://docker/{version}/networks")
+    }
+}
+
+fn docker_api_socket_path(args: &AgentArgs) -> PathBuf {
+    resolve_docker_api_socket(
+        args.docker_api_socket.as_deref(),
+        std::env::var_os("DOCKER_HOST").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        |path| path.exists(),
+    )
+}
+
+fn resolve_docker_api_socket(
+    configured: Option<&Path>,
+    docker_host: Option<&OsStr>,
+    xdg_runtime_dir: Option<&OsStr>,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(configured) = configured {
+        return configured.to_path_buf();
+    }
+    if let Some(path) = docker_host.and_then(docker_host_unix_socket_path) {
+        return path;
+    }
+
+    let rootful = PathBuf::from("/var/run/docker.sock");
+    if exists(&rootful) {
+        return rootful;
+    }
+
+    if let Some(runtime_dir) = xdg_runtime_dir {
+        let rootless = PathBuf::from(runtime_dir).join("docker.sock");
+        if exists(&rootless) {
+            return rootless;
+        }
+    }
+
+    rootful
+}
+
+fn docker_host_unix_socket_path(docker_host: &OsStr) -> Option<PathBuf> {
+    let docker_host = docker_host.to_str()?;
+    docker_host
+        .strip_prefix("unix://")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn docker_discovered_routes(
+    networks: &[DockerApiNetwork],
+    filters: &[String],
+) -> anyhow::Result<DockerDiscoveredRoutes> {
+    let mut network_names = Vec::new();
+    let mut cidrs = BTreeMap::<ipnet::IpNet, String>::new();
+    for network in networks {
+        if !docker_network_matches(network, filters) {
+            continue;
+        }
+        let mut found_subnet = false;
+        for config in &network.ipam.config {
+            let Some(subnet) = config.subnet.as_deref() else {
+                continue;
+            };
+            let cidr = subnet.parse::<ipnet::IpNet>().with_context(|| {
+                format!(
+                    "Docker network `{}` has invalid subnet `{subnet}`",
+                    network.name
+                )
+            })?;
+            cidrs.entry(cidr).or_insert_with(|| network.name.clone());
+            found_subnet = true;
+        }
+        if found_subnet {
+            network_names.push(network.name.clone());
+        }
+    }
+    if cidrs.is_empty() {
+        anyhow::bail!("Docker network discovery found no bridge networks with IPAM subnets");
+    }
+    Ok(DockerDiscoveredRoutes {
+        network_names,
+        cidrs: cidrs.into_keys().collect(),
+    })
+}
+
+fn docker_network_matches(network: &DockerApiNetwork, filters: &[String]) -> bool {
+    if network.driver != "bridge" {
+        return false;
+    }
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| filter == &network.name || filter == &network.id)
+}
+
+fn docker_namespace_from_networks(network_names: &[String]) -> String {
+    if network_names.is_empty() {
+        return "docker-api".to_string();
+    }
+    let joined = network_names.join("+");
+    format!("docker:{joined}")
+}
+
 async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let intent = docker_network_intent(args)?;
+    let source = docker_route_source(args)?;
     let interval = Duration::from_secs(args.docker_route_interval_seconds.max(1));
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
@@ -1245,12 +1485,12 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
                     SystemRouteCommandRunner,
                 ));
                 Ok(tokio::spawn(async move {
-                    run_docker_route_loop(manager, intent, interval).await;
+                    run_docker_route_loop(manager, source, interval).await;
                 }))
             } else {
                 let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
                 Ok(tokio::spawn(async move {
-                    run_docker_route_loop(manager, intent, interval).await;
+                    run_docker_route_loop(manager, source, interval).await;
                 }))
             }
         }
@@ -1260,11 +1500,11 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
             }
             tracing::info!(
                 backend = args.runtime_backend.as_str(),
-                container_namespace = %intent.container_namespace,
+                route_source = source.source_label(),
                 "starting Docker route loop with dry-run runtime backend"
             );
             Ok(tokio::spawn(async move {
-                run_docker_route_loop(DryRunLinuxRouteManager, intent, interval).await;
+                run_docker_route_loop(DryRunLinuxRouteManager, source, interval).await;
             }))
         }
     }
@@ -1288,23 +1528,32 @@ fn docker_network_intent(args: &AgentArgs) -> anyhow::Result<DockerNetworkIntent
     })
 }
 
-async fn run_docker_route_loop<M>(manager: M, intent: DockerNetworkIntent, interval: Duration)
+async fn run_docker_route_loop<M>(manager: M, source: DockerRouteSource, interval: Duration)
 where
     M: RouteManager + 'static,
 {
     loop {
-        match manager.apply_docker_intent(intent.clone()).await {
-            Ok(plan) => tracing::info!(
-                container_namespace = %intent.container_namespace,
-                host_interface = %intent.host_interface,
-                routes = plan.routes.len(),
-                policy_rules = plan.policy_rules.len(),
-                "applied Docker overlay routes"
-            ),
+        match source.resolve_intent().await {
+            Ok(intent) => match manager.apply_docker_intent(intent.clone()).await {
+                Ok(plan) => tracing::info!(
+                    route_source = source.source_label(),
+                    container_namespace = %intent.container_namespace,
+                    host_interface = %intent.host_interface,
+                    routes = plan.routes.len(),
+                    policy_rules = plan.policy_rules.len(),
+                    "applied Docker overlay routes"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    route_source = source.source_label(),
+                    container_namespace = %intent.container_namespace,
+                    "failed to apply Docker overlay routes; will retry"
+                ),
+            },
             Err(error) => tracing::warn!(
                 %error,
-                container_namespace = %intent.container_namespace,
-                "failed to apply Docker overlay routes; will retry"
+                route_source = source.source_label(),
+                "failed to resolve Docker overlay routes; will retry"
             ),
         }
         tokio::time::sleep(interval).await;
@@ -3380,6 +3629,140 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_route_source_allows_api_discovery_without_explicit_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            "/run/user/1000/docker.sock",
+            "--docker-network",
+            "compose_default",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert!(args.docker_discover_networks);
+            assert!(args.docker_container_cidrs.is_empty());
+            assert!(matches!(
+                docker_route_source(&args)?,
+                DockerRouteSource::Api(_)
+            ));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_api_discovery_selects_bridge_network_subnets() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
+            docker_api_network(
+                "other-id",
+                "compose_extra",
+                "bridge",
+                &["172.19.0.0/16", "172.18.0.0/16"],
+            ),
+        ];
+
+        let discovered = docker_discovered_routes(&networks, &[])?;
+
+        assert_eq!(
+            discovered.network_names,
+            vec!["compose_default".to_string(), "compose_extra".to_string()]
+        );
+        assert_eq!(
+            discovered.cidrs,
+            vec![
+                "172.18.0.0/16".parse::<ipnet::IpNet>()?,
+                "172.19.0.0/16".parse::<ipnet::IpNet>()?,
+            ]
+        );
+        assert_eq!(
+            docker_namespace_from_networks(&discovered.network_names),
+            "docker:compose_default+compose_extra"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_filters_by_name_or_id() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_extra", "bridge", &["172.19.0.0/16"]),
+        ];
+
+        let by_name = docker_discovered_routes(&networks, &["compose_extra".to_string()])?;
+        let by_id = docker_discovered_routes(&networks, &["default-id".to_string()])?;
+
+        assert_eq!(by_name.network_names, vec!["compose_extra".to_string()]);
+        assert_eq!(
+            by_name.cidrs,
+            vec!["172.19.0.0/16".parse::<ipnet::IpNet>()?]
+        );
+        assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
+        assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_resolution_prefers_explicit_then_docker_host_then_rootless() {
+        let explicit = Path::new("/custom/docker.sock");
+        assert_eq!(
+            resolve_docker_api_socket(Some(explicit), None, None, |_| false),
+            PathBuf::from("/custom/docker.sock")
+        );
+        assert_eq!(
+            resolve_docker_api_socket(
+                None,
+                Some(OsStr::new("unix:///tmp/docker.sock")),
+                None,
+                |_| false,
+            ),
+            PathBuf::from("/tmp/docker.sock")
+        );
+        assert_eq!(
+            resolve_docker_api_socket(None, None, Some(OsStr::new("/run/user/1000")), |path| {
+                path == Path::new("/run/user/1000/docker.sock")
+            }),
+            PathBuf::from("/run/user/1000/docker.sock")
+        );
+    }
+
+    fn docker_api_network(
+        id: &str,
+        name: &str,
+        driver: &str,
+        subnets: &[&str],
+    ) -> DockerApiNetwork {
+        DockerApiNetwork {
+            id: id.to_string(),
+            name: name.to_string(),
+            driver: driver.to_string(),
+            ipam: DockerApiIpam {
+                config: subnets
+                    .iter()
+                    .map(|subnet| DockerApiIpamConfig {
+                        subnet: Some((*subnet).to_string()),
+                    })
+                    .collect(),
+            },
+        }
     }
 
     #[test]

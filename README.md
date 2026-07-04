@@ -31,7 +31,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to an OpenTelemetry collector
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - Kubernetes underlay Service/API route application from Helm-provided CIDRs through the Linux route backend
-- Docker container CIDR route application from explicit Compose/agent route intents through the Linux route backend
+- Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through the Linux route backend
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
@@ -87,6 +87,8 @@ ipars k8s install
 ```
 
 `iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
+
+Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. `--docker-api-socket` overrides socket placement, otherwise `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, and rootless `$XDG_RUNTIME_DIR/docker.sock` are checked in order. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments.
 
 `iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; relay dataplane counters are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls relay snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 

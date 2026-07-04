@@ -126,7 +126,7 @@ Docker support targets:
 - host-to-container reachability
 - container-to-remote-node reachability
 
-The route manager works from explicit network namespace, capability, and routing intents. The design avoids treating iptables-only rewrites as the primary integration mechanism. Rootful deployments use `NET_ADMIN` and `/dev/net/tun`; `iparsd agent --linux-netns` runs the Linux WireGuard and route command backends through validated `ip netns exec` placement. Docker route application is driven by explicit container namespace, host interface, and container CIDR inputs from Compose or agent flags. Rootless deployments require a userspace WireGuard backend once implemented.
+The route manager works from explicit network namespace, capability, and routing intents. The design avoids treating iptables-only rewrites as the primary integration mechanism. Rootful deployments use `NET_ADMIN` and `/dev/net/tun`; `iparsd agent --linux-netns` runs the Linux WireGuard and route command backends through validated `ip netns exec` placement. Docker route application can be driven by explicit container namespace, host interface, and container CIDR inputs from Compose or agent flags, or by `iparsd agent --docker-discover-networks`, which queries Docker Engine bridge networks and derives IPAM subnets dynamically. Discovery supports `--docker-network` name/ID filters for multi-network Compose deployments and resolves Docker sockets from explicit `--docker-api-socket`, `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, or rootless `$XDG_RUNTIME_DIR/docker.sock`. Rootless deployments still require a userspace WireGuard backend before host dataplane mutation can be fully rootless.
 
 The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an agent.
 
