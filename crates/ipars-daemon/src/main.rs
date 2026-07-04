@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -220,6 +221,20 @@ struct AgentArgs {
     relay_forwarder_bind: Option<SocketAddr>,
     #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT")]
     relay_forwarder_wireguard_endpoint: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_NETNS")]
+    relay_forwarder_netns: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS",
+        default_value_t = 1024
+    )]
+    relay_forwarder_max_sessions: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS",
+        default_value_t = 5
+    )]
+    relay_forwarder_restart_backoff_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_APPLY_KUBERNETES_UNDERLAY",
@@ -734,25 +749,83 @@ fn relay_forwarder_supervisor(
     let wireguard_endpoint = args
         .relay_forwarder_wireguard_endpoint
         .context("--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind")?;
+    let placement = relay_forwarder_placement(args)?;
     Ok(Some(Arc::new(RelayForwarderSupervisor::new(
-        bind_addr,
-        wireguard_endpoint,
+        RelayForwarderConfig {
+            bind_addr,
+            wireguard_endpoint,
+            placement,
+            max_sessions: args.relay_forwarder_max_sessions,
+            restart_backoff: Duration::from_secs(args.relay_forwarder_restart_backoff_seconds),
+        },
     ))))
+}
+
+fn relay_forwarder_placement(args: &AgentArgs) -> anyhow::Result<RelayForwarderPlacement> {
+    let namespace = args
+        .relay_forwarder_netns
+        .as_deref()
+        .or(args.linux_netns.as_deref());
+    let namespace = namespace
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()
+        .map_err(anyhow::Error::from)?;
+    Ok(namespace
+        .map(RelayForwarderPlacement::from)
+        .unwrap_or(RelayForwarderPlacement::CurrentProcess))
+}
+
+#[derive(Debug, Clone)]
+struct RelayForwarderConfig {
+    bind_addr: SocketAddr,
+    wireguard_endpoint: SocketAddr,
+    placement: RelayForwarderPlacement,
+    max_sessions: usize,
+    restart_backoff: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayForwarderPlacement {
+    CurrentProcess,
+    LinuxNetns(LinuxNetworkNamespace),
+}
+
+impl From<LinuxNetworkNamespace> for RelayForwarderPlacement {
+    fn from(namespace: LinuxNetworkNamespace) -> Self {
+        Self::LinuxNetns(namespace)
+    }
+}
+
+impl RelayForwarderPlacement {
+    fn description(&self) -> String {
+        match self {
+            Self::CurrentProcess => "current-process".to_string(),
+            Self::LinuxNetns(namespace) => format!("netns:{}", namespace.name()),
+        }
+    }
+
+    fn validate_current_process(&self) -> anyhow::Result<()> {
+        match self {
+            Self::CurrentProcess => Ok(()),
+            Self::LinuxNetns(namespace) => ensure_process_in_netns(namespace),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct RelayForwarderSupervisor {
-    bind_addr: SocketAddr,
-    wireguard_endpoint: SocketAddr,
+    config: RelayForwarderConfig,
     handles: tokio::sync::Mutex<std::collections::BTreeMap<NodeId, RelayForwarderTask>>,
+    restart_backoff_until:
+        tokio::sync::Mutex<std::collections::BTreeMap<NodeId, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl RelayForwarderSupervisor {
-    fn new(bind_addr: SocketAddr, wireguard_endpoint: SocketAddr) -> Self {
+    fn new(config: RelayForwarderConfig) -> Self {
         Self {
-            bind_addr,
-            wireguard_endpoint,
+            config,
             handles: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+            restart_backoff_until: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -780,15 +853,22 @@ impl RelayForwarderSupervisor {
             return Ok(endpoint);
         }
 
+        self.ensure_capacity(&session.peer).await?;
+        self.ensure_not_backing_off(&session.peer).await?;
         self.remove(runtime, &session.peer).await;
-        let socket = tokio::net::UdpSocket::bind(self.bind_addr)
-            .await
-            .context("failed to bind relay forwarder UDP socket")?;
+        let socket = match self.bind_socket().await {
+            Ok(socket) => socket,
+            Err(error) => {
+                self.record_start_failure(&session.peer).await;
+                return Err(error);
+            }
+        };
         let local_endpoint = socket
             .local_addr()
             .context("failed to read relay forwarder local endpoint")?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let forwarder = UdpRelayFrameForwarder::new(session.clone(), self.wireguard_endpoint);
+        let forwarder =
+            UdpRelayFrameForwarder::new(session.clone(), self.config.wireguard_endpoint);
         let task = tokio::spawn(forwarder.serve(socket, shutdown_rx));
         self.handles.lock().await.insert(
             session.peer.clone(),
@@ -807,14 +887,67 @@ impl RelayForwarderSupervisor {
             peer = %session.peer,
             relay = %session.relay_node,
             local_endpoint = %local_endpoint,
-            wireguard_endpoint = %self.wireguard_endpoint,
+            wireguard_endpoint = %self.config.wireguard_endpoint,
+            placement = %self.config.placement.description(),
             "started relay forwarder"
         );
         Ok(local_endpoint)
     }
 
+    async fn bind_socket(&self) -> anyhow::Result<tokio::net::UdpSocket> {
+        self.config.placement.validate_current_process()?;
+        tokio::net::UdpSocket::bind(self.config.bind_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind relay forwarder UDP socket in {}",
+                    self.config.placement.description()
+                )
+            })
+    }
+
+    async fn ensure_capacity(&self, peer: &NodeId) -> anyhow::Result<()> {
+        let handles = self.handles.lock().await;
+        if handles.contains_key(peer) || handles.len() < self.config.max_sessions {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "relay forwarder capacity exceeded: active={} max={}",
+            handles.len(),
+            self.config.max_sessions
+        );
+    }
+
+    async fn ensure_not_backing_off(&self, peer: &NodeId) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let mut backoff = self.restart_backoff_until.lock().await;
+        match backoff.get(peer).copied() {
+            Some(until) if now < until => anyhow::bail!(
+                "relay forwarder restart backoff active until {until} for peer {peer}"
+            ),
+            Some(_) => {
+                backoff.remove(peer);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn record_start_failure(&self, peer: &NodeId) {
+        if self.config.restart_backoff.is_zero() {
+            return;
+        }
+        let backoff = chrono::Duration::from_std(self.config.restart_backoff)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
+        self.restart_backoff_until
+            .lock()
+            .await
+            .insert(peer.clone(), chrono::Utc::now() + backoff);
+    }
+
     async fn remove(&self, runtime: &AgentRuntime, peer: &NodeId) {
         runtime.remove_relay_forwarder_endpoint(peer).await;
+        self.restart_backoff_until.lock().await.remove(peer);
         let handle = self.handles.lock().await.remove(peer);
         if let Some(handle) = handle {
             if let Err(error) = handle.stop().await {
@@ -828,6 +961,7 @@ impl RelayForwarderSupervisor {
             let mut handles = self.handles.lock().await;
             std::mem::take(&mut *handles)
         };
+        self.restart_backoff_until.lock().await.clear();
         for (peer, handle) in handles {
             runtime.remove_relay_forwarder_endpoint(&peer).await;
             if let Err(error) = handle.stop().await {
@@ -835,6 +969,41 @@ impl RelayForwarderSupervisor {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = std::fs::metadata("/proc/self/ns/net")
+        .context("failed to inspect current network namespace")?;
+    let target_path = netns_path(namespace);
+    let target = std::fs::metadata(&target_path).with_context(|| {
+        format!(
+            "failed to inspect network namespace {}; run the agent inside it or create {}",
+            namespace.name(),
+            target_path.display()
+        )
+    })?;
+    if current.dev() == target.dev() && current.ino() == target.ino() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "relay forwarder requires process network namespace {}; current process is in a different namespace",
+        namespace.name()
+    )
+}
+
+#[cfg(not(unix))]
+fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "relay forwarder network namespace placement is only supported on Unix/Linux: {}",
+        namespace.name()
+    )
+}
+
+fn netns_path(namespace: &LinuxNetworkNamespace) -> std::path::PathBuf {
+    Path::new("/var/run/netns").join(namespace.name())
 }
 
 #[derive(Debug)]
@@ -1677,6 +1846,10 @@ mod tests {
             "127.0.0.1:0",
             "--relay-forwarder-wireguard-endpoint",
             "127.0.0.1:51820",
+            "--relay-forwarder-max-sessions",
+            "7",
+            "--relay-forwarder-restart-backoff-seconds",
+            "11",
             "--apply-kubernetes-underlay",
             "--kubernetes-node-name",
             "worker-a",
@@ -1705,6 +1878,15 @@ mod tests {
                 args.relay_forwarder_wireguard_endpoint,
                 Some(SocketAddr::from(([127, 0, 0, 1], 51_820)))
             );
+            assert_eq!(args.relay_forwarder_max_sessions, 7);
+            assert_eq!(args.relay_forwarder_restart_backoff_seconds, 11);
+            let supervisor = relay_forwarder_supervisor(&args)?.context("expected supervisor")?;
+            assert_eq!(supervisor.config.max_sessions, 7);
+            assert_eq!(supervisor.config.restart_backoff, Duration::from_secs(11));
+            assert_eq!(
+                supervisor.config.placement,
+                RelayForwarderPlacement::LinuxNetns(LinuxNetworkNamespace::from_name("node-a")?)
+            );
             assert!(args.apply_kubernetes_underlay);
             assert_eq!(args.kubernetes_node_name.as_deref(), Some("worker-a"));
             assert_eq!(
@@ -1724,6 +1906,40 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn relay_forwarder_supervisor_enforces_capacity() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 0,
+            restart_backoff: Duration::from_secs(1),
+        });
+        let session = RelaySessionState {
+            peer: NodeId::from_string("peer-a"),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-a".to_string(),
+            session_token: "token-a".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        };
+
+        let error = match supervisor.upsert(&runtime, session).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("capacity exceeded"));
+        assert!(runtime.relay_forwarder_endpoints().await.is_empty());
+        Ok(())
     }
 
     #[test]

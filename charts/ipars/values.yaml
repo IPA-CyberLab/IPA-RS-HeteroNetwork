@@ -16,6 +16,10 @@ agent:
   routeProvider: false
   hostNetwork: true
   privileged: false
+  relayForwarder:
+    maxSessions: 1024
+    restartBackoffSeconds: 5
+    netns: ""
 
 serviceExposure:
   enabled: true
