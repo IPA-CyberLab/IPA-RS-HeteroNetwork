@@ -45,7 +45,7 @@ This file tracks the gap between the requested final system and the current repo
 - Selectable Linux route-manager rtnetlink backend for peer-map, Docker, and Kubernetes route plans, including route replacement/removal and policy-rule add/delete without invoking `ip`, in either the current namespace or validated `--linux-netns` placement.
 - Gated Linux network namespace integration smoke tests for applying and removing routes through the namespaced command and rtnetlink route backends.
 - Gated Linux network namespace integration smoke test for creating a WireGuard interface and upserting/removing a peer through the kernel WireGuard netlink backend inside a target namespace.
-- Gated Linux network namespace integration smoke tests for signal-plan driven UDP hole-punch datagrams across direct-routed isolated namespaces and a two-sided endpoint-independent SNAT topology.
+- Gated Linux network namespace integration smoke tests for signal-plan driven UDP hole-punch datagrams across direct-routed isolated namespaces and two-sided endpoint-independent SNAT topologies with IP-only and fixed public-port mappings.
 - Gated Linux network namespace integration smoke test for relay fallback dataplane forwarding between isolated client, relay, and peer namespaces.
 - Agent peer-map applier that turns active or pinned `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans, while pruning idle unpinned peers from WireGuard state.
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map with ordered endpoint failover, applies active/pinned peers through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command and kernel-netlink execution, and retries without stopping the agent when the control plane is temporarily unavailable.
@@ -62,8 +62,8 @@ This file tracks the gap between the requested final system and the current repo
 - Packet-flow detector hardening beyond current typed ingestion, procfs conntrack polling, conntrack netlink table dumping, conntrack NEW/UPDATE event subscription, and source/protocol/port metadata, including eBPF-based flow observation and deeper flow classification.
 - Privileged integration coverage beyond current namespace-aware route, WireGuard netlink, hole-punch, and relay fallback smoke tests.
 - Linux namespace lifecycle/capability hardening beyond current `CAP_SYS_ADMIN` startup preflight, `/var/run/netns` entry and `nsfs` validation, and current-namespace placement warnings around command and netlink dataplane backends.
-- NAT topology validation beyond current mapping/filtering probes, classification-aware signal selection, and one endpoint-independent SNAT namespace topology.
-- Network-namespace validation of signal-coordinated UDP hole punching across additional reproducible NAT behaviours beyond the current direct-routed and endpoint-independent SNAT smoke tests.
+- NAT topology validation beyond current mapping/filtering probes, classification-aware signal selection, and endpoint-independent SNAT namespace topologies.
+- Network-namespace validation of signal-coordinated UDP hole punching across additional reproducible NAT behaviours beyond the current direct-routed, IP-only SNAT, and fixed-port SNAT smoke tests.
 - OpenTelemetry metrics coverage beyond current control-plane node/path/health gauges, signal node/relay/NAT/health/request metrics, relay capacity/session, byte, packet, drop-reason counters, and agent path/relay-forwarder/lazy-connect/packet-flow metrics.
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.
 - Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery and explicit Service exposure acknowledgement/source-range controls.

@@ -60,7 +60,7 @@ IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_p
 IPARS_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallback
 ```
 
-The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace test includes an endpoint-independent SNAT topology and requires `iptables` plus `sysctl` when the gated tests are enabled.
+The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include IP-only and fixed-port endpoint-independent SNAT topologies and require `iptables` plus `sysctl` when the gated tests are enabled.
 
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay

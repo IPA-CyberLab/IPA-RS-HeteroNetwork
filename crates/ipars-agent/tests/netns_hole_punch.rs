@@ -13,6 +13,8 @@ use ipars_types::{CandidateSource, EndpointCandidate, EndpointCandidateKind, Nod
 const DIRECT_TEST_NAME: &str = "udp_hole_puncher_sends_signal_payload_between_network_namespaces";
 const NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces";
+const FIXED_PORT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_traverses_fixed_port_snat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -149,6 +151,74 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
     require_command("iptables")?;
     require_command("sysctl")?;
 
+    run_two_sided_snat_hole_punch_topology(
+        NAT_TEST_NAME,
+        "nat",
+        TwoSidedSnatTopology {
+            private_second_octet: 242,
+            public_third_octet: 0,
+            left_bind_port: 40101,
+            right_bind_port: 40102,
+            left_reflexive_port: 40101,
+            right_reflexive_port: 40102,
+            fixed_snat_ports: false,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping fixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_two_sided_snat_hole_punch_topology(
+        FIXED_PORT_NAT_TEST_NAME,
+        "pnat",
+        TwoSidedSnatTopology {
+            private_second_octet: 243,
+            public_third_octet: 1,
+            left_bind_port: 40101,
+            right_bind_port: 40102,
+            left_reflexive_port: 50101,
+            right_reflexive_port: 50102,
+            fixed_snat_ports: true,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TwoSidedSnatTopology {
+    private_second_octet: u8,
+    public_third_octet: u8,
+    left_bind_port: u16,
+    right_bind_port: u16,
+    left_reflexive_port: u16,
+    right_reflexive_port: u16,
+    fixed_snat_ports: bool,
+}
+
+fn run_two_sided_snat_hole_punch_topology(
+    test_name: &str,
+    label: &str,
+    topology: TwoSidedSnatTopology,
+) -> Result<(), Box<dyn std::error::Error>> {
     let suffix = unique_suffix()?;
     let left_namespace = format!("ipars-hp-left-{suffix}");
     let left_nat_namespace = format!("ipars-hp-lnat-{suffix}");
@@ -176,12 +246,35 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
     move_link_to_namespace(&left_nat_public_if, &left_nat_namespace)?;
     move_link_to_namespace(&right_nat_public_if, &right_nat_namespace)?;
 
-    configure_namespace_interface(&left_namespace, &left_if, "10.242.0.2/30")?;
-    configure_namespace_interface(&left_nat_namespace, &left_nat_private_if, "10.242.0.1/30")?;
-    configure_namespace_interface(&right_namespace, &right_if, "10.242.1.2/30")?;
-    configure_namespace_interface(&right_nat_namespace, &right_nat_private_if, "10.242.1.1/30")?;
-    configure_namespace_interface(&left_nat_namespace, &left_nat_public_if, "198.18.0.1/30")?;
-    configure_namespace_interface(&right_nat_namespace, &right_nat_public_if, "198.18.0.2/30")?;
+    let left_ip = format!("10.{}.0.2", topology.private_second_octet);
+    let left_gateway = format!("10.{}.0.1", topology.private_second_octet);
+    let right_ip = format!("10.{}.1.2", topology.private_second_octet);
+    let right_gateway = format!("10.{}.1.1", topology.private_second_octet);
+    let left_public_ip = format!("198.18.{}.1", topology.public_third_octet);
+    let right_public_ip = format!("198.18.{}.2", topology.public_third_octet);
+
+    configure_namespace_interface(&left_namespace, &left_if, &format!("{left_ip}/30"))?;
+    configure_namespace_interface(
+        &left_nat_namespace,
+        &left_nat_private_if,
+        &format!("{left_gateway}/30"),
+    )?;
+    configure_namespace_interface(&right_namespace, &right_if, &format!("{right_ip}/30"))?;
+    configure_namespace_interface(
+        &right_nat_namespace,
+        &right_nat_private_if,
+        &format!("{right_gateway}/30"),
+    )?;
+    configure_namespace_interface(
+        &left_nat_namespace,
+        &left_nat_public_if,
+        &format!("{left_public_ip}/30"),
+    )?;
+    configure_namespace_interface(
+        &right_nat_namespace,
+        &right_nat_public_if,
+        &format!("{right_public_ip}/30"),
+    )?;
     command(
         "ip",
         [
@@ -191,7 +284,7 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
             "replace",
             "default",
             "via",
-            "10.242.0.1",
+            left_gateway.as_str(),
         ],
     )?;
     command(
@@ -203,52 +296,77 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
             "replace",
             "default",
             "via",
-            "10.242.1.1",
+            right_gateway.as_str(),
         ],
     )?;
+
+    let left_snat_port = topology
+        .fixed_snat_ports
+        .then_some(topology.left_reflexive_port);
+    let right_snat_port = topology
+        .fixed_snat_ports
+        .then_some(topology.right_reflexive_port);
     enable_snat_namespace(
         &left_nat_namespace,
         &left_nat_public_if,
-        "10.242.0.2/32",
-        "198.18.0.1",
+        &format!("{left_ip}/32"),
+        &left_public_ip,
+        left_snat_port,
     )?;
     enable_snat_namespace(
         &right_nat_namespace,
         &right_nat_public_if,
-        "10.242.1.2/32",
-        "198.18.0.2",
+        &format!("{right_ip}/32"),
+        &right_public_ip,
+        right_snat_port,
     )?;
 
-    let left_ready = temp_file(format!("ipars-hp-nat-ready-left-{suffix}"));
-    let right_ready = temp_file(format!("ipars-hp-nat-ready-right-{suffix}"));
-    let start_file = temp_file(format!("ipars-hp-nat-start-{suffix}"));
+    let left_ready = temp_file(format!("ipars-hp-{label}-ready-left-{suffix}"));
+    let right_ready = temp_file(format!("ipars-hp-{label}-ready-right-{suffix}"));
+    let start_file = temp_file(format!("ipars-hp-{label}-start-{suffix}"));
     let left_ready_str = left_ready.to_string_lossy().into_owned();
     let right_ready_str = right_ready.to_string_lossy().into_owned();
     let start_file_str = start_file.to_string_lossy().into_owned();
+    let left_bind = format!("{}:{}", left_ip, topology.left_bind_port);
+    let right_bind = format!("{}:{}", right_ip, topology.right_bind_port);
+    let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
+    let target_reflexive = format!("{}:{}", right_public_ip, topology.right_reflexive_port);
 
     let left = spawn_child(
-        NAT_TEST_NAME,
+        test_name,
         &left_namespace,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.242.0.2:40101"),
-            ("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE", "198.18.0.1:40101"),
-            ("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE", "198.18.0.2:40102"),
+            ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
+            (
+                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+                source_reflexive.as_str(),
+            ),
+            (
+                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+                target_reflexive.as_str(),
+            ),
             ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
             ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
             ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
         ],
     )?;
     let right = spawn_child(
-        NAT_TEST_NAME,
+        test_name,
         &right_namespace,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.242.1.2:40102"),
-            ("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE", "198.18.0.1:40101"),
-            ("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE", "198.18.0.2:40102"),
+            ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
+            (
+                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+                source_reflexive.as_str(),
+            ),
+            (
+                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+                target_reflexive.as_str(),
+            ),
             ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
             ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
             ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
@@ -398,6 +516,7 @@ fn enable_snat_namespace(
     public_interface: &str,
     source_cidr: &str,
     public_ip: &str,
+    public_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     command(
         "ip",
@@ -416,27 +535,28 @@ fn enable_snat_namespace(
             "netns", "exec", namespace, "iptables", "-P", "FORWARD", "ACCEPT",
         ],
     )?;
-    command(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace,
-            "iptables",
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            source_cidr,
-            "-o",
-            public_interface,
-            "-j",
-            "SNAT",
-            "--to-source",
-            public_ip,
-        ],
-    )
+    let public_mapping = public_port
+        .map(|port| format!("{public_ip}:{port}-{port}"))
+        .unwrap_or_else(|| public_ip.to_string());
+    let mut args = vec![
+        "netns",
+        "exec",
+        namespace,
+        "iptables",
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        source_cidr,
+        "-o",
+        public_interface,
+    ];
+    if public_port.is_some() {
+        args.extend(["-p", "udp"]);
+    }
+    args.extend(["-j", "SNAT", "--to-source", public_mapping.as_str()]);
+    command_dynamic("ip", &args)
 }
 
 fn spawn_child<const N: usize>(
@@ -549,6 +669,15 @@ fn command<const N: usize>(
     program: &str,
     args: [&str; N],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(program).args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(command_error(program, output).into())
+}
+
+fn command_dynamic(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(program).args(args).output()?;
     if output.status.success() {
         return Ok(());
