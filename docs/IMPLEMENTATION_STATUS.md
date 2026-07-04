@@ -44,7 +44,7 @@ This file tracks the gap between the requested final system and the current repo
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
 - Docker Compose and Helm chart starting points.
-- `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, and relay HTTP admission plus UDP forwarding throughput runs.
+- `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, relay HTTP admission plus UDP forwarding throughput runs, and spawned multi-process `iparsd` daemon transport across control-plane, signal, STUN, relay, and dry-run agent processes.
 
 ## Remaining For Full Production Completion
 
@@ -57,4 +57,4 @@ This file tracks the gap between the requested final system and the current repo
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.
-- External multi-process daemon load orchestration across separate control-plane, signal, relay, and agent processes beyond the loopback in-process HTTP/UDP harness.
+- External multi-process daemon load orchestration hardening beyond current loopback `iparsd` control-plane/signal/STUN/relay/dry-run-agent transport.

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +19,9 @@ use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    AgentStatusResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -46,6 +48,12 @@ struct Cli {
 
     #[arg(long, default_value_t = 512)]
     relay_payload_bytes: usize,
+
+    #[arg(long, default_value = "iparsd")]
+    iparsd_bin: PathBuf,
+
+    #[arg(long, default_value_t = 4)]
+    daemon_agent_processes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -62,6 +70,7 @@ enum TransportMode {
     InMemory,
     Http,
     RelayUdp,
+    Daemon,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +156,8 @@ struct LoadReport {
     relay_udp_payload_bytes_received: u64,
     relay_forwarded_bytes_reported: u64,
     relay_mbps: f64,
+    daemon_processes: usize,
+    daemon_agent_processes: usize,
     registration_millis: u128,
     peer_map_millis: u128,
     signal_millis: u128,
@@ -163,6 +174,18 @@ async fn main() -> anyhow::Result<()> {
         TransportMode::RelayUdp => {
             run_relay_udp_scenario(
                 scenario,
+                RelayLoadOptions {
+                    packets_per_session: cli.relay_packets_per_session,
+                    payload_bytes: cli.relay_payload_bytes,
+                },
+            )
+            .await?
+        }
+        TransportMode::Daemon => {
+            run_daemon_scenario(
+                scenario,
+                &cli.iparsd_bin,
+                cli.daemon_agent_processes,
                 RelayLoadOptions {
                     packets_per_session: cli.relay_packets_per_session,
                     payload_bytes: cli.relay_payload_bytes,
@@ -260,6 +283,8 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_udp_payload_bytes_received: 0,
         relay_forwarded_bytes_reported: 0,
         relay_mbps: 0.0,
+        daemon_processes: 0,
+        daemon_agent_processes: 0,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -378,6 +403,8 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_udp_payload_bytes_received: 0,
         relay_forwarded_bytes_reported: 0,
         relay_mbps: 0.0,
+        daemon_processes: 0,
+        daemon_agent_processes: 0,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -489,9 +516,201 @@ async fn run_relay_udp_scenario(
         relay_udp_payload_bytes_received: payload_bytes_received,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_mbps,
+        daemon_processes: 0,
+        daemon_agent_processes: 0,
         registration_millis: 0,
         peer_map_millis: 0,
         signal_millis: 0,
+        relay_millis,
+    })
+}
+
+async fn run_daemon_scenario(
+    scenario: Scenario,
+    iparsd_bin: &Path,
+    requested_agent_processes: usize,
+    relay_options: RelayLoadOptions,
+) -> anyhow::Result<LoadReport> {
+    let relay_options = relay_options.normalized();
+    let agent_processes = requested_agent_processes.clamp(1, scenario.node_count);
+    let issuer = IdentityKeyPair::generate();
+    let key_id = KeyId::from_string("load-key");
+    let cluster_id = ClusterId::from_string(format!("load-daemon-{:?}", scenario.name));
+    let services = DaemonProcessGroup::start(
+        iparsd_bin,
+        cluster_id.clone(),
+        &issuer,
+        &key_id,
+        agent_processes,
+    )
+    .await?;
+    let client = reqwest::Client::new();
+
+    let registration_started = Instant::now();
+    let mut agent_statuses: Vec<AgentStatusResponse> = Vec::with_capacity(agent_processes);
+    for url in &services.agent_urls {
+        agent_statuses
+            .push(get_json(&client, format!("{url}/v1/status"), "daemon agent status").await?);
+    }
+    let registration_millis = registration_started.elapsed().as_millis();
+
+    let peer_map_started = Instant::now();
+    let mut peer_map_edges_seen = 0;
+    let mut peer_records = Vec::new();
+    for status in &agent_statuses {
+        let peer_map: PeerMap = get_json(
+            &client,
+            format!("{}/v1/peers/{}", services.control_plane_url, status.node_id),
+            "daemon control-plane peer map",
+        )
+        .await?;
+        peer_map_edges_seen += peer_map.peers.len();
+        peer_records.extend(peer_map.peers);
+    }
+    let peer_map_millis = peer_map_started.elapsed().as_millis();
+
+    for peer in &peer_records {
+        let _: SignalNodeUpsertResponse = put_json(
+            &client,
+            format!("{}/v1/nodes/{}", services.signal_url, peer.node_id),
+            &SignalNodeUpsertRequest { node: peer.clone() },
+            "daemon signal node upsert",
+        )
+        .await?;
+    }
+
+    let signal_started = Instant::now();
+    let advertised_routes = peer_records.iter().map(|node| node.routes.len()).sum();
+    let active_pair_count = if agent_statuses.len() > 1 {
+        scenario.active_pair_count
+    } else {
+        0
+    };
+    let mut path_counts = PathCounts::default();
+    for pair_index in 0..active_pair_count {
+        let (source_index, target_index) = active_pair_indices(pair_index, agent_statuses.len());
+        let source = &agent_statuses[source_index];
+        let target = &agent_statuses[target_index];
+        let response: SignalPathResponse = post_json(
+            &client,
+            format!("{}/v1/paths/negotiate", services.signal_url),
+            &SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.candidates.clone(),
+                desired_routes: Vec::new(),
+            },
+            "daemon signal path negotiation",
+        )
+        .await?;
+        path_counts.record(response.preferred_state);
+    }
+    let signal_millis = signal_started.elapsed().as_millis();
+
+    let relay_started = Instant::now();
+    let left_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    let right_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    let left_addr = left_socket.local_addr()?;
+    let right_addr = right_socket.local_addr()?;
+    let mut relay_packets_sent = 0;
+    let mut relay_packets_received = 0;
+    let mut relay_payload_bytes_sent = 0_u64;
+    let mut relay_payload_bytes_received = 0_u64;
+    let mut receive_buffer = vec![0_u8; relay_options.payload_bytes];
+    for pair_index in 0..active_pair_count {
+        let admission: RelayAdmissionResponse = post_json(
+            &client,
+            format!("{}/v1/sessions", services.relay_http_url),
+            &RelayAdmissionRequest {
+                left: NodeId::from_string(format!("daemon-left-{pair_index:04}")),
+                right: NodeId::from_string(format!("daemon-right-{pair_index:04}")),
+                left_addr,
+                right_addr,
+            },
+            "daemon relay admission",
+        )
+        .await?;
+        for packet_index in 0..relay_options.packets_per_session {
+            let payload = relay_payload(pair_index, packet_index, relay_options.payload_bytes);
+            let datagram =
+                encode_relay_datagram(&admission.session_id, &admission.session_token, &payload)?;
+            left_socket
+                .send_to(&datagram, services.relay_udp_addr)
+                .await?;
+            relay_packets_sent += 1;
+            relay_payload_bytes_sent =
+                relay_payload_bytes_sent.saturating_add(payload.len() as u64);
+            let (len, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                right_socket.recv_from(&mut receive_buffer),
+            )
+            .await
+            .context("timed out waiting for daemon relay UDP payload")??;
+            if &receive_buffer[..len] != payload.as_slice() {
+                bail!(
+                    "daemon relay UDP payload mismatch for pair {pair_index} packet {packet_index}"
+                );
+            }
+            relay_packets_received += 1;
+            relay_payload_bytes_received = relay_payload_bytes_received.saturating_add(len as u64);
+        }
+    }
+    let relay_elapsed = relay_started.elapsed();
+    let relay_millis = relay_elapsed.as_millis();
+    let status: RelayStatusResponse = get_json(
+        &client,
+        format!("{}/v1/status", services.relay_http_url),
+        "daemon relay status",
+    )
+    .await?;
+    let metrics = get_text(
+        &client,
+        format!("{}/metrics", services.relay_http_url),
+        "daemon relay metrics",
+    )
+    .await?;
+    let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
+    let relay_mbps = if relay_elapsed.is_zero() {
+        0.0
+    } else {
+        relay_payload_bytes_received as f64 * 8.0 / relay_elapsed.as_secs_f64() / 1_000_000.0
+    };
+
+    Ok(LoadReport {
+        transport: TransportMode::Daemon,
+        scenario: scenario.name,
+        node_count: agent_statuses.len(),
+        relay_count: 1,
+        route_provider_count: 0,
+        advertised_routes,
+        active_pair_count,
+        registrations: agent_statuses.len(),
+        peer_map_requests: agent_statuses.len(),
+        peer_map_edges_seen,
+        signal_negotiations: active_pair_count,
+        relay_candidates: 1,
+        direct_public_paths: path_counts.direct_public,
+        direct_ipv6_paths: path_counts.direct_ipv6,
+        direct_nat_paths: path_counts.direct_nat,
+        relay_paths: path_counts.relay,
+        unreachable_paths: path_counts.unreachable,
+        control_plane_http_requests: agent_statuses.len() + agent_statuses.len(),
+        signal_http_requests: peer_records.len() + active_pair_count,
+        relay_http_requests: active_pair_count + 2,
+        relay_udp_sessions: status.capability.active_sessions as usize,
+        relay_packets_per_session: relay_options.packets_per_session,
+        relay_payload_bytes_per_packet: relay_options.payload_bytes,
+        relay_udp_packets_sent: relay_packets_sent,
+        relay_udp_packets_received: relay_packets_received,
+        relay_udp_payload_bytes_sent: relay_payload_bytes_sent,
+        relay_udp_payload_bytes_received: relay_payload_bytes_received,
+        relay_forwarded_bytes_reported: forwarded_bytes,
+        relay_mbps,
+        daemon_processes: services.process_count(),
+        daemon_agent_processes: agent_processes,
+        registration_millis,
+        peer_map_millis,
+        signal_millis,
         relay_millis,
     })
 }
@@ -645,6 +864,233 @@ impl Drop for RelayNetworkedServices {
         self.http_task.abort();
         self.udp_task.abort();
     }
+}
+
+struct DaemonProcessGroup {
+    control_plane_url: String,
+    signal_url: String,
+    relay_http_url: String,
+    relay_udp_addr: SocketAddr,
+    agent_urls: Vec<String>,
+    runtime_dir: PathBuf,
+    children: Vec<Child>,
+}
+
+impl DaemonProcessGroup {
+    async fn start(
+        iparsd_bin: &Path,
+        cluster_id: ClusterId,
+        issuer: &IdentityKeyPair,
+        key_id: &KeyId,
+        agent_processes: usize,
+    ) -> anyhow::Result<Self> {
+        if !iparsd_bin.exists() && iparsd_bin.components().count() > 1 {
+            bail!("iparsd binary does not exist at {}", iparsd_bin.display());
+        }
+        let runtime_dir = daemon_runtime_dir()?;
+        std::fs::create_dir_all(&runtime_dir)?;
+        let control_addr = reserve_tcp_addr().await?;
+        let signal_addr = reserve_tcp_addr().await?;
+        let relay_http_addr = reserve_tcp_addr().await?;
+        let relay_udp_addr = reserve_udp_addr().await?;
+        let stun_addr = reserve_udp_addr().await?;
+        let control_plane_url = format!("http://{control_addr}");
+        let signal_url = format!("http://{signal_addr}");
+        let relay_http_url = format!("http://{relay_http_addr}");
+        let mut children = vec![
+            spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "control-plane".to_string(),
+                    "--listen".to_string(),
+                    control_addr.to_string(),
+                    "--cluster-id".to_string(),
+                    cluster_id.to_string(),
+                    "--issuer-node-id".to_string(),
+                    issuer.node_id().to_string(),
+                    "--issuer-key-id".to_string(),
+                    key_id.to_string(),
+                    "--issuer-public-key".to_string(),
+                    issuer.public_key_b64(),
+                ],
+                "control-plane",
+            )?,
+            spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "signal".to_string(),
+                    "--listen".to_string(),
+                    signal_addr.to_string(),
+                ],
+                "signal",
+            )?,
+            spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "relay".to_string(),
+                    "--relay-node-id".to_string(),
+                    "daemon-relay".to_string(),
+                    "--udp-listen".to_string(),
+                    relay_udp_addr.to_string(),
+                    "--http-listen".to_string(),
+                    relay_http_addr.to_string(),
+                    "--public-endpoint".to_string(),
+                    relay_udp_addr.to_string(),
+                    "--admission-url".to_string(),
+                    relay_http_url.clone(),
+                    "--max-sessions".to_string(),
+                    "10000".to_string(),
+                    "--max-mbps".to_string(),
+                    "10000".to_string(),
+                ],
+                "relay",
+            )?,
+            spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "stun".to_string(),
+                    "--listen".to_string(),
+                    stun_addr.to_string(),
+                ],
+                "stun",
+            )?,
+        ];
+
+        let client = reqwest::Client::new();
+        wait_for_http_ok(
+            &client,
+            format!("{control_plane_url}/healthz"),
+            "control-plane",
+        )
+        .await?;
+        wait_for_http_ok(&client, format!("{signal_url}/healthz"), "signal").await?;
+        wait_for_http_ok(&client, format!("{relay_http_url}/healthz"), "relay").await?;
+
+        let mut agent_urls = Vec::with_capacity(agent_processes);
+        for index in 0..agent_processes {
+            let agent_addr = reserve_tcp_addr().await?;
+            let agent_url = format!("http://{agent_addr}");
+            let state_path = runtime_dir.join(format!("agent-{index:04}.json"));
+            let token = issuer.sign_join_token(join_claims(
+                &cluster_id,
+                &issuer.node_id(),
+                key_id,
+                index,
+                Scenario::from_name(ScenarioName::Three),
+            )?)?;
+            children.push(spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "agent".to_string(),
+                    "--listen".to_string(),
+                    agent_addr.to_string(),
+                    "--state-path".to_string(),
+                    state_path.display().to_string(),
+                    "--join-token".to_string(),
+                    serde_json::to_string(&token)?,
+                    "--control-plane-url".to_string(),
+                    control_plane_url.clone(),
+                    "--signal-url".to_string(),
+                    signal_url.clone(),
+                    "--stun-server".to_string(),
+                    stun_addr.to_string(),
+                    "--runtime-backend".to_string(),
+                    "dry-run".to_string(),
+                    "--skip-runtime-preflight".to_string(),
+                    "--apply-peer-map".to_string(),
+                    "--peer-map-poll-interval-seconds".to_string(),
+                    "1".to_string(),
+                    "--heartbeat-interval-seconds".to_string(),
+                    "1".to_string(),
+                    "--signal-registration-interval-seconds".to_string(),
+                    "1".to_string(),
+                    "--signal-path-interval-seconds".to_string(),
+                    "1".to_string(),
+                ],
+                "agent",
+            )?);
+            wait_for_http_ok(&client, format!("{agent_url}/healthz"), "agent").await?;
+            agent_urls.push(agent_url);
+        }
+
+        Ok(Self {
+            control_plane_url,
+            signal_url,
+            relay_http_url,
+            relay_udp_addr,
+            agent_urls,
+            runtime_dir,
+            children,
+        })
+    }
+
+    fn process_count(&self) -> usize {
+        self.children.len()
+    }
+}
+
+impl Drop for DaemonProcessGroup {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
+    }
+}
+
+fn spawn_iparsd(iparsd_bin: &Path, args: &[String], role: &str) -> anyhow::Result<Child> {
+    Command::new(iparsd_bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn iparsd {role} process"))
+}
+
+fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
+    let unique = format!(
+        "ipars-load-daemon-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    Ok(std::env::temp_dir().join(unique))
+}
+
+async fn reserve_tcp_addr() -> anyhow::Result<SocketAddr> {
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    Ok(listener.local_addr()?)
+}
+
+async fn reserve_udp_addr() -> anyhow::Result<SocketAddr> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    Ok(socket.local_addr()?)
+}
+
+async fn wait_for_http_ok(
+    client: &reqwest::Client,
+    url: String,
+    context: &str,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                last_error = Some(anyhow::anyhow!(
+                    "{context} readiness returned {}",
+                    response.status()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error.into());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{context} readiness timed out")))
 }
 
 async fn get_json<Response>(
@@ -945,6 +1391,33 @@ mod tests {
         assert_eq!(report.relay_udp_payload_bytes_received, 768);
         assert_eq!(report.relay_forwarded_bytes_reported, 768);
         assert_eq!(report.relay_http_requests, 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_harness_can_drive_daemon_processes_when_binary_is_provided() -> anyhow::Result<()>
+    {
+        let Some(iparsd_bin) = std::env::var_os("IPARS_TEST_IPARSD_BIN").map(PathBuf::from) else {
+            return Ok(());
+        };
+
+        let report = run_daemon_scenario(
+            Scenario::from_name(ScenarioName::Three),
+            &iparsd_bin,
+            2,
+            RelayLoadOptions {
+                packets_per_session: 1,
+                payload_bytes: 64,
+            },
+        )
+        .await?;
+
+        assert_eq!(report.transport, TransportMode::Daemon);
+        assert_eq!(report.daemon_agent_processes, 2);
+        assert_eq!(report.registrations, 2);
+        assert_eq!(report.daemon_processes, 6);
+        assert_eq!(report.relay_udp_packets_sent, report.active_pair_count);
+        assert_eq!(report.relay_udp_packets_received, report.active_pair_count);
         Ok(())
     }
 
