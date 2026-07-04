@@ -9,7 +9,9 @@ use chrono::Utc;
 use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
-use ipars_types::api::{JoinNodeRequest, PeerMap, RegisterNodeResponse};
+use ipars_types::api::{
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
+};
 use ipars_types::NodeId;
 use serde::Serialize;
 
@@ -48,6 +50,7 @@ where
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/join", post(join::<S, L>))
+        .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
         .with_state(state)
 }
@@ -84,6 +87,17 @@ where
     Ok(Json(response))
 }
 
+async fn heartbeat<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<HeartbeatRequest>,
+) -> Result<Json<HeartbeatResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.heartbeat(request).await?))
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -109,6 +123,7 @@ impl IntoResponse for ApiError {
             }
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_) => StatusCode::CONFLICT,
+            ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
             ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -136,10 +151,13 @@ mod tests {
         IssuerKeyRing,
     };
     use ipars_crypto::IdentityKeyPair;
-    use ipars_types::api::{JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse};
+    use ipars_types::api::{
+        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
+        RegisterNodeResponse,
+    };
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, ClusterId, JoinTokenClaims, KeyId, NodeId, Role,
-        Tag, TokenPolicy,
+        BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState, JoinTokenClaims, KeyId,
+        NodeHealth, NodeId, Role, Tag, TokenPolicy,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -206,6 +224,7 @@ mod tests {
         };
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -219,6 +238,32 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RegisterNodeResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.node.node_id, NodeId::from_string("node-http"));
+
+        let heartbeat = HeartbeatRequest {
+            node_id: NodeId::from_string("node-http"),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: Some(1.0),
+                relay_load: None,
+                message: None,
+            },
+            candidates: Vec::new(),
+            path_state: Vec::new(),
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&heartbeat)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: HeartbeatResponse = serde_json::from_slice(&body)?;
+        assert!(response.accepted);
         Ok(())
     }
 }

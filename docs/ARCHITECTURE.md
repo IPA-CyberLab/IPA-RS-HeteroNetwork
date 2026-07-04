@@ -147,6 +147,7 @@ Initial control-plane HTTP routes:
 
 - `GET /healthz`
 - `POST /v1/join`
+- `POST /v1/heartbeat`
 - `GET /v1/peers/{node_id}`
 
 Initial signal HTTP routes:

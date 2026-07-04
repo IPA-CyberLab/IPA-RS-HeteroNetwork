@@ -5,10 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{verify_join_token, CryptoError};
-use ipars_types::api::{PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap};
+use ipars_types::api::{
+    HeartbeatRequest, HeartbeatResponse, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayMap,
+};
 use ipars_types::{
-    ClusterId, ClusterPolicy, JoinTokenClaims, KeyId, NodeId, NodeRecord, PathRecord, Route,
-    SignedJoinToken, TokenLedgerRecord, TokenStatus, VpnIp,
+    ClusterId, ClusterPolicy, EndpointCandidate, JoinTokenClaims, KeyId, NodeHealth, NodeId,
+    NodeRecord, PathRecord, Route, SignedJoinToken, TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use ipnet::Ipv4Net;
 use thiserror::Error;
@@ -20,6 +23,8 @@ pub enum ControlPlaneError {
     JoinDenied,
     #[error("node {0} already exists")]
     NodeAlreadyExists(NodeId),
+    #[error("node not found: {0}")]
+    NodeNotFound(NodeId),
     #[error("no available VPN IP in pool")]
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
@@ -64,6 +69,17 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError>;
     async fn get_node(&self, node_id: &NodeId) -> Result<Option<NodeRecord>, ControlPlaneError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError>;
+    async fn update_node_candidates(
+        &self,
+        node_id: &NodeId,
+        candidates: Vec<EndpointCandidate>,
+    ) -> Result<(), ControlPlaneError>;
+    async fn upsert_health(
+        &self,
+        node_id: NodeId,
+        health: NodeHealth,
+    ) -> Result<(), ControlPlaneError>;
+    async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
 }
@@ -93,6 +109,7 @@ pub trait TokenLedger: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
+    health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     paths: RwLock<Vec<PathRecord>>,
 }
 
@@ -113,6 +130,32 @@ impl ControlPlaneStore for InMemoryStore {
 
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
         Ok(self.nodes.read().await.values().cloned().collect())
+    }
+
+    async fn update_node_candidates(
+        &self,
+        node_id: &NodeId,
+        candidates: Vec<EndpointCandidate>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.endpoint_candidates = candidates;
+        Ok(())
+    }
+
+    async fn upsert_health(
+        &self,
+        node_id: NodeId,
+        health: NodeHealth,
+    ) -> Result<(), ControlPlaneError> {
+        self.health.write().await.insert(node_id, health);
+        Ok(())
+    }
+
+    async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError> {
+        Ok(self.health.read().await.get(node_id).cloned())
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -421,6 +464,27 @@ where
             generated_at: Utc::now(),
         })
     }
+
+    pub async fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Result<HeartbeatResponse, ControlPlaneError> {
+        self.store
+            .update_node_candidates(&request.node_id, request.candidates)
+            .await?;
+        self.store
+            .upsert_health(request.node_id.clone(), request.health)
+            .await?;
+        for path in request.path_state {
+            self.store.upsert_path(path).await?;
+        }
+
+        Ok(HeartbeatResponse {
+            accepted: true,
+            policy_version: 0,
+            peer_delta_available: false,
+        })
+    }
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
@@ -465,9 +529,11 @@ mod tests {
 
     use chrono::{Duration, Utc};
     use ipars_crypto::IdentityKeyPair;
-    use ipars_types::api::RegisterNodeRequest;
+    use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest};
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, KeyId, RelayCapability, Role, Tag, TokenPolicy,
+        BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, EndpointCandidate,
+        EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics, PathRecord, PathScore,
+        PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy,
     };
 
     use super::*;
@@ -513,6 +579,35 @@ mod tests {
             candidates: Vec::new(),
             relay_capability: None,
             requested_routes: Vec::new(),
+        }
+    }
+
+    fn candidate(node_id: &str) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: NodeId::from_string(node_id),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: std::net::SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }
+    }
+
+    fn path(local: &str, remote: &str) -> PathRecord {
+        PathRecord {
+            key: PeerPathKey::new(NodeId::from_string(local), NodeId::from_string(remote)),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
         }
     }
 
@@ -570,6 +665,62 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         );
         assert_eq!(response.relay_map.relays.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_records_health_candidates_and_paths(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: Some(12.0),
+            relay_load: None,
+            message: Some("ok".to_string()),
+        };
+
+        let response = plane
+            .heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("node-a"),
+                health: health.clone(),
+                candidates: vec![candidate("node-a")],
+                path_state: vec![path("node-a", "node-b")],
+            })
+            .await?;
+
+        assert!(response.accepted);
+        assert_eq!(
+            store
+                .get_node(&NodeId::from_string("node-a"))
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(NodeId::from_string(
+                    "node-a"
+                )))?
+                .endpoint_candidates
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.get_health(&NodeId::from_string("node-a")).await?,
+            Some(health)
+        );
+        assert_eq!(
+            store
+                .list_paths_for(&NodeId::from_string("node-a"))
+                .await?
+                .len(),
+            1
+        );
         Ok(())
     }
 

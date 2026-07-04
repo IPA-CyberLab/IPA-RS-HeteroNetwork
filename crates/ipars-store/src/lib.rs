@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
-use ipars_types::{ClusterId, NodeId, NodeRecord, PathRecord, TokenLedgerRecord, TokenStatus};
+use ipars_types::{
+    ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, TokenLedgerRecord,
+    TokenStatus,
+};
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
 #[derive(Debug, Clone)]
@@ -42,6 +45,17 @@ impl SqliteControlPlaneStore {
                     remote_node_id TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY (local_node_id, remote_node_id)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS health (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    record_json TEXT NOT NULL
                 );
                 "#,
             )
@@ -93,6 +107,55 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .into_iter()
             .map(row_to_node)
             .collect()
+    }
+
+    async fn update_node_candidates(
+        &self,
+        node_id: &NodeId,
+        candidates: Vec<EndpointCandidate>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.endpoint_candidates = candidates;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn upsert_health(
+        &self,
+        node_id: NodeId,
+        health: NodeHealth,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO health (node_id, record_json)
+            VALUES (?1, ?2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(serde_json::to_string(&health).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM health WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(row_to_health).transpose()
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -251,6 +314,17 @@ impl PostgresControlPlaneStore {
         self.pool
             .execute(
                 r#"
+                CREATE TABLE IF NOT EXISTS health (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    record_json JSONB NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS tokens (
                     cluster_id TEXT NOT NULL,
                     nonce TEXT NOT NULL,
@@ -294,6 +368,55 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .into_iter()
             .map(pg_row_to_node)
             .collect()
+    }
+
+    async fn update_node_candidates(
+        &self,
+        node_id: &NodeId,
+        candidates: Vec<EndpointCandidate>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.endpoint_candidates = candidates;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn upsert_health(
+        &self,
+        node_id: NodeId,
+        health: NodeHealth,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO health (node_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(serde_json::to_value(&health).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM health WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(pg_row_to_health).transpose()
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -415,6 +538,11 @@ fn row_to_path(row: sqlx::sqlite::SqliteRow) -> Result<PathRecord, ControlPlaneE
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_health(row: sqlx::sqlite::SqliteRow) -> Result<NodeHealth, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn row_to_token(row: sqlx::sqlite::SqliteRow) -> Result<TokenLedgerRecord, ControlPlaneError> {
     let record_json: String = row.get("record_json");
     serde_json::from_str(&record_json).map_err(json_error)
@@ -426,6 +554,11 @@ fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlane
 }
 
 fn pg_row_to_path(row: sqlx::postgres::PgRow) -> Result<PathRecord, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_health(row: sqlx::postgres::PgRow) -> Result<NodeHealth, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
 }
@@ -446,12 +579,13 @@ fn json_error(error: serde_json::Error) -> ControlPlaneError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use chrono::Utc;
     use ipars_control_plane::{ControlPlaneStore, TokenAdmission};
     use ipars_types::{
-        ClusterId, JoinTokenClaims, KeyId, NodeRecord, PathMetrics, PathRecord, PathScore,
+        CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, HealthState,
+        JoinTokenClaims, KeyId, NodeHealth, NodeRecord, PathMetrics, PathRecord, PathScore,
         PathState, PeerPathKey, Role, Tag, TokenPolicy, VpnIp,
     };
 
@@ -491,6 +625,18 @@ mod tests {
         }
     }
 
+    fn candidate(node_id: &str) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: NodeId::from_string(node_id),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_store_round_trips_nodes_and_paths() -> Result<(), Box<dyn std::error::Error>> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
@@ -519,6 +665,29 @@ mod tests {
         assert_eq!(store.get_node(&local.node_id).await?, Some(local.clone()));
         assert_eq!(store.list_nodes().await?.len(), 2);
         assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 1);
+        store
+            .update_node_candidates(&local.node_id, vec![candidate(local.node_id.as_str())])
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .endpoint_candidates
+                .len(),
+            1
+        );
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: Some(12.0),
+            relay_load: None,
+            message: Some("ok".to_string()),
+        };
+        store
+            .upsert_health(local.node_id.clone(), health.clone())
+            .await?;
+        assert_eq!(store.get_health(&local.node_id).await?, Some(health));
 
         let admission = TokenAdmission::new(std::sync::Arc::new(store.clone()));
         let token_claims = claims(local.cluster_id.clone());

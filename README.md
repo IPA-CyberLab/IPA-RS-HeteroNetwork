@@ -19,6 +19,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - relay session admission/status HTTP API, opaque UDP payload forwarding, and `iparsd relay`
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - persistent agent node state, agent status/STUN probe HTTP API, and `iparsd agent`
+- control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
