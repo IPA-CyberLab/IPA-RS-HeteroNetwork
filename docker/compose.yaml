@@ -82,6 +82,7 @@ services:
       - 0.0.0.0:9580
     environment:
       IPARS_ROLE: relay
+      IPARS_RELAY_ADMISSION_URL: http://relay:9580
       IPARS_RELAY_MAX_SESSIONS: "10000"
     ports:
       - "51820:51820/udp"

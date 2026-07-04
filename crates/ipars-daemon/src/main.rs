@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
     NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
-    SystemCommandRunner, UdpHolePuncher,
+    RelaySessionState, SystemCommandRunner, UdpHolePuncher,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -29,8 +29,9 @@ use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
+    SignalHolePunchPlanResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
@@ -114,6 +115,8 @@ struct RelayArgs {
     http_listen: SocketAddr,
     #[arg(long, env = "IPARS_RELAY_PUBLIC_ENDPOINT")]
     public_endpoint: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_URL")]
+    admission_url: Option<String>,
     #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     max_sessions: u32,
     #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
@@ -307,11 +310,16 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
     let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
+    let admission_url = args
+        .admission_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", args.http_listen));
     let service = Arc::new(RelayService::with_session_ttl(
         NodeId::from_string(args.relay_node_id),
         RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(public_endpoint),
+            admission_url: Some(admission_url),
             max_sessions: args.max_sessions,
             active_sessions: 0,
             max_mbps: args.max_mbps,
@@ -694,6 +702,7 @@ async fn negotiate_signal_paths(
     for peer in peer_map.peers {
         let request = signal_path_request(&status, &peer);
         let response = send_signal_path_request(client, signal_url, request).await?;
+        let relay_candidate = selected_relay_candidate(&response);
         let record = signal_path_record(response, chrono::Utc::now());
         if record.selected_state == PathState::DirectNatTraversal {
             match fetch_hole_punch_plan(client, signal_url, &record.key).await {
@@ -716,9 +725,146 @@ async fn negotiate_signal_paths(
                 ),
             }
         }
+        if record.selected_state == PathState::Relay {
+            match relay_candidate {
+                Some(relay) => match admit_relay_session(client, &status, &peer, &relay).await {
+                    Ok(session) => {
+                        tracing::info!(
+                            peer = %record.key.remote,
+                            relay = %session.relay_node,
+                            expires_at = %session.expires_at,
+                            "admitted relay session"
+                        );
+                        runtime.upsert_relay_session(session).await;
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        peer = %record.key.remote,
+                        "failed to admit relay session"
+                    ),
+                },
+                None => tracing::warn!(
+                    peer = %record.key.remote,
+                    "signal selected relay path without a usable relay candidate"
+                ),
+            }
+        }
         runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+async fn admit_relay_session(
+    client: &reqwest::Client,
+    status: &ipars_types::api::AgentStatusResponse,
+    peer: &NodeRecord,
+    relay: &NodeRecord,
+) -> anyhow::Result<RelaySessionState> {
+    let request = relay_admission_request(status, peer)
+        .context("relay session requires endpoint candidates")?;
+    let relay_endpoint = relay_public_endpoint(relay)?;
+    let response = client
+        .post(relay_admission_url(relay)?)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send relay admission request")?
+        .error_for_status()
+        .context("relay rejected admission request")?
+        .json::<RelayAdmissionResponse>()
+        .await
+        .context("failed to decode relay admission response")?;
+
+    Ok(RelaySessionState {
+        peer: peer.node_id.clone(),
+        relay_node: response.relay_node,
+        relay_endpoint,
+        session_id: response.session_id,
+        session_token: response.session_token,
+        expires_at: response.expires_at,
+    })
+}
+
+fn relay_admission_request(
+    status: &ipars_types::api::AgentStatusResponse,
+    peer: &NodeRecord,
+) -> Option<RelayAdmissionRequest> {
+    Some(RelayAdmissionRequest {
+        left: status.node_id.clone(),
+        right: peer.node_id.clone(),
+        left_addr: relay_session_endpoint(&status.candidates)?,
+        right_addr: relay_session_endpoint(&peer.endpoint_candidates)?,
+    })
+}
+
+fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            relay_session_endpoint_rank(candidate).map(|rank| (rank, candidate))
+        })
+        .min_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.cost.cmp(&right.cost))
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+        .map(|(_, candidate)| candidate.addr)
+}
+
+fn relay_session_endpoint_rank(candidate: &EndpointCandidate) -> Option<u8> {
+    match candidate.kind {
+        ipars_types::EndpointCandidateKind::StunReflexive => Some(0),
+        ipars_types::EndpointCandidateKind::PublicUdp => Some(1),
+        ipars_types::EndpointCandidateKind::Ipv6 => Some(2),
+        ipars_types::EndpointCandidateKind::LocalUdp => Some(3),
+        ipars_types::EndpointCandidateKind::Relay => None,
+    }
+}
+
+fn selected_relay_candidate(response: &SignalPathResponse) -> Option<NodeRecord> {
+    if response.preferred_state != PathState::Relay {
+        return None;
+    }
+    response
+        .relay_candidates
+        .iter()
+        .filter(|relay| {
+            relay
+                .relay_capability
+                .as_ref()
+                .map(|capability| capability.can_admit())
+                .unwrap_or(false)
+        })
+        .min_by(|left, right| {
+            let left = left.relay_capability.as_ref();
+            let right = right.relay_capability.as_ref();
+            left.map(|capability| capability.active_sessions)
+                .cmp(&right.map(|capability| capability.active_sessions))
+                .then_with(|| {
+                    right
+                        .map(|capability| capability.max_mbps)
+                        .cmp(&left.map(|capability| capability.max_mbps))
+                })
+        })
+        .cloned()
+}
+
+fn relay_admission_url(relay: &NodeRecord) -> anyhow::Result<String> {
+    let url = relay
+        .relay_capability
+        .as_ref()
+        .and_then(|capability| capability.admission_url.as_ref())
+        .context("relay admission URL is missing")?;
+    Ok(format!("{}/v1/sessions", url.trim_end_matches('/')))
+}
+
+fn relay_public_endpoint(relay: &NodeRecord) -> anyhow::Result<SocketAddr> {
+    relay
+        .relay_capability
+        .as_ref()
+        .and_then(|capability| capability.public_endpoint)
+        .context("relay public UDP endpoint is missing")
 }
 
 async fn fetch_hole_punch_plan(
@@ -1063,12 +1209,15 @@ mod tests {
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--admission-url",
+            "http://relay-a:9580",
             "--session-ttl-seconds",
             "60",
         ])?;
 
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
+            assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
             return Ok(());
         }
 
@@ -1116,6 +1265,121 @@ mod tests {
                 &NodeId::from_string("node-b"),
             ),
             "http://127.0.0.1:9443/v1/hole-punch/node-a/node-b"
+        );
+    }
+
+    #[test]
+    fn relay_admission_url_trims_relay_base_url() -> anyhow::Result<()> {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51820))),
+            admission_url: Some("http://203.0.113.30:9580/".to_string()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        assert_eq!(
+            relay_admission_url(&relay)?,
+            "http://203.0.113.30:9580/v1/sessions"
+        );
+        assert_eq!(
+            relay_public_endpoint(&relay)?,
+            SocketAddr::from(([203, 0, 113, 30], 51820))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_request_prefers_reflexive_endpoints() {
+        let local = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let status = ipars_types::api::AgentStatusResponse {
+            node_id: local.clone(),
+            identity_public_key: "identity-local".to_string(),
+            wireguard_public_key: "wg-local".to_string(),
+            candidate_count: 2,
+            candidates: vec![
+                candidate("local", EndpointCandidateKind::LocalUdp, 1),
+                EndpointCandidate {
+                    node_id: local.clone(),
+                    kind: EndpointCandidateKind::StunReflexive,
+                    addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 10,
+                    source: CandidateSource::StunProbe,
+                },
+            ],
+            state_updated_at: Utc::now(),
+        };
+        let mut peer_record = node_record("peer-a");
+        peer_record.endpoint_candidates = vec![
+            candidate("peer-a", EndpointCandidateKind::LocalUdp, 1),
+            EndpointCandidate {
+                node_id: peer.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            },
+        ];
+
+        let request = relay_admission_request(&status, &peer_record);
+
+        assert_eq!(
+            request,
+            Some(RelayAdmissionRequest {
+                left: local,
+                right: peer,
+                left_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                right_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            })
+        );
+    }
+
+    #[test]
+    fn selected_relay_candidate_prefers_capacity_tie_breaker() {
+        let mut low_bandwidth = node_record("relay-low");
+        low_bandwidth.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 100,
+            e2e_only: true,
+        });
+        let mut high_bandwidth = node_record("relay-high");
+        high_bandwidth.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some("http://203.0.113.32:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![low_bandwidth, high_bandwidth],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let selected = selected_relay_candidate(&response);
+
+        assert_eq!(
+            selected.map(|relay| relay.node_id),
+            Some(NodeId::from_string("relay-high"))
         );
     }
 
@@ -1225,6 +1489,7 @@ mod tests {
         relay.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
             max_sessions: 100,
             active_sessions: 0,
             max_mbps: 1000,

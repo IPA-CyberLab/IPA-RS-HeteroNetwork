@@ -304,6 +304,7 @@ pub struct PathRecord {
 pub struct RelayCapability {
     pub enabled_by_policy: bool,
     pub public_endpoint: Option<SocketAddr>,
+    pub admission_url: Option<String>,
     pub max_sessions: u32,
     pub active_sessions: u32,
     pub max_mbps: u32,
@@ -318,6 +319,7 @@ impl RelayCapability {
     pub fn can_admit(&self) -> bool {
         self.enabled_by_policy
             && self.public_endpoint.is_some()
+            && self.admission_url.is_some()
             && self.e2e_only
             && self.available_capacity() > 0
             && self.max_mbps > 0
@@ -717,6 +719,7 @@ mod tests {
         let relay = RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
             max_sessions: 10,
             active_sessions: 9,
             max_mbps: 1000,

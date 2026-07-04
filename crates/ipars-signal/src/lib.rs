@@ -287,6 +287,7 @@ mod tests {
             relay_capability: Some(RelayCapability {
                 enabled_by_policy: true,
                 public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
+                admission_url: Some("http://203.0.113.20:9580".to_string()),
                 max_sessions: 10,
                 active_sessions: 0,
                 max_mbps: 1000,
@@ -332,6 +333,30 @@ mod tests {
 
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_ignores_relay_without_admission_url() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut relay = relay();
+        if let Some(capability) = relay.relay_capability.as_mut() {
+            capability.admission_url = None;
+        }
+        registry.upsert_node(target(Vec::new())).await;
+        registry.upsert_node(relay).await;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
         Ok(())
     }
 

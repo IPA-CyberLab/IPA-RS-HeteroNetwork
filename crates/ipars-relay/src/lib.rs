@@ -506,17 +506,22 @@ mod tests {
 
     use super::*;
 
+    fn relay_capability(public_endpoint: SocketAddr, max_mbps: u32) -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(public_endpoint),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps,
+            e2e_only: true,
+        }
+    }
+
     #[test]
     fn relay_forwards_only_known_opaque_session_payloads() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1000,
-            e2e_only: true,
-        };
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
         let left = NodeId::from_string("left");
         let right = NodeId::from_string("right");
         let credentials = table.admit_with_token(
@@ -542,14 +547,7 @@ mod tests {
     #[test]
     fn relay_rejects_invalid_session_token() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1000,
-            e2e_only: true,
-        };
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
         let left = NodeId::from_string("left");
         let right = NodeId::from_string("right");
         let credentials = table.admit_with_token(
@@ -576,14 +574,7 @@ mod tests {
     #[test]
     fn relay_removes_expired_session_before_forwarding() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1000,
-            e2e_only: true,
-        };
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
         let left = NodeId::from_string("left");
         let right = NodeId::from_string("right");
         let credentials = table.admit_with_options(
@@ -616,14 +607,7 @@ mod tests {
     #[test]
     fn relay_enforces_per_session_rate_limit() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1,
-            e2e_only: true,
-        };
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1);
         let left = NodeId::from_string("left");
         let right = NodeId::from_string("right");
         let credentials = table.admit_with_token(
@@ -659,14 +643,7 @@ mod tests {
     #[test]
     fn relay_frame_uses_length_prefixed_metadata() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1000,
-            e2e_only: true,
-        };
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
         let left = NodeId::from_string("left\nspoof");
         let right = NodeId::from_string("right");
         let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
@@ -697,14 +674,7 @@ mod tests {
     {
         let service = RelayService::with_session_ttl(
             NodeId::from_string("relay"),
-            RelayCapability {
-                enabled_by_policy: true,
-                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
-                max_sessions: 10,
-                active_sessions: 0,
-                max_mbps: 1000,
-                e2e_only: true,
-            },
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
             chrono::Duration::milliseconds(1),
         );
         let _admission = service
@@ -730,14 +700,7 @@ mod tests {
         let relay_addr = relay.local_addr()?;
         let left_socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let right_socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let capability = RelayCapability {
-            enabled_by_policy: true,
-            public_endpoint: Some(relay_addr),
-            max_sessions: 10,
-            active_sessions: 0,
-            max_mbps: 1000,
-            e2e_only: true,
-        };
+        let capability = relay_capability(relay_addr, 1000);
         let service = RelayService::new(NodeId::from_string("relay"), capability);
         let admission = service
             .admit(RelayAdmissionRequest {

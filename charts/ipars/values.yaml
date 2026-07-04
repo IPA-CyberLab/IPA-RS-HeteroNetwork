@@ -8,6 +8,7 @@ cluster:
   signalUrl: "https://ipars-signal:9443"
   stunEndpoint: "ipars-stun:3478"
   relayEndpoint: "ipars-relay:51820"
+  relayAdmissionUrl: "https://ipars-relay:9580"
 
 agent:
   interfaceName: ipars0

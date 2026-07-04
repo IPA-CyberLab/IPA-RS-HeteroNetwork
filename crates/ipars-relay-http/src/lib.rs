@@ -103,6 +103,7 @@ mod tests {
             RelayCapability {
                 enabled_by_policy: true,
                 public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                admission_url: Some("http://203.0.113.10:9580".to_string()),
                 max_sessions: 10,
                 active_sessions: 0,
                 max_mbps: 1000,

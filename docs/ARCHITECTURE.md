@@ -106,6 +106,8 @@ Public nodes are relay candidates only when policy, health, and capacity permit 
 
 Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an outer relay frame containing session metadata and an expiring bearer credential, enforce per-session throughput windows, strip the relay frame before forwarding, and never receive keys that can decrypt tenant payload.
 
+Relay candidates advertise both a public UDP relay endpoint and an HTTP admission URL. When signal negotiation selects `RELAY`, the agent admits a relay session directly with that relay and keeps the returned credential in transient runtime state rather than reporting it back through control-plane heartbeat.
+
 ## Docker Support
 
 Docker support targets:

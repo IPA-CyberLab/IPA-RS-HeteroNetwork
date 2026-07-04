@@ -34,6 +34,8 @@ pub enum AgentError {
     ControlPlaneClient(String),
     #[error("hole punch error: {0}")]
     HolePunch(String),
+    #[error("relay session error: {0}")]
+    RelaySession(String),
     #[error("wireguard backend error: {0}")]
     WireGuard(String),
     #[error("peer path does not exist: {0}")]
@@ -124,7 +126,18 @@ pub struct AgentRuntime {
     state: AgentNodeState,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
+    relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySessionState {
+    pub peer: NodeId,
+    pub relay_node: NodeId,
+    pub relay_endpoint: std::net::SocketAddr,
+    pub session_id: String,
+    pub session_token: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 impl AgentRuntime {
@@ -133,6 +146,7 @@ impl AgentRuntime {
             state,
             candidates: tokio::sync::RwLock::new(Vec::new()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
+            relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
         }
     }
@@ -174,6 +188,21 @@ impl AgentRuntime {
             (record.key.local.clone(), record.key.remote.clone()),
             record,
         );
+    }
+
+    pub async fn upsert_relay_session(&self, session: RelaySessionState) {
+        self.relay_sessions
+            .write()
+            .await
+            .insert(session.peer.clone(), session);
+    }
+
+    pub async fn relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
+        self.relay_sessions.read().await.get(peer).cloned()
+    }
+
+    pub async fn relay_sessions(&self) -> Vec<RelaySessionState> {
+        self.relay_sessions.read().await.values().cloned().collect()
     }
 
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -988,6 +1017,28 @@ mod tests {
         runtime.upsert_path_state(latest.clone()).await;
 
         assert_eq!(runtime.path_state().await, vec![latest]);
+    }
+
+    #[tokio::test]
+    async fn runtime_stores_relay_sessions_separately_from_path_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-a");
+        let session = RelaySessionState {
+            peer: peer.clone(),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+            session_id: "session-a".to_string(),
+            session_token: "secret".to_string(),
+            expires_at: Utc::now() + ChronoDuration::seconds(60),
+        };
+
+        runtime.upsert_relay_session(session.clone()).await;
+
+        assert_eq!(runtime.relay_session(&peer).await, Some(session));
+        assert!(runtime.path_state().await.is_empty());
     }
 
     #[tokio::test]

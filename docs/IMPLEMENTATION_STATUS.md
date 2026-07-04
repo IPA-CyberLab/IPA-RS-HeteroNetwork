@@ -24,6 +24,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` heartbeat reporting that posts current node health, candidates, and negotiated path-state data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.
 - `iparsd agent` signal-service node registration that upserts the registered `NodeRecord` with refreshed endpoint candidates when a signal endpoint is known.
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
+- `iparsd agent` relay admission for `RELAY` paths selected by signal negotiation, using relay-advertised admission URLs and keeping expiring relay credentials in transient agent runtime state.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
@@ -42,7 +43,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - Full STUN protocol support and NAT classification.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
-- Relay credential distribution through control-plane/signal path selection and coordinated relay session rotation.
+- Relay session renewal/rotation and data-plane relay frame emission from the agent/WireGuard backend.
 - Metrics export and structured path-change events.
 - Docker namespace integration implementation.
 - Kubernetes route discovery and service/API exposure implementation.
