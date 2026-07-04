@@ -516,6 +516,12 @@ impl AgentRuntime {
             (record.key.local.clone(), record.key.remote.clone()),
             record.clone(),
         );
+        if record.pinned {
+            self.lazy_connect
+                .write()
+                .await
+                .pin_peer(record.key.remote.clone());
+        }
         if let Some(event) = path_change_event(previous.as_ref(), &record) {
             let mut events = self.path_change_events.write().await;
             if events.len() >= MAX_PATH_CHANGE_EVENTS {
@@ -620,6 +626,35 @@ impl AgentRuntime {
 
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
         self.lazy_connect.read().await.idle_peers_to_close(now)
+    }
+
+    pub async fn record_peer_activity(&self, peer: NodeId, at: DateTime<Utc>, pin: bool) -> bool {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        lazy_connect.record_activity(peer.clone(), at);
+        if pin {
+            lazy_connect.pin_peer(peer.clone());
+        }
+        lazy_connect.is_pinned(&peer)
+    }
+
+    pub async fn observe_peer_map_for_lazy_connect(&self, peers: &[NodeRecord]) {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        for peer in peers {
+            lazy_connect.observe_peer(peer);
+        }
+    }
+
+    pub async fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
+        self.lazy_connect.read().await.should_connect_peer(peer)
+    }
+
+    pub async fn take_idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        let idle_peers = lazy_connect.idle_peers_to_close(now);
+        for peer in &idle_peers {
+            lazy_connect.remove_activity(peer);
+        }
+        idle_peers
     }
 }
 
@@ -1331,6 +1366,7 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerMapApplySummary {
     pub peers_applied: usize,
+    pub peers_removed: usize,
     pub routes_applied: usize,
 }
 
@@ -1340,6 +1376,8 @@ pub struct PeerMapApplier<W, R> {
     wireguard: W,
     route_manager: R,
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
+    lazy_runtime: Option<Arc<AgentRuntime>>,
+    applied_peers: tokio::sync::RwLock<BTreeSet<NodeId>>,
 }
 
 impl<W, R> PeerMapApplier<W, R>
@@ -1353,6 +1391,8 @@ where
             wireguard,
             route_manager,
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
+            lazy_runtime: None,
+            applied_peers: tokio::sync::RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -1364,14 +1404,62 @@ where
         self
     }
 
+    pub fn with_lazy_connect_runtime(mut self, runtime: Arc<AgentRuntime>) -> Self {
+        self.lazy_runtime = Some(runtime);
+        self
+    }
+
     pub async fn apply_peer_map(
         &self,
         peer_map: PeerMap,
     ) -> Result<PeerMapApplySummary, AgentError> {
+        if let Some(runtime) = &self.lazy_runtime {
+            runtime
+                .observe_peer_map_for_lazy_connect(&peer_map.peers)
+                .await;
+        }
+
+        let now = Utc::now();
+        let peer_map_ids = peer_map
+            .peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut peers_to_remove = BTreeSet::new();
+        if let Some(runtime) = &self.lazy_runtime {
+            peers_to_remove.extend(runtime.take_idle_peers_to_close(now).await);
+        }
+        let stale_peers = {
+            let applied_peers = self.applied_peers.read().await;
+            applied_peers
+                .iter()
+                .filter(|peer| !peer_map_ids.contains(*peer))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        peers_to_remove.extend(stale_peers);
+
+        let mut peers_removed = 0;
+        for peer in peers_to_remove {
+            let was_applied = self.applied_peers.read().await.contains(&peer);
+            if !was_applied {
+                continue;
+            }
+            self.wireguard.remove_peer(&peer).await?;
+            self.applied_peers.write().await.remove(&peer);
+            peers_removed += 1;
+        }
+
         let mut routes = Vec::new();
         let mut peers_applied = 0;
 
         for peer in peer_map.peers {
+            if let Some(runtime) = &self.lazy_runtime {
+                if !runtime.should_connect_peer(&peer).await {
+                    continue;
+                }
+            }
+
             let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
             let endpoint = self.endpoint_resolver.endpoint_for_peer(&peer).await?;
             self.wireguard
@@ -1383,6 +1471,10 @@ where
                     persistent_keepalive_seconds: endpoint.map(|_| 25),
                 })
                 .await?;
+            self.applied_peers
+                .write()
+                .await
+                .insert(peer.node_id.clone());
             peers_applied += 1;
 
             routes.push(peer_host_route(&peer)?);
@@ -1402,6 +1494,7 @@ where
 
         Ok(PeerMapApplySummary {
             peers_applied,
+            peers_removed,
             routes_applied,
         })
     }
@@ -1515,9 +1608,29 @@ impl LazyConnectManager {
         self.pins.insert(peer);
     }
 
+    pub fn is_pinned(&self, peer: &NodeId) -> bool {
+        self.pins.contains(peer)
+    }
+
     pub fn is_pinned_by_policy(&self, role: &Role, tags: &BTreeSet<Tag>) -> bool {
         self.policy.pinned_roles.contains(role)
             || tags.iter().any(|tag| self.policy.pinned_tags.contains(tag))
+    }
+
+    pub fn observe_peer(&mut self, peer: &NodeRecord) {
+        if self.is_pinned_by_policy(&peer.role, &peer.tags)
+            || !peer.routes.is_empty()
+            || peer
+                .relay_capability
+                .as_ref()
+                .is_some_and(|capability| capability.can_admit())
+        {
+            self.pin_peer(peer.node_id.clone());
+        }
+    }
+
+    pub fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
+        self.pins.contains(&peer.node_id) || self.last_used.contains_key(&peer.node_id)
     }
 
     pub fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -1536,6 +1649,10 @@ impl LazyConnectManager {
                 }
             })
             .collect()
+    }
+
+    pub fn remove_activity(&mut self, peer: &NodeId) {
+        self.last_used.remove(peer);
     }
 }
 
@@ -2415,6 +2532,7 @@ mod tests {
             summary,
             PeerMapApplySummary {
                 peers_applied: 1,
+                peers_removed: 0,
                 routes_applied: 2,
             }
         );
@@ -2523,6 +2641,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_map_applier_prunes_idle_unpinned_peers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy {
+                idle_timeout_seconds: 10,
+                ..ClusterPolicy::default()
+            },
+        ));
+        let active_peer_id = NodeId::from_string("peer-active");
+        let inactive_peer_id = NodeId::from_string("peer-inactive");
+        let pinned_peer_id = NodeId::from_string("peer-pinned");
+        runtime
+            .record_peer_activity(active_peer_id.clone(), Utc::now(), false)
+            .await;
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_lazy_connect_runtime(runtime.clone());
+        let active_peer = peer_record(
+            active_peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-active",
+            vec![EndpointCandidate {
+                node_id: active_peer_id.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+        let inactive_peer = peer_record(
+            inactive_peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)),
+            "wg-inactive",
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut pinned_peer = peer_record(
+            pinned_peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 12)),
+            "wg-pinned",
+            Vec::new(),
+            Vec::new(),
+        );
+        pinned_peer.role = Role::control_plane();
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![active_peer, inactive_peer, pinned_peer],
+            generated_at: Utc::now(),
+        };
+
+        let first = applier.apply_peer_map(peer_map.clone()).await?;
+
+        assert_eq!(
+            first,
+            PeerMapApplySummary {
+                peers_applied: 2,
+                peers_removed: 0,
+                routes_applied: 2,
+            }
+        );
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        assert!(wireguard_peers.contains_key(&active_peer_id));
+        assert!(!wireguard_peers.contains_key(&inactive_peer_id));
+        assert!(wireguard_peers.contains_key(&pinned_peer_id));
+        drop(wireguard_peers);
+
+        runtime
+            .record_peer_activity(
+                active_peer_id.clone(),
+                Utc::now() - ChronoDuration::seconds(30),
+                false,
+            )
+            .await;
+        let second = applier.apply_peer_map(peer_map).await?;
+
+        assert_eq!(
+            second,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 1,
+                routes_applied: 1,
+            }
+        );
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        assert!(!wireguard_peers.contains_key(&active_peer_id));
+        assert!(!wireguard_peers.contains_key(&inactive_peer_id));
+        assert!(wireguard_peers.contains_key(&pinned_peer_id));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn peer_map_sync_fetches_and_applies_once() -> Result<(), AgentError> {
         let node_id = NodeId::from_string("local");
         let peer_map = PeerMap {
@@ -2533,6 +2749,7 @@ mod tests {
         let source = StaticPeerMapSource::new(node_id.clone(), peer_map.clone());
         let sink = RecordingPeerMapSink::new(PeerMapApplySummary {
             peers_applied: 3,
+            peers_removed: 0,
             routes_applied: 5,
         });
         let sync = PeerMapSync::new(node_id.clone(), source.clone(), sink.clone());
@@ -2543,6 +2760,7 @@ mod tests {
             summary,
             PeerMapApplySummary {
                 peers_applied: 3,
+                peers_removed: 0,
                 routes_applied: 5,
             }
         );

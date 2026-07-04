@@ -2662,7 +2662,7 @@ where
         );
         applier = applier.with_endpoint_resolver(resolver);
     }
-    applier
+    applier.with_lazy_connect_runtime(runtime)
 }
 
 fn start_peer_map_sync_with_sink<A>(
@@ -3884,6 +3884,7 @@ async fn run_peer_map_sync_loop<S, A>(
         match sync.sync_once().await {
             Ok(summary) => tracing::info!(
                 peers_applied = summary.peers_applied,
+                peers_removed = summary.peers_removed,
                 routes_applied = summary.routes_applied,
                 interface = %interface,
                 "applied control-plane peer map"

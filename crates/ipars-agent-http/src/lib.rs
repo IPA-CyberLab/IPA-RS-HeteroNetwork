@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime};
 use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
-    AgentPathEventsResponse, AgentPathsResponse, AgentStatusResponse, AgentStunProbeRequest,
-    AgentStunProbeResponse,
+    AgentPathEventsResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
 };
 use ipars_types::PathState;
 use serde::Serialize;
@@ -42,6 +42,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/path-events", get(path_events))
         .route("/v1/stun-probe", post(stun_probe))
         .route("/v1/nat-classification", post(nat_classification))
+        .route("/v1/peer-activity", post(peer_activity))
         .with_state(state)
 }
 
@@ -107,6 +108,25 @@ async fn nat_classification(
     Ok((
         StatusCode::CREATED,
         Json(AgentNatClassifyResponse { classification }),
+    ))
+}
+
+async fn peer_activity(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentPeerActivityRequest>,
+) -> Result<(StatusCode, Json<AgentPeerActivityResponse>), ApiError> {
+    let recorded_at = chrono::Utc::now();
+    let pinned = state
+        .runtime
+        .record_peer_activity(request.peer.clone(), recorded_at, request.pin)
+        .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AgentPeerActivityResponse {
+            peer: request.peer,
+            recorded_at,
+            pinned,
+        }),
     ))
 }
 
@@ -466,6 +486,38 @@ mod tests {
         let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
         assert_eq!(events.events.len(), 1);
         assert_eq!(events.events[0].new_state, PathState::Relay);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_records_peer_activity_for_lazy_connect(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let peer = NodeId::from_string("peer-active");
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/peer-activity")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&AgentPeerActivityRequest {
+                        peer: peer.clone(),
+                        pin: true,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let activity: AgentPeerActivityResponse = serde_json::from_slice(&body)?;
+        assert_eq!(activity.peer, peer);
+        assert!(activity.pinned);
+        assert!(runtime.idle_peers_to_close(Utc::now()).await.is_empty());
         Ok(())
     }
 }

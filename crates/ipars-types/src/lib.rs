@@ -1057,6 +1057,20 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPeerActivityRequest {
+        pub peer: NodeId,
+        #[serde(default)]
+        pub pin: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPeerActivityResponse {
+        pub peer: NodeId,
+        pub recorded_at: DateTime<Utc>,
+        pub pinned: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentRelayForwarderMetrics {
         pub peer: NodeId,
         pub relay_node: NodeId,
