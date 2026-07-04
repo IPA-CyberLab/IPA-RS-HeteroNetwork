@@ -27,7 +27,7 @@ use ipars_route_manager::{
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
-use ipars_stun::EchoStunServer;
+use ipars_stun::BindingStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
     RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
@@ -353,7 +353,7 @@ async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
 }
 
 async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
-    let server = EchoStunServer::bind(args.listen).await?;
+    let server = BindingStunServer::bind(args.listen).await?;
     let listen = server.local_addr()?;
     tracing::info!(%listen, "stun listening");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

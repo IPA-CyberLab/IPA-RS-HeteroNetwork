@@ -91,6 +91,8 @@ The default path discovery order is:
 4. Relay fallback.
 5. `UNREACHABLE`.
 
+STUN reflexive endpoint detection uses RFC 5389 Binding requests and success responses with `XOR-MAPPED-ADDRESS`; NAT classification builds on these probes.
+
 The signal service only coordinates endpoint candidate exchange and timing. It does not forward data-plane payload.
 
 ## Relay Design

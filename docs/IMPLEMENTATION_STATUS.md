@@ -16,7 +16,7 @@ This file tracks the gap between the requested final system and the current repo
 - Control-plane HTTP crate with typed health, join, and peer-map routes backed by the join service.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
-- Continuous UDP STUN echo loop and `iparsd stun` daemon for public endpoint detection.
+- RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding and `iparsd stun` daemon support for public endpoint detection.
 - Relay admission/status HTTP API, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
@@ -47,7 +47,7 @@ This file tracks the gap between the requested final system and the current repo
 - Runtime backend selection and hardening for production deployments.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
-- Full STUN protocol support and NAT classification.
+- NAT classification and extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay forwarder namespace placement, capacity limits, and restart/backoff policy hardening.
 - Prometheus/OpenTelemetry exporters and broader control-plane/relay metrics coverage.

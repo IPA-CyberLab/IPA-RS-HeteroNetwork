@@ -1093,7 +1093,7 @@ mod tests {
     use ipars_route_manager::{
         DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
     };
-    use ipars_stun::EchoStunServer;
+    use ipars_stun::BindingStunServer;
     use ipars_types::api::RelayAdmissionRequest;
     use ipars_types::{
         CandidateSource, ClusterId, PathMetrics, PeerPathKey, RelayCapability, TokenPolicy,
@@ -1981,7 +1981,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_collects_stun_candidate() -> Result<(), Box<dyn std::error::Error>> {
-        let server = EchoStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let server_addr = server.local_addr()?;
         let server_task = tokio::spawn(async move { server.serve_once().await });
         let runtime = AgentRuntime::new(
