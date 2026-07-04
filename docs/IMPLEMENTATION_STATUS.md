@@ -46,7 +46,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent --runtime-backend dry-run` for peer-map, Docker route, and Kubernetes underlay loops using in-memory WireGuard state and dry-run route application without mutating host networking.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
-- Docker Compose and Helm chart starting points.
+- Docker Compose and Helm chart starting points aligned to the current plain-HTTP `iparsd` service listeners.
 - `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, relay HTTP admission plus UDP forwarding throughput runs, and spawned multi-process `iparsd` daemon transport across control-plane, signal, STUN, relay, and dry-run agent processes.
 
 ## Remaining For Full Production Completion

@@ -261,6 +261,8 @@ Target: no full mesh. Agents subscribe to relevant peer/route deltas by tag, rol
 
 The `ipars-load` harness provides executable `three`, `ten`, and `thousand` scenarios against in-memory control-plane and signal components, plus `--transport http` for driving loopback TCP HTTP control-plane and signal endpoints with the same workload. `--transport relay-udp` drives relay HTTP admission and loopback UDP forwarding with configurable packet count and payload size. `--transport daemon` spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes, waits for readiness, registers agents through signed join tokens, negotiates paths through the signal daemon, and verifies relay UDP forwarding through the relay daemon. It reports registration count/time, peer-map fanout, advertised route count, sampled active pair negotiations, relay candidate count, HTTP request counts, daemon process counts, relay UDP packets/bytes/throughput, and selected path-state totals as JSON. The 1000-node scenario samples active pairs rather than negotiating all possible pairs so the harness exercises the lazy-connect assumption while still measuring current peer-map fanout.
 
+The bundled Docker Compose and Helm manifests use HTTP service URLs for control-plane, signal, relay admission, and agent APIs because `iparsd` serves plain HTTP directly. Production deployments should terminate TLS at a reverse proxy, load balancer, or Kubernetes Ingress before exposing those APIs outside the private deployment network.
+
 ## Implementation Roadmap
 
 1. Shared typed models, CLI surface, and signed-token primitives.

@@ -96,6 +96,8 @@ For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent
 
 Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. `--docker-api-socket` overrides socket placement, otherwise `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, and rootless `$XDG_RUNTIME_DIR/docker.sock` are checked in order. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments.
 
+The bundled Docker Compose and Helm examples use plain HTTP between private deployment services because the current `iparsd` daemons serve HTTP directly. Terminate TLS at an external reverse proxy or Kubernetes Ingress when exposing control-plane, signal, relay, or agent APIs outside the private deployment network.
+
 `iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; relay dataplane counters are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls relay snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 
 The next production milestone is to extend network-namespace integration tests from route-backend validation into direct, NAT traversal, and relay fallback path validation.

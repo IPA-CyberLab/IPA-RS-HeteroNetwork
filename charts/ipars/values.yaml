@@ -4,11 +4,11 @@ image:
   pullPolicy: IfNotPresent
 
 cluster:
-  controlPlaneUrl: "https://ipars-control-plane:8443"
-  signalUrl: "https://ipars-signal:9443"
+  controlPlaneUrl: "http://ipars-control-plane:8443"
+  signalUrl: "http://ipars-signal:9443"
   stunEndpoint: ""
   relayEndpoint: "ipars-relay:51820"
-  relayAdmissionUrl: "https://ipars-relay:9580"
+  relayAdmissionUrl: "http://ipars-relay:9580"
 
 agent:
   interfaceName: ipars0

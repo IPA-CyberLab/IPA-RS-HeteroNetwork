@@ -108,7 +108,7 @@ services:
       - 127.0.0.1:3478
     environment:
       IPARS_ROLE: agent
-      IPARS_CONTROL_PLANE_URL: https://control-plane:8443
+      IPARS_CONTROL_PLANE_URL: http://control-plane:8443
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
       IPARS_DOCKER_CONTAINER_NAMESPACE: compose-default
       IPARS_DOCKER_HOST_INTERFACE: docker0
