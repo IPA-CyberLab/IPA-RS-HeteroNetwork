@@ -74,6 +74,7 @@ impl IntoResponse for ApiError {
             | AgentError::RouteManager(_)
             | AgentError::RoutePlanning(_)
             | AgentError::ControlPlaneClient(_)
+            | AgentError::HolePunch(_)
             | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
             AgentError::MissingPeer(_) => StatusCode::NOT_FOUND,
         };

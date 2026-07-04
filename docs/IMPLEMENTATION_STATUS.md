@@ -24,6 +24,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` heartbeat reporting that posts current node health, candidates, and negotiated path-state data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.
 - `iparsd agent` signal-service node registration that upserts the registered `NodeRecord` with refreshed endpoint candidates when a signal endpoint is known.
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
+- UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
@@ -35,11 +36,11 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Agent daemon UDP hole-punch execution and runtime backend selection.
+- Runtime backend selection and hardening for production deployments.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace execution hardening.
 - Full STUN protocol support and NAT classification.
-- Signal-coordinated UDP hole punching runtime.
+- Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay abuse prevention with authenticated sessions and rate limits.
 - Metrics export and structured path-change events.
 - Docker namespace integration implementation.

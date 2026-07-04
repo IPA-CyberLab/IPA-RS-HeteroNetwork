@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
 use ipars_route_manager::{RouteManager, RouteManagerError, RoutePlan};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
-use ipars_types::api::{AgentStatusResponse, PeerMap};
+use ipars_types::api::{AgentStatusResponse, PeerMap, SignalHolePunchPlanResponse};
 use ipars_types::{
     ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathRecord,
     PathScore, PathState, Role, Route, Tag, VpnIp,
@@ -32,6 +32,8 @@ pub enum AgentError {
     RoutePlanning(String),
     #[error("control-plane client error: {0}")]
     ControlPlaneClient(String),
+    #[error("hole punch error: {0}")]
+    HolePunch(String),
     #[error("wireguard backend error: {0}")]
     WireGuard(String),
     #[error("peer path does not exist: {0}")]
@@ -210,6 +212,94 @@ impl LinuxCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpHolePuncher {
+    local_bind: std::net::SocketAddr,
+    attempts: usize,
+    interval: Duration,
+}
+
+impl UdpHolePuncher {
+    pub fn new(local_bind: std::net::SocketAddr) -> Self {
+        Self {
+            local_bind,
+            attempts: 5,
+            interval: Duration::from_millis(100),
+        }
+    }
+
+    pub fn with_attempts(mut self, attempts: usize) -> Self {
+        self.attempts = attempts.max(1);
+        self
+    }
+
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    pub async fn execute(
+        &self,
+        local_node: &NodeId,
+        plan: &SignalHolePunchPlanResponse,
+    ) -> Result<usize, AgentError> {
+        let remote_addr = remote_reflexive_addr(local_node, plan)?;
+        if Utc::now() >= plan.expires_at {
+            return Err(AgentError::HolePunch("hole punch plan expired".to_string()));
+        }
+
+        if plan.start_after_millis > 0 {
+            tokio::time::sleep(Duration::from_millis(plan.start_after_millis)).await;
+        }
+
+        let socket = tokio::net::UdpSocket::bind(self.local_bind).await?;
+        let payload = hole_punch_payload(local_node, plan);
+        for attempt in 0..self.attempts {
+            socket.send_to(payload.as_bytes(), remote_addr).await?;
+            if attempt + 1 < self.attempts && !self.interval.is_zero() {
+                tokio::time::sleep(self.interval).await;
+            }
+        }
+        Ok(self.attempts)
+    }
+}
+
+fn remote_reflexive_addr(
+    local_node: &NodeId,
+    plan: &SignalHolePunchPlanResponse,
+) -> Result<std::net::SocketAddr, AgentError> {
+    if local_node == &plan.key.local {
+        return plan
+            .target_reflexive
+            .as_ref()
+            .map(|candidate| candidate.addr)
+            .ok_or_else(|| {
+                AgentError::HolePunch("target reflexive candidate missing".to_string())
+            });
+    }
+    if local_node == &plan.key.remote {
+        return plan
+            .source_reflexive
+            .as_ref()
+            .map(|candidate| candidate.addr)
+            .ok_or_else(|| {
+                AgentError::HolePunch("source reflexive candidate missing".to_string())
+            });
+    }
+
+    Err(AgentError::HolePunch(format!(
+        "node {local_node} is not part of hole punch plan {} -> {}",
+        plan.key.local, plan.key.remote
+    )))
+}
+
+fn hole_punch_payload(local_node: &NodeId, plan: &SignalHolePunchPlanResponse) -> String {
+    format!(
+        "ipars-hole-punch-v1 source={} target={} local={}",
+        plan.key.local, plan.key.remote, local_node
+    )
 }
 
 #[async_trait]
@@ -649,6 +739,18 @@ mod tests {
         }
     }
 
+    fn reflexive_candidate(node_id: &NodeId, addr: SocketAddr) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr,
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: ipars_types::CandidateSource::StunProbe,
+        }
+    }
+
     #[derive(Debug, Clone, Default)]
     struct RecordingRunner {
         commands: Arc<tokio::sync::RwLock<Vec<LinuxCommand>>>,
@@ -859,6 +961,65 @@ mod tests {
         runtime.upsert_path_state(latest.clone()).await;
 
         assert_eq!(runtime.path_state().await, vec![latest]);
+    }
+
+    #[tokio::test]
+    async fn udp_hole_puncher_sends_to_remote_reflexive_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let local = NodeId::from_string("local");
+        let remote = NodeId::from_string("remote");
+        let receiver = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let target_addr = receiver.local_addr()?;
+        let plan = SignalHolePunchPlanResponse {
+            key: PeerPathKey::new(local.clone(), remote.clone()),
+            source_reflexive: Some(reflexive_candidate(
+                &local,
+                SocketAddr::from(([127, 0, 0, 1], 50_000)),
+            )),
+            target_reflexive: Some(reflexive_candidate(&remote, target_addr)),
+            start_after_millis: 0,
+            expires_at: Utc::now() + ChronoDuration::seconds(5),
+        };
+
+        let sent = UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .with_attempts(1)
+            .with_interval(std::time::Duration::ZERO)
+            .execute(&local, &plan)
+            .await?;
+        let mut buffer = [0_u8; 256];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            receiver.recv_from(&mut buffer),
+        )
+        .await??;
+        let payload = std::str::from_utf8(&buffer[..len])?;
+
+        assert_eq!(sent, 1);
+        assert!(payload.contains("ipars-hole-punch-v1"));
+        assert!(payload.contains("local=local"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_hole_puncher_rejects_plan_without_remote_candidate() {
+        let local = NodeId::from_string("local");
+        let remote = NodeId::from_string("remote");
+        let plan = SignalHolePunchPlanResponse {
+            key: PeerPathKey::new(local.clone(), remote),
+            source_reflexive: None,
+            target_reflexive: None,
+            start_after_millis: 0,
+            expires_at: Utc::now() + ChronoDuration::seconds(5),
+        };
+
+        let error = UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .execute(&local, &plan)
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(AgentError::HolePunch(message)) if message == "target reflexive candidate missing"
+        ));
     }
 
     #[tokio::test]

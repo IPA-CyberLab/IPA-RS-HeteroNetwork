@@ -8,7 +8,7 @@ use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxWireGuardBackend, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, SystemCommandRunner,
+    PeerMapSink, PeerMapSource, PeerMapSync, SystemCommandRunner, UdpHolePuncher,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -25,8 +25,8 @@ use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest,
-    SignalPathResponse,
+    RegisterNodeResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
@@ -176,6 +176,16 @@ struct AgentArgs {
         default_value_t = false
     )]
     disable_signal_paths: bool,
+    #[arg(long, env = "IPARS_AGENT_HOLE_PUNCH_BIND", default_value = "0.0.0.0:0")]
+    hole_punch_bind: SocketAddr,
+    #[arg(long, env = "IPARS_AGENT_HOLE_PUNCH_ATTEMPTS", default_value_t = 5)]
+    hole_punch_attempts: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_HOLE_PUNCH_INTERVAL_MILLIS",
+        default_value_t = 100
+    )]
+    hole_punch_interval_millis: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_WIREGUARD_INTERFACE",
@@ -374,10 +384,14 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     }
     if !args.disable_signal_paths {
         if let (Some(control_plane_url), Some(signal_url)) = (control_plane_base, signal_base) {
+            let hole_puncher = UdpHolePuncher::new(args.hole_punch_bind)
+                .with_attempts(args.hole_punch_attempts)
+                .with_interval(Duration::from_millis(args.hole_punch_interval_millis));
             background_tasks.push(start_signal_path_negotiation(
                 runtime.clone(),
                 control_plane_url,
                 signal_url,
+                hole_puncher,
                 Duration::from_secs(args.signal_path_interval_seconds.max(1)),
             ));
         }
@@ -574,10 +588,18 @@ fn start_signal_path_negotiation(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     signal_url: String,
+    hole_puncher: UdpHolePuncher,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_signal_path_negotiation_loop(runtime, control_plane_url, signal_url, interval).await;
+        run_signal_path_negotiation_loop(
+            runtime,
+            control_plane_url,
+            signal_url,
+            hole_puncher,
+            interval,
+        )
+        .await;
     })
 }
 
@@ -585,12 +607,19 @@ async fn run_signal_path_negotiation_loop(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     signal_url: String,
+    hole_puncher: UdpHolePuncher,
     interval: Duration,
 ) {
     let client = reqwest::Client::new();
     loop {
-        if let Err(error) =
-            negotiate_signal_paths(&client, runtime.as_ref(), &control_plane_url, &signal_url).await
+        if let Err(error) = negotiate_signal_paths(
+            &client,
+            runtime.as_ref(),
+            &control_plane_url,
+            &signal_url,
+            &hole_puncher,
+        )
+        .await
         {
             tracing::warn!(%error, "failed to negotiate signal paths; will retry");
         }
@@ -603,6 +632,7 @@ async fn negotiate_signal_paths(
     runtime: &AgentRuntime,
     control_plane_url: &str,
     signal_url: &str,
+    hole_puncher: &UdpHolePuncher,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
     let peer_map = client
@@ -619,11 +649,48 @@ async fn negotiate_signal_paths(
     for peer in peer_map.peers {
         let request = signal_path_request(&status, &peer);
         let response = send_signal_path_request(client, signal_url, request).await?;
-        runtime
-            .upsert_path_state(signal_path_record(response, chrono::Utc::now()))
-            .await;
+        let record = signal_path_record(response, chrono::Utc::now());
+        if record.selected_state == PathState::DirectNatTraversal {
+            match fetch_hole_punch_plan(client, signal_url, &record.key).await {
+                Ok(plan) => match hole_puncher.execute(&status.node_id, &plan).await {
+                    Ok(attempts) => tracing::info!(
+                        attempts,
+                        peer = %record.key.remote,
+                        "executed UDP hole punch plan"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        peer = %record.key.remote,
+                        "failed to execute UDP hole punch plan"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    %error,
+                    peer = %record.key.remote,
+                    "failed to fetch UDP hole punch plan"
+                ),
+            }
+        }
+        runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+async fn fetch_hole_punch_plan(
+    client: &reqwest::Client,
+    signal_url: &str,
+    key: &ipars_types::PeerPathKey,
+) -> anyhow::Result<SignalHolePunchPlanResponse> {
+    client
+        .get(signal_hole_punch_url(signal_url, &key.local, &key.remote))
+        .send()
+        .await
+        .context("failed to fetch hole punch plan")?
+        .error_for_status()
+        .context("signal service rejected hole punch plan request")?
+        .json()
+        .await
+        .context("failed to decode hole punch plan response")
 }
 
 async fn send_signal_path_request(
@@ -783,6 +850,15 @@ fn signal_node_url(signal_url: &str, node_id: &NodeId) -> String {
 
 fn signal_path_url(signal_url: &str) -> String {
     format!("{}/v1/paths/negotiate", signal_url.trim_end_matches('/'))
+}
+
+fn signal_hole_punch_url(signal_url: &str, source: &NodeId, target: &NodeId) -> String {
+    format!(
+        "{}/v1/hole-punch/{}/{}",
+        signal_url.trim_end_matches('/'),
+        source,
+        target
+    )
 }
 
 fn control_plane_join_url(
@@ -955,6 +1031,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signal_hole_punch_url_trims_signal_base_url() {
+        assert_eq!(
+            signal_hole_punch_url(
+                "http://127.0.0.1:9443/",
+                &NodeId::from_string("node-a"),
+                &NodeId::from_string("node-b"),
+            ),
+            "http://127.0.0.1:9443/v1/hole-punch/node-a/node-b"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_request_uses_runtime_state() {
         let runtime = AgentRuntime::new(
@@ -1025,6 +1113,34 @@ mod tests {
             Some(EndpointCandidateKind::PublicUdp)
         );
         assert_eq!(record.relay_node, None);
+    }
+
+    #[test]
+    fn signal_path_record_selects_nat_traversal_candidate() {
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![
+                candidate("peer-a", EndpointCandidateKind::LocalUdp, 1),
+                candidate("peer-a", EndpointCandidateKind::StunReflexive, 10),
+            ],
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::DirectNatTraversal);
+        assert_eq!(
+            record
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.kind),
+            Some(EndpointCandidateKind::StunReflexive)
+        );
     }
 
     #[test]
