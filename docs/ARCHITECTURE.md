@@ -112,6 +112,8 @@ The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets
 
 Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
 
+When the agent is started with a local relay forwarder endpoint, peer-map application consults negotiated path state and transient relay sessions before configuring kernel WireGuard peers. Relay-selected peers with active credentials use the local forwarder endpoint as their WireGuard endpoint, allowing the forwarder to wrap opaque WireGuard packets before they leave for the public relay.
+
 ## Docker Support
 
 Docker support targets:

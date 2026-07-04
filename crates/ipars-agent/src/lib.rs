@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -135,9 +137,9 @@ pub struct AgentRuntime {
 pub struct RelaySessionState {
     pub peer: NodeId,
     pub relay_node: NodeId,
-    pub relay_endpoint: std::net::SocketAddr,
-    pub admitted_local_addr: std::net::SocketAddr,
-    pub admitted_peer_addr: std::net::SocketAddr,
+    pub relay_endpoint: SocketAddr,
+    pub admitted_local_addr: SocketAddr,
+    pub admitted_peer_addr: SocketAddr,
     pub session_id: String,
     pub session_token: String,
     pub expires_at: DateTime<Utc>,
@@ -146,11 +148,11 @@ pub struct RelaySessionState {
 #[derive(Debug, Clone)]
 pub struct UdpRelayFrameForwarder {
     session: RelaySessionState,
-    wireguard_endpoint: std::net::SocketAddr,
+    wireguard_endpoint: SocketAddr,
 }
 
 impl UdpRelayFrameForwarder {
-    pub fn new(session: RelaySessionState, wireguard_endpoint: std::net::SocketAddr) -> Self {
+    pub fn new(session: RelaySessionState, wireguard_endpoint: SocketAddr) -> Self {
         Self {
             session,
             wireguard_endpoint,
@@ -161,7 +163,7 @@ impl UdpRelayFrameForwarder {
         &self.session
     }
 
-    pub fn wireguard_endpoint(&self) -> std::net::SocketAddr {
+    pub fn wireguard_endpoint(&self) -> SocketAddr {
         self.wireguard_endpoint
     }
 
@@ -249,6 +251,14 @@ impl AgentRuntime {
         self.path_state.read().await.values().cloned().collect()
     }
 
+    pub async fn path_record_for_peer(&self, peer: &NodeId) -> Option<PathRecord> {
+        self.path_state
+            .read()
+            .await
+            .get(&(self.state.node_id.clone(), peer.clone()))
+            .cloned()
+    }
+
     pub async fn upsert_path_state(&self, record: PathRecord) {
         self.path_state.write().await.insert(
             (record.key.local.clone(), record.key.remote.clone()),
@@ -292,6 +302,32 @@ impl AgentRuntime {
                 &session.relay_node != relay_node || now + renew_before >= session.expires_at
             })
             .unwrap_or(true)
+    }
+
+    pub async fn relay_forwarder_endpoint_for_peer(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+        forwarder_endpoint: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let path = self.path_record_for_peer(peer).await?;
+        if path.selected_state != PathState::Relay {
+            return None;
+        }
+
+        let session = self.relay_session(peer).await?;
+        if now >= session.expires_at {
+            return None;
+        }
+        if path
+            .relay_node
+            .as_ref()
+            .is_some_and(|relay_node| relay_node != &session.relay_node)
+        {
+            return None;
+        }
+
+        Some(forwarder_endpoint)
     }
 
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -621,6 +657,73 @@ pub trait PeerMapSink: Send + Sync {
     ) -> Result<PeerMapApplySummary, AgentError>;
 }
 
+#[async_trait]
+pub trait PeerEndpointResolver: Send + Sync + std::fmt::Debug {
+    async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirectPeerEndpointResolver;
+
+#[async_trait]
+impl PeerEndpointResolver for DirectPeerEndpointResolver {
+    async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
+        Ok(preferred_endpoint(peer))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePeerEndpointResolver {
+    runtime: Arc<AgentRuntime>,
+    relay_forwarder_endpoint: Option<SocketAddr>,
+}
+
+impl RuntimePeerEndpointResolver {
+    pub fn new(runtime: Arc<AgentRuntime>) -> Self {
+        Self {
+            runtime,
+            relay_forwarder_endpoint: None,
+        }
+    }
+
+    pub fn with_relay_forwarder_endpoint(mut self, endpoint: SocketAddr) -> Self {
+        self.relay_forwarder_endpoint = Some(endpoint);
+        self
+    }
+}
+
+#[async_trait]
+impl PeerEndpointResolver for RuntimePeerEndpointResolver {
+    async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
+        let path = self.runtime.path_record_for_peer(&peer.node_id).await;
+        let Some(path) = path else {
+            return Ok(preferred_endpoint(peer));
+        };
+
+        match path.selected_state {
+            PathState::Relay => {
+                let Some(forwarder_endpoint) = self.relay_forwarder_endpoint else {
+                    return Ok(None);
+                };
+                Ok(self
+                    .runtime
+                    .relay_forwarder_endpoint_for_peer(
+                        &peer.node_id,
+                        Utc::now(),
+                        forwarder_endpoint,
+                    )
+                    .await
+                    .map(|endpoint| endpoint.to_string()))
+            }
+            PathState::Unreachable => Ok(None),
+            _ => Ok(path
+                .selected_candidate
+                .map(|candidate| candidate.addr.to_string())
+                .or_else(|| preferred_endpoint(peer))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerMapApplySummary {
     pub peers_applied: usize,
@@ -632,6 +735,7 @@ pub struct PeerMapApplier<W, R> {
     interface: String,
     wireguard: W,
     route_manager: R,
+    endpoint_resolver: Arc<dyn PeerEndpointResolver>,
 }
 
 impl<W, R> PeerMapApplier<W, R>
@@ -644,7 +748,16 @@ where
             interface: interface.into(),
             wireguard,
             route_manager,
+            endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
         }
+    }
+
+    pub fn with_endpoint_resolver(
+        mut self,
+        endpoint_resolver: impl PeerEndpointResolver + 'static,
+    ) -> Self {
+        self.endpoint_resolver = Arc::new(endpoint_resolver);
+        self
     }
 
     pub async fn apply_peer_map(
@@ -656,7 +769,7 @@ where
 
         for peer in peer_map.peers {
             let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
-            let endpoint = preferred_endpoint(&peer);
+            let endpoint = self.endpoint_resolver.endpoint_for_peer(&peer).await?;
             self.wireguard
                 .upsert_peer(WireGuardPeerConfig {
                     peer: peer.node_id.clone(),
@@ -1498,6 +1611,86 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_uses_relay_forwarder_endpoint_for_active_relay_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-relay");
+        let relay_id = NodeId::from_string("relay-a");
+        let forwarder_endpoint = SocketAddr::from(([127, 0, 0, 1], 52_000));
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(relay_id.clone()),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer_id.clone(),
+                relay_node: relay_id,
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 30], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_endpoint_resolver(
+            RuntimePeerEndpointResolver::new(runtime)
+                .with_relay_forwarder_endpoint(forwarder_endpoint),
+        );
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)),
+            "wg-peer-public",
+            vec![EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        let config = wireguard_peers
+            .get(&peer_id)
+            .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
+        assert_eq!(config.endpoint.as_deref(), Some("127.0.0.1:52000"));
+        assert_eq!(config.persistent_keepalive_seconds, Some(25));
         Ok(())
     }
 

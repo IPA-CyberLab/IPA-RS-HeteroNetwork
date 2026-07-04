@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
     NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
-    RelaySessionState, SystemCommandRunner, UdpHolePuncher,
+    RelaySessionState, RuntimePeerEndpointResolver, SystemCommandRunner, UdpHolePuncher,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -52,7 +52,7 @@ enum Command {
     Signal(SignalArgs),
     Stun(StunArgs),
     Relay(RelayArgs),
-    Agent(AgentArgs),
+    Agent(Box<AgentArgs>),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -209,6 +209,8 @@ struct AgentArgs {
     wireguard_interface: String,
     #[arg(long, env = "IPARS_AGENT_LINUX_NETNS")]
     linux_netns: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT")]
+    relay_forwarder_endpoint: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -219,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
         Command::Relay(args) => run_relay(args).await,
-        Command::Agent(args) => run_agent(args).await,
+        Command::Agent(args) => run_agent(*args).await,
     }
 }
 
@@ -388,7 +390,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
         let control_plane_url = control_plane_base
             .clone()
             .context("control-plane URL is required when --apply-peer-map is set")?;
-        Some(start_peer_map_sync(&args, runtime.state().node_id.clone(), control_plane_url).await?)
+        Some(start_peer_map_sync(&args, runtime.clone(), control_plane_url).await?)
     } else {
         None
     };
@@ -430,7 +432,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
 
 async fn start_peer_map_sync(
     args: &AgentArgs,
-    node_id: NodeId,
+    runtime: Arc<AgentRuntime>,
     control_plane_url: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let namespace = args
@@ -441,7 +443,7 @@ async fn start_peer_map_sync(
     if let Some(namespace) = namespace {
         start_peer_map_sync_with_runners(
             args,
-            node_id,
+            runtime,
             control_plane_url,
             NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
             NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
@@ -450,7 +452,7 @@ async fn start_peer_map_sync(
     } else {
         start_peer_map_sync_with_runners(
             args,
-            node_id,
+            runtime,
             control_plane_url,
             SystemCommandRunner,
             SystemRouteCommandRunner,
@@ -461,7 +463,7 @@ async fn start_peer_map_sync(
 
 async fn start_peer_map_sync_with_runners<W, R>(
     args: &AgentArgs,
-    node_id: NodeId,
+    runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     wireguard_runner: W,
     route_runner: R,
@@ -473,8 +475,23 @@ where
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
     let route_manager = LinuxRouteManager::new(route_runner);
-    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let sync = PeerMapSync::new(node_id, HttpPeerMapSource::new(control_plane_url), applier);
+    let mut applier =
+        PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    if let Some(endpoint) = args.relay_forwarder_endpoint {
+        tracing::info!(
+            relay_forwarder_endpoint = %endpoint,
+            "using local relay forwarder endpoint for relay-selected WireGuard peers"
+        );
+        applier = applier.with_endpoint_resolver(
+            RuntimePeerEndpointResolver::new(runtime.clone())
+                .with_relay_forwarder_endpoint(endpoint),
+        );
+    }
+    let sync = PeerMapSync::new(
+        runtime.state().node_id.clone(),
+        HttpPeerMapSource::new(control_plane_url),
+        applier,
+    );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
     let interface = args.wireguard_interface.clone();
     Ok(tokio::spawn(async move {
@@ -1251,11 +1268,17 @@ mod tests {
             "node-a",
             "--relay-session-renew-before-seconds",
             "45",
+            "--relay-forwarder-endpoint",
+            "127.0.0.1:52000",
         ])?;
 
         if let Command::Agent(args) = cli.command {
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
             assert_eq!(args.relay_session_renew_before_seconds, 45);
+            assert_eq!(
+                args.relay_forwarder_endpoint,
+                Some(SocketAddr::from(([127, 0, 0, 1], 52_000)))
+            );
             return Ok(());
         }
 
