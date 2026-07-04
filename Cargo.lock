@@ -1199,8 +1199,10 @@ name = "ipars-route-manager"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "ipars-types",
  "ipnet",
+ "rtnetlink",
  "thiserror 1.0.69",
  "tokio",
 ]

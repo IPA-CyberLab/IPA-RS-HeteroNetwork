@@ -8,8 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 ipnet.workspace = true
 ipars-types = { path = "../ipars-types" }
+rtnetlink.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

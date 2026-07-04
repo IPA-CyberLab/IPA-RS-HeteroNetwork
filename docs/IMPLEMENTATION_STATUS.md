@@ -38,6 +38,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
 - Selectable current-namespace kernel WireGuard netlink backend for peer-map application, using rtnetlink for interface creation/up state and WireGuard generic netlink for peer upsert/removal without invoking `wg`.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
+- Selectable current-namespace Linux route-manager rtnetlink backend for peer-map, Docker, and Kubernetes route plans, including route replacement/removal and policy-rule add/delete without invoking `ip`.
 - Gated Linux network namespace integration smoke test for applying and removing routes through the namespaced route backend.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command execution, and retries without stopping the agent when the control plane is temporarily unavailable.
@@ -50,9 +51,9 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
-- Namespace-aware kernel WireGuard netlink placement and privileged integration coverage beyond current current-namespace netlink backend.
-- Linux policy routing netlink backend and namespace lifecycle/capability hardening.
+- Runtime backend hardening beyond current Linux command/current-namespace kernel-netlink/dry-run selection and startup preflight.
+- Namespace-aware WireGuard/route netlink placement and privileged integration coverage beyond current current-namespace netlink backends.
+- Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
 - NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - OpenTelemetry metrics coverage beyond current relay capacity/session, byte, packet, and drop-reason counters.

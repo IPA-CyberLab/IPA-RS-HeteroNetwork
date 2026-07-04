@@ -1,9 +1,17 @@
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::process::Command;
 
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use ipars_types::{NodeId, Route};
 use ipnet::IpNet;
+use rtnetlink::packet_route::{
+    route::RouteMessage,
+    rule::{RuleAction, RuleAttribute, RuleMessage},
+    AddressFamily,
+};
+use rtnetlink::{Handle, RouteMessageBuilder};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,6 +22,8 @@ pub enum RouteManagerError {
     Backend(String),
     #[error("invalid linux network namespace name: {0}")]
     InvalidNamespace(String),
+    #[error("invalid policy rule: {0}")]
+    InvalidPolicyRule(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +388,231 @@ where
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LinuxNetlinkRouteManager;
+
+impl LinuxNetlinkRouteManager {
+    pub fn new() -> Self {
+        Self
+    }
+
+    async fn open_handle() -> Result<Handle, RouteManagerError> {
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(|error| {
+            RouteManagerError::Backend(format!("failed to open route netlink connection: {error}"))
+        })?;
+        tokio::spawn(connection);
+        Ok(handle)
+    }
+
+    async fn interface_index(handle: &Handle, interface: &str) -> Result<u32, RouteManagerError> {
+        let mut links = handle
+            .link()
+            .get()
+            .match_name(interface.to_string())
+            .execute();
+        let link = links.try_next().await.map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "failed to query interface `{interface}` through rtnetlink: {error}"
+            ))
+        })?;
+        link.map(|link| link.header.index).ok_or_else(|| {
+            RouteManagerError::Backend(format!(
+                "interface `{interface}` was not found for route netlink backend"
+            ))
+        })
+    }
+
+    async fn replace_route(
+        handle: &Handle,
+        route: &Route,
+        interface_index: u32,
+        table: Option<u32>,
+    ) -> Result<(), RouteManagerError> {
+        handle
+            .route()
+            .add(netlink_route_message(route, interface_index, table))
+            .replace()
+            .execute()
+            .await
+            .map_err(|error| {
+                RouteManagerError::Backend(format!(
+                    "failed to replace route {} through rtnetlink: {error}",
+                    route.cidr
+                ))
+            })
+    }
+
+    async fn delete_route(
+        handle: &Handle,
+        route: &Route,
+        interface_index: u32,
+        table: Option<u32>,
+    ) -> Result<(), RouteManagerError> {
+        handle
+            .route()
+            .del(netlink_route_message(route, interface_index, table))
+            .execute()
+            .await
+            .map_err(|error| {
+                RouteManagerError::Backend(format!(
+                    "failed to delete route {} through rtnetlink: {error}",
+                    route.cidr
+                ))
+            })
+    }
+
+    async fn add_rule(handle: &Handle, rule: &PolicyRule) -> Result<(), RouteManagerError> {
+        let mut request = handle.rule().add();
+        request
+            .message_mut()
+            .clone_from(&netlink_rule_message(rule)?);
+        request.execute().await.map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "failed to add policy rule priority {} through rtnetlink: {error}",
+                rule.priority
+            ))
+        })
+    }
+
+    async fn delete_rule(handle: &Handle, rule: &PolicyRule) -> Result<(), RouteManagerError> {
+        handle
+            .rule()
+            .del(netlink_rule_message(rule)?)
+            .execute()
+            .await
+            .map_err(|error| {
+                RouteManagerError::Backend(format!(
+                    "failed to delete policy rule priority {} through rtnetlink: {error}",
+                    rule.priority
+                ))
+            })
+    }
+}
+
+#[async_trait]
+impl RouteManager for LinuxNetlinkRouteManager {
+    async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        let handle = Self::open_handle().await?;
+        let interface_index = Self::interface_index(&handle, &plan.interface).await?;
+        for table in LinuxRouteManager::<SystemRouteCommandRunner>::route_tables(&plan) {
+            for route in &plan.routes {
+                Self::replace_route(&handle, route, interface_index, table).await?;
+            }
+        }
+        for rule in &plan.policy_rules {
+            let _ = Self::delete_rule(&handle, rule).await;
+            Self::add_rule(&handle, rule).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        let handle = Self::open_handle().await?;
+        let interface_index = Self::interface_index(&handle, &plan.interface).await?;
+        for rule in &plan.policy_rules {
+            Self::delete_rule(&handle, rule).await?;
+        }
+        for table in LinuxRouteManager::<SystemRouteCommandRunner>::route_tables(&plan) {
+            for route in &plan.routes {
+                Self::delete_route(&handle, route, interface_index, table).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_docker_intent(
+        &self,
+        intent: DockerNetworkIntent,
+    ) -> Result<RoutePlan, RouteManagerError> {
+        let plan = docker_route_plan(intent);
+        self.apply_routes(plan.clone()).await?;
+        Ok(plan)
+    }
+
+    async fn apply_kubernetes_intent(
+        &self,
+        intent: KubernetesUnderlayIntent,
+    ) -> Result<RoutePlan, RouteManagerError> {
+        let plan = kubernetes_route_plan(intent);
+        self.apply_routes(plan.clone()).await?;
+        Ok(plan)
+    }
+}
+
+fn netlink_route_message(route: &Route, interface_index: u32, table: Option<u32>) -> RouteMessage {
+    match route.cidr {
+        IpNet::V4(network) => {
+            let mut builder = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                .destination_prefix(network.addr(), network.prefix_len())
+                .output_interface(interface_index)
+                .priority(route.metric);
+            if let Some(table) = table {
+                builder = builder.table_id(table);
+            }
+            builder.build()
+        }
+        IpNet::V6(network) => {
+            let mut builder = RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+                .destination_prefix(network.addr(), network.prefix_len())
+                .output_interface(interface_index)
+                .priority(route.metric);
+            if let Some(table) = table {
+                builder = builder.table_id(table);
+            }
+            builder.build()
+        }
+    }
+}
+
+fn netlink_rule_message(rule: &PolicyRule) -> Result<RuleMessage, RouteManagerError> {
+    let mut message = RuleMessage::default();
+    message.header.family = policy_rule_address_family(rule)?;
+    message.header.action = RuleAction::ToTable;
+    if rule.table > u8::MAX as u32 {
+        message.attributes.push(RuleAttribute::Table(rule.table));
+    } else {
+        message.header.table = rule.table as u8;
+    }
+    message
+        .attributes
+        .push(RuleAttribute::Priority(rule.priority));
+    if let Some(from) = rule.from {
+        message.header.src_len = from.prefix_len();
+        message.attributes.push(RuleAttribute::Source(from.addr()));
+    }
+    if let Some(to) = rule.to {
+        message.header.dst_len = to.prefix_len();
+        message
+            .attributes
+            .push(RuleAttribute::Destination(to.addr()));
+    }
+    if let Some(fwmark) = rule.fwmark {
+        message.attributes.push(RuleAttribute::FwMark(fwmark));
+    }
+    Ok(message)
+}
+
+fn policy_rule_address_family(rule: &PolicyRule) -> Result<AddressFamily, RouteManagerError> {
+    let mut family = None;
+    for network in rule.from.into_iter().chain(rule.to) {
+        let network_family = match network.addr() {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+        match family {
+            Some(existing) if existing != network_family => {
+                return Err(RouteManagerError::InvalidPolicyRule(format!(
+                    "rule priority {} mixes IPv4 and IPv6 selectors",
+                    rule.priority
+                )));
+            }
+            Some(_) => {}
+            None => family = Some(network_family),
+        }
+    }
+    Ok(family.unwrap_or(AddressFamily::Unspec))
+}
+
 #[derive(Debug, Clone)]
 pub struct DryRunLinuxRouteManager;
 
@@ -409,6 +644,8 @@ impl RouteManager for DryRunLinuxRouteManager {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
 
     use super::*;
 
@@ -556,6 +793,83 @@ mod tests {
         assert_eq!(plan.routes[1].id, "k8s-1");
         assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
         assert_eq!(plan.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_netlink_route_message_sets_destination_interface_table_and_metric(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: NodeId::from_string("peer-a"),
+            via: None,
+            metric: 100,
+            tags: Default::default(),
+        };
+
+        let message = netlink_route_message(&route, 7, Some(10_064));
+
+        assert_eq!(message.header.address_family, AddressFamily::Inet);
+        assert_eq!(message.header.destination_prefix_length, 16);
+        assert!(message
+            .attributes
+            .contains(&RouteAttribute::Destination(RouteAddress::Inet(
+                "10.42.0.0".parse()?
+            ))));
+        assert!(message.attributes.contains(&RouteAttribute::Oif(7)));
+        assert!(message.attributes.contains(&RouteAttribute::Table(10_064)));
+        assert!(message.attributes.contains(&RouteAttribute::Priority(100)));
+        Ok(())
+    }
+
+    #[test]
+    fn linux_netlink_rule_message_sets_selectors_mark_and_table(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rule = PolicyRule {
+            table: 10_064,
+            priority: 10_050,
+            from: Some("10.0.0.0/8".parse()?),
+            to: Some("10.42.0.0/16".parse()?),
+            fwmark: Some(0x6473),
+        };
+
+        let message = netlink_rule_message(&rule)?;
+
+        assert_eq!(message.header.family, AddressFamily::Inet);
+        assert_eq!(message.header.action, RuleAction::ToTable);
+        assert_eq!(message.header.src_len, 8);
+        assert_eq!(message.header.dst_len, 16);
+        assert!(message
+            .attributes
+            .contains(&RuleAttribute::Priority(10_050)));
+        assert!(message.attributes.contains(&RuleAttribute::Table(10_064)));
+        assert!(message.attributes.contains(&RuleAttribute::FwMark(0x6473)));
+        assert!(message
+            .attributes
+            .contains(&RuleAttribute::Source("10.0.0.0".parse()?)));
+        assert!(message
+            .attributes
+            .contains(&RuleAttribute::Destination("10.42.0.0".parse()?)));
+        Ok(())
+    }
+
+    #[test]
+    fn linux_netlink_rule_message_rejects_mixed_ip_families(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rule = PolicyRule {
+            table: 10_064,
+            priority: 10_050,
+            from: Some("10.0.0.0/8".parse()?),
+            to: Some("fd00::/64".parse()?),
+            fwmark: None,
+        };
+
+        assert!(matches!(
+            netlink_rule_message(&rule),
+            Err(RouteManagerError::InvalidPolicyRule(message))
+                if message.contains("mixes IPv4 and IPv6")
+        ));
         Ok(())
     }
 
