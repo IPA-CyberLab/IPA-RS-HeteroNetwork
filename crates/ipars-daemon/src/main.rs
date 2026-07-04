@@ -35,11 +35,11 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentRelayForwarderMetrics, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    AgentMetricsResponse, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
+    RelayStatusResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
@@ -897,7 +897,9 @@ async fn main() -> anyhow::Result<()> {
         "observability initialized"
     );
     match cli.command {
-        Command::ControlPlane(args) => run_control_plane(args).await,
+        Command::ControlPlane(args) => {
+            run_control_plane(args, otel_metrics_enabled, otel_metrics_interval).await
+        }
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
         Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
@@ -905,7 +907,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_control_plane(args: ControlPlaneArgs) -> anyhow::Result<()> {
+async fn run_control_plane(
+    args: ControlPlaneArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
     match database_kind(args.database_url.as_deref()) {
         DatabaseKind::Postgres => {
             let database_url = args
@@ -913,7 +919,14 @@ async fn run_control_plane(args: ControlPlaneArgs) -> anyhow::Result<()> {
                 .as_deref()
                 .context("postgres database URL is required")?;
             let store = Arc::new(PostgresControlPlaneStore::connect(database_url).await?);
-            serve_with_store(args, store.clone(), store).await
+            serve_with_store(
+                args,
+                store.clone(),
+                store,
+                otel_metrics_enabled,
+                otel_metrics_interval,
+            )
+            .await
         }
         DatabaseKind::Sqlite => {
             let database_url = args
@@ -921,12 +934,26 @@ async fn run_control_plane(args: ControlPlaneArgs) -> anyhow::Result<()> {
                 .as_deref()
                 .context("sqlite database URL is required")?;
             let store = Arc::new(SqliteControlPlaneStore::connect(database_url).await?);
-            serve_with_store(args, store.clone(), store).await
+            serve_with_store(
+                args,
+                store.clone(),
+                store,
+                otel_metrics_enabled,
+                otel_metrics_interval,
+            )
+            .await
         }
         DatabaseKind::Memory => {
             let store = Arc::new(InMemoryStore::default());
             let ledger = Arc::new(InMemoryTokenLedger::default());
-            serve_with_store(args, store, ledger).await
+            serve_with_store(
+                args,
+                store,
+                ledger,
+                otel_metrics_enabled,
+                otel_metrics_interval,
+            )
+            .await
         }
     }
 }
@@ -935,6 +962,8 @@ async fn serve_with_store<S, L>(
     args: ControlPlaneArgs,
     store: Arc<S>,
     token_ledger: Arc<L>,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
 ) -> anyhow::Result<()>
 where
     S: ControlPlaneStore + 'static,
@@ -963,11 +992,21 @@ where
         token_ledger,
         key_ring,
     ));
-    serve_router(
+    let otel_metrics_task = otel_metrics_enabled.then(|| {
+        start_control_plane_otel_metrics_export(
+            plane.clone(),
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        )
+    });
+    let result = serve_router(
         args.listen,
         router(ControlPlaneHttpState::new(plane, join_service)),
     )
-    .await
+    .await;
+    if let Some(task) = otel_metrics_task {
+        task.abort();
+    }
+    result
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
@@ -1002,6 +1041,116 @@ async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
     shutdown_task.abort();
     result?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct ControlPlaneOtelMetrics {
+    nodes: Gauge<u64>,
+    relay_candidates: Gauge<u64>,
+    node_health: Gauge<u64>,
+    paths: Gauge<u64>,
+    paths_by_state: Gauge<u64>,
+}
+
+impl ControlPlaneOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.control_plane");
+        Self {
+            nodes: meter
+                .u64_gauge("ipars.control_plane.nodes")
+                .with_description("Registered control-plane nodes.")
+                .build(),
+            relay_candidates: meter
+                .u64_gauge("ipars.control_plane.relay_candidates")
+                .with_description("Relay-capable nodes accepted into relay maps.")
+                .build(),
+            node_health: meter
+                .u64_gauge("ipars.control_plane.node_health")
+                .with_description("Registered nodes by last reported health state.")
+                .build(),
+            paths: meter
+                .u64_gauge("ipars.control_plane.paths")
+                .with_description("Pair-scoped paths persisted by the control plane.")
+                .build(),
+            paths_by_state: meter
+                .u64_gauge("ipars.control_plane.paths.by_state")
+                .with_description(
+                    "Pair-scoped paths persisted by the control plane, by selected state.",
+                )
+                .build(),
+        }
+    }
+
+    fn record_status(&self, metrics: &ControlPlaneMetricsResponse) {
+        let cluster_id = metrics.cluster_id.as_str().to_string();
+        let cluster_attrs = [KeyValue::new("cluster_id", cluster_id.clone())];
+        self.nodes.record(metrics.node_count as u64, &cluster_attrs);
+        self.relay_candidates
+            .record(metrics.relay_candidate_count as u64, &cluster_attrs);
+        self.paths.record(metrics.path_count as u64, &cluster_attrs);
+
+        for (state, count) in [
+            (HealthState::Healthy, metrics.healthy_node_count),
+            (HealthState::Degraded, metrics.degraded_node_count),
+            (HealthState::Unhealthy, metrics.unhealthy_node_count),
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("state", health_label(state)),
+            ];
+            self.node_health.record(count as u64, &attrs);
+        }
+
+        for state in [
+            PathState::DirectPublic,
+            PathState::DirectIpv6,
+            PathState::DirectNatTraversal,
+            PathState::Relay,
+            PathState::Unreachable,
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("state", path_state_label(state)),
+            ];
+            self.paths_by_state.record(
+                control_plane_path_state_count(metrics, state) as u64,
+                &attrs,
+            );
+        }
+    }
+}
+
+fn control_plane_path_state_count(
+    metrics: &ControlPlaneMetricsResponse,
+    state: PathState,
+) -> usize {
+    metrics
+        .path_state_counts
+        .iter()
+        .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn start_control_plane_otel_metrics_export<S>(
+    plane: Arc<ControlPlane<S>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    S: ControlPlaneStore + 'static,
+{
+    tokio::spawn(async move {
+        let metrics = ControlPlaneOtelMetrics::new();
+        loop {
+            match plane.metrics().await {
+                Ok(status) => metrics.record_status(&status),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to collect control-plane OTLP metrics")
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4239,6 +4388,33 @@ mod tests {
         assert_eq!(
             otlp_http_signal_endpoint(args.otel_endpoint.as_deref().unwrap_or_default(), "logs"),
             "http://collector:4318/v1/logs"
+        );
+    }
+
+    #[test]
+    fn control_plane_otel_path_state_count_defaults_missing_states_to_zero() {
+        let metrics = ControlPlaneMetricsResponse {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            node_count: 2,
+            relay_candidate_count: 1,
+            healthy_node_count: 1,
+            degraded_node_count: 1,
+            unhealthy_node_count: 0,
+            path_count: 3,
+            path_state_counts: vec![PathStateCount {
+                state: PathState::Relay,
+                count: 3,
+            }],
+            generated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            control_plane_path_state_count(&metrics, PathState::Relay),
+            3
+        );
+        assert_eq!(
+            control_plane_path_state_count(&metrics, PathState::DirectPublic),
+            0
         );
     }
 

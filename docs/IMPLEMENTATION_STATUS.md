@@ -34,7 +34,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings; relay forwarders support namespace placement checks, capacity limits, dead-task reaping, stale endpoint removal, restart backoff, and configurable crash-loop cooldown policy.
 - Agent HTTP JSON/Prometheus metrics export and bounded structured path-change event export.
 - Agent relay forwarder per-peer dataplane metrics for outbound/inbound packets and opaque payload bytes, exported through JSON and Prometheus metrics.
-- Shared `iparsd` observability bootstrap with formatted tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to OpenTelemetry collectors, including relay capacity/dataplane and agent path/relay-forwarder metric recording.
+- Shared `iparsd` observability bootstrap with formatted tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to OpenTelemetry collectors, including control-plane node/relay/path/health gauges, relay capacity/dataplane metrics, and agent path/relay-forwarder metric recording.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - `iparsd agent` Kubernetes underlay route application for explicit Service/API CIDRs or RBAC-backed Kubernetes API Service discovery, with Helm DaemonSet wiring for node-name discovery, namespace/label filters, API server host-route discovery, explicit route-provider configuration, and optional agent/relay Service exposure templates.
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents or Docker Engine API bridge-network discovery, with network name/ID filters, rootless socket discovery, and Docker Compose wiring for rootful bridge deployments.
@@ -64,7 +64,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
 - NAT topology validation beyond current mapping/filtering probes, classification-aware signal selection, and one endpoint-independent SNAT namespace topology.
 - Network-namespace validation of signal-coordinated UDP hole punching across additional reproducible NAT behaviours beyond the current direct-routed and endpoint-independent SNAT smoke tests.
-- OpenTelemetry metrics coverage beyond current relay capacity/session, byte, packet, drop-reason counters, and agent path/relay-forwarder metrics.
+- OpenTelemetry metrics coverage beyond current control-plane node/path/health gauges, relay capacity/session, byte, packet, drop-reason counters, and agent path/relay-forwarder metrics.
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.
 - Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery.
 - Full direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests beyond current focused smoke coverage.
