@@ -627,6 +627,8 @@ enum PacketFlowDetector {
     ProcNetConntrack,
     #[value(name = "conntrack-netlink")]
     ConntrackNetlink,
+    #[value(name = "conntrack-netlink-events")]
+    ConntrackNetlinkEvents,
 }
 
 impl PacketFlowDetector {
@@ -635,6 +637,7 @@ impl PacketFlowDetector {
             Self::Disabled => "disabled",
             Self::ProcNetConntrack => "proc-net-conntrack",
             Self::ConntrackNetlink => "conntrack-netlink",
+            Self::ConntrackNetlinkEvents => "conntrack-netlink-events",
         }
     }
 }
@@ -1962,6 +1965,19 @@ async fn run_agent(
                 "starting packet-flow detector"
             );
             background_tasks.push(start_conntrack_netlink_packet_flow_detector(
+                runtime.clone(),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                args.packet_flow_pin,
+            ));
+        }
+        PacketFlowDetector::ConntrackNetlinkEvents => {
+            tracing::info!(
+                detector = args.packet_flow_detector.as_str(),
+                idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                pin = args.packet_flow_pin,
+                "starting packet-flow detector"
+            );
+            background_tasks.push(start_conntrack_netlink_event_packet_flow_detector(
                 runtime.clone(),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
                 args.packet_flow_pin,
@@ -4454,6 +4470,72 @@ fn start_conntrack_netlink_packet_flow_detector(
     })
 }
 
+fn start_conntrack_netlink_event_packet_flow_detector(
+    runtime: Arc<AgentRuntime>,
+    idle_poll_interval: Duration,
+    pin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match open_conntrack_netlink_event_socket() {
+                Ok(socket) => {
+                    if let Err(error) = run_conntrack_netlink_event_detector_once(
+                        runtime.as_ref(),
+                        &socket,
+                        idle_poll_interval,
+                        pin,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "conntrack netlink event detector failed; reopening socket"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to open conntrack netlink event socket; will retry"
+                ),
+            }
+            tokio::time::sleep(idle_poll_interval).await;
+        }
+    })
+}
+
+async fn run_conntrack_netlink_event_detector_once(
+    runtime: &AgentRuntime,
+    socket: &Socket,
+    idle_poll_interval: Duration,
+    pin: bool,
+) -> anyhow::Result<()> {
+    let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
+    loop {
+        let mut recorded_any = false;
+        while let Some(destinations) =
+            read_conntrack_netlink_event_destination_ips(socket, &mut buffer)?
+        {
+            recorded_any = true;
+            let matched_count = record_packet_flow_destinations(
+                runtime,
+                destinations,
+                pin,
+                "conntrack-netlink-events",
+            )
+            .await;
+            if matched_count > 0 {
+                tracing::info!(
+                    matched = matched_count,
+                    "recorded packet-flow lazy-connect activity from conntrack netlink events"
+                );
+            }
+        }
+        if !recorded_any {
+            tokio::time::sleep(idle_poll_interval).await;
+        }
+    }
+}
+
 async fn record_packet_flow_destinations(
     runtime: &AgentRuntime,
     destinations: BTreeSet<IpAddr>,
@@ -4534,6 +4616,35 @@ fn dump_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> 
     }
 }
 
+fn open_conntrack_netlink_event_socket() -> anyhow::Result<Socket> {
+    let mut socket =
+        Socket::new(NETLINK_NETFILTER).context("failed to open NETLINK_NETFILTER socket")?;
+    socket
+        .bind(&NetlinkSocketAddr::new(
+            0,
+            conntrack_netlink_event_group_mask(),
+        ))
+        .context("failed to bind NETLINK_NETFILTER socket to conntrack event groups")?;
+    socket
+        .set_non_blocking(true)
+        .context("failed to set NETLINK_NETFILTER event socket nonblocking")?;
+    Ok(socket)
+}
+
+fn read_conntrack_netlink_event_destination_ips(
+    socket: &Socket,
+    buffer: &mut [u8],
+) -> anyhow::Result<Option<BTreeSet<IpAddr>>> {
+    match socket.recv(&mut &mut buffer[..], 0) {
+        Ok(received) => {
+            let datagram = parse_conntrack_netlink_datagram_destination_ips(&buffer[..received])?;
+            Ok(Some(datagram.destinations))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error).context("failed to receive conntrack netlink event"),
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ConntrackNetlinkDatagram {
     destinations: BTreeSet<IpAddr>,
@@ -4549,6 +4660,8 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300;
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
+const NFNLGRP_CONNTRACK_NEW: u32 = 1;
+const NFNLGRP_CONNTRACK_UPDATE: u32 = 2;
 const IPCTNL_MSG_CT_GET: u16 = 1;
 const NFNETLINK_V0: u8 = 0;
 const CTA_TUPLE_ORIG: u16 = 1;
@@ -4557,6 +4670,18 @@ const CTA_TUPLE_IP: u16 = 1;
 const CTA_IP_V4_DST: u16 = 2;
 const CTA_IP_V6_DST: u16 = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+
+fn conntrack_netlink_event_group_mask() -> u32 {
+    netlink_group_mask(NFNLGRP_CONNTRACK_NEW) | netlink_group_mask(NFNLGRP_CONNTRACK_UPDATE)
+}
+
+fn netlink_group_mask(group: u32) -> u32 {
+    if group == 0 || group > 32 {
+        0
+    } else {
+        1_u32 << (group - 1)
+    }
+}
 
 fn conntrack_netlink_dump_request(sequence_number: u32) -> Vec<u8> {
     let mut request = Vec::with_capacity(NLMSG_HDR_LEN + NFGENMSG_LEN);
@@ -5874,6 +5999,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_args_accept_conntrack_netlink_events_packet_flow_detector() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "conntrack-netlink-events",
+            "--packet-flow-pin",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.packet_flow_detector,
+                PacketFlowDetector::ConntrackNetlinkEvents
+            );
+            assert_eq!(
+                args.packet_flow_detector.as_str(),
+                "conntrack-netlink-events"
+            );
+            assert!(args.packet_flow_pin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn conntrack_paths_default_and_override() {
         assert_eq!(
             conntrack_paths(None),
@@ -5922,6 +6073,15 @@ invalid no-destination-here
     }
 
     #[test]
+    fn conntrack_netlink_event_group_mask_subscribes_new_and_update() {
+        assert_eq!(netlink_group_mask(0), 0);
+        assert_eq!(netlink_group_mask(NFNLGRP_CONNTRACK_NEW), 0b01);
+        assert_eq!(netlink_group_mask(NFNLGRP_CONNTRACK_UPDATE), 0b10);
+        assert_eq!(netlink_group_mask(33), 0);
+        assert_eq!(conntrack_netlink_event_group_mask(), 0b11);
+    }
+
+    #[test]
     fn conntrack_netlink_parser_extracts_orig_and_reply_destination_ips() -> anyhow::Result<()> {
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
         let ipv6_destination = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x42);
@@ -5955,6 +6115,30 @@ invalid no-destination-here
                 IpAddr::from(ipv4_destination),
                 IpAddr::from(ipv6_destination)
             ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conntrack_netlink_event_parser_does_not_require_done_message() -> anyhow::Result<()> {
+        let ipv4_destination = Ipv4Addr::new(100, 64, 0, 77);
+        let tuple = test_nla(
+            CTA_TUPLE_ORIG | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_IP_V4_DST, &ipv4_destination.octets()),
+            ),
+        );
+        let mut payload = vec![0, NFNETLINK_V0, 0, 0];
+        payload.extend(tuple);
+        let datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
+
+        let result = parse_conntrack_netlink_datagram_destination_ips(&datagram)?;
+
+        assert!(!result.done);
+        assert_eq!(
+            result.destinations,
+            BTreeSet::from([IpAddr::from(ipv4_destination)])
         );
         Ok(())
     }
