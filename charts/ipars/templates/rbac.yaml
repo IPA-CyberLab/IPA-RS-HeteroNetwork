@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ipars.fullname" . }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ipars.fullname" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ipars.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ipars.fullname" . }}
+    namespace: {{ .Release.Namespace }}

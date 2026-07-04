@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ipars-agent",
+    "crates/ipars-cli",
+    "crates/ipars-control-plane",
+    "crates/ipars-crypto",
+    "crates/ipars-relay",
+    "crates/ipars-route-manager",
+    "crates/ipars-signal",
+    "crates/ipars-stun",
+    "crates/ipars-types",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+ipnet = { version = "2.10", features = ["serde"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1.10", features = ["serde", "v4"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

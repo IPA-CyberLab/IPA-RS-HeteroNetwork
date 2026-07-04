@@ -1,0 +1,22 @@
+image:
+  repository: ghcr.io/ipa-cyberlab/ipars
+  tag: latest
+  pullPolicy: IfNotPresent
+
+cluster:
+  controlPlaneUrl: "https://ipars-control-plane:8443"
+  signalUrl: "https://ipars-signal:9443"
+  stunEndpoint: "ipars-stun:3478"
+  relayEndpoint: "ipars-relay:51820"
+
+agent:
+  interfaceName: ipars0
+  joinTokenSecretName: ipars-join-token
+  routeProvider: false
+  hostNetwork: true
+  privileged: false
+
+serviceExposure:
+  apiServer: true
+  serviceCidrs:
+    - 10.96.0.0/12

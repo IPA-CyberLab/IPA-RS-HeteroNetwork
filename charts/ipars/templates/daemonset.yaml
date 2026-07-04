@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ipars.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ipars.name" . }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "ipars.name" . }}
+    spec:
+      serviceAccountName: {{ include "ipars.fullname" . }}
+      hostNetwork: {{ .Values.agent.hostNetwork }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - status
+          env:
+            - name: IPARS_CONTROL_PLANE_URL
+              value: {{ .Values.cluster.controlPlaneUrl | quote }}
+            - name: IPARS_SIGNAL_URL
+              value: {{ .Values.cluster.signalUrl | quote }}
+            - name: IPARS_STUN_ENDPOINT
+              value: {{ .Values.cluster.stunEndpoint | quote }}
+            - name: IPARS_RELAY_ENDPOINT
+              value: {{ .Values.cluster.relayEndpoint | quote }}
+            - name: IPARS_INTERFACE
+              value: {{ .Values.agent.interfaceName | quote }}
+            - name: IPARS_ROUTE_PROVIDER
+              value: {{ .Values.agent.routeProvider | quote }}
+          securityContext:
+            privileged: {{ .Values.agent.privileged }}
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          volumeMounts:
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+            - name: join-token
+              mountPath: /var/lib/ipars/token
+              readOnly: true
+      volumes:
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: join-token
+          secret:
+            secretName: {{ .Values.agent.joinTokenSecretName }}
