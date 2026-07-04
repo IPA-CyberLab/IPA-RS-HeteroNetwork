@@ -17,7 +17,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - Continuous UDP STUN echo loop and `iparsd stun` daemon for public endpoint detection.
-- Relay admission/status HTTP API, credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
+- Relay admission/status HTTP API, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
 - `iparsd agent --join-token` startup registration that uses persisted agent identity/WireGuard keys, current candidates, and token bootstrap control-plane discovery.
@@ -32,7 +32,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through Linux WireGuard/route backends when explicitly enabled, supports `--linux-netns` namespace placement, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Lazy connect and pinning primitives in the agent crate.
-- Relay session table that forwards only credentialed opaque payload frames and enforces per-session throughput windows.
+- Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
 - Docker Compose and Helm chart starting points.
 
 ## Remaining For Full Production Completion
@@ -42,7 +42,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - Full STUN protocol support and NAT classification.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
-- Relay credential distribution through control-plane/signal path selection and relay session expiry/rotation.
+- Relay credential distribution through control-plane/signal path selection and coordinated relay session rotation.
 - Metrics export and structured path-change events.
 - Docker namespace integration implementation.
 - Kubernetes route discovery and service/API exposure implementation.

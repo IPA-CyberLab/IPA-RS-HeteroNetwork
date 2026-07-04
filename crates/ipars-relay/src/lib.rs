@@ -9,12 +9,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::{watch, RwLock};
 use uuid::Uuid;
 
+const DEFAULT_SESSION_TTL_SECONDS: i64 = 300;
+
 #[derive(Debug, Error)]
 pub enum RelayError {
     #[error("relay admission denied")]
     AdmissionDenied,
     #[error("unknown relay session")]
     UnknownSession,
+    #[error("relay session expired")]
+    SessionExpired,
     #[error("invalid relay session credential")]
     InvalidSessionCredential,
     #[error("relay session rate limit exceeded")]
@@ -47,6 +51,7 @@ pub struct RelaySession {
     pub left_addr: SocketAddr,
     pub right_addr: SocketAddr,
     pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
     pub bytes_forwarded: u64,
     window_started_at: DateTime<Utc>,
     window_bytes: u64,
@@ -57,6 +62,17 @@ pub struct RelaySession {
 pub struct RelaySessionCredentials {
     pub session_id: RelaySessionId,
     pub session_token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySessionAdmission {
+    pub left: NodeId,
+    pub right: NodeId,
+    pub left_addr: SocketAddr,
+    pub right_addr: SocketAddr,
+    pub session_token: String,
+    pub session_ttl: chrono::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,13 +135,16 @@ impl RelayTable {
         left_addr: SocketAddr,
         right_addr: SocketAddr,
     ) -> Result<RelaySessionCredentials, RelayError> {
-        self.admit_with_token(
+        self.admit_with_options(
             capability,
-            left,
-            right,
-            left_addr,
-            right_addr,
-            Uuid::new_v4().to_string(),
+            RelaySessionAdmission {
+                left,
+                right,
+                left_addr,
+                right_addr,
+                session_token: Uuid::new_v4().to_string(),
+                session_ttl: default_session_ttl(),
+            },
         )
     }
 
@@ -138,22 +157,42 @@ impl RelayTable {
         right_addr: SocketAddr,
         session_token: String,
     ) -> Result<RelaySessionCredentials, RelayError> {
-        if !capability.can_admit() {
-            return Err(RelayError::AdmissionDenied);
-        }
-
-        let id = RelaySessionId::new(&left, &right);
-        let now = Utc::now();
-        self.sessions.insert(
-            id.clone(),
-            RelaySession {
-                id: id.clone(),
-                session_token: session_token.clone(),
+        self.admit_with_options(
+            capability,
+            RelaySessionAdmission {
                 left,
                 right,
                 left_addr,
                 right_addr,
+                session_token,
+                session_ttl: default_session_ttl(),
+            },
+        )
+    }
+
+    pub fn admit_with_options(
+        &mut self,
+        capability: &RelayCapability,
+        admission: RelaySessionAdmission,
+    ) -> Result<RelaySessionCredentials, RelayError> {
+        if !capability.can_admit() {
+            return Err(RelayError::AdmissionDenied);
+        }
+
+        let id = RelaySessionId::new(&admission.left, &admission.right);
+        let now = Utc::now();
+        let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
+        self.sessions.insert(
+            id.clone(),
+            RelaySession {
+                id: id.clone(),
+                session_token: admission.session_token.clone(),
+                left: admission.left,
+                right: admission.right,
+                left_addr: admission.left_addr,
+                right_addr: admission.right_addr,
                 created_at: now,
+                expires_at,
                 bytes_forwarded: 0,
                 window_started_at: now,
                 window_bytes: 0,
@@ -162,7 +201,8 @@ impl RelayTable {
         );
         Ok(RelaySessionCredentials {
             session_id: id,
-            session_token,
+            session_token: admission.session_token,
+            expires_at,
         })
     }
 
@@ -175,6 +215,7 @@ impl RelayTable {
         frame: &RelayFrame,
         now: DateTime<Utc>,
     ) -> Result<SocketAddr, RelayError> {
+        self.remove_expired_session(&frame.session_id, now)?;
         let session = self
             .sessions
             .get_mut(&frame.session_id)
@@ -210,6 +251,7 @@ impl RelayTable {
         now: DateTime<Utc>,
     ) -> Result<(SocketAddr, Vec<u8>), RelayError> {
         let datagram = decode_relay_datagram(datagram)?;
+        self.remove_expired_session(&datagram.session_id, now)?;
         let session = self
             .sessions
             .get_mut(&datagram.session_id)
@@ -230,6 +272,12 @@ impl RelayTable {
         Ok((target, datagram.ciphertext_payload))
     }
 
+    pub fn purge_expired(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| !session.is_expired(now));
+        before.saturating_sub(self.sessions.len())
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -240,9 +288,30 @@ impl RelayTable {
             .map(|session| session.bytes_forwarded)
             .sum()
     }
+
+    fn remove_expired_session(
+        &mut self,
+        session_id: &RelaySessionId,
+        now: DateTime<Utc>,
+    ) -> Result<(), RelayError> {
+        let expired = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.is_expired(now))
+            .unwrap_or(false);
+        if expired {
+            self.sessions.remove(session_id);
+            return Err(RelayError::SessionExpired);
+        }
+        Ok(())
+    }
 }
 
 impl RelaySession {
+    fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.expires_at
+    }
+
     fn verify_token(&self, session_token: &str) -> Result<(), RelayError> {
         if self.session_token == session_token {
             Ok(())
@@ -272,6 +341,10 @@ impl RelaySession {
 
 fn megabits_to_bytes_per_second(max_mbps: u32) -> u64 {
     u64::from(max_mbps).saturating_mul(1_000_000) / 8
+}
+
+fn default_session_ttl() -> chrono::Duration {
+    chrono::Duration::seconds(DEFAULT_SESSION_TTL_SECONDS)
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
@@ -316,14 +389,24 @@ pub struct RelayService {
     relay_node: NodeId,
     capability: RwLock<RelayCapability>,
     table: std::sync::Arc<RwLock<RelayTable>>,
+    session_ttl: chrono::Duration,
 }
 
 impl RelayService {
     pub fn new(relay_node: NodeId, capability: RelayCapability) -> Self {
+        Self::with_session_ttl(relay_node, capability, default_session_ttl())
+    }
+
+    pub fn with_session_ttl(
+        relay_node: NodeId,
+        capability: RelayCapability,
+        session_ttl: chrono::Duration,
+    ) -> Self {
         Self {
             relay_node,
             capability: RwLock::new(capability),
             table: std::sync::Arc::new(RwLock::new(RelayTable::default())),
+            session_ttl: session_ttl.max(chrono::Duration::milliseconds(1)),
         }
     }
 
@@ -336,19 +419,27 @@ impl RelayService {
         request: RelayAdmissionRequest,
     ) -> Result<RelayAdmissionResponse, RelayError> {
         let mut capability = self.capability.write().await;
-        let credentials = self.table.write().await.admit(
+        let mut table = self.table.write().await;
+        table.purge_expired(Utc::now());
+        capability.active_sessions = table.session_count() as u32;
+        let credentials = table.admit_with_options(
             &capability,
-            request.left.clone(),
-            request.right.clone(),
-            request.left_addr,
-            request.right_addr,
+            RelaySessionAdmission {
+                left: request.left.clone(),
+                right: request.right.clone(),
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+                session_token: Uuid::new_v4().to_string(),
+                session_ttl: self.session_ttl,
+            },
         )?;
-        capability.active_sessions = capability.active_sessions.saturating_add(1);
+        capability.active_sessions = table.session_count() as u32;
 
         Ok(RelayAdmissionResponse {
             relay_node: self.relay_node.clone(),
             session_id: credentials.session_id.as_str().to_string(),
             session_token: credentials.session_token,
+            expires_at: credentials.expires_at,
             left: request.left,
             right: request.right,
             left_addr: request.left_addr,
@@ -357,9 +448,13 @@ impl RelayService {
     }
 
     pub async fn status(&self) -> RelayStatusResponse {
+        let mut capability = self.capability.write().await;
+        let mut table = self.table.write().await;
+        table.purge_expired(Utc::now());
+        capability.active_sessions = table.session_count() as u32;
         RelayStatusResponse {
             relay_node: self.relay_node.clone(),
-            capability: self.capability.read().await.clone(),
+            capability: capability.clone(),
             health: HealthState::Healthy,
         }
     }
@@ -479,6 +574,46 @@ mod tests {
     }
 
     #[test]
+    fn relay_removes_expired_session_before_forwarding() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let credentials = table.admit_with_options(
+            &capability,
+            RelaySessionAdmission {
+                left: left.clone(),
+                right: right.clone(),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+                session_token: "relay-secret".to_string(),
+                session_ttl: chrono::Duration::seconds(1),
+            },
+        )?;
+        let error = table.forward_target_at(
+            &RelayFrame {
+                session_id: credentials.session_id,
+                session_token: credentials.session_token,
+                source: left,
+                destination: right,
+                ciphertext_payload: vec![1, 2, 3],
+            },
+            credentials.expires_at,
+        );
+
+        assert!(matches!(error, Err(RelayError::SessionExpired)));
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn relay_enforces_per_session_rate_limit() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = RelayCapability {
@@ -554,6 +689,37 @@ mod tests {
 
         assert_eq!(target, right_addr);
         assert_eq!(payload, b"opaque");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_status_purges_expired_sessions() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = RelayService::with_session_ttl(
+            NodeId::from_string("relay"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+            chrono::Duration::milliseconds(1),
+        );
+        let _admission = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let status = service.status().await;
+
+        assert_eq!(status.capability.active_sessions, 0);
         Ok(())
     }
 

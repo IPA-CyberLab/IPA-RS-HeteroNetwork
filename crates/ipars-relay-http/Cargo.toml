@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
+chrono.workspace = true
 ipars-relay = { path = "../ipars-relay" }
 ipars-types = { path = "../ipars-types" }
 serde.workspace = true

@@ -654,6 +654,7 @@ pub mod api {
         pub relay_node: NodeId,
         pub session_id: String,
         pub session_token: String,
+        pub expires_at: DateTime<Utc>,
         pub left: NodeId,
         pub right: NodeId,
         pub left_addr: SocketAddr,

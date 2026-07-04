@@ -118,6 +118,8 @@ struct RelayArgs {
     max_sessions: u32,
     #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
     max_mbps: u32,
+    #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
+    session_ttl_seconds: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -305,7 +307,7 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
     let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
-    let service = Arc::new(RelayService::new(
+    let service = Arc::new(RelayService::with_session_ttl(
         NodeId::from_string(args.relay_node_id),
         RelayCapability {
             enabled_by_policy: true,
@@ -315,6 +317,7 @@ async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
             max_mbps: args.max_mbps,
             e2e_only: true,
         },
+        chrono::Duration::seconds(args.session_ttl_seconds.max(1) as i64),
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
@@ -1051,6 +1054,25 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn relay_args_accepts_session_ttl() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--session-ttl-seconds",
+            "60",
+        ])?;
+
+        if let Command::Relay(args) = cli.command {
+            assert_eq!(args.session_ttl_seconds, 60);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected relay command"))
     }
 
     #[test]

@@ -62,6 +62,7 @@ impl IntoResponse for ApiError {
         let status = match self.0 {
             RelayError::AdmissionDenied => StatusCode::FORBIDDEN,
             RelayError::UnknownSession => StatusCode::NOT_FOUND,
+            RelayError::SessionExpired => StatusCode::GONE,
             RelayError::InvalidSessionCredential => StatusCode::FORBIDDEN,
             RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             RelayError::MalformedFrame => StatusCode::BAD_REQUEST,
@@ -130,6 +131,7 @@ mod tests {
         let response: RelayAdmissionResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.session_id, "left:right");
         assert!(!response.session_token.is_empty());
+        assert!(response.expires_at > chrono::Utc::now());
 
         let response = app
             .oneshot(
