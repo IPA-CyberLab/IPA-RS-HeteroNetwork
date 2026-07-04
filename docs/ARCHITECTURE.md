@@ -231,5 +231,5 @@ Target: no full mesh. Agents subscribe to relevant peer/route deltas by tag, rol
 3. Long-running control-plane, signal, STUN, relay, and agent daemons.
 4. Kernel WireGuard backend: initial Linux `ip`/`wg` command runner exists; add netlink/wgctrl-equivalent calls for production control.
 5. Route manager for Linux policy routing, Docker namespaces, and Kubernetes node underlay: initial `ip route`/`ip rule` command backend and validated namespace command execution exist; add netlink and namespace lifecycle hardening.
-6. NAT traversal integration tests with network namespaces.
+6. NAT traversal integration tests with network namespaces. A gated route-backend namespace smoke test exists; extend this into direct, NAT traversal, and relay fallback topologies.
 7. Relay abuse controls, metrics, and production hardening.

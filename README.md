@@ -41,6 +41,12 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete target design 
 cargo test --workspace
 ```
 
+Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN`:
+
+```bash
+IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
+```
+
 ## CLI Surface
 
 ```bash
@@ -56,4 +62,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to extend network-namespace integration tests from route-backend validation into direct, NAT traversal, and relay fallback path validation.
