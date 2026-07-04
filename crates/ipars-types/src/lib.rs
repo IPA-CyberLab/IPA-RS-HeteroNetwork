@@ -320,6 +320,7 @@ impl RelayCapability {
             && self.public_endpoint.is_some()
             && self.e2e_only
             && self.available_capacity() > 0
+            && self.max_mbps > 0
     }
 }
 
@@ -652,6 +653,7 @@ pub mod api {
     pub struct RelayAdmissionResponse {
         pub relay_node: NodeId,
         pub session_id: String,
+        pub session_token: String,
         pub left: NodeId,
         pub right: NodeId,
         pub left_addr: SocketAddr,

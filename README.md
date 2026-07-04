@@ -16,7 +16,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - continuous UDP STUN echo server and `iparsd stun` daemon for public endpoint detection
-- relay session admission/status HTTP API, opaque UDP payload forwarding, and `iparsd relay`
+- relay session admission/status HTTP API, credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - persistent agent node state, agent status/STUN probe HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery

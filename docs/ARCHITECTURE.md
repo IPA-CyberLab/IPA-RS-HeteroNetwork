@@ -104,7 +104,7 @@ Public nodes are relay candidates only when policy, health, and capacity permit 
 - abuse/rate-limit status
 - health status
 
-Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by session metadata and never receive keys that can decrypt tenant payload.
+Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an outer relay frame containing session metadata and a bearer credential, enforce per-session throughput windows, strip the relay frame before forwarding, and never receive keys that can decrypt tenant payload.
 
 ## Docker Support
 

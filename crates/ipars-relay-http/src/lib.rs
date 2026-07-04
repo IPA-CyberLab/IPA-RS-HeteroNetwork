@@ -62,6 +62,9 @@ impl IntoResponse for ApiError {
         let status = match self.0 {
             RelayError::AdmissionDenied => StatusCode::FORBIDDEN,
             RelayError::UnknownSession => StatusCode::NOT_FOUND,
+            RelayError::InvalidSessionCredential => StatusCode::FORBIDDEN,
+            RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            RelayError::MalformedFrame => StatusCode::BAD_REQUEST,
             RelayError::Socket(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
@@ -126,6 +129,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RelayAdmissionResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.session_id, "left:right");
+        assert!(!response.session_token.is_empty());
 
         let response = app
             .oneshot(
