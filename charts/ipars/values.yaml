@@ -25,6 +25,7 @@ agent:
     enabled: false
     publicEndpoint: ""
     admissionUrl: ""
+    statusUrl: ""
     maxSessions: 10000
     maxMbps: 1000
 

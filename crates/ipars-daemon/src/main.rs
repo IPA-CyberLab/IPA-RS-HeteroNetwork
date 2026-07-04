@@ -252,6 +252,8 @@ struct AgentArgs {
         requires = "relay_public_endpoint"
     )]
     relay_admission_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_STATUS_URL")]
+    relay_status_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     relay_max_sessions: u32,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_MBPS", default_value_t = 1000)]
@@ -1198,7 +1200,10 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
-    let relay_capability = agent_relay_capability(&args);
+    let relay_capability_reporter = agent_relay_capability_reporter(&args);
+    let relay_capability = relay_capability_reporter
+        .as_ref()
+        .map(|reporter| reporter.advertised.clone());
     if args.stun_servers.len() > 1 {
         runtime
             .classify_nat(args.stun_bind, args.stun_servers.clone())
@@ -1240,7 +1245,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
                 runtime.clone(),
                 control_plane_url,
                 Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
-                relay_capability.clone(),
+                relay_capability_reporter.clone(),
             ));
         }
     }
@@ -2851,10 +2856,16 @@ fn start_heartbeat_reporting(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     interval: Duration,
-    relay_capability: Option<RelayCapability>,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_heartbeat_loop(runtime, control_plane_url, interval, relay_capability).await;
+        run_heartbeat_loop(
+            runtime,
+            control_plane_url,
+            interval,
+            relay_capability_reporter,
+        )
+        .await;
     })
 }
 
@@ -2862,10 +2873,12 @@ async fn run_heartbeat_loop(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     interval: Duration,
-    relay_capability: Option<RelayCapability>,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
     let client = reqwest::Client::new();
     loop {
+        let relay_capability =
+            heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let request = heartbeat_request(runtime.as_ref(), relay_capability.clone()).await;
         match send_heartbeat(&client, &control_plane_url, request).await {
             Ok(response) => tracing::info!(
@@ -3215,6 +3228,77 @@ fn agent_relay_capability(args: &AgentArgs) -> Option<RelayCapability> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct RelayCapabilityReporter {
+    advertised: RelayCapability,
+    status_url: Option<String>,
+}
+
+fn agent_relay_capability_reporter(args: &AgentArgs) -> Option<RelayCapabilityReporter> {
+    let advertised = agent_relay_capability(args)?;
+    let status_url = args
+        .relay_status_url
+        .clone()
+        .or_else(|| args.relay_admission_url.clone());
+    Some(RelayCapabilityReporter {
+        advertised,
+        status_url,
+    })
+}
+
+async fn heartbeat_relay_capability(
+    client: &reqwest::Client,
+    reporter: Option<&RelayCapabilityReporter>,
+) -> Option<RelayCapability> {
+    let reporter = reporter?;
+    let Some(status_url) = reporter.status_url.as_deref() else {
+        return Some(reporter.advertised.clone());
+    };
+    match fetch_relay_status(client, status_url).await {
+        Ok(status) => Some(relay_capability_from_status(&reporter.advertised, &status)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                status_url,
+                "failed to refresh relay status for heartbeat; using configured relay capability"
+            );
+            Some(reporter.advertised.clone())
+        }
+    }
+}
+
+async fn fetch_relay_status(
+    client: &reqwest::Client,
+    relay_url: &str,
+) -> anyhow::Result<RelayStatusResponse> {
+    let url = relay_status_url(relay_url);
+    client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to send relay status request to {url}"))?
+        .error_for_status()
+        .with_context(|| format!("relay status request to {url} returned an error status"))?
+        .json()
+        .await
+        .with_context(|| format!("failed to decode relay status response from {url}"))
+}
+
+fn relay_capability_from_status(
+    advertised: &RelayCapability,
+    status: &RelayStatusResponse,
+) -> RelayCapability {
+    RelayCapability {
+        enabled_by_policy: advertised.enabled_by_policy,
+        public_endpoint: advertised.public_endpoint,
+        admission_url: advertised.admission_url.clone(),
+        max_sessions: status.capability.max_sessions,
+        active_sessions: status.capability.active_sessions,
+        max_mbps: status.capability.max_mbps,
+        e2e_only: status.capability.e2e_only,
+    }
+}
+
 async fn relay_session_needs_renewal(
     runtime: &AgentRuntime,
     peer: &NodeId,
@@ -3523,6 +3607,15 @@ fn heartbeat_url(control_plane_url: &str) -> String {
     format!("{}/v1/heartbeat", control_plane_url.trim_end_matches('/'))
 }
 
+fn relay_status_url(relay_url: &str) -> String {
+    let relay_url = relay_url.trim_end_matches('/');
+    if relay_url.ends_with("/v1/status") {
+        relay_url.to_string()
+    } else {
+        format!("{relay_url}/v1/status")
+    }
+}
+
 fn signal_node_url(signal_url: &str, node_id: &NodeId) -> String {
     format!("{}/v1/nodes/{}", signal_url.trim_end_matches('/'), node_id)
 }
@@ -3610,7 +3703,9 @@ mod tests {
 
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
-    use ipars_types::api::{RelayAdmissionResponse, RelayDataplaneDropReason};
+    use ipars_types::api::{
+        RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+    };
     use ipars_types::{
         BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
         JoinTokenClaims, PathScore, PeerPathKey, Role, TokenPolicy, VpnIp,
@@ -3880,6 +3975,8 @@ mod tests {
             "203.0.113.30:51820",
             "--relay-admission-url",
             "http://relay-a:9580",
+            "--relay-status-url",
+            "http://relay-a:9580",
             "--relay-max-sessions",
             "500",
             "--relay-max-mbps",
@@ -3935,6 +4032,9 @@ mod tests {
                 relay_capability.admission_url.as_deref(),
                 Some("http://relay-a:9580")
             );
+            let reporter =
+                agent_relay_capability_reporter(&args).context("expected relay reporter")?;
+            assert_eq!(reporter.status_url.as_deref(), Some("http://relay-a:9580"));
             assert!(!relay_capability.enabled_by_policy);
             assert_eq!(relay_capability.max_sessions, 500);
             assert_eq!(relay_capability.max_mbps, 250);
@@ -4081,6 +4181,54 @@ mod tests {
         assert_eq!(session.peer, NodeId::from_string("node-b"));
         assert_eq!(session.relay_node, NodeId::from_string("relay-advertised"));
         assert_eq!(session.relay_endpoint, relay_endpoint);
+    }
+
+    #[test]
+    fn relay_status_url_accepts_base_or_full_status_url() {
+        assert_eq!(
+            relay_status_url("http://127.0.0.1:9580/"),
+            "http://127.0.0.1:9580/v1/status"
+        );
+        assert_eq!(
+            relay_status_url("http://127.0.0.1:9580/v1/status"),
+            "http://127.0.0.1:9580/v1/status"
+        );
+    }
+
+    #[test]
+    fn relay_capability_status_refresh_preserves_advertised_endpoints() {
+        let advertised = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51_820))),
+            admission_url: Some("http://public-relay:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+        let status = RelayStatusResponse {
+            relay_node: NodeId::from_string("relay-a"),
+            capability: RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([127, 0, 0, 1], 51_820))),
+                admission_url: Some("http://127.0.0.1:9580".to_string()),
+                max_sessions: 250,
+                active_sessions: 12,
+                max_mbps: 500,
+                e2e_only: true,
+            },
+            health: HealthState::Healthy,
+            dataplane: RelayDataplaneMetrics::default(),
+        };
+
+        let refreshed = relay_capability_from_status(&advertised, &status);
+
+        assert_eq!(refreshed.public_endpoint, advertised.public_endpoint);
+        assert_eq!(refreshed.admission_url, advertised.admission_url);
+        assert!(!refreshed.enabled_by_policy);
+        assert_eq!(refreshed.max_sessions, 250);
+        assert_eq!(refreshed.active_sessions, 12);
+        assert_eq!(refreshed.max_mbps, 500);
     }
 
     #[test]

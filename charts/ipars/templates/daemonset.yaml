@@ -36,6 +36,10 @@ spec:
             - {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
             - --relay-admission-url
             - {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}
+            {{- if .Values.agent.relayAdvertisement.statusUrl }}
+            - --relay-status-url
+            - {{ .Values.agent.relayAdvertisement.statusUrl | quote }}
+            {{- end }}
             - --relay-max-sessions
             - {{ .Values.agent.relayAdvertisement.maxSessions | quote }}
             - --relay-max-mbps

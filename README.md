@@ -95,7 +95,7 @@ Join tokens are single-use by default. `ipars init` and `ipars token create` can
 
 For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent query the Kubernetes API with its ServiceAccount token, optionally constrained by `--kubernetes-namespace` and `--kubernetes-service-label-selector`, and convert Service cluster IPs plus the in-cluster API server address into overlay host routes. Explicit `--kubernetes-service-cidr` and `--kubernetes-api-server-cidr` values remain supported for static deployments. The Helm chart mounts the join token Secret and passes it to the agent through `--join-token-path`.
 
-Public nodes that run a colocated relay can start `iparsd agent` with `--relay-public-endpoint` and `--relay-admission-url` to advertise relay capability during join. The control plane enables that capability only when the signed join token includes relay permission.
+Public nodes that run a colocated relay can start `iparsd agent` with `--relay-public-endpoint` and `--relay-admission-url` to advertise relay capability during join. `--relay-status-url` lets heartbeat refresh capacity and active-session counts from the relay daemon. The control plane enables that capability only when the signed join token includes relay permission.
 
 Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. `--docker-api-socket` overrides socket placement, otherwise `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, and rootless `$XDG_RUNTIME_DIR/docker.sock` are checked in order. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments.
 

@@ -114,7 +114,7 @@ Relay candidates advertise both a public UDP relay endpoint and an HTTP admissio
 
 An agent only advertises a local relay service to the control plane when it is started with an explicit relay public endpoint and relay admission URL. The control plane still marks that relay capability enabled only when the join token policy allows relay, so public UDP reachability alone does not make a node a relay candidate.
 
-Agent heartbeats can refresh relay capability and capacity fields, but the control plane re-checks the node's stored token policy before accepting those updates and rewrites `enabled_by_policy` itself.
+Agent heartbeats can refresh relay capability and capacity fields, including active session counts from an optional relay status URL, but the control plane re-checks the node's stored token policy before accepting those updates and rewrites `enabled_by_policy` itself.
 
 The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Its UDP loop forwards packets from the local WireGuard socket to the relay and sends stripped inbound relay payloads back toward the local WireGuard endpoint.
 
