@@ -204,6 +204,33 @@ pub enum NatMappingBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum NatFilteringBehavior {
+    Unknown,
+    EndpointIndependent,
+    AddressDependent,
+    AddressAndPortDependent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatFilteringProbeKind {
+    SameAddress,
+    ChangePort,
+    ChangeAddressAndPort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatFilteringObservation {
+    pub local_addr: SocketAddr,
+    pub stun_server: SocketAddr,
+    pub probe: NatFilteringProbeKind,
+    pub response_origin: Option<SocketAddr>,
+    pub other_address: Option<SocketAddr>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NatTraversalStrategy {
     DirectCandidate,
     CoordinatedHolePunch,
@@ -215,8 +242,10 @@ pub enum NatTraversalStrategy {
 pub struct NatClassification {
     pub local_addr: SocketAddr,
     pub mapping_behavior: NatMappingBehavior,
+    pub filtering_behavior: NatFilteringBehavior,
     pub observed_endpoint: Option<SocketAddr>,
     pub observations: Vec<NatProbeObservation>,
+    pub filtering_observations: Vec<NatFilteringObservation>,
     pub strategy: NatTraversalStrategy,
     pub confidence: f32,
     pub assessed_at: DateTime<Utc>,
@@ -228,16 +257,33 @@ impl NatClassification {
         observations: Vec<NatProbeObservation>,
         assessed_at: DateTime<Utc>,
     ) -> Self {
+        Self::from_observations_with_filtering(local_addr, observations, Vec::new(), assessed_at)
+    }
+
+    pub fn from_observations_with_filtering(
+        local_addr: SocketAddr,
+        observations: Vec<NatProbeObservation>,
+        filtering_observations: Vec<NatFilteringObservation>,
+        assessed_at: DateTime<Utc>,
+    ) -> Self {
         let mapping_behavior = classify_nat_mapping(local_addr, &observations);
+        let filtering_behavior = classify_nat_filtering(&filtering_observations);
         let observed_endpoint = stable_observed_endpoint(&observations);
-        let strategy = nat_traversal_strategy(mapping_behavior);
-        let confidence = nat_classification_confidence(mapping_behavior, observations.len());
+        let strategy = nat_traversal_strategy(mapping_behavior, filtering_behavior);
+        let confidence = nat_classification_confidence(
+            mapping_behavior,
+            observations.len(),
+            filtering_behavior,
+            filtering_observations.len(),
+        );
 
         Self {
             local_addr,
             mapping_behavior,
+            filtering_behavior,
             observed_endpoint,
             observations,
+            filtering_observations,
             strategy,
             confidence,
             assessed_at,
@@ -293,22 +339,62 @@ fn same_stun_address_different_port_changes_mapping(observations: &[NatProbeObse
     })
 }
 
-fn nat_traversal_strategy(mapping_behavior: NatMappingBehavior) -> NatTraversalStrategy {
-    match mapping_behavior {
-        NatMappingBehavior::NoNat => NatTraversalStrategy::DirectCandidate,
-        NatMappingBehavior::EndpointIndependent | NatMappingBehavior::AddressDependent => {
-            NatTraversalStrategy::CoordinatedHolePunch
-        }
-        NatMappingBehavior::AddressAndPortDependent => NatTraversalStrategy::RelayPreferred,
-        NatMappingBehavior::Unknown => NatTraversalStrategy::InsufficientData,
+fn classify_nat_filtering(observations: &[NatFilteringObservation]) -> NatFilteringBehavior {
+    if observations.is_empty() {
+        return NatFilteringBehavior::Unknown;
+    }
+    if filtering_probe_received(observations, NatFilteringProbeKind::ChangeAddressAndPort) {
+        return NatFilteringBehavior::EndpointIndependent;
+    }
+    if filtering_probe_received(observations, NatFilteringProbeKind::ChangePort) {
+        return NatFilteringBehavior::AddressDependent;
+    }
+    if filtering_probe_received(observations, NatFilteringProbeKind::SameAddress) {
+        return NatFilteringBehavior::AddressAndPortDependent;
+    }
+    NatFilteringBehavior::Unknown
+}
+
+fn filtering_probe_received(
+    observations: &[NatFilteringObservation],
+    probe: NatFilteringProbeKind,
+) -> bool {
+    observations
+        .iter()
+        .any(|observation| observation.probe == probe && observation.response_origin.is_some())
+}
+
+fn nat_traversal_strategy(
+    mapping_behavior: NatMappingBehavior,
+    filtering_behavior: NatFilteringBehavior,
+) -> NatTraversalStrategy {
+    if mapping_behavior == NatMappingBehavior::NoNat {
+        return NatTraversalStrategy::DirectCandidate;
+    }
+    if matches!(
+        mapping_behavior,
+        NatMappingBehavior::AddressAndPortDependent | NatMappingBehavior::Unknown
+    ) {
+        return match mapping_behavior {
+            NatMappingBehavior::Unknown => NatTraversalStrategy::InsufficientData,
+            _ => NatTraversalStrategy::RelayPreferred,
+        };
+    }
+    match filtering_behavior {
+        NatFilteringBehavior::AddressAndPortDependent => NatTraversalStrategy::RelayPreferred,
+        NatFilteringBehavior::EndpointIndependent
+        | NatFilteringBehavior::AddressDependent
+        | NatFilteringBehavior::Unknown => NatTraversalStrategy::CoordinatedHolePunch,
     }
 }
 
 fn nat_classification_confidence(
     mapping_behavior: NatMappingBehavior,
     observation_count: usize,
+    filtering_behavior: NatFilteringBehavior,
+    filtering_observation_count: usize,
 ) -> f32 {
-    match mapping_behavior {
+    let mapping_confidence = match mapping_behavior {
         NatMappingBehavior::Unknown if observation_count == 0 => 0.0,
         NatMappingBehavior::Unknown => 0.25,
         NatMappingBehavior::NoNat => 1.0,
@@ -317,6 +403,24 @@ fn nat_classification_confidence(
         NatMappingBehavior::AddressAndPortDependent => {
             (0.65 + observation_count as f32 * 0.1).min(0.95)
         }
+    };
+    let filtering_confidence = match filtering_behavior {
+        NatFilteringBehavior::Unknown if filtering_observation_count == 0 => mapping_confidence,
+        NatFilteringBehavior::Unknown => 0.25,
+        NatFilteringBehavior::EndpointIndependent => {
+            (0.6 + filtering_observation_count as f32 * 0.1).min(0.95)
+        }
+        NatFilteringBehavior::AddressDependent => {
+            (0.55 + filtering_observation_count as f32 * 0.1).min(0.9)
+        }
+        NatFilteringBehavior::AddressAndPortDependent => {
+            (0.65 + filtering_observation_count as f32 * 0.1).min(0.95)
+        }
+    };
+    if filtering_observation_count == 0 {
+        mapping_confidence
+    } else {
+        ((mapping_confidence + filtering_confidence) / 2.0).min(0.98)
     }
 }
 
@@ -994,6 +1098,10 @@ mod tests {
             NatMappingBehavior::EndpointIndependent
         );
         assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::Unknown
+        );
+        assert_eq!(
             classification.strategy,
             NatTraversalStrategy::CoordinatedHolePunch
         );
@@ -1030,6 +1138,10 @@ mod tests {
             NatMappingBehavior::AddressAndPortDependent
         );
         assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::Unknown
+        );
+        assert_eq!(
             classification.strategy,
             NatTraversalStrategy::RelayPreferred
         );
@@ -1053,9 +1165,140 @@ mod tests {
 
         assert_eq!(classification.mapping_behavior, NatMappingBehavior::NoNat);
         assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::Unknown
+        );
+        assert_eq!(
             classification.strategy,
             NatTraversalStrategy::DirectCandidate
         );
         assert_eq!(classification.confidence, 1.0);
+    }
+
+    #[test]
+    fn nat_classification_detects_filtering_behavior_from_change_request_probes() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 0, 0, 10], 50_000));
+        let stun_server = std::net::SocketAddr::from(([198, 51, 100, 1], 3478));
+        let other_address = std::net::SocketAddr::from(([198, 51, 100, 2], 3479));
+        let classification = NatClassification::from_observations_with_filtering(
+            local_addr,
+            vec![
+                NatProbeObservation {
+                    local_addr,
+                    stun_server,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: other_address,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+            ],
+            vec![
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::SameAddress,
+                    response_origin: Some(stun_server),
+                    other_address: Some(other_address),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::ChangeAddressAndPort,
+                    response_origin: None,
+                    other_address: Some(other_address),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::ChangePort,
+                    response_origin: Some(other_address),
+                    other_address: Some(other_address),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.mapping_behavior,
+            NatMappingBehavior::EndpointIndependent
+        );
+        assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::AddressDependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::CoordinatedHolePunch
+        );
+        assert_eq!(classification.filtering_observations.len(), 3);
+        assert!(classification.confidence > 0.5);
+    }
+
+    #[test]
+    fn address_and_port_dependent_filtering_prefers_relay() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 0, 0, 10], 50_000));
+        let stun_server = std::net::SocketAddr::from(([198, 51, 100, 1], 3478));
+        let classification = NatClassification::from_observations_with_filtering(
+            local_addr,
+            vec![
+                NatProbeObservation {
+                    local_addr,
+                    stun_server,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: std::net::SocketAddr::from(([198, 51, 100, 2], 3478)),
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+            ],
+            vec![
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::SameAddress,
+                    response_origin: Some(stun_server),
+                    other_address: Some(std::net::SocketAddr::from(([198, 51, 100, 2], 3479))),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::ChangeAddressAndPort,
+                    response_origin: None,
+                    other_address: Some(std::net::SocketAddr::from(([198, 51, 100, 2], 3479))),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server,
+                    probe: NatFilteringProbeKind::ChangePort,
+                    response_origin: None,
+                    other_address: Some(std::net::SocketAddr::from(([198, 51, 100, 2], 3479))),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::AddressAndPortDependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::RelayPreferred
+        );
     }
 }

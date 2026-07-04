@@ -16,7 +16,7 @@ This file tracks the gap between the requested final system and the current repo
 - Control-plane HTTP crate with typed health, join, peer-map, and JSON/Prometheus metrics routes backed by the join service.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
-- RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, multi-server NAT mapping classification, and `iparsd stun` daemon support for public endpoint detection.
+- RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, RFC 5780 `CHANGE-REQUEST`/`RESPONSE-ORIGIN`/`OTHER-ADDRESS` support, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon support for public endpoint detection.
 - Relay admission/status HTTP API, Prometheus relay metrics, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint; `token revoke` posts typed token revocation requests to the control plane.
 - Persistent agent node state, STUN candidate collection, NAT classification status, agent status/STUN/NAT HTTP routes, and `iparsd agent`.
@@ -50,7 +50,7 @@ This file tracks the gap between the requested final system and the current repo
 - Runtime backend hardening beyond current Linux command and dry-run selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
-- NAT filtering classification, extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS, and topology validation.
+- NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - OpenTelemetry exporters plus deeper relay dataplane metrics coverage.
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.

@@ -1,9 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_types::{
-    CandidateSource, EndpointCandidate, EndpointCandidateKind, NatProbeObservation, NodeId,
+    CandidateSource, EndpointCandidate, EndpointCandidateKind, NatFilteringObservation,
+    NatFilteringProbeKind, NatProbeObservation, NodeId,
 };
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
@@ -12,9 +14,15 @@ use tokio::sync::watch;
 
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
+const CHANGE_REQUEST: u16 = 0x0003;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const RESPONSE_ORIGIN: u16 = 0x802b;
+const OTHER_ADDRESS: u16 = 0x802c;
 const STUN_HEADER_LEN: usize = 20;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
+const CHANGE_REQUEST_CHANGE_IP: u32 = 0x04;
+const CHANGE_REQUEST_CHANGE_PORT: u32 = 0x02;
+const FILTERING_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub enum StunError {
@@ -59,6 +67,66 @@ impl UdpStunProbe {
         }
         Ok(observations)
     }
+
+    pub async fn observe_filtering(
+        &self,
+        local_bind: SocketAddr,
+        stun_server: SocketAddr,
+    ) -> Result<Vec<NatFilteringObservation>, StunError> {
+        let socket = UdpSocket::bind(local_bind).await?;
+        let baseline = match tokio::time::timeout(
+            FILTERING_PROBE_TIMEOUT,
+            observe_binding_details_with_socket(
+                &socket,
+                stun_server,
+                BindingRequestOptions::same_address(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let Some(other_address) = baseline.other_address else {
+            return Ok(Vec::new());
+        };
+        let local_addr = socket.local_addr()?;
+        let mut observations = vec![NatFilteringObservation {
+            local_addr,
+            stun_server,
+            probe: NatFilteringProbeKind::SameAddress,
+            response_origin: baseline.response_origin.or(Some(stun_server)),
+            other_address: Some(other_address),
+            observed_at: Utc::now(),
+        }];
+
+        let change_address_and_port = observe_filtering_probe_with_socket(
+            &socket,
+            stun_server,
+            NatFilteringProbeKind::ChangeAddressAndPort,
+            BindingRequestOptions::change_address_and_port(),
+            Some(other_address),
+        )
+        .await?;
+        let received_changed_address = change_address_and_port.response_origin.is_some();
+        observations.push(change_address_and_port);
+
+        if !received_changed_address {
+            observations.push(
+                observe_filtering_probe_with_socket(
+                    &socket,
+                    stun_server,
+                    NatFilteringProbeKind::ChangePort,
+                    BindingRequestOptions::change_port(),
+                    Some(other_address),
+                )
+                .await?,
+            );
+        }
+
+        Ok(observations)
+    }
 }
 
 #[async_trait]
@@ -94,8 +162,13 @@ impl BindingStunServer {
     pub async fn serve_once(&self) -> Result<(), StunError> {
         let mut buffer = [0_u8; 1500];
         let (len, peer) = self.socket.recv_from(&mut buffer).await?;
-        let transaction_id = decode_binding_request(&buffer[..len])?;
-        let response = encode_binding_success_response(transaction_id, peer)?;
+        let request = decode_binding_request(&buffer[..len])?;
+        let response = encode_binding_success_response_with_attrs(
+            request.transaction_id,
+            peer,
+            Some(self.socket.local_addr()?),
+            None,
+        )?;
         self.socket.send_to(&response, peer).await?;
         Ok(())
     }
@@ -111,8 +184,13 @@ impl BindingStunServer {
                 }
                 packet = self.socket.recv_from(&mut buffer) => {
                     let (len, peer) = packet?;
-                    if let Ok(transaction_id) = decode_binding_request(&buffer[..len]) {
-                        let response = encode_binding_success_response(transaction_id, peer)?;
+                    if let Ok(request) = decode_binding_request(&buffer[..len]) {
+                        let response = encode_binding_success_response_with_attrs(
+                            request.transaction_id,
+                            peer,
+                            Some(self.socket.local_addr()?),
+                            None,
+                        )?;
                         self.socket.send_to(&response, peer).await?;
                     }
                 }
@@ -121,23 +199,193 @@ impl BindingStunServer {
     }
 }
 
+pub struct Rfc5780StunServer {
+    primary: UdpSocket,
+    alternate: UdpSocket,
+}
+
+impl Rfc5780StunServer {
+    pub async fn bind(
+        primary_addr: SocketAddr,
+        alternate_addr: SocketAddr,
+    ) -> Result<Self, StunError> {
+        Ok(Self {
+            primary: UdpSocket::bind(primary_addr).await?,
+            alternate: UdpSocket::bind(alternate_addr).await?,
+        })
+    }
+
+    pub fn primary_addr(&self) -> Result<SocketAddr, StunError> {
+        Ok(self.primary.local_addr()?)
+    }
+
+    pub fn alternate_addr(&self) -> Result<SocketAddr, StunError> {
+        Ok(self.alternate.local_addr()?)
+    }
+
+    pub async fn serve_once(&self) -> Result<(), StunError> {
+        let mut primary_buffer = [0_u8; 1500];
+        let mut alternate_buffer = [0_u8; 1500];
+        tokio::select! {
+            packet = self.primary.recv_from(&mut primary_buffer) => {
+                let (len, peer) = packet?;
+                self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer).await
+            }
+            packet = self.alternate.recv_from(&mut alternate_buffer) => {
+                let (len, peer) = packet?;
+                self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer).await
+            }
+        }
+    }
+
+    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+        let mut primary_buffer = [0_u8; 1500];
+        let mut alternate_buffer = [0_u8; 1500];
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                packet = self.primary.recv_from(&mut primary_buffer) => {
+                    let (len, peer) = packet?;
+                    self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer).await?;
+                }
+                packet = self.alternate.recv_from(&mut alternate_buffer) => {
+                    let (len, peer) = packet?;
+                    self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer).await?;
+                }
+            }
+        }
+    }
+
+    async fn respond_to_request(
+        &self,
+        received_on: &UdpSocket,
+        other_socket: &UdpSocket,
+        request_bytes: &[u8],
+        peer: SocketAddr,
+    ) -> Result<(), StunError> {
+        let request = match decode_binding_request(request_bytes) {
+            Ok(request) => request,
+            Err(_) => return Ok(()),
+        };
+        let response_socket = if request.options.change_ip || request.options.change_port {
+            other_socket
+        } else {
+            received_on
+        };
+        let response_origin = response_socket.local_addr()?;
+        let other_address = other_socket.local_addr()?;
+        let response = encode_binding_success_response_with_attrs(
+            request.transaction_id,
+            peer,
+            Some(response_origin),
+            Some(other_address),
+        )?;
+        response_socket.send_to(&response, peer).await?;
+        Ok(())
+    }
+}
+
 type TransactionId = [u8; 12];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BindingRequestOptions {
+    change_ip: bool,
+    change_port: bool,
+}
+
+impl BindingRequestOptions {
+    fn same_address() -> Self {
+        Self::default()
+    }
+
+    fn change_port() -> Self {
+        Self {
+            change_ip: false,
+            change_port: true,
+        }
+    }
+
+    fn change_address_and_port() -> Self {
+        Self {
+            change_ip: true,
+            change_port: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BindingRequest {
+    transaction_id: TransactionId,
+    options: BindingRequestOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BindingResponse {
+    mapped_addr: SocketAddr,
+    response_origin: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
+}
 
 async fn observe_binding_with_socket(
     socket: &UdpSocket,
     stun_server: SocketAddr,
 ) -> Result<NatProbeObservation, StunError> {
-    let transaction_id = new_transaction_id();
-    let request = encode_binding_request(transaction_id);
-    socket.send_to(&request, stun_server).await?;
-    let mut buffer = [0_u8; 1500];
-    let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
-    let reflexive_addr = decode_binding_success_response(&buffer[..len], transaction_id)?;
+    let response =
+        observe_binding_details_with_socket(socket, stun_server, BindingRequestOptions::default())
+            .await?;
     Ok(NatProbeObservation {
         local_addr: socket.local_addr()?,
         stun_server,
-        reflexive_addr,
+        reflexive_addr: response.mapped_addr,
         observed_at: Utc::now(),
+    })
+}
+
+async fn observe_binding_details_with_socket(
+    socket: &UdpSocket,
+    stun_server: SocketAddr,
+    options: BindingRequestOptions,
+) -> Result<BindingResponse, StunError> {
+    let transaction_id = new_transaction_id();
+    let request = encode_binding_request(transaction_id, options)?;
+    socket.send_to(&request, stun_server).await?;
+    let mut buffer = [0_u8; 1500];
+    let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
+    decode_binding_success_response_details(&buffer[..len], transaction_id)
+}
+
+async fn observe_filtering_probe_with_socket(
+    socket: &UdpSocket,
+    stun_server: SocketAddr,
+    probe: NatFilteringProbeKind,
+    options: BindingRequestOptions,
+    other_address: Option<SocketAddr>,
+) -> Result<NatFilteringObservation, StunError> {
+    let observed_at = Utc::now();
+    let response = match tokio::time::timeout(
+        FILTERING_PROBE_TIMEOUT,
+        observe_binding_details_with_socket(socket, stun_server, options),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Some(response),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => None,
+    };
+
+    Ok(NatFilteringObservation {
+        local_addr: socket.local_addr()?,
+        stun_server,
+        probe,
+        response_origin: response.and_then(|response| response.response_origin),
+        other_address: response
+            .and_then(|response| response.other_address)
+            .or(other_address),
+        observed_at,
     })
 }
 
@@ -162,28 +410,70 @@ fn new_transaction_id() -> TransactionId {
     transaction_id
 }
 
-fn encode_binding_request(transaction_id: TransactionId) -> Vec<u8> {
-    let mut message = Vec::with_capacity(STUN_HEADER_LEN);
-    write_header(&mut message, BINDING_REQUEST, 0, transaction_id);
-    message
+fn encode_binding_request(
+    transaction_id: TransactionId,
+    options: BindingRequestOptions,
+) -> Result<Vec<u8>, StunError> {
+    let mut attributes = Vec::new();
+    if options.change_ip || options.change_port {
+        write_change_request(&mut attributes, options)?;
+    }
+    let mut message = Vec::with_capacity(STUN_HEADER_LEN + attributes.len());
+    write_header(
+        &mut message,
+        BINDING_REQUEST,
+        attributes.len() as u16,
+        transaction_id,
+    );
+    message.extend_from_slice(&attributes);
+    Ok(message)
 }
 
-fn decode_binding_request(message: &[u8]) -> Result<TransactionId, StunError> {
-    let (message_type, _message_len, transaction_id) = read_header(message)?;
+fn decode_binding_request(message: &[u8]) -> Result<BindingRequest, StunError> {
+    let (message_type, message_len, transaction_id) = read_header(message)?;
     if message_type != BINDING_REQUEST {
         return Err(StunError::InvalidResponse(format!(
             "expected binding request, got message type 0x{message_type:04x}"
         )));
     }
-    Ok(transaction_id)
+    let mut options = BindingRequestOptions::default();
+    let attributes_end = STUN_HEADER_LEN + message_len as usize;
+    let mut cursor = STUN_HEADER_LEN;
+    while cursor + 4 <= attributes_end {
+        let attr_type = u16::from_be_bytes([message[cursor], message[cursor + 1]]);
+        let attr_len = u16::from_be_bytes([message[cursor + 2], message[cursor + 3]]) as usize;
+        let value_start = cursor + 4;
+        let value_end = value_start + attr_len;
+        if value_end > attributes_end {
+            return Err(StunError::InvalidResponse(
+                "attribute length exceeds message length".to_string(),
+            ));
+        }
+        if attr_type == CHANGE_REQUEST {
+            options = decode_change_request(&message[value_start..value_end])?;
+        }
+        cursor = value_end + padding_len(attr_len);
+    }
+    Ok(BindingRequest {
+        transaction_id,
+        options,
+    })
 }
 
-fn encode_binding_success_response(
+fn encode_binding_success_response_with_attrs(
     transaction_id: TransactionId,
     mapped_addr: SocketAddr,
+    response_origin: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
 ) -> Result<Vec<u8>, StunError> {
     let mut attributes = Vec::new();
     write_xor_mapped_address(&mut attributes, transaction_id, mapped_addr)?;
+    if let Some(response_origin) = response_origin {
+        write_address_attribute(&mut attributes, RESPONSE_ORIGIN, response_origin)?;
+    }
+    if let Some(other_address) = other_address {
+        write_address_attribute(&mut attributes, OTHER_ADDRESS, other_address)?;
+    }
     let mut message = Vec::with_capacity(STUN_HEADER_LEN + attributes.len());
     write_header(
         &mut message,
@@ -195,10 +485,10 @@ fn encode_binding_success_response(
     Ok(message)
 }
 
-fn decode_binding_success_response(
+fn decode_binding_success_response_details(
     message: &[u8],
     expected_transaction_id: TransactionId,
-) -> Result<SocketAddr, StunError> {
+) -> Result<BindingResponse, StunError> {
     let (message_type, message_len, transaction_id) = read_header(message)?;
     if message_type != BINDING_SUCCESS_RESPONSE {
         return Err(StunError::InvalidResponse(format!(
@@ -213,6 +503,9 @@ fn decode_binding_success_response(
 
     let attributes_end = STUN_HEADER_LEN + message_len as usize;
     let mut cursor = STUN_HEADER_LEN;
+    let mut mapped_addr = None;
+    let mut response_origin = None;
+    let mut other_address = None;
     while cursor + 4 <= attributes_end {
         let attr_type = u16::from_be_bytes([message[cursor], message[cursor + 1]]);
         let attr_len = u16::from_be_bytes([message[cursor + 2], message[cursor + 3]]) as usize;
@@ -224,14 +517,26 @@ fn decode_binding_success_response(
             ));
         }
         if attr_type == XOR_MAPPED_ADDRESS {
-            return decode_xor_mapped_address(&message[value_start..value_end], transaction_id);
+            mapped_addr = Some(decode_xor_mapped_address(
+                &message[value_start..value_end],
+                transaction_id,
+            )?);
+        } else if attr_type == RESPONSE_ORIGIN {
+            response_origin = Some(decode_address_attribute(&message[value_start..value_end])?);
+        } else if attr_type == OTHER_ADDRESS {
+            other_address = Some(decode_address_attribute(&message[value_start..value_end])?);
         }
         cursor = value_end + padding_len(attr_len);
     }
 
-    Err(StunError::InvalidResponse(
-        "XOR-MAPPED-ADDRESS attribute missing".to_string(),
-    ))
+    let mapped_addr = mapped_addr.ok_or_else(|| {
+        StunError::InvalidResponse("XOR-MAPPED-ADDRESS attribute missing".to_string())
+    })?;
+    Ok(BindingResponse {
+        mapped_addr,
+        response_origin,
+        other_address,
+    })
 }
 
 fn write_header(
@@ -308,6 +613,88 @@ fn write_xor_mapped_address(
     }
 
     write_attribute(attributes, XOR_MAPPED_ADDRESS, &value)
+}
+
+fn write_change_request(
+    attributes: &mut Vec<u8>,
+    options: BindingRequestOptions,
+) -> Result<(), StunError> {
+    let mut flags = 0_u32;
+    if options.change_ip {
+        flags |= CHANGE_REQUEST_CHANGE_IP;
+    }
+    if options.change_port {
+        flags |= CHANGE_REQUEST_CHANGE_PORT;
+    }
+    write_attribute(attributes, CHANGE_REQUEST, &flags.to_be_bytes())
+}
+
+fn decode_change_request(value: &[u8]) -> Result<BindingRequestOptions, StunError> {
+    if value.len() != 4 {
+        return Err(StunError::InvalidResponse(
+            "malformed CHANGE-REQUEST attribute".to_string(),
+        ));
+    }
+    let flags = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+    Ok(BindingRequestOptions {
+        change_ip: flags & CHANGE_REQUEST_CHANGE_IP != 0,
+        change_port: flags & CHANGE_REQUEST_CHANGE_PORT != 0,
+    })
+}
+
+fn write_address_attribute(
+    attributes: &mut Vec<u8>,
+    attr_type: u16,
+    addr: SocketAddr,
+) -> Result<(), StunError> {
+    let mut value = Vec::new();
+    value.push(0);
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            value.push(0x01);
+            value.extend_from_slice(&addr.port().to_be_bytes());
+            value.extend_from_slice(&u32::from(ip).to_be_bytes());
+        }
+        IpAddr::V6(ip) => {
+            value.push(0x02);
+            value.extend_from_slice(&addr.port().to_be_bytes());
+            value.extend_from_slice(&ip.octets());
+        }
+    }
+    write_attribute(attributes, attr_type, &value)
+}
+
+fn decode_address_attribute(value: &[u8]) -> Result<SocketAddr, StunError> {
+    if value.len() < 4 || value[0] != 0 {
+        return Err(StunError::InvalidResponse(
+            "malformed address attribute".to_string(),
+        ));
+    }
+    let port = u16::from_be_bytes([value[2], value[3]]);
+    match value[1] {
+        0x01 => {
+            if value.len() != 8 {
+                return Err(StunError::InvalidResponse(
+                    "malformed IPv4 address attribute".to_string(),
+                ));
+            }
+            let ip = Ipv4Addr::from(u32::from_be_bytes([value[4], value[5], value[6], value[7]]));
+            Ok(SocketAddr::new(IpAddr::V4(ip), port))
+        }
+        0x02 => {
+            if value.len() != 20 {
+                return Err(StunError::InvalidResponse(
+                    "malformed IPv6 address attribute".to_string(),
+                ));
+            }
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(&value[4..20]);
+            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
+        }
+        family => Err(StunError::InvalidResponse(format!(
+            "unsupported address attribute family {family}"
+        ))),
+    }
 }
 
 fn decode_xor_mapped_address(
@@ -390,10 +777,11 @@ mod tests {
     fn binding_success_round_trips_xor_mapped_ipv4() -> Result<(), StunError> {
         let transaction_id = [7_u8; 12];
         let mapped_addr = SocketAddr::from(([198, 51, 100, 10], 54_321));
-        let response = encode_binding_success_response(transaction_id, mapped_addr)?;
+        let response =
+            encode_binding_success_response_with_attrs(transaction_id, mapped_addr, None, None)?;
 
         assert_eq!(
-            decode_binding_success_response(&response, transaction_id)?,
+            decode_binding_success_response_details(&response, transaction_id)?.mapped_addr,
             mapped_addr
         );
         Ok(())
@@ -408,22 +796,72 @@ mod tests {
             )),
             54_322,
         );
-        let response = encode_binding_success_response(transaction_id, mapped_addr)?;
+        let response =
+            encode_binding_success_response_with_attrs(transaction_id, mapped_addr, None, None)?;
 
         assert_eq!(
-            decode_binding_success_response(&response, transaction_id)?,
+            decode_binding_success_response_details(&response, transaction_id)?.mapped_addr,
             mapped_addr
         );
         Ok(())
     }
 
     #[test]
+    fn binding_request_round_trips_change_request_options() -> Result<(), StunError> {
+        let transaction_id = [3_u8; 12];
+        let request = encode_binding_request(
+            transaction_id,
+            BindingRequestOptions::change_address_and_port(),
+        )?;
+
+        assert_eq!(
+            decode_binding_request(&request)?,
+            BindingRequest {
+                transaction_id,
+                options: BindingRequestOptions {
+                    change_ip: true,
+                    change_port: true,
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binding_success_round_trips_rfc5780_addresses() -> Result<(), StunError> {
+        let transaction_id = [5_u8; 12];
+        let mapped_addr = SocketAddr::from(([198, 51, 100, 10], 54_321));
+        let response_origin = SocketAddr::from(([203, 0, 113, 10], 3478));
+        let other_address = SocketAddr::from(([203, 0, 113, 11], 3479));
+        let response = encode_binding_success_response_with_attrs(
+            transaction_id,
+            mapped_addr,
+            Some(response_origin),
+            Some(other_address),
+        )?;
+
+        assert_eq!(
+            decode_binding_success_response_details(&response, transaction_id)?,
+            BindingResponse {
+                mapped_addr,
+                response_origin: Some(response_origin),
+                other_address: Some(other_address),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn binding_success_rejects_transaction_mismatch() -> Result<(), StunError> {
-        let response =
-            encode_binding_success_response([1_u8; 12], SocketAddr::from(([127, 0, 0, 1], 3478)))?;
+        let response = encode_binding_success_response_with_attrs(
+            [1_u8; 12],
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            None,
+            None,
+        )?;
 
         assert!(matches!(
-            decode_binding_success_response(&response, [2_u8; 12]),
+            decode_binding_success_response_details(&response, [2_u8; 12]),
             Err(StunError::InvalidResponse(message)) if message == "transaction id mismatch"
         ));
         Ok(())
@@ -499,6 +937,55 @@ mod tests {
             observations[0].reflexive_addr,
             observations[1].reflexive_addr
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_leaves_filtering_unknown_without_other_address(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move { server.serve_once().await });
+
+        let observations = UdpStunProbe
+            .observe_filtering(SocketAddr::from(([127, 0, 0, 1], 0)), server_addr)
+            .await?;
+        server_task.await??;
+
+        assert!(observations.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_observes_endpoint_independent_filtering_with_rfc5780_server(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = Rfc5780StunServer::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await?;
+        let primary_addr = server.primary_addr()?;
+        let alternate_addr = server.alternate_addr()?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+        let observations = UdpStunProbe
+            .observe_filtering(SocketAddr::from(([127, 0, 0, 1], 0)), primary_addr)
+            .await?;
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
+
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].probe, NatFilteringProbeKind::SameAddress);
+        assert_eq!(observations[0].response_origin, Some(primary_addr));
+        assert_eq!(observations[0].other_address, Some(alternate_addr));
+        assert_eq!(
+            observations[1].probe,
+            NatFilteringProbeKind::ChangeAddressAndPort
+        );
+        assert_eq!(observations[1].response_origin, Some(alternate_addr));
+        assert_eq!(observations[1].other_address, Some(alternate_addr));
         Ok(())
     }
 }

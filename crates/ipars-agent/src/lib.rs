@@ -397,12 +397,23 @@ impl AgentRuntime {
         let observations = UdpStunProbe
             .observe_binding_many(local_bind, &stun_servers)
             .await?;
+        let filtering_observations = match stun_servers.first().copied() {
+            Some(stun_server) => UdpStunProbe
+                .observe_filtering(local_bind, stun_server)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         let local_addr = observations
             .first()
             .map(|observation| observation.local_addr)
             .unwrap_or(local_bind);
-        let classification =
-            NatClassification::from_observations(local_addr, observations.clone(), Utc::now());
+        let classification = NatClassification::from_observations_with_filtering(
+            local_addr,
+            observations.clone(),
+            filtering_observations,
+            Utc::now(),
+        );
 
         let mut candidates = self.candidates.write().await;
         candidates.extend(
@@ -1256,11 +1267,11 @@ mod tests {
     use ipars_route_manager::{
         DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
     };
-    use ipars_stun::BindingStunServer;
+    use ipars_stun::{BindingStunServer, Rfc5780StunServer};
     use ipars_types::api::RelayAdmissionRequest;
     use ipars_types::{
-        CandidateSource, ClusterId, NatMappingBehavior, NatTraversalStrategy, PathMetrics,
-        PeerPathKey, RelayCapability, TokenPolicy,
+        CandidateSource, ClusterId, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy,
+        PathMetrics, PeerPathKey, RelayCapability, TokenPolicy,
     };
 
     use super::*;
@@ -2187,9 +2198,14 @@ mod tests {
     #[tokio::test]
     async fn runtime_classifies_nat_from_multiple_stun_observations(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let first_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let first_server_addr = first_server.local_addr()?;
-        let first_task = tokio::spawn(async move { first_server.serve_once().await });
+        let first_server = Rfc5780StunServer::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await?;
+        let first_server_addr = first_server.primary_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let first_task = tokio::spawn(async move { first_server.serve(shutdown_rx).await });
         let second_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let second_server_addr = second_server.local_addr()?;
         let second_task = tokio::spawn(async move { second_server.serve_once().await });
@@ -2204,11 +2220,17 @@ mod tests {
                 vec![first_server_addr, second_server_addr],
             )
             .await?;
-        first_task.await??;
         second_task.await??;
+        shutdown_tx.send(true)?;
+        first_task.await??;
 
         assert_eq!(classification.observations.len(), 2);
+        assert!(!classification.filtering_observations.is_empty());
         assert_eq!(classification.mapping_behavior, NatMappingBehavior::NoNat);
+        assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::EndpointIndependent
+        );
         assert_eq!(
             classification.strategy,
             NatTraversalStrategy::DirectCandidate
