@@ -454,6 +454,35 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_packet_flow_filtered_total Packet-flow observations filtered before lazy-connect resolution."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_filtered_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_filtered_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_filtered_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before lazy-connect resolution, by reason."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_filtered_by_reason_total counter"
+    );
+    for reason_count in &metrics.packet_flow_filtered_reason_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{node_id}\",reason=\"{}\"}} {}",
+            reason_count.reason.as_str(),
+            reason_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_path_state_count Number of peer paths by selected state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_path_state_count gauge");
@@ -534,7 +563,9 @@ mod tests {
     use axum::http::{header, Request};
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
-    use ipars_types::api::{AgentPacketFlowMatchKind, AgentPacketFlowObservation};
+    use ipars_types::api::{
+        AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
+    };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
         PathState, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
@@ -637,6 +668,8 @@ mod tests {
                 false,
             )
             .await;
+        runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
+        runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -671,6 +704,11 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert!(metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .any(|entry| entry.reason == AgentPacketFlowDropReason::Multicast && entry.count == 1));
 
         let prometheus_response = app
             .clone()
@@ -706,6 +744,11 @@ mod tests {
         assert!(body.contains("ipars_agent_peer_activity_records_total"));
         assert!(body.contains("ipars_agent_packet_flow_observations_total"));
         assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
+        assert!(body.contains("ipars_agent_packet_flow_filtered_total"));
+        let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")
+        ));
 
         let paths_response = app
             .clone()

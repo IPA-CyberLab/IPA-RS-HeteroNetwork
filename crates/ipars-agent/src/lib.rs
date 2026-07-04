@@ -19,9 +19,10 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
-    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+    AgentMetricsResponse, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
+    AgentPacketFlowMatch, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
+    AgentPathProbeRequest, AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics,
+    PathStateCount, PeerMap, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -169,6 +170,12 @@ pub struct AgentRuntime {
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
     packet_flow_unmatched_count: AtomicU64,
+    packet_flow_filtered_count: AtomicU64,
+    packet_flow_filtered_unspecified_count: AtomicU64,
+    packet_flow_filtered_loopback_count: AtomicU64,
+    packet_flow_filtered_multicast_count: AtomicU64,
+    packet_flow_filtered_broadcast_count: AtomicU64,
+    packet_flow_filtered_link_local_count: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +392,12 @@ impl AgentRuntime {
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
             packet_flow_unmatched_count: AtomicU64::new(0),
+            packet_flow_filtered_count: AtomicU64::new(0),
+            packet_flow_filtered_unspecified_count: AtomicU64::new(0),
+            packet_flow_filtered_loopback_count: AtomicU64::new(0),
+            packet_flow_filtered_multicast_count: AtomicU64::new(0),
+            packet_flow_filtered_broadcast_count: AtomicU64::new(0),
+            packet_flow_filtered_link_local_count: AtomicU64::new(0),
         }
     }
 
@@ -534,6 +547,8 @@ impl AgentRuntime {
                 .load(Ordering::Relaxed),
             packet_flow_match_count: self.packet_flow_match_count.load(Ordering::Relaxed),
             packet_flow_unmatched_count: self.packet_flow_unmatched_count.load(Ordering::Relaxed),
+            packet_flow_filtered_count: self.packet_flow_filtered_count.load(Ordering::Relaxed),
+            packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
             generated_at: Utc::now(),
         }
     }
@@ -750,6 +765,35 @@ impl AgentRuntime {
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
         self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
         Some(matched)
+    }
+
+    pub fn record_packet_flow_filtered(&self, reason: AgentPacketFlowDropReason) {
+        self.packet_flow_filtered_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.packet_flow_filtered_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn packet_flow_filtered_reason_counts(&self) -> Vec<AgentPacketFlowDropReasonCount> {
+        AgentPacketFlowDropReason::ALL
+            .into_iter()
+            .map(|reason| AgentPacketFlowDropReasonCount {
+                reason,
+                count: self
+                    .packet_flow_filtered_counter(reason)
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn packet_flow_filtered_counter(&self, reason: AgentPacketFlowDropReason) -> &AtomicU64 {
+        match reason {
+            AgentPacketFlowDropReason::Unspecified => &self.packet_flow_filtered_unspecified_count,
+            AgentPacketFlowDropReason::Loopback => &self.packet_flow_filtered_loopback_count,
+            AgentPacketFlowDropReason::Multicast => &self.packet_flow_filtered_multicast_count,
+            AgentPacketFlowDropReason::Broadcast => &self.packet_flow_filtered_broadcast_count,
+            AgentPacketFlowDropReason::LinkLocal => &self.packet_flow_filtered_link_local_count,
+        }
     }
 
     pub async fn observe_peer_map_for_lazy_connect(&self, peers: &[NodeRecord]) {
@@ -3080,6 +3124,9 @@ mod tests {
                 .await
                 .is_none()
         );
+        runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
+        runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
+        runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.lazy_connect.observed_peer_vpn_ip_count, 3);
         assert_eq!(metrics.lazy_connect.observed_route_peer_count, 2);
@@ -3089,6 +3136,23 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 3);
         assert_eq!(metrics.packet_flow_match_count, 2);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.packet_flow_filtered_count, 3);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Multicast)
+                .map(|entry| entry.count),
+            Some(2)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Broadcast)
+                .map(|entry| entry.count),
+            Some(1)
+        );
         assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);
         Ok(())

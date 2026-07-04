@@ -1146,6 +1146,36 @@ pub mod api {
         AdvertisedRoute,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowDropReason {
+        Unspecified,
+        Loopback,
+        Multicast,
+        Broadcast,
+        LinkLocal,
+    }
+
+    impl AgentPacketFlowDropReason {
+        pub const ALL: [Self; 5] = [
+            Self::Unspecified,
+            Self::Loopback,
+            Self::Multicast,
+            Self::Broadcast,
+            Self::LinkLocal,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Unspecified => "unspecified",
+                Self::Loopback => "loopback",
+                Self::Multicast => "multicast",
+                Self::Broadcast => "broadcast",
+                Self::LinkLocal => "link_local",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowRequest {
         pub destination: IpAddr,
@@ -1215,6 +1245,12 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowDropReasonCount {
+        pub reason: AgentPacketFlowDropReason,
+        pub count: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentMetricsResponse {
         pub node_id: NodeId,
         pub candidate_count: usize,
@@ -1233,6 +1269,8 @@ pub mod api {
         pub packet_flow_observation_count: u64,
         pub packet_flow_match_count: u64,
         pub packet_flow_unmatched_count: u64,
+        pub packet_flow_filtered_count: u64,
+        pub packet_flow_filtered_reason_counts: Vec<AgentPacketFlowDropReasonCount>,
         pub generated_at: DateTime<Utc>,
     }
 

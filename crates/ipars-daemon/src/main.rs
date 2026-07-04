@@ -37,11 +37,12 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowObservation, AgentRelayForwarderMetrics,
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentMetricsResponse, AgentPacketFlowDropReason, AgentPacketFlowObservation,
+    AgentRelayForwarderMetrics, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
@@ -1742,6 +1743,8 @@ struct AgentOtelSnapshot {
     packet_flow_observation_count: u64,
     packet_flow_match_count: u64,
     packet_flow_unmatched_count: u64,
+    packet_flow_filtered_count: u64,
+    packet_flow_filtered_reason_counts: BTreeMap<AgentPacketFlowDropReason, u64>,
 }
 
 impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
@@ -1766,6 +1769,12 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
             packet_flow_observation_count: metrics.packet_flow_observation_count,
             packet_flow_match_count: metrics.packet_flow_match_count,
             packet_flow_unmatched_count: metrics.packet_flow_unmatched_count,
+            packet_flow_filtered_count: metrics.packet_flow_filtered_count,
+            packet_flow_filtered_reason_counts: metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .map(|entry| (entry.reason, entry.count))
+                .collect(),
         }
     }
 }
@@ -1791,6 +1800,8 @@ struct AgentOtelMetrics {
     packet_flow_observations: Counter<u64>,
     packet_flow_matches: Counter<u64>,
     packet_flow_unmatched: Counter<u64>,
+    packet_flow_filtered: Counter<u64>,
+    packet_flow_filtered_by_reason: Counter<u64>,
     forwarder_outbound_packets: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
@@ -1879,6 +1890,18 @@ impl AgentOtelMetrics {
             packet_flow_unmatched: meter
                 .u64_counter("ipars.agent.packet_flow.unmatched")
                 .with_description("Packet-flow observations that did not resolve to a peer.")
+                .build(),
+            packet_flow_filtered: meter
+                .u64_counter("ipars.agent.packet_flow.filtered")
+                .with_description(
+                    "Packet-flow observations filtered before lazy-connect resolution.",
+                )
+                .build(),
+            packet_flow_filtered_by_reason: meter
+                .u64_counter("ipars.agent.packet_flow.filtered.by_reason")
+                .with_description(
+                    "Packet-flow observations filtered before lazy-connect resolution, by reason.",
+                )
                 .build(),
             forwarder_outbound_packets: meter
                 .u64_counter("ipars.agent.relay.forwarder.outbound.packets")
@@ -2002,6 +2025,30 @@ impl AgentOtelMetrics {
         if packet_flow_unmatched_delta > 0 {
             self.packet_flow_unmatched
                 .add(packet_flow_unmatched_delta, &node_attrs);
+        }
+        let packet_flow_filtered_delta = counter_delta(
+            metrics.packet_flow_filtered_count,
+            previous.map(|previous| previous.packet_flow_filtered_count),
+        );
+        if packet_flow_filtered_delta > 0 {
+            self.packet_flow_filtered
+                .add(packet_flow_filtered_delta, &node_attrs);
+        }
+        for reason_count in &metrics.packet_flow_filtered_reason_counts {
+            let previous_count = previous.and_then(|previous| {
+                previous
+                    .packet_flow_filtered_reason_counts
+                    .get(&reason_count.reason)
+                    .copied()
+            });
+            let delta = counter_delta(reason_count.count, previous_count);
+            if delta > 0 {
+                let attrs = [
+                    KeyValue::new("node_id", node_id.clone()),
+                    KeyValue::new("reason", reason_count.reason.as_str()),
+                ];
+                self.packet_flow_filtered_by_reason.add(delta, &attrs);
+            }
         }
 
         for state in [
@@ -4945,6 +4992,7 @@ async fn record_packet_flow_observations(
     let mut matched_count = 0_usize;
     for flow in flows {
         if let Some(reason) = packet_flow_destination_drop_reason(flow.destination) {
+            runtime.record_packet_flow_filtered(reason);
             tracing::debug!(
                 destination = %flow.destination,
                 reason = reason.as_str(),
@@ -4998,48 +5046,25 @@ struct PacketFlowRecord {
     observation: AgentPacketFlowObservation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PacketFlowDestinationDropReason {
-    Unspecified,
-    Loopback,
-    Multicast,
-    Broadcast,
-    LinkLocal,
-}
-
-impl PacketFlowDestinationDropReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unspecified => "unspecified",
-            Self::Loopback => "loopback",
-            Self::Multicast => "multicast",
-            Self::Broadcast => "broadcast",
-            Self::LinkLocal => "link-local",
-        }
-    }
-}
-
-fn packet_flow_destination_drop_reason(
-    destination: IpAddr,
-) -> Option<PacketFlowDestinationDropReason> {
+fn packet_flow_destination_drop_reason(destination: IpAddr) -> Option<AgentPacketFlowDropReason> {
     if destination.is_unspecified() {
-        return Some(PacketFlowDestinationDropReason::Unspecified);
+        return Some(AgentPacketFlowDropReason::Unspecified);
     }
     if destination.is_loopback() {
-        return Some(PacketFlowDestinationDropReason::Loopback);
+        return Some(AgentPacketFlowDropReason::Loopback);
     }
     if destination.is_multicast() {
-        return Some(PacketFlowDestinationDropReason::Multicast);
+        return Some(AgentPacketFlowDropReason::Multicast);
     }
     match destination {
         IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
-            Some(PacketFlowDestinationDropReason::Broadcast)
+            Some(AgentPacketFlowDropReason::Broadcast)
         }
         IpAddr::V4(address) if address.is_link_local() => {
-            Some(PacketFlowDestinationDropReason::LinkLocal)
+            Some(AgentPacketFlowDropReason::LinkLocal)
         }
         IpAddr::V6(address) if is_ipv6_unicast_link_local(address) => {
-            Some(PacketFlowDestinationDropReason::LinkLocal)
+            Some(AgentPacketFlowDropReason::LinkLocal)
         }
         _ => None,
     }
@@ -5815,8 +5840,9 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
-        AgentMetricsResponse, AgentRelayForwarderMetrics, LazyConnectMetrics, PathStateCount,
-        RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentMetricsResponse, AgentPacketFlowDropReasonCount, AgentRelayForwarderMetrics,
+        LazyConnectMetrics, PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason,
+        RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -6276,6 +6302,11 @@ mod tests {
             packet_flow_observation_count: 3,
             packet_flow_match_count: 2,
             packet_flow_unmatched_count: 1,
+            packet_flow_filtered_count: 3,
+            packet_flow_filtered_reason_counts: vec![AgentPacketFlowDropReasonCount {
+                reason: AgentPacketFlowDropReason::Multicast,
+                count: 3,
+            }],
             generated_at: Utc::now(),
         };
         let previous = AgentOtelSnapshot::from(&metrics);
@@ -6755,44 +6786,41 @@ invalid no-destination-here
 
         assert_eq!(
             packet_flow_destination_drop_reason("0.0.0.0".parse()?),
-            Some(PacketFlowDestinationDropReason::Unspecified)
+            Some(AgentPacketFlowDropReason::Unspecified)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("::".parse()?),
-            Some(PacketFlowDestinationDropReason::Unspecified)
+            Some(AgentPacketFlowDropReason::Unspecified)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("127.0.0.1".parse()?),
-            Some(PacketFlowDestinationDropReason::Loopback)
+            Some(AgentPacketFlowDropReason::Loopback)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("::1".parse()?),
-            Some(PacketFlowDestinationDropReason::Loopback)
+            Some(AgentPacketFlowDropReason::Loopback)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("224.0.0.1".parse()?),
-            Some(PacketFlowDestinationDropReason::Multicast)
+            Some(AgentPacketFlowDropReason::Multicast)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("ff02::1".parse()?),
-            Some(PacketFlowDestinationDropReason::Multicast)
+            Some(AgentPacketFlowDropReason::Multicast)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("255.255.255.255".parse()?),
-            Some(PacketFlowDestinationDropReason::Broadcast)
+            Some(AgentPacketFlowDropReason::Broadcast)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("169.254.10.20".parse()?),
-            Some(PacketFlowDestinationDropReason::LinkLocal)
+            Some(AgentPacketFlowDropReason::LinkLocal)
         );
         assert_eq!(
             packet_flow_destination_drop_reason("fe80::1".parse()?),
-            Some(PacketFlowDestinationDropReason::LinkLocal)
+            Some(AgentPacketFlowDropReason::LinkLocal)
         );
-        assert_eq!(
-            PacketFlowDestinationDropReason::LinkLocal.as_str(),
-            "link-local"
-        );
+        assert_eq!(AgentPacketFlowDropReason::LinkLocal.as_str(), "link_local");
         Ok(())
     }
 
@@ -6839,6 +6867,23 @@ invalid no-destination-here
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 1);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Multicast)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Broadcast)
+                .map(|entry| entry.count),
+            Some(1)
+        );
         assert!(runtime.should_connect_peer(&peer).await);
         Ok(())
     }
