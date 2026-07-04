@@ -55,6 +55,7 @@ Linux network namespace integration tests are gated because they create host net
 ```bash
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
 IPARS_RUN_WG_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_wireguard_backend
+IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_punch
 ```
 
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support.
