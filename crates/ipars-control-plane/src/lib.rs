@@ -11,8 +11,8 @@ use ipars_types::api::{
 };
 use ipars_types::{
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth,
-    NodeId, NodeRecord, PathRecord, PathState, Route, SignedJoinToken, TokenLedgerRecord,
-    TokenStatus, VpnIp,
+    NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken,
+    TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use ipnet::Ipv4Net;
 use thiserror::Error;
@@ -30,6 +30,8 @@ pub enum ControlPlaneError {
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
     RouteDenied(String),
+    #[error("relay capability is not permitted by token policy")]
+    RelayDenied,
     #[error("token {nonce} rejected with status {status}")]
     TokenRejected { nonce: String, status: TokenStatus },
     #[error("token not found: {0}")]
@@ -422,6 +424,7 @@ where
             }
         }
 
+        let relay_capability = relay_capability_allowed(request.relay_capability, &claims)?;
         let vpn_ip = self.allocator.write().await.allocate_next()?;
         let now = Utc::now();
         let node = NodeRecord {
@@ -433,7 +436,7 @@ where
             role: claims.role,
             tags: claims.tags,
             endpoint_candidates: request.candidates,
-            relay_capability: request.relay_capability,
+            relay_capability,
             token_policy: claims.policy,
             routes: request.requested_routes,
             registered_at: now,
@@ -564,6 +567,21 @@ fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
     claims.policy.allowed_routes.contains(&route.cidr)
 }
 
+fn relay_capability_allowed(
+    relay_capability: Option<RelayCapability>,
+    claims: &JoinTokenClaims,
+) -> Result<Option<RelayCapability>, ControlPlaneError> {
+    relay_capability
+        .map(|mut capability| {
+            if !claims.policy.allow_relay {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+            capability.enabled_by_policy = true;
+            Ok(capability)
+        })
+        .transpose()
+}
+
 fn token_key(cluster_id: &ClusterId, nonce: &str) -> String {
     format!("{cluster_id}:{nonce}")
 }
@@ -655,6 +673,18 @@ mod tests {
         }
     }
 
+    fn relay_capability() -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
     fn candidate(node_id: &str) -> EndpointCandidate {
         EndpointCandidate {
             node_id: NodeId::from_string(node_id),
@@ -718,27 +748,51 @@ mod tests {
             identity_public_key: "identity".to_string(),
             wireguard_public_key: "wg".to_string(),
             candidates: Vec::new(),
-            relay_capability: Some(RelayCapability {
-                enabled_by_policy: true,
-                public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
-                admission_url: Some("http://203.0.113.10:9580".to_string()),
-                max_sessions: 100,
-                active_sessions: 0,
-                max_mbps: 1000,
-                e2e_only: true,
-            }),
+            relay_capability: Some(relay_capability()),
             requested_routes: Vec::new(),
         };
+        let mut claims = claims(cluster_id);
+        claims.policy.allow_relay = true;
 
-        let response = plane
-            .register_with_claims(claims(cluster_id), request)
-            .await?;
+        let response = plane.register_with_claims(claims, request).await?;
 
         assert_eq!(
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         );
+        assert_eq!(
+            response
+                .node
+                .relay_capability
+                .as_ref()
+                .map(|capability| capability.enabled_by_policy),
+            Some(true)
+        );
         assert_eq!(response.relay_map.relays.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_relay_capability_when_token_policy_denies_relay(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.relay_capability = Some(relay_capability());
+
+        let error = match plane
+            .register_with_claims(claims(cluster_id), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ControlPlaneError::RelayDenied));
         Ok(())
     }
 

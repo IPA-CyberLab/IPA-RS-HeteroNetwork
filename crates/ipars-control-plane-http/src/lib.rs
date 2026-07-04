@@ -262,6 +262,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             ControlPlaneError::JoinDenied
+            | ControlPlaneError::RelayDenied
             | ControlPlaneError::RouteDenied(_)
             | ControlPlaneError::TokenRejected { .. } => StatusCode::FORBIDDEN,
             ControlPlaneError::TokenNotFound(_) | ControlPlaneError::IssuerKeyNotFound { .. } => {

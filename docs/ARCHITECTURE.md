@@ -221,6 +221,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 - WireGuard keys provide data-plane confidentiality.
 - Relays cannot decrypt payload.
 - Public nodes are not automatically relays; policy, health, and capacity are required.
+- Control-plane registration rejects relay capability advertisements unless the join token policy allows relay, and accepted capabilities are marked as enabled by policy by the control plane.
 - ACLs are evaluated by tag, role, route, protocol, and relay permission.
 - Key rotation supports identity and WireGuard key families separately.
 

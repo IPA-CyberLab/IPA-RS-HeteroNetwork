@@ -11,7 +11,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - initial control-plane registration/IP-allocation service with in-memory test backend
 - SQLite and PostgreSQL control-plane store implementations
 - token ledger primitives and control-plane revocation API for revocation and max-use enforcement
-- control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, and token-ledger admission before registration
+- control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, route policy, and relay-capability policy before registration
 - typed control-plane HTTP routes for health, join registration, peer-map retrieval, and JSON/Prometheus metrics
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
