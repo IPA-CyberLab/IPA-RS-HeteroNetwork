@@ -15,6 +15,8 @@ const NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces";
 const FIXED_PORT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_fixed_port_snat_network_namespaces";
+const MIXED_PORT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_traverses_mixed_port_snat_network_namespaces";
 const ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
 
@@ -163,7 +165,8 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
             right_bind_port: 40102,
             left_reflexive_port: 40101,
             right_reflexive_port: 40102,
-            fixed_snat_ports: false,
+            left_fixed_snat_port: false,
+            right_fixed_snat_port: false,
         },
     )
 }
@@ -200,7 +203,46 @@ async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
             right_bind_port: 40102,
             left_reflexive_port: 50101,
             right_reflexive_port: 50102,
-            fixed_snat_ports: true,
+            left_fixed_snat_port: true,
+            right_fixed_snat_port: true,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_traverses_mixed_port_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping mixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_two_sided_snat_hole_punch_topology(
+        MIXED_PORT_NAT_TEST_NAME,
+        "mixednat",
+        TwoSidedSnatTopology {
+            private_second_octet: 245,
+            public_third_octet: 3,
+            left_bind_port: 40101,
+            right_bind_port: 40102,
+            left_reflexive_port: 40101,
+            right_reflexive_port: 50102,
+            left_fixed_snat_port: false,
+            right_fixed_snat_port: true,
         },
     )
 }
@@ -238,7 +280,8 @@ struct TwoSidedSnatTopology {
     right_bind_port: u16,
     left_reflexive_port: u16,
     right_reflexive_port: u16,
-    fixed_snat_ports: bool,
+    left_fixed_snat_port: bool,
+    right_fixed_snat_port: bool,
 }
 
 fn run_two_sided_snat_hole_punch_topology(
@@ -328,10 +371,10 @@ fn run_two_sided_snat_hole_punch_topology(
     )?;
 
     let left_snat_port = topology
-        .fixed_snat_ports
+        .left_fixed_snat_port
         .then_some(topology.left_reflexive_port);
     let right_snat_port = topology
-        .fixed_snat_ports
+        .right_fixed_snat_port
         .then_some(topology.right_reflexive_port);
     enable_snat_namespace(
         &left_nat_namespace,
