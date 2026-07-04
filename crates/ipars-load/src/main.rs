@@ -1043,6 +1043,7 @@ impl DaemonProcessGroup {
             wait_for_http_ok(&client, format!("{agent_url}/healthz"), "agent").await?;
             agent_urls.push(agent_url);
         }
+        wait_for_daemon_agents_ready(&client, &control_plane_url, &signal_url, &agent_urls).await?;
 
         Ok(Self {
             control_plane_url,
@@ -1122,6 +1123,96 @@ async fn wait_for_http_ok(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{context} readiness timed out")))
+}
+
+async fn wait_for_daemon_agents_ready(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    signal_url: &str,
+    agent_urls: &[String],
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for _ in 0..150 {
+        match daemon_agent_statuses(client, agent_urls).await {
+            Ok(statuses) => match check_daemon_agent_control_and_signal_readiness(
+                client,
+                control_plane_url,
+                signal_url,
+                &statuses,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon agent readiness timed out")))
+}
+
+async fn daemon_agent_statuses(
+    client: &reqwest::Client,
+    agent_urls: &[String],
+) -> anyhow::Result<Vec<AgentStatusResponse>> {
+    let mut statuses = Vec::with_capacity(agent_urls.len());
+    for url in agent_urls {
+        statuses.push(
+            get_json(
+                client,
+                format!("{url}/v1/status"),
+                "daemon agent readiness status",
+            )
+            .await?,
+        );
+    }
+    Ok(statuses)
+}
+
+async fn check_daemon_agent_control_and_signal_readiness(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    signal_url: &str,
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<()> {
+    for status in statuses {
+        let peer_map: PeerMap = get_json(
+            client,
+            format!("{control_plane_url}/v1/peers/{}", status.node_id),
+            "daemon control-plane readiness peer map",
+        )
+        .await?;
+        let expected_peer_count = statuses.len().saturating_sub(1);
+        if peer_map.peers.len() < expected_peer_count {
+            bail!(
+                "daemon control-plane peer map for {} has {} peers; expected at least {}",
+                status.node_id,
+                peer_map.peers.len(),
+                expected_peer_count
+            );
+        }
+    }
+
+    if statuses.len() >= 2 {
+        let source = &statuses[0];
+        let target = &statuses[1];
+        let _: SignalPathResponse = post_json(
+            client,
+            format!("{signal_url}/v1/paths/negotiate"),
+            &SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.candidates.clone(),
+                source_nat_classification: source.nat_classification.clone(),
+                desired_routes: Vec::new(),
+            },
+            "daemon signal readiness negotiation",
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 async fn get_json<Response>(
@@ -1443,6 +1534,65 @@ mod tests {
         assert_eq!(report.relay_forwarded_bytes_reported, 768);
         assert_eq!(report.relay_http_requests, 8);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_readiness_checks_control_plane_and_signal_visibility() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("load-key");
+        let cluster_id = ClusterId::from_string("load-readiness");
+        let scenario = Scenario::from_name(ScenarioName::Three);
+        let services = NetworkedServices::start(cluster_id.clone(), &issuer, &key_id).await?;
+        let client = reqwest::Client::new();
+        let mut statuses = Vec::new();
+
+        for index in 0..2 {
+            let token = issuer.sign_join_token(join_claims(
+                &cluster_id,
+                &issuer.node_id(),
+                &key_id,
+                index,
+                scenario,
+            )?)?;
+            let response: RegisterNodeResponse = post_json(
+                &client,
+                format!("{}/v1/join", services.control_plane_url),
+                &JoinNodeRequest {
+                    token,
+                    registration: register_request(index, scenario)?,
+                },
+                "readiness control-plane join",
+            )
+            .await?;
+            let _: SignalNodeUpsertResponse = put_json(
+                &client,
+                format!("{}/v1/nodes/{}", services.signal_url, response.node.node_id),
+                &SignalNodeUpsertRequest {
+                    node: response.node.clone(),
+                    nat_classification: None,
+                    health: Some(healthy_node_health()),
+                },
+                "readiness signal node upsert",
+            )
+            .await?;
+            statuses.push(AgentStatusResponse {
+                node_id: response.node.node_id.clone(),
+                identity_public_key: response.node.identity_public_key,
+                wireguard_public_key: response.node.wireguard_public_key,
+                candidate_count: response.node.endpoint_candidates.len(),
+                candidates: response.node.endpoint_candidates,
+                nat_classification: None,
+                state_updated_at: Utc::now(),
+            });
+        }
+
+        check_daemon_agent_control_and_signal_readiness(
+            &client,
+            &services.control_plane_url,
+            &services.signal_url,
+            &statuses,
+        )
+        .await
     }
 
     #[tokio::test]

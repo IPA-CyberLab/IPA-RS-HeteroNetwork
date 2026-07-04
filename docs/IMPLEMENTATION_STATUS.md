@@ -54,7 +54,7 @@ This file tracks the gap between the requested final system and the current repo
 - Lazy connect and pinning runtime support in the agent crate and daemon loops, including peer activity recording, packet-flow destination resolution against peer VPN IPs and advertised routes, optional typed packet-flow source/protocol/port/detector metadata, opt-in Linux conntrack procfs polling, conntrack netlink table dumping, or conntrack NEW/UPDATE event subscription, policy/route/relay/path pins, active-only signal negotiation, and idle peer removal during peer-map application.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
 - Docker Compose and Helm chart starting points aligned to the current plain-HTTP `iparsd` service listeners.
-- `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, relay HTTP admission plus UDP forwarding throughput runs, and spawned multi-process `iparsd` daemon transport across control-plane, signal, STUN, relay, and dry-run agent processes.
+- `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, relay HTTP admission plus UDP forwarding throughput runs, and spawned multi-process `iparsd` daemon transport across control-plane, signal, STUN, relay, and dry-run agent processes with service health, control-plane agent visibility, and signal negotiation readiness waits.
 
 ## Remaining For Full Production Completion
 
@@ -68,4 +68,4 @@ This file tracks the gap between the requested final system and the current repo
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.
 - Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery and explicit Service exposure acknowledgement/source-range controls.
 - Full direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests beyond current focused smoke coverage.
-- External multi-process daemon load orchestration hardening beyond current loopback `iparsd` control-plane/signal/STUN/relay/dry-run-agent transport.
+- External multi-process daemon load orchestration hardening beyond current loopback `iparsd` control-plane/signal/STUN/relay/dry-run-agent transport with health, control-plane registration, and signal negotiation readiness checks.
