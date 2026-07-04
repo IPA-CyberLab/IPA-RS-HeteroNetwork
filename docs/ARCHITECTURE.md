@@ -33,7 +33,7 @@ The node ID is derived from the identity verifying key. WireGuard keys can rotat
 - issuer node ID and key ID
 - Ed25519 signature over typed claims
 
-Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, and `ipars token create` can later sign additional join tokens with that same key. Both commands expose token-policy inputs for relay permission, route allowlists, and max-use or unlimited-use admission.
+Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, emit the concrete `iparsd` commands for control-plane, signal, STUN, and relay bootstrap services, and optionally spawn those services with per-service logs. `ipars token create` can later sign additional join tokens with that same key. Both commands expose token-policy inputs for relay permission, route allowlists, and max-use or unlimited-use admission.
 
 ## Control Plane HA
 

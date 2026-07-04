@@ -38,7 +38,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`, with reusable issuer-key token signing, token policy flags, and HTTP API-backed status/peer/route/relay/path queries when URLs are provided
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed status/peer/route/relay/path queries when URLs are provided
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
@@ -79,7 +79,7 @@ cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin targ
 ## CLI Surface
 
 ```bash
-ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --allowed-route 10.43.0.0/16 --allow-relay --unlimited-uses
+ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --allowed-route 10.43.0.0/16 --allow-relay --unlimited-uses --daemon-state-dir ./ipars-state --spawn-daemons
 ipars join '<signed-token>'
 ipars status --agent-url http://127.0.0.1:9780
 ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
@@ -92,7 +92,7 @@ ipars docker install --project-name ipars --compose-file docker/compose.yaml
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
-The control-plane daemon must be started with the issuer node ID, key ID, and public key reported by `ipars init`; later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`.
+`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`.
 
 Join tokens are single-use by default. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, relay permission with `--allow-relay`, and admission limits with `--max-uses` or `--unlimited-uses`.
 

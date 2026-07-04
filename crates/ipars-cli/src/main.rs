@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
@@ -59,6 +60,8 @@ enum Command {
 struct InitArgs {
     #[arg(long)]
     public_endpoint: SocketAddr,
+    #[arg(long, default_value = "http", value_parser = parse_bootstrap_scheme)]
+    bootstrap_scheme: String,
     #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
     issuer_key_id: String,
     #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
@@ -81,6 +84,26 @@ struct InitArgs {
     max_uses: Option<u32>,
     #[arg(long, default_value_t = false)]
     unlimited_uses: bool,
+    #[arg(long, default_value_t = false)]
+    spawn_daemons: bool,
+    #[arg(long, env = "IPARS_IPARSD_BIN", default_value = "iparsd")]
+    daemon_binary: PathBuf,
+    #[arg(long, default_value = "/var/lib/ipars/bootstrap")]
+    daemon_state_dir: PathBuf,
+    #[arg(long, default_value = "0.0.0.0:8443")]
+    control_plane_listen: SocketAddr,
+    #[arg(long)]
+    control_plane_database_url: Option<String>,
+    #[arg(long, default_value = "0.0.0.0:9443")]
+    signal_listen: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:3478")]
+    stun_listen: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:51820")]
+    relay_udp_listen: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:9580")]
+    relay_http_listen: SocketAddr,
+    #[arg(long)]
+    relay_admission_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -298,32 +321,50 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     )?;
     let wireguard = WireGuardKeyPair::generate();
     let cluster_id = ClusterId::new();
-    let bootstrap_endpoints = bootstrap_from_public_endpoint(args.public_endpoint);
+    let bootstrap_endpoints = bootstrap_from_public_endpoint(&args);
+    let issuer_key_id = args.issuer_key_id.clone();
+    let issuer_public_key = identity.public_key_b64();
     let issuer = TokenIssuer {
         node_id: identity.node_id(),
-        key_id: KeyId::from_string(args.issuer_key_id.clone()),
+        key_id: KeyId::from_string(issuer_key_id.clone()),
     };
     let claims = claims(
         cluster_id.clone(),
         issuer.clone(),
-        args.default_role,
-        args.tags,
+        args.default_role.clone(),
+        args.tags.clone(),
         args.token_ttl_seconds,
         bootstrap_endpoints.clone(),
         TokenPolicyInput {
             allow_relay: args.allow_relay,
-            allowed_routes: args.allowed_routes,
+            allowed_routes: args.allowed_routes.clone(),
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
     );
     let token = identity.sign_join_token(claims)?;
+    let daemon_specs = init_daemon_specs(
+        &args,
+        &cluster_id,
+        &identity.node_id(),
+        &issuer_key_id,
+        &issuer_public_key,
+    );
+    let daemon_commands = daemon_specs
+        .iter()
+        .map(|spec| spec.command_output(&args.daemon_binary))
+        .collect::<Vec<_>>();
+    let daemon_processes = if args.spawn_daemons {
+        spawn_init_daemons(&args.daemon_binary, &args.daemon_state_dir, &daemon_specs)?
+    } else {
+        Vec::new()
+    };
 
     Ok(InitOutput {
         cluster_id,
         node_id: identity.node_id(),
         issuer_node_id: identity.node_id(),
-        issuer_key_id: KeyId::from_string(args.issuer_key_id),
-        issuer_public_key: identity.public_key_b64(),
+        issuer_key_id: KeyId::from_string(issuer_key_id),
+        issuer_public_key,
         issuer_private_key_b64: args
             .emit_issuer_private_key
             .then(|| identity.signing_key_b64()),
@@ -338,7 +379,182 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
             "stun".to_string(),
             "relay".to_string(),
         ],
+        daemon_state_dir: args.daemon_state_dir,
+        daemon_commands,
+        daemon_processes,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitDaemonSpec {
+    service: &'static str,
+    args: Vec<String>,
+    log_path: PathBuf,
+}
+
+impl InitDaemonSpec {
+    fn command_output(&self, binary: &Path) -> InitDaemonCommand {
+        InitDaemonCommand {
+            service: self.service.to_string(),
+            command: self.command(binary),
+            log_path: self.log_path.clone(),
+        }
+    }
+
+    fn command(&self, binary: &Path) -> Vec<String> {
+        let mut command = Vec::with_capacity(self.args.len() + 1);
+        command.push(binary.display().to_string());
+        command.extend(self.args.iter().cloned());
+        command
+    }
+}
+
+fn init_daemon_specs(
+    args: &InitArgs,
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+    issuer_key_id: &str,
+    issuer_public_key: &str,
+) -> Vec<InitDaemonSpec> {
+    let log_dir = args.daemon_state_dir.join("logs");
+    let control_plane_database_url = effective_control_plane_database_url(args);
+    let relay_admission_url = args.relay_admission_url.clone().unwrap_or_else(|| {
+        format!(
+            "{}://{}:{}",
+            args.bootstrap_scheme,
+            args.public_endpoint.ip(),
+            args.relay_http_listen.port()
+        )
+    });
+
+    vec![
+        InitDaemonSpec {
+            service: "control-plane",
+            args: vec![
+                "control-plane".to_string(),
+                "--listen".to_string(),
+                args.control_plane_listen.to_string(),
+                "--cluster-id".to_string(),
+                cluster_id.as_str().to_string(),
+                "--issuer-node-id".to_string(),
+                node_id.as_str().to_string(),
+                "--issuer-key-id".to_string(),
+                issuer_key_id.to_string(),
+                "--issuer-public-key".to_string(),
+                issuer_public_key.to_string(),
+                "--database-url".to_string(),
+                control_plane_database_url,
+            ],
+            log_path: log_dir.join("control-plane.log"),
+        },
+        InitDaemonSpec {
+            service: "signal",
+            args: vec![
+                "signal".to_string(),
+                "--listen".to_string(),
+                args.signal_listen.to_string(),
+            ],
+            log_path: log_dir.join("signal.log"),
+        },
+        InitDaemonSpec {
+            service: "stun",
+            args: vec![
+                "stun".to_string(),
+                "--listen".to_string(),
+                args.stun_listen.to_string(),
+            ],
+            log_path: log_dir.join("stun.log"),
+        },
+        InitDaemonSpec {
+            service: "relay",
+            args: vec![
+                "relay".to_string(),
+                "--relay-node-id".to_string(),
+                node_id.as_str().to_string(),
+                "--udp-listen".to_string(),
+                args.relay_udp_listen.to_string(),
+                "--http-listen".to_string(),
+                args.relay_http_listen.to_string(),
+                "--public-endpoint".to_string(),
+                args.public_endpoint.to_string(),
+                "--admission-url".to_string(),
+                relay_admission_url,
+            ],
+            log_path: log_dir.join("relay.log"),
+        },
+    ]
+}
+
+fn effective_control_plane_database_url(args: &InitArgs) -> String {
+    args.control_plane_database_url
+        .clone()
+        .unwrap_or_else(|| sqlite_database_url(&args.daemon_state_dir.join("control-plane.sqlite")))
+}
+
+fn sqlite_database_url(path: &Path) -> String {
+    format!("sqlite://{}?mode=rwc", path.display())
+}
+
+fn spawn_init_daemons(
+    binary: &Path,
+    state_dir: &Path,
+    specs: &[InitDaemonSpec],
+) -> anyhow::Result<Vec<InitDaemonProcess>> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("failed to create daemon state dir {}", state_dir.display()))?;
+    let log_dir = state_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create daemon log dir {}", log_dir.display()))?;
+
+    let mut processes = Vec::with_capacity(specs.len());
+    let mut spawned: Vec<Child> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let child = match spawn_init_daemon(binary, spec) {
+            Ok(child) => child,
+            Err(error) => {
+                for mut child in spawned {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+        };
+        processes.push(InitDaemonProcess {
+            service: spec.service.to_string(),
+            pid: child.id(),
+            command: spec.command(binary),
+            log_path: spec.log_path.clone(),
+        });
+        spawned.push(child);
+    }
+
+    Ok(processes)
+}
+
+fn spawn_init_daemon(binary: &Path, spec: &InitDaemonSpec) -> anyhow::Result<Child> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.log_path)
+        .with_context(|| format!("failed to open daemon log {}", spec.log_path.display()))?;
+    let stdout = log.try_clone().with_context(|| {
+        format!(
+            "failed to clone daemon log handle {}",
+            spec.log_path.display()
+        )
+    })?;
+    ProcessCommand::new(binary)
+        .args(&spec.args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn {} using {}",
+                spec.service,
+                binary.display()
+            )
+        })
 }
 
 async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
@@ -583,6 +799,15 @@ fn api_url(base_url: &str, path: &str) -> String {
     )
 }
 
+fn parse_bootstrap_scheme(value: &str) -> Result<String, String> {
+    match value {
+        "http" | "https" => Ok(value.to_string()),
+        _ => Err(format!(
+            "bootstrap scheme must be http or https; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_service_type(value: &str) -> Result<String, String> {
     match value {
         "ClusterIP" | "NodePort" | "LoadBalancer" => Ok(value.to_string()),
@@ -709,23 +934,31 @@ fn claims(
     }
 }
 
-fn bootstrap_from_public_endpoint(public_endpoint: SocketAddr) -> Vec<BootstrapEndpoint> {
-    let host = public_endpoint.ip();
+fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
+    let host = args.public_endpoint.ip();
     vec![
         BootstrapEndpoint {
-            url: format!("https://{host}:8443"),
+            url: format!(
+                "{}://{host}:{}",
+                args.bootstrap_scheme,
+                args.control_plane_listen.port()
+            ),
             kind: BootstrapEndpointKind::ControlPlane,
         },
         BootstrapEndpoint {
-            url: format!("https://{host}:9443"),
+            url: format!(
+                "{}://{host}:{}",
+                args.bootstrap_scheme,
+                args.signal_listen.port()
+            ),
             kind: BootstrapEndpointKind::Signal,
         },
         BootstrapEndpoint {
-            url: format!("udp://{public_endpoint}"),
+            url: format!("udp://{}", args.public_endpoint),
             kind: BootstrapEndpointKind::Stun,
         },
         BootstrapEndpoint {
-            url: format!("udp://{public_endpoint}"),
+            url: format!("udp://{}", args.public_endpoint),
             kind: BootstrapEndpointKind::Relay,
         },
     ]
@@ -773,6 +1006,24 @@ struct InitOutput {
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
     join_token: SignedJoinToken,
     services: Vec<String>,
+    daemon_state_dir: PathBuf,
+    daemon_commands: Vec<InitDaemonCommand>,
+    daemon_processes: Vec<InitDaemonProcess>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct InitDaemonCommand {
+    service: String,
+    command: Vec<String>,
+    log_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct InitDaemonProcess {
+    service: String,
+    pid: u32,
+    command: Vec<String>,
+    log_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -1152,6 +1403,7 @@ mod tests {
         let key_path = temp_path("issuer.key");
         let output = init(InitArgs {
             public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            bootstrap_scheme: "http".to_string(),
             issuer_key_id: "root".to_string(),
             issuer_private_key_b64: None,
             issuer_private_key_path: Some(key_path.clone()),
@@ -1163,6 +1415,16 @@ mod tests {
             allow_relay: true,
             max_uses: None,
             unlimited_uses: true,
+            spawn_daemons: false,
+            daemon_binary: PathBuf::from("iparsd"),
+            daemon_state_dir: temp_path("state"),
+            control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            control_plane_database_url: None,
+            signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
+            stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
+            relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
+            relay_admission_url: None,
         })?;
 
         assert_eq!(output.issuer_private_key_path, Some(key_path.clone()));
@@ -1183,6 +1445,94 @@ mod tests {
             Utc::now(),
             &output.cluster_id,
         )?;
+        let _ = std::fs::remove_file(key_path);
+        Ok(())
+    }
+
+    #[test]
+    fn init_outputs_daemon_commands_for_bootstrap_services() -> anyhow::Result<()> {
+        let key_path = temp_path("issuer-bootstrap.key");
+        let state_dir = temp_path("bootstrap-state");
+        let output = init(InitArgs {
+            public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            bootstrap_scheme: "http".to_string(),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: Some(key_path.clone()),
+            emit_issuer_private_key: false,
+            token_ttl_seconds: 300,
+            default_role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            allow_relay: true,
+            max_uses: Some(10),
+            unlimited_uses: false,
+            spawn_daemons: false,
+            daemon_binary: PathBuf::from("iparsd"),
+            daemon_state_dir: state_dir.clone(),
+            control_plane_listen: "127.0.0.1:18443".parse()?,
+            control_plane_database_url: None,
+            signal_listen: "127.0.0.1:19443".parse()?,
+            stun_listen: "0.0.0.0:13478".parse()?,
+            relay_udp_listen: "0.0.0.0:15182".parse()?,
+            relay_http_listen: "127.0.0.1:19580".parse()?,
+            relay_admission_url: None,
+        })?;
+
+        assert!(output.daemon_processes.is_empty());
+        assert_eq!(output.daemon_commands.len(), 4);
+        assert_eq!(
+            output
+                .join_token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.as_str()),
+            Some("http://203.0.113.10:18443")
+        );
+        assert_eq!(
+            output
+                .join_token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+                .map(|endpoint| endpoint.url.as_str()),
+            Some("http://203.0.113.10:19443")
+        );
+
+        let control_plane = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "control-plane")
+            .context("expected control-plane daemon command")?;
+        assert_eq!(
+            control_plane.log_path,
+            state_dir.join("logs").join("control-plane.log")
+        );
+        assert!(control_plane.command.contains(&"control-plane".to_string()));
+        assert!(control_plane
+            .command
+            .contains(&output.cluster_id.as_str().to_string()));
+        assert!(control_plane
+            .command
+            .contains(&output.issuer_public_key.to_string()));
+        assert!(control_plane.command.iter().any(|value| {
+            value.starts_with("sqlite://") && value.ends_with("control-plane.sqlite?mode=rwc")
+        }));
+
+        let relay = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "relay")
+            .context("expected relay daemon command")?;
+        assert!(relay.command.contains(&"relay".to_string()));
+        assert!(relay.command.contains(&"203.0.113.10:51820".to_string()));
+        assert!(relay
+            .command
+            .contains(&"http://203.0.113.10:19580".to_string()));
+
         let _ = std::fs::remove_file(key_path);
         Ok(())
     }
