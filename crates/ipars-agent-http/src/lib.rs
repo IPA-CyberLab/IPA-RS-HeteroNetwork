@@ -280,6 +280,108 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_active_peers Number of peers with recent lazy-connect activity."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_active_peers gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_active_peers{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.active_peer_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_pinned_peers Number of peers pinned in lazy-connect state."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_pinned_peers gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_pinned_peers{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.pinned_peer_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_observed_peer_vpn_ips Number of peer VPN IPs indexed for packet-flow resolution."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_observed_peer_vpn_ips gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_observed_peer_vpn_ips{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.observed_peer_vpn_ip_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_observed_route_peers Number of peers with advertised routes indexed for packet-flow resolution."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_observed_route_peers gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_observed_route_peers{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.observed_route_peer_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_observed_routes Number of advertised routes indexed for packet-flow resolution."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_observed_routes gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_observed_routes{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.observed_route_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_peer_activity_records_total Peer activity records accepted by the agent."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_peer_activity_records_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_peer_activity_records_total{{node_id=\"{node_id}\"}} {}",
+        metrics.peer_activity_record_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_observations_total Packet-flow observations submitted to lazy-connect resolution."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_observations_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_observations_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_observation_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_matches_total Packet-flow observations that resolved to a peer."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_matches_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_matches_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_match_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_unmatched_total Packet-flow observations that did not resolve to a peer."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_unmatched_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_unmatched_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_unmatched_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_path_state_count Number of peer paths by selected state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_path_state_count gauge");
@@ -451,6 +553,16 @@ mod tests {
         runtime
             .register_relay_forwarder_metrics(forwarder_metrics)
             .await;
+        runtime
+            .record_peer_activity(NodeId::from_string("peer-a"), Utc::now(), true)
+            .await;
+        runtime
+            .record_packet_flow_activity(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                Utc::now(),
+                false,
+            )
+            .await;
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -475,6 +587,12 @@ mod tests {
         assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
         assert_eq!(metrics.relay_forwarders[0].inbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].inbound_payload_bytes, 32);
+        assert_eq!(metrics.lazy_connect.active_peer_count, 1);
+        assert_eq!(metrics.lazy_connect.pinned_peer_count, 1);
+        assert_eq!(metrics.peer_activity_record_count, 1);
+        assert_eq!(metrics.packet_flow_observation_count, 1);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
 
         let prometheus_response = app
             .clone()
@@ -501,6 +619,11 @@ mod tests {
         assert!(body.contains("relay_node=\"relay-a\""));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 32"));
+        assert!(body.contains("ipars_agent_active_peers"));
+        assert!(body.contains("ipars_agent_pinned_peers"));
+        assert!(body.contains("ipars_agent_peer_activity_records_total"));
+        assert!(body.contains("ipars_agent_packet_flow_observations_total"));
+        assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
 
         let paths_response = app
             .clone()

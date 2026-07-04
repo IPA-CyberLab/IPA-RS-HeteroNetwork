@@ -1706,6 +1706,10 @@ fn start_relay_otel_metrics_export(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AgentOtelSnapshot {
     relay_forwarders: BTreeMap<(NodeId, NodeId), AgentRelayForwarderMetrics>,
+    peer_activity_record_count: u64,
+    packet_flow_observation_count: u64,
+    packet_flow_match_count: u64,
+    packet_flow_unmatched_count: u64,
 }
 
 impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
@@ -1722,6 +1726,10 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                     )
                 })
                 .collect(),
+            peer_activity_record_count: metrics.peer_activity_record_count,
+            packet_flow_observation_count: metrics.packet_flow_observation_count,
+            packet_flow_match_count: metrics.packet_flow_match_count,
+            packet_flow_unmatched_count: metrics.packet_flow_unmatched_count,
         }
     }
 }
@@ -1734,6 +1742,15 @@ struct AgentOtelMetrics {
     relay_sessions: Gauge<u64>,
     relay_forwarders: Gauge<u64>,
     path_change_events: Gauge<u64>,
+    lazy_active_peers: Gauge<u64>,
+    lazy_pinned_peers: Gauge<u64>,
+    lazy_observed_peer_vpn_ips: Gauge<u64>,
+    lazy_observed_route_peers: Gauge<u64>,
+    lazy_observed_routes: Gauge<u64>,
+    peer_activity_records: Counter<u64>,
+    packet_flow_observations: Counter<u64>,
+    packet_flow_matches: Counter<u64>,
+    packet_flow_unmatched: Counter<u64>,
     forwarder_outbound_packets: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
@@ -1768,6 +1785,44 @@ impl AgentOtelMetrics {
             path_change_events: meter
                 .u64_gauge("ipars.agent.path_change_events")
                 .with_description("Retained path change events.")
+                .build(),
+            lazy_active_peers: meter
+                .u64_gauge("ipars.agent.lazy_connect.active_peers")
+                .with_description("Peers with recent lazy-connect activity.")
+                .build(),
+            lazy_pinned_peers: meter
+                .u64_gauge("ipars.agent.lazy_connect.pinned_peers")
+                .with_description("Peers pinned in lazy-connect state.")
+                .build(),
+            lazy_observed_peer_vpn_ips: meter
+                .u64_gauge("ipars.agent.lazy_connect.observed_peer_vpn_ips")
+                .with_description("Peer VPN IPs indexed for packet-flow resolution.")
+                .build(),
+            lazy_observed_route_peers: meter
+                .u64_gauge("ipars.agent.lazy_connect.observed_route_peers")
+                .with_description(
+                    "Peers with advertised routes indexed for packet-flow resolution.",
+                )
+                .build(),
+            lazy_observed_routes: meter
+                .u64_gauge("ipars.agent.lazy_connect.observed_routes")
+                .with_description("Advertised routes indexed for packet-flow resolution.")
+                .build(),
+            peer_activity_records: meter
+                .u64_counter("ipars.agent.peer_activity.records")
+                .with_description("Peer activity records accepted by the agent.")
+                .build(),
+            packet_flow_observations: meter
+                .u64_counter("ipars.agent.packet_flow.observations")
+                .with_description("Packet-flow observations submitted to lazy-connect resolution.")
+                .build(),
+            packet_flow_matches: meter
+                .u64_counter("ipars.agent.packet_flow.matches")
+                .with_description("Packet-flow observations that resolved to a peer.")
+                .build(),
+            packet_flow_unmatched: meter
+                .u64_counter("ipars.agent.packet_flow.unmatched")
+                .with_description("Packet-flow observations that did not resolve to a peer.")
                 .build(),
             forwarder_outbound_packets: meter
                 .u64_counter("ipars.agent.relay.forwarder.outbound.packets")
@@ -1811,6 +1866,55 @@ impl AgentOtelMetrics {
             .record(metrics.relay_forwarder_count as u64, &node_attrs);
         self.path_change_events
             .record(metrics.path_change_event_count as u64, &node_attrs);
+        self.lazy_active_peers
+            .record(metrics.lazy_connect.active_peer_count as u64, &node_attrs);
+        self.lazy_pinned_peers
+            .record(metrics.lazy_connect.pinned_peer_count as u64, &node_attrs);
+        self.lazy_observed_peer_vpn_ips.record(
+            metrics.lazy_connect.observed_peer_vpn_ip_count as u64,
+            &node_attrs,
+        );
+        self.lazy_observed_route_peers.record(
+            metrics.lazy_connect.observed_route_peer_count as u64,
+            &node_attrs,
+        );
+        self.lazy_observed_routes.record(
+            metrics.lazy_connect.observed_route_count as u64,
+            &node_attrs,
+        );
+
+        let peer_activity_delta = counter_delta(
+            metrics.peer_activity_record_count,
+            previous.map(|previous| previous.peer_activity_record_count),
+        );
+        if peer_activity_delta > 0 {
+            self.peer_activity_records
+                .add(peer_activity_delta, &node_attrs);
+        }
+        let packet_flow_observation_delta = counter_delta(
+            metrics.packet_flow_observation_count,
+            previous.map(|previous| previous.packet_flow_observation_count),
+        );
+        if packet_flow_observation_delta > 0 {
+            self.packet_flow_observations
+                .add(packet_flow_observation_delta, &node_attrs);
+        }
+        let packet_flow_match_delta = counter_delta(
+            metrics.packet_flow_match_count,
+            previous.map(|previous| previous.packet_flow_match_count),
+        );
+        if packet_flow_match_delta > 0 {
+            self.packet_flow_matches
+                .add(packet_flow_match_delta, &node_attrs);
+        }
+        let packet_flow_unmatched_delta = counter_delta(
+            metrics.packet_flow_unmatched_count,
+            previous.map(|previous| previous.packet_flow_unmatched_count),
+        );
+        if packet_flow_unmatched_delta > 0 {
+            self.packet_flow_unmatched
+                .add(packet_flow_unmatched_delta, &node_attrs);
+        }
 
         for state in [
             PathState::DirectPublic,
@@ -5311,8 +5415,8 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
-        AgentMetricsResponse, AgentRelayForwarderMetrics, PathStateCount, RelayAdmissionResponse,
-        RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentMetricsResponse, AgentRelayForwarderMetrics, LazyConnectMetrics, PathStateCount,
+        RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -5731,6 +5835,17 @@ mod tests {
                 state: PathState::Relay,
                 count: 1,
             }],
+            lazy_connect: LazyConnectMetrics {
+                active_peer_count: 1,
+                pinned_peer_count: 1,
+                observed_peer_vpn_ip_count: 1,
+                observed_route_peer_count: 1,
+                observed_route_count: 2,
+            },
+            peer_activity_record_count: 2,
+            packet_flow_observation_count: 3,
+            packet_flow_match_count: 2,
+            packet_flow_unmatched_count: 1,
             generated_at: Utc::now(),
         };
         let previous = AgentOtelSnapshot::from(&metrics);

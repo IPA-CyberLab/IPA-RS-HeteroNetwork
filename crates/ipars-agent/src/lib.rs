@@ -20,7 +20,7 @@ use ipars_route_manager::{
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
     AgentMetricsResponse, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentRelayForwarderMetrics, AgentStatusResponse, PathStateCount, PeerMap,
+    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
@@ -161,6 +161,10 @@ pub struct AgentRuntime {
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
+    peer_activity_record_count: AtomicU64,
+    packet_flow_observation_count: AtomicU64,
+    packet_flow_match_count: AtomicU64,
+    packet_flow_unmatched_count: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +373,10 @@ impl AgentRuntime {
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
+            peer_activity_record_count: AtomicU64::new(0),
+            packet_flow_observation_count: AtomicU64::new(0),
+            packet_flow_match_count: AtomicU64::new(0),
+            packet_flow_unmatched_count: AtomicU64::new(0),
         }
     }
 
@@ -480,6 +488,7 @@ impl AgentRuntime {
         let relay_forwarders = self.relay_forwarder_endpoints.read().await;
         let relay_forwarder_metrics = self.relay_forwarder_metrics.read().await;
         let path_change_events = self.path_change_events.read().await;
+        let lazy_connect = self.lazy_connect.read().await;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in path_state.values() {
             *path_state_counts.entry(path.selected_state).or_default() += 1;
@@ -500,6 +509,13 @@ impl AgentRuntime {
                 .into_iter()
                 .map(|(state, count)| PathStateCount { state, count })
                 .collect(),
+            lazy_connect: lazy_connect.metrics(),
+            peer_activity_record_count: self.peer_activity_record_count.load(Ordering::Relaxed),
+            packet_flow_observation_count: self
+                .packet_flow_observation_count
+                .load(Ordering::Relaxed),
+            packet_flow_match_count: self.packet_flow_match_count.load(Ordering::Relaxed),
+            packet_flow_unmatched_count: self.packet_flow_unmatched_count.load(Ordering::Relaxed),
             generated_at: Utc::now(),
         }
     }
@@ -630,6 +646,8 @@ impl AgentRuntime {
     }
 
     pub async fn record_peer_activity(&self, peer: NodeId, at: DateTime<Utc>, pin: bool) -> bool {
+        self.peer_activity_record_count
+            .fetch_add(1, Ordering::Relaxed);
         let mut lazy_connect = self.lazy_connect.write().await;
         lazy_connect.record_activity(peer.clone(), at);
         if pin {
@@ -644,13 +662,20 @@ impl AgentRuntime {
         at: DateTime<Utc>,
         pin: bool,
     ) -> Option<AgentPacketFlowMatch> {
+        self.packet_flow_observation_count
+            .fetch_add(1, Ordering::Relaxed);
         let mut lazy_connect = self.lazy_connect.write().await;
-        let mut matched = lazy_connect.resolve_packet_flow_destination(destination)?;
+        let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
+            self.packet_flow_unmatched_count
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         lazy_connect.record_activity(matched.peer.clone(), at);
         if pin {
             lazy_connect.pin_peer(matched.peer.clone());
         }
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
+        self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
         Some(matched)
     }
 
@@ -1694,6 +1719,16 @@ impl LazyConnectManager {
 
     pub fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
         self.pins.contains(&peer.node_id) || self.last_used.contains_key(&peer.node_id)
+    }
+
+    pub fn metrics(&self) -> LazyConnectMetrics {
+        LazyConnectMetrics {
+            active_peer_count: self.last_used.len(),
+            pinned_peer_count: self.pins.len(),
+            observed_peer_vpn_ip_count: self.peer_vpn_ips.len(),
+            observed_route_peer_count: self.advertised_routes.len(),
+            observed_route_count: self.advertised_routes.values().map(Vec::len).sum(),
+        }
     }
 
     pub fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -2886,6 +2921,16 @@ mod tests {
                 .await
                 .is_none()
         );
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.lazy_connect.observed_peer_vpn_ip_count, 3);
+        assert_eq!(metrics.lazy_connect.observed_route_peer_count, 2);
+        assert_eq!(metrics.lazy_connect.observed_route_count, 2);
+        assert_eq!(metrics.lazy_connect.active_peer_count, 2);
+        assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
+        assert_eq!(metrics.packet_flow_observation_count, 3);
+        assert_eq!(metrics.packet_flow_match_count, 2);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.peer_activity_record_count, 0);
         Ok(())
     }
 
