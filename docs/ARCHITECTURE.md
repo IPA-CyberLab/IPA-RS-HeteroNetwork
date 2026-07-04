@@ -153,6 +153,8 @@ When Kubernetes underlay routing is enabled, the DaemonSet starts `iparsd agent`
 
 Helm can optionally pass relay advertisement settings to the agent for public nodes that run a colocated relay service. Those settings remain inactive unless `agent.relayAdvertisement.enabled` is set and the join token policy permits relay.
 
+The chart can also render optional Services for the agent HTTP API and colocated relay UDP/HTTP endpoints. These are disabled by default so private underlay deployments do not publish node APIs unless an operator explicitly selects a Service type and annotations.
+
 CNI-owned pod networking remains the responsibility of the cluster CNI.
 
 ## API Schema

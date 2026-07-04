@@ -17,6 +17,11 @@ agent:
   routeProvider: false
   hostNetwork: true
   privileged: false
+  apiService:
+    enabled: false
+    type: ClusterIP
+    annotations: {}
+    port: 9780
   relayForwarder:
     maxSessions: 1024
     restartBackoffSeconds: 5
@@ -28,6 +33,12 @@ agent:
     statusUrl: ""
     maxSessions: 10000
     maxMbps: 1000
+  relayService:
+    enabled: false
+    type: LoadBalancer
+    annotations: {}
+    udpPort: 51820
+    httpPort: 9580
 
 serviceExposure:
   enabled: true

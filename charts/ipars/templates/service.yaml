@@ -1,0 +1,49 @@
+{{- if .Values.agent.apiService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ipars.fullname" . }}-agent
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/component: agent
+  {{- with .Values.agent.apiService.annotations }}
+  annotations:
+{{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.agent.apiService.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.agent.apiService.port }}
+      targetPort: 9780
+{{- end }}
+{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ipars.fullname" . }}-relay
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/component: relay
+  {{- with .Values.agent.relayService.annotations }}
+  annotations:
+{{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.agent.relayService.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+  ports:
+    - name: relay-udp
+      protocol: UDP
+      port: {{ .Values.agent.relayService.udpPort }}
+      targetPort: {{ .Values.agent.relayService.udpPort }}
+    - name: relay-http
+      protocol: TCP
+      port: {{ .Values.agent.relayService.httpPort }}
+      targetPort: {{ .Values.agent.relayService.httpPort }}
+{{- end }}
