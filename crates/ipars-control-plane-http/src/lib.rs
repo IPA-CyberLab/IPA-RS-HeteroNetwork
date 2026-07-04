@@ -430,6 +430,7 @@ mod tests {
                 message: None,
             },
             candidates: Vec::new(),
+            relay_capability: None,
             path_state: Vec::new(),
         };
         let response = app

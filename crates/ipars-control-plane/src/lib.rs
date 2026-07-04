@@ -77,6 +77,11 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         candidates: Vec<EndpointCandidate>,
     ) -> Result<(), ControlPlaneError>;
+    async fn update_node_relay_capability(
+        &self,
+        node_id: &NodeId,
+        relay_capability: Option<RelayCapability>,
+    ) -> Result<(), ControlPlaneError>;
     async fn upsert_health(
         &self,
         node_id: NodeId,
@@ -145,6 +150,19 @@ impl ControlPlaneStore for InMemoryStore {
             .get_mut(node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.endpoint_candidates = candidates;
+        Ok(())
+    }
+
+    async fn update_node_relay_capability(
+        &self,
+        node_id: &NodeId,
+        relay_capability: Option<RelayCapability>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.relay_capability = relay_capability;
         Ok(())
     }
 
@@ -498,6 +516,20 @@ where
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
+        if let Some(mut relay_capability) = request.relay_capability {
+            let node = self
+                .store
+                .get_node(&request.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+            if !node.token_policy.allow_relay {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+            relay_capability.enabled_by_policy = true;
+            self.store
+                .update_node_relay_capability(&request.node_id, Some(relay_capability))
+                .await?;
+        }
         self.store
             .upsert_health(request.node_id.clone(), request.health)
             .await?;
@@ -881,6 +913,7 @@ mod tests {
                 node_id: NodeId::from_string("node-a"),
                 health: health.clone(),
                 candidates: vec![candidate("node-a")],
+                relay_capability: None,
                 path_state: vec![path("node-a", "node-b")],
             })
             .await?;
@@ -908,6 +941,87 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_relay_capability_when_policy_allows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allow_relay = true;
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+        let mut heartbeat_relay = relay_capability();
+        heartbeat_relay.enabled_by_policy = false;
+        heartbeat_relay.active_sessions = 7;
+
+        let response = plane
+            .heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("node-a"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: Some(0.25),
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: Some(heartbeat_relay),
+                path_state: Vec::new(),
+            })
+            .await?;
+
+        assert!(response.accepted);
+        let node = store
+            .get_node(&NodeId::from_string("node-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(NodeId::from_string("node-a")))?;
+        let Some(relay) = node.relay_capability else {
+            return Err("expected heartbeat relay capability".into());
+        };
+        assert!(relay.enabled_by_policy);
+        assert_eq!(relay.active_sessions, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_capability_when_policy_denies(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("node-a"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: Some(relay_capability()),
+                path_state: Vec::new(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(ControlPlaneError::RelayDenied)));
         Ok(())
     }
 

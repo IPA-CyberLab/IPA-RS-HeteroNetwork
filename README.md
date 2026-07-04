@@ -20,7 +20,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
 - persistent agent node state, agent status/path/STUN probe/NAT classification HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
-- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health and endpoint candidates, retrying on control-plane errors
+- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying on control-plane errors
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates when a signal endpoint is known
 - `iparsd agent` signal path negotiation loop that records pair-scoped path state and reports it in heartbeat payloads
 - `iparsd agent` relay admission for signal-selected relay paths, storing expiring relay credentials only in transient agent runtime state

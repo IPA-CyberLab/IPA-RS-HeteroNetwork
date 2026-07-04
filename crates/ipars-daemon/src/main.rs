@@ -1240,6 +1240,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
                 runtime.clone(),
                 control_plane_url,
                 Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
+                relay_capability.clone(),
             ));
         }
     }
@@ -2850,9 +2851,10 @@ fn start_heartbeat_reporting(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     interval: Duration,
+    relay_capability: Option<RelayCapability>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_heartbeat_loop(runtime, control_plane_url, interval).await;
+        run_heartbeat_loop(runtime, control_plane_url, interval, relay_capability).await;
     })
 }
 
@@ -2860,10 +2862,11 @@ async fn run_heartbeat_loop(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
     interval: Duration,
+    relay_capability: Option<RelayCapability>,
 ) {
     let client = reqwest::Client::new();
     loop {
-        let request = heartbeat_request(runtime.as_ref()).await;
+        let request = heartbeat_request(runtime.as_ref(), relay_capability.clone()).await;
         match send_heartbeat(&client, &control_plane_url, request).await {
             Ok(response) => tracing::info!(
                 accepted = response.accepted,
@@ -2898,7 +2901,10 @@ async fn send_heartbeat(
         .context("failed to decode heartbeat response")
 }
 
-async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
+async fn heartbeat_request(
+    runtime: &AgentRuntime,
+    relay_capability: Option<RelayCapability>,
+) -> HeartbeatRequest {
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
     HeartbeatRequest {
@@ -2911,6 +2917,7 @@ async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
             message: Some("agent heartbeat".to_string()),
         },
         candidates: status.candidates,
+        relay_capability,
         path_state,
     }
 }
@@ -4972,11 +4979,12 @@ mod tests {
         };
         runtime.upsert_path_state(path.clone()).await;
 
-        let request = heartbeat_request(&runtime).await;
+        let request = heartbeat_request(&runtime, None).await;
 
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.candidates.is_empty());
+        assert!(request.relay_capability.is_none());
         assert_eq!(request.path_state, vec![path]);
     }
 

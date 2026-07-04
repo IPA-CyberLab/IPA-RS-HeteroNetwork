@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
 use ipars_types::{
-    ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, TokenLedgerRecord,
-    TokenStatus,
+    ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
+    TokenLedgerRecord, TokenStatus,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -119,6 +119,25 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.endpoint_candidates = candidates;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn update_node_relay_capability(
+        &self,
+        node_id: &NodeId,
+        relay_capability: Option<RelayCapability>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.relay_capability = relay_capability;
         sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
             .bind(node_id.as_str())
             .bind(serde_json::to_string(&node).map_err(json_error)?)
@@ -389,6 +408,25 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         Ok(())
     }
 
+    async fn update_node_relay_capability(
+        &self,
+        node_id: &NodeId,
+        relay_capability: Option<RelayCapability>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.relay_capability = relay_capability;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn upsert_health(
         &self,
         node_id: NodeId,
@@ -586,7 +624,7 @@ mod tests {
     use ipars_types::{
         CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, HealthState,
         JoinTokenClaims, KeyId, NodeHealth, NodeRecord, PathMetrics, PathRecord, PathScore,
-        PathState, PeerPathKey, Role, Tag, TokenPolicy, VpnIp,
+        PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -637,6 +675,18 @@ mod tests {
         }
     }
 
+    fn relay_capability() -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 7,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_store_round_trips_nodes_and_paths() -> Result<(), Box<dyn std::error::Error>> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
@@ -676,6 +726,18 @@ mod tests {
                 .endpoint_candidates
                 .len(),
             1
+        );
+        store
+            .update_node_relay_capability(&local.node_id, Some(relay_capability()))
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .relay_capability
+                .map(|capability| capability.active_sessions),
+            Some(7)
         );
         let health = NodeHealth {
             state: HealthState::Healthy,

@@ -854,6 +854,8 @@ pub mod api {
         pub node_id: NodeId,
         pub health: NodeHealth,
         pub candidates: Vec<EndpointCandidate>,
+        #[serde(default)]
+        pub relay_capability: Option<RelayCapability>,
         pub path_state: Vec<PathRecord>,
     }
 
