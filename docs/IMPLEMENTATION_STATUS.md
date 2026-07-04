@@ -9,8 +9,8 @@ This file tracks the gap between the requested final system and the current repo
 - Ed25519 signed join token creation and verification.
 - X25519/WireGuard key generation primitive.
 - Pair-scoped path scoring with direct/IPv6/NAT traversal/relay/unreachable states.
-- In-memory control-plane registration and VPN IP allocation.
-- SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
+- In-memory control-plane registration and store-aware VPN IP allocation that skips already assigned addresses after durable-store restarts.
+- SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests and VPN IP uniqueness indexes.
 - Token ledger records, control-plane revocation API, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, overlapping issuer key rotation sets, cluster/time constraints, ledger admission, CIDR-containing route policy, relay-capability policy, and node registration.
 - Control-plane HTTP crate with typed health, join, policy inspection, ACL-filtered peer-map, and JSON/Prometheus metrics routes backed by the join service.

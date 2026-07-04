@@ -40,6 +40,15 @@ impl SqliteControlPlaneStore {
         self.pool
             .execute(
                 r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS nodes_vpn_ip_unique
+                ON nodes(json_extract(record_json, '$.vpn_ip'));
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS paths (
                     local_node_id TEXT NOT NULL,
                     remote_node_id TEXT NOT NULL,
@@ -313,6 +322,15 @@ impl PostgresControlPlaneStore {
                     node_id TEXT PRIMARY KEY NOT NULL,
                     record_json JSONB NOT NULL
                 );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS nodes_vpn_ip_unique
+                ON nodes ((record_json->>'vpn_ip'));
                 "#,
             )
             .await
@@ -695,6 +713,11 @@ mod tests {
         let remote = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
         store.insert_node(local.clone()).await?;
         store.insert_node(remote.clone()).await?;
+        let duplicate_ip = node("node-c", Ipv4Addr::new(100, 64, 0, 1));
+        assert!(matches!(
+            store.insert_node(duplicate_ip).await,
+            Err(ControlPlaneError::Store(_))
+        ));
 
         let path = PathRecord {
             key: PeerPathKey::new(local.node_id.clone(), remote.node_id.clone()),

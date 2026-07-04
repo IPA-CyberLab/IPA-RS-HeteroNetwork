@@ -46,7 +46,7 @@ Control-plane nodes use the same durable store and advertise themselves through 
 
 ## VPN IP Allocation
 
-The default pool is `100.64.0.0/10`. IP allocation is explicit and stored as durable lease state. Reclaiming a lease requires node removal, token/policy revocation, or administrative reassignment. Agents do not self-assign overlay IPs.
+The default pool is `100.64.0.0/10`. IP allocation is explicit and stored as durable lease state. Reclaiming a lease requires node removal, token/policy revocation, or administrative reassignment. Agents do not self-assign overlay IPs. On registration, the control plane reads existing node leases from the store and skips already assigned VPN IPs before allocating the next address; SQL stores also maintain a VPN IP uniqueness index as a last-resort guard for restarted or overlapping control-plane processes.
 
 ## Peer And Path Model
 

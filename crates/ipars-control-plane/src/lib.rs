@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -444,7 +444,13 @@ where
         }
 
         let relay_capability = relay_capability_allowed(request.relay_capability, &claims)?;
-        let vpn_ip = self.allocator.write().await.allocate_next()?;
+        let existing_nodes = self.store.list_nodes().await?;
+        let reserved_vpn_ips = assigned_ipv4_vpn_ips(&existing_nodes);
+        let vpn_ip = self
+            .allocator
+            .write()
+            .await
+            .allocate_next(&reserved_vpn_ips)?;
         let now = Utc::now();
         let node = NodeRecord {
             node_id: request.node_id,
@@ -765,18 +771,32 @@ impl VpnAllocator {
         }
     }
 
-    fn allocate_next(&mut self) -> Result<VpnIp, ControlPlaneError> {
+    fn allocate_next(&mut self, reserved: &BTreeSet<Ipv4Addr>) -> Result<VpnIp, ControlPlaneError> {
         let network = u32::from(self.pool.network());
         let broadcast = u32::from(self.pool.broadcast());
 
-        if network.saturating_add(self.next_host_offset) < broadcast {
+        while network.saturating_add(self.next_host_offset) < broadcast {
             let candidate = network + self.next_host_offset;
             self.next_host_offset += 1;
-            return Ok(VpnIp(IpAddr::V4(Ipv4Addr::from(candidate))));
+            let candidate = Ipv4Addr::from(candidate);
+            if reserved.contains(&candidate) {
+                continue;
+            }
+            return Ok(VpnIp(IpAddr::V4(candidate)));
         }
 
         Err(ControlPlaneError::VpnPoolExhausted)
     }
+}
+
+fn assigned_ipv4_vpn_ips(nodes: &[NodeRecord]) -> BTreeSet<Ipv4Addr> {
+    nodes
+        .iter()
+        .filter_map(|node| match node.vpn_ip.0 {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -963,6 +983,32 @@ mod tests {
             Some(true)
         );
         assert_eq!(response.relay_map.relays.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_skips_vpn_ips_already_present_in_store(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let mut existing = node_record("node-existing");
+        existing.cluster_id = cluster_id.clone();
+        existing.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)));
+        store.insert_node(existing).await?;
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store);
+
+        let response = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        assert_eq!(
+            response.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
+        );
         Ok(())
     }
 
