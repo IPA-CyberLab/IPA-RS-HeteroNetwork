@@ -1,13 +1,21 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_relay::{RelayError, RelayService};
 use ipars_types::api::{RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse};
+use ipars_types::HealthState;
 use serde::Serialize;
+
+macro_rules! prometheus_line {
+    ($body:expr, $($arg:tt)*) => {{
+        let _ = writeln!($body, $($arg)*);
+    }};
+}
 
 #[derive(Debug, Clone)]
 pub struct RelayHttpState {
@@ -23,6 +31,7 @@ impl RelayHttpState {
 pub fn router(state: RelayHttpState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
         .route("/v1/sessions", post(admit))
         .with_state(state)
@@ -36,6 +45,18 @@ async fn status(State(state): State<RelayHttpState>) -> Json<RelayStatusResponse
     Json(state.relay.status().await)
 }
 
+async fn prometheus_metrics(State(state): State<RelayHttpState>) -> impl IntoResponse {
+    let status = state.relay.status().await;
+    let bytes_forwarded = state.relay.table().read().await.bytes_forwarded();
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_prometheus_metrics(&status, bytes_forwarded),
+    )
+}
+
 async fn admit(
     State(state): State<RelayHttpState>,
     Json(request): Json<RelayAdmissionRequest>,
@@ -46,6 +67,99 @@ async fn admit(
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+fn render_prometheus_metrics(status: &RelayStatusResponse, bytes_forwarded: u64) -> String {
+    let relay_node = prometheus_label(status.relay_node.as_str());
+    let mut body = String::new();
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_active_sessions Number of active relay sessions."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_active_sessions gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_active_sessions{{relay_node=\"{relay_node}\"}} {}",
+        status.capability.active_sessions
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_max_sessions Configured relay session capacity."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_max_sessions gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_max_sessions{{relay_node=\"{relay_node}\"}} {}",
+        status.capability.max_sessions
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_available_sessions Remaining relay session capacity."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_available_sessions gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_available_sessions{{relay_node=\"{relay_node}\"}} {}",
+        status.capability.available_capacity()
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_max_mbps Configured relay throughput budget in megabits per second."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_max_mbps gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_max_mbps{{relay_node=\"{relay_node}\"}} {}",
+        status.capability.max_mbps
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_enabled_by_policy Whether relay admission is enabled by policy."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_enabled_by_policy gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_enabled_by_policy{{relay_node=\"{relay_node}\"}} {}",
+        u8::from(status.capability.enabled_by_policy)
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_bytes_forwarded_total Total opaque payload bytes forwarded by active relay sessions."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_bytes_forwarded_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_bytes_forwarded_total{{relay_node=\"{relay_node}\"}} {bytes_forwarded}"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_health Relay health state as a labeled gauge."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_health gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_health{{relay_node=\"{relay_node}\",state=\"{}\"}} 1",
+        health_label(status.health)
+    );
+    body
+}
+
+fn health_label(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Healthy => "healthy",
+        HealthState::Degraded => "degraded",
+        HealthState::Unhealthy => "unhealthy",
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[derive(Debug)]
@@ -135,6 +249,7 @@ mod tests {
         assert!(response.expires_at > chrono::Utc::now());
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -146,6 +261,26 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RelayStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.capability.active_sessions, 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static(
+                "text/plain; version=0.0.4; charset=utf-8"
+            ))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_relay_active_sessions"));
+        assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
         Ok(())
     }
 }

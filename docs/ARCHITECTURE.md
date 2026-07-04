@@ -172,12 +172,14 @@ Initial signal HTTP routes:
 Initial relay HTTP routes:
 
 - `GET /healthz`
+- `GET /metrics`
 - `GET /v1/status`
 - `POST /v1/sessions`
 
 Initial agent HTTP routes:
 
 - `GET /healthz`
+- `GET /metrics`
 - `GET /v1/status`
 - `GET /v1/metrics`
 - `GET /v1/path-events`
@@ -196,7 +198,7 @@ All daemons emit:
 
 Critical events include path promotion/demotion, relay fallback, relay abuse refusal, VPN IP allocation, route publication, and policy denial.
 
-Agents expose typed JSON metrics and a bounded structured path-change event buffer. The metrics include candidate, path, relay session, relay forwarder, and per-path-state counts. Path events record the previous and new path state, relay node, selected candidate, and score for create/change transitions.
+Agents expose typed JSON metrics, Prometheus scrape metrics, and a bounded structured path-change event buffer. The metrics include candidate, path, relay session, relay forwarder, and per-path-state counts. Relays expose Prometheus scrape metrics for capacity, active sessions, policy-enabled state, health, and forwarded opaque payload bytes. Path events record the previous and new path state, relay node, selected candidate, and score for create/change transitions.
 
 ## Security Model
 

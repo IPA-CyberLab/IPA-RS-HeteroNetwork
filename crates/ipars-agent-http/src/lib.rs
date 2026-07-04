@@ -1,7 +1,8 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,7 +11,14 @@ use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
     AgentPathEventsResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
 };
+use ipars_types::PathState;
 use serde::Serialize;
+
+macro_rules! prometheus_line {
+    ($body:expr, $($arg:tt)*) => {{
+        let _ = writeln!($body, $($arg)*);
+    }};
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentHttpState {
@@ -26,6 +34,7 @@ impl AgentHttpState {
 pub fn router(state: AgentHttpState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
         .route("/v1/metrics", get(metrics))
         .route("/v1/path-events", get(path_events))
@@ -44,6 +53,17 @@ async fn status(State(state): State<AgentHttpState>) -> Json<AgentStatusResponse
 
 async fn metrics(State(state): State<AgentHttpState>) -> Json<AgentMetricsResponse> {
     Json(state.runtime.metrics().await)
+}
+
+async fn prometheus_metrics(State(state): State<AgentHttpState>) -> impl IntoResponse {
+    let metrics = state.runtime.metrics().await;
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_prometheus_metrics(&metrics),
+    )
 }
 
 async fn path_events(State(state): State<AgentHttpState>) -> Json<AgentPathEventsResponse> {
@@ -84,6 +104,92 @@ async fn nat_classification(
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
+    let node_id = prometheus_label(metrics.node_id.as_str());
+    let mut body = String::new();
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_candidates Number of endpoint candidates currently known."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_candidates gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_candidates{{node_id=\"{node_id}\"}} {}",
+        metrics.candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_paths Number of peer paths currently tracked."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_paths gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_paths{{node_id=\"{node_id}\"}} {}",
+        metrics.path_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_sessions Number of active relay sessions held by the agent."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_relay_sessions gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_relay_sessions{{node_id=\"{node_id}\"}} {}",
+        metrics.relay_session_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarders Number of supervised relay forwarder endpoints."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_relay_forwarders gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_relay_forwarders{{node_id=\"{node_id}\"}} {}",
+        metrics.relay_forwarder_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_path_change_events Number of retained path change events."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_path_change_events gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_path_change_events{{node_id=\"{node_id}\"}} {}",
+        metrics.path_change_event_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_path_state_count Number of peer paths by selected state."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_path_state_count gauge");
+    for state_count in &metrics.path_state_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_path_state_count{{node_id=\"{node_id}\",state=\"{}\"}} {}",
+            path_state_label(state_count.state),
+            state_count.count
+        );
+    }
+    body
+}
+
+fn path_state_label(state: PathState) -> &'static str {
+    match state {
+        PathState::DirectPublic => "DIRECT_PUBLIC",
+        PathState::DirectIpv6 => "DIRECT_IPV6",
+        PathState::DirectNatTraversal => "DIRECT_NAT_TRAVERSAL",
+        PathState::Relay => "RELAY",
+        PathState::Unreachable => "UNREACHABLE",
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[derive(Debug)]
@@ -130,7 +236,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime};
     use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathScore, PathState, PeerPathKey};
@@ -203,6 +309,27 @@ mod tests {
         assert_eq!(metrics.node_id, node_id);
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
+
+        let prometheus_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(prometheus_response.status(), StatusCode::OK);
+        assert_eq!(
+            prometheus_response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static(
+                "text/plain; version=0.0.4; charset=utf-8"
+            ))
+        );
+        let body = axum::body::to_bytes(prometheus_response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_agent_paths"));
+        assert!(body.contains("state=\"RELAY\""));
 
         let events_response = app
             .oneshot(

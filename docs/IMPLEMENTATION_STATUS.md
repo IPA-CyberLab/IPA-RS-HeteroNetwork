@@ -17,7 +17,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, multi-server NAT mapping classification, and `iparsd stun` daemon support for public endpoint detection.
-- Relay admission/status HTTP API, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
+- Relay admission/status HTTP API, Prometheus relay metrics, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, NAT classification status, agent status/STUN/NAT HTTP routes, and `iparsd agent`.
 - `iparsd agent --join-token` startup registration that uses persisted agent identity/WireGuard keys, current candidates, and token bootstrap control-plane discovery.
@@ -28,7 +28,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
 - Agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames and preserves opaque WireGuard payloads.
 - Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings.
-- Agent HTTP metrics export and bounded structured path-change event export.
+- Agent HTTP JSON/Prometheus metrics export and bounded structured path-change event export.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - `iparsd agent` Kubernetes underlay route application for Service/API CIDRs, with Helm DaemonSet wiring for node-name discovery and explicit route-provider configuration.
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents, with Docker Compose wiring for rootful bridge deployments.
@@ -50,7 +50,7 @@ This file tracks the gap between the requested final system and the current repo
 - NAT filtering classification, extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS, and topology validation.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay forwarder namespace placement, capacity limits, and restart/backoff policy hardening.
-- Prometheus/OpenTelemetry exporters and broader control-plane/relay metrics coverage.
+- OpenTelemetry exporters plus broader control-plane and relay dataplane metrics coverage.
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.
