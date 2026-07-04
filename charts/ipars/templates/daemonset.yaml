@@ -29,6 +29,8 @@ spec:
             - /var/lib/ipars/agent.json
             - --wireguard-interface
             - {{ .Values.agent.interfaceName | quote }}
+            - --join-token-path
+            - {{ printf "/var/lib/ipars/token/%s" .Values.agent.joinTokenSecretKey | quote }}
             - --control-plane-url
             - {{ .Values.cluster.controlPlaneUrl | quote }}
             - --signal-url
@@ -106,3 +108,6 @@ spec:
         - name: join-token
           secret:
             secretName: {{ .Values.agent.joinTokenSecretName }}
+            items:
+              - key: {{ .Values.agent.joinTokenSecretKey | quote }}
+                path: {{ .Values.agent.joinTokenSecretKey | quote }}

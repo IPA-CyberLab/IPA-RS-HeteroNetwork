@@ -13,6 +13,7 @@ cluster:
 agent:
   interfaceName: ipars0
   joinTokenSecretName: ipars-join-token
+  joinTokenSecretKey: token
   routeProvider: false
   hostNetwork: true
   privileged: false

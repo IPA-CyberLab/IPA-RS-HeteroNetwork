@@ -232,8 +232,14 @@ struct AgentArgs {
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_SIGNAL_URL")]
     signal_url: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN")]
+    #[arg(
+        long,
+        env = "IPARS_AGENT_JOIN_TOKEN",
+        conflicts_with = "join_token_path"
+    )]
     join_token: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN_PATH")]
+    join_token_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
     apply_peer_map: bool,
     #[arg(
@@ -1183,12 +1189,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     } else if let Some(stun_server) = args.stun_servers.first().copied() {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
-    let join_token = args
-        .join_token
-        .as_deref()
-        .map(serde_json::from_str::<SignedJoinToken>)
-        .transpose()
-        .context("agent join token must be JSON signed token")?;
+    let join_token = agent_join_token(&args)?;
     let registered_node = if let Some(token) = &join_token {
         let response = register_agent(runtime.as_ref(), token, args.control_plane_url.as_deref())
             .await
@@ -3145,6 +3146,31 @@ async fn negotiate_signal_paths(
     Ok(())
 }
 
+fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>> {
+    let Some(token) = raw_agent_join_token(args)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&token)
+        .map(Some)
+        .context("agent join token must be JSON signed token")
+}
+
+fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.join_token.as_deref() {
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.join_token_path.as_deref() else {
+        return Ok(None);
+    };
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read agent join token from {}", path.display()))?;
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("agent join token file {} is empty", path.display());
+    }
+    Ok(Some(token.to_string()))
+}
+
 async fn relay_session_needs_renewal(
     runtime: &AgentRuntime,
     peer: &NodeId,
@@ -3790,6 +3816,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "iparsd",
             "agent",
+            "--join-token-path",
+            "/var/lib/ipars/token/token",
             "--linux-netns",
             "node-a",
             "--runtime-backend",
@@ -3827,6 +3855,10 @@ mod tests {
         ])?;
 
         if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.join_token_path.as_deref(),
+                Some(Path::new("/var/lib/ipars/token/token"))
+            );
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
             assert_eq!(args.runtime_backend, AgentRuntimeBackend::DryRun);
             assert!(args.skip_runtime_preflight);
@@ -3883,6 +3915,51 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_join_token_can_be_loaded_from_file() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "iparsd-agent-token-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let token = serde_json::to_string(&token_with_bootstrap(Vec::new()))?;
+        std::fs::write(&path, format!(" {token}\n"))?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--join-token-path",
+            path.to_str()
+                .context("temporary token path must be valid UTF-8")?,
+        ])?;
+
+        let loaded = if let Command::Agent(args) = cli.command {
+            agent_join_token(&args)?
+        } else {
+            anyhow::bail!("expected agent command");
+        };
+
+        assert_eq!(
+            loaded.map(|token| token.claims.cluster_id),
+            Some(ClusterId::from_string("cluster-a"))
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_join_token_rejects_inline_and_path_together() {
+        let result = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--join-token",
+            "{}",
+            "--join-token-path",
+            "/var/lib/ipars/token/token",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
