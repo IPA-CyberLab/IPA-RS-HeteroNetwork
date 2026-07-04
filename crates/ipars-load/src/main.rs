@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use ipars_control_plane::{
@@ -12,11 +12,14 @@ use ipars_control_plane::{
 };
 use ipars_control_plane_http::{router as control_plane_router, ControlPlaneHttpState};
 use ipars_crypto::IdentityKeyPair;
+use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
+use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -24,6 +27,8 @@ use ipars_types::{
     RelayCapability, Role, Route, Tag, TokenPolicy,
 };
 use serde::{de::DeserializeOwned, Serialize};
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Parser)]
@@ -35,6 +40,12 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = TransportMode::InMemory)]
     transport: TransportMode,
+
+    #[arg(long, default_value_t = 4)]
+    relay_packets_per_session: usize,
+
+    #[arg(long, default_value_t = 512)]
+    relay_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -50,6 +61,22 @@ enum ScenarioName {
 enum TransportMode {
     InMemory,
     Http,
+    RelayUdp,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayLoadOptions {
+    packets_per_session: usize,
+    payload_bytes: usize,
+}
+
+impl RelayLoadOptions {
+    fn normalized(self) -> Self {
+        Self {
+            packets_per_session: self.packets_per_session.max(1),
+            payload_bytes: self.payload_bytes.clamp(1, 60_000),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,9 +137,20 @@ struct LoadReport {
     unreachable_paths: usize,
     control_plane_http_requests: usize,
     signal_http_requests: usize,
+    relay_http_requests: usize,
+    relay_udp_sessions: usize,
+    relay_packets_per_session: usize,
+    relay_payload_bytes_per_packet: usize,
+    relay_udp_packets_sent: usize,
+    relay_udp_packets_received: usize,
+    relay_udp_payload_bytes_sent: u64,
+    relay_udp_payload_bytes_received: u64,
+    relay_forwarded_bytes_reported: u64,
+    relay_mbps: f64,
     registration_millis: u128,
     peer_map_millis: u128,
     signal_millis: u128,
+    relay_millis: u128,
 }
 
 #[tokio::main]
@@ -122,6 +160,16 @@ async fn main() -> anyhow::Result<()> {
     let report = match cli.transport {
         TransportMode::InMemory => run_in_memory_scenario(scenario).await?,
         TransportMode::Http => run_http_scenario(scenario).await?,
+        TransportMode::RelayUdp => {
+            run_relay_udp_scenario(
+                scenario,
+                RelayLoadOptions {
+                    packets_per_session: cli.relay_packets_per_session,
+                    payload_bytes: cli.relay_payload_bytes,
+                },
+            )
+            .await?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -202,9 +250,20 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         unreachable_paths: path_counts.unreachable,
         control_plane_http_requests: 0,
         signal_http_requests: 0,
+        relay_http_requests: 0,
+        relay_udp_sessions: 0,
+        relay_packets_per_session: 0,
+        relay_payload_bytes_per_packet: 0,
+        relay_udp_packets_sent: 0,
+        relay_udp_packets_received: 0,
+        relay_udp_payload_bytes_sent: 0,
+        relay_udp_payload_bytes_received: 0,
+        relay_forwarded_bytes_reported: 0,
+        relay_mbps: 0.0,
         registration_millis,
         peer_map_millis,
         signal_millis,
+        relay_millis: 0,
     })
 }
 
@@ -309,9 +368,131 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         unreachable_paths: path_counts.unreachable,
         control_plane_http_requests: nodes.len() * 2,
         signal_http_requests: nodes.len() + scenario.active_pair_count,
+        relay_http_requests: 0,
+        relay_udp_sessions: 0,
+        relay_packets_per_session: 0,
+        relay_payload_bytes_per_packet: 0,
+        relay_udp_packets_sent: 0,
+        relay_udp_packets_received: 0,
+        relay_udp_payload_bytes_sent: 0,
+        relay_udp_payload_bytes_received: 0,
+        relay_forwarded_bytes_reported: 0,
+        relay_mbps: 0.0,
         registration_millis,
         peer_map_millis,
         signal_millis,
+        relay_millis: 0,
+    })
+}
+
+async fn run_relay_udp_scenario(
+    scenario: Scenario,
+    options: RelayLoadOptions,
+) -> anyhow::Result<LoadReport> {
+    let options = options.normalized();
+    let services = RelayNetworkedServices::start().await?;
+    let client = reqwest::Client::new();
+    let left_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    let right_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+    let left_addr = left_socket.local_addr()?;
+    let right_addr = right_socket.local_addr()?;
+    let mut receive_buffer = vec![0_u8; options.payload_bytes];
+
+    let relay_started = Instant::now();
+    let mut packets_sent = 0;
+    let mut packets_received = 0;
+    let mut payload_bytes_sent = 0_u64;
+    let mut payload_bytes_received = 0_u64;
+    for pair_index in 0..scenario.active_pair_count {
+        let admission: RelayAdmissionResponse = post_json(
+            &client,
+            format!("{}/v1/sessions", services.http_url),
+            &RelayAdmissionRequest {
+                left: NodeId::from_string(format!("relay-left-{pair_index:04}")),
+                right: NodeId::from_string(format!("relay-right-{pair_index:04}")),
+                left_addr,
+                right_addr,
+            },
+            "relay session admission",
+        )
+        .await?;
+
+        for packet_index in 0..options.packets_per_session {
+            let payload = relay_payload(pair_index, packet_index, options.payload_bytes);
+            let datagram =
+                encode_relay_datagram(&admission.session_id, &admission.session_token, &payload)?;
+            left_socket.send_to(&datagram, services.udp_addr).await?;
+            packets_sent += 1;
+            payload_bytes_sent = payload_bytes_sent.saturating_add(payload.len() as u64);
+
+            let (len, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                right_socket.recv_from(&mut receive_buffer),
+            )
+            .await
+            .context("timed out waiting for relay UDP payload")??;
+            if &receive_buffer[..len] != payload.as_slice() {
+                bail!("relay UDP payload mismatch for pair {pair_index} packet {packet_index}");
+            }
+            packets_received += 1;
+            payload_bytes_received = payload_bytes_received.saturating_add(len as u64);
+        }
+    }
+    let relay_elapsed = relay_started.elapsed();
+    let relay_millis = relay_elapsed.as_millis();
+    let status: RelayStatusResponse = get_json(
+        &client,
+        format!("{}/v1/status", services.http_url),
+        "relay status",
+    )
+    .await?;
+    let metrics = get_text(
+        &client,
+        format!("{}/metrics", services.http_url),
+        "relay metrics",
+    )
+    .await?;
+    let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
+    let relay_mbps = if relay_elapsed.is_zero() {
+        0.0
+    } else {
+        payload_bytes_received as f64 * 8.0 / relay_elapsed.as_secs_f64() / 1_000_000.0
+    };
+
+    Ok(LoadReport {
+        transport: TransportMode::RelayUdp,
+        scenario: scenario.name,
+        node_count: scenario.node_count,
+        relay_count: 1,
+        route_provider_count: 0,
+        advertised_routes: 0,
+        active_pair_count: scenario.active_pair_count,
+        registrations: 0,
+        peer_map_requests: 0,
+        peer_map_edges_seen: 0,
+        signal_negotiations: 0,
+        relay_candidates: 1,
+        direct_public_paths: 0,
+        direct_ipv6_paths: 0,
+        direct_nat_paths: 0,
+        relay_paths: scenario.active_pair_count,
+        unreachable_paths: 0,
+        control_plane_http_requests: 0,
+        signal_http_requests: 0,
+        relay_http_requests: scenario.active_pair_count + 2,
+        relay_udp_sessions: status.capability.active_sessions as usize,
+        relay_packets_per_session: options.packets_per_session,
+        relay_payload_bytes_per_packet: options.payload_bytes,
+        relay_udp_packets_sent: packets_sent,
+        relay_udp_packets_received: packets_received,
+        relay_udp_payload_bytes_sent: payload_bytes_sent,
+        relay_udp_payload_bytes_received: payload_bytes_received,
+        relay_forwarded_bytes_reported: forwarded_bytes,
+        relay_mbps,
+        registration_millis: 0,
+        peer_map_millis: 0,
+        signal_millis: 0,
+        relay_millis,
     })
 }
 
@@ -415,6 +596,57 @@ impl Drop for NetworkedServices {
     }
 }
 
+struct RelayNetworkedServices {
+    http_url: String,
+    udp_addr: SocketAddr,
+    shutdown_tx: watch::Sender<bool>,
+    http_task: JoinHandle<std::io::Result<()>>,
+    udp_task: JoinHandle<Result<(), ipars_relay::RelayError>>,
+}
+
+impl RelayNetworkedServices {
+    async fn start() -> anyhow::Result<Self> {
+        let udp_relay = UdpRelay::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+        let udp_addr = udp_relay.local_addr()?;
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await?;
+        let http_addr = listener.local_addr()?;
+        let service = Arc::new(RelayService::new(
+            NodeId::from_string("relay-load"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(udp_addr),
+                admission_url: Some(format!("http://{http_addr}")),
+                max_sessions: 10_000,
+                active_sessions: 0,
+                max_mbps: 10_000,
+                e2e_only: true,
+            },
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
+        let app = relay_router(RelayHttpState::new(service));
+        let http_task = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        Ok(Self {
+            http_url: format!("http://{http_addr}"),
+            udp_addr,
+            shutdown_tx,
+            http_task,
+            udp_task,
+        })
+    }
+}
+
+impl Drop for RelayNetworkedServices {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        self.http_task.abort();
+        self.udp_task.abort();
+    }
+}
+
 async fn get_json<Response>(
     client: &reqwest::Client,
     url: String,
@@ -433,6 +665,43 @@ where
         .json()
         .await
         .with_context(|| format!("failed to decode {context} response"))
+}
+
+async fn get_text(client: &reqwest::Client, url: String, context: &str) -> anyhow::Result<String> {
+    client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {context} request"))?
+        .error_for_status()
+        .with_context(|| format!("{context} request was rejected"))?
+        .text()
+        .await
+        .with_context(|| format!("failed to decode {context} response"))
+}
+
+fn prometheus_metric_u64(body: &str, metric_name: &str) -> anyhow::Result<u64> {
+    for line in body.lines() {
+        if line.starts_with(metric_name) {
+            let value = line
+                .split_whitespace()
+                .last()
+                .with_context(|| format!("missing value for metric {metric_name}"))?;
+            return value
+                .parse()
+                .with_context(|| format!("failed to parse metric {metric_name} value"));
+        }
+    }
+
+    bail!("metric {metric_name} was not present in relay metrics response")
+}
+
+fn relay_payload(pair_index: usize, packet_index: usize, payload_bytes: usize) -> Vec<u8> {
+    let mut payload = vec![0_u8; payload_bytes];
+    for (offset, byte) in payload.iter_mut().enumerate() {
+        *byte = ((pair_index + packet_index + offset) % 251) as u8;
+    }
+    payload
 }
 
 async fn post_json<Request, Response>(
@@ -652,6 +921,30 @@ mod tests {
         assert_eq!(report.signal_negotiations, 6);
         assert_eq!(report.control_plane_http_requests, 6);
         assert_eq!(report.signal_http_requests, 9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_harness_can_measure_relay_udp_throughput() -> anyhow::Result<()> {
+        let report = run_relay_udp_scenario(
+            Scenario::from_name(ScenarioName::Three),
+            RelayLoadOptions {
+                packets_per_session: 2,
+                payload_bytes: 64,
+            },
+        )
+        .await?;
+
+        assert_eq!(report.transport, TransportMode::RelayUdp);
+        assert_eq!(report.relay_udp_sessions, 6);
+        assert_eq!(report.relay_packets_per_session, 2);
+        assert_eq!(report.relay_payload_bytes_per_packet, 64);
+        assert_eq!(report.relay_udp_packets_sent, 12);
+        assert_eq!(report.relay_udp_packets_received, 12);
+        assert_eq!(report.relay_udp_payload_bytes_sent, 768);
+        assert_eq!(report.relay_udp_payload_bytes_received, 768);
+        assert_eq!(report.relay_forwarded_bytes_reported, 768);
+        assert_eq!(report.relay_http_requests, 8);
         Ok(())
     }
 

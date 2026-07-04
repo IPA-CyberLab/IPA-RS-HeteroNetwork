@@ -1090,6 +1090,8 @@ dependencies = [
  "ipars-control-plane",
  "ipars-control-plane-http",
  "ipars-crypto",
+ "ipars-relay",
+ "ipars-relay-http",
  "ipars-signal",
  "ipars-signal-http",
  "ipars-types",

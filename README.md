@@ -55,13 +55,15 @@ IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_bac
 ```
 
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
-or against loopback HTTP control-plane/signal endpoints with `--transport http`:
+against loopback HTTP control-plane/signal endpoints with `--transport http`, or through relay
+HTTP admission plus UDP forwarding with `--transport relay-udp`:
 
 ```bash
 cargo run -p ipars-load -- --scenario three
 cargo run -p ipars-load -- --scenario ten
 cargo run -p ipars-load -- --scenario thousand
 cargo run -p ipars-load -- --transport http --scenario ten
+cargo run -p ipars-load -- --transport relay-udp --scenario ten --relay-packets-per-session 16 --relay-payload-bytes 1200
 ```
 
 ## CLI Surface
