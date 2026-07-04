@@ -130,6 +130,10 @@ The route manager works from explicit network namespace, capability, and routing
 
 The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an agent.
 
+## Runtime Backends
+
+The agent data-plane applier has an explicit runtime backend selector. `linux-command` is the default and applies peer maps, Docker route intents, and Kubernetes underlay intents through host `ip`/`wg` commands, optionally wrapped with validated `ip netns exec` placement. `dry-run` keeps the same peer-map polling, relay-aware endpoint resolution, Docker route planning, and Kubernetes underlay route planning loops active while using in-memory WireGuard state and dry-run route application. This lets operators validate control-plane, signal, route, and relay decisions on hosts that should not yet mutate kernel networking state.
+
 ## Kubernetes Support
 
 This project implements Kubernetes node underlay VPN support and does not claim to be a CNI. The Helm chart installs:

@@ -6,12 +6,13 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::Router;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
-    NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
-    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, SystemCommandRunner,
-    UdpHolePuncher, UdpRelayFrameForwarder,
+    MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink,
+    PeerMapSource, PeerMapSync, RelayForwarderStats, RelaySessionState,
+    RuntimePeerEndpointResolver, SystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
+    WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -22,8 +23,9 @@ use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetworkNamespace, LinuxRouteCommandRunner,
-    LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
+    DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent, LinuxNetworkNamespace,
+    LinuxRouteCommandRunner, LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager,
+    SystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
@@ -153,6 +155,13 @@ struct AgentArgs {
     join_token: Option<String>,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
     apply_peer_map: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RUNTIME_BACKEND",
+        value_enum,
+        default_value_t = AgentRuntimeBackend::LinuxCommand
+    )]
+    runtime_backend: AgentRuntimeBackend,
     #[arg(
         long,
         env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
@@ -301,6 +310,23 @@ struct AgentArgs {
         default_value_t = 60
     )]
     kubernetes_route_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentRuntimeBackend {
+    #[value(name = "linux-command")]
+    LinuxCommand,
+    #[value(name = "dry-run")]
+    DryRun,
+}
+
+impl AgentRuntimeBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxCommand => "linux-command",
+            Self::DryRun => "dry-run",
+        }
+    }
 }
 
 #[tokio::main]
@@ -545,53 +571,96 @@ async fn start_peer_map_sync(
     runtime: Arc<AgentRuntime>,
     control_plane_url: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let namespace = args
-        .linux_netns
-        .as_deref()
-        .map(LinuxNetworkNamespace::from_name)
-        .transpose()?;
-    if let Some(namespace) = namespace {
-        start_peer_map_sync_with_runners(
-            args,
-            runtime,
-            control_plane_url,
-            NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
-            NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
-        )
-        .await
-    } else {
-        start_peer_map_sync_with_runners(
-            args,
-            runtime,
-            control_plane_url,
-            SystemCommandRunner,
-            SystemRouteCommandRunner,
-        )
-        .await
+    match args.runtime_backend {
+        AgentRuntimeBackend::LinuxCommand => {
+            let namespace = args
+                .linux_netns
+                .as_deref()
+                .map(LinuxNetworkNamespace::from_name)
+                .transpose()?;
+            if let Some(namespace) = namespace {
+                start_peer_map_sync_with_runners(
+                    args,
+                    runtime,
+                    control_plane_url,
+                    NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
+                    NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
+                )
+                .await
+            } else {
+                start_peer_map_sync_with_runners(
+                    args,
+                    runtime,
+                    control_plane_url,
+                    SystemCommandRunner,
+                    SystemRouteCommandRunner,
+                )
+                .await
+            }
+        }
+        AgentRuntimeBackend::DryRun => {
+            if let Some(namespace) = args.linux_netns.as_deref() {
+                LinuxNetworkNamespace::from_name(namespace)?;
+            }
+            tracing::info!(
+                backend = args.runtime_backend.as_str(),
+                linux_netns = ?args.linux_netns,
+                "starting peer-map sync with dry-run runtime backend"
+            );
+            let applier = PeerMapApplier::new(
+                args.wireguard_interface.clone(),
+                MemoryWireGuardBackend::default(),
+                DryRunLinuxRouteManager,
+            );
+            let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+            Ok(start_peer_map_sync_with_sink(
+                args,
+                runtime,
+                control_plane_url,
+                applier,
+            ))
+        }
     }
 }
 
 async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let namespace = args
-        .linux_netns
-        .as_deref()
-        .map(LinuxNetworkNamespace::from_name)
-        .transpose()?;
     let intent = docker_network_intent(args)?;
     let interval = Duration::from_secs(args.docker_route_interval_seconds.max(1));
-    if let Some(namespace) = namespace {
-        let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
-            namespace,
-            SystemRouteCommandRunner,
-        ));
-        Ok(tokio::spawn(async move {
-            run_docker_route_loop(manager, intent, interval).await;
-        }))
-    } else {
-        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
-        Ok(tokio::spawn(async move {
-            run_docker_route_loop(manager, intent, interval).await;
-        }))
+    match args.runtime_backend {
+        AgentRuntimeBackend::LinuxCommand => {
+            let namespace = args
+                .linux_netns
+                .as_deref()
+                .map(LinuxNetworkNamespace::from_name)
+                .transpose()?;
+            if let Some(namespace) = namespace {
+                let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                    namespace,
+                    SystemRouteCommandRunner,
+                ));
+                Ok(tokio::spawn(async move {
+                    run_docker_route_loop(manager, intent, interval).await;
+                }))
+            } else {
+                let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+                Ok(tokio::spawn(async move {
+                    run_docker_route_loop(manager, intent, interval).await;
+                }))
+            }
+        }
+        AgentRuntimeBackend::DryRun => {
+            if let Some(namespace) = args.linux_netns.as_deref() {
+                LinuxNetworkNamespace::from_name(namespace)?;
+            }
+            tracing::info!(
+                backend = args.runtime_backend.as_str(),
+                container_namespace = %intent.container_namespace,
+                "starting Docker route loop with dry-run runtime backend"
+            );
+            Ok(tokio::spawn(async move {
+                run_docker_route_loop(DryRunLinuxRouteManager, intent, interval).await;
+            }))
+        }
     }
 }
 
@@ -613,12 +682,9 @@ fn docker_network_intent(args: &AgentArgs) -> anyhow::Result<DockerNetworkIntent
     })
 }
 
-async fn run_docker_route_loop<R>(
-    manager: LinuxRouteManager<R>,
-    intent: DockerNetworkIntent,
-    interval: Duration,
-) where
-    R: LinuxRouteCommandRunner + 'static,
+async fn run_docker_route_loop<M>(manager: M, intent: DockerNetworkIntent, interval: Duration)
+where
+    M: RouteManager + 'static,
 {
     loop {
         match manager.apply_docker_intent(intent.clone()).await {
@@ -643,26 +709,43 @@ async fn start_kubernetes_underlay_routes(
     args: &AgentArgs,
     local_node_id: NodeId,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let namespace = args
-        .linux_netns
-        .as_deref()
-        .map(LinuxNetworkNamespace::from_name)
-        .transpose()?;
     let intent = kubernetes_underlay_intent(args, local_node_id)?;
     let interval = Duration::from_secs(args.kubernetes_route_interval_seconds.max(1));
-    if let Some(namespace) = namespace {
-        let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
-            namespace,
-            SystemRouteCommandRunner,
-        ));
-        Ok(tokio::spawn(async move {
-            run_kubernetes_underlay_route_loop(manager, intent, interval).await;
-        }))
-    } else {
-        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
-        Ok(tokio::spawn(async move {
-            run_kubernetes_underlay_route_loop(manager, intent, interval).await;
-        }))
+    match args.runtime_backend {
+        AgentRuntimeBackend::LinuxCommand => {
+            let namespace = args
+                .linux_netns
+                .as_deref()
+                .map(LinuxNetworkNamespace::from_name)
+                .transpose()?;
+            if let Some(namespace) = namespace {
+                let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                    namespace,
+                    SystemRouteCommandRunner,
+                ));
+                Ok(tokio::spawn(async move {
+                    run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+                }))
+            } else {
+                let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+                Ok(tokio::spawn(async move {
+                    run_kubernetes_underlay_route_loop(manager, intent, interval).await;
+                }))
+            }
+        }
+        AgentRuntimeBackend::DryRun => {
+            if let Some(namespace) = args.linux_netns.as_deref() {
+                LinuxNetworkNamespace::from_name(namespace)?;
+            }
+            tracing::info!(
+                backend = args.runtime_backend.as_str(),
+                node_name = %intent.node_name,
+                "starting Kubernetes underlay route loop with dry-run runtime backend"
+            );
+            Ok(tokio::spawn(async move {
+                run_kubernetes_underlay_route_loop(DryRunLinuxRouteManager, intent, interval).await;
+            }))
+        }
     }
 }
 
@@ -692,12 +775,12 @@ fn kubernetes_underlay_intent(
     })
 }
 
-async fn run_kubernetes_underlay_route_loop<R>(
-    manager: LinuxRouteManager<R>,
+async fn run_kubernetes_underlay_route_loop<M>(
+    manager: M,
     intent: KubernetesUnderlayIntent,
     interval: Duration,
 ) where
-    R: LinuxRouteCommandRunner + 'static,
+    M: RouteManager + 'static,
 {
     loop {
         match manager.apply_kubernetes_intent(intent.clone()).await {
@@ -732,8 +815,30 @@ where
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
     let route_manager = LinuxRouteManager::new(route_runner);
-    let mut applier =
-        PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    tracing::info!(
+        backend = args.runtime_backend.as_str(),
+        linux_netns = ?args.linux_netns,
+        "starting peer-map sync with Linux command runtime backend"
+    );
+    Ok(start_peer_map_sync_with_sink(
+        args,
+        runtime,
+        control_plane_url,
+        applier,
+    ))
+}
+
+fn configure_peer_map_endpoint_resolver<W, R>(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+    mut applier: PeerMapApplier<W, R>,
+) -> PeerMapApplier<W, R>
+where
+    W: WireGuardBackend,
+    R: RouteManager,
+{
     if args.relay_forwarder_endpoint.is_some() || args.relay_forwarder_bind.is_some() {
         let mut resolver = RuntimePeerEndpointResolver::new(runtime.clone());
         if let Some(endpoint) = args.relay_forwarder_endpoint {
@@ -746,16 +851,28 @@ where
         );
         applier = applier.with_endpoint_resolver(resolver);
     }
+    applier
+}
+
+fn start_peer_map_sync_with_sink<A>(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+    control_plane_url: String,
+    sink: A,
+) -> tokio::task::JoinHandle<()>
+where
+    A: PeerMapSink + 'static,
+{
     let sync = PeerMapSync::new(
         runtime.state().node_id.clone(),
         HttpPeerMapSource::new(control_plane_url),
-        applier,
+        sink,
     );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
     let interface = args.wireguard_interface.clone();
-    Ok(tokio::spawn(async move {
+    tokio::spawn(async move {
         run_peer_map_sync_loop(sync, interval, interface).await;
-    }))
+    })
 }
 
 fn relay_forwarder_supervisor(
@@ -2048,6 +2165,8 @@ mod tests {
             "agent",
             "--linux-netns",
             "node-a",
+            "--runtime-backend",
+            "dry-run",
             "--relay-session-renew-before-seconds",
             "45",
             "--relay-forwarder-endpoint",
@@ -2081,6 +2200,7 @@ mod tests {
 
         if let Command::Agent(args) = cli.command {
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
+            assert_eq!(args.runtime_backend, AgentRuntimeBackend::DryRun);
             assert_eq!(args.relay_session_renew_before_seconds, 45);
             assert_eq!(
                 args.relay_forwarder_endpoint,
@@ -2130,6 +2250,19 @@ mod tests {
                 Some("route-provider-a")
             );
             assert_eq!(args.kubernetes_route_interval_seconds, 15);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_args_default_to_linux_command_runtime_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(args.runtime_backend, AgentRuntimeBackend::LinuxCommand);
+            assert_eq!(args.runtime_backend.as_str(), "linux-command");
             return Ok(());
         }
 

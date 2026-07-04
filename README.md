@@ -35,7 +35,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
-- `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends, including `--linux-netns` namespace placement, with retry on control-plane errors
+- `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
@@ -81,5 +81,7 @@ ipars path status
 ipars docker install
 ipars k8s install
 ```
+
+`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
 
 The next production milestone is to extend network-namespace integration tests from route-backend validation into direct, NAT traversal, and relay fallback path validation.

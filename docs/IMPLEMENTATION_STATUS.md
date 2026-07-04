@@ -38,7 +38,8 @@ This file tracks the gap between the requested final system and the current repo
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
 - Gated Linux network namespace integration smoke test for applying and removing routes through the namespaced route backend.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
-- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through Linux WireGuard/route backends when explicitly enabled, supports `--linux-netns` namespace placement, and retries without stopping the agent when the control plane is temporarily unavailable.
+- `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command execution, and retries without stopping the agent when the control plane is temporarily unavailable.
+- `iparsd agent --runtime-backend dry-run` for peer-map, Docker route, and Kubernetes underlay loops using in-memory WireGuard state and dry-run route application without mutating host networking.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
 - Docker Compose and Helm chart starting points.
@@ -46,7 +47,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Runtime backend selection and hardening for production deployments.
+- Runtime backend hardening beyond current Linux command and dry-run selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - NAT filtering classification, extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS, and topology validation.
