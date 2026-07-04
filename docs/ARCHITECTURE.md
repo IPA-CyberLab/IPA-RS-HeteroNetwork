@@ -156,6 +156,12 @@ Initial signal HTTP routes:
 - `POST /v1/paths/negotiate`
 - `GET /v1/hole-punch/{source}/{target}`
 
+Initial relay HTTP routes:
+
+- `GET /healthz`
+- `GET /v1/status`
+- `POST /v1/sessions`
+
 ## Observability
 
 All daemons emit:

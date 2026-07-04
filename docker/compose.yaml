@@ -70,14 +70,22 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
     command:
       - relay
-      - status
+      - --relay-node-id
+      - relay-dev
+      - --udp-listen
+      - 0.0.0.0:51820
+      - --http-listen
+      - 0.0.0.0:9580
     environment:
       IPARS_ROLE: relay
       IPARS_RELAY_MAX_SESSIONS: "10000"
     ports:
       - "51820:51820/udp"
+      - "9580:9580"
     cap_add:
       - NET_ADMIN
     devices:

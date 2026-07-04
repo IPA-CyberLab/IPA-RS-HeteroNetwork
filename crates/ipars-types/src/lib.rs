@@ -639,6 +639,24 @@ pub mod api {
         pub capability: RelayCapability,
         pub health: HealthState,
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RelayAdmissionRequest {
+        pub left: NodeId,
+        pub right: NodeId,
+        pub left_addr: SocketAddr,
+        pub right_addr: SocketAddr,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RelayAdmissionResponse {
+        pub relay_node: NodeId,
+        pub session_id: String,
+        pub left: NodeId,
+        pub right: NodeId,
+        pub left_addr: SocketAddr,
+        pub right_addr: SocketAddr,
+    }
 }
 
 #[cfg(test)]

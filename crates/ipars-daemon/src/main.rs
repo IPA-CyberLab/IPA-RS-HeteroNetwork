@@ -9,11 +9,13 @@ use ipars_control_plane::{
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
+use ipars_relay::{RelayService, UdpRelay};
+use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
-use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId};
+use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId, RelayCapability};
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -28,6 +30,7 @@ enum Command {
     ControlPlane(ControlPlaneArgs),
     Signal(SignalArgs),
     Stun(StunArgs),
+    Relay(RelayArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -80,6 +83,22 @@ struct StunArgs {
     listen: SocketAddr,
 }
 
+#[derive(Debug, Args, Clone)]
+struct RelayArgs {
+    #[arg(long, env = "IPARS_RELAY_NODE_ID")]
+    relay_node_id: String,
+    #[arg(long, env = "IPARS_RELAY_UDP_LISTEN", default_value = "0.0.0.0:51820")]
+    udp_listen: SocketAddr,
+    #[arg(long, env = "IPARS_RELAY_HTTP_LISTEN", default_value = "0.0.0.0:9580")]
+    http_listen: SocketAddr,
+    #[arg(long, env = "IPARS_RELAY_PUBLIC_ENDPOINT")]
+    public_endpoint: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
+    max_sessions: u32,
+    #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
+    max_mbps: u32,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -87,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ControlPlane(args) => run_control_plane(args).await,
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
+        Command::Relay(args) => run_relay(args).await,
     }
 }
 
@@ -177,6 +197,30 @@ async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
     shutdown_task.abort();
     result?;
     Ok(())
+}
+
+async fn run_relay(args: RelayArgs) -> anyhow::Result<()> {
+    let udp_relay = UdpRelay::bind(args.udp_listen).await?;
+    let udp_addr = udp_relay.local_addr()?;
+    let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
+    let service = Arc::new(RelayService::new(
+        NodeId::from_string(args.relay_node_id),
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(public_endpoint),
+            max_sessions: args.max_sessions,
+            active_sessions: 0,
+            max_mbps: args.max_mbps,
+            e2e_only: true,
+        },
+    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
+    tracing::info!(%udp_addr, http_listen = %args.http_listen, "relay listening");
+    let http_result =
+        serve_router(args.http_listen, relay_router(RelayHttpState::new(service))).await;
+    udp_task.abort();
+    http_result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,6 +8,7 @@ members = [
     "crates/ipars-crypto",
     "crates/ipars-daemon",
     "crates/ipars-relay",
+    "crates/ipars-relay-http",
     "crates/ipars-route-manager",
     "crates/ipars-signal",
     "crates/ipars-signal-http",
