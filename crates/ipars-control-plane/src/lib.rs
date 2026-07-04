@@ -564,7 +564,11 @@ where
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
-    claims.policy.allowed_routes.contains(&route.cidr)
+    claims
+        .policy
+        .allowed_routes
+        .iter()
+        .any(|allowed_route| allowed_route.contains(&route.cidr))
 }
 
 fn relay_capability_allowed(
@@ -685,6 +689,17 @@ mod tests {
         }
     }
 
+    fn route(id: &str, cidr: &str, advertised_by: &str) -> Result<Route, ipnet::AddrParseError> {
+        Ok(Route {
+            id: id.to_string(),
+            cidr: cidr.parse()?,
+            advertised_by: NodeId::from_string(advertised_by),
+            via: None,
+            metric: 100,
+            tags: BTreeSet::new(),
+        })
+    }
+
     fn candidate(node_id: &str) -> EndpointCandidate {
         EndpointCandidate {
             node_id: NodeId::from_string(node_id),
@@ -769,6 +784,50 @@ mod tests {
             Some(true)
         );
         assert_eq!(response.relay_map.relays.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_allows_routes_within_token_route_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.requested_routes = vec![route("route-a", "10.42.1.0/24", "node-a")?];
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+
+        let response = plane.register_with_claims(claims, request).await?;
+
+        assert_eq!(response.node.routes.len(), 1);
+        assert_eq!(response.node.routes[0].cidr, "10.42.1.0/24".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_routes_outside_token_route_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.requested_routes = vec![route("route-a", "10.43.0.0/16", "node-a")?];
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+
+        let error = match plane.register_with_claims(claims, request).await {
+            Ok(_) => return Err("unexpected successful route registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ControlPlaneError::RouteDenied(route) if route == "route-a"));
         Ok(())
     }
 
