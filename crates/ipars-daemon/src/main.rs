@@ -61,6 +61,10 @@ use serde::Deserialize;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
+const CAP_NET_ADMIN_BIT: u8 = 12;
+const CAP_NET_RAW_BIT: u8 = 13;
+const CAP_SYS_ADMIN_BIT: u8 = 21;
+
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
 #[command(about = "IPA-RS-HeteroNetwork daemon processes")]
@@ -648,6 +652,7 @@ struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
     cap_net_admin: bool,
+    cap_net_raw: bool,
     cap_sys_admin: bool,
     linux_netns: bool,
 }
@@ -658,6 +663,7 @@ impl RuntimePreflightNeeds {
             ip_command: false,
             wg_command: false,
             cap_net_admin: false,
+            cap_net_raw: false,
             cap_sys_admin: false,
             linux_netns: false,
         }
@@ -797,6 +803,7 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     if !needs.ip_command
         && !needs.wg_command
         && !needs.cap_net_admin
+        && !needs.cap_net_raw
         && !needs.cap_sys_admin
         && !needs.linux_netns
     {
@@ -810,6 +817,9 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     }
     if needs.cap_net_admin {
         ensure_cap_net_admin_if_known()?;
+    }
+    if needs.cap_net_raw {
+        ensure_cap_net_raw_if_known()?;
     }
     if needs.cap_sys_admin {
         ensure_cap_sys_admin_if_known()?;
@@ -830,6 +840,7 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
         needs_cap_net_admin = needs.cap_net_admin,
+        needs_cap_net_raw = needs.cap_net_raw,
         needs_cap_sys_admin = needs.cap_sys_admin,
         linux_netns = ?args.linux_netns,
         "runtime backend preflight passed"
@@ -852,6 +863,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
         wg_command: applies_wireguard_with_command,
         cap_net_admin: applies_routes || applies_wireguard,
+        cap_net_raw: applies_wireguard,
         cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
     }
@@ -905,14 +917,23 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
-    if let Some(false) = process_has_capability(12)? {
+    if let Some(false) = process_has_capability(CAP_NET_ADMIN_BIT)? {
         anyhow::bail!("linux-command runtime backend requires CAP_NET_ADMIN");
     }
     Ok(())
 }
 
+fn ensure_cap_net_raw_if_known() -> anyhow::Result<()> {
+    if let Some(false) = process_has_capability(CAP_NET_RAW_BIT)? {
+        anyhow::bail!(
+            "linux-command runtime backend requires CAP_NET_RAW for WireGuard dataplane sockets"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_cap_sys_admin_if_known() -> anyhow::Result<()> {
-    if let Some(false) = process_has_capability(21)? {
+    if let Some(false) = process_has_capability(CAP_SYS_ADMIN_BIT)? {
         anyhow::bail!(
             "linux network namespace runtime backend requires CAP_SYS_ADMIN for setns/ip netns exec"
         );
@@ -926,6 +947,10 @@ fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    process_status_has_capability(&status, bit)
+}
+
+fn process_status_has_capability(status: &str, bit: u8) -> anyhow::Result<Option<bool>> {
     let cap_eff = status
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
@@ -6845,6 +6870,7 @@ invalid no-destination-here
             assert!(needs.ip_command);
             assert!(needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
             let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
                 Ok(()) => anyhow::bail!("unexpected successful preflight"),
@@ -6877,6 +6903,7 @@ invalid no-destination-here
             assert!(needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
             return Ok(());
         }
@@ -6906,6 +6933,7 @@ invalid no-destination-here
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
             return Ok(());
         }
@@ -6934,12 +6962,60 @@ invalid no-destination-here
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(needs.cap_net_raw);
             assert!(needs.cap_sys_admin);
             assert!(needs.linux_netns);
             return Ok(());
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_does_not_require_net_raw_for_route_only_application() -> anyhow::Result<()>
+    {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn process_status_capability_parser_handles_known_and_missing_caps() -> anyhow::Result<()> {
+        let status = "Name:\tiparsd\nCapEff:\t0000000000003000\n";
+        assert_eq!(
+            process_status_has_capability(status, CAP_NET_ADMIN_BIT)?,
+            Some(true)
+        );
+        assert_eq!(
+            process_status_has_capability(status, CAP_NET_RAW_BIT)?,
+            Some(true)
+        );
+        assert_eq!(
+            process_status_has_capability(status, CAP_SYS_ADMIN_BIT)?,
+            Some(false)
+        );
+        assert_eq!(
+            process_status_has_capability("Name:\tiparsd\n", CAP_NET_RAW_BIT)?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
