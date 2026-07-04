@@ -240,6 +240,22 @@ struct AgentArgs {
     join_token: Option<String>,
     #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN_PATH")]
     join_token_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT",
+        requires = "relay_admission_url"
+    )]
+    relay_public_endpoint: Option<SocketAddr>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_ADMISSION_URL",
+        requires = "relay_public_endpoint"
+    )]
+    relay_admission_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
+    relay_max_sessions: u32,
+    #[arg(long, env = "IPARS_AGENT_RELAY_MAX_MBPS", default_value_t = 1000)]
+    relay_max_mbps: u32,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
     apply_peer_map: bool,
     #[arg(
@@ -1182,6 +1198,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+    let relay_capability = agent_relay_capability(&args);
     if args.stun_servers.len() > 1 {
         runtime
             .classify_nat(args.stun_bind, args.stun_servers.clone())
@@ -1191,9 +1208,14 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     }
     let join_token = agent_join_token(&args)?;
     let registered_node = if let Some(token) = &join_token {
-        let response = register_agent(runtime.as_ref(), token, args.control_plane_url.as_deref())
-            .await
-            .context("failed to register agent with control plane")?;
+        let response = register_agent(
+            runtime.as_ref(),
+            token,
+            args.control_plane_url.as_deref(),
+            relay_capability.clone(),
+        )
+        .await
+        .context("failed to register agent with control plane")?;
         let registered_node = response.node.clone();
         tracing::info!(
             node_id = %response.node.node_id,
@@ -2795,6 +2817,7 @@ async fn register_agent(
     runtime: &AgentRuntime,
     token: &SignedJoinToken,
     control_plane_url: Option<&str>,
+    relay_capability: Option<RelayCapability>,
 ) -> anyhow::Result<RegisterNodeResponse> {
     let join_url = control_plane_join_url(token, control_plane_url)?;
     let status = runtime.status().await;
@@ -2805,7 +2828,7 @@ async fn register_agent(
             identity_public_key: status.identity_public_key,
             wireguard_public_key: status.wireguard_public_key,
             candidates: status.candidates,
-            relay_capability: None,
+            relay_capability,
             requested_routes: Vec::new(),
         },
     };
@@ -3171,6 +3194,20 @@ fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     Ok(Some(token.to_string()))
 }
 
+fn agent_relay_capability(args: &AgentArgs) -> Option<RelayCapability> {
+    let public_endpoint = args.relay_public_endpoint?;
+    let admission_url = args.relay_admission_url.clone()?;
+    Some(RelayCapability {
+        enabled_by_policy: false,
+        public_endpoint: Some(public_endpoint),
+        admission_url: Some(admission_url),
+        max_sessions: args.relay_max_sessions,
+        active_sessions: 0,
+        max_mbps: args.relay_max_mbps,
+        e2e_only: true,
+    })
+}
+
 async fn relay_session_needs_renewal(
     runtime: &AgentRuntime,
     peer: &NodeId,
@@ -3203,16 +3240,30 @@ async fn admit_relay_session(
         .await
         .context("failed to decode relay admission response")?;
 
-    Ok(RelaySessionState {
+    Ok(relay_session_state_from_admission(
+        peer,
+        relay,
+        response,
+        relay_endpoint,
+    ))
+}
+
+fn relay_session_state_from_admission(
+    peer: &NodeRecord,
+    relay: &NodeRecord,
+    response: RelayAdmissionResponse,
+    relay_endpoint: SocketAddr,
+) -> RelaySessionState {
+    RelaySessionState {
         peer: peer.node_id.clone(),
-        relay_node: response.relay_node,
+        relay_node: relay.node_id.clone(),
         relay_endpoint,
         admitted_local_addr: response.left_addr,
         admitted_peer_addr: response.right_addr,
         session_id: response.session_id,
         session_token: response.session_token,
         expires_at: response.expires_at,
-    })
+    }
 }
 
 fn relay_admission_request(
@@ -3552,7 +3603,7 @@ mod tests {
 
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
-    use ipars_types::api::RelayDataplaneDropReason;
+    use ipars_types::api::{RelayAdmissionResponse, RelayDataplaneDropReason};
     use ipars_types::{
         BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
         JoinTokenClaims, PathScore, PeerPathKey, Role, TokenPolicy, VpnIp,
@@ -3818,6 +3869,14 @@ mod tests {
             "agent",
             "--join-token-path",
             "/var/lib/ipars/token/token",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-max-sessions",
+            "500",
+            "--relay-max-mbps",
+            "250",
             "--linux-netns",
             "node-a",
             "--runtime-backend",
@@ -3859,6 +3918,19 @@ mod tests {
                 args.join_token_path.as_deref(),
                 Some(Path::new("/var/lib/ipars/token/token"))
             );
+            let relay_capability =
+                agent_relay_capability(&args).context("expected relay capability")?;
+            assert_eq!(
+                relay_capability.public_endpoint,
+                Some(SocketAddr::from(([203, 0, 113, 30], 51_820)))
+            );
+            assert_eq!(
+                relay_capability.admission_url.as_deref(),
+                Some("http://relay-a:9580")
+            );
+            assert!(!relay_capability.enabled_by_policy);
+            assert_eq!(relay_capability.max_sessions, 500);
+            assert_eq!(relay_capability.max_mbps, 250);
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
             assert_eq!(args.runtime_backend, AgentRuntimeBackend::DryRun);
             assert!(args.skip_runtime_preflight);
@@ -3918,6 +3990,25 @@ mod tests {
     }
 
     #[test]
+    fn agent_relay_capability_requires_endpoint_and_admission_url() {
+        let missing_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+        ]);
+        assert!(missing_url.is_err());
+
+        let missing_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+        ]);
+        assert!(missing_endpoint.is_err());
+    }
+
+    #[test]
     fn agent_join_token_can_be_loaded_from_file() -> anyhow::Result<()> {
         let path = std::env::temp_dir().join(format!(
             "iparsd-agent-token-{}-{}.json",
@@ -3960,6 +4051,29 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn relay_session_state_uses_advertised_relay_node() {
+        let peer = node_record("node-b");
+        let relay = node_record("relay-advertised");
+        let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
+        let response = RelayAdmissionResponse {
+            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            session_id: "node-a:node-b".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: Utc::now() + ChronoDuration::seconds(300),
+            left: NodeId::from_string("node-a"),
+            right: peer.node_id.clone(),
+            left_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+            right_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
+        };
+
+        let session = relay_session_state_from_admission(&peer, &relay, response, relay_endpoint);
+
+        assert_eq!(session.peer, NodeId::from_string("node-b"));
+        assert_eq!(session.relay_node, NodeId::from_string("relay-advertised"));
+        assert_eq!(session.relay_endpoint, relay_endpoint);
     }
 
     #[test]

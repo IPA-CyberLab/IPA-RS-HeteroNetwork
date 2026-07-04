@@ -31,6 +31,16 @@ spec:
             - {{ .Values.agent.interfaceName | quote }}
             - --join-token-path
             - {{ printf "/var/lib/ipars/token/%s" .Values.agent.joinTokenSecretKey | quote }}
+            {{- if .Values.agent.relayAdvertisement.enabled }}
+            - --relay-public-endpoint
+            - {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
+            - --relay-admission-url
+            - {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}
+            - --relay-max-sessions
+            - {{ .Values.agent.relayAdvertisement.maxSessions | quote }}
+            - --relay-max-mbps
+            - {{ .Values.agent.relayAdvertisement.maxMbps | quote }}
+            {{- end }}
             - --control-plane-url
             - {{ .Values.cluster.controlPlaneUrl | quote }}
             - --signal-url

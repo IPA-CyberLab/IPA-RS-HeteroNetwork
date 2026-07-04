@@ -25,6 +25,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` signal-service node registration that upserts the registered `NodeRecord` with refreshed endpoint candidates when a signal endpoint is known.
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
 - `iparsd agent` relay admission for `RELAY` paths selected by signal negotiation, using relay-advertised admission URLs and keeping expiring relay credentials in transient agent runtime state.
+- `iparsd agent` relay capability advertisement for public nodes with explicit relay endpoint/admission URL settings, gated by join-token relay policy during control-plane registration.
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
 - Agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames and preserves opaque WireGuard payloads.
 - Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings; relay forwarders support namespace placement checks, capacity limits, dead-task reaping, stale endpoint removal, restart backoff, and configurable crash-loop cooldown policy.

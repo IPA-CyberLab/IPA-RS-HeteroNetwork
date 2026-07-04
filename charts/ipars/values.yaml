@@ -21,6 +21,12 @@ agent:
     maxSessions: 1024
     restartBackoffSeconds: 5
     netns: ""
+  relayAdvertisement:
+    enabled: false
+    publicEndpoint: ""
+    admissionUrl: ""
+    maxSessions: 10000
+    maxMbps: 1000
 
 serviceExposure:
   enabled: true

@@ -112,6 +112,8 @@ Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an oute
 
 Relay candidates advertise both a public UDP relay endpoint and an HTTP admission URL. When signal negotiation selects `RELAY`, the agent admits a relay session directly with that relay and keeps the returned credential in transient runtime state rather than reporting it back through control-plane heartbeat.
 
+An agent only advertises a local relay service to the control plane when it is started with an explicit relay public endpoint and relay admission URL. The control plane still marks that relay capability enabled only when the join token policy allows relay, so public UDP reachability alone does not make a node a relay candidate.
+
 The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Its UDP loop forwards packets from the local WireGuard socket to the relay and sends stripped inbound relay payloads back toward the local WireGuard endpoint.
 
 Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
@@ -146,6 +148,8 @@ This project implements Kubernetes node underlay VPN support and does not claim 
 - routing-peer configuration for node-to-node and node-to-service overlay routes
 
 When Kubernetes underlay routing is enabled, the DaemonSet starts `iparsd agent` with the node name from the Downward API, a mounted join token Secret passed through `--join-token-path`, and either explicit Service/API CIDRs or RBAC-backed Kubernetes API discovery. With `--kubernetes-discover-services`, the agent uses its ServiceAccount token, optional namespace filters, and an optional Service label selector to list Services and derive cluster-IP host routes. It can also derive the in-cluster API server host route from `KUBERNETES_SERVICE_HOST`. The agent periodically applies the resolved routes through the Linux route backend, optionally through `ip netns exec`, using either an explicit route-provider node ID or the local node identity.
+
+Helm can optionally pass relay advertisement settings to the agent for public nodes that run a colocated relay service. Those settings remain inactive unless `agent.relayAdvertisement.enabled` is set and the join token policy permits relay.
 
 CNI-owned pod networking remains the responsibility of the cluster CNI.
 
