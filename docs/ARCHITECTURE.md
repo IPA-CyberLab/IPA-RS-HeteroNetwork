@@ -42,7 +42,7 @@ The control plane is designed for multiple public nodes. Durable state lives in 
 - Durable: node records, VPN IP leases, identity public keys, WireGuard public keys, policy, ACL, routes, relay policy, token revocation, and latest accepted path state.
 - Ephemeral: active signal sessions, transient endpoint candidates, probe windows, relay session counters, and short-lived health samples.
 
-Control-plane nodes use the same durable store and advertise themselves through the bootstrap endpoint list. CLI and agent join registration try control-plane bootstrap endpoints in token order, so additional public control-plane nodes can take over initial registration when an earlier endpoint is unavailable. After registration, agents keep an ordered control-plane endpoint list for heartbeat reporting, peer-map polling, and signal path peer-map fetches, preferring the endpoint that accepted registration and falling back to the token bootstrap endpoints unless an operator pins `--control-plane-url`. Relay/STUN/signal instances are separately discoverable and can be added or drained without invalidating existing WireGuard peers.
+Control-plane nodes use the same durable store and advertise themselves through the bootstrap endpoint list. CLI and agent join registration try control-plane bootstrap endpoints in token order, so additional public control-plane nodes can take over initial registration when an earlier endpoint is unavailable. After registration, agents keep an ordered control-plane endpoint list for heartbeat reporting, peer-map polling, and signal path peer-map fetches, preferring the endpoint that accepted registration and falling back to the token bootstrap endpoints unless an operator pins `--control-plane-url`. Agents register their node/candidate state with every token signal bootstrap endpoint and fail over signal path negotiation plus hole-punch plan fetches across the ordered signal bootstrap list unless an operator pins `--signal-url`. Relay/STUN/signal instances are separately discoverable and can be added or drained without invalidating existing WireGuard peers.
 
 ## VPN IP Allocation
 
@@ -101,7 +101,7 @@ The default path discovery order is:
 
 STUN reflexive endpoint detection uses RFC 5389 Binding requests and success responses with `XOR-MAPPED-ADDRESS`. Agents can reuse one UDP socket across multiple STUN endpoints to classify NAT mapping behavior as no NAT, endpoint-independent, address-dependent, address-and-port-dependent, or unknown. STUN probes also understand RFC 5780 `CHANGE-REQUEST`, `RESPONSE-ORIGIN`, and `OTHER-ADDRESS` attributes so compatible STUN deployments can classify NAT filtering behavior as endpoint-independent, address-dependent, address-and-port-dependent, or unknown. Reproducible topology validation across network namespaces builds on these probes, including a gated two-sided endpoint-independent SNAT topology for signal-coordinated UDP punching.
 
-Agents include their latest NAT classification when registering with signal and when requesting path negotiation. The signal service uses that classification to avoid coordinated hole punching when either side reports relay-preferred or insufficient NAT data, falling back to relay candidates when policy and capacity allow. The signal service only coordinates endpoint candidate exchange and timing. It does not forward data-plane payload.
+Agents include their latest NAT classification when registering with signal and when requesting path negotiation. Registration is sent to all configured signal endpoints, while path negotiation uses ordered failover and fetches hole-punch plans from the signal endpoint that accepted the negotiation. The signal service uses that classification to avoid coordinated hole punching when either side reports relay-preferred or insufficient NAT data, falling back to relay candidates when policy and capacity allow. The signal service only coordinates endpoint candidate exchange and timing. It does not forward data-plane payload.
 
 ## Relay Design
 
@@ -247,7 +247,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 ## Failure Behavior
 
 - Control plane down: existing WireGuard data-plane paths remain active until idle timers or kernel state changes remove them.
-- Signal down: existing paths remain active; new NAT traversal and path renegotiation wait for signal recovery.
+- Signal down: existing paths remain active; agents retry registration and path negotiation against the remaining configured signal endpoints, and new NAT traversal waits for signal recovery only when all configured signal endpoints are unavailable.
 - Relay down: affected pairs demote to probing/direct candidates or another relay if available; otherwise `UNREACHABLE`.
 - STUN down: known candidates remain usable; new NAT classification is degraded.
 - Agent restart: identity and WireGuard keys are read from disk; the agent can re-register with a join token, refresh signal-service node state, negotiate pair paths, execute UDP hole-punch plans, report heartbeat/path state, then pinned routes and current peer map are rehydrated through explicit backend application and refreshed by continuous peer-map polling.

@@ -2131,7 +2131,8 @@ async fn run_agent(
         args.control_plane_url.as_deref(),
         registered_control_plane_base.as_deref(),
     )?;
-    let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
+    let signal_bases =
+        signal_base_urls(join_token.as_ref(), args.signal_url.as_deref()).unwrap_or_default();
     preflight_agent_runtime(&args)?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
@@ -2213,31 +2214,29 @@ async fn run_agent(
         }
     }
     if !args.disable_signal_registration {
-        if let (Some(node), Some(signal_url)) = (registered_node.clone(), signal_base.clone()) {
+        if let Some(node) = registered_node.clone().filter(|_| !signal_bases.is_empty()) {
             background_tasks.push(start_signal_registration(
                 runtime.clone(),
                 node,
-                signal_url,
+                signal_bases.clone(),
                 Duration::from_secs(args.signal_registration_interval_seconds.max(1)),
             ));
         }
     }
-    if !args.disable_signal_paths {
-        if let Some(signal_url) = signal_base {
-            let hole_puncher = UdpHolePuncher::new(args.hole_punch_bind)
-                .with_attempts(args.hole_punch_attempts)
-                .with_interval(Duration::from_millis(args.hole_punch_interval_millis));
-            if !control_plane_bases.is_empty() {
-                background_tasks.push(start_signal_path_negotiation(
-                    runtime.clone(),
-                    control_plane_bases,
-                    signal_url,
-                    hole_puncher,
-                    relay_forwarder_supervisor.clone(),
-                    Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
-                    Duration::from_secs(args.signal_path_interval_seconds.max(1)),
-                ));
-            }
+    if !args.disable_signal_paths && !signal_bases.is_empty() {
+        let hole_puncher = UdpHolePuncher::new(args.hole_punch_bind)
+            .with_attempts(args.hole_punch_attempts)
+            .with_interval(Duration::from_millis(args.hole_punch_interval_millis));
+        if !control_plane_bases.is_empty() {
+            background_tasks.push(start_signal_path_negotiation(
+                runtime.clone(),
+                control_plane_bases,
+                signal_bases,
+                hole_puncher,
+                relay_forwarder_supervisor.clone(),
+                Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
+                Duration::from_secs(args.signal_path_interval_seconds.max(1)),
+            ));
         }
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
@@ -3929,27 +3928,28 @@ async fn heartbeat_request(
 fn start_signal_registration(
     runtime: Arc<AgentRuntime>,
     node: NodeRecord,
-    signal_url: String,
+    signal_urls: Vec<String>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_signal_registration_loop(runtime, node, signal_url, interval).await;
+        run_signal_registration_loop(runtime, node, signal_urls, interval).await;
     })
 }
 
 async fn run_signal_registration_loop(
     runtime: Arc<AgentRuntime>,
     node: NodeRecord,
-    signal_url: String,
+    signal_urls: Vec<String>,
     interval: Duration,
 ) {
     let client = reqwest::Client::new();
     loop {
         let request = signal_node_upsert_request(runtime.as_ref(), node.clone()).await;
-        match send_signal_node_upsert(&client, &signal_url, request).await {
-            Ok(response) => tracing::info!(
-                node_id = %response.node.node_id,
-                "registered agent node with signal service"
+        match send_signal_node_upsert_to_signal_services(&client, &signal_urls, request).await {
+            Ok(successes) => tracing::info!(
+                node_id = %node.node_id,
+                signal_services = successes,
+                "registered agent node with signal services"
             ),
             Err(error) => tracing::warn!(
                 %error,
@@ -3958,6 +3958,44 @@ async fn run_signal_registration_loop(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn send_signal_node_upsert_to_signal_services(
+    client: &reqwest::Client,
+    signal_urls: &[String],
+    request: SignalNodeUpsertRequest,
+) -> anyhow::Result<usize> {
+    let mut successes = 0_usize;
+    let mut errors = Vec::new();
+    for signal_url in signal_urls {
+        match send_signal_node_upsert(client, signal_url, request.clone()).await {
+            Ok(response) => {
+                successes += 1;
+                tracing::debug!(
+                    signal_url,
+                    node_id = %response.node.node_id,
+                    "registered agent node with signal service"
+                );
+            }
+            Err(error) => errors.push(format!("{signal_url}: {error:#}")),
+        }
+    }
+
+    if successes == 0 {
+        anyhow::bail!(
+            "all signal services failed node upsert: {}",
+            errors.join("; ")
+        );
+    }
+    if !errors.is_empty() {
+        tracing::warn!(
+            successes,
+            failures = errors.len(),
+            errors = ?errors,
+            "registered agent node with a subset of signal services"
+        );
+    }
+    Ok(successes)
 }
 
 async fn send_signal_node_upsert(
@@ -4000,7 +4038,7 @@ async fn signal_node_upsert_request(
 fn start_signal_path_negotiation(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
-    signal_url: String,
+    signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
     relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
@@ -4010,7 +4048,7 @@ fn start_signal_path_negotiation(
         run_signal_path_negotiation_loop(
             runtime,
             control_plane_urls,
-            signal_url,
+            signal_urls,
             hole_puncher,
             relay_forwarder_supervisor,
             relay_session_renew_before,
@@ -4023,7 +4061,7 @@ fn start_signal_path_negotiation(
 async fn run_signal_path_negotiation_loop(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
-    signal_url: String,
+    signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
     relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
@@ -4035,7 +4073,7 @@ async fn run_signal_path_negotiation_loop(
             &client,
             runtime.as_ref(),
             &control_plane_urls,
-            &signal_url,
+            &signal_urls,
             &hole_puncher,
             relay_forwarder_supervisor.as_ref(),
             relay_session_renew_before,
@@ -4052,7 +4090,7 @@ async fn negotiate_signal_paths(
     client: &reqwest::Client,
     runtime: &AgentRuntime,
     control_plane_urls: &[String],
-    signal_url: &str,
+    signal_urls: &[String],
     hole_puncher: &UdpHolePuncher,
     relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
@@ -4076,11 +4114,12 @@ async fn negotiate_signal_paths(
 
     for peer in peer_set.active {
         let request = signal_path_request(&status, &peer);
-        let response = send_signal_path_request(client, signal_url, request).await?;
+        let (signal_url, response) =
+            send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let relay_candidate = selected_relay_candidate(&response);
         let record = signal_path_record(response, chrono::Utc::now());
         if record.selected_state == PathState::DirectNatTraversal {
-            match fetch_hole_punch_plan(client, signal_url, &record.key).await {
+            match fetch_hole_punch_plan(client, &signal_url, &record.key).await {
                 Ok(plan) => match hole_puncher.execute(&status.node_id, &plan).await {
                     Ok(attempts) => tracing::info!(
                         attempts,
@@ -4527,6 +4566,24 @@ async fn send_signal_path_request(
         .json()
         .await
         .context("failed to decode signal path response")
+}
+
+async fn send_signal_path_request_to_signal_services(
+    client: &reqwest::Client,
+    signal_urls: &[String],
+    request: SignalPathRequest,
+) -> anyhow::Result<(String, SignalPathResponse)> {
+    let mut errors = Vec::new();
+    for signal_url in signal_urls {
+        match send_signal_path_request(client, signal_url, request.clone()).await {
+            Ok(response) => return Ok((signal_url.clone(), response)),
+            Err(error) => errors.push(format!("{signal_url}: {error:#}")),
+        }
+    }
+    anyhow::bail!(
+        "all signal services failed path negotiation: {}",
+        errors.join("; ")
+    )
 }
 
 fn signal_path_request(
@@ -5505,22 +5562,42 @@ fn dedupe_urls_preserve_order(base_urls: impl IntoIterator<Item = String>) -> Ve
     deduped
 }
 
+#[cfg(test)]
 fn signal_base_url(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<String> {
-    let base_url = override_url.map(ToOwned::to_owned).or_else(|| {
-        token.and_then(|token| {
+    signal_base_urls(token, override_url)?
+        .into_iter()
+        .next()
+        .context("signal URL is required and no signal bootstrap exists")
+}
+
+fn signal_base_urls(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
+        token.map(|token| {
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
-                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
                 .map(|endpoint| endpoint.url.clone())
+                .collect::<Vec<_>>()
         })
     });
-    let base_url = base_url.context("signal URL is required and no signal bootstrap exists")?;
-    Ok(base_url.trim_end_matches('/').to_string())
+    let base_urls = base_urls.context("signal URL is required and no signal bootstrap exists")?;
+    let base_urls = dedupe_urls_preserve_order(
+        base_urls
+            .into_iter()
+            .map(|base_url| normalize_base_url(&base_url)),
+    );
+    if base_urls.is_empty() {
+        anyhow::bail!("signal URL is required and no signal bootstrap exists");
+    }
+    Ok(base_urls)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5611,6 +5688,27 @@ mod tests {
             max_crashes_per_window: 3,
             cooldown: Duration::from_secs(60),
         }
+    }
+
+    async fn spawn_test_signal_service(
+        registry: Arc<SignalRegistry>,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let app = signal_router(SignalHttpState::new(registry));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .context("signal test service failed")
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    async fn unused_http_base_url() -> anyhow::Result<String> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        Ok(format!("http://{addr}"))
     }
 
     #[test]
@@ -7906,14 +8004,27 @@ invalid no-destination-here
 
     #[test]
     fn signal_base_url_uses_token_bootstrap() -> anyhow::Result<()> {
-        let token = token_with_bootstrap(vec![BootstrapEndpoint {
-            url: "https://203.0.113.10:9443/".to_string(),
-            kind: BootstrapEndpointKind::Signal,
-        }]);
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:9443/".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+        ]);
 
         assert_eq!(
             signal_base_url(Some(&token), None)?,
             "https://203.0.113.10:9443"
+        );
+        assert_eq!(
+            signal_base_urls(Some(&token), None)?,
+            vec![
+                "https://203.0.113.10:9443".to_string(),
+                "https://203.0.113.11:9443".to_string()
+            ]
         );
         Ok(())
     }
@@ -7929,6 +8040,72 @@ invalid no-destination-here
             signal_base_url(Some(&token), Some("http://127.0.0.1:9443/"))?,
             "http://127.0.0.1:9443"
         );
+        assert_eq!(
+            signal_base_urls(Some(&token), Some("http://127.0.0.1:9443/"))?,
+            vec!["http://127.0.0.1:9443".to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_registers_with_available_signal_services() -> anyhow::Result<()> {
+        let registry_a = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let registry_b = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let (base_a, task_a) = spawn_test_signal_service(registry_a.clone()).await?;
+        let (base_b, task_b) = spawn_test_signal_service(registry_b.clone()).await?;
+        let unavailable = unused_http_base_url().await?;
+        let client = reqwest::Client::new();
+        let node = node_record("node-a");
+        let node_id = node.node_id.clone();
+        let request = SignalNodeUpsertRequest {
+            node,
+            nat_classification: None,
+            health: None,
+        };
+
+        let successes = send_signal_node_upsert_to_signal_services(
+            &client,
+            &[unavailable, base_a.clone(), base_b.clone()],
+            request,
+        )
+        .await?;
+
+        assert_eq!(successes, 2);
+        assert!(registry_a.get_node(&node_id).await.is_some());
+        assert!(registry_b.get_node(&node_id).await.is_some());
+        task_a.abort();
+        task_b.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_path_request_fails_over_to_available_signal_service() -> anyhow::Result<()> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        registry.upsert_node(node_record("node-b")).await;
+        let (base, task) = spawn_test_signal_service(registry.clone()).await?;
+        let unavailable = unused_http_base_url().await?;
+        let client = reqwest::Client::new();
+        let source = NodeId::from_string("node-a");
+        let target = NodeId::from_string("node-b");
+        let request = SignalPathRequest {
+            source: source.clone(),
+            target: target.clone(),
+            source_candidates: vec![candidate("node-a", EndpointCandidateKind::PublicUdp, 10)],
+            source_nat_classification: None,
+            desired_routes: Vec::new(),
+        };
+
+        let (selected_signal, response) = send_signal_path_request_to_signal_services(
+            &client,
+            &[unavailable, base.clone()],
+            request,
+        )
+        .await?;
+
+        assert_eq!(selected_signal, base);
+        assert_eq!(response.key, PeerPathKey::new(source, target));
+        assert_eq!(registry.metrics().await.path_negotiation_count, 1);
+        task.abort();
         Ok(())
     }
 

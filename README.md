@@ -22,8 +22,8 @@ The repository is being built toward a complete system rather than an MVP. The c
 - persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery with ordered failover
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying across known control-plane endpoints
-- `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates when a signal endpoint is known
-- `iparsd agent` signal path negotiation loop that fetches peer maps across known control-plane endpoints, records pair-scoped path state, and reports it in heartbeat payloads
+- `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates across known signal endpoints
+- `iparsd agent` signal path negotiation loop that fetches peer maps across known control-plane endpoints, fails over across known signal endpoints, records pair-scoped path state, and reports it in heartbeat payloads
 - `iparsd agent` relay admission for signal-selected relay paths, storing expiring relay credentials only in transient agent runtime state
 - relay session renewal window handling and stale relay credential removal when paths return to direct/non-relay states
 - agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
@@ -94,7 +94,7 @@ ipars docker install --project-name ipars --compose-file docker/compose.yaml
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
-`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover. After agent registration, heartbeat reporting, peer-map polling, and signal path peer-map fetches keep an ordered control-plane endpoint list, prioritizing the registered endpoint and falling back to token bootstraps unless `--control-plane-url` is explicitly set.
+`ipars init` returns the signed bootstrap join token, the issuer metadata, and the `iparsd` commands for control-plane, signal, STUN, and relay. With `--spawn-daemons`, those services are started in the background and write logs under `--daemon-state-dir`; without it, run the returned commands manually. Later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover. After agent registration, heartbeat reporting, peer-map polling, and signal path peer-map fetches keep an ordered control-plane endpoint list, prioritizing the registered endpoint and falling back to token bootstraps unless `--control-plane-url` is explicitly set. Agents also register node/candidate state with all token signal bootstraps and fail over signal path negotiation and hole-punch plan requests across them unless `--signal-url` is explicitly set.
 
 Join tokens are single-use by default. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, relay permission with `--allow-relay`, and admission limits with `--max-uses` or `--unlimited-uses`.
 
