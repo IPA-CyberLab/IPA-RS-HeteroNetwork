@@ -263,6 +263,20 @@ struct DockerInstallArgs {
     compose_file: PathBuf,
     #[arg(long, default_value = "ipars")]
     project_name: String,
+    #[arg(long, default_value_t = false)]
+    rootless: bool,
+    #[arg(long, default_value_t = false)]
+    docker_discover_networks: bool,
+    #[arg(long = "docker-network")]
+    docker_networks: Vec<String>,
+    #[arg(long)]
+    docker_api_socket: Option<PathBuf>,
+    #[arg(long)]
+    docker_container_namespace: Option<String>,
+    #[arg(long, default_value = "docker0")]
+    docker_host_interface: String,
+    #[arg(long = "docker-container-cidr")]
+    docker_container_cidrs: Vec<ipnet::IpNet>,
 }
 
 #[derive(Debug, Args)]
@@ -1332,9 +1346,16 @@ struct InstallPlan {
     platform: String,
     manifest: String,
     commands: Vec<String>,
+    environment: Vec<InstallEnvironment>,
     prerequisites: Vec<String>,
     security: Vec<String>,
     notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct InstallEnvironment {
+    name: String,
+    value: String,
 }
 
 fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
@@ -1343,6 +1364,33 @@ fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
         "docker compose -p {} -f {}",
         args.project_name, compose_file
     );
+    let environment = docker_install_environment(&args);
+    let mut prerequisites = vec![
+        "Docker Engine with the Compose plugin".to_string(),
+        "/dev/net/tun available on agent/relay hosts".to_string(),
+        "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
+        "A reusable issuer private key for init/token create workflows".to_string(),
+    ];
+    if args.rootless {
+        prerequisites.push(
+            "Rootless Docker Engine with a reachable user Docker socket for network discovery"
+                .to_string(),
+        );
+    }
+    if args.docker_discover_networks {
+        prerequisites
+            .push("Docker API access from the agent for bridge-network IPAM discovery".to_string());
+    }
+    let mut notes = vec![
+        "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
+        "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
+    ];
+    if args.rootless {
+        notes.push("Rootless Docker network discovery can use the user socket, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
+    } else {
+        notes.push("Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
+    }
+
     InstallPlan {
         platform: "docker-compose".to_string(),
         manifest: compose_file,
@@ -1350,22 +1398,67 @@ fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
             format!("{compose_prefix} config"),
             format!("{compose_prefix} up -d --build"),
         ],
-        prerequisites: vec![
-            "Docker Engine with the Compose plugin".to_string(),
-            "/dev/net/tun available on agent/relay hosts".to_string(),
-            "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
-            "A reusable issuer private key for init/token create workflows".to_string(),
-        ],
+        environment,
+        prerequisites,
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
-        notes: vec![
-            "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
-            "Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string(),
-        ],
+        notes,
     }
+}
+
+fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
+    let mut environment = vec![InstallEnvironment {
+        name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+        value: "true".to_string(),
+    }];
+    if args.docker_discover_networks {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+            value: "true".to_string(),
+        });
+    }
+    if !args.docker_networks.is_empty() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_NETWORKS".to_string(),
+            value: args.docker_networks.join(","),
+        });
+    }
+    if let Some(socket) = args.docker_api_socket.as_ref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            value: socket.display().to_string(),
+        });
+    } else if args.rootless {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
+        });
+    }
+    if let Some(namespace) = args.docker_container_namespace.as_ref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+            value: namespace.clone(),
+        });
+    }
+    environment.push(InstallEnvironment {
+        name: "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+        value: args.docker_host_interface.clone(),
+    });
+    if !args.docker_container_cidrs.is_empty() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+            value: args
+                .docker_container_cidrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        });
+    }
+    environment
 }
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
@@ -1475,6 +1568,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             ),
             helm_command,
         ],
+        environment: Vec::new(),
         prerequisites: vec![
             "kubectl access with permission to create namespaces, Secrets, RBAC, and DaemonSets".to_string(),
             "Helm 3".to_string(),
@@ -2165,6 +2259,13 @@ mod tests {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
         });
 
         assert_eq!(plan.platform, "docker-compose");
@@ -2180,10 +2281,73 @@ mod tests {
             .prerequisites
             .iter()
             .any(|requirement| requirement.contains("CAP_NET_ADMIN")));
+        assert!(plan.environment.iter().any(|environment| {
+            environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
+        }));
         assert!(plan
             .security
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
+    }
+
+    #[test]
+    fn docker_install_plan_exports_rootless_multi_network_settings() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string(), "edge_apps".to_string()],
+            docker_api_socket: None,
+            docker_container_namespace: Some("compose-edge".to_string()),
+            docker_host_interface: "br-edge".to_string(),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?, "172.21.0.0/16".parse()?],
+        });
+
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("Rootless Docker Engine")));
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("Docker API access")));
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_DISCOVER_NETWORKS"),
+            Some("true")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
+            Some("edge_default,edge_apps")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET"),
+            Some("${XDG_RUNTIME_DIR}/docker.sock")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
+            Some("compose-edge")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_HOST_INTERFACE"),
+            Some("br-edge")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
+            Some("172.20.0.0/16,172.21.0.0/16")
+        );
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("userspace WireGuard backend")));
+        Ok(())
+    }
+
+    fn environment_value<'a>(plan: &'a InstallPlan, name: &str) -> Option<&'a str> {
+        plan.environment
+            .iter()
+            .find(|environment| environment.name == name)
+            .map(|environment| environment.value.as_str())
     }
 
     #[test]
@@ -2266,6 +2430,20 @@ mod tests {
             "ops/compose.yaml",
             "--project-name",
             "edge",
+            "--rootless",
+            "--docker-discover-networks",
+            "--docker-network",
+            "edge_default",
+            "--docker-network",
+            "edge_apps",
+            "--docker-api-socket",
+            "/run/user/1000/docker.sock",
+            "--docker-container-namespace",
+            "compose-edge",
+            "--docker-host-interface",
+            "br-edge",
+            "--docker-container-cidr",
+            "172.20.0.0/16",
         ])?;
         if let Command::Docker {
             command: DockerCommand::Install(args),
@@ -2273,6 +2451,19 @@ mod tests {
         {
             assert_eq!(args.compose_file, PathBuf::from("ops/compose.yaml"));
             assert_eq!(args.project_name, "edge");
+            assert!(args.rootless);
+            assert!(args.docker_discover_networks);
+            assert_eq!(args.docker_networks, vec!["edge_default", "edge_apps"]);
+            assert_eq!(
+                args.docker_api_socket,
+                Some(PathBuf::from("/run/user/1000/docker.sock"))
+            );
+            assert_eq!(
+                args.docker_container_namespace.as_deref(),
+                Some("compose-edge")
+            );
+            assert_eq!(args.docker_host_interface, "br-edge");
+            assert_eq!(args.docker_container_cidrs, vec!["172.20.0.0/16".parse()?]);
         } else {
             anyhow::bail!("expected docker install command");
         }

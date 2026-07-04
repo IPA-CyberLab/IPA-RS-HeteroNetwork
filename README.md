@@ -91,7 +91,7 @@ ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <c
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars path status --agent-url http://127.0.0.1:9780
 ipars path probe --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --state DIRECT_NAT_TRAVERSAL --latency-ms 23.5 --loss-ppm 100 --jitter-ms 3.25 --candidate-addr 198.51.100.10:51820 --candidate-kind stun-reflexive --pin
-ipars docker install --project-name ipars --compose-file docker/compose.yaml
+ipars docker install --project-name ipars --compose-file docker/compose.yaml --docker-discover-networks --docker-network ipars_default
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
@@ -119,7 +119,7 @@ Docker route application can use explicit `--docker-container-cidr` inputs or `-
 
 The bundled Docker Compose and Helm examples use plain HTTP between private deployment services because the current `iparsd` daemons serve HTTP directly. Terminate TLS at an external reverse proxy or Kubernetes Ingress when exposing control-plane, signal, relay, or agent APIs outside the private deployment network.
 
-`ipars docker install` and `ipars k8s install` emit JSON install plans with the manifest path, validation/apply commands, privilege requirements, and exposure/security notes. The Kubernetes plan includes the join-token Secret wiring and optional flags for agent API and relay Service exposure, including Service type and annotation overrides; relay exposure requires the public UDP endpoint and relay admission URL that peers should use.
+`ipars docker install` and `ipars k8s install` emit JSON install plans with the manifest path, validation/apply commands, environment overrides, privilege requirements, and exposure/security notes. The Docker plan exports the agent route settings for rootless socket discovery, repeated network filters, explicit container namespace/interface/CIDR inputs, and the default `IPARS_AGENT_APPLY_DOCKER_ROUTES=true` wiring. The Kubernetes plan includes the join-token Secret wiring and optional flags for agent API and relay Service exposure, including Service type and annotation overrides; relay exposure requires the public UDP endpoint and relay admission URL that peers should use.
 
 `iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; control-plane node/path/health gauges, signal node/relay/NAT/health/request metrics, relay dataplane counters, and agent path, path-probe, relay-admission, relay-forwarder, lazy-connect, and packet-flow metrics are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls control-plane, signal, relay, and agent snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 
