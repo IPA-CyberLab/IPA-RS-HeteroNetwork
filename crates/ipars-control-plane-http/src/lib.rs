@@ -11,8 +11,8 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
+    ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{NodeId, PathState};
 use serde::Serialize;
@@ -61,6 +61,7 @@ where
         .route("/v1/join", post(join::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/metrics", get(metrics::<S, L>))
+        .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
         .route("/v1/tokens/revoke", post(revoke_token::<S, L>))
         .with_state(state)
@@ -78,6 +79,22 @@ where
     L: TokenLedger,
 {
     Ok(Json(state.plane.metrics().await?))
+}
+
+async fn policy<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Json<ControlPlanePolicyResponse>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let config = state.plane.config();
+    Json(ControlPlanePolicyResponse {
+        cluster_id: config.cluster_id.clone(),
+        vpn_pool: config.vpn_pool,
+        cluster_policy: config.cluster_policy.clone(),
+        generated_at: Utc::now(),
+    })
 }
 
 async fn prometheus_metrics<S, L>(
@@ -299,12 +316,14 @@ mod tests {
     };
     use ipars_crypto::IdentityKeyPair;
     use ipars_types::api::{
-        ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-        RegisterNodeRequest, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
+        ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest,
+        HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse,
+        RevokeTokenRequest, RevokeTokenResponse,
     };
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState, JoinTokenClaims, KeyId,
-        NodeHealth, NodeId, Role, Tag, TokenPolicy, TokenStatus,
+        AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState,
+        JoinTokenClaims, KeyId, NodeHealth, NodeId, Role, Tag, TokenPolicy, TokenStatus,
+        TransportProtocol,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -350,13 +369,22 @@ mod tests {
         let cluster_id = ClusterId::new();
         let store = Arc::new(InMemoryStore::default());
         let ledger = Arc::new(InMemoryTokenLedger::default());
-        let plane = Arc::new(ControlPlane::new(
-            ControlPlaneConfig::new(
-                cluster_id.clone(),
-                Ipv4Net::new(std::net::Ipv4Addr::new(100, 64, 0, 0), 29)?,
-            ),
-            store,
-        ));
+        let vpn_pool = Ipv4Net::new(std::net::Ipv4Addr::new(100, 64, 0, 0), 29)?;
+        let mut config = ControlPlaneConfig::new(cluster_id.clone(), vpn_pool);
+        config.cluster_policy.allow_relay_fallback = false;
+        let mut from_roles = BTreeSet::new();
+        from_roles.insert(Role::edge());
+        config.cluster_policy.acl_rules = vec![AclRule {
+            id: "allow-edge".to_string(),
+            from_roles,
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
+        }];
+        let plane = Arc::new(ControlPlane::new(config, store));
         let mut key_ring = IssuerKeyRing::default();
         key_ring.insert(issuer.node_id(), key_id.clone(), issuer.public_key_b64());
         let join_service = Arc::new(ControlPlaneJoinService::new(
@@ -365,6 +393,25 @@ mod tests {
             key_ring,
         ));
         let app = router(ControlPlaneHttpState::new(plane, join_service));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/policy")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let policy: ControlPlanePolicyResponse = serde_json::from_slice(&body)?;
+        assert_eq!(policy.cluster_id, cluster_id);
+        assert_eq!(policy.vpn_pool, vpn_pool);
+        assert!(!policy.cluster_policy.allow_relay_fallback);
+        assert_eq!(policy.cluster_policy.acl_rules.len(), 1);
+        assert_eq!(policy.cluster_policy.acl_rules[0].id, "allow-edge");
+
         let request_body = JoinNodeRequest {
             token: issuer.sign_join_token(claims(cluster_id, issuer.node_id(), key_id))?,
             registration: registration("node-http"),

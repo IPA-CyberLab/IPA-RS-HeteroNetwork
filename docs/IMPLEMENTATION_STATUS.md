@@ -13,7 +13,7 @@ This file tracks the gap between the requested final system and the current repo
 - SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
 - Token ledger records, control-plane revocation API, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, overlapping issuer key rotation sets, cluster/time constraints, ledger admission, CIDR-containing route policy, relay-capability policy, and node registration.
-- Control-plane HTTP crate with typed health, join, ACL-filtered peer-map, and JSON/Prometheus metrics routes backed by the join service.
+- Control-plane HTTP crate with typed health, join, policy inspection, ACL-filtered peer-map, and JSON/Prometheus metrics routes backed by the join service.
 - Control-plane peer-map and relay-map visibility filtering through cluster ACL rules matching source/target role, tag, route CIDR containment, and protocol, with deny rules taking precedence and default allow-all behavior when no rules are configured.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage, accepts extra trusted issuer public keys for token-signing key rotation overlap, and loads repeated JSON `--acl-rule` values or semicolon-separated `IPARS_ACL_RULES`.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.

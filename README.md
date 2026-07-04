@@ -12,7 +12,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - SQLite and PostgreSQL control-plane store implementations
 - token ledger primitives and control-plane revocation API for revocation and max-use enforcement
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, and relay-capability policy before registration
-- typed control-plane HTTP routes for health, join registration, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics
+- typed control-plane HTTP routes for health, join registration, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
@@ -99,6 +99,8 @@ Join tokens are single-use by default. `ipars init` and `ipars token create` can
 For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`.
 
 Control-plane ACLs can be loaded with repeated `iparsd control-plane --acl-rule '<json>'` values, or semicolon-separated JSON objects in `IPARS_ACL_RULES`. Each object uses the typed `AclRule` shape with `id`, `from_roles`, `from_tags`, `to_roles`, `to_tags`, `routes`, `protocol`, and `action`; an empty ACL list keeps default allow-all peer visibility, while configured deny rules take precedence over allow rules.
+
+Operators can inspect the active control-plane cluster policy, VPN pool, and loaded ACL rules with `GET /v1/policy` on the control-plane HTTP service.
 
 `iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`, and peer-map/Docker/Kubernetes route application can switch route/rule management to rtnetlink with `--route-backend kernel-netlink`. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
 

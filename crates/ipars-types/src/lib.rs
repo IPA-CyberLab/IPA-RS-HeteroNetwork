@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 
 use chrono::{DateTime, Utc};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -883,6 +883,14 @@ pub mod api {
     pub struct RevokeTokenResponse {
         pub record: TokenLedgerRecord,
         pub status: TokenStatus,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlanePolicyResponse {
+        pub cluster_id: ClusterId,
+        pub vpn_pool: Ipv4Net,
+        pub cluster_policy: ClusterPolicy,
+        pub generated_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
