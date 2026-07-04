@@ -10,8 +10,8 @@ use clap::{Args, Parser, Subcommand};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
     NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
-    RelaySessionState, RuntimePeerEndpointResolver, SystemCommandRunner, UdpHolePuncher,
-    UdpRelayFrameForwarder,
+    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, SystemCommandRunner,
+    UdpHolePuncher, UdpRelayFrameForwarder,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -868,8 +868,15 @@ impl RelayForwarderSupervisor {
             .local_addr()
             .context("failed to read relay forwarder local endpoint")?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let metrics = Arc::new(RelayForwarderStats::new(
+            session.peer.clone(),
+            session.relay_node.clone(),
+            session.relay_endpoint,
+            local_endpoint,
+        ));
         let forwarder =
-            UdpRelayFrameForwarder::new(session.clone(), self.config.wireguard_endpoint);
+            UdpRelayFrameForwarder::new(session.clone(), self.config.wireguard_endpoint)
+                .with_metrics(metrics.clone());
         let task = tokio::spawn(forwarder.serve(socket, shutdown_rx));
         self.handles.lock().await.insert(
             session.peer.clone(),
@@ -884,6 +891,7 @@ impl RelayForwarderSupervisor {
         runtime
             .upsert_relay_forwarder_endpoint(session.peer.clone(), local_endpoint)
             .await;
+        runtime.register_relay_forwarder_metrics(metrics).await;
         tracing::info!(
             peer = %session.peer,
             relay = %session.relay_node,

@@ -883,6 +883,20 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentRelayForwarderMetrics {
+        pub peer: NodeId,
+        pub relay_node: NodeId,
+        pub relay_endpoint: SocketAddr,
+        pub local_endpoint: SocketAddr,
+        pub outbound_packets: u64,
+        pub outbound_payload_bytes: u64,
+        pub outbound_datagram_bytes: u64,
+        pub inbound_packets: u64,
+        pub inbound_payload_bytes: u64,
+        pub last_forwarded_at: Option<DateTime<Utc>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PathStateCount {
         pub state: PathState,
         pub count: usize,
@@ -895,6 +909,7 @@ pub mod api {
         pub path_count: usize,
         pub relay_session_count: usize,
         pub relay_forwarder_count: usize,
+        pub relay_forwarders: Vec<AgentRelayForwarderMetrics>,
         pub path_change_event_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         pub generated_at: DateTime<Utc>,

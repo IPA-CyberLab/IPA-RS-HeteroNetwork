@@ -151,6 +151,75 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_packets_total Relay forwarder packets sent from local WireGuard to relay."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_payload_bytes_total Relay forwarder opaque payload bytes sent from local WireGuard to relay."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_datagram_bytes_total Relay forwarder framed datagram bytes sent to relay."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_datagram_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_packets_total Relay forwarder packets received from relay and sent to local WireGuard."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_payload_bytes_total Relay forwarder opaque payload bytes received from relay."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_payload_bytes_total counter"
+    );
+    for forwarder in &metrics.relay_forwarders {
+        let peer = prometheus_label(forwarder.peer.as_str());
+        let relay_node = prometheus_label(forwarder.relay_node.as_str());
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_datagram_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_datagram_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_payload_bytes
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_path_change_events Number of retained path change events."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_path_change_events gauge");
@@ -238,7 +307,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use chrono::Utc;
-    use ipars_agent::{AgentNodeState, AgentRuntime};
+    use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
     use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathScore, PathState, PeerPathKey};
     use tower::ServiceExt;
 
@@ -292,6 +361,23 @@ mod tests {
                 pinned: false,
             })
             .await;
+        let forwarder_metrics = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("peer-a"),
+            NodeId::from_string("relay-a"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 51820)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 52000)),
+        ));
+        forwarder_metrics.record_outbound(64, 128);
+        forwarder_metrics.record_inbound(32);
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                NodeId::from_string("peer-a"),
+                std::net::SocketAddr::from(([127, 0, 0, 1], 52000)),
+            )
+            .await;
+        runtime
+            .register_relay_forwarder_metrics(forwarder_metrics)
+            .await;
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -308,7 +394,14 @@ mod tests {
         let metrics: AgentMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_id, node_id);
         assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.relay_forwarder_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
+        assert_eq!(metrics.relay_forwarders.len(), 1);
+        assert_eq!(metrics.relay_forwarders[0].outbound_packets, 1);
+        assert_eq!(metrics.relay_forwarders[0].outbound_payload_bytes, 64);
+        assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
+        assert_eq!(metrics.relay_forwarders[0].inbound_packets, 1);
+        assert_eq!(metrics.relay_forwarders[0].inbound_payload_bytes, 32);
 
         let prometheus_response = app
             .clone()
@@ -330,6 +423,11 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
+        assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
+        assert!(body.contains("peer=\"peer-a\""));
+        assert!(body.contains("relay_node=\"relay-a\""));
+        assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));
+        assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 32"));
 
         let events_response = app
             .oneshot(

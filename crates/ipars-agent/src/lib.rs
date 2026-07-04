@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,8 @@ use ipars_relay::encode_relay_datagram;
 use ipars_route_manager::{LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentStatusResponse, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+    AgentMetricsResponse, AgentRelayForwarderMetrics, AgentStatusResponse, PathStateCount, PeerMap,
+    SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -138,6 +140,7 @@ pub struct AgentRuntime {
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
+    relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
 }
 
@@ -153,10 +156,90 @@ pub struct RelaySessionState {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug)]
+pub struct RelayForwarderStats {
+    peer: NodeId,
+    relay_node: NodeId,
+    relay_endpoint: SocketAddr,
+    local_endpoint: SocketAddr,
+    outbound_packets: AtomicU64,
+    outbound_payload_bytes: AtomicU64,
+    outbound_datagram_bytes: AtomicU64,
+    inbound_packets: AtomicU64,
+    inbound_payload_bytes: AtomicU64,
+    last_forwarded_unix_millis: AtomicI64,
+}
+
+impl RelayForwarderStats {
+    pub fn new(
+        peer: NodeId,
+        relay_node: NodeId,
+        relay_endpoint: SocketAddr,
+        local_endpoint: SocketAddr,
+    ) -> Self {
+        Self {
+            peer,
+            relay_node,
+            relay_endpoint,
+            local_endpoint,
+            outbound_packets: AtomicU64::new(0),
+            outbound_payload_bytes: AtomicU64::new(0),
+            outbound_datagram_bytes: AtomicU64::new(0),
+            inbound_packets: AtomicU64::new(0),
+            inbound_payload_bytes: AtomicU64::new(0),
+            last_forwarded_unix_millis: AtomicI64::new(-1),
+        }
+    }
+
+    pub fn peer(&self) -> &NodeId {
+        &self.peer
+    }
+
+    pub fn record_outbound(&self, payload_bytes: usize, datagram_bytes: usize) {
+        self.outbound_packets.fetch_add(1, Ordering::Relaxed);
+        self.outbound_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.outbound_datagram_bytes
+            .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
+        self.record_forwarded_at();
+    }
+
+    pub fn record_inbound(&self, payload_bytes: usize) {
+        self.inbound_packets.fetch_add(1, Ordering::Relaxed);
+        self.inbound_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.record_forwarded_at();
+    }
+
+    pub fn snapshot(&self) -> AgentRelayForwarderMetrics {
+        let last_forwarded_unix_millis = self.last_forwarded_unix_millis.load(Ordering::Relaxed);
+        AgentRelayForwarderMetrics {
+            peer: self.peer.clone(),
+            relay_node: self.relay_node.clone(),
+            relay_endpoint: self.relay_endpoint,
+            local_endpoint: self.local_endpoint,
+            outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
+            outbound_payload_bytes: self.outbound_payload_bytes.load(Ordering::Relaxed),
+            outbound_datagram_bytes: self.outbound_datagram_bytes.load(Ordering::Relaxed),
+            inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
+            inbound_payload_bytes: self.inbound_payload_bytes.load(Ordering::Relaxed),
+            last_forwarded_at: (last_forwarded_unix_millis >= 0)
+                .then(|| DateTime::<Utc>::from_timestamp_millis(last_forwarded_unix_millis))
+                .flatten(),
+        }
+    }
+
+    fn record_forwarded_at(&self) {
+        self.last_forwarded_unix_millis
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpRelayFrameForwarder {
     session: RelaySessionState,
     wireguard_endpoint: SocketAddr,
+    metrics: Option<Arc<RelayForwarderStats>>,
 }
 
 impl UdpRelayFrameForwarder {
@@ -164,7 +247,13 @@ impl UdpRelayFrameForwarder {
         Self {
             session,
             wireguard_endpoint,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<RelayForwarderStats>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn session(&self) -> &RelaySessionState {
@@ -191,9 +280,13 @@ impl UdpRelayFrameForwarder {
         payload: &[u8],
     ) -> Result<usize, AgentError> {
         let datagram = self.encode_outbound(payload)?;
-        Ok(socket
+        let bytes_sent = socket
             .send_to(&datagram, self.session.relay_endpoint)
-            .await?)
+            .await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_outbound(payload.len(), datagram.len());
+        }
+        Ok(bytes_sent)
     }
 
     pub async fn forward_to_wireguard(
@@ -202,7 +295,11 @@ impl UdpRelayFrameForwarder {
         payload: &[u8],
     ) -> Result<usize, AgentError> {
         self.ensure_session_active()?;
-        Ok(socket.send_to(payload, self.wireguard_endpoint).await?)
+        let bytes_sent = socket.send_to(payload, self.wireguard_endpoint).await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_inbound(payload.len());
+        }
+        Ok(bytes_sent)
     }
 
     pub async fn serve(
@@ -251,6 +348,7 @@ impl AgentRuntime {
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
+            relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
         }
     }
@@ -350,6 +448,7 @@ impl AgentRuntime {
         let path_state = self.path_state.read().await;
         let relay_sessions = self.relay_sessions.read().await;
         let relay_forwarders = self.relay_forwarder_endpoints.read().await;
+        let relay_forwarder_metrics = self.relay_forwarder_metrics.read().await;
         let path_change_events = self.path_change_events.read().await;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in path_state.values() {
@@ -362,6 +461,10 @@ impl AgentRuntime {
             path_count: path_state.len(),
             relay_session_count: relay_sessions.len(),
             relay_forwarder_count: relay_forwarders.len(),
+            relay_forwarders: relay_forwarder_metrics
+                .values()
+                .map(|metrics| metrics.snapshot())
+                .collect(),
             path_change_event_count: path_change_events.len(),
             path_state_counts: path_state_counts
                 .into_iter()
@@ -419,6 +522,13 @@ impl AgentRuntime {
             .insert(peer, endpoint);
     }
 
+    pub async fn register_relay_forwarder_metrics(&self, metrics: Arc<RelayForwarderStats>) {
+        self.relay_forwarder_metrics
+            .write()
+            .await
+            .insert(metrics.peer().clone(), metrics);
+    }
+
     pub async fn relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
         self.relay_forwarder_endpoints
             .read()
@@ -428,6 +538,7 @@ impl AgentRuntime {
     }
 
     pub async fn remove_relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.relay_forwarder_metrics.write().await.remove(peer);
         self.relay_forwarder_endpoints.write().await.remove(peer)
     }
 
@@ -1426,6 +1537,7 @@ mod tests {
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.path_change_event_count, 2);
         assert_eq!(metrics.relay_session_count, 0);
+        assert!(metrics.relay_forwarders.is_empty());
         assert_eq!(
             metrics.path_state_counts,
             vec![PathStateCount {
@@ -1609,6 +1721,12 @@ mod tests {
                 right_addr: peer_addr,
             })
             .await?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            admission.relay_node.clone(),
+            relay_addr,
+            forwarder_addr,
+        ));
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
                 peer: NodeId::from_string("right"),
@@ -1621,7 +1739,8 @@ mod tests {
                 expires_at: admission.expires_at,
             },
             wireguard_addr,
-        );
+        )
+        .with_metrics(stats.clone());
         let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
         let (forwarder_shutdown_tx, forwarder_shutdown_rx) = tokio::sync::watch::channel(false);
         let relay_task = tokio::spawn(relay.serve(service.table(), relay_shutdown_rx));
@@ -1650,6 +1769,19 @@ mod tests {
         )
         .await??;
         assert_eq!(&buffer[..len], b"opaque-wireguard-inbound");
+        let stats = stats.snapshot();
+        assert_eq!(stats.outbound_packets, 1);
+        assert_eq!(
+            stats.outbound_payload_bytes,
+            b"opaque-wireguard-outbound".len() as u64
+        );
+        assert!(stats.outbound_datagram_bytes > stats.outbound_payload_bytes);
+        assert_eq!(stats.inbound_packets, 1);
+        assert_eq!(
+            stats.inbound_payload_bytes,
+            b"opaque-wireguard-inbound".len() as u64
+        );
+        assert!(stats.last_forwarded_at.is_some());
 
         forwarder_shutdown_tx.send(true)?;
         relay_shutdown_tx.send(true)?;
