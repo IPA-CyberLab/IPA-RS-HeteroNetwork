@@ -51,7 +51,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete target design 
 cargo test --workspace
 ```
 
-Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN`:
+Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`:
 
 ```bash
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
@@ -106,7 +106,7 @@ Relay candidates also require fresh healthy status. `iparsd control-plane --rela
 
 Operators can inspect the active control-plane cluster policy, VPN pool, and loaded ACL rules with `GET /v1/policy` on the control-plane HTTP service.
 
-`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`, and peer-map/Docker/Kubernetes route application can switch route/rule management to rtnetlink with `--route-backend kernel-netlink`. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
+`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN` for kernel network mutation, `CAP_SYS_ADMIN` when `--linux-netns` placement is requested, and the requested `/var/run/netns` entry before mutating host networking. Namespace preflight rejects missing entries, symlinks, and directories, and warns when the requested entry resolves to the current process namespace. Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`, and peer-map/Docker/Kubernetes route application can switch route/rule management to rtnetlink with `--route-backend kernel-netlink`. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
 
 Lazy connect is enforced during signal path negotiation and `--apply-peer-map`: route providers, relay-capable peers, control-plane/policy-pinned roles or tags, peers marked through `POST /v1/peer-activity`, and packet-flow destinations resolved through `POST /v1/packet-flow` are negotiated/applied, while idle unpinned peers are removed from WireGuard and relay-forwarder state after the cluster idle timeout. `iparsd agent --packet-flow-detector proc-net-conntrack` can poll `/proc/net/nf_conntrack` or `/proc/net/ip_conntrack`, or a custom `--packet-flow-conntrack-path`; `--packet-flow-detector conntrack-netlink` reads the Linux conntrack table through `NETLINK_NETFILTER`; and `--packet-flow-detector conntrack-netlink-events` subscribes to conntrack NEW/UPDATE multicast events. All feed observed destinations into the same lazy-connect resolver.
 

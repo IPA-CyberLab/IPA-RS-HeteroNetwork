@@ -647,6 +647,7 @@ struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
     cap_net_admin: bool,
+    cap_sys_admin: bool,
     linux_netns: bool,
 }
 
@@ -656,6 +657,7 @@ impl RuntimePreflightNeeds {
             ip_command: false,
             wg_command: false,
             cap_net_admin: false,
+            cap_sys_admin: false,
             linux_netns: false,
         }
     }
@@ -791,7 +793,12 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     }
 
     let needs = runtime_preflight_needs(args);
-    if !needs.ip_command && !needs.wg_command && !needs.cap_net_admin && !needs.linux_netns {
+    if !needs.ip_command
+        && !needs.wg_command
+        && !needs.cap_net_admin
+        && !needs.cap_sys_admin
+        && !needs.linux_netns
+    {
         return Ok(());
     }
     if needs.ip_command {
@@ -803,13 +810,16 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
     if needs.cap_net_admin {
         ensure_cap_net_admin_if_known()?;
     }
+    if needs.cap_sys_admin {
+        ensure_cap_sys_admin_if_known()?;
+    }
     if needs.linux_netns {
         let namespace_name = args
             .linux_netns
             .as_deref()
             .context("linux namespace preflight requested without --linux-netns")?;
         let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
-        ensure_linux_netns_exists(&namespace)?;
+        ensure_linux_netns_ready(&namespace)?;
     }
 
     tracing::info!(
@@ -819,6 +829,7 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
         needs_cap_net_admin = needs.cap_net_admin,
+        needs_cap_sys_admin = needs.cap_sys_admin,
         linux_netns = ?args.linux_netns,
         "runtime backend preflight passed"
     );
@@ -840,6 +851,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
         wg_command: applies_wireguard_with_command,
         cap_net_admin: applies_routes || applies_wireguard,
+        cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
     }
 }
@@ -892,13 +904,22 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
-    if let Some(false) = process_has_cap_net_admin()? {
+    if let Some(false) = process_has_capability(12)? {
         anyhow::bail!("linux-command runtime backend requires CAP_NET_ADMIN");
     }
     Ok(())
 }
 
-fn process_has_cap_net_admin() -> anyhow::Result<Option<bool>> {
+fn ensure_cap_sys_admin_if_known() -> anyhow::Result<()> {
+    if let Some(false) = process_has_capability(21)? {
+        anyhow::bail!(
+            "linux network namespace runtime backend requires CAP_SYS_ADMIN for setns/ip netns exec"
+        );
+    }
+    Ok(())
+}
+
+fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
     let status = match std::fs::read_to_string("/proc/self/status") {
         Ok(status) => status,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -913,20 +934,97 @@ fn process_has_cap_net_admin() -> anyhow::Result<Option<bool>> {
     };
     let mask = u64::from_str_radix(cap_eff, 16)
         .with_context(|| format!("failed to parse CapEff from /proc/self/status: {cap_eff}"))?;
-    Ok(Some(mask & (1_u64 << 12) != 0))
+    Ok(Some(mask & (1_u64 << bit) != 0))
 }
 
-fn ensure_linux_netns_exists(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxNetnsPathReport {
+    same_as_current: Option<bool>,
+}
+
+fn ensure_linux_netns_ready(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
     let path = Path::new("/var/run/netns").join(namespace.name());
-    if path.exists() {
-        Ok(())
-    } else {
+    let current_path = current_process_netns_path();
+    let report = inspect_linux_netns_path(namespace, &path, current_path.as_deref())?;
+    if report.same_as_current == Some(true) {
+        tracing::warn!(
+            namespace = namespace.name(),
+            path = %path.display(),
+            "configured linux network namespace resolves to the current process namespace"
+        );
+    }
+    Ok(())
+}
+
+fn current_process_netns_path() -> Option<PathBuf> {
+    let thread_self = PathBuf::from("/proc/thread-self/ns/net");
+    if thread_self.exists() {
+        return Some(thread_self);
+    }
+    let self_netns = PathBuf::from("/proc/self/ns/net");
+    self_netns.exists().then_some(self_netns)
+}
+
+fn inspect_linux_netns_path(
+    namespace: &LinuxNetworkNamespace,
+    path: &Path,
+    current_netns_path: Option<&Path>,
+) -> anyhow::Result<LinuxNetnsPathReport> {
+    let symlink_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "linux network namespace `{}` does not exist at {}",
+                namespace.name(),
+                path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect linux network namespace `{}` at {}",
+                    namespace.name(),
+                    path.display()
+                )
+            })
+        }
+    };
+    let file_type = symlink_metadata.file_type();
+    if file_type.is_symlink() {
         anyhow::bail!(
-            "linux network namespace `{}` does not exist at {}",
+            "linux network namespace `{}` at {} must not be a symlink",
             namespace.name(),
             path.display()
         );
     }
+    if file_type.is_dir() {
+        anyhow::bail!(
+            "linux network namespace `{}` at {} must be a namespace bind mount, not a directory",
+            namespace.name(),
+            path.display()
+        );
+    }
+
+    let same_as_current = current_netns_path
+        .map(|current_netns_path| same_file_identity(path, current_netns_path))
+        .transpose()?;
+    Ok(LinuxNetnsPathReport { same_as_current })
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left =
+        std::fs::metadata(left).with_context(|| format!("failed to stat {}", left.display()))?;
+    let right =
+        std::fs::metadata(right).with_context(|| format!("failed to stat {}", right.display()))?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &Path, _right: &Path) -> anyhow::Result<bool> {
+    Ok(false)
 }
 
 #[tokio::main]
@@ -6199,6 +6297,7 @@ invalid no-destination-here
             assert!(needs.ip_command);
             assert!(needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(!needs.cap_sys_admin);
             let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
                 Ok(()) => anyhow::bail!("unexpected successful preflight"),
                 Err(error) => error,
@@ -6230,6 +6329,7 @@ invalid no-destination-here
             assert!(needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(!needs.cap_sys_admin);
             return Ok(());
         }
 
@@ -6258,6 +6358,7 @@ invalid no-destination-here
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(!needs.cap_sys_admin);
             return Ok(());
         }
 
@@ -6285,6 +6386,7 @@ invalid no-destination-here
             assert!(!needs.ip_command);
             assert!(!needs.wg_command);
             assert!(needs.cap_net_admin);
+            assert!(needs.cap_sys_admin);
             assert!(needs.linux_netns);
             return Ok(());
         }
@@ -6315,6 +6417,77 @@ invalid no-destination-here
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn linux_netns_path_preflight_rejects_missing_and_directory() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("netns-preflight")?;
+        let missing = base.join("missing");
+        let error = match inspect_linux_netns_path(&namespace, &missing, None) {
+            Ok(_) => anyhow::bail!("unexpected successful netns path inspection"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not exist"));
+
+        let directory = base.join("directory");
+        std::fs::create_dir(&directory)?;
+        let error = match inspect_linux_netns_path(&namespace, &directory, None) {
+            Ok(_) => anyhow::bail!("unexpected successful netns path inspection"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a directory"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_netns_path_preflight_detects_current_namespace_identity() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("netns-preflight-current")?;
+        let path = base.join("node-a");
+        std::fs::write(&path, b"netns")?;
+
+        let report = inspect_linux_netns_path(&namespace, &path, Some(&path))?;
+
+        assert_eq!(
+            report,
+            LinuxNetnsPathReport {
+                same_as_current: Some(true)
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_netns_path_preflight_rejects_symlink() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("netns-preflight-symlink")?;
+        let target = base.join("target");
+        let link = base.join("node-a");
+        std::fs::write(&target, b"netns")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match inspect_linux_netns_path(&namespace, &link, None) {
+            Ok(_) => anyhow::bail!("unexpected successful netns path inspection"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    fn unique_test_dir(name: &str) -> anyhow::Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "ipars-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 
     #[tokio::test]
