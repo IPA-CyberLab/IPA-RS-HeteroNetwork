@@ -76,6 +76,8 @@ Direct paths are preferred when allowed and healthy. Relay paths remain encrypte
 
 Control-plane peer maps and relay maps are filtered through cluster ACL rules when rules are configured. An empty ACL list preserves the default allow-all peer visibility. When ACL rules exist, deny matches take precedence over allow matches, and unmatched peers/routes are hidden. Rules match source role/tag, target role/tag, protocol, and advertised route CIDR containment; route-specific rules can expose only the allowed subset of a node's advertised routes.
 
+Operators can load these rules into `iparsd control-plane` with repeated `--acl-rule '<json>'` arguments, or a semicolon-separated `IPARS_ACL_RULES` value. The JSON is the typed `AclRule` schema, so daemon configuration, control-plane policy, and API behavior all share the same role/tag/route/protocol/action model.
+
 ## Lazy Connect
 
 Agents do not establish a full mesh. They keep a compact peer map and only negotiate a path when:

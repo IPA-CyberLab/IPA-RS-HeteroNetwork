@@ -42,8 +42,8 @@ use ipars_types::api::{
     SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
-    NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
+    AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
+    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
 };
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge};
@@ -150,6 +150,10 @@ fn parse_trusted_issuer_key(value: &str) -> Result<TrustedIssuerKeyArg, String> 
     })
 }
 
+fn parse_acl_rule(value: &str) -> Result<AclRule, String> {
+    serde_json::from_str(value).map_err(|error| format!("ACL rule must be JSON AclRule: {error}"))
+}
+
 #[derive(Debug, Default)]
 struct ObservabilityGuard {
     tracer_provider: Option<SdkTracerProvider>,
@@ -194,6 +198,13 @@ struct ControlPlaneArgs {
         value_parser = parse_trusted_issuer_key
     )]
     trusted_issuer_keys: Vec<TrustedIssuerKeyArg>,
+    #[arg(
+        long = "acl-rule",
+        env = "IPARS_ACL_RULES",
+        value_delimiter = ';',
+        value_parser = parse_acl_rule
+    )]
+    acl_rules: Vec<AclRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -927,7 +938,9 @@ where
     S: ControlPlaneStore + 'static,
     L: TokenLedger + 'static,
 {
-    let config = ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
+    let mut config =
+        ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
+    config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
     let mut key_ring = IssuerKeyRing::default();
     key_ring.insert(
@@ -4128,8 +4141,9 @@ mod tests {
         RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
-        BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
-        JoinTokenClaims, PathScore, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+        AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
+        JoinTokenClaims, PathScore, PeerPathKey, Role, Route, Tag, TokenPolicy, TransportProtocol,
+        VpnIp,
     };
 
     use super::*;
@@ -4304,6 +4318,44 @@ mod tests {
         assert!(parse_trusted_issuer_key("issuer,,pub").is_err());
         assert!(parse_trusted_issuer_key(",key,pub").is_err());
         assert!(parse_trusted_issuer_key("issuer,key,").is_err());
+    }
+
+    #[test]
+    fn control_plane_args_accept_acl_rules() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--acl-rule",
+            r#"{"id":"edge-to-db","from_roles":["edge"],"from_tags":["app"],"to_roles":["database"],"to_tags":["db"],"routes":["10.42.0.0/16"],"protocol":"any","action":"allow"}"#,
+        ])?;
+
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        assert_eq!(args.acl_rules.len(), 1);
+        let rule = &args.acl_rules[0];
+        assert_eq!(rule.id, "edge-to-db");
+        assert!(rule.from_roles.contains(&Role::edge()));
+        assert!(rule.from_tags.contains(&Tag::from_string("app")));
+        assert!(rule.to_roles.contains(&Role::from_string("database")));
+        assert!(rule.to_tags.contains(&Tag::from_string("db")));
+        assert_eq!(rule.routes, vec!["10.42.0.0/16".parse()?]);
+        assert_eq!(rule.protocol, TransportProtocol::Any);
+        assert_eq!(rule.action, AclAction::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn acl_rule_parser_rejects_invalid_json() {
+        assert!(parse_acl_rule("not json").is_err());
     }
 
     #[test]
