@@ -620,6 +620,8 @@ pub struct ClusterPolicy {
     pub idle_timeout_seconds: u64,
     pub pinned_roles: BTreeSet<Role>,
     pub pinned_tags: BTreeSet<Tag>,
+    #[serde(default)]
+    pub acl_rules: Vec<AclRule>,
 }
 
 impl Default for ClusterPolicy {
@@ -633,6 +635,7 @@ impl Default for ClusterPolicy {
             idle_timeout_seconds: 300,
             pinned_roles,
             pinned_tags: BTreeSet::new(),
+            acl_rules: Vec::new(),
         }
     }
 }
@@ -640,7 +643,11 @@ impl Default for ClusterPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclRule {
     pub id: String,
+    #[serde(default)]
+    pub from_roles: BTreeSet<Role>,
     pub from_tags: BTreeSet<Tag>,
+    #[serde(default)]
+    pub to_roles: BTreeSet<Role>,
     pub to_tags: BTreeSet<Tag>,
     pub routes: Vec<IpNet>,
     pub protocol: TransportProtocol,

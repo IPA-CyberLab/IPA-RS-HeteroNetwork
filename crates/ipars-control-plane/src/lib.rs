@@ -10,10 +10,11 @@ use ipars_types::api::{
     RegisterNodeRequest, RegisterNodeResponse, RelayMap,
 };
 use ipars_types::{
-    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth,
-    NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken,
-    TokenLedgerRecord, TokenStatus, VpnIp,
+    AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
+    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
+    SignedJoinToken, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
+use ipnet::IpNet;
 use ipnet::Ipv4Net;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -462,28 +463,8 @@ where
 
         self.store.insert_node(node.clone()).await?;
         let peers = self.store.list_nodes().await?;
-        let peer_map = PeerMap {
-            cluster_id: self.config.cluster_id.clone(),
-            peers: peers
-                .iter()
-                .filter(|peer| peer.node_id != node.node_id)
-                .cloned()
-                .collect(),
-            generated_at: now,
-        };
-        let relay_map = RelayMap {
-            cluster_id: self.config.cluster_id.clone(),
-            relays: peers
-                .into_iter()
-                .filter(|peer| {
-                    peer.relay_capability
-                        .as_ref()
-                        .map(|capability| capability.can_admit())
-                        .unwrap_or(false)
-                })
-                .collect(),
-            generated_at: now,
-        };
+        let peer_map = self.filtered_peer_map_for_node(&node, &peers, now);
+        let relay_map = self.filtered_relay_map_for_node(&node, &peers, now);
 
         Ok(RegisterNodeResponse {
             node,
@@ -494,19 +475,19 @@ where
     }
 
     pub async fn peer_map_for(&self, node_id: &NodeId) -> Result<PeerMap, ControlPlaneError> {
+        let source = self
+            .store
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let peers = self
             .store
             .list_nodes()
             .await?
             .into_iter()
-            .filter(|peer| &peer.node_id != node_id)
-            .collect();
+            .collect::<Vec<_>>();
 
-        Ok(PeerMap {
-            cluster_id: self.config.cluster_id.clone(),
-            peers,
-            generated_at: Utc::now(),
-        })
+        Ok(self.filtered_peer_map_for_node(&source, &peers, Utc::now()))
     }
 
     pub async fn heartbeat(
@@ -593,6 +574,154 @@ where
             generated_at: Utc::now(),
         })
     }
+
+    fn filtered_peer_map_for_node(
+        &self,
+        source: &NodeRecord,
+        peers: &[NodeRecord],
+        generated_at: chrono::DateTime<Utc>,
+    ) -> PeerMap {
+        PeerMap {
+            cluster_id: self.config.cluster_id.clone(),
+            peers: peers
+                .iter()
+                .filter(|peer| peer.node_id != source.node_id)
+                .filter_map(|peer| acl_filter_peer(source, peer, &self.config.cluster_policy))
+                .collect(),
+            generated_at,
+        }
+    }
+
+    fn filtered_relay_map_for_node(
+        &self,
+        source: &NodeRecord,
+        peers: &[NodeRecord],
+        generated_at: chrono::DateTime<Utc>,
+    ) -> RelayMap {
+        RelayMap {
+            cluster_id: self.config.cluster_id.clone(),
+            relays: peers
+                .iter()
+                .filter(|peer| {
+                    peer.relay_capability
+                        .as_ref()
+                        .map(|capability| capability.can_admit())
+                        .unwrap_or(false)
+                })
+                .filter_map(|peer| {
+                    if peer.node_id == source.node_id {
+                        Some(peer.clone())
+                    } else {
+                        acl_filter_peer(source, peer, &self.config.cluster_policy)
+                    }
+                })
+                .collect(),
+            generated_at,
+        }
+    }
+}
+
+fn acl_filter_peer(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    policy: &ClusterPolicy,
+) -> Option<NodeRecord> {
+    if policy.acl_rules.is_empty() {
+        return Some(target.clone());
+    }
+
+    let peer_allowed = acl_allows_peer(source, target, policy);
+    let routes = target
+        .routes
+        .iter()
+        .filter(|route| acl_allows_route(source, target, route, policy))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !peer_allowed && routes.is_empty() {
+        return None;
+    }
+
+    let mut filtered = target.clone();
+    filtered.routes = routes;
+    Some(filtered)
+}
+
+fn acl_allows_peer(source: &NodeRecord, target: &NodeRecord, policy: &ClusterPolicy) -> bool {
+    acl_decision(source, target, None, policy).unwrap_or(false)
+}
+
+fn acl_allows_route(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    route: &Route,
+    policy: &ClusterPolicy,
+) -> bool {
+    acl_decision(source, target, Some(route), policy).unwrap_or(false)
+}
+
+fn acl_decision(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    route: Option<&Route>,
+    policy: &ClusterPolicy,
+) -> Option<bool> {
+    let mut allowed = None;
+    for rule in &policy.acl_rules {
+        if !acl_rule_matches(rule, source, target, route) {
+            continue;
+        }
+        match rule.action {
+            AclAction::Deny => return Some(false),
+            AclAction::Allow => allowed = Some(true),
+        }
+    }
+    allowed
+}
+
+fn acl_rule_matches(
+    rule: &AclRule,
+    source: &NodeRecord,
+    target: &NodeRecord,
+    route: Option<&Route>,
+) -> bool {
+    if rule.protocol != TransportProtocol::Any {
+        return false;
+    }
+    if !rule.from_roles.is_empty() && !rule.from_roles.contains(&source.role) {
+        return false;
+    }
+    if !rule.to_roles.is_empty() && !rule.to_roles.contains(&target.role) {
+        return false;
+    }
+    if !rule.from_tags.is_empty() && rule.from_tags.is_disjoint(&source.tags) {
+        return false;
+    }
+    if !rule.to_tags.is_empty() && rule.to_tags.is_disjoint(&target.tags) {
+        return false;
+    }
+    match route {
+        Some(route) => {
+            rule.routes.is_empty()
+                || rule
+                    .routes
+                    .iter()
+                    .any(|allowed| ipnet_contains(allowed, &route.cidr))
+        }
+        None => rule.routes.is_empty(),
+    }
+}
+
+fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
+    match (outer, inner) {
+        (IpNet::V4(outer), IpNet::V4(inner)) => {
+            outer.prefix_len() <= inner.prefix_len() && outer.contains(&inner.addr())
+        }
+        (IpNet::V6(outer), IpNet::V6(inner)) => {
+            outer.prefix_len() <= inner.prefix_len() && outer.contains(&inner.addr())
+        }
+        _ => false,
+    }
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
@@ -658,9 +787,10 @@ mod tests {
     use ipars_crypto::IdentityKeyPair;
     use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest};
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, EndpointCandidate,
-        EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics, PathRecord, PathScore,
-        PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy,
+        AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
+        EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics,
+        PathRecord, PathScore, PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy,
+        TransportProtocol,
     };
 
     use super::*;
@@ -706,6 +836,23 @@ mod tests {
             candidates: Vec::new(),
             relay_capability: None,
             requested_routes: Vec::new(),
+        }
+    }
+
+    fn node_record(node_id: &str) -> NodeRecord {
+        NodeRecord {
+            node_id: NodeId::from_string(node_id),
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wg-{node_id}"),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
         }
     }
 
@@ -884,6 +1031,88 @@ mod tests {
         };
 
         assert!(matches!(error, ControlPlaneError::RelayDenied));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applies_acl_roles_tags_and_routes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![
+            AclRule {
+                id: "edge-to-app".to_string(),
+                from_roles: BTreeSet::from([Role::edge()]),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("app")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+            AclRule {
+                id: "deny-blocked".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("blocked")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Deny,
+            },
+            AclRule {
+                id: "allow-route".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::new(),
+                routes: vec!["10.42.0.0/16".parse()?],
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+        ];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut source = node_record("source");
+        source.tags.insert(Tag::from_string("client"));
+        let mut allowed = node_record("allowed");
+        allowed.tags.insert(Tag::from_string("app"));
+        let mut denied = node_record("denied");
+        denied.tags.insert(Tag::from_string("app"));
+        denied.tags.insert(Tag::from_string("blocked"));
+        let mut route_provider = node_record("route-provider");
+        route_provider.routes = vec![
+            route("allowed-route", "10.42.1.0/24", "route-provider")?,
+            route("denied-route", "10.99.0.0/16", "route-provider")?,
+        ];
+
+        store.insert_node(source.clone()).await?;
+        store.insert_node(allowed.clone()).await?;
+        store.insert_node(denied).await?;
+        store.insert_node(route_provider).await?;
+
+        let peer_map = plane.peer_map_for(&source.node_id).await?;
+
+        assert_eq!(peer_map.peers.len(), 2);
+        let allowed_peer = peer_map
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == NodeId::from_string("allowed"))
+            .ok_or("allowed peer should be visible")?;
+        assert!(allowed_peer.routes.is_empty());
+        let route_peer = peer_map
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == NodeId::from_string("route-provider"))
+            .ok_or("route provider should be visible")?;
+        assert_eq!(route_peer.routes.len(), 1);
+        assert_eq!(route_peer.routes[0].id, "allowed-route");
+        assert!(peer_map
+            .peers
+            .iter()
+            .all(|peer| peer.node_id != NodeId::from_string("denied")));
         Ok(())
     }
 

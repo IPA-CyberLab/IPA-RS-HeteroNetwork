@@ -72,6 +72,10 @@ Path selection scores candidates using:
 
 Direct paths are preferred when allowed and healthy. Relay paths remain encrypted end to end and are demoted automatically when direct paths recover. Important peers, Kubernetes control-plane nodes, relays, and route providers can be pinned so lazy connection cleanup does not tear them down.
 
+## ACL And Peer Visibility
+
+Control-plane peer maps and relay maps are filtered through cluster ACL rules when rules are configured. An empty ACL list preserves the default allow-all peer visibility. When ACL rules exist, deny matches take precedence over allow matches, and unmatched peers/routes are hidden. Rules match source role/tag, target role/tag, protocol, and advertised route CIDR containment; route-specific rules can expose only the allowed subset of a node's advertised routes.
+
 ## Lazy Connect
 
 Agents do not establish a full mesh. They keep a compact peer map and only negotiate a path when:
@@ -232,7 +236,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 - Relays cannot decrypt payload.
 - Public nodes are not automatically relays; policy, health, and capacity are required.
 - Control-plane registration rejects relay capability advertisements unless the join token policy allows relay, and accepted capabilities are marked as enabled by policy by the control plane.
-- ACLs are evaluated by tag, role, route, protocol, and relay permission.
+- ACLs are evaluated by tag, role, route, protocol, and relay permission, and control-plane peer maps hide peers or advertised routes that are not allowed.
 - Key rotation supports overlapping issuer token-signing keys plus identity and WireGuard key families separately.
 
 ## Failure Behavior
