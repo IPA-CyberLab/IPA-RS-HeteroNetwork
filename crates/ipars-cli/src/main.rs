@@ -182,12 +182,48 @@ struct PathStatusArgs {
 
 #[derive(Debug, Subcommand)]
 enum DockerCommand {
-    Install,
+    Install(DockerInstallArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum K8sCommand {
-    Install,
+    Install(K8sInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct DockerInstallArgs {
+    #[arg(long, default_value = "docker/compose.yaml")]
+    compose_file: PathBuf,
+    #[arg(long, default_value = "ipars")]
+    project_name: String,
+}
+
+#[derive(Debug, Args)]
+struct K8sInstallArgs {
+    #[arg(long, default_value = "ipars")]
+    release: String,
+    #[arg(long, default_value = "ipars-system")]
+    namespace: String,
+    #[arg(long, default_value = "charts/ipars")]
+    chart: PathBuf,
+    #[arg(long, default_value = "ipars-join-token")]
+    join_token_secret: String,
+    #[arg(long, default_value = "token")]
+    join_token_key: String,
+    #[arg(long, default_value_t = false)]
+    expose_agent_api: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        requires_all = ["relay_public_endpoint", "relay_admission_url"]
+    )]
+    expose_relay: bool,
+    #[arg(long)]
+    relay_public_endpoint: Option<String>,
+    #[arg(long)]
+    relay_admission_url: Option<String>,
+    #[arg(long)]
+    relay_status_url: Option<String>,
 }
 
 #[tokio::main]
@@ -231,11 +267,11 @@ async fn main() -> anyhow::Result<()> {
             None => print_json(&StaticStatus::path())?,
         },
         Command::Docker {
-            command: DockerCommand::Install,
-        } => print_manifest_hint("docker/compose.yaml")?,
+            command: DockerCommand::Install(args),
+        } => print_json(&docker_install_plan(args))?,
         Command::K8s {
-            command: K8sCommand::Install,
-        } => print_manifest_hint("charts/ipars")?,
+            command: K8sCommand::Install(args),
+        } => print_json(&k8s_install_plan(args)?)?,
     };
     Ok(())
 }
@@ -665,13 +701,6 @@ fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_manifest_hint(path: &str) -> anyhow::Result<()> {
-    print_json(&serde_json::json!({
-        "manifest": path,
-        "status": "available"
-    }))
-}
-
 #[derive(Debug, Serialize)]
 struct InitOutput {
     cluster_id: ClusterId,
@@ -714,6 +743,114 @@ struct RoutesOutput {
 struct RouteEntry {
     peer: NodeId,
     route: Route,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct InstallPlan {
+    platform: String,
+    manifest: String,
+    commands: Vec<String>,
+    prerequisites: Vec<String>,
+    security: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
+    let compose_file = args.compose_file.display().to_string();
+    let compose_prefix = format!(
+        "docker compose -p {} -f {}",
+        args.project_name, compose_file
+    );
+    InstallPlan {
+        platform: "docker-compose".to_string(),
+        manifest: compose_file,
+        commands: vec![
+            format!("{compose_prefix} config"),
+            format!("{compose_prefix} up -d --build"),
+        ],
+        prerequisites: vec![
+            "Docker Engine with the Compose plugin".to_string(),
+            "/dev/net/tun available on agent/relay hosts".to_string(),
+            "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
+            "A reusable issuer private key for init/token create workflows".to_string(),
+        ],
+        security: vec![
+            "The bundled Compose file uses plain HTTP on a private development network".to_string(),
+            "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
+            "Relay use still requires signed join-token policy permission".to_string(),
+        ],
+        notes: vec![
+            "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
+            "Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string(),
+        ],
+    }
+}
+
+fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
+    let chart = args.chart.display().to_string();
+    let mut helm_command = format!(
+        "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
+        args.release, chart, args.namespace, args.join_token_secret, args.join_token_key
+    );
+    if args.expose_agent_api {
+        helm_command.push_str(" --set agent.apiService.enabled=true");
+    }
+    if args.expose_relay {
+        let relay_public_endpoint = args
+            .relay_public_endpoint
+            .as_deref()
+            .context("--expose-relay requires --relay-public-endpoint")?;
+        let relay_admission_url = args
+            .relay_admission_url
+            .as_deref()
+            .context("--expose-relay requires --relay-admission-url")?;
+        helm_command.push_str(
+            " --set agent.relayAdvertisement.enabled=true --set agent.relayService.enabled=true",
+        );
+        helm_command.push_str(&format!(
+            " --set-string agent.relayAdvertisement.publicEndpoint={relay_public_endpoint}"
+        ));
+        helm_command.push_str(&format!(
+            " --set-string agent.relayAdvertisement.admissionUrl={relay_admission_url}"
+        ));
+        if let Some(relay_status_url) = args.relay_status_url.as_deref() {
+            helm_command.push_str(&format!(
+                " --set-string agent.relayAdvertisement.statusUrl={relay_status_url}"
+            ));
+        }
+    }
+
+    Ok(InstallPlan {
+        platform: "kubernetes-helm".to_string(),
+        manifest: chart,
+        commands: vec![
+            format!(
+                "kubectl create namespace {} --dry-run=client -o yaml | kubectl apply -f -",
+                args.namespace
+            ),
+            format!(
+                "kubectl -n {} create secret generic {} --from-file={}=./join.token --dry-run=client -o yaml | kubectl apply -f -",
+                args.namespace, args.join_token_secret, args.join_token_key
+            ),
+            helm_command,
+        ],
+        prerequisites: vec![
+            "kubectl access with permission to create namespaces, Secrets, RBAC, and DaemonSets".to_string(),
+            "Helm 3".to_string(),
+            "/dev/net/tun available on every scheduled node".to_string(),
+            "NET_ADMIN and NET_RAW capability allowance for the DaemonSet agent".to_string(),
+        ],
+        security: vec![
+            "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
+            "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
+            "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
+        ],
+        notes: vec![
+            "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
+            "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
+        ],
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1090,6 +1227,154 @@ mod tests {
         assert_eq!(output.routes[0].peer, peer);
         assert_eq!(output.routes[0].route, route);
         Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_lists_compose_commands_and_requirements() {
+        let plan = docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+        });
+
+        assert_eq!(plan.platform, "docker-compose");
+        assert_eq!(plan.manifest, "ops/compose.yaml");
+        assert_eq!(
+            plan.commands,
+            vec![
+                "docker compose -p edge -f ops/compose.yaml config",
+                "docker compose -p edge -f ops/compose.yaml up -d --build",
+            ]
+        );
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("CAP_NET_ADMIN")));
+        assert!(plan
+            .security
+            .iter()
+            .any(|requirement| requirement.contains("plain HTTP")));
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_join_secret_and_optional_services() -> anyhow::Result<()> {
+        let plan = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            expose_relay: true,
+            relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
+            relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_status_url: Some("http://203.0.113.10:9580".to_string()),
+        })?;
+
+        assert_eq!(plan.platform, "kubernetes-helm");
+        assert_eq!(plan.manifest, "charts/ipars");
+        assert_eq!(
+            plan.commands[1],
+            "kubectl -n edge-system create secret generic edge-token --from-file=signed-token=./join.token --dry-run=client -o yaml | kubectl apply -f -"
+        );
+        assert!(plan.commands[2].contains("helm upgrade --install edge"));
+        assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
+        assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayAdvertisement.admissionUrl=http://203.0.113.10:9580"
+        ));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
+        assert!(plan
+            .security
+            .iter()
+            .any(|requirement| requirement.contains("disabled by default")));
+        Ok(())
+    }
+
+    #[test]
+    fn install_commands_accept_plan_options() -> anyhow::Result<()> {
+        let docker = Cli::try_parse_from([
+            "ipars",
+            "docker",
+            "install",
+            "--compose-file",
+            "ops/compose.yaml",
+            "--project-name",
+            "edge",
+        ])?;
+        if let Command::Docker {
+            command: DockerCommand::Install(args),
+        } = docker.command
+        {
+            assert_eq!(args.compose_file, PathBuf::from("ops/compose.yaml"));
+            assert_eq!(args.project_name, "edge");
+        } else {
+            anyhow::bail!("expected docker install command");
+        }
+
+        let k8s = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--release",
+            "edge",
+            "--namespace",
+            "edge-system",
+            "--join-token-secret",
+            "edge-token",
+            "--join-token-key",
+            "signed-token",
+            "--expose-agent-api",
+            "--expose-relay",
+            "--relay-public-endpoint",
+            "203.0.113.10:51820",
+            "--relay-admission-url",
+            "http://203.0.113.10:9580",
+        ])?;
+        if let Command::K8s {
+            command: K8sCommand::Install(args),
+        } = k8s.command
+        {
+            assert_eq!(args.release, "edge");
+            assert_eq!(args.namespace, "edge-system");
+            assert_eq!(args.join_token_secret, "edge-token");
+            assert_eq!(args.join_token_key, "signed-token");
+            assert!(args.expose_agent_api);
+            assert!(args.expose_relay);
+            assert_eq!(
+                args.relay_public_endpoint.as_deref(),
+                Some("203.0.113.10:51820")
+            );
+            assert_eq!(
+                args.relay_admission_url.as_deref(),
+                Some("http://203.0.113.10:9580")
+            );
+            return Ok(());
+        }
+
+        anyhow::bail!("expected k8s install command")
+    }
+
+    #[test]
+    fn k8s_install_rejects_relay_exposure_without_endpoints() {
+        let parsed = Cli::try_parse_from(["ipars", "k8s", "install", "--expose-relay"]);
+        assert!(parsed.is_err());
+
+        let plan = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: false,
+            expose_relay: true,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
+        });
+        assert!(plan.is_err());
     }
 
     fn temp_path(name: &str) -> PathBuf {

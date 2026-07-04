@@ -83,8 +83,8 @@ ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root -
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars path status --agent-url http://127.0.0.1:9780
-ipars docker install
-ipars k8s install
+ipars docker install --project-name ipars --compose-file docker/compose.yaml
+ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
 ```
 
 The control-plane daemon must be started with the issuer node ID, key ID, and public key reported by `ipars init`; later `token create` calls should use the same issuer private key path or `IPARS_ISSUER_PRIVATE_KEY`.
@@ -100,6 +100,8 @@ Public nodes that run a colocated relay can start `iparsd agent` with `--relay-p
 Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. `--docker-api-socket` overrides socket placement, otherwise `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, and rootless `$XDG_RUNTIME_DIR/docker.sock` are checked in order. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments.
 
 The bundled Docker Compose and Helm examples use plain HTTP between private deployment services because the current `iparsd` daemons serve HTTP directly. Terminate TLS at an external reverse proxy or Kubernetes Ingress when exposing control-plane, signal, relay, or agent APIs outside the private deployment network.
+
+`ipars docker install` and `ipars k8s install` emit JSON install plans with the manifest path, validation/apply commands, privilege requirements, and exposure/security notes. The Kubernetes plan includes the join-token Secret wiring and optional flags for agent API and relay Service exposure; relay exposure requires the public UDP endpoint and relay admission URL that peers should use.
 
 `iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; relay dataplane counters are also recorded as OTLP metrics. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls relay snapshot polling, and `--log-filter` maps to tracing filter syntax. The same settings are available through `IPARS_OTEL_ENABLED`, `IPARS_OTEL_ENDPOINT`, `IPARS_OTEL_SERVICE_NAME`, `IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `IPARS_LOG_FILTER`.
 

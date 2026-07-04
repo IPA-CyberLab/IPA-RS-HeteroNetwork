@@ -14,7 +14,7 @@ The data plane must continue after the control plane is unavailable. New joins, 
 - `relay`: UDP relay that forwards opaque E2E-encrypted packets and cannot decrypt payload.
 - `stun`: public endpoint detection for NAT traversal.
 - `route-manager`: Linux routing, policy routing, Docker integration, and Kubernetes node-underlay integration.
-- `cli`: entry point for cluster init, joins, status, path/relay inspection, and Docker/Kubernetes install output.
+- `cli`: entry point for cluster init, joins, status, path/relay inspection, and typed Docker/Kubernetes install plans.
 
 ## Trust And Identity
 
@@ -134,7 +134,7 @@ Docker support targets:
 
 The route manager works from explicit network namespace, capability, and routing intents. The design avoids treating iptables-only rewrites as the primary integration mechanism. Rootful deployments use `NET_ADMIN` and `/dev/net/tun`; `iparsd agent --linux-netns` runs the Linux WireGuard and route command backends through validated `ip netns exec` placement. Peer-map application can instead use `--wireguard-backend kernel-netlink` to create the WireGuard link through rtnetlink and upsert/remove peers through WireGuard generic netlink without shelling out to `wg`, in either the current namespace or the requested `--linux-netns` namespace. Route/rule application can use `--route-backend kernel-netlink` to replace `ip route`/`ip rule` execution with rtnetlink for peer-map, Docker, and Kubernetes route plans in either namespace placement. Docker route application can be driven by explicit container namespace, host interface, and container CIDR inputs from Compose or agent flags, or by `iparsd agent --docker-discover-networks`, which queries Docker Engine bridge networks and derives IPAM subnets dynamically. Discovery supports `--docker-network` name/ID filters for multi-network Compose deployments and resolves Docker sockets from explicit `--docker-api-socket`, `DOCKER_HOST=unix://...`, `/var/run/docker.sock`, or rootless `$XDG_RUNTIME_DIR/docker.sock`. Rootless deployments still require a userspace WireGuard backend before host dataplane mutation can be fully rootless.
 
-The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an agent.
+The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an agent. `ipars docker install` emits a JSON plan with the Compose manifest path, validation/apply commands, host capability requirements, and private-network HTTP exposure notes.
 
 ## Runtime Backends
 
@@ -153,7 +153,7 @@ When Kubernetes underlay routing is enabled, the DaemonSet starts `iparsd agent`
 
 Helm can optionally pass relay advertisement settings to the agent for public nodes that run a colocated relay service. Those settings remain inactive unless `agent.relayAdvertisement.enabled` is set and the join token policy permits relay.
 
-The chart can also render optional Services for the agent HTTP API and colocated relay UDP/HTTP endpoints. These are disabled by default so private underlay deployments do not publish node APIs unless an operator explicitly selects a Service type and annotations.
+The chart can also render optional Services for the agent HTTP API and colocated relay UDP/HTTP endpoints. These are disabled by default so private underlay deployments do not publish node APIs unless an operator explicitly selects a Service type and annotations. `ipars k8s install` emits a JSON plan with namespace creation, join-token Secret wiring, Helm upgrade/install flags, and the optional Service exposure toggles. Relay exposure in that plan requires the public UDP endpoint and HTTP admission URL that should be advertised to peers.
 
 CNI-owned pod networking remains the responsibility of the cluster CNI.
 
