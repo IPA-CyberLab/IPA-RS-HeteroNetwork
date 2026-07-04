@@ -10,7 +10,7 @@ The data plane must continue after the control plane is unavailable. New joins, 
 
 - `control-plane`: registration, token validation, VPN IP allocation, peer map, relay map, ACL, route, policy, health, and path-state management.
 - `signal`: endpoint candidate exchange, UDP hole-punch coordination, and path negotiation.
-- `agent`: identity/WireGuard key management, STUN probing, candidate collection, lazy connect, peer probing, WireGuard endpoint updates, route management, and health reports.
+- `agent`: identity/WireGuard key management, STUN probing, candidate collection, lazy connect, peer-map application, peer probing, WireGuard endpoint updates, route management, and health reports.
 - `relay`: UDP relay that forwards opaque E2E-encrypted packets and cannot decrypt payload.
 - `stun`: public endpoint detection for NAT traversal.
 - `route-manager`: Linux routing, policy routing, Docker integration, and Kubernetes node-underlay integration.

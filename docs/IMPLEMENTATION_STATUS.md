@@ -23,13 +23,14 @@ This file tracks the gap between the requested final system and the current repo
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
+- Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
 
 ## Remaining For Full Production Completion
 
-- Agent registration, signal-loop, peer-map application, and route-manager backend wiring.
+- Agent daemon registration, peer-map polling, signal loop, and runtime backend selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace execution hardening.
 - Full STUN protocol support and NAT classification.

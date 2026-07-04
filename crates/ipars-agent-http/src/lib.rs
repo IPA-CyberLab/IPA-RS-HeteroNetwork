@@ -71,6 +71,8 @@ impl IntoResponse for ApiError {
             | AgentError::Json(_)
             | AgentError::Crypto(_)
             | AgentError::Stun(_)
+            | AgentError::RouteManager(_)
+            | AgentError::RoutePlanning(_)
             | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
             AgentError::MissingPeer(_) => StatusCode::NOT_FOUND,
         };

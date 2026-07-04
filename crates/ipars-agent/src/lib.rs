@@ -6,10 +6,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
+use ipars_route_manager::{RouteManager, RouteManagerError, RoutePlan};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
-use ipars_types::api::AgentStatusResponse;
+use ipars_types::api::{AgentStatusResponse, PeerMap};
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, NodeId, PathRecord, PathScore, PathState, Role, Tag,
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathRecord,
+    PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -24,6 +26,10 @@ pub enum AgentError {
     Crypto(#[from] CryptoError),
     #[error("stun probe error: {0}")]
     Stun(#[from] StunError),
+    #[error("route manager error: {0}")]
+    RouteManager(#[from] RouteManagerError),
+    #[error("route planning error: {0}")]
+    RoutePlanning(String),
     #[error("wireguard backend error: {0}")]
     WireGuard(String),
     #[error("peer path does not exist: {0}")]
@@ -352,6 +358,119 @@ impl WireGuardBackend for MemoryWireGuardBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMapApplySummary {
+    pub peers_applied: usize,
+    pub routes_applied: usize,
+}
+
+#[derive(Debug)]
+pub struct PeerMapApplier<W, R> {
+    interface: String,
+    wireguard: W,
+    route_manager: R,
+}
+
+impl<W, R> PeerMapApplier<W, R>
+where
+    W: WireGuardBackend,
+    R: RouteManager,
+{
+    pub fn new(interface: impl Into<String>, wireguard: W, route_manager: R) -> Self {
+        Self {
+            interface: interface.into(),
+            wireguard,
+            route_manager,
+        }
+    }
+
+    pub async fn apply_peer_map(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError> {
+        let mut routes = Vec::new();
+        let mut peers_applied = 0;
+
+        for peer in peer_map.peers {
+            let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
+            let endpoint = preferred_endpoint(&peer);
+            self.wireguard
+                .upsert_peer(WireGuardPeerConfig {
+                    peer: peer.node_id.clone(),
+                    public_key: peer.wireguard_public_key.clone(),
+                    endpoint: endpoint.clone(),
+                    allowed_ips: vec![allowed_ip],
+                    persistent_keepalive_seconds: endpoint.map(|_| 25),
+                })
+                .await?;
+            peers_applied += 1;
+
+            routes.push(peer_host_route(&peer)?);
+            routes.extend(peer.routes);
+        }
+
+        let routes_applied = routes.len();
+        if routes_applied > 0 {
+            self.route_manager
+                .apply_routes(RoutePlan {
+                    interface: self.interface.clone(),
+                    routes,
+                    policy_rules: Vec::new(),
+                })
+                .await?;
+        }
+
+        Ok(PeerMapApplySummary {
+            peers_applied,
+            routes_applied,
+        })
+    }
+}
+
+fn peer_overlay_cidr(vpn_ip: &VpnIp) -> String {
+    match vpn_ip.0 {
+        std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+        std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+    }
+}
+
+fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
+    let cidr = peer_overlay_cidr(&peer.vpn_ip);
+    Ok(Route {
+        id: format!("peer-{}", peer.node_id),
+        cidr: cidr
+            .parse()
+            .map_err(|error| AgentError::RoutePlanning(format!("{cidr}: {error}")))?,
+        advertised_by: peer.node_id.clone(),
+        via: Some(peer.node_id.clone()),
+        metric: 10,
+        tags: peer.tags.clone(),
+    })
+}
+
+fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
+    peer.endpoint_candidates
+        .iter()
+        .filter_map(|candidate| candidate_kind_rank(candidate.kind).map(|rank| (rank, candidate)))
+        .min_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.cost.cmp(&right.cost))
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+        .map(|(_, candidate)| candidate.addr.to_string())
+}
+
+fn candidate_kind_rank(kind: EndpointCandidateKind) -> Option<u8> {
+    match kind {
+        EndpointCandidateKind::Ipv6 => Some(0),
+        EndpointCandidateKind::PublicUdp => Some(1),
+        EndpointCandidateKind::StunReflexive => Some(2),
+        EndpointCandidateKind::LocalUdp => Some(3),
+        EndpointCandidateKind::Relay => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LazyConnectManager {
     policy: ClusterPolicy,
@@ -431,8 +550,11 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Duration as ChronoDuration;
+    use ipars_route_manager::{
+        DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
+    };
     use ipars_stun::EchoStunServer;
-    use ipars_types::{PathMetrics, PeerPathKey};
+    use ipars_types::{CandidateSource, ClusterId, PathMetrics, PeerPathKey, TokenPolicy};
 
     use super::*;
 
@@ -507,6 +629,66 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingRouteManager {
+        applied: tokio::sync::RwLock<Vec<RoutePlan>>,
+        removed: tokio::sync::RwLock<Vec<RoutePlan>>,
+    }
+
+    #[async_trait]
+    impl RouteManager for RecordingRouteManager {
+        async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.applied.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.removed.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn apply_docker_intent(
+            &self,
+            _intent: DockerNetworkIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "docker intent is not used by agent tests".to_string(),
+            ))
+        }
+
+        async fn apply_kubernetes_intent(
+            &self,
+            _intent: KubernetesUnderlayIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "kubernetes intent is not used by agent tests".to_string(),
+            ))
+        }
+    }
+
+    fn peer_record(
+        node_id: NodeId,
+        vpn_ip: IpAddr,
+        wireguard_public_key: &str,
+        endpoint_candidates: Vec<EndpointCandidate>,
+        routes: Vec<Route>,
+    ) -> NodeRecord {
+        NodeRecord {
+            node_id,
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(vpn_ip),
+            identity_public_key: "identity-public".to_string(),
+            wireguard_public_key: wireguard_public_key.to_string(),
+            role: Role::edge(),
+            tags: Default::default(),
+            endpoint_candidates,
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes,
+            registered_at: Utc::now(),
         }
     }
 
@@ -625,6 +807,87 @@ mod tests {
                 LinuxCommand::new("ip", ["link", "set", "up", "dev", "ipars0"]),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_configures_wireguard_and_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let wireguard = MemoryWireGuardBackend::default();
+        let route_manager = RecordingRouteManager::default();
+        let applier = PeerMapApplier::new("ipars0", wireguard, route_manager);
+        let peer_id = NodeId::from_string("peer-a");
+        let advertised_route = Route {
+            id: "advertised-a".to_string(),
+            cidr: "10.10.0.0/16".parse()?,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-public",
+            vec![
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::StunReflexive,
+                    addr: SocketAddr::from(([198, 51, 100, 20], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::StunProbe,
+                },
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 10,
+                    cost: 50,
+                    source: CandidateSource::ControlPlane,
+                },
+            ],
+            vec![advertised_route],
+        );
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                routes_applied: 2,
+            }
+        );
+
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        let config = wireguard_peers
+            .get(&peer_id)
+            .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
+        assert_eq!(config.public_key, "wg-peer-public");
+        assert_eq!(config.allowed_ips, vec!["100.64.0.2/32"]);
+        assert_eq!(config.endpoint.as_deref(), Some("203.0.113.10:51820"));
+        assert_eq!(config.persistent_keepalive_seconds, Some(25));
+        drop(wireguard_peers);
+
+        let applied = applier.route_manager.applied.read().await;
+        let plan = applied
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing route plan".to_string()))?;
+        assert_eq!(plan.interface, "ipars0");
+        assert!(plan.policy_rules.is_empty());
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
+        assert_eq!(plan.routes[0].metric, 10);
+        assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
         Ok(())
     }
 

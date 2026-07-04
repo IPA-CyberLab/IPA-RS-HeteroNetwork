@@ -22,6 +22,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
 - Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`
+- agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -49,4 +50,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to wire the agent into registration, signal negotiation, route/peer application, and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to wire the agent daemon into registration, peer-map polling, signal negotiation, and network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
