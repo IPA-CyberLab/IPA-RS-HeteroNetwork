@@ -54,7 +54,10 @@ Linux network namespace integration tests are gated because they create host net
 
 ```bash
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
+IPARS_RUN_WG_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_wireguard_backend
 ```
+
+The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support.
 
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
