@@ -198,6 +198,45 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_admission_attempts_total Relay admission candidate attempts made by the agent."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_admission_attempts_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_relay_admission_attempts_total{{node_id=\"{node_id}\"}} {}",
+        metrics.relay_admission_attempt_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_admission_success_total Relay admission candidate attempts accepted by relays."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_admission_success_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_relay_admission_success_total{{node_id=\"{node_id}\"}} {}",
+        metrics.relay_admission_success_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_admission_failures_total Relay admission candidate attempts rejected or unreachable."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_admission_failures_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_relay_admission_failures_total{{node_id=\"{node_id}\"}} {}",
+        metrics.relay_admission_failure_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarders Number of supervised relay forwarder endpoints."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_relay_forwarders gauge");
@@ -560,6 +599,8 @@ mod tests {
         runtime
             .register_relay_forwarder_metrics(forwarder_metrics)
             .await;
+        runtime.record_relay_admission_attempt();
+        runtime.record_relay_admission_success();
         runtime
             .record_peer_activity(NodeId::from_string("peer-a"), Utc::now(), true)
             .await;
@@ -594,6 +635,9 @@ mod tests {
         assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
         assert_eq!(metrics.relay_forwarders[0].inbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].inbound_payload_bytes, 32);
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
         assert_eq!(metrics.lazy_connect.active_peer_count, 1);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 1);
         assert_eq!(metrics.peer_activity_record_count, 1);
@@ -622,6 +666,9 @@ mod tests {
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
         assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
+        assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
+        assert!(body.contains("ipars_agent_relay_admission_success_total"));
+        assert!(body.contains("ipars_agent_relay_admission_failures_total"));
         assert!(body.contains("peer=\"peer-a\""));
         assert!(body.contains("relay_node=\"relay-a\""));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));

@@ -1707,6 +1707,9 @@ fn start_relay_otel_metrics_export(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AgentOtelSnapshot {
     relay_forwarders: BTreeMap<(NodeId, NodeId), AgentRelayForwarderMetrics>,
+    relay_admission_attempt_count: u64,
+    relay_admission_success_count: u64,
+    relay_admission_failure_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
     packet_flow_match_count: u64,
@@ -1727,6 +1730,9 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                     )
                 })
                 .collect(),
+            relay_admission_attempt_count: metrics.relay_admission_attempt_count,
+            relay_admission_success_count: metrics.relay_admission_success_count,
+            relay_admission_failure_count: metrics.relay_admission_failure_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
             packet_flow_match_count: metrics.packet_flow_match_count,
@@ -1748,6 +1754,9 @@ struct AgentOtelMetrics {
     lazy_observed_peer_vpn_ips: Gauge<u64>,
     lazy_observed_route_peers: Gauge<u64>,
     lazy_observed_routes: Gauge<u64>,
+    relay_admission_attempts: Counter<u64>,
+    relay_admission_success: Counter<u64>,
+    relay_admission_failures: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
     packet_flow_matches: Counter<u64>,
@@ -1808,6 +1817,18 @@ impl AgentOtelMetrics {
             lazy_observed_routes: meter
                 .u64_gauge("ipars.agent.lazy_connect.observed_routes")
                 .with_description("Advertised routes indexed for packet-flow resolution.")
+                .build(),
+            relay_admission_attempts: meter
+                .u64_counter("ipars.agent.relay.admission.attempts")
+                .with_description("Relay admission candidate attempts made by the agent.")
+                .build(),
+            relay_admission_success: meter
+                .u64_counter("ipars.agent.relay.admission.success")
+                .with_description("Relay admission candidate attempts accepted by relays.")
+                .build(),
+            relay_admission_failures: meter
+                .u64_counter("ipars.agent.relay.admission.failures")
+                .with_description("Relay admission candidate attempts rejected or unreachable.")
                 .build(),
             peer_activity_records: meter
                 .u64_counter("ipars.agent.peer_activity.records")
@@ -1883,6 +1904,31 @@ impl AgentOtelMetrics {
             metrics.lazy_connect.observed_route_count as u64,
             &node_attrs,
         );
+
+        let relay_admission_attempt_delta = counter_delta(
+            metrics.relay_admission_attempt_count,
+            previous.map(|previous| previous.relay_admission_attempt_count),
+        );
+        if relay_admission_attempt_delta > 0 {
+            self.relay_admission_attempts
+                .add(relay_admission_attempt_delta, &node_attrs);
+        }
+        let relay_admission_success_delta = counter_delta(
+            metrics.relay_admission_success_count,
+            previous.map(|previous| previous.relay_admission_success_count),
+        );
+        if relay_admission_success_delta > 0 {
+            self.relay_admission_success
+                .add(relay_admission_success_delta, &node_attrs);
+        }
+        let relay_admission_failure_delta = counter_delta(
+            metrics.relay_admission_failure_count,
+            previous.map(|previous| previous.relay_admission_failure_count),
+        );
+        if relay_admission_failure_delta > 0 {
+            self.relay_admission_failures
+                .add(relay_admission_failure_delta, &node_attrs);
+        }
 
         let peer_activity_delta = counter_delta(
             metrics.peer_activity_record_count,
@@ -4152,6 +4198,7 @@ async fn negotiate_signal_paths(
                     {
                         match admit_relay_session_from_candidates(
                             client,
+                            runtime,
                             &status,
                             &peer,
                             &relay_candidates,
@@ -4442,15 +4489,21 @@ async fn admit_relay_session(
 
 async fn admit_relay_session_from_candidates(
     client: &reqwest::Client,
+    runtime: &AgentRuntime,
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
     relays: &[NodeRecord],
 ) -> anyhow::Result<RelaySessionState> {
     let mut errors = Vec::new();
     for relay in relays {
+        runtime.record_relay_admission_attempt();
         match admit_relay_session(client, status, peer, relay).await {
-            Ok(session) => return Ok(session),
+            Ok(session) => {
+                runtime.record_relay_admission_success();
+                return Ok(session);
+            }
             Err(error) => {
+                runtime.record_relay_admission_failure();
                 errors.push(format!("{}: {error:#}", relay.node_id));
                 tracing::warn!(
                     relay = %relay.node_id,
@@ -6100,6 +6153,9 @@ mod tests {
             candidate_count: 2,
             path_count: 1,
             relay_session_count: 1,
+            relay_admission_attempt_count: 3,
+            relay_admission_success_count: 2,
+            relay_admission_failure_count: 1,
             relay_forwarder_count: 1,
             relay_forwarders: vec![forwarder],
             path_change_event_count: 1,
@@ -7788,9 +7844,14 @@ invalid no-destination-here
             cost: 10,
             source: CandidateSource::StunProbe,
         }];
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
 
         let session = admit_relay_session_from_candidates(
             &reqwest::Client::new(),
+            &runtime,
             &status,
             &peer,
             &ordered_relays,
@@ -7802,6 +7863,10 @@ invalid no-destination-here
             session.relay_endpoint,
             SocketAddr::from(([203, 0, 113, 32], 51820))
         );
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
         relay_task.abort();
         Ok(())
     }

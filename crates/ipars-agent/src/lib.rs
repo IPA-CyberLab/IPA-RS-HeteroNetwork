@@ -161,6 +161,9 @@ pub struct AgentRuntime {
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
+    relay_admission_attempt_count: AtomicU64,
+    relay_admission_success_count: AtomicU64,
+    relay_admission_failure_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
@@ -373,6 +376,9 @@ impl AgentRuntime {
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
+            relay_admission_attempt_count: AtomicU64::new(0),
+            relay_admission_success_count: AtomicU64::new(0),
+            relay_admission_failure_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
@@ -499,6 +505,15 @@ impl AgentRuntime {
             candidate_count: candidates.len(),
             path_count: path_state.len(),
             relay_session_count: relay_sessions.len(),
+            relay_admission_attempt_count: self
+                .relay_admission_attempt_count
+                .load(Ordering::Relaxed),
+            relay_admission_success_count: self
+                .relay_admission_success_count
+                .load(Ordering::Relaxed),
+            relay_admission_failure_count: self
+                .relay_admission_failure_count
+                .load(Ordering::Relaxed),
             relay_forwarder_count: relay_forwarders.len(),
             relay_forwarders: relay_forwarder_metrics
                 .values()
@@ -553,6 +568,21 @@ impl AgentRuntime {
             .write()
             .await
             .insert(session.peer.clone(), session);
+    }
+
+    pub fn record_relay_admission_attempt(&self) {
+        self.relay_admission_attempt_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relay_admission_success(&self) {
+        self.relay_admission_success_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_relay_admission_failure(&self) {
+        self.relay_admission_failure_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
@@ -2092,6 +2122,9 @@ mod tests {
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.path_change_event_count, 2);
         assert_eq!(metrics.relay_session_count, 0);
+        assert_eq!(metrics.relay_admission_attempt_count, 0);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
         assert!(metrics.relay_forwarders.is_empty());
         assert_eq!(
             metrics.path_state_counts,
@@ -2100,6 +2133,24 @@ mod tests {
                 count: 1,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_records_relay_admission_metrics() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        runtime.record_relay_admission_attempt();
+        runtime.record_relay_admission_attempt();
+        runtime.record_relay_admission_success();
+        runtime.record_relay_admission_failure();
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
     }
 
     #[tokio::test]
