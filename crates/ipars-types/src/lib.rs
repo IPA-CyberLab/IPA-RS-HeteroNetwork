@@ -1111,6 +1111,35 @@ pub mod api {
         pub pinned: bool,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowMatchKind {
+        PeerVpnIp,
+        AdvertisedRoute,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowRequest {
+        pub destination: IpAddr,
+        #[serde(default)]
+        pub pin: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowMatch {
+        pub peer: NodeId,
+        pub kind: AgentPacketFlowMatchKind,
+        pub route: Option<IpNet>,
+        pub pinned: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowResponse {
+        pub destination: IpAddr,
+        pub recorded_at: DateTime<Utc>,
+        pub matched: Option<AgentPacketFlowMatch>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentRelayForwarderMetrics {
         pub peer: NodeId,

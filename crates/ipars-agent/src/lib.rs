@@ -19,7 +19,8 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentRelayForwarderMetrics, AgentStatusResponse, PathStateCount, PeerMap,
+    AgentMetricsResponse, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
+    AgentRelayForwarderMetrics, AgentStatusResponse, PathStateCount, PeerMap,
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
@@ -635,6 +636,22 @@ impl AgentRuntime {
             lazy_connect.pin_peer(peer.clone());
         }
         lazy_connect.is_pinned(&peer)
+    }
+
+    pub async fn record_packet_flow_activity(
+        &self,
+        destination: IpAddr,
+        at: DateTime<Utc>,
+        pin: bool,
+    ) -> Option<AgentPacketFlowMatch> {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        let mut matched = lazy_connect.resolve_packet_flow_destination(destination)?;
+        lazy_connect.record_activity(matched.peer.clone(), at);
+        if pin {
+            lazy_connect.pin_peer(matched.peer.clone());
+        }
+        matched.pinned = lazy_connect.is_pinned(&matched.peer);
+        Some(matched)
     }
 
     pub async fn observe_peer_map_for_lazy_connect(&self, peers: &[NodeRecord]) {
@@ -1589,6 +1606,8 @@ pub struct LazyConnectManager {
     policy: ClusterPolicy,
     pins: BTreeSet<NodeId>,
     last_used: BTreeMap<NodeId, DateTime<Utc>>,
+    peer_vpn_ips: BTreeMap<IpAddr, NodeId>,
+    advertised_routes: BTreeMap<NodeId, Vec<ipnet::IpNet>>,
 }
 
 impl LazyConnectManager {
@@ -1597,6 +1616,8 @@ impl LazyConnectManager {
             policy,
             pins: BTreeSet::new(),
             last_used: BTreeMap::new(),
+            peer_vpn_ips: BTreeMap::new(),
+            advertised_routes: BTreeMap::new(),
         }
     }
 
@@ -1618,6 +1639,18 @@ impl LazyConnectManager {
     }
 
     pub fn observe_peer(&mut self, peer: &NodeRecord) {
+        self.remove_observed_peer(&peer.node_id);
+        self.peer_vpn_ips
+            .insert(peer.vpn_ip.0, peer.node_id.clone());
+        let routes = peer
+            .routes
+            .iter()
+            .map(|route| route.cidr)
+            .collect::<Vec<_>>();
+        if !routes.is_empty() {
+            self.advertised_routes.insert(peer.node_id.clone(), routes);
+        }
+
         if self.is_pinned_by_policy(&peer.role, &peer.tags)
             || !peer.routes.is_empty()
             || peer
@@ -1627,6 +1660,36 @@ impl LazyConnectManager {
         {
             self.pin_peer(peer.node_id.clone());
         }
+    }
+
+    pub fn resolve_packet_flow_destination(
+        &self,
+        destination: IpAddr,
+    ) -> Option<AgentPacketFlowMatch> {
+        if let Some(peer) = self.peer_vpn_ips.get(&destination) {
+            return Some(AgentPacketFlowMatch {
+                peer: peer.clone(),
+                kind: AgentPacketFlowMatchKind::PeerVpnIp,
+                route: None,
+                pinned: self.is_pinned(peer),
+            });
+        }
+
+        self.advertised_routes
+            .iter()
+            .flat_map(|(peer, routes)| {
+                routes
+                    .iter()
+                    .filter(move |route| route.contains(&destination))
+                    .map(move |route| (peer, route))
+            })
+            .max_by_key(|(_, route)| route.prefix_len())
+            .map(|(peer, route)| AgentPacketFlowMatch {
+                peer: peer.clone(),
+                kind: AgentPacketFlowMatchKind::AdvertisedRoute,
+                route: Some(*route),
+                pinned: self.is_pinned(peer),
+            })
     }
 
     pub fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
@@ -1653,6 +1716,12 @@ impl LazyConnectManager {
 
     pub fn remove_activity(&mut self, peer: &NodeId) {
         self.last_used.remove(peer);
+    }
+
+    fn remove_observed_peer(&mut self, peer: &NodeId) {
+        self.peer_vpn_ips
+            .retain(|_, observed_peer| observed_peer != peer);
+        self.advertised_routes.remove(peer);
     }
 }
 
@@ -2735,6 +2804,88 @@ mod tests {
         assert!(!wireguard_peers.contains_key(&active_peer_id));
         assert!(!wireguard_peers.contains_key(&inactive_peer_id));
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_activity_resolves_peer_vpn_ip_and_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_a_id = NodeId::from_string("peer-a");
+        let peer_b_id = NodeId::from_string("peer-b");
+        let peer_c_id = NodeId::from_string("peer-c");
+        let peer_a = peer_record(
+            peer_a_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        let peer_b = peer_record(
+            peer_b_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)),
+            "wg-peer-b",
+            Vec::new(),
+            vec![Route {
+                id: "peer-b-specific".to_string(),
+                cidr: "10.42.7.0/24".parse()?,
+                advertised_by: peer_b_id.clone(),
+                via: None,
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+        let peer_c = peer_record(
+            peer_c_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 12)),
+            "wg-peer-c",
+            Vec::new(),
+            vec![Route {
+                id: "peer-c-wide".to_string(),
+                cidr: "10.42.0.0/16".parse()?,
+                advertised_by: peer_c_id,
+                via: None,
+                metric: 100,
+                tags: BTreeSet::new(),
+            }],
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(&[peer_a.clone(), peer_b.clone(), peer_c])
+            .await;
+
+        let vpn_ip_match = runtime
+            .record_packet_flow_activity(peer_a.vpn_ip.0, Utc::now(), false)
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_a_id.clone()))?;
+        assert_eq!(vpn_ip_match.peer, peer_a_id);
+        assert_eq!(vpn_ip_match.kind, AgentPacketFlowMatchKind::PeerVpnIp);
+        assert_eq!(vpn_ip_match.route, None);
+        assert!(!vpn_ip_match.pinned);
+        assert!(runtime.should_connect_peer(&peer_a).await);
+
+        let route_match = runtime
+            .record_packet_flow_activity(IpAddr::V4(Ipv4Addr::new(10, 42, 7, 25)), Utc::now(), true)
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(route_match.peer, peer_b_id);
+        assert_eq!(route_match.kind, AgentPacketFlowMatchKind::AdvertisedRoute);
+        assert_eq!(route_match.route, Some("10.42.7.0/24".parse()?));
+        assert!(route_match.pinned);
+        assert!(runtime.should_connect_peer(&peer_b).await);
+
+        assert!(
+            runtime
+                .record_packet_flow_activity(
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                    Utc::now(),
+                    false,
+                )
+                .await
+                .is_none()
+        );
         Ok(())
     }
 

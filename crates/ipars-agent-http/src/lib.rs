@@ -9,8 +9,9 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime};
 use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
-    AgentPathEventsResponse, AgentPathsResponse, AgentPeerActivityRequest,
-    AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
+    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse, AgentPathsResponse,
+    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
+    AgentStunProbeRequest, AgentStunProbeResponse,
 };
 use ipars_types::PathState;
 use serde::Serialize;
@@ -43,6 +44,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/stun-probe", post(stun_probe))
         .route("/v1/nat-classification", post(nat_classification))
         .route("/v1/peer-activity", post(peer_activity))
+        .route("/v1/packet-flow", post(packet_flow))
         .with_state(state)
 }
 
@@ -126,6 +128,25 @@ async fn peer_activity(
             peer: request.peer,
             recorded_at,
             pinned,
+        }),
+    ))
+}
+
+async fn packet_flow(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentPacketFlowRequest>,
+) -> Result<(StatusCode, Json<AgentPacketFlowResponse>), ApiError> {
+    let recorded_at = chrono::Utc::now();
+    let matched = state
+        .runtime
+        .record_packet_flow_activity(request.destination, recorded_at, request.pin)
+        .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AgentPacketFlowResponse {
+            destination: request.destination,
+            recorded_at,
+            matched,
         }),
     ))
 }
@@ -331,16 +352,39 @@ struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
     use axum::body::Body;
     use axum::http::{header, Request};
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
-    use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathScore, PathState, PeerPathKey};
+    use ipars_types::api::AgentPacketFlowMatchKind;
+    use ipars_types::{
+        ClusterId, ClusterPolicy, NodeId, NodeRecord, PathRecord, PathScore, PathState,
+        PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+    };
     use tower::ServiceExt;
 
     use super::*;
+
+    fn peer_record(node_id: NodeId, vpn_ip: IpAddr, routes: Vec<Route>) -> NodeRecord {
+        NodeRecord {
+            node_id,
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(vpn_ip),
+            identity_public_key: "identity-public".to_string(),
+            wireguard_public_key: "wireguard-public".to_string(),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes,
+            registered_at: Utc::now(),
+        }
+    }
 
     #[tokio::test]
     async fn http_agent_status_returns_node_keys() -> Result<(), Box<dyn std::error::Error>> {
@@ -518,6 +562,59 @@ mod tests {
         assert_eq!(activity.peer, peer);
         assert!(activity.pinned);
         assert!(runtime.idle_peers_to_close(Utc::now()).await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_records_packet_flow_for_lazy_connect(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let peer = NodeId::from_string("peer-route");
+        let route = "10.44.0.0/16".parse()?;
+        let peer_record = peer_record(
+            peer.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 44)),
+            vec![Route {
+                id: "peer-route-cidr".to_string(),
+                cidr: route,
+                advertised_by: peer.clone(),
+                via: None,
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer_record))
+            .await;
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&AgentPacketFlowRequest {
+                        destination: IpAddr::V4(Ipv4Addr::new(10, 44, 3, 10)),
+                        pin: true,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        let matched = packet_flow
+            .matched
+            .ok_or_else(|| std::io::Error::other("route should match peer"))?;
+        assert_eq!(matched.peer, peer);
+        assert_eq!(matched.kind, AgentPacketFlowMatchKind::AdvertisedRoute);
+        assert_eq!(matched.route, Some(route));
+        assert!(matched.pinned);
+        assert!(runtime.should_connect_peer(&peer_record).await);
         Ok(())
     }
 }

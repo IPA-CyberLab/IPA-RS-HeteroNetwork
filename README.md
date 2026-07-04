@@ -19,7 +19,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
-- persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity HTTP API, and `iparsd agent`
+- persistent agent node state, agent status/path/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` or `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, relay capability updates, and path state, retrying on control-plane errors
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates when a signal endpoint is known
@@ -108,7 +108,7 @@ Operators can inspect the active control-plane cluster policy, VPN pool, and loa
 
 `iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`, and peer-map/Docker/Kubernetes route application can switch route/rule management to rtnetlink with `--route-backend kernel-netlink`. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
 
-Lazy connect is enforced during signal path negotiation and `--apply-peer-map`: route providers, relay-capable peers, control-plane/policy-pinned roles or tags, and peers marked through `POST /v1/peer-activity` are negotiated/applied, while idle unpinned peers are removed from WireGuard and relay-forwarder state after the cluster idle timeout.
+Lazy connect is enforced during signal path negotiation and `--apply-peer-map`: route providers, relay-capable peers, control-plane/policy-pinned roles or tags, peers marked through `POST /v1/peer-activity`, and packet-flow destinations resolved through `POST /v1/packet-flow` are negotiated/applied, while idle unpinned peers are removed from WireGuard and relay-forwarder state after the cluster idle timeout.
 
 For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent query the Kubernetes API with its ServiceAccount token, optionally constrained by `--kubernetes-namespace` and `--kubernetes-service-label-selector`, and convert Service cluster IPs plus the in-cluster API server address into overlay host routes. Explicit `--kubernetes-service-cidr` and `--kubernetes-api-server-cidr` values remain supported for static deployments. The Helm chart mounts the join token Secret and passes it to the agent through `--join-token-path`, and can optionally create ClusterIP/LoadBalancer Services for the agent API and colocated relay endpoints.
 
