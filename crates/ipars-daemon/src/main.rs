@@ -45,6 +45,7 @@ use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
 };
+use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr as NetlinkSocketAddr};
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Gauge};
 use opentelemetry::trace::TracerProvider as _;
@@ -624,6 +625,8 @@ enum PacketFlowDetector {
     Disabled,
     #[value(name = "proc-net-conntrack")]
     ProcNetConntrack,
+    #[value(name = "conntrack-netlink")]
+    ConntrackNetlink,
 }
 
 impl PacketFlowDetector {
@@ -631,6 +634,7 @@ impl PacketFlowDetector {
         match self {
             Self::Disabled => "disabled",
             Self::ProcNetConntrack => "proc-net-conntrack",
+            Self::ConntrackNetlink => "conntrack-netlink",
         }
     }
 }
@@ -1933,20 +1937,36 @@ async fn run_agent(
         background_tasks
             .push(start_kubernetes_underlay_routes(&args, runtime.state().node_id.clone()).await?);
     }
-    if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
-        tracing::info!(
-            detector = args.packet_flow_detector.as_str(),
-            conntrack_path = ?args.packet_flow_conntrack_path,
-            interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
-            pin = args.packet_flow_pin,
-            "starting packet-flow detector"
-        );
-        background_tasks.push(start_proc_net_conntrack_packet_flow_detector(
-            runtime.clone(),
-            conntrack_paths(args.packet_flow_conntrack_path.clone()),
-            Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
-            args.packet_flow_pin,
-        ));
+    match args.packet_flow_detector {
+        PacketFlowDetector::Disabled => {}
+        PacketFlowDetector::ProcNetConntrack => {
+            tracing::info!(
+                detector = args.packet_flow_detector.as_str(),
+                conntrack_path = ?args.packet_flow_conntrack_path,
+                interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                pin = args.packet_flow_pin,
+                "starting packet-flow detector"
+            );
+            background_tasks.push(start_proc_net_conntrack_packet_flow_detector(
+                runtime.clone(),
+                conntrack_paths(args.packet_flow_conntrack_path.clone()),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                args.packet_flow_pin,
+            ));
+        }
+        PacketFlowDetector::ConntrackNetlink => {
+            tracing::info!(
+                detector = args.packet_flow_detector.as_str(),
+                interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                pin = args.packet_flow_pin,
+                "starting packet-flow detector"
+            );
+            background_tasks.push(start_conntrack_netlink_packet_flow_detector(
+                runtime.clone(),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                args.packet_flow_pin,
+            ));
+        }
     }
     if !args.disable_signal_registration {
         if let (Some(node), Some(signal_url)) = (registered_node.clone(), signal_base.clone()) {
@@ -4401,6 +4421,67 @@ fn start_proc_net_conntrack_packet_flow_detector(
     })
 }
 
+fn start_conntrack_netlink_packet_flow_detector(
+    runtime: Arc<AgentRuntime>,
+    interval: Duration,
+    pin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match read_conntrack_netlink_destination_ips().await {
+                Ok(destinations) => {
+                    let matched_count = record_packet_flow_destinations(
+                        runtime.as_ref(),
+                        destinations,
+                        pin,
+                        "conntrack-netlink",
+                    )
+                    .await;
+                    if matched_count > 0 {
+                        tracing::info!(
+                            matched = matched_count,
+                            "recorded packet-flow lazy-connect activity from conntrack netlink"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to read conntrack netlink packet-flow table; will retry"
+                ),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+async fn record_packet_flow_destinations(
+    runtime: &AgentRuntime,
+    destinations: BTreeSet<IpAddr>,
+    pin: bool,
+    source: &'static str,
+) -> usize {
+    let now = chrono::Utc::now();
+    let mut matched_count = 0_usize;
+    for destination in destinations {
+        if let Some(matched) = runtime
+            .record_packet_flow_activity(destination, now, pin)
+            .await
+        {
+            matched_count += 1;
+            tracing::debug!(
+                destination = %destination,
+                peer = %matched.peer,
+                kind = ?matched.kind,
+                route = ?matched.route,
+                pinned = matched.pinned,
+                source,
+                "recorded packet-flow lazy-connect activity"
+            );
+        }
+    }
+    matched_count
+}
+
 fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
     custom_path.map_or_else(
         || {
@@ -4411,6 +4492,311 @@ fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
         },
         |path| vec![path],
     )
+}
+
+async fn read_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> {
+    tokio::task::spawn_blocking(dump_conntrack_netlink_destination_ips)
+        .await
+        .context("conntrack netlink reader task failed")?
+}
+
+fn dump_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut socket =
+        Socket::new(NETLINK_NETFILTER).context("failed to open NETLINK_NETFILTER socket")?;
+    socket
+        .bind_auto()
+        .context("failed to bind NETLINK_NETFILTER socket")?;
+    socket
+        .connect(&NetlinkSocketAddr::new(0, 0))
+        .context("failed to connect NETLINK_NETFILTER socket to kernel")?;
+
+    let request = conntrack_netlink_dump_request(1);
+    let sent = socket
+        .send(&request, 0)
+        .context("failed to send conntrack netlink dump request")?;
+    anyhow::ensure!(
+        sent == request.len(),
+        "short conntrack netlink dump request write: sent {sent} of {} bytes",
+        request.len()
+    );
+
+    let mut destinations = BTreeSet::new();
+    let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
+    loop {
+        let received = socket
+            .recv(&mut &mut buffer[..], 0)
+            .context("failed to receive conntrack netlink dump response")?;
+        let result = parse_conntrack_netlink_datagram_destination_ips(&buffer[..received])?;
+        destinations.extend(result.destinations);
+        if result.done {
+            return Ok(destinations);
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConntrackNetlinkDatagram {
+    destinations: BTreeSet<IpAddr>,
+    done: bool,
+}
+
+const CONNTRACK_NETLINK_RECV_BUFFER_BYTES: usize = 256 * 1024;
+const NLMSG_HDR_LEN: usize = 16;
+const NLA_HDR_LEN: usize = 4;
+const NFGENMSG_LEN: usize = 4;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_DUMP: u16 = 0x300;
+const NFNL_SUBSYS_CTNETLINK: u16 = 1;
+const IPCTNL_MSG_CT_GET: u16 = 1;
+const NFNETLINK_V0: u8 = 0;
+const CTA_TUPLE_ORIG: u16 = 1;
+const CTA_TUPLE_REPLY: u16 = 2;
+const CTA_TUPLE_IP: u16 = 1;
+const CTA_IP_V4_DST: u16 = 2;
+const CTA_IP_V6_DST: u16 = 4;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+
+fn conntrack_netlink_dump_request(sequence_number: u32) -> Vec<u8> {
+    let mut request = Vec::with_capacity(NLMSG_HDR_LEN + NFGENMSG_LEN);
+    push_u32_ne(&mut request, (NLMSG_HDR_LEN + NFGENMSG_LEN) as u32);
+    push_u16_ne(&mut request, ctnetlink_message_type(IPCTNL_MSG_CT_GET));
+    push_u16_ne(&mut request, NLM_F_REQUEST | NLM_F_DUMP);
+    push_u32_ne(&mut request, sequence_number);
+    push_u32_ne(&mut request, 0);
+    request.push(0);
+    request.push(NFNETLINK_V0);
+    push_u16_be(&mut request, 0);
+    request
+}
+
+fn parse_conntrack_netlink_datagram_destination_ips(
+    datagram: &[u8],
+) -> anyhow::Result<ConntrackNetlinkDatagram> {
+    let mut result = ConntrackNetlinkDatagram::default();
+    let mut offset = 0_usize;
+    while offset < datagram.len() {
+        let remaining = &datagram[offset..];
+        if remaining.len() < NLMSG_HDR_LEN {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!(
+                "truncated conntrack netlink header: {} trailing bytes",
+                remaining.len()
+            );
+        }
+
+        let message_len = read_u32_ne(remaining, 0)? as usize;
+        if message_len == 0 {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!("conntrack netlink message has zero length");
+        }
+        if message_len < NLMSG_HDR_LEN {
+            anyhow::bail!("conntrack netlink message is too short: {message_len} bytes");
+        }
+        let message_end = offset
+            .checked_add(message_len)
+            .context("conntrack netlink message length overflow")?;
+        if message_end > datagram.len() {
+            anyhow::bail!(
+                "conntrack netlink message length {message_len} exceeds datagram remainder {}",
+                remaining.len()
+            );
+        }
+
+        let message_type = read_u16_ne(remaining, 4)?;
+        let payload = &datagram[offset + NLMSG_HDR_LEN..message_end];
+        match message_type {
+            NLMSG_DONE => result.done = true,
+            NLMSG_ERROR => handle_netlink_error(payload)?,
+            message_type if ctnetlink_subsystem(message_type) == NFNL_SUBSYS_CTNETLINK => {
+                result
+                    .destinations
+                    .extend(parse_ctnetlink_destination_ips(payload)?);
+            }
+            _ => {}
+        }
+
+        let aligned_len = align_to_4(message_len);
+        let next_offset = offset
+            .checked_add(aligned_len)
+            .context("conntrack netlink aligned length overflow")?;
+        if next_offset > datagram.len() {
+            offset = message_end;
+        } else {
+            offset = next_offset;
+        }
+    }
+    Ok(result)
+}
+
+fn handle_netlink_error(payload: &[u8]) -> anyhow::Result<()> {
+    if payload.len() < 4 {
+        anyhow::bail!("truncated conntrack netlink error payload");
+    }
+    let code = i32::from_ne_bytes(payload[..4].try_into()?);
+    if code == 0 {
+        return Ok(());
+    }
+    let raw_error = code.checked_neg().unwrap_or(code);
+    anyhow::bail!(
+        "conntrack netlink dump request failed: {}",
+        std::io::Error::from_raw_os_error(raw_error)
+    )
+}
+
+fn parse_ctnetlink_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
+    if payload.len() < NFGENMSG_LEN {
+        anyhow::bail!("truncated conntrack netlink nfgenmsg payload");
+    }
+    let mut destinations = BTreeSet::new();
+    for attribute in netlink_attributes(&payload[NFGENMSG_LEN..])? {
+        match attribute.kind {
+            CTA_TUPLE_ORIG | CTA_TUPLE_REPLY => {
+                destinations.extend(parse_conntrack_tuple_destination_ips(attribute.value)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(destinations)
+}
+
+fn parse_conntrack_tuple_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut destinations = BTreeSet::new();
+    for attribute in netlink_attributes(payload)? {
+        if attribute.kind == CTA_TUPLE_IP {
+            destinations.extend(parse_conntrack_ip_destination_ips(attribute.value)?);
+        }
+    }
+    Ok(destinations)
+}
+
+fn parse_conntrack_ip_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut destinations = BTreeSet::new();
+    for attribute in netlink_attributes(payload)? {
+        match attribute.kind {
+            CTA_IP_V4_DST => {
+                anyhow::ensure!(
+                    attribute.value.len() == 4,
+                    "invalid conntrack IPv4 destination attribute length: {}",
+                    attribute.value.len()
+                );
+                destinations.insert(IpAddr::from(<[u8; 4]>::try_from(attribute.value)?));
+            }
+            CTA_IP_V6_DST => {
+                anyhow::ensure!(
+                    attribute.value.len() == 16,
+                    "invalid conntrack IPv6 destination attribute length: {}",
+                    attribute.value.len()
+                );
+                destinations.insert(IpAddr::from(<[u8; 16]>::try_from(attribute.value)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(destinations)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NetlinkAttribute<'a> {
+    kind: u16,
+    value: &'a [u8],
+}
+
+fn netlink_attributes(payload: &[u8]) -> anyhow::Result<Vec<NetlinkAttribute<'_>>> {
+    let mut attributes = Vec::new();
+    let mut offset = 0_usize;
+    while offset < payload.len() {
+        let remaining = &payload[offset..];
+        if remaining.len() < NLA_HDR_LEN {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!(
+                "truncated conntrack netlink attribute header: {} trailing bytes",
+                remaining.len()
+            );
+        }
+
+        let attribute_len = read_u16_ne(remaining, 0)? as usize;
+        if attribute_len == 0 {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!("conntrack netlink attribute has zero length");
+        }
+        if attribute_len < NLA_HDR_LEN {
+            anyhow::bail!("conntrack netlink attribute is too short: {attribute_len} bytes");
+        }
+        let attribute_end = offset
+            .checked_add(attribute_len)
+            .context("conntrack netlink attribute length overflow")?;
+        if attribute_end > payload.len() {
+            anyhow::bail!(
+                "conntrack netlink attribute length {attribute_len} exceeds payload remainder {}",
+                remaining.len()
+            );
+        }
+
+        let kind = read_u16_ne(remaining, 2)? & NLA_TYPE_MASK;
+        attributes.push(NetlinkAttribute {
+            kind,
+            value: &payload[offset + NLA_HDR_LEN..attribute_end],
+        });
+
+        let aligned_len = align_to_4(attribute_len);
+        let next_offset = offset
+            .checked_add(aligned_len)
+            .context("conntrack netlink aligned attribute length overflow")?;
+        if next_offset > payload.len() {
+            offset = attribute_end;
+        } else {
+            offset = next_offset;
+        }
+    }
+    Ok(attributes)
+}
+
+fn ctnetlink_message_type(message: u16) -> u16 {
+    (NFNL_SUBSYS_CTNETLINK << 8) | message
+}
+
+fn ctnetlink_subsystem(message_type: u16) -> u16 {
+    (message_type & 0xff00) >> 8
+}
+
+fn align_to_4(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+fn read_u16_ne(buffer: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let bytes = buffer
+        .get(offset..offset + 2)
+        .context("buffer too short for u16 field")?;
+    Ok(u16::from_ne_bytes(bytes.try_into()?))
+}
+
+fn read_u32_ne(buffer: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let bytes = buffer
+        .get(offset..offset + 4)
+        .context("buffer too short for u32 field")?;
+    Ok(u32::from_ne_bytes(bytes.try_into()?))
+}
+
+fn push_u16_ne(buffer: &mut Vec<u8>, value: u16) {
+    buffer.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_u16_be(buffer: &mut Vec<u8>, value: u16) {
+    buffer.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u32_ne(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_ne_bytes());
 }
 
 async fn read_conntrack_destination_ips(paths: &[PathBuf]) -> anyhow::Result<BTreeSet<IpAddr>> {
@@ -4672,7 +5058,7 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
@@ -5464,6 +5850,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_args_accept_conntrack_netlink_packet_flow_detector() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "conntrack-netlink",
+            "--packet-flow-poll-interval-seconds",
+            "3",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.packet_flow_detector,
+                PacketFlowDetector::ConntrackNetlink
+            );
+            assert_eq!(args.packet_flow_detector.as_str(), "conntrack-netlink");
+            assert_eq!(args.packet_flow_poll_interval_seconds, 3);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn conntrack_paths_default_and_override() {
         assert_eq!(
             conntrack_paths(None),
@@ -5493,6 +5903,85 @@ invalid no-destination-here
         assert!(destinations.contains(&"2001:db8::1".parse()?));
         assert_eq!(destinations.len(), 4);
         Ok(())
+    }
+
+    #[test]
+    fn conntrack_netlink_dump_request_uses_ct_get_dump_message() -> anyhow::Result<()> {
+        let request = conntrack_netlink_dump_request(42);
+
+        assert_eq!(read_u32_ne(&request, 0)?, request.len() as u32);
+        assert_eq!(
+            read_u16_ne(&request, 4)?,
+            ctnetlink_message_type(IPCTNL_MSG_CT_GET)
+        );
+        assert_eq!(read_u16_ne(&request, 6)?, NLM_F_REQUEST | NLM_F_DUMP);
+        assert_eq!(read_u32_ne(&request, 8)?, 42);
+        assert_eq!(read_u32_ne(&request, 12)?, 0);
+        assert_eq!(&request[16..], &[0, NFNETLINK_V0, 0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn conntrack_netlink_parser_extracts_orig_and_reply_destination_ips() -> anyhow::Result<()> {
+        let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
+        let ipv6_destination = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x42);
+        let orig_tuple = test_nla(
+            CTA_TUPLE_ORIG | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_IP_V4_DST, &ipv4_destination.octets()),
+            ),
+        );
+        let reply_tuple = test_nla(
+            CTA_TUPLE_REPLY | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_IP_V6_DST, &ipv6_destination.octets()),
+            ),
+        );
+        let mut payload = vec![0, NFNETLINK_V0, 0, 0];
+        payload.extend(orig_tuple);
+        payload.extend(reply_tuple);
+
+        let mut datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
+        datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
+
+        let result = parse_conntrack_netlink_datagram_destination_ips(&datagram)?;
+
+        assert!(result.done);
+        assert_eq!(
+            result.destinations,
+            BTreeSet::from([
+                IpAddr::from(ipv4_destination),
+                IpAddr::from(ipv6_destination)
+            ])
+        );
+        Ok(())
+    }
+
+    const TEST_NLA_F_NESTED: u16 = 1 << 15;
+
+    fn test_netlink_message(message_type: u16, payload: &[u8]) -> Vec<u8> {
+        let message_len = NLMSG_HDR_LEN + payload.len();
+        let mut message = Vec::with_capacity(align_to_4(message_len));
+        push_u32_ne(&mut message, message_len as u32);
+        push_u16_ne(&mut message, message_type);
+        push_u16_ne(&mut message, 0);
+        push_u32_ne(&mut message, 7);
+        push_u32_ne(&mut message, 0);
+        message.extend_from_slice(payload);
+        message.resize(align_to_4(message_len), 0);
+        message
+    }
+
+    fn test_nla(kind: u16, value: &[u8]) -> Vec<u8> {
+        let attribute_len = NLA_HDR_LEN + value.len();
+        let mut attribute = Vec::with_capacity(align_to_4(attribute_len));
+        push_u16_ne(&mut attribute, attribute_len as u16);
+        push_u16_ne(&mut attribute, kind);
+        attribute.extend_from_slice(value);
+        attribute.resize(align_to_4(attribute_len), 0);
+        attribute
     }
 
     #[test]

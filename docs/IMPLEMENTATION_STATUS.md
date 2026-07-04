@@ -51,7 +51,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map with ordered endpoint failover, applies active/pinned peers through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command and kernel-netlink execution, and retries without stopping the agent when the control plane is temporarily unavailable.
 - Linux command runtime preflight for `iparsd agent` that validates interface names, required `ip`/`wg` commands, `CAP_NET_ADMIN` when host networking will be mutated, and requested `/var/run/netns` namespace placement before starting data-plane application loops.
 - `iparsd agent --runtime-backend dry-run` for peer-map, Docker route, and Kubernetes underlay loops using in-memory WireGuard state and dry-run route application without mutating host networking.
-- Lazy connect and pinning runtime support in the agent crate and daemon loops, including peer activity recording, packet-flow destination resolution against peer VPN IPs and advertised routes, opt-in Linux conntrack procfs polling, policy/route/relay/path pins, active-only signal negotiation, and idle peer removal during peer-map application.
+- Lazy connect and pinning runtime support in the agent crate and daemon loops, including peer activity recording, packet-flow destination resolution against peer VPN IPs and advertised routes, opt-in Linux conntrack procfs polling or conntrack netlink table dumping, policy/route/relay/path pins, active-only signal negotiation, and idle peer removal during peer-map application.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
 - Docker Compose and Helm chart starting points aligned to the current plain-HTTP `iparsd` service listeners.
 - `ipars-load` executable scale/load harness for 3-node, 10-node, and 1000-node in-memory control-plane/signal scenarios, loopback HTTP endpoint transport for control-plane join/peer-map and signal upsert/negotiate paths, relay HTTP admission plus UDP forwarding throughput runs, and spawned multi-process `iparsd` daemon transport across control-plane, signal, STUN, relay, and dry-run agent processes.
@@ -59,7 +59,7 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
-- Packet-flow detector hardening beyond current typed ingestion and procfs conntrack polling, including conntrack netlink or eBPF-based flow observation.
+- Packet-flow detector hardening beyond current typed ingestion, procfs conntrack polling, and conntrack netlink table dumping, including eBPF-based or event-driven flow observation.
 - Privileged integration coverage beyond current namespace-aware route, WireGuard netlink, hole-punch, and relay fallback smoke tests.
 - Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
 - NAT topology validation beyond current mapping/filtering probes, classification-aware signal selection, and one endpoint-independent SNAT namespace topology.

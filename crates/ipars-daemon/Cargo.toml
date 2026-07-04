@@ -29,6 +29,7 @@ ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-store = { path = "../ipars-store" }
 ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }
+netlink-sys.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
