@@ -790,10 +790,7 @@ fn otlp_http_signal_endpoint(base_endpoint: &str, signal: &str) -> String {
 }
 
 fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> anyhow::Result<()> {
-    validate_linux_interface_name(&args.wireguard_interface)?;
-    if let Some(namespace) = args.linux_netns.as_deref() {
-        LinuxNetworkNamespace::from_name(namespace)?;
-    }
+    validate_agent_runtime_config(args)?;
     if args.skip_runtime_preflight {
         tracing::warn!(
             backend = args.runtime_backend.as_str(),
@@ -848,6 +845,25 @@ fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> 
         linux_netns = ?args.linux_netns,
         "runtime backend preflight passed"
     );
+    Ok(())
+}
+
+fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
+    validate_linux_interface_name(&args.wireguard_interface)?;
+    if args.apply_docker_routes {
+        validate_linux_interface_name(&args.docker_host_interface)?;
+    }
+    if let Some(namespace) = args.linux_netns.as_deref() {
+        LinuxNetworkNamespace::from_name(namespace)?;
+    }
+    if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+        LinuxNetworkNamespace::from_name(namespace)?;
+    }
+    if args.relay_forwarder_bind.is_some() && args.relay_forwarder_max_sessions == 0 {
+        anyhow::bail!(
+            "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
+        );
+    }
     Ok(())
 }
 
@@ -7250,6 +7266,83 @@ invalid no-destination-here
             assert!(error
                 .to_string()
                 .contains("must contain only ASCII letters"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_config_validation_survives_skipped_runtime_preflight() -> anyhow::Result<()> {
+        let invalid_docker_host_interface = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-host-interface",
+            "invalid/name",
+        ])?;
+        if let Command::Agent(args) = invalid_docker_host_interface.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("must contain only ASCII letters"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let invalid_relay_forwarder_namespace = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-netns",
+            "../node-a",
+        ])?;
+        if let Command::Agent(args) = invalid_relay_forwarder_namespace.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("invalid linux network namespace name"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let zero_forwarder_capacity = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-max-sessions",
+            "0",
+        ])?;
+        if let Command::Agent(args) = zero_forwarder_capacity.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-forwarder-max-sessions must be greater than zero"));
             return Ok(());
         }
 
