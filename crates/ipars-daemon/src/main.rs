@@ -21,8 +21,8 @@ use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    KubernetesUnderlayIntent, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
-    NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
+    DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetworkNamespace, LinuxRouteCommandRunner,
+    LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
@@ -222,6 +222,26 @@ struct AgentArgs {
         default_value_t = false
     )]
     apply_kubernetes_underlay: bool,
+    #[arg(long, env = "IPARS_AGENT_APPLY_DOCKER_ROUTES", default_value_t = false)]
+    apply_docker_routes: bool,
+    #[arg(long, env = "IPARS_DOCKER_CONTAINER_NAMESPACE")]
+    docker_container_namespace: Option<String>,
+    #[arg(long, env = "IPARS_DOCKER_HOST_INTERFACE", default_value = "docker0")]
+    docker_host_interface: String,
+    #[arg(
+        long = "docker-container-cidr",
+        env = "IPARS_DOCKER_CONTAINER_CIDRS",
+        value_delimiter = ','
+    )]
+    docker_container_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long, env = "IPARS_DOCKER_EXPOSE_HOST_ROUTES", default_value_t = true)]
+    docker_expose_host_routes: bool,
+    #[arg(
+        long,
+        env = "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS",
+        default_value_t = 60
+    )]
+    docker_route_interval_seconds: u64,
     #[arg(long, env = "IPARS_KUBERNETES_NODE_NAME")]
     kubernetes_node_name: Option<String>,
     #[arg(
@@ -431,6 +451,9 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     if let Some(task) = peer_map_task {
         background_tasks.push(task);
     }
+    if args.apply_docker_routes {
+        background_tasks.push(start_docker_routes(&args).await?);
+    }
     if args.apply_kubernetes_underlay {
         background_tasks
             .push(start_kubernetes_underlay_routes(&args, runtime.state().node_id.clone()).await?);
@@ -504,6 +527,74 @@ async fn start_peer_map_sync(
             SystemRouteCommandRunner,
         )
         .await
+    }
+}
+
+async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let namespace = args
+        .linux_netns
+        .as_deref()
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()?;
+    let intent = docker_network_intent(args)?;
+    let interval = Duration::from_secs(args.docker_route_interval_seconds.max(1));
+    if let Some(namespace) = namespace {
+        let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+            namespace,
+            SystemRouteCommandRunner,
+        ));
+        Ok(tokio::spawn(async move {
+            run_docker_route_loop(manager, intent, interval).await;
+        }))
+    } else {
+        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+        Ok(tokio::spawn(async move {
+            run_docker_route_loop(manager, intent, interval).await;
+        }))
+    }
+}
+
+fn docker_network_intent(args: &AgentArgs) -> anyhow::Result<DockerNetworkIntent> {
+    let container_namespace = args
+        .docker_container_namespace
+        .clone()
+        .context("--apply-docker-routes requires --docker-container-namespace")?;
+    if args.docker_container_cidrs.is_empty() {
+        anyhow::bail!("--apply-docker-routes requires at least one --docker-container-cidr");
+    }
+
+    Ok(DockerNetworkIntent {
+        container_namespace,
+        host_interface: args.docker_host_interface.clone(),
+        overlay_interface: args.wireguard_interface.clone(),
+        container_cidrs: args.docker_container_cidrs.clone(),
+        expose_host_routes: args.docker_expose_host_routes,
+    })
+}
+
+async fn run_docker_route_loop<R>(
+    manager: LinuxRouteManager<R>,
+    intent: DockerNetworkIntent,
+    interval: Duration,
+) where
+    R: LinuxRouteCommandRunner + 'static,
+{
+    loop {
+        match manager.apply_docker_intent(intent.clone()).await {
+            Ok(plan) => tracing::info!(
+                container_namespace = %intent.container_namespace,
+                host_interface = %intent.host_interface,
+                routes = plan.routes.len(),
+                policy_rules = plan.policy_rules.len(),
+                "applied Docker overlay routes"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                container_namespace = %intent.container_namespace,
+                "failed to apply Docker overlay routes; will retry"
+            ),
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1650,6 +1741,68 @@ mod tests {
                 intent.service_cidrs,
                 vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
             );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_network_intent_uses_explicit_container_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-host-interface",
+            "docker0",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-route-interval-seconds",
+            "20",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert!(args.apply_docker_routes);
+            assert_eq!(args.docker_route_interval_seconds, 20);
+            let intent = docker_network_intent(&args)?;
+            assert_eq!(intent.container_namespace, "compose-default");
+            assert_eq!(intent.host_interface, "docker0");
+            assert_eq!(intent.overlay_interface, "ipars0");
+            assert_eq!(
+                intent.container_cidrs,
+                vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]
+            );
+            assert!(intent.expose_host_routes);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_network_intent_requires_namespace_and_routes() -> anyhow::Result<()> {
+        let missing_namespace = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        if let Command::Agent(args) = missing_namespace.command {
+            assert!(docker_network_intent(&args).is_err());
+        }
+
+        let missing_routes = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+        ])?;
+        if let Command::Agent(args) = missing_routes.command {
+            assert!(docker_network_intent(&args).is_err());
             return Ok(());
         }
 

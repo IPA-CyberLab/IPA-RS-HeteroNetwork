@@ -31,6 +31,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent HTTP metrics export and bounded structured path-change event export.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - `iparsd agent` Kubernetes underlay route application for Service/API CIDRs, with Helm DaemonSet wiring for node-name discovery and explicit route-provider configuration.
+- `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents, with Docker Compose wiring for rootful bridge deployments.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
@@ -50,7 +51,7 @@ This file tracks the gap between the requested final system and the current repo
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay forwarder namespace placement, capacity limits, and restart/backoff policy hardening.
 - Prometheus/OpenTelemetry exporters and broader control-plane/relay metrics coverage.
-- Docker namespace integration implementation.
+- Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.
 - Scale/load test harness for 3-node, 10-node, and 1000-node scenarios.
