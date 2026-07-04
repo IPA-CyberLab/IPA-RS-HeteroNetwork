@@ -158,8 +158,10 @@ The wire protocol can be exposed as gRPC or HTTP. The schema is Rust-first and s
 Initial control-plane HTTP routes:
 
 - `GET /healthz`
+- `GET /metrics`
 - `POST /v1/join`
 - `POST /v1/heartbeat`
+- `GET /v1/metrics`
 - `GET /v1/peers/{node_id}`
 
 Initial signal HTTP routes:
@@ -198,7 +200,7 @@ All daemons emit:
 
 Critical events include path promotion/demotion, relay fallback, relay abuse refusal, VPN IP allocation, route publication, and policy denial.
 
-Agents expose typed JSON metrics, Prometheus scrape metrics, and a bounded structured path-change event buffer. The metrics include candidate, path, relay session, relay forwarder, and per-path-state counts. Relays expose Prometheus scrape metrics for capacity, active sessions, policy-enabled state, health, and forwarded opaque payload bytes. Path events record the previous and new path state, relay node, selected candidate, and score for create/change transitions.
+The control plane exposes JSON and Prometheus metrics for registered nodes, relay-capable nodes, last reported health, and pair-scoped path state counts. Agents expose typed JSON metrics, Prometheus scrape metrics, and a bounded structured path-change event buffer. The metrics include candidate, path, relay session, relay forwarder, and per-path-state counts. Relays expose Prometheus scrape metrics for capacity, active sessions, policy-enabled state, health, and forwarded opaque payload bytes. Path events record the previous and new path state, relay node, selected candidate, and score for create/change transitions.
 
 ## Security Model
 

@@ -761,6 +761,19 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneMetricsResponse {
+        pub cluster_id: ClusterId,
+        pub node_count: usize,
+        pub relay_candidate_count: usize,
+        pub healthy_node_count: usize,
+        pub degraded_node_count: usize,
+        pub unhealthy_node_count: usize,
+        pub path_count: usize,
+        pub path_state_counts: Vec<PathStateCount>,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SignalPathRequest {
         pub source: NodeId,
         pub target: NodeId,

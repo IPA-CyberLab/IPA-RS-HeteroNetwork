@@ -6,12 +6,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{verify_join_token, CryptoError};
 use ipars_types::api::{
-    HeartbeatRequest, HeartbeatResponse, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayMap,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayMap,
 };
 use ipars_types::{
-    ClusterId, ClusterPolicy, EndpointCandidate, JoinTokenClaims, KeyId, NodeHealth, NodeId,
-    NodeRecord, PathRecord, Route, SignedJoinToken, TokenLedgerRecord, TokenStatus, VpnIp,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth,
+    NodeId, NodeRecord, PathRecord, PathState, Route, SignedJoinToken, TokenLedgerRecord,
+    TokenStatus, VpnIp,
 };
 use ipnet::Ipv4Net;
 use thiserror::Error;
@@ -483,6 +484,56 @@ where
             accepted: true,
             policy_version: 0,
             peer_delta_available: false,
+        })
+    }
+
+    pub async fn metrics(&self) -> Result<ControlPlaneMetricsResponse, ControlPlaneError> {
+        let nodes = self.store.list_nodes().await?;
+        let mut healthy_node_count = 0;
+        let mut degraded_node_count = 0;
+        let mut unhealthy_node_count = 0;
+        let relay_candidate_count = nodes
+            .iter()
+            .filter(|node| {
+                node.relay_capability
+                    .as_ref()
+                    .map(|capability| capability.can_admit())
+                    .unwrap_or(false)
+            })
+            .count();
+
+        let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
+        for node in &nodes {
+            if let Some(health) = self.store.get_health(&node.node_id).await? {
+                match health.state {
+                    HealthState::Healthy => healthy_node_count += 1,
+                    HealthState::Degraded => degraded_node_count += 1,
+                    HealthState::Unhealthy => unhealthy_node_count += 1,
+                }
+            }
+            for path in self.store.list_paths_for(&node.node_id).await? {
+                paths.insert((path.key.local.clone(), path.key.remote.clone()), path);
+            }
+        }
+
+        let mut path_state_counts = BTreeMap::<PathState, usize>::new();
+        for path in paths.values() {
+            *path_state_counts.entry(path.selected_state).or_default() += 1;
+        }
+
+        Ok(ControlPlaneMetricsResponse {
+            cluster_id: self.config.cluster_id.clone(),
+            node_count: nodes.len(),
+            relay_candidate_count,
+            healthy_node_count,
+            degraded_node_count,
+            unhealthy_node_count,
+            path_count: paths.len(),
+            path_state_counts: path_state_counts
+                .into_iter()
+                .map(|(state, count)| PathStateCount { state, count })
+                .collect(),
+            generated_at: Utc::now(),
         })
     }
 }

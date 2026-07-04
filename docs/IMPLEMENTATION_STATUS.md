@@ -13,7 +13,7 @@ This file tracks the gap between the requested final system and the current repo
 - SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
 - Token ledger records, revocation state, and max-use enforcement for in-memory and SQL stores.
 - Control-plane join service that validates signed join tokens, issuer keys, cluster/time constraints, ledger admission, and node registration.
-- Control-plane HTTP crate with typed health, join, and peer-map routes backed by the join service.
+- Control-plane HTTP crate with typed health, join, peer-map, and JSON/Prometheus metrics routes backed by the join service.
 - `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, multi-server NAT mapping classification, and `iparsd stun` daemon support for public endpoint detection.
@@ -50,7 +50,7 @@ This file tracks the gap between the requested final system and the current repo
 - NAT filtering classification, extended STUN behaviours beyond Binding/XOR-MAPPED-ADDRESS, and topology validation.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay forwarder namespace placement, capacity limits, and restart/backoff policy hardening.
-- OpenTelemetry exporters plus broader control-plane and relay dataplane metrics coverage.
+- OpenTelemetry exporters plus deeper relay dataplane metrics coverage.
 - Docker API/namespace discovery, rootless backend support, and multi-network Compose hardening.
 - Kubernetes API discovery/RBAC-backed route discovery and service/API exposure hardening.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.

@@ -1,7 +1,8 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,10 +11,17 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
 use ipars_types::api::{
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeResponse,
 };
-use ipars_types::NodeId;
+use ipars_types::{NodeId, PathState};
 use serde::Serialize;
+
+macro_rules! prometheus_line {
+    ($body:expr, $($arg:tt)*) => {{
+        let _ = writeln!($body, $($arg)*);
+    }};
+}
 
 #[derive(Debug)]
 pub struct ControlPlaneHttpState<S, L> {
@@ -49,14 +57,43 @@ where
 {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(prometheus_metrics::<S, L>))
         .route("/v1/join", post(join::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
+        .route("/v1/metrics", get(metrics::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
         .with_state(state)
 }
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn metrics<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<ControlPlaneMetricsResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.metrics().await?))
+}
+
+async fn prometheus_metrics<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let metrics = state.plane.metrics().await?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_prometheus_metrics(&metrics),
+    ))
 }
 
 async fn join<S, L>(
@@ -101,6 +138,98 @@ where
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+}
+
+fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
+    let cluster_id = prometheus_label(metrics.cluster_id.as_str());
+    let mut body = String::new();
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_nodes Number of registered nodes."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_nodes gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_nodes{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_relay_candidates Number of relay-capable registered nodes."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_relay_candidates gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_relay_candidates{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.relay_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_node_health Registered nodes by last reported health."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_node_health gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_node_health{{cluster_id=\"{cluster_id}\",state=\"healthy\"}} {}",
+        metrics.healthy_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_node_health{{cluster_id=\"{cluster_id}\",state=\"degraded\"}} {}",
+        metrics.degraded_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_node_health{{cluster_id=\"{cluster_id}\",state=\"unhealthy\"}} {}",
+        metrics.unhealthy_node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_paths Number of pair-scoped paths persisted by the control plane."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_paths gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_paths{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.path_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_path_state_count Pair-scoped paths by selected state."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_path_state_count gauge"
+    );
+    for state_count in &metrics.path_state_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_control_plane_path_state_count{{cluster_id=\"{cluster_id}\",state=\"{}\"}} {}",
+            path_state_label(state_count.state),
+            state_count.count
+        );
+    }
+    body
+}
+
+fn path_state_label(state: PathState) -> &'static str {
+    match state {
+        PathState::DirectPublic => "DIRECT_PUBLIC",
+        PathState::DirectIpv6 => "DIRECT_IPV6",
+        PathState::DirectNatTraversal => "DIRECT_NAT_TRAVERSAL",
+        PathState::Relay => "RELAY",
+        PathState::Unreachable => "UNREACHABLE",
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[derive(Debug)]
@@ -152,8 +281,8 @@ mod tests {
     };
     use ipars_crypto::IdentityKeyPair;
     use ipars_types::api::{
-        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-        RegisterNodeResponse,
+        ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
+        RegisterNodeRequest, RegisterNodeResponse,
     };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState, JoinTokenClaims, KeyId,
@@ -252,6 +381,7 @@ mod tests {
             path_state: Vec::new(),
         };
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -264,6 +394,41 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: HeartbeatResponse = serde_json::from_slice(&body)?;
         assert!(response.accepted);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let metrics: ControlPlaneMetricsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(metrics.node_count, 1);
+        assert_eq!(metrics.healthy_node_count, 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static(
+                "text/plain; version=0.0.4; charset=utf-8"
+            ))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_control_plane_nodes"));
+        assert!(body.contains("ipars_control_plane_node_health"));
         Ok(())
     }
 }
