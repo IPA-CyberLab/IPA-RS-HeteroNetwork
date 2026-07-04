@@ -197,6 +197,31 @@ impl UdpRelayFrameForwarder {
         Ok(socket.send_to(payload, self.wireguard_endpoint).await?)
     }
 
+    pub async fn serve(
+        self,
+        socket: tokio::net::UdpSocket,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), AgentError> {
+        let mut buffer = vec![0_u8; 65_535];
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                packet = socket.recv_from(&mut buffer) => {
+                    let (len, peer) = packet?;
+                    if peer == self.session.relay_endpoint {
+                        self.forward_to_wireguard(&socket, &buffer[..len]).await?;
+                    } else {
+                        self.send_to_relay(&socket, &buffer[..len]).await?;
+                    }
+                }
+            }
+        }
+    }
+
     fn ensure_session_active(&self) -> Result<(), AgentError> {
         if Utc::now() >= self.session.expires_at {
             return Err(AgentError::RelaySession(format!(
@@ -966,7 +991,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Duration as ChronoDuration;
-    use ipars_relay::{RelayService, UdpRelay};
+    use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
     use ipars_route_manager::{
         DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
     };
@@ -1361,6 +1386,89 @@ mod tests {
 
         assert_eq!(&buffer[..len], b"opaque-wireguard-packet");
         shutdown_tx.send(true)?;
+        relay_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_proxies_wireguard_and_relay_datagrams(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let relay = UdpRelay::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_addr = relay.local_addr()?;
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let forwarder_addr = forwarder_socket.local_addr()?;
+        let wireguard_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let wireguard_addr = wireguard_socket.local_addr()?;
+        let peer_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let peer_addr = peer_socket.local_addr()?;
+        let service = RelayService::new(
+            NodeId::from_string("relay-a"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(relay_addr),
+                admission_url: Some("http://127.0.0.1:9580".to_string()),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+        );
+        let admission = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: forwarder_addr,
+                right_addr: peer_addr,
+            })
+            .await?;
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: admission.relay_node.clone(),
+                relay_endpoint: relay_addr,
+                admitted_local_addr: admission.left_addr,
+                admitted_peer_addr: admission.right_addr,
+                session_id: admission.session_id.clone(),
+                session_token: admission.session_token.clone(),
+                expires_at: admission.expires_at,
+            },
+            wireguard_addr,
+        );
+        let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (forwarder_shutdown_tx, forwarder_shutdown_rx) = tokio::sync::watch::channel(false);
+        let relay_task = tokio::spawn(relay.serve(service.table(), relay_shutdown_rx));
+        let forwarder_task = tokio::spawn(forwarder.serve(forwarder_socket, forwarder_shutdown_rx));
+
+        wireguard_socket
+            .send_to(b"opaque-wireguard-outbound", forwarder_addr)
+            .await?;
+        let mut buffer = [0_u8; 128];
+        let (len, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_socket.recv_from(&mut buffer),
+        )
+        .await??;
+        assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
+
+        let datagram = encode_relay_datagram(
+            &admission.session_id,
+            &admission.session_token,
+            b"opaque-wireguard-inbound",
+        )?;
+        peer_socket.send_to(&datagram, relay_addr).await?;
+        let (len, _peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wireguard_socket.recv_from(&mut buffer),
+        )
+        .await??;
+        assert_eq!(&buffer[..len], b"opaque-wireguard-inbound");
+
+        forwarder_shutdown_tx.send(true)?;
+        relay_shutdown_tx.send(true)?;
+        forwarder_task.await??;
         relay_task.await??;
         Ok(())
     }

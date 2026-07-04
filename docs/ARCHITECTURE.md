@@ -108,7 +108,7 @@ Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an oute
 
 Relay candidates advertise both a public UDP relay endpoint and an HTTP admission URL. When signal negotiation selects `RELAY`, the agent admits a relay session directly with that relay and keeps the returned credential in transient runtime state rather than reporting it back through control-plane heartbeat.
 
-The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Inbound relay payloads remain opaque and are forwarded toward the local WireGuard endpoint.
+The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Its UDP loop forwards packets from the local WireGuard socket to the relay and sends stripped inbound relay payloads back toward the local WireGuard endpoint.
 
 Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
 

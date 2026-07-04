@@ -25,7 +25,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent` signal path negotiation loop that records pair-scoped path state and reports it in heartbeat payloads
 - `iparsd agent` relay admission for signal-selected relay paths, storing expiring relay credentials only in transient agent runtime state
 - relay session renewal window handling and stale relay credential removal when paths return to direct/non-relay states
-- agent relay dataplane forwarder that emits credentialed relay frames while keeping WireGuard payload opaque end to end
+- agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
 - relay-aware peer-map application that can point kernel WireGuard peers at a configured local relay forwarder endpoint for active relay sessions
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence

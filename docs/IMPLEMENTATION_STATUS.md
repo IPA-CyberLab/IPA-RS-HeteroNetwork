@@ -26,7 +26,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
 - `iparsd agent` relay admission for `RELAY` paths selected by signal negotiation, using relay-advertised admission URLs and keeping expiring relay credentials in transient agent runtime state.
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
-- Agent relay dataplane forwarder that emits credentialed relay frames to the selected relay UDP endpoint and preserves opaque WireGuard payloads.
+- Agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames and preserves opaque WireGuard payloads.
 - Agent peer-map application can bind active relay-selected peers to a configured local relay forwarder endpoint when applying kernel WireGuard peer settings.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
@@ -46,7 +46,7 @@ This file tracks the gap between the requested final system and the current repo
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - Full STUN protocol support and NAT classification.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
-- Relay forwarder socket lifecycle management, per-peer endpoint allocation, and inbound/outbound proxy supervision.
+- Relay forwarder per-peer endpoint allocation and daemon-side proxy supervision.
 - Metrics export and structured path-change events.
 - Docker namespace integration implementation.
 - Kubernetes route discovery and service/API exposure implementation.
