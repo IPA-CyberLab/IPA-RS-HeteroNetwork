@@ -81,7 +81,7 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 - Kubernetes/API/service exposure needs an underlay path
 - an operator runs an explicit path probe
 
-The agent runtime records peer activity through a typed peer-activity API so packet detectors, probes, or operators can mark a peer active and optionally pin it. During peer-map application, only active peers, policy-pinned peers, relay-capable peers, and route providers are applied to WireGuard. Idle unpinned peers close after a configurable timeout and are removed from WireGuard state; pinned peers stay connected by role, tag, route ownership, relay capability, path pinning, or explicit activity pinning.
+The agent runtime records peer activity through a typed peer-activity API so packet detectors, probes, or operators can mark a peer active and optionally pin it. Signal path negotiation and peer-map application operate only on active peers, policy-pinned peers, relay-capable peers, and route providers. Idle unpinned peers close after a configurable timeout and are removed from WireGuard and relay-forwarder runtime state; pinned peers stay connected by role, tag, route ownership, relay capability, path pinning, or explicit activity pinning.
 
 ## NAT Traversal
 

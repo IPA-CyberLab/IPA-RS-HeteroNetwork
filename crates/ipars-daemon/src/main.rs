@@ -3402,7 +3402,19 @@ async fn negotiate_signal_paths(
         .await
         .context("failed to decode peer map for signal negotiation")?;
 
-    for peer in peer_map.peers {
+    let peer_set = signal_negotiation_peer_set(runtime, peer_map).await;
+    for peer in peer_set.skipped {
+        remove_relay_session_for_peer(
+            runtime,
+            relay_forwarder_supervisor,
+            &peer,
+            None,
+            "removed relay session for idle lazy-connect peer",
+        )
+        .await;
+    }
+
+    for peer in peer_set.active {
         let request = signal_path_request(&status, &peer);
         let response = send_signal_path_request(client, signal_url, request).await?;
         let relay_candidate = selected_relay_candidate(&response);
@@ -3503,24 +3515,73 @@ async fn negotiate_signal_paths(
                 }
             }
         } else {
-            let removed = runtime.remove_relay_session(&peer.node_id).await;
-            if let Some(session) = removed {
-                if let Some(supervisor) = relay_forwarder_supervisor {
-                    supervisor.remove(runtime, &session.peer).await;
-                } else {
-                    runtime.remove_relay_forwarder_endpoint(&session.peer).await;
-                }
-                tracing::info!(
-                    peer = %session.peer,
-                    relay = %session.relay_node,
-                    state = ?record.selected_state,
-                    "removed relay session after non-relay path selection"
-                );
-            }
+            remove_relay_session_for_peer(
+                runtime,
+                relay_forwarder_supervisor,
+                &peer.node_id,
+                Some(record.selected_state),
+                "removed relay session after non-relay path selection",
+            )
+            .await;
         }
         runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalNegotiationPeerSet {
+    active: Vec<NodeRecord>,
+    skipped: Vec<NodeId>,
+}
+
+async fn signal_negotiation_peer_set(
+    runtime: &AgentRuntime,
+    peer_map: PeerMap,
+) -> SignalNegotiationPeerSet {
+    let mut skipped = runtime
+        .take_idle_peers_to_close(chrono::Utc::now())
+        .await
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    runtime
+        .observe_peer_map_for_lazy_connect(&peer_map.peers)
+        .await;
+    let mut active = Vec::new();
+    for peer in peer_map.peers {
+        if runtime.should_connect_peer(&peer).await {
+            active.push(peer);
+        } else {
+            skipped.insert(peer.node_id);
+        }
+    }
+    SignalNegotiationPeerSet {
+        active,
+        skipped: skipped.into_iter().collect(),
+    }
+}
+
+async fn remove_relay_session_for_peer(
+    runtime: &AgentRuntime,
+    relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
+    peer: &NodeId,
+    selected_state: Option<PathState>,
+    message: &'static str,
+) {
+    let removed = runtime.remove_relay_session(peer).await;
+    if let Some(session) = removed {
+        if let Some(supervisor) = relay_forwarder_supervisor {
+            supervisor.remove(runtime, &session.peer).await;
+        } else {
+            runtime.remove_relay_forwarder_endpoint(&session.peer).await;
+        }
+        tracing::info!(
+            peer = %session.peer,
+            relay = %session.relay_node,
+            state = ?selected_state,
+            "{message}"
+        );
+    }
 }
 
 fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>> {
@@ -4068,7 +4129,7 @@ mod tests {
     };
     use ipars_types::{
         BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
-        JoinTokenClaims, PathScore, PeerPathKey, Role, TokenPolicy, VpnIp,
+        JoinTokenClaims, PathScore, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -5630,6 +5691,114 @@ mod tests {
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_peer_set_uses_lazy_connect_state() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy {
+                idle_timeout_seconds: 10,
+                ..ClusterPolicy::default()
+            },
+        );
+        let active_id = NodeId::from_string("peer-active");
+        let stale_id = NodeId::from_string("peer-stale");
+        runtime
+            .record_peer_activity(active_id.clone(), Utc::now(), false)
+            .await;
+        runtime
+            .record_peer_activity(
+                stale_id.clone(),
+                Utc::now() - ChronoDuration::seconds(30),
+                false,
+            )
+            .await;
+        let active = node_record("peer-active");
+        let idle = node_record("peer-idle");
+        let stale = node_record("peer-stale");
+        let mut pinned = node_record("peer-pinned");
+        pinned.role = Role::control_plane();
+        let mut route_provider = node_record("peer-route");
+        route_provider.routes.push(Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: route_provider.node_id.clone(),
+            via: Some(route_provider.node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        });
+
+        let peers = signal_negotiation_peer_set(
+            &runtime,
+            PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![active, idle, stale, pinned, route_provider],
+                generated_at: Utc::now(),
+            },
+        )
+        .await;
+
+        let active_ids = peers
+            .active
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active_ids,
+            vec![
+                NodeId::from_string("peer-active"),
+                NodeId::from_string("peer-pinned"),
+                NodeId::from_string("peer-route"),
+            ]
+        );
+        assert_eq!(
+            peers.skipped,
+            vec![
+                NodeId::from_string("peer-idle"),
+                NodeId::from_string("peer-stale"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_signal_peer_cleanup_removes_relay_runtime_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-idle");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 30], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 52000)),
+            )
+            .await;
+
+        remove_relay_session_for_peer(
+            &runtime,
+            None,
+            &peer,
+            None,
+            "removed relay session for idle lazy-connect peer",
+        )
+        .await;
+
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
     #[test]
