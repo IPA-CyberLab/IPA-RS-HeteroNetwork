@@ -23,8 +23,11 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
-use ipars_types::api::PeerMap;
-use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId, RelayCapability};
+use ipars_types::api::{JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse};
+use ipars_types::{
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, KeyId, NodeId, RelayCapability,
+    SignedJoinToken,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -125,6 +128,8 @@ struct AgentArgs {
     stun_bind: SocketAddr,
     #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN")]
+    join_token: Option<String>,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
     apply_peer_map: bool,
     #[arg(
@@ -273,8 +278,28 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     if let Some(stun_server) = args.stun_server {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
+    let join_token = args
+        .join_token
+        .as_deref()
+        .map(serde_json::from_str::<SignedJoinToken>)
+        .transpose()
+        .context("agent join token must be JSON signed token")?;
+    if let Some(token) = &join_token {
+        let response = register_agent(runtime.as_ref(), token, args.control_plane_url.as_deref())
+            .await
+            .context("failed to register agent with control plane")?;
+        tracing::info!(
+            node_id = %response.node.node_id,
+            vpn_ip = %response.node.vpn_ip,
+            peer_count = response.peer_map.peers.len(),
+            relay_count = response.relay_map.relays.len(),
+            "registered agent with control plane"
+        );
+    }
     let peer_map_task = if args.apply_peer_map {
-        Some(start_peer_map_sync(&args, runtime.state().node_id.clone()).await?)
+        let control_plane_url =
+            control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref())?;
+        Some(start_peer_map_sync(&args, runtime.state().node_id.clone(), control_plane_url).await?)
     } else {
         None
     };
@@ -289,11 +314,8 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
 async fn start_peer_map_sync(
     args: &AgentArgs,
     node_id: NodeId,
+    control_plane_url: String,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let control_plane_url = args
-        .control_plane_url
-        .clone()
-        .context("--control-plane-url is required when --apply-peer-map is set")?;
     let wireguard =
         LinuxWireGuardBackend::new(args.wireguard_interface.clone(), SystemCommandRunner);
     wireguard.ensure_interface().await?;
@@ -305,6 +327,38 @@ async fn start_peer_map_sync(
     Ok(tokio::spawn(async move {
         run_peer_map_sync_loop(sync, interval, interface).await;
     }))
+}
+
+async fn register_agent(
+    runtime: &AgentRuntime,
+    token: &SignedJoinToken,
+    control_plane_url: Option<&str>,
+) -> anyhow::Result<RegisterNodeResponse> {
+    let join_url = control_plane_join_url(token, control_plane_url)?;
+    let status = runtime.status().await;
+    let request = JoinNodeRequest {
+        token: token.clone(),
+        registration: RegisterNodeRequest {
+            node_id: status.node_id,
+            identity_public_key: status.identity_public_key,
+            wireguard_public_key: status.wireguard_public_key,
+            candidates: status.candidates,
+            relay_capability: None,
+            requested_routes: Vec::new(),
+        },
+    };
+
+    reqwest::Client::new()
+        .post(join_url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send agent join request")?
+        .error_for_status()
+        .context("control plane rejected agent join request")?
+        .json()
+        .await
+        .context("failed to decode agent join response")
 }
 
 async fn run_peer_map_sync_loop<S, A>(
@@ -373,6 +427,35 @@ fn peer_map_url(control_plane_url: &str, node_id: &NodeId) -> String {
     )
 }
 
+fn control_plane_join_url(
+    token: &SignedJoinToken,
+    override_url: Option<&str>,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/v1/join",
+        control_plane_base_url(Some(token), override_url)?
+    ))
+}
+
+fn control_plane_base_url(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+) -> anyhow::Result<String> {
+    let base_url = override_url.map(ToOwned::to_owned).or_else(|| {
+        token.and_then(|token| {
+            token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.clone())
+        })
+    });
+    let base_url =
+        base_url.context("control-plane URL is required and no control-plane bootstrap exists")?;
+    Ok(base_url.trim_end_matches('/').to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseKind {
     Memory,
@@ -392,7 +475,28 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use ipars_types::{BootstrapEndpoint, JoinTokenClaims, Role, TokenPolicy};
+
     use super::*;
+
+    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
+        SignedJoinToken {
+            claims: JoinTokenClaims {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                bootstrap_endpoints: endpoints,
+                expires_at: Utc::now() + ChronoDuration::seconds(300),
+                not_before: Utc::now() - ChronoDuration::seconds(5),
+                role: Role::edge(),
+                tags: Default::default(),
+                issuer: NodeId::from_string("issuer"),
+                key_id: KeyId::from_string("key-a"),
+                policy: TokenPolicy::default(),
+                nonce: "nonce-a".to_string(),
+            },
+            signature: "signature".to_string(),
+        }
+    }
 
     #[test]
     fn database_kind_selects_backend_from_url() {
@@ -414,5 +518,38 @@ mod tests {
             peer_map_url("http://127.0.0.1:8443/", &NodeId::from_string("node-a")),
             "http://127.0.0.1:8443/v1/peers/node-a"
         );
+    }
+
+    #[test]
+    fn control_plane_join_url_uses_token_bootstrap() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443/".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+
+        assert_eq!(
+            control_plane_join_url(&token, None)?,
+            "https://203.0.113.10:8443/v1/join"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_base_url_override_takes_precedence() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+
+        assert_eq!(
+            control_plane_base_url(Some(&token), Some("http://127.0.0.1:8443/"))?,
+            "http://127.0.0.1:8443"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_base_url_requires_url_or_bootstrap() {
+        assert!(control_plane_base_url(None, None).is_err());
     }
 }

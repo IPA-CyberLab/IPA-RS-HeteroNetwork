@@ -20,6 +20,7 @@ This file tracks the gap between the requested final system and the current repo
 - Relay admission/status HTTP API, opaque UDP forwarding loop, and `iparsd relay`.
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
+- `iparsd agent --join-token` startup registration that uses persisted agent identity/WireGuard keys, current candidates, and token bootstrap control-plane discovery.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands.
@@ -31,7 +32,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Agent daemon registration, signal loop, and runtime backend selection.
+- Agent daemon signal loop, heartbeat reporting, and runtime backend selection.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace execution hardening.
 - Full STUN protocol support and NAT classification.

@@ -1073,6 +1073,7 @@ dependencies = [
  "ipars-types",
  "ipnet",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
 ]
