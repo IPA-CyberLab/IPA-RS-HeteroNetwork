@@ -18,7 +18,7 @@ This file tracks the gap between the requested final system and the current repo
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, multi-server NAT mapping classification, and `iparsd stun` daemon support for public endpoint detection.
 - Relay admission/status HTTP API, Prometheus relay metrics, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.
-- CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
+- CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint; `token revoke` posts typed token revocation requests to the control plane.
 - Persistent agent node state, STUN candidate collection, NAT classification status, agent status/STUN/NAT HTTP routes, and `iparsd agent`.
 - `iparsd agent --join-token` startup registration that uses persisted agent identity/WireGuard keys, current candidates, and token bootstrap control-plane discovery.
 - `iparsd agent` heartbeat reporting that posts current node health, candidates, and negotiated path-state data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.

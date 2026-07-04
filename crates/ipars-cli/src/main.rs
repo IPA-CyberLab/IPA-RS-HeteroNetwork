@@ -5,7 +5,10 @@ use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
-use ipars_types::api::{JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse};
+use ipars_types::api::{
+    JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse, RevokeTokenRequest,
+    RevokeTokenResponse,
+};
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, JoinTokenClaims, KeyId, NodeId, Role,
     SignedJoinToken, Tag, TokenPolicy,
@@ -73,6 +76,7 @@ struct JoinArgs {
 #[derive(Debug, Subcommand)]
 enum TokenCommand {
     Create(TokenCreateArgs),
+    Revoke(TokenRevokeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -89,6 +93,16 @@ struct TokenCreateArgs {
     bootstrap_endpoints: Vec<String>,
     #[arg(long, default_value_t = false)]
     allow_relay: bool,
+}
+
+#[derive(Debug, Args)]
+struct TokenRevokeArgs {
+    #[arg(long)]
+    control_plane_url: String,
+    #[arg(long)]
+    cluster_id: String,
+    #[arg(long)]
+    nonce: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,9 +134,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Status => print_json(&StaticStatus::status())?,
         Command::Peers => print_json(&StaticStatus::peers())?,
         Command::Routes => print_json(&StaticStatus::routes())?,
-        Command::Token {
-            command: TokenCommand::Create(args),
-        } => print_json(&create_token(args)?)?,
+        Command::Token { command } => match command {
+            TokenCommand::Create(args) => print_json(&create_token(args)?)?,
+            TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
+        },
         Command::Relay {
             command: RelayCommand::Status,
         } => print_json(&StaticStatus::relay())?,
@@ -247,6 +262,24 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
     Ok(token)
 }
 
+async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenResponse> {
+    let request = RevokeTokenRequest {
+        cluster_id: ClusterId::from_string(args.cluster_id),
+        nonce: args.nonce,
+    };
+    reqwest::Client::new()
+        .post(control_plane_token_revoke_url(&args.control_plane_url))
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send token revoke request")?
+        .error_for_status()
+        .context("control plane rejected token revoke request")?
+        .json::<RevokeTokenResponse>()
+        .await
+        .context("failed to decode token revoke response")
+}
+
 fn claims(
     cluster_id: ClusterId,
     issuer: NodeId,
@@ -317,6 +350,13 @@ fn control_plane_join_url(
     });
     let base_url = base_url.context("join token does not contain a control-plane bootstrap URL")?;
     Ok(format!("{}/v1/join", base_url.trim_end_matches('/')))
+}
+
+fn control_plane_token_revoke_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/v1/tokens/revoke",
+        control_plane_url.trim_end_matches('/')
+    )
 }
 
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
@@ -461,5 +501,13 @@ mod tests {
         let result = control_plane_join_url(&token, None);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn token_revoke_url_trims_control_plane_base_url() {
+        assert_eq!(
+            control_plane_token_revoke_url("http://127.0.0.1:8443/"),
+            "http://127.0.0.1:8443/v1/tokens/revoke"
+        );
     }
 }

@@ -36,7 +36,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through Linux backends, including `--linux-netns` namespace placement, with retry on control-plane errors
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
 
@@ -63,6 +63,7 @@ ipars status
 ipars peers
 ipars routes
 ipars token create --role edge --tag edge --ttl-seconds 86400
+ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status
 ipars path status
 ipars docker install
