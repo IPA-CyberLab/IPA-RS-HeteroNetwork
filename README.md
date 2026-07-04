@@ -26,7 +26,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent` relay admission for signal-selected relay paths, storing expiring relay credentials only in transient agent runtime state
 - relay session renewal window handling and stale relay credential removal when paths return to direct/non-relay states
 - agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
-- relay-aware peer-map application and daemon-supervised per-peer forwarder endpoints with namespace placement checks, capacity limits, and restart backoff for active relay sessions
+- relay-aware peer-map application and daemon-supervised per-peer forwarder endpoints with namespace placement checks, capacity limits, dead-task reaping, and restart backoff for active relay sessions
 - agent JSON and Prometheus metrics plus bounded structured path-change event export
 - UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans
 - Kubernetes underlay Service/API route application from Helm-provided CIDRs through the Linux route backend

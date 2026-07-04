@@ -834,6 +834,7 @@ impl RelayForwarderSupervisor {
         runtime: &AgentRuntime,
         session: RelaySessionState,
     ) -> anyhow::Result<SocketAddr> {
+        self.reap_finished(runtime).await;
         let existing_endpoint = {
             let handles = self.handles.lock().await;
             handles.get(&session.peer).and_then(|handle| {
@@ -892,6 +893,38 @@ impl RelayForwarderSupervisor {
             "started relay forwarder"
         );
         Ok(local_endpoint)
+    }
+
+    async fn reap_finished(&self, runtime: &AgentRuntime) -> usize {
+        let finished = {
+            let mut handles = self.handles.lock().await;
+            let finished_peers = handles
+                .iter()
+                .filter_map(|(peer, handle)| handle.task.is_finished().then_some(peer.clone()))
+                .collect::<Vec<_>>();
+            finished_peers
+                .into_iter()
+                .filter_map(|peer| handles.remove(&peer).map(|handle| (peer, handle)))
+                .collect::<Vec<_>>()
+        };
+        let finished_count = finished.len();
+        for (peer, handle) in finished {
+            runtime.remove_relay_forwarder_endpoint(&peer).await;
+            self.record_start_failure(&peer).await;
+            if let Err(error) = handle.stop().await {
+                tracing::warn!(
+                    %error,
+                    peer = %peer,
+                    "relay forwarder exited and was removed from supervisor"
+                );
+            } else {
+                tracing::warn!(
+                    peer = %peer,
+                    "relay forwarder exited without an explicit supervisor stop"
+                );
+            }
+        }
+        finished_count
     }
 
     async fn bind_socket(&self) -> anyhow::Result<tokio::net::UdpSocket> {
@@ -1939,6 +1972,64 @@ mod tests {
 
         assert!(error.to_string().contains("capacity exceeded"));
         assert!(runtime.relay_forwarder_endpoints().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_forwarder_supervisor_reaps_dead_tasks_and_backs_off() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 10,
+            restart_backoff: Duration::from_secs(30),
+        });
+        let peer = NodeId::from_string("peer-dead");
+        let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 42_000));
+        runtime
+            .upsert_relay_forwarder_endpoint(peer.clone(), local_endpoint)
+            .await;
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async {
+            Err(AgentError::RelaySession(
+                "synthetic forwarder death".to_string(),
+            ))
+        });
+        supervisor.handles.lock().await.insert(
+            peer.clone(),
+            RelayForwarderTask {
+                session_id: "session-dead".to_string(),
+                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                local_endpoint,
+                shutdown_tx,
+                task,
+            },
+        );
+        tokio::task::yield_now().await;
+
+        assert_eq!(supervisor.reap_finished(&runtime).await, 1);
+        assert!(runtime.relay_forwarder_endpoints().await.is_empty());
+
+        let session = RelaySessionState {
+            peer,
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-new".to_string(),
+            session_token: "token-new".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        };
+        let error = match supervisor.upsert(&runtime, session).await {
+            Ok(endpoint) => anyhow::bail!("unexpected relay forwarder endpoint: {endpoint}"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("restart backoff active"));
         Ok(())
     }
 
