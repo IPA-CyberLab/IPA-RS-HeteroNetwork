@@ -562,7 +562,7 @@ async fn run_daemon_scenario(
     let issuer = IdentityKeyPair::generate();
     let key_id = KeyId::from_string("load-key");
     let cluster_id = ClusterId::from_string(format!("load-daemon-{:?}", scenario.name));
-    let services = DaemonProcessGroup::start(
+    let mut services = DaemonProcessGroup::start(
         iparsd_bin,
         cluster_id.clone(),
         &issuer,
@@ -578,6 +578,7 @@ async fn run_daemon_scenario(
         agent_statuses
             .push(get_json(&client, format!("{url}/v1/status"), "daemon agent status").await?);
     }
+    services.ensure_running()?;
     let registration_millis = registration_started.elapsed().as_millis();
 
     let peer_map_started = Instant::now();
@@ -593,6 +594,7 @@ async fn run_daemon_scenario(
         peer_map_edges_seen += peer_map.peers.len();
         peer_records.extend(peer_map.peers);
     }
+    services.ensure_running()?;
     let peer_map_millis = peer_map_started.elapsed().as_millis();
 
     for peer in &peer_records {
@@ -608,6 +610,7 @@ async fn run_daemon_scenario(
         )
         .await?;
     }
+    services.ensure_running()?;
 
     let signal_started = Instant::now();
     let advertised_routes = peer_records.iter().map(|node| node.routes.len()).sum();
@@ -636,6 +639,7 @@ async fn run_daemon_scenario(
         .await?;
         path_counts.record(response.preferred_state);
     }
+    services.ensure_running()?;
     let signal_millis = signal_started.elapsed().as_millis();
 
     let relay_started = Instant::now();
@@ -686,6 +690,7 @@ async fn run_daemon_scenario(
             relay_payload_bytes_received = relay_payload_bytes_received.saturating_add(len as u64);
         }
     }
+    services.ensure_running()?;
     let relay_elapsed = relay_started.elapsed();
     let relay_millis = relay_elapsed.as_millis();
     let status: RelayStatusResponse = get_json(
@@ -904,7 +909,7 @@ struct DaemonProcessGroup {
     relay_udp_addr: SocketAddr,
     agent_urls: Vec<String>,
     runtime_dir: PathBuf,
-    children: Vec<Child>,
+    children: Vec<DaemonChild>,
 }
 
 impl DaemonProcessGroup {
@@ -992,10 +997,23 @@ impl DaemonProcessGroup {
             &client,
             format!("{control_plane_url}/healthz"),
             "control-plane",
+            &mut children,
         )
         .await?;
-        wait_for_http_ok(&client, format!("{signal_url}/healthz"), "signal").await?;
-        wait_for_http_ok(&client, format!("{relay_http_url}/healthz"), "relay").await?;
+        wait_for_http_ok(
+            &client,
+            format!("{signal_url}/healthz"),
+            "signal",
+            &mut children,
+        )
+        .await?;
+        wait_for_http_ok(
+            &client,
+            format!("{relay_http_url}/healthz"),
+            "relay",
+            &mut children,
+        )
+        .await?;
 
         let mut agent_urls = Vec::with_capacity(agent_processes);
         for index in 0..agent_processes {
@@ -1040,10 +1058,23 @@ impl DaemonProcessGroup {
                 ],
                 "agent",
             )?);
-            wait_for_http_ok(&client, format!("{agent_url}/healthz"), "agent").await?;
+            wait_for_http_ok(
+                &client,
+                format!("{agent_url}/healthz"),
+                "agent",
+                &mut children,
+            )
+            .await?;
             agent_urls.push(agent_url);
         }
-        wait_for_daemon_agents_ready(&client, &control_plane_url, &signal_url, &agent_urls).await?;
+        wait_for_daemon_agents_ready(
+            &client,
+            &control_plane_url,
+            &signal_url,
+            &agent_urls,
+            &mut children,
+        )
+        .await?;
 
         Ok(Self {
             control_plane_url,
@@ -1059,26 +1090,57 @@ impl DaemonProcessGroup {
     fn process_count(&self) -> usize {
         self.children.len()
     }
+
+    fn ensure_running(&mut self) -> anyhow::Result<()> {
+        ensure_daemon_children_running(&mut self.children)
+    }
 }
 
 impl Drop for DaemonProcessGroup {
     fn drop(&mut self) {
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        for daemon_child in &mut self.children {
+            let _ = daemon_child.child.kill();
+            let _ = daemon_child.child.wait();
         }
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
 }
 
-fn spawn_iparsd(iparsd_bin: &Path, args: &[String], role: &str) -> anyhow::Result<Child> {
-    Command::new(iparsd_bin)
+struct DaemonChild {
+    role: String,
+    child: Child,
+}
+
+fn spawn_iparsd(iparsd_bin: &Path, args: &[String], role: &str) -> anyhow::Result<DaemonChild> {
+    let child = Command::new(iparsd_bin)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to spawn iparsd {role} process"))
+        .with_context(|| format!("failed to spawn iparsd {role} process"))?;
+    Ok(DaemonChild {
+        role: role.to_string(),
+        child,
+    })
+}
+
+fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Result<()> {
+    for daemon_child in children {
+        if let Some(status) = daemon_child.child.try_wait().with_context(|| {
+            format!(
+                "failed to inspect iparsd {} process status",
+                daemon_child.role
+            )
+        })? {
+            bail!(
+                "iparsd {} process exited before daemon load scenario completed: {}",
+                daemon_child.role,
+                status
+            );
+        }
+    }
+    Ok(())
 }
 
 fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
@@ -1105,9 +1167,11 @@ async fn wait_for_http_ok(
     client: &reqwest::Client,
     url: String,
     context: &str,
+    children: &mut [DaemonChild],
 ) -> anyhow::Result<()> {
     let mut last_error = None;
     for _ in 0..100 {
+        ensure_daemon_children_running(children)?;
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
@@ -1130,9 +1194,11 @@ async fn wait_for_daemon_agents_ready(
     control_plane_url: &str,
     signal_url: &str,
     agent_urls: &[String],
+    children: &mut [DaemonChild],
 ) -> anyhow::Result<()> {
     let mut last_error = None;
     for _ in 0..150 {
+        ensure_daemon_children_running(children)?;
         match daemon_agent_statuses(client, agent_urls).await {
             Ok(statuses) => match check_daemon_agent_control_and_signal_readiness(
                 client,
@@ -1593,6 +1659,37 @@ mod tests {
             &statuses,
         )
         .await
+    }
+
+    #[test]
+    fn daemon_child_liveness_reports_role_and_exit_status() -> anyhow::Result<()> {
+        let child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn synthetic daemon child")?;
+        let mut children = vec![DaemonChild {
+            role: "synthetic".to_string(),
+            child,
+        }];
+
+        for _ in 0..50 {
+            match ensure_daemon_children_running(&mut children) {
+                Ok(()) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("iparsd synthetic process exited"));
+                    assert!(message.contains("7"));
+                    return Ok(());
+                }
+            }
+        }
+
+        let _ = children[0].child.kill();
+        let _ = children[0].child.wait();
+        bail!("synthetic daemon child did not exit before liveness timeout")
     }
 
     #[tokio::test]
