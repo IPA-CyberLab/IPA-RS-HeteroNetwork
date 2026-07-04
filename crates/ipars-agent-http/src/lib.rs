@@ -9,7 +9,8 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime};
 use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
-    AgentPathEventsResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
+    AgentPathEventsResponse, AgentPathsResponse, AgentStatusResponse, AgentStunProbeRequest,
+    AgentStunProbeResponse,
 };
 use ipars_types::PathState;
 use serde::Serialize;
@@ -37,6 +38,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/paths", get(paths))
         .route("/v1/path-events", get(path_events))
         .route("/v1/stun-probe", post(stun_probe))
         .route("/v1/nat-classification", post(nat_classification))
@@ -69,6 +71,13 @@ async fn prometheus_metrics(State(state): State<AgentHttpState>) -> impl IntoRes
 async fn path_events(State(state): State<AgentHttpState>) -> Json<AgentPathEventsResponse> {
     Json(AgentPathEventsResponse {
         events: state.runtime.path_change_events().await,
+        generated_at: chrono::Utc::now(),
+    })
+}
+
+async fn paths(State(state): State<AgentHttpState>) -> Json<AgentPathsResponse> {
+    Json(AgentPathsResponse {
+        paths: state.runtime.path_state().await,
         generated_at: chrono::Utc::now(),
     })
 }
@@ -428,6 +437,21 @@ mod tests {
         assert!(body.contains("relay_node=\"relay-a\""));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 32"));
+
+        let paths_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/paths")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(paths_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(paths_response.into_body(), usize::MAX).await?;
+        let paths: AgentPathsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(paths.paths.len(), 1);
+        assert_eq!(paths.paths[0].selected_state, PathState::Relay);
 
         let events_response = app
             .oneshot(

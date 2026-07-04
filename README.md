@@ -18,7 +18,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoint
-- persistent agent node state, agent status/STUN probe/NAT classification HTTP API, and `iparsd agent`
+- persistent agent node state, agent status/path/STUN probe/NAT classification HTTP API, and `iparsd agent`
 - `iparsd agent --join-token` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health and endpoint candidates, retrying on control-plane errors
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord and endpoint candidates when a signal endpoint is known
@@ -33,11 +33,11 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Kubernetes underlay Service/API route application from explicit Helm CIDRs or RBAC-backed Kubernetes API Service discovery through command or kernel netlink Linux route backends
 - Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through command or kernel netlink Linux route backends
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
-- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, plus a selectable kernel netlink backend for current-namespace WireGuard interface and peer management
-- Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
+- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, plus a selectable kernel netlink backend for current or validated `--linux-netns` WireGuard interface and peer management
+- Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`, with HTTP API-backed status/peer/route/relay/path queries when URLs are provided
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
@@ -75,13 +75,13 @@ cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin targ
 ```bash
 ipars init --public-endpoint 203.0.113.10:51820
 ipars join '<signed-token>'
-ipars status
-ipars peers
-ipars routes
+ipars status --agent-url http://127.0.0.1:9780
+ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars token create --role edge --tag edge --ttl-seconds 86400
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
-ipars relay status
-ipars path status
+ipars relay status --relay-url http://127.0.0.1:9580
+ipars path status --agent-url http://127.0.0.1:9780
 ipars docker install
 ipars k8s install
 ```

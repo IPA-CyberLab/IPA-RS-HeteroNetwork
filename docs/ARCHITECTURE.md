@@ -191,6 +191,7 @@ Initial agent HTTP routes:
 - `GET /metrics`
 - `GET /v1/status`
 - `GET /v1/metrics`
+- `GET /v1/paths`
 - `GET /v1/path-events`
 - `POST /v1/stun-probe`
 - `POST /v1/nat-classification`

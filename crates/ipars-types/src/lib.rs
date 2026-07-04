@@ -1088,6 +1088,12 @@ pub mod api {
         pub events: Vec<PathChangeEvent>,
         pub generated_at: DateTime<Utc>,
     }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentPathsResponse {
+        pub paths: Vec<PathRecord>,
+        pub generated_at: DateTime<Utc>,
+    }
 }
 
 #[cfg(test)]

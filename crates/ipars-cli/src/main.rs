@@ -6,13 +6,14 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
-    JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse, RevokeTokenRequest,
-    RevokeTokenResponse,
+    AgentPathsResponse, AgentStatusResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, JoinTokenClaims, KeyId, NodeId, Role,
-    SignedJoinToken, Tag, TokenPolicy,
+    Route, SignedJoinToken, Tag, TokenPolicy,
 };
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -27,9 +28,9 @@ struct Cli {
 enum Command {
     Init(InitArgs),
     Join(JoinArgs),
-    Status,
-    Peers,
-    Routes,
+    Status(StatusArgs),
+    Peers(PeersArgs),
+    Routes(RoutesArgs),
     Token {
         #[command(subcommand)]
         command: TokenCommand,
@@ -73,6 +74,28 @@ struct JoinArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PeersArgs {
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_NODE_ID")]
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RoutesArgs {
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_NODE_ID")]
+    node_id: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum TokenCommand {
     Create(TokenCreateArgs),
@@ -107,12 +130,24 @@ struct TokenRevokeArgs {
 
 #[derive(Debug, Subcommand)]
 enum RelayCommand {
-    Status,
+    Status(RelayStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct RelayStatusArgs {
+    #[arg(long, env = "IPARS_RELAY_URL")]
+    relay_url: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum PathCommand {
-    Status,
+    Status(PathStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct PathStatusArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,19 +166,40 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => print_json(&init(args)?)?,
         Command::Join(args) => print_json(&join(args).await?)?,
-        Command::Status => print_json(&StaticStatus::status())?,
-        Command::Peers => print_json(&StaticStatus::peers())?,
-        Command::Routes => print_json(&StaticStatus::routes())?,
+        Command::Status(args) => match args.agent_url.as_deref() {
+            Some(agent_url) => print_json(&agent_status(agent_url).await?)?,
+            None => print_json(&StaticStatus::status())?,
+        },
+        Command::Peers(args) => match args.control_plane_url.as_deref() {
+            Some(control_plane_url) => print_json(&peer_map(control_plane_url, &args).await?)?,
+            None if args.node_id.is_some() => {
+                anyhow::bail!("ipars peers requires --control-plane-url with --node-id")
+            }
+            None => print_json(&StaticStatus::peers())?,
+        },
+        Command::Routes(args) => match args.control_plane_url.as_deref() {
+            Some(control_plane_url) => print_json(&routes(control_plane_url, &args).await?)?,
+            None if args.node_id.is_some() => {
+                anyhow::bail!("ipars routes requires --control-plane-url with --node-id")
+            }
+            None => print_json(&StaticStatus::routes())?,
+        },
         Command::Token { command } => match command {
             TokenCommand::Create(args) => print_json(&create_token(args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
         },
         Command::Relay {
-            command: RelayCommand::Status,
-        } => print_json(&StaticStatus::relay())?,
+            command: RelayCommand::Status(args),
+        } => match args.relay_url.as_deref() {
+            Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
+            None => print_json(&StaticStatus::relay())?,
+        },
         Command::Path {
-            command: PathCommand::Status,
-        } => print_json(&StaticStatus::path())?,
+            command: PathCommand::Status(args),
+        } => match args.agent_url.as_deref() {
+            Some(agent_url) => print_json(&path_status(agent_url).await?)?,
+            None => print_json(&StaticStatus::path())?,
+        },
         Command::Docker {
             command: DockerCommand::Install,
         } => print_manifest_hint("docker/compose.yaml")?,
@@ -280,6 +336,89 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
         .context("failed to decode token revoke response")
 }
 
+async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
+    get_json(agent_url, "/v1/status", "agent status").await
+}
+
+async fn peer_map(control_plane_url: &str, args: &PeersArgs) -> anyhow::Result<PeerMap> {
+    let node_id = required_node_id(args.node_id.as_deref(), "peers")?;
+    get_json(
+        control_plane_url,
+        &format!("/v1/peers/{node_id}"),
+        "control-plane peer map",
+    )
+    .await
+}
+
+async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<RoutesOutput> {
+    let node_id = required_node_id(args.node_id.as_deref(), "routes")?;
+    let peer_map: PeerMap = get_json(
+        control_plane_url,
+        &format!("/v1/peers/{node_id}"),
+        "control-plane peer map",
+    )
+    .await?;
+    Ok(routes_output(node_id, peer_map))
+}
+
+async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
+    get_json(relay_url, "/v1/status", "relay status").await
+}
+
+async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
+    get_json(agent_url, "/v1/paths", "agent path status").await
+}
+
+async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let url = api_url(base_url, path);
+    reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {label} request to {url}"))?
+        .error_for_status()
+        .with_context(|| format!("{label} request to {url} returned an error status"))?
+        .json::<T>()
+        .await
+        .with_context(|| format!("failed to decode {label} response from {url}"))
+}
+
+fn api_url(base_url: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
+    value
+        .map(NodeId::from_string)
+        .with_context(|| format!("ipars {command} requires --node-id with --control-plane-url"))
+}
+
+fn routes_output(node_id: NodeId, peer_map: PeerMap) -> RoutesOutput {
+    let routes = peer_map
+        .peers
+        .iter()
+        .flat_map(|peer| {
+            peer.routes.iter().cloned().map(|route| RouteEntry {
+                peer: peer.node_id.clone(),
+                route,
+            })
+        })
+        .collect();
+    RoutesOutput {
+        cluster_id: peer_map.cluster_id,
+        node_id,
+        generated_at: peer_map.generated_at,
+        routes,
+    }
+}
+
 fn claims(
     cluster_id: ClusterId,
     issuer: NodeId,
@@ -397,6 +536,20 @@ struct JoinOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct RoutesOutput {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    generated_at: chrono::DateTime<Utc>,
+    routes: Vec<RouteEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteEntry {
+    peer: NodeId,
+    route: Route,
+}
+
+#[derive(Debug, Serialize)]
 struct StaticStatus<'a> {
     subsystem: &'a str,
     status: &'a str,
@@ -509,5 +662,140 @@ mod tests {
             control_plane_token_revoke_url("http://127.0.0.1:8443/"),
             "http://127.0.0.1:8443/v1/tokens/revoke"
         );
+    }
+
+    #[test]
+    fn api_url_trims_base_and_path_slashes() {
+        assert_eq!(
+            api_url("http://127.0.0.1:9780/", "/v1/status"),
+            "http://127.0.0.1:9780/v1/status"
+        );
+    }
+
+    #[test]
+    fn status_and_path_args_accept_agent_url() -> anyhow::Result<()> {
+        let status =
+            Cli::try_parse_from(["ipars", "status", "--agent-url", "http://127.0.0.1:9780"])?;
+        if let Command::Status(args) = status.command {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+        } else {
+            anyhow::bail!("expected status command");
+        }
+
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "status",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Status(args),
+        } = path.command
+        {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            return Ok(());
+        }
+
+        anyhow::bail!("expected path status command")
+    }
+
+    #[test]
+    fn peers_routes_and_relay_args_accept_api_urls() -> anyhow::Result<()> {
+        let peers = Cli::try_parse_from([
+            "ipars",
+            "peers",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])?;
+        if let Command::Peers(args) = peers.command {
+            assert_eq!(
+                args.control_plane_url.as_deref(),
+                Some("http://127.0.0.1:8443")
+            );
+            assert_eq!(args.node_id.as_deref(), Some("node-a"));
+        } else {
+            anyhow::bail!("expected peers command");
+        }
+
+        let routes = Cli::try_parse_from([
+            "ipars",
+            "routes",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])?;
+        if let Command::Routes(args) = routes.command {
+            assert_eq!(
+                args.control_plane_url.as_deref(),
+                Some("http://127.0.0.1:8443")
+            );
+            assert_eq!(args.node_id.as_deref(), Some("node-a"));
+        } else {
+            anyhow::bail!("expected routes command");
+        }
+
+        let relay = Cli::try_parse_from([
+            "ipars",
+            "relay",
+            "status",
+            "--relay-url",
+            "http://127.0.0.1:9580",
+        ])?;
+        if let Command::Relay {
+            command: RelayCommand::Status(args),
+        } = relay.command
+        {
+            assert_eq!(args.relay_url.as_deref(), Some("http://127.0.0.1:9580"));
+            return Ok(());
+        }
+
+        anyhow::bail!("expected relay status command")
+    }
+
+    #[test]
+    fn routes_output_flattens_peer_map_routes() -> anyhow::Result<()> {
+        let local = NodeId::from_string("node-a");
+        let peer = NodeId::from_string("node-b");
+        let route = Route {
+            id: "route-b".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: peer.clone(),
+            via: Some(peer.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let generated_at = Utc::now();
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![ipars_types::NodeRecord {
+                node_id: peer.clone(),
+                cluster_id: ClusterId::from_string("cluster-a"),
+                vpn_ip: ipars_types::VpnIp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    100, 64, 0, 2,
+                ))),
+                identity_public_key: "identity".to_string(),
+                wireguard_public_key: "wireguard".to_string(),
+                role: Role::edge(),
+                tags: Default::default(),
+                endpoint_candidates: Vec::new(),
+                relay_capability: None,
+                token_policy: TokenPolicy::default(),
+                routes: vec![route.clone()],
+                registered_at: generated_at,
+            }],
+            generated_at,
+        };
+
+        let output = routes_output(local.clone(), peer_map);
+
+        assert_eq!(output.node_id, local);
+        assert_eq!(output.routes.len(), 1);
+        assert_eq!(output.routes[0].peer, peer);
+        assert_eq!(output.routes[0].route, route);
+        Ok(())
     }
 }
