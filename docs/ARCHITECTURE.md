@@ -149,6 +149,13 @@ Initial control-plane HTTP routes:
 - `POST /v1/join`
 - `GET /v1/peers/{node_id}`
 
+Initial signal HTTP routes:
+
+- `GET /healthz`
+- `PUT /v1/nodes/{node_id}`
+- `POST /v1/paths/negotiate`
+- `GET /v1/hole-punch/{source}/{target}`
+
 ## Observability
 
 All daemons emit:

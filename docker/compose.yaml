@@ -40,9 +40,12 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
     command:
-      - path
-      - status
+      - signal
+      - --listen
+      - 0.0.0.0:9443
     environment:
       IPARS_ROLE: signal
     ports:

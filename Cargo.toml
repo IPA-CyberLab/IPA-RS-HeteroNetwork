@@ -10,6 +10,7 @@ members = [
     "crates/ipars-relay",
     "crates/ipars-route-manager",
     "crates/ipars-signal",
+    "crates/ipars-signal-http",
     "crates/ipars-store",
     "crates/ipars-stun",
     "crates/ipars-types",

@@ -14,6 +14,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, and token-ledger admission before registration
 - typed control-plane HTTP routes for health, join registration, and peer-map retrieval
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
+- signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -41,4 +42,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to add daemon binaries for signal, relay, STUN, and agent, then add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to add daemon binaries for relay, STUN, and agent, then add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

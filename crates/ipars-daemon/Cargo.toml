@@ -17,6 +17,8 @@ clap.workspace = true
 ipnet.workspace = true
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
+ipars-signal = { path = "../ipars-signal" }
+ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-store = { path = "../ipars-store" }
 ipars-types = { path = "../ipars-types" }
 tokio.workspace = true

@@ -992,6 +992,8 @@ dependencies = [
  "clap",
  "ipars-control-plane",
  "ipars-control-plane-http",
+ "ipars-signal",
+ "ipars-signal-http",
  "ipars-store",
  "ipars-types",
  "ipnet",
@@ -1026,6 +1028,22 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ipars-types",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ipars-signal-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "ipars-signal",
+ "ipars-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

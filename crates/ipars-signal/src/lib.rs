@@ -1,9 +1,106 @@
+use std::collections::BTreeMap;
+
 use chrono::Utc;
-use ipars_types::api::{SignalPathRequest, SignalPathResponse};
-use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeRecord, PathMetrics, PathScore,
-    PathState, PeerPathKey,
+use ipars_types::api::{
+    SignalHolePunchPlanResponse, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
+use ipars_types::{
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathMetrics,
+    PathScore, PathState, PeerPathKey,
+};
+use thiserror::Error;
+use tokio::sync::RwLock;
+
+#[derive(Debug, Error)]
+pub enum SignalError {
+    #[error("node not found: {0}")]
+    NodeNotFound(NodeId),
+}
+
+#[derive(Debug)]
+pub struct SignalRegistry {
+    coordinator: SignalCoordinator,
+    nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
+}
+
+impl SignalRegistry {
+    pub fn new(policy: ClusterPolicy) -> Self {
+        Self {
+            coordinator: SignalCoordinator::new(policy),
+            nodes: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn upsert_node(&self, node: NodeRecord) -> SignalNodeUpsertResponse {
+        let registered_at = Utc::now();
+        self.nodes
+            .write()
+            .await
+            .insert(node.node_id.clone(), node.clone());
+        SignalNodeUpsertResponse {
+            node,
+            registered_at,
+        }
+    }
+
+    pub async fn get_node(&self, node_id: &NodeId) -> Option<NodeRecord> {
+        self.nodes.read().await.get(node_id).cloned()
+    }
+
+    pub async fn negotiate(
+        &self,
+        request: SignalPathRequest,
+    ) -> Result<SignalPathResponse, SignalError> {
+        let target = self
+            .get_node(&request.target)
+            .await
+            .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
+        let relays = self.relay_candidates().await;
+        Ok(self.coordinator.negotiate(request, &target, &relays))
+    }
+
+    pub async fn hole_punch_plan(
+        &self,
+        source: NodeId,
+        target: NodeId,
+    ) -> Result<SignalHolePunchPlanResponse, SignalError> {
+        let source_node = self
+            .get_node(&source)
+            .await
+            .ok_or_else(|| SignalError::NodeNotFound(source.clone()))?;
+        let target_node = self
+            .get_node(&target)
+            .await
+            .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
+        let plan = self.coordinator.punch_plan(
+            &source_node.endpoint_candidates,
+            &target_node.endpoint_candidates,
+        );
+
+        Ok(SignalHolePunchPlanResponse {
+            key: PeerPathKey::new(source, target),
+            source_reflexive: plan.source_reflexive,
+            target_reflexive: plan.target_reflexive,
+            start_after_millis: plan.start_after_millis,
+            expires_at: plan.expires_at,
+        })
+    }
+
+    pub async fn relay_candidates(&self) -> Vec<NodeRecord> {
+        self.nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| {
+                node.relay_capability
+                    .as_ref()
+                    .map(|capability| capability.can_admit())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SignalCoordinator {
@@ -142,7 +239,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use ipars_types::{CandidateSource, ClusterId, NodeId, Role, TokenPolicy, VpnIp};
+    use ipars_types::{
+        CandidateSource, ClusterId, NodeId, RelayCapability, Role, TokenPolicy, VpnIp,
+    };
 
     use super::*;
 
@@ -175,6 +274,30 @@ mod tests {
         }
     }
 
+    fn relay() -> NodeRecord {
+        NodeRecord {
+            node_id: NodeId::from_string("relay-a"),
+            cluster_id: ClusterId::new(),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
+            identity_public_key: "identity-relay".to_string(),
+            wireguard_public_key: "wg-relay".to_string(),
+            role: Role::from_string("relay"),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: Some(RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            }),
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn direct_public_is_preferred_when_target_has_public_udp() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
@@ -190,5 +313,44 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::DirectPublic);
+    }
+
+    #[tokio::test]
+    async fn registry_uses_relay_fallback_when_direct_is_unreachable() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        registry.upsert_node(target(Vec::new())).await;
+        registry.upsert_node(relay()).await;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_builds_hole_punch_plan_for_reflexive_candidates() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        source.node_id = NodeId::from_string("node-a");
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source).await;
+        registry.upsert_node(target).await;
+
+        let plan = registry
+            .hole_punch_plan(NodeId::from_string("node-a"), NodeId::from_string("node-b"))
+            .await?;
+
+        assert!(plan.source_reflexive.is_some());
+        assert!(plan.target_reflexive.is_some());
+        assert_eq!(plan.start_after_millis, 50);
+        Ok(())
     }
 }

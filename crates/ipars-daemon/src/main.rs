@@ -9,8 +9,10 @@ use ipars_control_plane::{
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
+use ipars_signal::SignalRegistry;
+use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
-use ipars_types::{ClusterId, KeyId, NodeId};
+use ipars_types::{ClusterId, ClusterPolicy, KeyId, NodeId};
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -23,6 +25,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     ControlPlane(ControlPlaneArgs),
+    Signal(SignalArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -43,11 +46,38 @@ struct ControlPlaneArgs {
     issuer_public_key: String,
 }
 
+#[derive(Debug, Args, Clone)]
+struct SignalArgs {
+    #[arg(long, env = "IPARS_SIGNAL_LISTEN", default_value = "0.0.0.0:9443")]
+    listen: SocketAddr,
+    #[arg(long, env = "IPARS_SIGNAL_IDLE_TIMEOUT_SECONDS", default_value_t = 300)]
+    idle_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
+        default_value_t = false
+    )]
+    disable_ipv6_direct: bool,
+    #[arg(
+        long,
+        env = "IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL",
+        default_value_t = false
+    )]
+    disable_nat_traversal: bool,
+    #[arg(
+        long,
+        env = "IPARS_SIGNAL_DISABLE_RELAY_FALLBACK",
+        default_value_t = false
+    )]
+    disable_relay_fallback: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ControlPlane(args) => run_control_plane(args).await,
+        Command::Signal(args) => run_signal(args).await,
     }
 }
 
@@ -111,6 +141,18 @@ async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
     tracing::info!(%listen, "control-plane listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_signal(args: SignalArgs) -> anyhow::Result<()> {
+    let policy = ClusterPolicy {
+        allow_ipv6_direct: !args.disable_ipv6_direct,
+        allow_nat_traversal: !args.disable_nat_traversal,
+        allow_relay_fallback: !args.disable_relay_fallback,
+        idle_timeout_seconds: args.idle_timeout_seconds,
+        ..ClusterPolicy::default()
+    };
+    let registry = Arc::new(SignalRegistry::new(policy));
+    serve_router(args.listen, signal_router(SignalHttpState::new(registry))).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -604,6 +604,17 @@ pub mod api {
         pub desired_routes: Vec<IpNet>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SignalNodeUpsertRequest {
+        pub node: NodeRecord,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SignalNodeUpsertResponse {
+        pub node: NodeRecord,
+        pub registered_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalPathResponse {
         pub key: PeerPathKey,
@@ -611,6 +622,15 @@ pub mod api {
         pub relay_candidates: Vec<NodeRecord>,
         pub preferred_state: PathState,
         pub score: PathScore,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SignalHolePunchPlanResponse {
+        pub key: PeerPathKey,
+        pub source_reflexive: Option<EndpointCandidate>,
+        pub target_reflexive: Option<EndpointCandidate>,
+        pub start_after_millis: u64,
+        pub expires_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
