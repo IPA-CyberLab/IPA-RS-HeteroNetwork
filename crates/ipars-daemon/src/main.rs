@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -371,6 +371,23 @@ struct AgentArgs {
     signal_path_interval_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_AGENT_PACKET_FLOW_DETECTOR",
+        value_enum,
+        default_value_t = PacketFlowDetector::Disabled
+    )]
+    packet_flow_detector: PacketFlowDetector,
+    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_CONNTRACK_PATH")]
+    packet_flow_conntrack_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
+        default_value_t = 5
+    )]
+    packet_flow_poll_interval_seconds: u64,
+    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
+    packet_flow_pin: bool,
+    #[arg(
+        long,
         env = "IPARS_AGENT_RELAY_SESSION_RENEW_BEFORE_SECONDS",
         default_value_t = 60
     )]
@@ -599,6 +616,22 @@ impl RouteApplyBackend {
 impl std::fmt::Display for RouteApplyBackend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PacketFlowDetector {
+    Disabled,
+    #[value(name = "proc-net-conntrack")]
+    ProcNetConntrack,
+}
+
+impl PacketFlowDetector {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ProcNetConntrack => "proc-net-conntrack",
+        }
     }
 }
 
@@ -1900,6 +1933,21 @@ async fn run_agent(
     if args.apply_kubernetes_underlay {
         background_tasks
             .push(start_kubernetes_underlay_routes(&args, runtime.state().node_id.clone()).await?);
+    }
+    if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
+        tracing::info!(
+            detector = args.packet_flow_detector.as_str(),
+            conntrack_path = ?args.packet_flow_conntrack_path,
+            interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+            pin = args.packet_flow_pin,
+            "starting packet-flow detector"
+        );
+        background_tasks.push(start_proc_net_conntrack_packet_flow_detector(
+            runtime.clone(),
+            conntrack_paths(args.packet_flow_conntrack_path.clone()),
+            Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+            args.packet_flow_pin,
+        ));
     }
     if !args.disable_signal_registration {
         if let (Some(node), Some(signal_url)) = (registered_node.clone(), signal_base.clone()) {
@@ -4292,6 +4340,98 @@ async fn run_peer_map_sync_loop<S, A>(
     }
 }
 
+fn start_proc_net_conntrack_packet_flow_detector(
+    runtime: Arc<AgentRuntime>,
+    paths: Vec<PathBuf>,
+    interval: Duration,
+    pin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match read_conntrack_destination_ips(&paths).await {
+                Ok(destinations) => {
+                    let now = chrono::Utc::now();
+                    let mut matched_count = 0_usize;
+                    for destination in destinations {
+                        if let Some(matched) = runtime
+                            .record_packet_flow_activity(destination, now, pin)
+                            .await
+                        {
+                            matched_count += 1;
+                            tracing::debug!(
+                                destination = %destination,
+                                peer = %matched.peer,
+                                kind = ?matched.kind,
+                                route = ?matched.route,
+                                pinned = matched.pinned,
+                                "recorded packet-flow lazy-connect activity"
+                            );
+                        }
+                    }
+                    if matched_count > 0 {
+                        tracing::info!(
+                            matched = matched_count,
+                            "recorded packet-flow lazy-connect activity from conntrack"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to read conntrack packet-flow table; will retry"
+                ),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
+    custom_path.map_or_else(
+        || {
+            vec![
+                PathBuf::from("/proc/net/nf_conntrack"),
+                PathBuf::from("/proc/net/ip_conntrack"),
+            ]
+        },
+        |path| vec![path],
+    )
+}
+
+async fn read_conntrack_destination_ips(paths: &[PathBuf]) -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut attempted = Vec::new();
+    let mut last_error = None;
+    for path in paths {
+        attempted.push(path.display().to_string());
+        match tokio::fs::read_to_string(path).await {
+            Ok(contents) => return Ok(parse_conntrack_destination_ips(&contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if let Some(error) = last_error {
+        anyhow::bail!(
+            "failed to read conntrack flow table from {}: {error}",
+            attempted.join(", ")
+        );
+    }
+    anyhow::bail!("no conntrack flow table found at {}", attempted.join(", "))
+}
+
+fn parse_conntrack_destination_ips(contents: &str) -> BTreeSet<IpAddr> {
+    contents
+        .lines()
+        .flat_map(parse_conntrack_line_destination_ips)
+        .collect()
+}
+
+fn parse_conntrack_line_destination_ips(line: &str) -> BTreeSet<IpAddr> {
+    line.split_whitespace()
+        .filter_map(|field| field.strip_prefix("dst="))
+        .filter_map(|value| value.parse::<IpAddr>().ok())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct HttpPeerMapSource {
     control_plane_url: String,
@@ -5208,6 +5348,70 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_args_accept_packet_flow_detector() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-conntrack-path",
+            "/tmp/ipars-conntrack",
+            "--packet-flow-poll-interval-seconds",
+            "2",
+            "--packet-flow-pin",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.packet_flow_detector,
+                PacketFlowDetector::ProcNetConntrack
+            );
+            assert_eq!(args.packet_flow_detector.as_str(), "proc-net-conntrack");
+            assert_eq!(
+                args.packet_flow_conntrack_path.as_deref(),
+                Some(Path::new("/tmp/ipars-conntrack"))
+            );
+            assert_eq!(args.packet_flow_poll_interval_seconds, 2);
+            assert!(args.packet_flow_pin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn conntrack_paths_default_and_override() {
+        assert_eq!(
+            conntrack_paths(None),
+            vec![
+                PathBuf::from("/proc/net/nf_conntrack"),
+                PathBuf::from("/proc/net/ip_conntrack")
+            ]
+        );
+        assert_eq!(
+            conntrack_paths(Some(PathBuf::from("/tmp/conntrack"))),
+            vec![PathBuf::from("/tmp/conntrack")]
+        );
+    }
+
+    #[test]
+    fn conntrack_parser_extracts_destination_ips() -> anyhow::Result<()> {
+        let contents = "\
+ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321
+ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
+invalid no-destination-here
+";
+        let destinations = parse_conntrack_destination_ips(contents);
+
+        assert!(destinations.contains(&"100.64.0.11".parse()?));
+        assert!(destinations.contains(&"192.0.2.10".parse()?));
+        assert!(destinations.contains(&"fd00::42".parse()?));
+        assert!(destinations.contains(&"2001:db8::1".parse()?));
+        assert_eq!(destinations.len(), 4);
+        Ok(())
     }
 
     #[test]
