@@ -724,6 +724,16 @@ impl UdpHolePuncher {
         local_node: &NodeId,
         plan: &SignalHolePunchPlanResponse,
     ) -> Result<usize, AgentError> {
+        let socket = tokio::net::UdpSocket::bind(self.local_bind).await?;
+        self.execute_on_socket(local_node, plan, &socket).await
+    }
+
+    pub async fn execute_on_socket(
+        &self,
+        local_node: &NodeId,
+        plan: &SignalHolePunchPlanResponse,
+        socket: &tokio::net::UdpSocket,
+    ) -> Result<usize, AgentError> {
         let remote_addr = remote_reflexive_addr(local_node, plan)?;
         if Utc::now() >= plan.expires_at {
             return Err(AgentError::HolePunch("hole punch plan expired".to_string()));
@@ -733,7 +743,6 @@ impl UdpHolePuncher {
             tokio::time::sleep(Duration::from_millis(plan.start_after_millis)).await;
         }
 
-        let socket = tokio::net::UdpSocket::bind(self.local_bind).await?;
         let payload = hole_punch_payload(local_node, plan);
         for attempt in 0..self.attempts {
             socket.send_to(payload.as_bytes(), remote_addr).await?;

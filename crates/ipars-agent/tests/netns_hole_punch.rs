@@ -10,7 +10,9 @@ use ipars_agent::UdpHolePuncher;
 use ipars_types::api::SignalHolePunchPlanResponse;
 use ipars_types::{CandidateSource, EndpointCandidate, EndpointCandidateKind, NodeId, PeerPathKey};
 
-const TEST_NAME: &str = "udp_hole_puncher_sends_signal_payload_between_network_namespaces";
+const DIRECT_TEST_NAME: &str = "udp_hole_puncher_sends_signal_payload_between_network_namespaces";
+const NAT_TEST_NAME: &str =
+    "udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -68,6 +70,7 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
     let ready_a = temp_file(format!("ipars-hp-ready-a-{suffix}"));
     let ready_b = temp_file(format!("ipars-hp-ready-b-{suffix}"));
     let receiver_a = spawn_child(
+        DIRECT_TEST_NAME,
         &namespace_a,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
@@ -80,6 +83,7 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
         ],
     )?;
     let receiver_b = spawn_child(
+        DIRECT_TEST_NAME,
         &namespace_b,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
@@ -95,6 +99,7 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
     wait_for_file(&ready_b)?;
 
     let puncher_a = spawn_child(
+        DIRECT_TEST_NAME,
         &namespace_a,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "puncher"),
@@ -103,6 +108,7 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
         ],
     )?;
     let puncher_b = spawn_child(
+        DIRECT_TEST_NAME,
         &namespace_b,
         [
             ("IPARS_HOLE_PUNCH_CHILD_ROLE", "puncher"),
@@ -121,10 +127,151 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
     Ok(())
 }
 
+#[tokio::test]
+async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping hole-punch NAT netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    let suffix = unique_suffix()?;
+    let left_namespace = format!("ipars-hp-left-{suffix}");
+    let left_nat_namespace = format!("ipars-hp-lnat-{suffix}");
+    let right_namespace = format!("ipars-hp-right-{suffix}");
+    let right_nat_namespace = format!("ipars-hp-rnat-{suffix}");
+    let _left_guard = NamespaceGuard::create(left_namespace.clone())?;
+    let _left_nat_guard = NamespaceGuard::create(left_nat_namespace.clone())?;
+    let _right_guard = NamespaceGuard::create(right_namespace.clone())?;
+    let _right_nat_guard = NamespaceGuard::create(right_nat_namespace.clone())?;
+
+    let left_if = format!("ihpl{suffix}");
+    let left_nat_private_if = format!("ihpnlp{suffix}");
+    let right_if = format!("ihpr{suffix}");
+    let right_nat_private_if = format!("ihpnrp{suffix}");
+    let left_nat_public_if = format!("ihpnlu{suffix}");
+    let right_nat_public_if = format!("ihpnru{suffix}");
+    let _left_nat_veth = VethGuard::create(&left_if, &left_nat_private_if)?;
+    let _right_nat_veth = VethGuard::create(&right_if, &right_nat_private_if)?;
+    let _public_veth = VethGuard::create(&left_nat_public_if, &right_nat_public_if)?;
+
+    move_link_to_namespace(&left_if, &left_namespace)?;
+    move_link_to_namespace(&left_nat_private_if, &left_nat_namespace)?;
+    move_link_to_namespace(&right_if, &right_namespace)?;
+    move_link_to_namespace(&right_nat_private_if, &right_nat_namespace)?;
+    move_link_to_namespace(&left_nat_public_if, &left_nat_namespace)?;
+    move_link_to_namespace(&right_nat_public_if, &right_nat_namespace)?;
+
+    configure_namespace_interface(&left_namespace, &left_if, "10.242.0.2/30")?;
+    configure_namespace_interface(&left_nat_namespace, &left_nat_private_if, "10.242.0.1/30")?;
+    configure_namespace_interface(&right_namespace, &right_if, "10.242.1.2/30")?;
+    configure_namespace_interface(&right_nat_namespace, &right_nat_private_if, "10.242.1.1/30")?;
+    configure_namespace_interface(&left_nat_namespace, &left_nat_public_if, "198.18.0.1/30")?;
+    configure_namespace_interface(&right_nat_namespace, &right_nat_public_if, "198.18.0.2/30")?;
+    command(
+        "ip",
+        [
+            "-n",
+            left_namespace.as_str(),
+            "route",
+            "replace",
+            "default",
+            "via",
+            "10.242.0.1",
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "-n",
+            right_namespace.as_str(),
+            "route",
+            "replace",
+            "default",
+            "via",
+            "10.242.1.1",
+        ],
+    )?;
+    enable_snat_namespace(
+        &left_nat_namespace,
+        &left_nat_public_if,
+        "10.242.0.2/32",
+        "198.18.0.1",
+    )?;
+    enable_snat_namespace(
+        &right_nat_namespace,
+        &right_nat_public_if,
+        "10.242.1.2/32",
+        "198.18.0.2",
+    )?;
+
+    let left_ready = temp_file(format!("ipars-hp-nat-ready-left-{suffix}"));
+    let right_ready = temp_file(format!("ipars-hp-nat-ready-right-{suffix}"));
+    let start_file = temp_file(format!("ipars-hp-nat-start-{suffix}"));
+    let left_ready_str = left_ready.to_string_lossy().into_owned();
+    let right_ready_str = right_ready.to_string_lossy().into_owned();
+    let start_file_str = start_file.to_string_lossy().into_owned();
+
+    let left = spawn_child(
+        NAT_TEST_NAME,
+        &left_namespace,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.242.0.2:40101"),
+            ("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE", "198.18.0.1:40101"),
+            ("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE", "198.18.0.2:40102"),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+            ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
+            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ],
+    )?;
+    let right = spawn_child(
+        NAT_TEST_NAME,
+        &right_namespace,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.242.1.2:40102"),
+            ("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE", "198.18.0.1:40101"),
+            ("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE", "198.18.0.2:40102"),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+            ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
+            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ],
+    )?;
+    wait_for_file(&left_ready)?;
+    wait_for_file(&right_ready)?;
+    fs::write(&start_file, b"start")?;
+
+    assert_success("nat-left", left.wait_with_output()?)?;
+    assert_success("nat-right", right.wait_with_output()?)?;
+
+    let _ = fs::remove_file(left_ready);
+    let _ = fs::remove_file(right_ready);
+    let _ = fs::remove_file(start_file);
+    Ok(())
+}
+
 async fn run_child(role: &str) -> Result<(), Box<dyn std::error::Error>> {
     match role {
         "receiver" => run_receiver().await,
         "puncher" => run_puncher().await,
+        "nat-duplex" => run_nat_duplex().await,
         other => Err(format!("unknown hole-punch child role `{other}`").into()),
     }
 }
@@ -167,19 +314,63 @@ async fn run_puncher() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_nat_duplex() -> Result<(), Box<dyn std::error::Error>> {
+    let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
+    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let source_reflexive =
+        required_env("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE")?.parse::<SocketAddr>()?;
+    let target_reflexive =
+        required_env("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE")?.parse::<SocketAddr>()?;
+    let expected_local = required_env("IPARS_HOLE_PUNCH_EXPECT_LOCAL")?;
+    let ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_READY_FILE")?);
+    let start_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_START_FILE")?);
+    let socket = tokio::net::UdpSocket::bind(bind).await?;
+    fs::write(&ready_file, b"ready")?;
+    wait_for_file(&start_file)?;
+
+    let plan = SignalHolePunchPlanResponse {
+        key: PeerPathKey::new(NodeId::from_string("node-a"), NodeId::from_string("node-b")),
+        source_reflexive: Some(reflexive_candidate_addr("node-a", source_reflexive)),
+        target_reflexive: Some(reflexive_candidate_addr("node-b", target_reflexive)),
+        start_after_millis: 0,
+        expires_at: Utc::now() + ChronoDuration::seconds(10),
+    };
+
+    let sent = UdpHolePuncher::new(bind)
+        .with_attempts(20)
+        .with_interval(Duration::from_millis(50))
+        .execute_on_socket(&local_node, &plan, &socket)
+        .await?;
+    assert_eq!(sent, 20);
+
+    let mut buffer = [0_u8; 512];
+    let (len, _) =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await??;
+    let payload = std::str::from_utf8(&buffer[..len])?;
+
+    assert!(payload.contains("ipars-hole-punch-v1"));
+    assert!(payload.contains("source=node-a target=node-b"));
+    assert!(payload.contains(&format!("local={expected_local}")));
+    Ok(())
+}
+
 fn reflexive_candidate(
     node_id: &str,
     addr: &str,
 ) -> Result<EndpointCandidate, Box<dyn std::error::Error>> {
-    Ok(EndpointCandidate {
+    Ok(reflexive_candidate_addr(node_id, addr.parse()?))
+}
+
+fn reflexive_candidate_addr(node_id: &str, addr: SocketAddr) -> EndpointCandidate {
+    EndpointCandidate {
         node_id: NodeId::from_string(node_id),
         kind: EndpointCandidateKind::StunReflexive,
-        addr: addr.parse()?,
+        addr,
         observed_at: Utc::now(),
         priority: 100,
         cost: 10,
         source: CandidateSource::StunProbe,
-    })
+    }
 }
 
 fn configure_namespace_interface(
@@ -195,7 +386,61 @@ fn configure_namespace_interface(
     command("ip", ["-n", namespace, "link", "set", interface, "up"])
 }
 
+fn move_link_to_namespace(
+    interface: &str,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    command("ip", ["link", "set", interface, "netns", namespace])
+}
+
+fn enable_snat_namespace(
+    namespace: &str,
+    public_interface: &str,
+    source_cidr: &str,
+    public_ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    command(
+        "ip",
+        [
+            "netns",
+            "exec",
+            namespace,
+            "sysctl",
+            "-w",
+            "net.ipv4.ip_forward=1",
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "netns", "exec", namespace, "iptables", "-P", "FORWARD", "ACCEPT",
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "netns",
+            "exec",
+            namespace,
+            "iptables",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            source_cidr,
+            "-o",
+            public_interface,
+            "-j",
+            "SNAT",
+            "--to-source",
+            public_ip,
+        ],
+    )
+}
+
 fn spawn_child<const N: usize>(
+    test_name: &str,
     namespace: &str,
     envs: [(&str, &str); N],
 ) -> Result<Child, Box<dyn std::error::Error>> {
@@ -203,7 +448,7 @@ fn spawn_child<const N: usize>(
     command
         .args(["netns", "exec", namespace])
         .arg(std::env::current_exe()?)
-        .arg(TEST_NAME)
+        .arg(test_name)
         .arg("--exact")
         .arg("--nocapture")
         .stdout(Stdio::piped())
