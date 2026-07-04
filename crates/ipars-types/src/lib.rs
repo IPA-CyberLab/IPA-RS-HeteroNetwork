@@ -184,7 +184,7 @@ pub enum CandidateSource {
     RelayMap,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PathState {
     DirectPublic,
@@ -298,6 +298,31 @@ pub struct PathRecord {
     pub score: PathScore,
     pub updated_at: DateTime<Utc>,
     pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathChangeKind {
+    Created,
+    StateChanged,
+    RelayChanged,
+    CandidateChanged,
+    ScoreChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathChangeEvent {
+    pub key: PeerPathKey,
+    pub kind: PathChangeKind,
+    pub previous_state: Option<PathState>,
+    pub new_state: PathState,
+    pub previous_relay_node: Option<NodeId>,
+    pub new_relay_node: Option<NodeId>,
+    pub previous_candidate: Option<EndpointCandidate>,
+    pub new_candidate: Option<EndpointCandidate>,
+    pub previous_score: Option<PathScore>,
+    pub new_score: PathScore,
+    pub changed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,6 +707,30 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentStunProbeResponse {
         pub candidate: EndpointCandidate,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PathStateCount {
+        pub state: PathState,
+        pub count: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentMetricsResponse {
+        pub node_id: NodeId,
+        pub candidate_count: usize,
+        pub path_count: usize,
+        pub relay_session_count: usize,
+        pub relay_forwarder_count: usize,
+        pub path_change_event_count: usize,
+        pub path_state_counts: Vec<PathStateCount>,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentPathEventsResponse {
+        pub events: Vec<PathChangeEvent>,
+        pub generated_at: DateTime<Utc>,
     }
 }
 

@@ -28,6 +28,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
 - Agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames and preserves opaque WireGuard payloads.
 - Agent peer-map application can bind active relay-selected peers to daemon-supervised per-peer local relay forwarder endpoints when applying kernel WireGuard peer settings.
+- Agent HTTP metrics export and bounded structured path-change event export.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
@@ -47,7 +48,7 @@ This file tracks the gap between the requested final system and the current repo
 - Full STUN protocol support and NAT classification.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.
 - Relay forwarder namespace placement, capacity limits, and restart/backoff policy hardening.
-- Metrics export and structured path-change events.
+- Prometheus/OpenTelemetry exporters and broader control-plane/relay metrics coverage.
 - Docker namespace integration implementation.
 - Kubernetes route discovery and service/API exposure implementation.
 - Direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests.

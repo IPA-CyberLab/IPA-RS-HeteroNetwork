@@ -175,6 +175,8 @@ Initial agent HTTP routes:
 
 - `GET /healthz`
 - `GET /v1/status`
+- `GET /v1/metrics`
+- `GET /v1/path-events`
 - `POST /v1/stun-probe`
 
 ## Observability
@@ -188,6 +190,8 @@ All daemons emit:
 - token validation/revocation events
 
 Critical events include path promotion/demotion, relay fallback, relay abuse refusal, VPN IP allocation, route publication, and policy denial.
+
+Agents expose typed JSON metrics and a bounded structured path-change event buffer. The metrics include candidate, path, relay session, relay forwarder, and per-path-state counts. Path events record the previous and new path state, relay node, selected candidate, and score for create/change transitions.
 
 ## Security Model
 

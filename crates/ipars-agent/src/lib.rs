@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,13 +11,17 @@ use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram;
 use ipars_route_manager::{LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
-use ipars_types::api::{AgentStatusResponse, PeerMap, SignalHolePunchPlanResponse};
+use ipars_types::api::{
+    AgentMetricsResponse, AgentStatusResponse, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+};
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathRecord,
-    PathScore, PathState, Role, Route, Tag, VpnIp,
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathChangeEvent,
+    PathChangeKind, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -129,6 +133,7 @@ pub struct AgentRuntime {
     state: AgentNodeState,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
+    path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
@@ -240,6 +245,7 @@ impl AgentRuntime {
             state,
             candidates: tokio::sync::RwLock::new(Vec::new()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
+            path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
@@ -278,6 +284,41 @@ impl AgentRuntime {
         self.path_state.read().await.values().cloned().collect()
     }
 
+    pub async fn path_change_events(&self) -> Vec<PathChangeEvent> {
+        self.path_change_events
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn metrics(&self) -> AgentMetricsResponse {
+        let candidates = self.candidates.read().await;
+        let path_state = self.path_state.read().await;
+        let relay_sessions = self.relay_sessions.read().await;
+        let relay_forwarders = self.relay_forwarder_endpoints.read().await;
+        let path_change_events = self.path_change_events.read().await;
+        let mut path_state_counts = BTreeMap::<PathState, usize>::new();
+        for path in path_state.values() {
+            *path_state_counts.entry(path.selected_state).or_default() += 1;
+        }
+
+        AgentMetricsResponse {
+            node_id: self.state.node_id.clone(),
+            candidate_count: candidates.len(),
+            path_count: path_state.len(),
+            relay_session_count: relay_sessions.len(),
+            relay_forwarder_count: relay_forwarders.len(),
+            path_change_event_count: path_change_events.len(),
+            path_state_counts: path_state_counts
+                .into_iter()
+                .map(|(state, count)| PathStateCount { state, count })
+                .collect(),
+            generated_at: Utc::now(),
+        }
+    }
+
     pub async fn path_record_for_peer(&self, peer: &NodeId) -> Option<PathRecord> {
         self.path_state
             .read()
@@ -287,10 +328,17 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) {
-        self.path_state.write().await.insert(
+        let previous = self.path_state.write().await.insert(
             (record.key.local.clone(), record.key.remote.clone()),
-            record,
+            record.clone(),
         );
+        if let Some(event) = path_change_event(previous.as_ref(), &record) {
+            let mut events = self.path_change_events.write().await;
+            if events.len() >= MAX_PATH_CHANGE_EVENTS {
+                events.pop_front();
+            }
+            events.push_back(event);
+        }
     }
 
     pub async fn upsert_relay_session(&self, session: RelaySessionState) {
@@ -381,6 +429,38 @@ impl AgentRuntime {
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
         self.lazy_connect.read().await.idle_peers_to_close(now)
     }
+}
+
+fn path_change_event(
+    previous: Option<&PathRecord>,
+    current: &PathRecord,
+) -> Option<PathChangeEvent> {
+    let kind = match previous {
+        None => PathChangeKind::Created,
+        Some(previous) if previous.selected_state != current.selected_state => {
+            PathChangeKind::StateChanged
+        }
+        Some(previous) if previous.relay_node != current.relay_node => PathChangeKind::RelayChanged,
+        Some(previous) if previous.selected_candidate != current.selected_candidate => {
+            PathChangeKind::CandidateChanged
+        }
+        Some(previous) if previous.score != current.score => PathChangeKind::ScoreChanged,
+        Some(_) => return None,
+    };
+
+    Some(PathChangeEvent {
+        key: current.key.clone(),
+        kind,
+        previous_state: previous.map(|path| path.selected_state),
+        new_state: current.selected_state,
+        previous_relay_node: previous.and_then(|path| path.relay_node.clone()),
+        new_relay_node: current.relay_node.clone(),
+        previous_candidate: previous.and_then(|path| path.selected_candidate.clone()),
+        new_candidate: current.selected_candidate.clone(),
+        previous_score: previous.map(|path| path.score.clone()),
+        new_score: current.score.clone(),
+        changed_at: current.updated_at,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1266,6 +1346,40 @@ mod tests {
         runtime.upsert_path_state(latest.clone()).await;
 
         assert_eq!(runtime.path_state().await, vec![latest]);
+    }
+
+    #[tokio::test]
+    async fn runtime_records_path_change_events_and_metrics() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let first = path("peer-a", PathState::Relay, 70.0);
+        let latest = path("peer-a", PathState::DirectPublic, 115.0);
+        runtime.upsert_path_state(first.clone()).await;
+        runtime.upsert_path_state(first.clone()).await;
+        runtime.upsert_path_state(latest.clone()).await;
+
+        let events = runtime.path_change_events().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, PathChangeKind::Created);
+        assert_eq!(events[0].previous_state, None);
+        assert_eq!(events[0].new_state, PathState::Relay);
+        assert_eq!(events[1].kind, PathChangeKind::StateChanged);
+        assert_eq!(events[1].previous_state, Some(PathState::Relay));
+        assert_eq!(events[1].new_state, PathState::DirectPublic);
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.path_change_event_count, 2);
+        assert_eq!(metrics.relay_session_count, 0);
+        assert_eq!(
+            metrics.path_state_counts,
+            vec![PathStateCount {
+                state: PathState::DirectPublic,
+                count: 1,
+            }]
+        );
     }
 
     #[tokio::test]
