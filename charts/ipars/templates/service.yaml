@@ -1,3 +1,11 @@
+{{- $agentApiExternal := or (eq .Values.agent.apiService.type "NodePort") (eq .Values.agent.apiService.type "LoadBalancer") -}}
+{{- $relayExternal := or (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
+{{- if and .Values.agent.apiService.enabled $agentApiExternal (not .Values.agent.apiService.exposureAcknowledged) -}}
+{{- fail "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
+{{- fail "agent.relayService external exposure requires agent.relayService.exposureAcknowledged=true" -}}
+{{- end -}}
 {{- if .Values.agent.apiService.enabled }}
 apiVersion: v1
 kind: Service
@@ -12,6 +20,13 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.apiService.type }}
+  {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+{{- toYaml .Values.agent.apiService.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if $agentApiExternal }}
+  externalTrafficPolicy: {{ .Values.agent.apiService.externalTrafficPolicy }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
   ports:
@@ -35,6 +50,13 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.relayService.type }}
+  {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+{{- toYaml .Values.agent.relayService.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if $relayExternal }}
+  externalTrafficPolicy: {{ .Values.agent.relayService.externalTrafficPolicy }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
   ports:

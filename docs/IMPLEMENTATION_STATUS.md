@@ -36,7 +36,7 @@ This file tracks the gap between the requested final system and the current repo
 - Agent relay forwarder per-peer dataplane metrics for outbound/inbound packets and opaque payload bytes, exported through JSON and Prometheus metrics.
 - Shared `iparsd` observability bootstrap with formatted tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to OpenTelemetry collectors, including control-plane node/relay/path/health gauges, signal node/relay/NAT/health/request metrics, relay capacity/dataplane metrics, and agent path/relay-forwarder metric recording.
 - UDP hole-punch executor and `iparsd agent` integration that fetches signal hole-punch plans for `DIRECT_NAT_TRAVERSAL` paths and sends coordinated UDP punch datagrams.
-- `iparsd agent` Kubernetes underlay route application for explicit Service/API CIDRs or RBAC-backed Kubernetes API Service discovery, with Helm DaemonSet wiring for node-name discovery, namespace/label filters, API server host-route discovery, explicit route-provider configuration, and optional agent/relay Service exposure templates.
+- `iparsd agent` Kubernetes underlay route application for explicit Service/API CIDRs or RBAC-backed Kubernetes API Service discovery, with Helm DaemonSet wiring for node-name discovery, namespace/label filters, API server host-route discovery, explicit route-provider configuration, and optional agent/relay Service exposure templates that require explicit acknowledgement for NodePort/LoadBalancer exposure and support LoadBalancer source ranges plus external traffic policy.
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents or Docker Engine API bridge-network discovery, with network name/ID filters, rootless socket discovery, and Docker Compose wiring for rootful bridge deployments.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
@@ -66,6 +66,6 @@ This file tracks the gap between the requested final system and the current repo
 - Network-namespace validation of signal-coordinated UDP hole punching across additional reproducible NAT behaviours beyond the current direct-routed and endpoint-independent SNAT smoke tests.
 - OpenTelemetry metrics coverage beyond current control-plane node/path/health gauges, signal node/relay/NAT/health/request metrics, relay capacity/session, byte, packet, drop-reason counters, and agent path/relay-forwarder metrics.
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.
-- Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery.
+- Kubernetes service/API exposure hardening beyond current RBAC-backed Service route discovery and explicit Service exposure acknowledgement/source-range controls.
 - Full direct path, NAT traversal, relay fallback, Docker Compose, and Kubernetes integration tests beyond current focused smoke coverage.
 - External multi-process daemon load orchestration hardening beyond current loopback `iparsd` control-plane/signal/STUN/relay/dry-run-agent transport.

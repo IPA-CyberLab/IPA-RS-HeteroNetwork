@@ -238,8 +238,14 @@ struct K8sInstallArgs {
     join_token_key: String,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
+    #[arg(long, default_value_t = false)]
+    allow_public_service_exposure: bool,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
+    #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
+    agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
+    agent_api_external_traffic_policy: String,
     #[arg(long = "agent-api-service-annotation", value_parser = parse_key_value, requires = "expose_agent_api")]
     agent_api_service_annotations: Vec<KeyValueArg>,
     #[arg(
@@ -250,6 +256,10 @@ struct K8sInstallArgs {
     expose_relay: bool,
     #[arg(long, default_value = "LoadBalancer", value_parser = parse_kubernetes_service_type)]
     relay_service_type: String,
+    #[arg(long = "relay-allow-source-cidr", requires = "expose_relay")]
+    relay_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
+    relay_external_traffic_policy: String,
     #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
     relay_service_annotations: Vec<KeyValueArg>,
     #[arg(long)]
@@ -868,6 +878,19 @@ fn parse_kubernetes_service_type(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_kubernetes_external_traffic_policy(value: &str) -> Result<String, String> {
+    match value {
+        "Cluster" | "Local" => Ok(value.to_string()),
+        _ => Err(format!(
+            "external traffic policy must be Cluster or Local; got {value}"
+        )),
+    }
+}
+
+fn is_external_kubernetes_service_type(service_type: &str) -> bool {
+    matches!(service_type, "NodePort" | "LoadBalancer")
+}
+
 fn parse_key_value(value: &str) -> Result<KeyValueArg, String> {
     let (key, annotation_value) = value
         .split_once('=')
@@ -901,6 +924,12 @@ fn append_helm_set_string(command: &mut String, key: &str, value: &str) {
         " --set-string {key}={}",
         helm_set_string_value(value)
     ));
+}
+
+fn append_helm_ipnet_list(command: &mut String, key: &str, values: &[ipnet::IpNet]) {
+    for (index, value) in values.iter().enumerate() {
+        append_helm_set_string(command, &format!("{key}[{index}]"), &value.to_string());
+    }
 }
 
 fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
@@ -1166,6 +1195,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
 }
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
+    validate_k8s_service_exposure(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
         "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
@@ -1177,6 +1207,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             " --set agent.apiService.type={}",
             args.agent_api_service_type
         ));
+        if is_external_kubernetes_service_type(&args.agent_api_service_type) {
+            helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
+            helm_command.push_str(&format!(
+                " --set agent.apiService.externalTrafficPolicy={}",
+                args.agent_api_external_traffic_policy
+            ));
+        }
+        append_helm_ipnet_list(
+            &mut helm_command,
+            "agent.apiService.loadBalancerSourceRanges",
+            &args.agent_api_allow_source_cidrs,
+        );
         for annotation in &args.agent_api_service_annotations {
             append_helm_set_string(
                 &mut helm_command,
@@ -1204,6 +1246,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             " --set agent.relayService.type={}",
             args.relay_service_type
         ));
+        if is_external_kubernetes_service_type(&args.relay_service_type) {
+            helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
+            helm_command.push_str(&format!(
+                " --set agent.relayService.externalTrafficPolicy={}",
+                args.relay_external_traffic_policy
+            ));
+        }
+        append_helm_ipnet_list(
+            &mut helm_command,
+            "agent.relayService.loadBalancerSourceRanges",
+            &args.relay_allow_source_cidrs,
+        );
         append_helm_set_string(
             &mut helm_command,
             "agent.relayAdvertisement.publicEndpoint",
@@ -1256,15 +1310,47 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         security: vec![
             "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
+            "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
+            "LoadBalancer exposure should use --agent-api-allow-source-cidr or --relay-allow-source-cidr to constrain allowed clients".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Service type and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "Service type, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if args.expose_agent_api
+        && is_external_kubernetes_service_type(&args.agent_api_service_type)
+        && !args.allow_public_service_exposure
+    {
+        anyhow::bail!(
+            "--expose-agent-api with {} requires --allow-public-service-exposure",
+            args.agent_api_service_type
+        );
+    }
+    if args.expose_relay
+        && is_external_kubernetes_service_type(&args.relay_service_type)
+        && !args.allow_public_service_exposure
+    {
+        anyhow::bail!(
+            "--expose-relay with {} requires --allow-public-service-exposure",
+            args.relay_service_type
+        );
+    }
+    if !args.agent_api_allow_source_cidrs.is_empty()
+        && args.agent_api_service_type != "LoadBalancer"
+    {
+        anyhow::bail!("--agent-api-allow-source-cidr only applies to LoadBalancer services");
+    }
+    if !args.relay_allow_source_cidrs.is_empty() && args.relay_service_type != "LoadBalancer" {
+        anyhow::bail!("--relay-allow-source-cidr only applies to LoadBalancer services");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1831,13 +1917,18 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             expose_agent_api: true,
+            allow_public_service_exposure: true,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
                 key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
                 value: "nlb,ip".to_string(),
             }],
             expose_relay: true,
-            relay_service_type: "NodePort".to_string(),
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
                 key: "metallb.universe.tf/address-pool".to_string(),
                 value: "public".to_string(),
@@ -1856,11 +1947,20 @@ mod tests {
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
+        assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
+        assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24"));
         assert!(plan.commands[2].contains(
             "--set-string agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip"
         ));
         assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
-        assert!(plan.commands[2].contains("--set agent.relayService.type=NodePort"));
+        assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
+        assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
+        assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24"
+        ));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820"));
         assert!(plan.commands[2].contains(
@@ -1911,14 +2011,23 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--allow-public-service-exposure",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
+            "--agent-api-allow-source-cidr",
+            "198.51.100.0/24",
+            "--agent-api-external-traffic-policy",
+            "Cluster",
             "--agent-api-service-annotation",
             "service.beta.kubernetes.io/aws-load-balancer-type=nlb",
             "--expose-relay",
             "--relay-service-type",
-            "NodePort",
+            "LoadBalancer",
+            "--relay-allow-source-cidr",
+            "203.0.113.0/24",
+            "--relay-external-traffic-policy",
+            "Local",
             "--relay-service-annotation",
             "metallb.universe.tf/address-pool=public",
             "--relay-public-endpoint",
@@ -1934,8 +2043,14 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert!(args.allow_public_service_exposure);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
+            assert_eq!(
+                args.agent_api_allow_source_cidrs,
+                vec!["198.51.100.0/24".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(args.agent_api_external_traffic_policy, "Cluster");
             assert_eq!(
                 args.agent_api_service_annotations,
                 vec![KeyValueArg {
@@ -1944,7 +2059,12 @@ mod tests {
                 }]
             );
             assert!(args.expose_relay);
-            assert_eq!(args.relay_service_type, "NodePort");
+            assert_eq!(args.relay_service_type, "LoadBalancer");
+            assert_eq!(
+                args.relay_allow_source_cidrs,
+                vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(args.relay_external_traffic_policy, "Local");
             assert_eq!(
                 args.relay_service_annotations,
                 vec![KeyValueArg {
@@ -1978,10 +2098,15 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             expose_agent_api: false,
+            allow_public_service_exposure: true,
             agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
             relay_admission_url: None,
@@ -1991,12 +2116,80 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_requires_acknowledgement_for_public_service_exposure() {
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-service-type",
+            "LoadBalancer",
+        ]);
+        assert!(parsed.is_ok());
+
+        let plan = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: false,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_external_traffic_policy: "Local".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: false,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
+        });
+        assert!(plan.is_err());
+    }
+
+    #[test]
+    fn k8s_install_rejects_source_ranges_without_load_balancer() -> anyhow::Result<()> {
+        let plan = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: false,
+            agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_external_traffic_policy: "Local".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: false,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
+        });
+        assert!(plan.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn install_plan_parsers_validate_service_types_and_annotations() {
         assert_eq!(
             parse_kubernetes_service_type("ClusterIP"),
             Ok("ClusterIP".to_string())
         );
         assert!(parse_kubernetes_service_type("ExternalName").is_err());
+        assert_eq!(
+            parse_kubernetes_external_traffic_policy("Local"),
+            Ok("Local".to_string())
+        );
+        assert!(parse_kubernetes_external_traffic_policy("Public").is_err());
         assert_eq!(
             parse_key_value("service.beta.kubernetes.io/aws-load-balancer-type=nlb"),
             Ok(KeyValueArg {

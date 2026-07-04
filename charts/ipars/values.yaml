@@ -19,8 +19,11 @@ agent:
   privileged: false
   apiService:
     enabled: false
+    exposureAcknowledged: false
     type: ClusterIP
     annotations: {}
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: Local
     port: 9780
   relayForwarder:
     maxSessions: 1024
@@ -35,8 +38,11 @@ agent:
     maxMbps: 1000
   relayService:
     enabled: false
+    exposureAcknowledged: false
     type: LoadBalancer
     annotations: {}
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580
 
