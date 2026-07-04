@@ -9,13 +9,15 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
-    AgentPathsResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
-    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentStatusResponse,
+    ControlPlaneMetricsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest,
+    RevokeTokenResponse,
 };
 use ipars_types::{
-    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, JoinTokenClaims, KeyId, NodeId, Role,
-    Route, SignedJoinToken, Tag, TokenPolicy,
+    BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
+    EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathMetrics, PathState, Role, Route,
+    SignedJoinToken, Tag, TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -198,12 +200,51 @@ struct RelayStatusArgs {
 #[derive(Debug, Subcommand)]
 enum PathCommand {
     Status(PathStatusArgs),
+    Probe(PathProbeArgs),
 }
 
 #[derive(Debug, Args)]
 struct PathStatusArgs {
     #[arg(long, env = "IPARS_AGENT_URL")]
     agent_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PathProbeArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, value_parser = parse_path_state)]
+    state: PathState,
+    #[arg(long)]
+    latency_ms: Option<f32>,
+    #[arg(long, default_value_t = 0)]
+    loss_ppm: u32,
+    #[arg(long)]
+    jitter_ms: Option<f32>,
+    #[arg(long)]
+    relay_load: Option<f32>,
+    #[arg(long, default_value_t = 1.0)]
+    stability: f32,
+    #[arg(long, default_value_t = 0)]
+    cost: u32,
+    #[arg(long, default_value_t = false)]
+    policy_denied: bool,
+    #[arg(long, default_value_t = false)]
+    pin: bool,
+    #[arg(long)]
+    relay_node: Option<String>,
+    #[arg(long)]
+    candidate_addr: Option<SocketAddr>,
+    #[arg(long, value_parser = parse_candidate_kind)]
+    candidate_kind: Option<EndpointCandidateKind>,
+    #[arg(long)]
+    candidate_priority: Option<u16>,
+    #[arg(long)]
+    candidate_cost: Option<u32>,
+    #[arg(long, value_parser = parse_candidate_source)]
+    candidate_source: Option<CandidateSource>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -316,11 +357,18 @@ async fn main() -> anyhow::Result<()> {
             Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
             None => print_json(&StaticStatus::relay())?,
         },
-        Command::Path {
-            command: PathCommand::Status(args),
-        } => match args.agent_url.as_deref() {
-            Some(agent_url) => print_json(&path_status(agent_url).await?)?,
-            None => print_json(&StaticStatus::path())?,
+        Command::Path { command } => match command {
+            PathCommand::Status(args) => match args.agent_url.as_deref() {
+                Some(agent_url) => print_json(&path_status(agent_url).await?)?,
+                None => print_json(&StaticStatus::path())?,
+            },
+            PathCommand::Probe(args) => {
+                let agent_url = args
+                    .agent_url
+                    .as_deref()
+                    .context("ipars path probe requires --agent-url or IPARS_AGENT_URL")?;
+                print_json(&path_probe(agent_url, &args).await?)?
+            }
         },
         Command::Docker {
             command: DockerCommand::Install(args),
@@ -835,6 +883,66 @@ async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
     get_json(agent_url, "/v1/paths", "agent path status").await
 }
 
+async fn path_probe(
+    agent_url: &str,
+    args: &PathProbeArgs,
+) -> anyhow::Result<AgentPathProbeResponse> {
+    let request = path_probe_request(args, Utc::now())?;
+    post_json(agent_url, "/v1/path-probe", "agent path probe", &request).await
+}
+
+fn path_probe_request(
+    args: &PathProbeArgs,
+    observed_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<AgentPathProbeRequest> {
+    Ok(AgentPathProbeRequest {
+        peer: NodeId::from_string(args.peer.clone()),
+        selected_state: args.state,
+        selected_candidate: path_probe_candidate(args, observed_at)?,
+        relay_node: args.relay_node.clone().map(NodeId::from_string),
+        metrics: PathMetrics {
+            latency_ms: args.latency_ms,
+            loss_ppm: args.loss_ppm,
+            jitter_ms: args.jitter_ms,
+            relay_load: args.relay_load,
+            stability: args.stability,
+        },
+        policy_allowed: !args.policy_denied,
+        cost: args.cost,
+        pin: args.pin,
+    })
+}
+
+fn path_probe_candidate(
+    args: &PathProbeArgs,
+    observed_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<Option<EndpointCandidate>> {
+    let Some(addr) = args.candidate_addr else {
+        if args.candidate_kind.is_some()
+            || args.candidate_priority.is_some()
+            || args.candidate_cost.is_some()
+            || args.candidate_source.is_some()
+        {
+            anyhow::bail!("candidate metadata requires --candidate-addr");
+        }
+        return Ok(None);
+    };
+
+    Ok(Some(EndpointCandidate {
+        node_id: NodeId::from_string(args.peer.clone()),
+        kind: args
+            .candidate_kind
+            .unwrap_or(EndpointCandidateKind::PublicUdp),
+        addr,
+        observed_at,
+        priority: args.candidate_priority.unwrap_or(100),
+        cost: args.candidate_cost.unwrap_or(args.cost),
+        source: args
+            .candidate_source
+            .unwrap_or(CandidateSource::ControlPlane),
+    }))
+}
+
 async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<T>
 where
     T: DeserializeOwned,
@@ -852,12 +960,78 @@ where
         .with_context(|| format!("failed to decode {label} response from {url}"))
 }
 
+async fn post_json<Request, Response>(
+    base_url: &str,
+    path: &str,
+    label: &str,
+    request: &Request,
+) -> anyhow::Result<Response>
+where
+    Request: Serialize + ?Sized,
+    Response: DeserializeOwned,
+{
+    let url = api_url(base_url, path);
+    reqwest::Client::new()
+        .post(&url)
+        .json(request)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {label} request to {url}"))?
+        .error_for_status()
+        .with_context(|| format!("{label} request to {url} returned an error status"))?
+        .json::<Response>()
+        .await
+        .with_context(|| format!("failed to decode {label} response from {url}"))
+}
+
 fn api_url(base_url: &str, path: &str) -> String {
     format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn parse_path_state(value: &str) -> Result<PathState, String> {
+    match normalized_enum_arg(value).as_str() {
+        "direct_public" => Ok(PathState::DirectPublic),
+        "direct_ipv6" => Ok(PathState::DirectIpv6),
+        "direct_nat_traversal" => Ok(PathState::DirectNatTraversal),
+        "relay" => Ok(PathState::Relay),
+        "unreachable" => Ok(PathState::Unreachable),
+        _ => Err(format!(
+            "path state must be one of DIRECT_PUBLIC, DIRECT_IPV6, DIRECT_NAT_TRAVERSAL, RELAY, or UNREACHABLE; got {value}"
+        )),
+    }
+}
+
+fn parse_candidate_kind(value: &str) -> Result<EndpointCandidateKind, String> {
+    match normalized_enum_arg(value).as_str() {
+        "public_udp" => Ok(EndpointCandidateKind::PublicUdp),
+        "ipv6" => Ok(EndpointCandidateKind::Ipv6),
+        "stun_reflexive" => Ok(EndpointCandidateKind::StunReflexive),
+        "local_udp" => Ok(EndpointCandidateKind::LocalUdp),
+        "relay" => Ok(EndpointCandidateKind::Relay),
+        _ => Err(format!(
+            "candidate kind must be one of public_udp, ipv6, stun_reflexive, local_udp, or relay; got {value}"
+        )),
+    }
+}
+
+fn parse_candidate_source(value: &str) -> Result<CandidateSource, String> {
+    match normalized_enum_arg(value).as_str() {
+        "interface_scan" => Ok(CandidateSource::InterfaceScan),
+        "stun_probe" => Ok(CandidateSource::StunProbe),
+        "control_plane" => Ok(CandidateSource::ControlPlane),
+        "relay_map" => Ok(CandidateSource::RelayMap),
+        _ => Err(format!(
+            "candidate source must be one of interface_scan, stun_probe, control_plane, or relay_map; got {value}"
+        )),
+    }
+}
+
+fn normalized_enum_arg(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 fn parse_bootstrap_scheme(value: &str) -> Result<String, String> {
@@ -1781,6 +1955,110 @@ mod tests {
         }
 
         anyhow::bail!("expected path status command")
+    }
+
+    #[test]
+    fn path_probe_args_build_typed_request() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_NAT_TRAVERSAL",
+            "--latency-ms",
+            "23.5",
+            "--loss-ppm",
+            "100",
+            "--jitter-ms",
+            "3.25",
+            "--relay-load",
+            "0.4",
+            "--stability",
+            "0.8",
+            "--cost",
+            "25",
+            "--policy-denied",
+            "--pin",
+            "--relay-node",
+            "relay-a",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+            "--candidate-kind",
+            "stun-reflexive",
+            "--candidate-priority",
+            "90",
+            "--candidate-cost",
+            "9",
+            "--candidate-source",
+            "stun-probe",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+        assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+
+        let observed_at = Utc::now();
+        let request = path_probe_request(&args, observed_at)?;
+        assert_eq!(request.peer, NodeId::from_string("peer-a"));
+        assert_eq!(request.selected_state, PathState::DirectNatTraversal);
+        assert_eq!(request.relay_node, Some(NodeId::from_string("relay-a")));
+        assert_eq!(request.metrics.latency_ms, Some(23.5));
+        assert_eq!(request.metrics.loss_ppm, 100);
+        assert_eq!(request.metrics.jitter_ms, Some(3.25));
+        assert_eq!(request.metrics.relay_load, Some(0.4));
+        assert_eq!(request.metrics.stability, 0.8);
+        assert!(!request.policy_allowed);
+        assert_eq!(request.cost, 25);
+        assert!(request.pin);
+
+        let candidate = request
+            .selected_candidate
+            .context("expected selected candidate")?;
+        assert_eq!(candidate.node_id, NodeId::from_string("peer-a"));
+        assert_eq!(candidate.kind, EndpointCandidateKind::StunReflexive);
+        assert_eq!(candidate.addr, "198.51.100.10:51820".parse()?);
+        assert_eq!(candidate.observed_at, observed_at);
+        assert_eq!(candidate.priority, 90);
+        assert_eq!(candidate.cost, 9);
+        assert_eq!(candidate.source, CandidateSource::StunProbe);
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_candidate_metadata_without_addr() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "relay",
+            "--candidate-kind",
+            "relay",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("candidate metadata without address should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("candidate metadata requires --candidate-addr"));
+        Ok(())
     }
 
     #[test]
