@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::net::SocketAddr;
+use std::convert::TryInto;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -7,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, TryStreamExt};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram;
 use ipars_route_manager::{LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan};
@@ -23,6 +26,18 @@ use ipars_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(target_os = "linux")]
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_REQUEST};
+#[cfg(target_os = "linux")]
+use netlink_packet_generic::GenlMessage;
+#[cfg(target_os = "linux")]
+use netlink_packet_wireguard::{
+    WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
+    WireguardCmd, WireguardMessage, WireguardPeer, WireguardPeerAttribute, WireguardPeerFlags,
+};
+#[cfg(target_os = "linux")]
+use rtnetlink::{LinkUnspec, LinkWireguard};
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 
@@ -926,6 +941,248 @@ where
         self.peer_public_keys.write().await.remove(peer);
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub struct KernelWireGuardBackend {
+    interface: String,
+    peer_public_keys: tokio::sync::RwLock<BTreeMap<NodeId, [u8; 32]>>,
+}
+
+impl KernelWireGuardBackend {
+    pub fn new(interface: impl Into<String>) -> Self {
+        Self {
+            interface: interface.into(),
+            peer_public_keys: tokio::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn ensure_interface(&self) -> Result<(), AgentError> {
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to open route netlink connection for WireGuard interface {}: {error}",
+                self.interface
+            ))
+        })?;
+        tokio::spawn(connection);
+
+        let index = match find_link_index(&handle, &self.interface).await? {
+            Some(index) => index,
+            None => {
+                handle
+                    .link()
+                    .add(LinkWireguard::new(&self.interface).build())
+                    .execute()
+                    .await
+                    .map_err(|error| {
+                        AgentError::WireGuard(format!(
+                            "failed to create WireGuard interface {} through rtnetlink: {error}",
+                            self.interface
+                        ))
+                    })?;
+                find_link_index(&handle, &self.interface)
+                    .await?
+                    .ok_or_else(|| {
+                        AgentError::WireGuard(format!(
+                            "WireGuard interface {} was not visible after rtnetlink create",
+                            self.interface
+                        ))
+                    })?
+            }
+        };
+
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .map_err(|error| {
+                AgentError::WireGuard(format!(
+                    "failed to set WireGuard interface {} up through rtnetlink: {error}",
+                    self.interface
+                ))
+            })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn ensure_interface(&self) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl WireGuardBackend for KernelWireGuardBackend {
+    async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
+        let public_key = parse_wireguard_public_key(&config.public_key)?;
+        let peer = netlink_peer_config(&config, public_key)?;
+        apply_wireguard_netlink(&self.interface, vec![WireguardAttribute::Peers(vec![peer])])
+            .await?;
+        self.peer_public_keys
+            .write()
+            .await
+            .insert(config.peer, public_key);
+        Ok(())
+    }
+
+    async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError> {
+        let public_key = self
+            .peer_public_keys
+            .read()
+            .await
+            .get(peer)
+            .copied()
+            .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        apply_wireguard_netlink(
+            &self.interface,
+            vec![WireguardAttribute::Peers(vec![WireguardPeer(vec![
+                WireguardPeerAttribute::PublicKey(public_key),
+                WireguardPeerAttribute::Flags(WireguardPeerFlags::RemoveMe),
+            ])])],
+        )
+        .await?;
+        self.peer_public_keys.write().await.remove(peer);
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[async_trait]
+impl WireGuardBackend for KernelWireGuardBackend {
+    async fn upsert_peer(&self, _config: WireGuardPeerConfig) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+
+    async fn remove_peer(&self, _peer: &NodeId) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn find_link_index(
+    handle: &rtnetlink::Handle,
+    name: &str,
+) -> Result<Option<u32>, AgentError> {
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    let link = links.try_next().await.map_err(|error| {
+        AgentError::WireGuard(format!(
+            "failed to query WireGuard interface {name} through rtnetlink: {error}"
+        ))
+    })?;
+    Ok(link.map(|link| link.header.index))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_wireguard_public_key(value: &str) -> Result<[u8; 32], AgentError> {
+    let decoded = BASE64_STANDARD.decode(value.trim()).map_err(|error| {
+        AgentError::WireGuard(format!("invalid WireGuard public key base64: {error}"))
+    })?;
+    decoded.try_into().map_err(|decoded: Vec<u8>| {
+        AgentError::WireGuard(format!(
+            "WireGuard public key decoded to {} bytes, expected 32",
+            decoded.len()
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn netlink_peer_config(
+    config: &WireGuardPeerConfig,
+    public_key: [u8; 32],
+) -> Result<WireguardPeer, AgentError> {
+    let mut attributes = vec![
+        WireguardPeerAttribute::PublicKey(public_key),
+        WireguardPeerAttribute::Flags(WireguardPeerFlags::ReplaceAllowedIps),
+        WireguardPeerAttribute::AllowedIps(netlink_allowed_ips(&config.allowed_ips)?),
+    ];
+    if let Some(endpoint) = config.endpoint.as_deref() {
+        attributes.push(WireguardPeerAttribute::Endpoint(
+            endpoint.parse::<SocketAddr>().map_err(|error| {
+                AgentError::WireGuard(format!(
+                    "kernel WireGuard netlink backend requires socket-address endpoints; `{endpoint}` is invalid: {error}"
+                ))
+            })?,
+        ));
+    }
+    if let Some(keepalive) = config.persistent_keepalive_seconds {
+        attributes.push(WireguardPeerAttribute::PersistentKeepalive(keepalive));
+    }
+    Ok(WireguardPeer(attributes))
+}
+
+#[cfg(target_os = "linux")]
+fn netlink_allowed_ips(allowed_ips: &[String]) -> Result<Vec<WireguardAllowedIp>, AgentError> {
+    allowed_ips
+        .iter()
+        .map(|allowed_ip| {
+            let network = allowed_ip.parse::<ipnet::IpNet>().map_err(|error| {
+                AgentError::WireGuard(format!(
+                    "invalid WireGuard allowed IP `{allowed_ip}`: {error}"
+                ))
+            })?;
+            let family = match network.addr() {
+                IpAddr::V4(_) => WireguardAddressFamily::Ipv4,
+                IpAddr::V6(_) => WireguardAddressFamily::Ipv6,
+            };
+            Ok(WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(family),
+                WireguardAllowedIpAttr::IpAddr(network.addr()),
+                WireguardAllowedIpAttr::Cidr(network.prefix_len()),
+            ]))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+async fn apply_wireguard_netlink(
+    interface: &str,
+    mut attributes: Vec<WireguardAttribute>,
+) -> Result<(), AgentError> {
+    attributes.insert(0, WireguardAttribute::IfName(interface.to_string()));
+    let (connection, mut handle, _) = genetlink::new_connection().map_err(|error| {
+        AgentError::WireGuard(format!(
+            "failed to open generic netlink connection for WireGuard interface {interface}: {error}"
+        ))
+    })?;
+    tokio::spawn(connection);
+
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
+        cmd: WireguardCmd::SetDevice,
+        attributes,
+    });
+    let mut nlmsg = NetlinkMessage::from(genlmsg);
+    nlmsg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+
+    let mut responses = handle.request(nlmsg).await.map_err(|error| {
+        AgentError::WireGuard(format!(
+            "failed to send WireGuard netlink request for interface {interface}: {error}"
+        ))
+    })?;
+    while let Some(response) = responses.next().await {
+        let response = response.map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to decode WireGuard netlink response for interface {interface}: {error}"
+            ))
+        })?;
+        match response.payload {
+            NetlinkPayload::Error(error) if error.code.is_some() => {
+                return Err(AgentError::WireGuard(format!(
+                    "WireGuard netlink request for interface {interface} failed: {}",
+                    error.to_io()
+                )));
+            }
+            NetlinkPayload::Error(_) | NetlinkPayload::Done(_) => return Ok(()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1967,6 +2224,81 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_wireguard_backend_builds_netlink_peer_config() -> Result<(), AgentError> {
+        let public_key =
+            parse_wireguard_public_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")?;
+        let config = WireGuardPeerConfig {
+            peer: NodeId::from_string("node-a"),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            endpoint: Some("203.0.113.10:51820".to_string()),
+            allowed_ips: vec!["100.64.0.2/32".to_string(), "fd00::2/128".to_string()],
+            persistent_keepalive_seconds: Some(25),
+        };
+
+        let peer = netlink_peer_config(&config, public_key)?;
+
+        assert_eq!(public_key, [0; 32]);
+        assert!(peer.0.contains(&WireguardPeerAttribute::PublicKey([0; 32])));
+        assert!(peer.0.contains(&WireguardPeerAttribute::Flags(
+            WireguardPeerFlags::ReplaceAllowedIps
+        )));
+        assert!(peer
+            .0
+            .contains(&WireguardPeerAttribute::Endpoint(SocketAddr::from((
+                [203, 0, 113, 10],
+                51_820
+            )))));
+        assert!(peer
+            .0
+            .contains(&WireguardPeerAttribute::PersistentKeepalive(25)));
+        let allowed_ips = peer.0.iter().find_map(|attribute| match attribute {
+            WireguardPeerAttribute::AllowedIps(allowed_ips) => Some(allowed_ips),
+            _ => None,
+        });
+        assert_eq!(
+            allowed_ips,
+            Some(&vec![
+                WireguardAllowedIp(vec![
+                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv4),
+                    WireguardAllowedIpAttr::IpAddr("100.64.0.2".parse().map_err(|error| {
+                        AgentError::WireGuard(format!("test IP parse failed: {error}"))
+                    })?),
+                    WireguardAllowedIpAttr::Cidr(32),
+                ]),
+                WireguardAllowedIp(vec![
+                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
+                    WireguardAllowedIpAttr::IpAddr("fd00::2".parse().map_err(|error| {
+                        AgentError::WireGuard(format!("test IP parse failed: {error}"))
+                    })?),
+                    WireguardAllowedIpAttr::Cidr(128),
+                ]),
+            ])
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_wireguard_backend_rejects_unresolved_endpoint() {
+        let config = WireGuardPeerConfig {
+            peer: NodeId::from_string("node-a"),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            endpoint: Some("peer.example.com:51820".to_string()),
+            allowed_ips: vec!["100.64.0.2/32".to_string()],
+            persistent_keepalive_seconds: None,
+        };
+
+        let error = netlink_peer_config(&config, [0; 32]);
+
+        assert!(matches!(
+            error,
+            Err(AgentError::WireGuard(message))
+                if message.contains("requires socket-address endpoints")
+        ));
     }
 
     #[tokio::test]

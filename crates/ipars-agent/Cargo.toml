@@ -8,12 +8,20 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
+genetlink.workspace = true
+ipnet.workspace = true
 ipars-crypto = { path = "../ipars-crypto" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-route-manager = { path = "../ipars-route-manager" }
 ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }
+netlink-packet-core.workspace = true
+netlink-packet-generic.workspace = true
+netlink-packet-wireguard.workspace = true
+rtnetlink.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

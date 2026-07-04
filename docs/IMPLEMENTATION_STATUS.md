@@ -36,6 +36,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` Docker container CIDR route application from explicit namespace/interface/CIDR intents or Docker Engine API bridge-network discovery, with network name/ID filters, rootless socket discovery, and Docker Compose wiring for rootful bridge deployments.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
 - Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands, with optional validated `ip netns exec` execution.
+- Selectable current-namespace kernel WireGuard netlink backend for peer-map application, using rtnetlink for interface creation/up state and WireGuard generic netlink for peer upsert/removal without invoking `wg`.
 - Linux route-manager command backend for route replacement/removal and policy-rule add/delete through explicit `ip` commands, with optional validated `ip netns exec` execution.
 - Gated Linux network namespace integration smoke test for applying and removing routes through the namespaced route backend.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
@@ -49,8 +50,8 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Runtime backend hardening beyond current Linux command/dry-run selection and startup preflight.
-- Kernel WireGuard netlink/wgctrl backend.
+- Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
+- Namespace-aware kernel WireGuard netlink placement and privileged integration coverage beyond current current-namespace netlink backend.
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies.

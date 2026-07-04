@@ -33,7 +33,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Kubernetes underlay Service/API route application from explicit Helm CIDRs or RBAC-backed Kubernetes API Service discovery through the Linux route backend
 - Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through the Linux route backend
 - control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
-- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, with optional validated `ip netns exec` execution
+- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, plus a selectable kernel netlink backend for current-namespace WireGuard interface and peer management
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, with optional validated `ip netns exec` execution
 - agent peer-map applier that converts control-plane peers into WireGuard peer configs and route plans
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
@@ -86,7 +86,7 @@ ipars docker install
 ipars k8s install
 ```
 
-`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
+`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It preflights interface naming, required host commands, `CAP_NET_ADMIN`, and requested `ip netns exec` placement before mutating host networking. Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`; route application still uses the Linux route command backend. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans.
 
 For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent query the Kubernetes API with its ServiceAccount token, optionally constrained by `--kubernetes-namespace` and `--kubernetes-service-label-selector`, and convert Service cluster IPs plus the in-cluster API server address into overlay host routes. Explicit `--kubernetes-service-cidr` and `--kubernetes-api-server-cidr` values remain supported for static deployments.
 
