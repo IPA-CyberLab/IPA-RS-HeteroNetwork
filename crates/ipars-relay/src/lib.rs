@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use chrono::{DateTime, Utc};
-use ipars_types::api::{RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse};
+use ipars_types::api::{
+    RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+    RelayStatusResponse,
+};
 use ipars_types::{HealthState, NodeId, RelayCapability};
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -124,6 +127,7 @@ pub fn encode_relay_datagram(
 #[derive(Debug, Default)]
 pub struct RelayTable {
     sessions: BTreeMap<RelaySessionId, RelaySession>,
+    dataplane: RelayDataplaneMetrics,
 }
 
 impl RelayTable {
@@ -215,6 +219,30 @@ impl RelayTable {
         frame: &RelayFrame,
         now: DateTime<Utc>,
     ) -> Result<SocketAddr, RelayError> {
+        self.dataplane
+            .record_received(frame.ciphertext_payload.len());
+        let result = self.forward_target_at_inner(frame, now);
+        match result {
+            Ok(target) => {
+                self.dataplane
+                    .record_forwarded(frame.ciphertext_payload.len());
+                Ok(target)
+            }
+            Err(error) => {
+                self.dataplane.record_drop(
+                    relay_error_drop_reason(&error),
+                    frame.ciphertext_payload.len(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn forward_target_at_inner(
+        &mut self,
+        frame: &RelayFrame,
+        now: DateTime<Utc>,
+    ) -> Result<SocketAddr, RelayError> {
         self.remove_expired_session(&frame.session_id, now)?;
         let session = self
             .sessions
@@ -245,6 +273,27 @@ impl RelayTable {
     }
 
     pub fn forward_datagram_for_addr_at(
+        &mut self,
+        source_addr: SocketAddr,
+        datagram: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<(SocketAddr, Vec<u8>), RelayError> {
+        self.dataplane.record_received(datagram.len());
+        let result = self.forward_datagram_for_addr_at_inner(source_addr, datagram, now);
+        match result {
+            Ok((target, payload)) => {
+                self.dataplane.record_forwarded(payload.len());
+                Ok((target, payload))
+            }
+            Err(error) => {
+                self.dataplane
+                    .record_drop(relay_error_drop_reason(&error), datagram.len());
+                Err(error)
+            }
+        }
+    }
+
+    fn forward_datagram_for_addr_at_inner(
         &mut self,
         source_addr: SocketAddr,
         datagram: &[u8],
@@ -283,10 +332,11 @@ impl RelayTable {
     }
 
     pub fn bytes_forwarded(&self) -> u64 {
-        self.sessions
-            .values()
-            .map(|session| session.bytes_forwarded)
-            .sum()
+        self.dataplane.payload_bytes_forwarded
+    }
+
+    pub fn dataplane_metrics(&self) -> RelayDataplaneMetrics {
+        self.dataplane.clone()
     }
 
     fn remove_expired_session(
@@ -345,6 +395,18 @@ fn megabits_to_bytes_per_second(max_mbps: u32) -> u64 {
 
 fn default_session_ttl() -> chrono::Duration {
     chrono::Duration::seconds(DEFAULT_SESSION_TTL_SECONDS)
+}
+
+fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
+    match error {
+        RelayError::AdmissionDenied => RelayDataplaneDropReason::AdmissionDenied,
+        RelayError::UnknownSession => RelayDataplaneDropReason::UnknownSession,
+        RelayError::SessionExpired => RelayDataplaneDropReason::SessionExpired,
+        RelayError::InvalidSessionCredential => RelayDataplaneDropReason::InvalidSessionCredential,
+        RelayError::RateLimited => RelayDataplaneDropReason::RateLimited,
+        RelayError::MalformedFrame => RelayDataplaneDropReason::MalformedFrame,
+        RelayError::Socket(_) => RelayDataplaneDropReason::SocketError,
+    }
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
@@ -456,6 +518,7 @@ impl RelayService {
             relay_node: self.relay_node.clone(),
             capability: capability.clone(),
             health: HealthState::Healthy,
+            dataplane: table.dataplane_metrics(),
         }
     }
 }
@@ -568,6 +631,16 @@ mod tests {
         });
 
         assert!(matches!(error, Err(RelayError::InvalidSessionCredential)));
+        let metrics = table.dataplane_metrics();
+        assert_eq!(metrics.datagrams_received, 1);
+        assert_eq!(metrics.datagrams_forwarded, 0);
+        assert_eq!(metrics.datagrams_dropped, 1);
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::InvalidSessionCredential),
+            Some(&1)
+        );
         Ok(())
     }
 
@@ -669,6 +742,69 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn relay_records_udp_dataplane_drop_reasons() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left,
+            right,
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let malformed = table.forward_datagram_for_addr(left_addr, b"not-a-relay-frame");
+        assert!(matches!(malformed, Err(RelayError::MalformedFrame)));
+
+        let unknown = encode_relay_datagram("missing-session", "relay-secret", b"opaque")?;
+        let unknown = table.forward_datagram_for_addr(left_addr, &unknown);
+        assert!(matches!(unknown, Err(RelayError::UnknownSession)));
+
+        let invalid =
+            encode_relay_datagram(credentials.session_id.as_str(), "wrong-secret", b"opaque")?;
+        let invalid = table.forward_datagram_for_addr(left_addr, &invalid);
+        assert!(matches!(invalid, Err(RelayError::InvalidSessionCredential)));
+
+        let valid = encode_relay_datagram(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            b"opaque",
+        )?;
+        let (_target, payload) = table.forward_datagram_for_addr(left_addr, &valid)?;
+
+        let metrics = table.dataplane_metrics();
+        assert_eq!(payload, b"opaque");
+        assert_eq!(metrics.datagrams_received, 4);
+        assert_eq!(metrics.datagrams_forwarded, 1);
+        assert_eq!(metrics.datagrams_dropped, 3);
+        assert_eq!(metrics.payload_bytes_forwarded, 6);
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&1)
+        );
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::UnknownSession),
+            Some(&1)
+        );
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::InvalidSessionCredential),
+            Some(&1)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn relay_service_status_purges_expired_sessions() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -727,7 +863,11 @@ mod tests {
         .await??;
 
         assert_eq!(&buffer[..len], b"opaque-wireguard-packet");
-        assert_eq!(service.table().read().await.bytes_forwarded(), len as u64);
+        let metrics = service.table().read().await.dataplane_metrics();
+        assert_eq!(metrics.datagrams_received, 1);
+        assert_eq!(metrics.datagrams_forwarded, 1);
+        assert_eq!(metrics.datagrams_dropped, 0);
+        assert_eq!(metrics.payload_bytes_forwarded, len as u64);
         shutdown_tx.send(true)?;
         relay_task.await??;
         Ok(())

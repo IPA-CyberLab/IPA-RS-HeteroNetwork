@@ -47,13 +47,12 @@ async fn status(State(state): State<RelayHttpState>) -> Json<RelayStatusResponse
 
 async fn prometheus_metrics(State(state): State<RelayHttpState>) -> impl IntoResponse {
     let status = state.relay.status().await;
-    let bytes_forwarded = state.relay.table().read().await.bytes_forwarded();
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_prometheus_metrics(&status, bytes_forwarded),
+        render_prometheus_metrics(&status),
     )
 }
 
@@ -69,7 +68,7 @@ struct HealthResponse {
     status: &'static str,
 }
 
-fn render_prometheus_metrics(status: &RelayStatusResponse, bytes_forwarded: u64) -> String {
+fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
     let relay_node = prometheus_label(status.relay_node.as_str());
     let mut body = String::new();
     prometheus_line!(
@@ -124,7 +123,87 @@ fn render_prometheus_metrics(status: &RelayStatusResponse, bytes_forwarded: u64)
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_relay_bytes_forwarded_total Total opaque payload bytes forwarded by active relay sessions."
+        "# HELP ipars_relay_datagrams_received_total Total UDP relay datagrams received."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagrams_received_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_datagrams_received_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.datagrams_received
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_datagram_bytes_received_total Total UDP relay datagram bytes received, including relay metadata."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagram_bytes_received_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_datagram_bytes_received_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.datagram_bytes_received
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_datagrams_forwarded_total Total UDP relay datagrams accepted for forwarding."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagrams_forwarded_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_datagrams_forwarded_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.datagrams_forwarded
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_datagrams_dropped_total Total UDP relay datagrams dropped before forwarding."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagrams_dropped_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_datagrams_dropped_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.datagrams_dropped
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_datagram_bytes_dropped_total Total UDP relay datagram bytes dropped, including relay metadata."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagram_bytes_dropped_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_datagram_bytes_dropped_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.datagram_bytes_dropped
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_datagrams_dropped_by_reason_total Total UDP relay datagrams dropped by reason."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_datagrams_dropped_by_reason_total counter"
+    );
+    for (reason, count) in &status.dataplane.drops_by_reason {
+        prometheus_line!(
+            &mut body,
+            "ipars_relay_datagrams_dropped_by_reason_total{{relay_node=\"{relay_node}\",reason=\"{}\"}} {count}",
+            reason.as_str()
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_bytes_forwarded_total Total opaque payload bytes accepted for relay forwarding."
     );
     prometheus_line!(
         &mut body,
@@ -132,7 +211,8 @@ fn render_prometheus_metrics(status: &RelayStatusResponse, bytes_forwarded: u64)
     );
     prometheus_line!(
         &mut body,
-        "ipars_relay_bytes_forwarded_total{{relay_node=\"{relay_node}\"}} {bytes_forwarded}"
+        "ipars_relay_bytes_forwarded_total{{relay_node=\"{relay_node}\"}} {}",
+        status.dataplane.payload_bytes_forwarded
     );
     prometheus_line!(
         &mut body,
@@ -224,7 +304,7 @@ mod tests {
                 e2e_only: true,
             },
         ));
-        let app = router(RelayHttpState::new(relay));
+        let app = router(RelayHttpState::new(relay.clone()));
 
         let response = app
             .clone()
@@ -261,6 +341,14 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RelayStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.capability.active_sessions, 1);
+        assert_eq!(response.dataplane.datagrams_received, 0);
+
+        let table = relay.table();
+        let malformed = table
+            .write()
+            .await
+            .forward_datagram_for_addr(SocketAddr::from(([10, 0, 0, 1], 10000)), b"bad frame");
+        assert!(matches!(malformed, Err(RelayError::MalformedFrame)));
 
         let response = app
             .oneshot(
@@ -281,6 +369,11 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_relay_active_sessions"));
         assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_datagrams_received_total"));
+        assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains(
+            "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"malformed_frame\"} 1"
+        ));
         Ok(())
     }
 }

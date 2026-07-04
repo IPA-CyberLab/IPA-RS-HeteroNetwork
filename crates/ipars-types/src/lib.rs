@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 
@@ -926,11 +926,75 @@ pub mod api {
         pub expires_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RelayDataplaneDropReason {
+        AdmissionDenied,
+        UnknownSession,
+        SessionExpired,
+        InvalidSessionCredential,
+        RateLimited,
+        MalformedFrame,
+        SocketError,
+    }
+
+    impl RelayDataplaneDropReason {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::AdmissionDenied => "admission_denied",
+                Self::UnknownSession => "unknown_session",
+                Self::SessionExpired => "session_expired",
+                Self::InvalidSessionCredential => "invalid_session_credential",
+                Self::RateLimited => "rate_limited",
+                Self::MalformedFrame => "malformed_frame",
+                Self::SocketError => "socket_error",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RelayDataplaneMetrics {
+        pub datagrams_received: u64,
+        pub datagrams_forwarded: u64,
+        pub datagrams_dropped: u64,
+        pub datagram_bytes_received: u64,
+        pub payload_bytes_forwarded: u64,
+        pub datagram_bytes_dropped: u64,
+        pub drops_by_reason: BTreeMap<RelayDataplaneDropReason, u64>,
+    }
+
+    impl RelayDataplaneMetrics {
+        pub fn record_received(&mut self, datagram_bytes: usize) {
+            self.datagrams_received = self.datagrams_received.saturating_add(1);
+            self.datagram_bytes_received = self
+                .datagram_bytes_received
+                .saturating_add(datagram_bytes as u64);
+        }
+
+        pub fn record_forwarded(&mut self, payload_bytes: usize) {
+            self.datagrams_forwarded = self.datagrams_forwarded.saturating_add(1);
+            self.payload_bytes_forwarded = self
+                .payload_bytes_forwarded
+                .saturating_add(payload_bytes as u64);
+        }
+
+        pub fn record_drop(&mut self, reason: RelayDataplaneDropReason, datagram_bytes: usize) {
+            self.datagrams_dropped = self.datagrams_dropped.saturating_add(1);
+            self.datagram_bytes_dropped = self
+                .datagram_bytes_dropped
+                .saturating_add(datagram_bytes as u64);
+            let count = self.drops_by_reason.entry(reason).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RelayStatusResponse {
         pub relay_node: NodeId,
         pub capability: RelayCapability,
         pub health: HealthState,
+        #[serde(default)]
+        pub dataplane: RelayDataplaneMetrics,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
