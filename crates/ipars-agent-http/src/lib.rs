@@ -137,15 +137,22 @@ async fn packet_flow(
     Json(request): Json<AgentPacketFlowRequest>,
 ) -> Result<(StatusCode, Json<AgentPacketFlowResponse>), ApiError> {
     let recorded_at = chrono::Utc::now();
+    let observation = request.observation;
     let matched = state
         .runtime
-        .record_packet_flow_activity(request.destination, recorded_at, request.pin)
+        .record_packet_flow_observation(
+            request.destination,
+            observation.clone(),
+            recorded_at,
+            request.pin,
+        )
         .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPacketFlowResponse {
             destination: request.destination,
             recorded_at,
+            observation,
             matched,
         }),
     ))
@@ -462,7 +469,7 @@ mod tests {
     use axum::http::{header, Request};
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
-    use ipars_types::api::AgentPacketFlowMatchKind;
+    use ipars_types::api::{AgentPacketFlowMatchKind, AgentPacketFlowObservation};
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathRecord, PathScore, PathState,
         PeerPathKey, Role, Route, TokenPolicy, VpnIp,
@@ -723,6 +730,13 @@ mod tests {
                     .body(Body::from(serde_json::to_vec(&AgentPacketFlowRequest {
                         destination: IpAddr::V4(Ipv4Addr::new(10, 44, 3, 10)),
                         pin: true,
+                        observation: AgentPacketFlowObservation {
+                            source: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                            protocol: Some(ipars_types::TransportProtocol::Udp),
+                            source_port: Some(50_000),
+                            destination_port: Some(51820),
+                            detector: Some("unit-test".to_string()),
+                        },
                     })?))?,
             )
             .await?;
@@ -730,6 +744,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert_eq!(
+            packet_flow.observation.protocol,
+            Some(ipars_types::TransportProtocol::Udp)
+        );
+        assert_eq!(packet_flow.observation.source_port, Some(50_000));
+        assert_eq!(packet_flow.observation.destination_port, Some(51820));
+        assert_eq!(
+            packet_flow.observation.detector.as_deref(),
+            Some("unit-test")
+        );
         let matched = packet_flow
             .matched
             .ok_or_else(|| std::io::Error::other("route should match peer"))?;

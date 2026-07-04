@@ -35,15 +35,16 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
-    RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    AgentMetricsResponse, AgentPacketFlowObservation, AgentRelayForwarderMetrics,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
     SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
+    TransportProtocol,
 };
 use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr as NetlinkSocketAddr};
 use opentelemetry::global;
@@ -4627,26 +4628,15 @@ fn start_proc_net_conntrack_packet_flow_detector(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match read_conntrack_destination_ips(&paths).await {
-                Ok(destinations) => {
-                    let now = chrono::Utc::now();
-                    let mut matched_count = 0_usize;
-                    for destination in destinations {
-                        if let Some(matched) = runtime
-                            .record_packet_flow_activity(destination, now, pin)
-                            .await
-                        {
-                            matched_count += 1;
-                            tracing::debug!(
-                                destination = %destination,
-                                peer = %matched.peer,
-                                kind = ?matched.kind,
-                                route = ?matched.route,
-                                pinned = matched.pinned,
-                                "recorded packet-flow lazy-connect activity"
-                            );
-                        }
-                    }
+            match read_conntrack_packet_flows(&paths).await {
+                Ok(flows) => {
+                    let matched_count = record_packet_flow_observations(
+                        runtime.as_ref(),
+                        flows,
+                        pin,
+                        "proc-net-conntrack",
+                    )
+                    .await;
                     if matched_count > 0 {
                         tracing::info!(
                             matched = matched_count,
@@ -4671,11 +4661,11 @@ fn start_conntrack_netlink_packet_flow_detector(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match read_conntrack_netlink_destination_ips().await {
-                Ok(destinations) => {
-                    let matched_count = record_packet_flow_destinations(
+            match read_conntrack_netlink_packet_flows().await {
+                Ok(flows) => {
+                    let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
-                        destinations,
+                        flows,
                         pin,
                         "conntrack-netlink",
                     )
@@ -4739,17 +4729,11 @@ async fn run_conntrack_netlink_event_detector_once(
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
     loop {
         let mut recorded_any = false;
-        while let Some(destinations) =
-            read_conntrack_netlink_event_destination_ips(socket, &mut buffer)?
-        {
+        while let Some(flows) = read_conntrack_netlink_event_packet_flows(socket, &mut buffer)? {
             recorded_any = true;
-            let matched_count = record_packet_flow_destinations(
-                runtime,
-                destinations,
-                pin,
-                "conntrack-netlink-events",
-            )
-            .await;
+            let matched_count =
+                record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events")
+                    .await;
             if matched_count > 0 {
                 tracing::info!(
                     matched = matched_count,
@@ -4763,22 +4747,30 @@ async fn run_conntrack_netlink_event_detector_once(
     }
 }
 
-async fn record_packet_flow_destinations(
+async fn record_packet_flow_observations(
     runtime: &AgentRuntime,
-    destinations: BTreeSet<IpAddr>,
+    flows: Vec<PacketFlowRecord>,
     pin: bool,
     source: &'static str,
 ) -> usize {
     let now = chrono::Utc::now();
     let mut matched_count = 0_usize;
-    for destination in destinations {
+    for flow in flows {
+        let mut observation = flow.observation;
+        if observation.detector.is_none() {
+            observation.detector = Some(source.to_string());
+        }
         if let Some(matched) = runtime
-            .record_packet_flow_activity(destination, now, pin)
+            .record_packet_flow_observation(flow.destination, observation.clone(), now, pin)
             .await
         {
             matched_count += 1;
             tracing::debug!(
-                destination = %destination,
+                destination = %flow.destination,
+                source_addr = ?observation.source,
+                protocol = ?observation.protocol,
+                source_port = ?observation.source_port,
+                destination_port = ?observation.destination_port,
                 peer = %matched.peer,
                 kind = ?matched.kind,
                 route = ?matched.route,
@@ -4803,13 +4795,19 @@ fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
     )
 }
 
-async fn read_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> {
-    tokio::task::spawn_blocking(dump_conntrack_netlink_destination_ips)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PacketFlowRecord {
+    destination: IpAddr,
+    observation: AgentPacketFlowObservation,
+}
+
+async fn read_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>> {
+    tokio::task::spawn_blocking(dump_conntrack_netlink_packet_flows)
         .await
         .context("conntrack netlink reader task failed")?
 }
 
-fn dump_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> {
+fn dump_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>> {
     let mut socket =
         Socket::new(NETLINK_NETFILTER).context("failed to open NETLINK_NETFILTER socket")?;
     socket
@@ -4829,16 +4827,16 @@ fn dump_conntrack_netlink_destination_ips() -> anyhow::Result<BTreeSet<IpAddr>> 
         request.len()
     );
 
-    let mut destinations = BTreeSet::new();
+    let mut flows = Vec::new();
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
     loop {
         let received = socket
             .recv(&mut &mut buffer[..], 0)
             .context("failed to receive conntrack netlink dump response")?;
-        let result = parse_conntrack_netlink_datagram_destination_ips(&buffer[..received])?;
-        destinations.extend(result.destinations);
+        let result = parse_conntrack_netlink_datagram_packet_flows(&buffer[..received])?;
+        flows.extend(result.flows);
         if result.done {
-            return Ok(destinations);
+            return Ok(flows);
         }
     }
 }
@@ -4858,14 +4856,14 @@ fn open_conntrack_netlink_event_socket() -> anyhow::Result<Socket> {
     Ok(socket)
 }
 
-fn read_conntrack_netlink_event_destination_ips(
+fn read_conntrack_netlink_event_packet_flows(
     socket: &Socket,
     buffer: &mut [u8],
-) -> anyhow::Result<Option<BTreeSet<IpAddr>>> {
+) -> anyhow::Result<Option<Vec<PacketFlowRecord>>> {
     match socket.recv(&mut &mut buffer[..], 0) {
         Ok(received) => {
-            let datagram = parse_conntrack_netlink_datagram_destination_ips(&buffer[..received])?;
-            Ok(Some(datagram.destinations))
+            let datagram = parse_conntrack_netlink_datagram_packet_flows(&buffer[..received])?;
+            Ok(Some(datagram.flows))
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error).context("failed to receive conntrack netlink event"),
@@ -4874,7 +4872,7 @@ fn read_conntrack_netlink_event_destination_ips(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ConntrackNetlinkDatagram {
-    destinations: BTreeSet<IpAddr>,
+    flows: Vec<PacketFlowRecord>,
     done: bool,
 }
 
@@ -4894,8 +4892,14 @@ const NFNETLINK_V0: u8 = 0;
 const CTA_TUPLE_ORIG: u16 = 1;
 const CTA_TUPLE_REPLY: u16 = 2;
 const CTA_TUPLE_IP: u16 = 1;
+const CTA_TUPLE_PROTO: u16 = 2;
+const CTA_IP_V4_SRC: u16 = 1;
 const CTA_IP_V4_DST: u16 = 2;
+const CTA_IP_V6_SRC: u16 = 3;
 const CTA_IP_V6_DST: u16 = 4;
+const CTA_PROTO_NUM: u16 = 1;
+const CTA_PROTO_SRC_PORT: u16 = 2;
+const CTA_PROTO_DST_PORT: u16 = 3;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
 fn conntrack_netlink_event_group_mask() -> u32 {
@@ -4923,7 +4927,7 @@ fn conntrack_netlink_dump_request(sequence_number: u32) -> Vec<u8> {
     request
 }
 
-fn parse_conntrack_netlink_datagram_destination_ips(
+fn parse_conntrack_netlink_datagram_packet_flows(
     datagram: &[u8],
 ) -> anyhow::Result<ConntrackNetlinkDatagram> {
     let mut result = ConntrackNetlinkDatagram::default();
@@ -4966,9 +4970,7 @@ fn parse_conntrack_netlink_datagram_destination_ips(
             NLMSG_DONE => result.done = true,
             NLMSG_ERROR => handle_netlink_error(payload)?,
             message_type if ctnetlink_subsystem(message_type) == NFNL_SUBSYS_CTNETLINK => {
-                result
-                    .destinations
-                    .extend(parse_ctnetlink_destination_ips(payload)?);
+                result.flows.extend(parse_ctnetlink_packet_flows(payload)?);
             }
             _ => {}
         }
@@ -5001,43 +5003,89 @@ fn handle_netlink_error(payload: &[u8]) -> anyhow::Result<()> {
     )
 }
 
-fn parse_ctnetlink_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
+fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlowRecord>> {
     if payload.len() < NFGENMSG_LEN {
         anyhow::bail!("truncated conntrack netlink nfgenmsg payload");
     }
-    let mut destinations = BTreeSet::new();
+    let mut flows = Vec::new();
     for attribute in netlink_attributes(&payload[NFGENMSG_LEN..])? {
         match attribute.kind {
             CTA_TUPLE_ORIG | CTA_TUPLE_REPLY => {
-                destinations.extend(parse_conntrack_tuple_destination_ips(attribute.value)?);
+                if let Some(flow) = parse_conntrack_tuple_packet_flow(attribute.value)? {
+                    flows.push(flow);
+                }
             }
             _ => {}
         }
     }
-    Ok(destinations)
+    Ok(flows)
 }
 
-fn parse_conntrack_tuple_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
-    let mut destinations = BTreeSet::new();
-    for attribute in netlink_attributes(payload)? {
-        if attribute.kind == CTA_TUPLE_IP {
-            destinations.extend(parse_conntrack_ip_destination_ips(attribute.value)?);
-        }
-    }
-    Ok(destinations)
-}
-
-fn parse_conntrack_ip_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet<IpAddr>> {
-    let mut destinations = BTreeSet::new();
+fn parse_conntrack_tuple_packet_flow(payload: &[u8]) -> anyhow::Result<Option<PacketFlowRecord>> {
+    let mut tuple = ConntrackTupleFields::default();
     for attribute in netlink_attributes(payload)? {
         match attribute.kind {
+            CTA_TUPLE_IP => parse_conntrack_ip_tuple(attribute.value, &mut tuple)?,
+            CTA_TUPLE_PROTO => parse_conntrack_proto_tuple(attribute.value, &mut tuple)?,
+            _ => {}
+        }
+    }
+    Ok(tuple.into_packet_flow())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConntrackTupleFields {
+    source: Option<IpAddr>,
+    destination: Option<IpAddr>,
+    protocol: Option<TransportProtocol>,
+    source_port: Option<u16>,
+    destination_port: Option<u16>,
+}
+
+impl ConntrackTupleFields {
+    fn into_packet_flow(self) -> Option<PacketFlowRecord> {
+        self.destination.map(|destination| PacketFlowRecord {
+            destination,
+            observation: AgentPacketFlowObservation {
+                source: self.source,
+                protocol: self.protocol,
+                source_port: self.source_port,
+                destination_port: self.destination_port,
+                detector: None,
+            },
+        })
+    }
+}
+
+fn parse_conntrack_ip_tuple(
+    payload: &[u8],
+    tuple: &mut ConntrackTupleFields,
+) -> anyhow::Result<()> {
+    for attribute in netlink_attributes(payload)? {
+        match attribute.kind {
+            CTA_IP_V4_SRC => {
+                anyhow::ensure!(
+                    attribute.value.len() == 4,
+                    "invalid conntrack IPv4 source attribute length: {}",
+                    attribute.value.len()
+                );
+                tuple.source = Some(IpAddr::from(<[u8; 4]>::try_from(attribute.value)?));
+            }
             CTA_IP_V4_DST => {
                 anyhow::ensure!(
                     attribute.value.len() == 4,
                     "invalid conntrack IPv4 destination attribute length: {}",
                     attribute.value.len()
                 );
-                destinations.insert(IpAddr::from(<[u8; 4]>::try_from(attribute.value)?));
+                tuple.destination = Some(IpAddr::from(<[u8; 4]>::try_from(attribute.value)?));
+            }
+            CTA_IP_V6_SRC => {
+                anyhow::ensure!(
+                    attribute.value.len() == 16,
+                    "invalid conntrack IPv6 source attribute length: {}",
+                    attribute.value.len()
+                );
+                tuple.source = Some(IpAddr::from(<[u8; 16]>::try_from(attribute.value)?));
             }
             CTA_IP_V6_DST => {
                 anyhow::ensure!(
@@ -5045,12 +5093,57 @@ fn parse_conntrack_ip_destination_ips(payload: &[u8]) -> anyhow::Result<BTreeSet
                     "invalid conntrack IPv6 destination attribute length: {}",
                     attribute.value.len()
                 );
-                destinations.insert(IpAddr::from(<[u8; 16]>::try_from(attribute.value)?));
+                tuple.destination = Some(IpAddr::from(<[u8; 16]>::try_from(attribute.value)?));
             }
             _ => {}
         }
     }
-    Ok(destinations)
+    Ok(())
+}
+
+fn parse_conntrack_proto_tuple(
+    payload: &[u8],
+    tuple: &mut ConntrackTupleFields,
+) -> anyhow::Result<()> {
+    for attribute in netlink_attributes(payload)? {
+        match attribute.kind {
+            CTA_PROTO_NUM => {
+                anyhow::ensure!(
+                    attribute.value.len() == 1,
+                    "invalid conntrack protocol number attribute length: {}",
+                    attribute.value.len()
+                );
+                tuple.protocol = transport_protocol_from_ip_number(attribute.value[0]);
+            }
+            CTA_PROTO_SRC_PORT => {
+                anyhow::ensure!(
+                    attribute.value.len() == 2,
+                    "invalid conntrack source port attribute length: {}",
+                    attribute.value.len()
+                );
+                tuple.source_port = Some(u16::from_be_bytes(attribute.value.try_into()?));
+            }
+            CTA_PROTO_DST_PORT => {
+                anyhow::ensure!(
+                    attribute.value.len() == 2,
+                    "invalid conntrack destination port attribute length: {}",
+                    attribute.value.len()
+                );
+                tuple.destination_port = Some(u16::from_be_bytes(attribute.value.try_into()?));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn transport_protocol_from_ip_number(number: u8) -> Option<TransportProtocol> {
+    match number {
+        1 => Some(TransportProtocol::Icmp),
+        6 => Some(TransportProtocol::Tcp),
+        17 => Some(TransportProtocol::Udp),
+        _ => None,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5151,13 +5244,13 @@ fn push_u32_ne(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_ne_bytes());
 }
 
-async fn read_conntrack_destination_ips(paths: &[PathBuf]) -> anyhow::Result<BTreeSet<IpAddr>> {
+async fn read_conntrack_packet_flows(paths: &[PathBuf]) -> anyhow::Result<Vec<PacketFlowRecord>> {
     let mut attempted = Vec::new();
     let mut last_error = None;
     for path in paths {
         attempted.push(path.display().to_string());
         match tokio::fs::read_to_string(path).await {
-            Ok(contents) => return Ok(parse_conntrack_destination_ips(&contents)),
+            Ok(contents) => return Ok(parse_conntrack_packet_flows(&contents)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => last_error = Some(error),
         }
@@ -5172,18 +5265,57 @@ async fn read_conntrack_destination_ips(paths: &[PathBuf]) -> anyhow::Result<BTr
     anyhow::bail!("no conntrack flow table found at {}", attempted.join(", "))
 }
 
-fn parse_conntrack_destination_ips(contents: &str) -> BTreeSet<IpAddr> {
+fn parse_conntrack_packet_flows(contents: &str) -> Vec<PacketFlowRecord> {
     contents
         .lines()
-        .flat_map(parse_conntrack_line_destination_ips)
+        .flat_map(parse_conntrack_line_packet_flows)
         .collect()
 }
 
-fn parse_conntrack_line_destination_ips(line: &str) -> BTreeSet<IpAddr> {
-    line.split_whitespace()
-        .filter_map(|field| field.strip_prefix("dst="))
-        .filter_map(|value| value.parse::<IpAddr>().ok())
-        .collect()
+fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
+    let protocol = line
+        .split_whitespace()
+        .find_map(transport_protocol_from_conntrack_token);
+    let mut flows = Vec::new();
+    let mut tuple = ConntrackTupleFields {
+        protocol,
+        ..ConntrackTupleFields::default()
+    };
+
+    for field in line.split_whitespace() {
+        if let Some(value) = field.strip_prefix("src=") {
+            if tuple.source.is_some() || tuple.destination.is_some() {
+                if let Some(flow) = tuple.into_packet_flow() {
+                    flows.push(flow);
+                }
+                tuple = ConntrackTupleFields {
+                    protocol,
+                    ..ConntrackTupleFields::default()
+                };
+            }
+            tuple.source = value.parse::<IpAddr>().ok();
+        } else if let Some(value) = field.strip_prefix("dst=") {
+            tuple.destination = value.parse::<IpAddr>().ok();
+        } else if let Some(value) = field.strip_prefix("sport=") {
+            tuple.source_port = value.parse::<u16>().ok();
+        } else if let Some(value) = field.strip_prefix("dport=") {
+            tuple.destination_port = value.parse::<u16>().ok();
+        }
+    }
+
+    if let Some(flow) = tuple.into_packet_flow() {
+        flows.push(flow);
+    }
+    flows
+}
+
+fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProtocol> {
+    match token {
+        "tcp" => Some(TransportProtocol::Tcp),
+        "udp" => Some(TransportProtocol::Udp),
+        "icmp" | "icmpv6" => Some(TransportProtocol::Icmp),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6284,13 +6416,26 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport
 ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
 invalid no-destination-here
 ";
-        let destinations = parse_conntrack_destination_ips(contents);
+        let flows = parse_conntrack_packet_flows(contents);
+        let destinations = flows
+            .iter()
+            .map(|flow| flow.destination)
+            .collect::<BTreeSet<_>>();
 
         assert!(destinations.contains(&"100.64.0.11".parse()?));
         assert!(destinations.contains(&"192.0.2.10".parse()?));
         assert!(destinations.contains(&"fd00::42".parse()?));
         assert!(destinations.contains(&"2001:db8::1".parse()?));
         assert_eq!(destinations.len(), 4);
+        let first_destination: IpAddr = "100.64.0.11".parse()?;
+        let first = flows
+            .iter()
+            .find(|flow| flow.destination == first_destination)
+            .context("missing first conntrack flow")?;
+        assert_eq!(first.observation.source, Some("192.0.2.10".parse()?));
+        assert_eq!(first.observation.protocol, Some(TransportProtocol::Tcp));
+        assert_eq!(first.observation.source_port, Some(54321));
+        assert_eq!(first.observation.destination_port, Some(51820));
         Ok(())
     }
 
@@ -6320,22 +6465,56 @@ invalid no-destination-here
     }
 
     #[test]
-    fn conntrack_netlink_parser_extracts_orig_and_reply_destination_ips() -> anyhow::Result<()> {
+    fn conntrack_netlink_parser_extracts_orig_and_reply_flow_metadata() -> anyhow::Result<()> {
+        let ipv4_source = Ipv4Addr::new(192, 0, 2, 10);
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
+        let ipv6_source = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let ipv6_destination = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x42);
         let orig_tuple = test_nla(
             CTA_TUPLE_ORIG | TEST_NLA_F_NESTED,
-            &test_nla(
-                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
-                &test_nla(CTA_IP_V4_DST, &ipv4_destination.octets()),
-            ),
+            &[
+                test_nla(
+                    CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                    &[
+                        test_nla(CTA_IP_V4_SRC, &ipv4_source.octets()),
+                        test_nla(CTA_IP_V4_DST, &ipv4_destination.octets()),
+                    ]
+                    .concat(),
+                ),
+                test_nla(
+                    CTA_TUPLE_PROTO | TEST_NLA_F_NESTED,
+                    &[
+                        test_nla(CTA_PROTO_NUM, &[17]),
+                        test_nla(CTA_PROTO_SRC_PORT, &50_000_u16.to_be_bytes()),
+                        test_nla(CTA_PROTO_DST_PORT, &51_820_u16.to_be_bytes()),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
         );
         let reply_tuple = test_nla(
             CTA_TUPLE_REPLY | TEST_NLA_F_NESTED,
-            &test_nla(
-                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
-                &test_nla(CTA_IP_V6_DST, &ipv6_destination.octets()),
-            ),
+            &[
+                test_nla(
+                    CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                    &[
+                        test_nla(CTA_IP_V6_SRC, &ipv6_source.octets()),
+                        test_nla(CTA_IP_V6_DST, &ipv6_destination.octets()),
+                    ]
+                    .concat(),
+                ),
+                test_nla(
+                    CTA_TUPLE_PROTO | TEST_NLA_F_NESTED,
+                    &[
+                        test_nla(CTA_PROTO_NUM, &[6]),
+                        test_nla(CTA_PROTO_SRC_PORT, &443_u16.to_be_bytes()),
+                        test_nla(CTA_PROTO_DST_PORT, &60_000_u16.to_be_bytes()),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
         );
         let mut payload = vec![0, NFNETLINK_V0, 0, 0];
         payload.extend(orig_tuple);
@@ -6344,16 +6523,30 @@ invalid no-destination-here
         let mut datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
         datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
 
-        let result = parse_conntrack_netlink_datagram_destination_ips(&datagram)?;
+        let result = parse_conntrack_netlink_datagram_packet_flows(&datagram)?;
+        let destinations = result
+            .flows
+            .iter()
+            .map(|flow| flow.destination)
+            .collect::<BTreeSet<_>>();
 
         assert!(result.done);
         assert_eq!(
-            result.destinations,
+            destinations,
             BTreeSet::from([
                 IpAddr::from(ipv4_destination),
                 IpAddr::from(ipv6_destination)
             ])
         );
+        let orig = result
+            .flows
+            .iter()
+            .find(|flow| flow.destination == IpAddr::from(ipv4_destination))
+            .context("missing orig flow")?;
+        assert_eq!(orig.observation.source, Some(IpAddr::from(ipv4_source)));
+        assert_eq!(orig.observation.protocol, Some(TransportProtocol::Udp));
+        assert_eq!(orig.observation.source_port, Some(50_000));
+        assert_eq!(orig.observation.destination_port, Some(51_820));
         Ok(())
     }
 
@@ -6371,11 +6564,15 @@ invalid no-destination-here
         payload.extend(tuple);
         let datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
 
-        let result = parse_conntrack_netlink_datagram_destination_ips(&datagram)?;
+        let result = parse_conntrack_netlink_datagram_packet_flows(&datagram)?;
 
         assert!(!result.done);
         assert_eq!(
-            result.destinations,
+            result
+                .flows
+                .iter()
+                .map(|flow| flow.destination)
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([IpAddr::from(ipv4_destination)])
         );
         Ok(())

@@ -1123,6 +1123,22 @@ pub mod api {
         pub destination: IpAddr,
         #[serde(default)]
         pub pin: bool,
+        #[serde(default, flatten)]
+        pub observation: AgentPacketFlowObservation,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowObservation {
+        #[serde(default)]
+        pub source: Option<IpAddr>,
+        #[serde(default)]
+        pub protocol: Option<TransportProtocol>,
+        #[serde(default)]
+        pub source_port: Option<u16>,
+        #[serde(default)]
+        pub destination_port: Option<u16>,
+        #[serde(default)]
+        pub detector: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1137,6 +1153,7 @@ pub mod api {
     pub struct AgentPacketFlowResponse {
         pub destination: IpAddr,
         pub recorded_at: DateTime<Utc>,
+        pub observation: AgentPacketFlowObservation,
         pub matched: Option<AgentPacketFlowMatch>,
     }
 

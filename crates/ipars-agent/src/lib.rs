@@ -20,8 +20,8 @@ use ipars_route_manager::{
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
     AgentMetricsResponse, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
-    SignalHolePunchPlanResponse,
+    AgentPacketFlowObservation, AgentRelayForwarderMetrics, AgentStatusResponse,
+    LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -659,6 +659,22 @@ impl AgentRuntime {
     pub async fn record_packet_flow_activity(
         &self,
         destination: IpAddr,
+        at: DateTime<Utc>,
+        pin: bool,
+    ) -> Option<AgentPacketFlowMatch> {
+        self.record_packet_flow_observation(
+            destination,
+            AgentPacketFlowObservation::default(),
+            at,
+            pin,
+        )
+        .await
+    }
+
+    pub async fn record_packet_flow_observation(
+        &self,
+        destination: IpAddr,
+        _observation: AgentPacketFlowObservation,
         at: DateTime<Utc>,
         pin: bool,
     ) -> Option<AgentPacketFlowMatch> {
