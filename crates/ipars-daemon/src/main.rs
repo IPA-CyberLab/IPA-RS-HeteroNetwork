@@ -35,10 +35,11 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
-    RelayStatusResponse, SignalHolePunchPlanResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentMetricsResponse, AgentRelayForwarderMetrics, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
@@ -843,7 +844,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Signal(args) => run_signal(args).await,
         Command::Stun(args) => run_stun(args).await,
         Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
-        Command::Agent(args) => run_agent(*args).await,
+        Command::Agent(args) => run_agent(*args, otel_metrics_enabled, otel_metrics_interval).await,
     }
 }
 
@@ -1137,6 +1138,16 @@ fn health_label(state: HealthState) -> &'static str {
     }
 }
 
+fn path_state_label(state: PathState) -> &'static str {
+    match state {
+        PathState::DirectPublic => "direct_public",
+        PathState::DirectIpv6 => "direct_ipv6",
+        PathState::DirectNatTraversal => "direct_nat_traversal",
+        PathState::Relay => "relay",
+        PathState::Unreachable => "unreachable",
+    }
+}
+
 fn start_relay_otel_metrics_export(
     service: Arc<RelayService>,
     interval: Duration,
@@ -1148,6 +1159,231 @@ fn start_relay_otel_metrics_export(
             let status = service.status().await;
             metrics.record_status(&status, previous.as_ref());
             previous = Some(RelayOtelSnapshot::from(&status));
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentOtelSnapshot {
+    relay_forwarders: BTreeMap<(NodeId, NodeId), AgentRelayForwarderMetrics>,
+}
+
+impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
+    fn from(metrics: &AgentMetricsResponse) -> Self {
+        Self {
+            relay_forwarders: metrics
+                .relay_forwarders
+                .iter()
+                .cloned()
+                .map(|forwarder| {
+                    (
+                        (forwarder.peer.clone(), forwarder.relay_node.clone()),
+                        forwarder,
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentOtelMetrics {
+    candidates: Gauge<u64>,
+    paths: Gauge<u64>,
+    paths_by_state: Gauge<u64>,
+    relay_sessions: Gauge<u64>,
+    relay_forwarders: Gauge<u64>,
+    path_change_events: Gauge<u64>,
+    forwarder_outbound_packets: Counter<u64>,
+    forwarder_outbound_payload_bytes: Counter<u64>,
+    forwarder_outbound_datagram_bytes: Counter<u64>,
+    forwarder_inbound_packets: Counter<u64>,
+    forwarder_inbound_payload_bytes: Counter<u64>,
+}
+
+impl AgentOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.agent");
+        Self {
+            candidates: meter
+                .u64_gauge("ipars.agent.candidates")
+                .with_description("Endpoint candidates currently known by the agent.")
+                .build(),
+            paths: meter
+                .u64_gauge("ipars.agent.paths")
+                .with_description("Peer paths currently tracked by the agent.")
+                .build(),
+            paths_by_state: meter
+                .u64_gauge("ipars.agent.paths.by_state")
+                .with_description("Peer paths currently tracked by the agent, by selected state.")
+                .build(),
+            relay_sessions: meter
+                .u64_gauge("ipars.agent.relay.sessions")
+                .with_description("Active relay sessions held by the agent.")
+                .build(),
+            relay_forwarders: meter
+                .u64_gauge("ipars.agent.relay.forwarders")
+                .with_description("Supervised relay forwarder endpoints.")
+                .build(),
+            path_change_events: meter
+                .u64_gauge("ipars.agent.path_change_events")
+                .with_description("Retained path change events.")
+                .build(),
+            forwarder_outbound_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.packets")
+                .with_description("Relay forwarder packets sent from local WireGuard to relay.")
+                .build(),
+            forwarder_outbound_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.payload.bytes")
+                .with_description(
+                    "Relay forwarder opaque payload bytes sent from local WireGuard to relay.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_datagram_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.datagram.bytes")
+                .with_description("Relay forwarder framed datagram bytes sent to relay.")
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.packets")
+                .with_description(
+                    "Relay forwarder packets received from relay and sent to local WireGuard.",
+                )
+                .build(),
+            forwarder_inbound_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.payload.bytes")
+                .with_description("Relay forwarder opaque payload bytes received from relay.")
+                .with_unit("By")
+                .build(),
+        }
+    }
+
+    fn record_status(&self, metrics: &AgentMetricsResponse, previous: Option<&AgentOtelSnapshot>) {
+        let node_id = metrics.node_id.as_str().to_string();
+        let node_attrs = [KeyValue::new("node_id", node_id.clone())];
+        self.candidates
+            .record(metrics.candidate_count as u64, &node_attrs);
+        self.paths.record(metrics.path_count as u64, &node_attrs);
+        self.relay_sessions
+            .record(metrics.relay_session_count as u64, &node_attrs);
+        self.relay_forwarders
+            .record(metrics.relay_forwarder_count as u64, &node_attrs);
+        self.path_change_events
+            .record(metrics.path_change_event_count as u64, &node_attrs);
+
+        for state in [
+            PathState::DirectPublic,
+            PathState::DirectIpv6,
+            PathState::DirectNatTraversal,
+            PathState::Relay,
+            PathState::Unreachable,
+        ] {
+            let count = metrics
+                .path_state_counts
+                .iter()
+                .find(|entry| entry.state == state)
+                .map(|entry| entry.count)
+                .unwrap_or(0);
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("state", path_state_label(state)),
+            ];
+            self.paths_by_state.record(count as u64, &attrs);
+        }
+
+        for forwarder in agent_forwarder_deltas(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("peer", forwarder.peer.as_str().to_string()),
+                KeyValue::new("relay_node", forwarder.relay_node.as_str().to_string()),
+            ];
+            self.forwarder_outbound_packets
+                .add(forwarder.outbound_packets, &attrs);
+            self.forwarder_outbound_payload_bytes
+                .add(forwarder.outbound_payload_bytes, &attrs);
+            self.forwarder_outbound_datagram_bytes
+                .add(forwarder.outbound_datagram_bytes, &attrs);
+            self.forwarder_inbound_packets
+                .add(forwarder.inbound_packets, &attrs);
+            self.forwarder_inbound_payload_bytes
+                .add(forwarder.inbound_payload_bytes, &attrs);
+        }
+    }
+}
+
+fn agent_forwarder_deltas(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> Vec<AgentRelayForwarderMetrics> {
+    metrics
+        .relay_forwarders
+        .iter()
+        .filter_map(|current| {
+            let previous = previous.and_then(|snapshot| {
+                snapshot
+                    .relay_forwarders
+                    .get(&(current.peer.clone(), current.relay_node.clone()))
+            });
+            let delta = agent_forwarder_delta(current, previous);
+            has_agent_forwarder_delta(&delta).then_some(delta)
+        })
+        .collect()
+}
+
+fn agent_forwarder_delta(
+    current: &AgentRelayForwarderMetrics,
+    previous: Option<&AgentRelayForwarderMetrics>,
+) -> AgentRelayForwarderMetrics {
+    AgentRelayForwarderMetrics {
+        peer: current.peer.clone(),
+        relay_node: current.relay_node.clone(),
+        relay_endpoint: current.relay_endpoint,
+        local_endpoint: current.local_endpoint,
+        outbound_packets: counter_delta(
+            current.outbound_packets,
+            previous.map(|previous| previous.outbound_packets),
+        ),
+        outbound_payload_bytes: counter_delta(
+            current.outbound_payload_bytes,
+            previous.map(|previous| previous.outbound_payload_bytes),
+        ),
+        outbound_datagram_bytes: counter_delta(
+            current.outbound_datagram_bytes,
+            previous.map(|previous| previous.outbound_datagram_bytes),
+        ),
+        inbound_packets: counter_delta(
+            current.inbound_packets,
+            previous.map(|previous| previous.inbound_packets),
+        ),
+        inbound_payload_bytes: counter_delta(
+            current.inbound_payload_bytes,
+            previous.map(|previous| previous.inbound_payload_bytes),
+        ),
+        last_forwarded_at: current.last_forwarded_at,
+    }
+}
+
+fn has_agent_forwarder_delta(delta: &AgentRelayForwarderMetrics) -> bool {
+    delta.outbound_packets > 0
+        || delta.outbound_payload_bytes > 0
+        || delta.outbound_datagram_bytes > 0
+        || delta.inbound_packets > 0
+        || delta.inbound_payload_bytes > 0
+}
+
+fn start_agent_otel_metrics_export(
+    runtime: Arc<AgentRuntime>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let metrics = AgentOtelMetrics::new();
+        let mut previous = None;
+        loop {
+            let status = runtime.metrics().await;
+            metrics.record_status(&status, previous.as_ref());
+            previous = Some(AgentOtelSnapshot::from(&status));
             tokio::time::sleep(interval).await;
         }
     })
@@ -1196,7 +1432,11 @@ async fn run_relay(
     http_result
 }
 
-async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
+async fn run_agent(
+    args: AgentArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
@@ -1239,6 +1479,12 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     preflight_agent_runtime(&args)?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
+    if otel_metrics_enabled {
+        background_tasks.push(start_agent_otel_metrics_export(
+            runtime.clone(),
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        ));
+    }
     if !args.disable_heartbeat {
         if let Some(control_plane_url) = control_plane_base.clone() {
             background_tasks.push(start_heartbeat_reporting(
@@ -3708,7 +3954,8 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
-        RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentMetricsResponse, AgentRelayForwarderMetrics, PathStateCount, RelayAdmissionResponse,
+        RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
         BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -3923,6 +4170,80 @@ mod tests {
                 .get(&RelayDataplaneDropReason::RateLimited),
             Some(&4)
         );
+    }
+
+    fn agent_forwarder_metrics(
+        peer: &str,
+        relay_node: &str,
+        outbound_packets: u64,
+        outbound_payload_bytes: u64,
+        outbound_datagram_bytes: u64,
+        inbound_packets: u64,
+        inbound_payload_bytes: u64,
+    ) -> AgentRelayForwarderMetrics {
+        AgentRelayForwarderMetrics {
+            peer: NodeId::from_string(peer),
+            relay_node: NodeId::from_string(relay_node),
+            relay_endpoint: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+            local_endpoint: SocketAddr::from(([127, 0, 0, 1], 52_000)),
+            outbound_packets,
+            outbound_payload_bytes,
+            outbound_datagram_bytes,
+            inbound_packets,
+            inbound_payload_bytes,
+            last_forwarded_at: None,
+        }
+    }
+
+    #[test]
+    fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
+        let current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+
+        let delta = agent_forwarder_delta(&current, None);
+
+        assert_eq!(delta.outbound_packets, 5);
+        assert_eq!(delta.outbound_payload_bytes, 500);
+        assert_eq!(delta.outbound_datagram_bytes, 620);
+        assert_eq!(delta.inbound_packets, 3);
+        assert_eq!(delta.inbound_payload_bytes, 300);
+        assert!(has_agent_forwarder_delta(&delta));
+    }
+
+    #[test]
+    fn agent_otel_delta_records_only_forwarder_increments_since_previous_snapshot() {
+        let previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
+
+        let delta = agent_forwarder_delta(&current, Some(&previous));
+
+        assert_eq!(delta.outbound_packets, 4);
+        assert_eq!(delta.outbound_payload_bytes, 350);
+        assert_eq!(delta.outbound_datagram_bytes, 430);
+        assert_eq!(delta.inbound_packets, 4);
+        assert_eq!(delta.inbound_payload_bytes, 400);
+        assert!(has_agent_forwarder_delta(&delta));
+    }
+
+    #[test]
+    fn agent_otel_delta_skips_unchanged_forwarders() {
+        let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let metrics = AgentMetricsResponse {
+            node_id: NodeId::from_string("node-a"),
+            candidate_count: 2,
+            path_count: 1,
+            relay_session_count: 1,
+            relay_forwarder_count: 1,
+            relay_forwarders: vec![forwarder],
+            path_change_event_count: 1,
+            path_state_counts: vec![PathStateCount {
+                state: PathState::Relay,
+                count: 1,
+            }],
+            generated_at: Utc::now(),
+        };
+        let previous = AgentOtelSnapshot::from(&metrics);
+
+        assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
     }
 
     async fn insert_dead_forwarder(
