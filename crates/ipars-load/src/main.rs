@@ -246,6 +246,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
                 source: source.node_id.clone(),
                 target: target.node_id.clone(),
                 source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
                 desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
             })
             .await?;
@@ -328,6 +329,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
             upsert_url,
             &SignalNodeUpsertRequest {
                 node: response.node.clone(),
+                nat_classification: None,
             },
             "signal node upsert",
         )
@@ -364,6 +366,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
                 source: source.node_id.clone(),
                 target: target.node_id.clone(),
                 source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
                 desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
             },
             "signal path negotiation",
@@ -573,7 +576,10 @@ async fn run_daemon_scenario(
         let _: SignalNodeUpsertResponse = put_json(
             &client,
             format!("{}/v1/nodes/{}", services.signal_url, peer.node_id),
-            &SignalNodeUpsertRequest { node: peer.clone() },
+            &SignalNodeUpsertRequest {
+                node: peer.clone(),
+                nat_classification: None,
+            },
             "daemon signal node upsert",
         )
         .await?;
@@ -598,6 +604,7 @@ async fn run_daemon_scenario(
                 source: source.node_id.clone(),
                 target: target.node_id.clone(),
                 source_candidates: source.candidates.clone(),
+                source_nat_classification: source.nat_classification.clone(),
                 desired_routes: Vec::new(),
             },
             "daemon signal path negotiation",

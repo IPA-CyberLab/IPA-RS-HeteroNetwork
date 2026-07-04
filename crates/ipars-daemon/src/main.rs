@@ -2993,7 +2993,10 @@ async fn signal_node_upsert_request(
 ) -> SignalNodeUpsertRequest {
     let status = runtime.status().await;
     node.endpoint_candidates = status.candidates;
-    SignalNodeUpsertRequest { node }
+    SignalNodeUpsertRequest {
+        node,
+        nat_classification: status.nat_classification,
+    }
 }
 
 fn start_signal_path_negotiation(
@@ -3482,6 +3485,7 @@ fn signal_path_request(
         source: status.node_id.clone(),
         target: peer.node_id.clone(),
         source_candidates: status.candidates.clone(),
+        source_nat_classification: status.nat_classification.clone(),
         desired_routes: peer.routes.iter().map(|route| route.cidr).collect(),
     }
 }

@@ -24,6 +24,7 @@ This file tracks the gap between the requested final system and the current repo
 - `iparsd agent` heartbeat reporting that posts current node health, candidates, relay capability updates, optional relay status-derived capacity/session counts, and negotiated path-state data to `/v1/heartbeat` when a control-plane endpoint is known, retrying without stopping the agent.
 - `iparsd agent` signal-service node registration that upserts the registered `NodeRecord` with refreshed endpoint candidates when a signal endpoint is known.
 - `iparsd agent` signal path negotiation loop that fetches peer maps, calls `/v1/paths/negotiate` for each peer, stores pair-scoped `PathRecord`s, and includes them in heartbeat reports.
+- Signal node registration and path negotiation carry optional NAT classification data, so signal selection avoids `DIRECT_NAT_TRAVERSAL` when either side has classified itself as relay-preferred or insufficient for hole punching.
 - `iparsd agent` relay admission for `RELAY` paths selected by signal negotiation, using relay-advertised admission URLs and keeping expiring relay credentials in transient agent runtime state.
 - `iparsd agent` relay capability advertisement for public nodes with explicit relay endpoint/admission URL settings, gated by join-token relay policy during control-plane registration.
 - Agent relay session renewal-window handling and stale credential removal when path negotiation returns to non-relay states.
@@ -57,7 +58,7 @@ This file tracks the gap between the requested final system and the current repo
 - Runtime backend hardening beyond current Linux command/kernel-netlink/dry-run selection and startup preflight.
 - Privileged integration coverage beyond current namespace-aware route and WireGuard netlink smoke tests.
 - Linux namespace lifecycle/capability hardening around command and netlink dataplane backends.
-- NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.
+- NAT topology validation beyond current mapping/filtering probes and classification-aware signal selection across reproducible NAT behaviours.
 - Network-namespace validation of signal-coordinated UDP hole punching across reproducible NAT topologies beyond the current direct-routed namespace smoke test.
 - OpenTelemetry metrics coverage beyond current relay capacity/session, byte, packet, and drop-reason counters.
 - Full rootless Docker dataplane backend support and multi-network Compose integration hardening beyond current Docker API route discovery.

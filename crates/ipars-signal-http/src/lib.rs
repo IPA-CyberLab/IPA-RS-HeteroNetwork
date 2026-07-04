@@ -47,7 +47,12 @@ async fn upsert_node(
         return Err(ApiError::bad_request("node_id path/body mismatch"));
     }
 
-    Ok(Json(state.registry.upsert_node(request.node).await))
+    Ok(Json(
+        state
+            .registry
+            .upsert_node_with_nat(request.node, request.nat_classification)
+            .await,
+    ))
 }
 
 async fn negotiate(
@@ -174,6 +179,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
                         node: target,
+                        nat_classification: None,
                     })?))?,
             )
             .await?;
@@ -192,6 +198,7 @@ mod tests {
                             "node-a",
                             EndpointCandidateKind::StunReflexive,
                         )],
+                        source_nat_classification: None,
                         desired_routes: Vec::new(),
                     })?))?,
             )

@@ -891,17 +891,21 @@ pub mod api {
         pub generated_at: DateTime<Utc>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalPathRequest {
         pub source: NodeId,
         pub target: NodeId,
         pub source_candidates: Vec<EndpointCandidate>,
+        #[serde(default)]
+        pub source_nat_classification: Option<NatClassification>,
         pub desired_routes: Vec<IpNet>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalNodeUpsertRequest {
         pub node: NodeRecord,
+        #[serde(default)]
+        pub nat_classification: Option<NatClassification>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1372,5 +1376,37 @@ mod tests {
             classification.strategy,
             NatTraversalStrategy::RelayPreferred
         );
+    }
+
+    #[test]
+    fn signal_requests_default_missing_nat_classification_fields(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path_request: api::SignalPathRequest = serde_json::from_value(serde_json::json!({
+            "source": "node-a",
+            "target": "node-b",
+            "source_candidates": [],
+            "desired_routes": [],
+        }))?;
+        assert!(path_request.source_nat_classification.is_none());
+
+        let node = NodeRecord {
+            node_id: NodeId::from_string("node-a"),
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: "identity".to_string(),
+            wireguard_public_key: "wireguard".to_string(),
+            role: Role::edge(),
+            tags: Default::default(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        let upsert_request: api::SignalNodeUpsertRequest =
+            serde_json::from_value(serde_json::json!({ "node": node }))?;
+        assert!(upsert_request.nat_classification.is_none());
+
+        Ok(())
     }
 }

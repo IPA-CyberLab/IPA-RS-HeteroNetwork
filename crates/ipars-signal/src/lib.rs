@@ -5,8 +5,8 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathMetrics,
-    PathScore, PathState, PeerPathKey,
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
+    NatTraversalStrategy, NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -21,6 +21,7 @@ pub enum SignalError {
 pub struct SignalRegistry {
     coordinator: SignalCoordinator,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
+    nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
 }
 
 impl SignalRegistry {
@@ -28,11 +29,31 @@ impl SignalRegistry {
         Self {
             coordinator: SignalCoordinator::new(policy),
             nodes: RwLock::new(BTreeMap::new()),
+            nat_classifications: RwLock::new(BTreeMap::new()),
         }
     }
 
     pub async fn upsert_node(&self, node: NodeRecord) -> SignalNodeUpsertResponse {
+        self.upsert_node_with_nat(node, None).await
+    }
+
+    pub async fn upsert_node_with_nat(
+        &self,
+        node: NodeRecord,
+        nat_classification: Option<NatClassification>,
+    ) -> SignalNodeUpsertResponse {
         let registered_at = Utc::now();
+        match nat_classification {
+            Some(classification) => {
+                self.nat_classifications
+                    .write()
+                    .await
+                    .insert(node.node_id.clone(), classification);
+            }
+            None => {
+                self.nat_classifications.write().await.remove(&node.node_id);
+            }
+        }
         self.nodes
             .write()
             .await
@@ -55,8 +76,19 @@ impl SignalRegistry {
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
+        let target_nat_classification = self
+            .nat_classifications
+            .read()
+            .await
+            .get(&request.target)
+            .cloned();
         let relays = self.relay_candidates().await;
-        Ok(self.coordinator.negotiate(request, &target, &relays))
+        Ok(self.coordinator.negotiate(
+            request,
+            &target,
+            target_nat_classification.as_ref(),
+            &relays,
+        ))
     }
 
     pub async fn hole_punch_plan(
@@ -116,9 +148,15 @@ impl SignalCoordinator {
         &self,
         request: SignalPathRequest,
         target: &NodeRecord,
+        target_nat_classification: Option<&NatClassification>,
         relays: &[NodeRecord],
     ) -> SignalPathResponse {
-        let preferred_state = self.preferred_state(&request.source_candidates, target);
+        let preferred_state = self.preferred_state(
+            &request.source_candidates,
+            request.source_nat_classification.as_ref(),
+            target,
+            target_nat_classification,
+        );
         let relay_candidates = relays
             .iter()
             .filter(|relay| {
@@ -188,7 +226,9 @@ impl SignalCoordinator {
     fn preferred_state(
         &self,
         source_candidates: &[EndpointCandidate],
+        source_nat_classification: Option<&NatClassification>,
         target: &NodeRecord,
+        target_nat_classification: Option<&NatClassification>,
     ) -> PathState {
         if self.policy.allow_ipv6_direct
             && source_candidates
@@ -218,11 +258,32 @@ impl SignalCoordinator {
                 .endpoint_candidates
                 .iter()
                 .any(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
+            && nat_classifications_allow_hole_punch(
+                source_nat_classification,
+                target_nat_classification,
+            )
         {
             return PathState::DirectNatTraversal;
         }
 
         PathState::Unreachable
+    }
+}
+
+fn nat_classifications_allow_hole_punch(
+    source: Option<&NatClassification>,
+    target: Option<&NatClassification>,
+) -> bool {
+    nat_classification_allows_hole_punch(source) && nat_classification_allows_hole_punch(target)
+}
+
+fn nat_classification_allows_hole_punch(classification: Option<&NatClassification>) -> bool {
+    match classification.map(|classification| classification.strategy) {
+        None => true,
+        Some(NatTraversalStrategy::DirectCandidate)
+        | Some(NatTraversalStrategy::CoordinatedHolePunch) => true,
+        Some(NatTraversalStrategy::RelayPreferred)
+        | Some(NatTraversalStrategy::InsufficientData) => false,
     }
 }
 
@@ -240,7 +301,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use ipars_types::{
-        CandidateSource, ClusterId, NodeId, RelayCapability, Role, TokenPolicy, VpnIp,
+        CandidateSource, ClusterId, NatMappingBehavior, NodeId, RelayCapability, Role, TokenPolicy,
+        VpnIp,
     };
 
     use super::*;
@@ -307,9 +369,11 @@ mod tests {
                 source: NodeId::from_string("node-a"),
                 target: NodeId::from_string("node-b"),
                 source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
                 desired_routes: Vec::new(),
             },
             &target(vec![candidate(EndpointCandidateKind::PublicUdp)]),
+            None,
             &[],
         );
 
@@ -327,6 +391,7 @@ mod tests {
                 source: NodeId::from_string("node-a"),
                 target: NodeId::from_string("node-b"),
                 source_candidates: Vec::new(),
+                source_nat_classification: None,
                 desired_routes: Vec::new(),
             })
             .await?;
@@ -351,12 +416,63 @@ mod tests {
                 source: NodeId::from_string("node-a"),
                 target: NodeId::from_string("node-b"),
                 source_candidates: Vec::new(),
+                source_nat_classification: None,
                 desired_routes: Vec::new(),
             })
             .await?;
 
         assert_eq!(response.preferred_state, PathState::Unreachable);
         assert!(response.relay_candidates.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_uses_relay_when_nat_classification_prefers_relay() -> Result<(), SignalError>
+    {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        source.node_id = NodeId::from_string("node-a");
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(target, Some(relay_preferred_nat()))
+            .await;
+        registry.upsert_node(relay()).await;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: NodeId::from_string("node-b"),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: Some(relay_preferred_nat()),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_clears_nat_classification_when_upsert_omits_it() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(target.clone(), Some(relay_preferred_nat()))
+            .await;
+        registry.upsert_node(target).await;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
         Ok(())
     }
 
@@ -377,5 +493,19 @@ mod tests {
         assert!(plan.target_reflexive.is_some());
         assert_eq!(plan.start_after_millis, 50);
         Ok(())
+    }
+
+    fn relay_preferred_nat() -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::AddressAndPortDependent,
+            filtering_behavior: ipars_types::NatFilteringBehavior::Unknown,
+            observed_endpoint: None,
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::RelayPreferred,
+            confidence: 0.9,
+            assessed_at: Utc::now(),
+        }
     }
 }
