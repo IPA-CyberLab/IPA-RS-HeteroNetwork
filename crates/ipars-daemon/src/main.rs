@@ -25,11 +25,11 @@ use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::EchoStunServer;
 use ipars_types::api::{
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse,
+    RegisterNodeResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
 };
 use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, KeyId, NodeHealth, NodeId,
-    RelayCapability, SignedJoinToken,
+    NodeRecord, RelayCapability, SignedJoinToken,
 };
 
 #[derive(Debug, Parser)]
@@ -131,6 +131,8 @@ struct AgentArgs {
     stun_bind: SocketAddr,
     #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_SIGNAL_URL")]
+    signal_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN")]
     join_token: Option<String>,
     #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
@@ -149,6 +151,18 @@ struct AgentArgs {
     heartbeat_interval_seconds: u64,
     #[arg(long, env = "IPARS_AGENT_DISABLE_HEARTBEAT", default_value_t = false)]
     disable_heartbeat: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_SIGNAL_REGISTRATION_INTERVAL_SECONDS",
+        default_value_t = 30
+    )]
+    signal_registration_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_DISABLE_SIGNAL_REGISTRATION",
+        default_value_t = false
+    )]
+    disable_signal_registration: bool,
     #[arg(
         long,
         env = "IPARS_AGENT_WIREGUARD_INTERFACE",
@@ -295,10 +309,11 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
         .map(serde_json::from_str::<SignedJoinToken>)
         .transpose()
         .context("agent join token must be JSON signed token")?;
-    if let Some(token) = &join_token {
+    let registered_node = if let Some(token) = &join_token {
         let response = register_agent(runtime.as_ref(), token, args.control_plane_url.as_deref())
             .await
             .context("failed to register agent with control plane")?;
+        let registered_node = response.node.clone();
         tracing::info!(
             node_id = %response.node.node_id,
             vpn_ip = %response.node.vpn_ip,
@@ -306,9 +321,13 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
             relay_count = response.relay_map.relays.len(),
             "registered agent with control plane"
         );
-    }
+        Some(registered_node)
+    } else {
+        None
+    };
     let control_plane_base =
         control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref()).ok();
+    let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
     let mut background_tasks = Vec::new();
     if !args.disable_heartbeat {
         if let Some(control_plane_url) = control_plane_base.clone() {
@@ -329,6 +348,16 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     };
     if let Some(task) = peer_map_task {
         background_tasks.push(task);
+    }
+    if !args.disable_signal_registration {
+        if let (Some(node), Some(signal_url)) = (registered_node, signal_base) {
+            background_tasks.push(start_signal_registration(
+                runtime.clone(),
+                node,
+                signal_url,
+                Duration::from_secs(args.signal_registration_interval_seconds.max(1)),
+            ));
+        }
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     let result = serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await;
@@ -456,6 +485,67 @@ async fn heartbeat_request(runtime: &AgentRuntime) -> HeartbeatRequest {
     }
 }
 
+fn start_signal_registration(
+    runtime: Arc<AgentRuntime>,
+    node: NodeRecord,
+    signal_url: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_signal_registration_loop(runtime, node, signal_url, interval).await;
+    })
+}
+
+async fn run_signal_registration_loop(
+    runtime: Arc<AgentRuntime>,
+    node: NodeRecord,
+    signal_url: String,
+    interval: Duration,
+) {
+    let client = reqwest::Client::new();
+    loop {
+        let request = signal_node_upsert_request(runtime.as_ref(), node.clone()).await;
+        match send_signal_node_upsert(&client, &signal_url, request).await {
+            Ok(response) => tracing::info!(
+                node_id = %response.node.node_id,
+                "registered agent node with signal service"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to register agent node with signal service; will retry"
+            ),
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn send_signal_node_upsert(
+    client: &reqwest::Client,
+    signal_url: &str,
+    request: SignalNodeUpsertRequest,
+) -> anyhow::Result<SignalNodeUpsertResponse> {
+    client
+        .put(signal_node_url(signal_url, &request.node.node_id))
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send signal node upsert")?
+        .error_for_status()
+        .context("signal service rejected node upsert")?
+        .json()
+        .await
+        .context("failed to decode signal node upsert response")
+}
+
+async fn signal_node_upsert_request(
+    runtime: &AgentRuntime,
+    mut node: NodeRecord,
+) -> SignalNodeUpsertRequest {
+    let status = runtime.status().await;
+    node.endpoint_candidates = status.candidates;
+    SignalNodeUpsertRequest { node }
+}
+
 async fn run_peer_map_sync_loop<S, A>(
     sync: PeerMapSync<S, A>,
     interval: Duration,
@@ -526,6 +616,10 @@ fn heartbeat_url(control_plane_url: &str) -> String {
     format!("{}/v1/heartbeat", control_plane_url.trim_end_matches('/'))
 }
 
+fn signal_node_url(signal_url: &str, node_id: &NodeId) -> String {
+    format!("{}/v1/nodes/{}", signal_url.trim_end_matches('/'), node_id)
+}
+
 fn control_plane_join_url(
     token: &SignedJoinToken,
     override_url: Option<&str>,
@@ -555,6 +649,24 @@ fn control_plane_base_url(
     Ok(base_url.trim_end_matches('/').to_string())
 }
 
+fn signal_base_url(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+) -> anyhow::Result<String> {
+    let base_url = override_url.map(ToOwned::to_owned).or_else(|| {
+        token.and_then(|token| {
+            token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+                .map(|endpoint| endpoint.url.clone())
+        })
+    });
+    let base_url = base_url.context("signal URL is required and no signal bootstrap exists")?;
+    Ok(base_url.trim_end_matches('/').to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseKind {
     Memory,
@@ -574,9 +686,11 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
-    use ipars_types::{BootstrapEndpoint, JoinTokenClaims, Role, TokenPolicy};
+    use ipars_types::{BootstrapEndpoint, JoinTokenClaims, Role, TokenPolicy, VpnIp};
 
     use super::*;
 
@@ -595,6 +709,23 @@ mod tests {
                 nonce: "nonce-a".to_string(),
             },
             signature: "signature".to_string(),
+        }
+    }
+
+    fn node_record(node_id: &str) -> NodeRecord {
+        NodeRecord {
+            node_id: NodeId::from_string(node_id),
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wg-{node_id}"),
+            role: Role::edge(),
+            tags: Default::default(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
         }
     }
 
@@ -628,6 +759,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signal_node_url_trims_signal_base_url() {
+        assert_eq!(
+            signal_node_url("http://127.0.0.1:9443/", &NodeId::from_string("node-a")),
+            "http://127.0.0.1:9443/v1/nodes/node-a"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_request_uses_runtime_state() {
         let runtime = AgentRuntime::new(
@@ -642,6 +781,20 @@ mod tests {
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.candidates.is_empty());
         assert!(request.path_state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_request_uses_runtime_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node = node_record("node-a");
+
+        let request = signal_node_upsert_request(&runtime, node).await;
+
+        assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
+        assert!(request.node.endpoint_candidates.is_empty());
     }
 
     #[test]
@@ -668,6 +821,34 @@ mod tests {
         assert_eq!(
             control_plane_base_url(Some(&token), Some("http://127.0.0.1:8443/"))?,
             "http://127.0.0.1:8443"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_uses_token_bootstrap() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:9443/".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }]);
+
+        assert_eq!(
+            signal_base_url(Some(&token), None)?,
+            "https://203.0.113.10:9443"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_override_takes_precedence() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:9443".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }]);
+
+        assert_eq!(
+            signal_base_url(Some(&token), Some("http://127.0.0.1:9443/"))?,
+            "http://127.0.0.1:9443"
         );
         Ok(())
     }
