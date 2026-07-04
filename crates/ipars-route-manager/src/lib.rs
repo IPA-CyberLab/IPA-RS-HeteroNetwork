@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::process::Command;
+
 use async_trait::async_trait;
 use ipars_types::{NodeId, Route};
 use ipnet::IpNet;
@@ -5,6 +8,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
+    #[error("route manager io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("route manager backend failed: {0}")]
     Backend(String),
 }
@@ -57,6 +62,256 @@ pub trait RouteManager: Send + Sync {
     ) -> Result<RoutePlan, RouteManagerError>;
 }
 
+pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
+    RoutePlan {
+        interface: intent.overlay_interface,
+        routes: intent
+            .container_cidrs
+            .into_iter()
+            .enumerate()
+            .map(|(index, cidr)| Route {
+                id: format!("docker-{index}"),
+                cidr,
+                advertised_by: NodeId::from_string(intent.container_namespace.clone()),
+                via: None,
+                metric: 100,
+                tags: Default::default(),
+            })
+            .collect(),
+        policy_rules: vec![PolicyRule {
+            table: 10_064,
+            priority: 10_064,
+            from: None,
+            to: None,
+            fwmark: Some(0x6473),
+        }],
+    }
+}
+
+pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
+    let mut routes = Vec::new();
+    for (index, cidr) in intent
+        .api_server_cidrs
+        .into_iter()
+        .chain(intent.service_cidrs)
+        .enumerate()
+    {
+        routes.push(Route {
+            id: format!("k8s-{index}"),
+            cidr,
+            advertised_by: intent.route_provider.clone(),
+            via: Some(intent.route_provider.clone()),
+            metric: 50,
+            tags: Default::default(),
+        });
+    }
+
+    RoutePlan {
+        interface: intent.overlay_interface,
+        routes,
+        policy_rules: vec![PolicyRule {
+            table: 10_064,
+            priority: 10_050,
+            from: None,
+            to: None,
+            fwmark: None,
+        }],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxRouteCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl LinuxRouteCommand {
+    pub fn new(
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait LinuxRouteCommandRunner: Send + Sync {
+    async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SystemRouteCommandRunner;
+
+#[async_trait]
+impl LinuxRouteCommandRunner for SystemRouteCommandRunner {
+    async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
+        let output = Command::new(&command.program)
+            .args(&command.args)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(RouteManagerError::Backend(format!(
+            "{} {} failed: {}",
+            command.program,
+            command.args.join(" "),
+            stderr.trim()
+        )))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LinuxRouteManager<R> {
+    runner: R,
+}
+
+impl<R> LinuxRouteManager<R>
+where
+    R: LinuxRouteCommandRunner,
+{
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    fn route_tables(plan: &RoutePlan) -> Vec<Option<u32>> {
+        let tables = plan
+            .policy_rules
+            .iter()
+            .map(|rule| rule.table)
+            .collect::<BTreeSet<_>>();
+        if tables.is_empty() {
+            vec![None]
+        } else {
+            tables.into_iter().map(Some).collect()
+        }
+    }
+
+    fn apply_route_commands(plan: &RoutePlan) -> Vec<LinuxRouteCommand> {
+        let mut commands = Vec::new();
+        for table in Self::route_tables(plan) {
+            for route in &plan.routes {
+                commands.push(Self::route_command("replace", plan, route, table));
+            }
+        }
+        commands
+    }
+
+    fn remove_route_commands(plan: &RoutePlan) -> Vec<LinuxRouteCommand> {
+        let mut commands = Vec::new();
+        for table in Self::route_tables(plan) {
+            for route in &plan.routes {
+                commands.push(Self::route_command("del", plan, route, table));
+            }
+        }
+        commands
+    }
+
+    fn route_command(
+        action: &str,
+        plan: &RoutePlan,
+        route: &Route,
+        table: Option<u32>,
+    ) -> LinuxRouteCommand {
+        let mut args = vec![
+            "route".to_string(),
+            action.to_string(),
+            route.cidr.to_string(),
+            "dev".to_string(),
+            plan.interface.clone(),
+        ];
+        if let Some(table) = table {
+            args.push("table".to_string());
+            args.push(table.to_string());
+        }
+        if action == "replace" {
+            args.push("metric".to_string());
+            args.push(route.metric.to_string());
+        }
+        LinuxRouteCommand::new("ip", args)
+    }
+
+    fn policy_rule_command(action: &str, rule: &PolicyRule) -> LinuxRouteCommand {
+        let mut args = vec![
+            "rule".to_string(),
+            action.to_string(),
+            "priority".to_string(),
+            rule.priority.to_string(),
+        ];
+        if let Some(from) = rule.from {
+            args.push("from".to_string());
+            args.push(from.to_string());
+        }
+        if let Some(to) = rule.to {
+            args.push("to".to_string());
+            args.push(to.to_string());
+        }
+        if let Some(fwmark) = rule.fwmark {
+            args.push("fwmark".to_string());
+            args.push(format!("0x{fwmark:x}"));
+        }
+        args.push("table".to_string());
+        args.push(rule.table.to_string());
+        LinuxRouteCommand::new("ip", args)
+    }
+}
+
+#[async_trait]
+impl<R> RouteManager for LinuxRouteManager<R>
+where
+    R: LinuxRouteCommandRunner,
+{
+    async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        for command in Self::apply_route_commands(&plan) {
+            self.runner.run(command).await?;
+        }
+        for rule in &plan.policy_rules {
+            let _ = self
+                .runner
+                .run(Self::policy_rule_command("del", rule))
+                .await;
+            self.runner
+                .run(Self::policy_rule_command("add", rule))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        for rule in &plan.policy_rules {
+            self.runner
+                .run(Self::policy_rule_command("del", rule))
+                .await?;
+        }
+        for command in Self::remove_route_commands(&plan) {
+            self.runner.run(command).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_docker_intent(
+        &self,
+        intent: DockerNetworkIntent,
+    ) -> Result<RoutePlan, RouteManagerError> {
+        let plan = docker_route_plan(intent);
+        self.apply_routes(plan.clone()).await?;
+        Ok(plan)
+    }
+
+    async fn apply_kubernetes_intent(
+        &self,
+        intent: KubernetesUnderlayIntent,
+    ) -> Result<RoutePlan, RouteManagerError> {
+        let plan = kubernetes_route_plan(intent);
+        self.apply_routes(plan.clone()).await?;
+        Ok(plan)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DryRunLinuxRouteManager;
 
@@ -74,69 +329,82 @@ impl RouteManager for DryRunLinuxRouteManager {
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        Ok(RoutePlan {
-            interface: intent.overlay_interface,
-            routes: intent
-                .container_cidrs
-                .into_iter()
-                .enumerate()
-                .map(|(index, cidr)| Route {
-                    id: format!("docker-{index}"),
-                    cidr,
-                    advertised_by: NodeId::from_string(intent.container_namespace.clone()),
-                    via: None,
-                    metric: 100,
-                    tags: Default::default(),
-                })
-                .collect(),
-            policy_rules: vec![PolicyRule {
-                table: 10_064,
-                priority: 10_064,
-                from: None,
-                to: None,
-                fwmark: Some(0x6473),
-            }],
-        })
+        Ok(docker_route_plan(intent))
     }
 
     async fn apply_kubernetes_intent(
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let mut routes = Vec::new();
-        for (index, cidr) in intent
-            .api_server_cidrs
-            .into_iter()
-            .chain(intent.service_cidrs)
-            .enumerate()
-        {
-            routes.push(Route {
-                id: format!("k8s-{index}"),
-                cidr,
-                advertised_by: intent.route_provider.clone(),
-                via: Some(intent.route_provider.clone()),
-                metric: 50,
-                tags: Default::default(),
-            });
-        }
-
-        Ok(RoutePlan {
-            interface: intent.overlay_interface,
-            routes,
-            policy_rules: vec![PolicyRule {
-                table: 10_064,
-                priority: 10_050,
-                from: None,
-                to: None,
-                fwmark: None,
-            }],
-        })
+        Ok(kubernetes_route_plan(intent))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<tokio::sync::RwLock<Vec<LinuxRouteCommand>>>,
+        fail_rule_delete: bool,
+    }
+
+    impl RecordingRunner {
+        fn with_failed_rule_delete() -> Self {
+            Self {
+                fail_rule_delete: true,
+                ..Self::default()
+            }
+        }
+
+        async fn commands(&self) -> Vec<LinuxRouteCommand> {
+            self.commands.read().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl LinuxRouteCommandRunner for RecordingRunner {
+        async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
+            let should_fail_rule_delete = self.fail_rule_delete
+                && command.program == "ip"
+                && command
+                    .args
+                    .iter()
+                    .map(String::as_str)
+                    .take(2)
+                    .eq(["rule", "del"]);
+            self.commands.write().await.push(command);
+            if should_fail_rule_delete {
+                Err(RouteManagerError::Backend("rule missing".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn route_plan() -> Result<RoutePlan, Box<dyn std::error::Error>> {
+        Ok(RoutePlan {
+            interface: "ipars0".to_string(),
+            routes: vec![Route {
+                id: "route-a".to_string(),
+                cidr: "10.42.0.0/16".parse()?,
+                advertised_by: NodeId::from_string("peer-a"),
+                via: None,
+                metric: 100,
+                tags: Default::default(),
+            }],
+            policy_rules: vec![PolicyRule {
+                table: 10_064,
+                priority: 10_064,
+                from: Some("10.0.0.0/8".parse()?),
+                to: None,
+                fwmark: Some(0x6473),
+            }],
+        })
+    }
 
     #[tokio::test]
     async fn docker_intent_builds_explicit_route_plan() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,6 +422,202 @@ mod tests {
         assert_eq!(plan.interface, "ipars0");
         assert_eq!(plan.routes.len(), 1);
         assert_eq!(plan.policy_rules[0].table, 10_064);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_generates_apply_and_remove_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+        let plan = route_plan()?;
+
+        manager.apply_routes(plan.clone()).await?;
+        manager.remove_routes(plan).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "route",
+                        "replace",
+                        "10.42.0.0/16",
+                        "dev",
+                        "ipars0",
+                        "table",
+                        "10064",
+                        "metric",
+                        "100",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "rule",
+                        "del",
+                        "priority",
+                        "10064",
+                        "from",
+                        "10.0.0.0/8",
+                        "fwmark",
+                        "0x6473",
+                        "table",
+                        "10064",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "rule",
+                        "add",
+                        "priority",
+                        "10064",
+                        "from",
+                        "10.0.0.0/8",
+                        "fwmark",
+                        "0x6473",
+                        "table",
+                        "10064",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "rule",
+                        "del",
+                        "priority",
+                        "10064",
+                        "from",
+                        "10.0.0.0/8",
+                        "fwmark",
+                        "0x6473",
+                        "table",
+                        "10064",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "route",
+                        "del",
+                        "10.42.0.0/16",
+                        "dev",
+                        "ipars0",
+                        "table",
+                        "10064",
+                    ],
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_ignores_missing_rule_during_apply(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::with_failed_rule_delete();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        manager.apply_routes(route_plan()?).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "route",
+                        "replace",
+                        "10.42.0.0/16",
+                        "dev",
+                        "ipars0",
+                        "table",
+                        "10064",
+                        "metric",
+                        "100",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "rule",
+                        "del",
+                        "priority",
+                        "10064",
+                        "from",
+                        "10.0.0.0/8",
+                        "fwmark",
+                        "0x6473",
+                        "table",
+                        "10064",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "rule",
+                        "add",
+                        "priority",
+                        "10064",
+                        "from",
+                        "10.0.0.0/8",
+                        "fwmark",
+                        "0x6473",
+                        "table",
+                        "10064",
+                    ],
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_applies_docker_intent_plan(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let plan = manager
+            .apply_docker_intent(DockerNetworkIntent {
+                container_namespace: "container-a".to_string(),
+                host_interface: "eth0".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                container_cidrs: vec!["172.18.0.0/16".parse()?],
+                expose_host_routes: true,
+            })
+            .await?;
+
+        assert_eq!(plan.routes[0].cidr, "172.18.0.0/16".parse::<IpNet>()?);
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxRouteCommand::new(
+                    "ip",
+                    [
+                        "route",
+                        "replace",
+                        "172.18.0.0/16",
+                        "dev",
+                        "ipars0",
+                        "table",
+                        "10064",
+                        "metric",
+                        "100",
+                    ],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    ["rule", "del", "priority", "10064", "fwmark", "0x6473", "table", "10064",],
+                ),
+                LinuxRouteCommand::new(
+                    "ip",
+                    ["rule", "add", "priority", "10064", "fwmark", "0x6473", "table", "10064",],
+                ),
+            ]
+        );
         Ok(())
     }
 }

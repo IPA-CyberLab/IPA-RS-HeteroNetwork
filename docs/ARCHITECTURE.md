@@ -230,6 +230,6 @@ Target: no full mesh. Agents subscribe to relevant peer/route deltas by tag, rol
 2. Control-plane store trait plus in-memory, SQLite, and PostgreSQL backends.
 3. Long-running control-plane, signal, STUN, relay, and agent daemons.
 4. Kernel WireGuard backend: initial Linux `ip`/`wg` command runner exists; add netlink/wgctrl-equivalent calls for production control.
-5. Route manager for Linux policy routing, Docker namespaces, and Kubernetes node underlay.
+5. Route manager for Linux policy routing, Docker namespaces, and Kubernetes node underlay: initial `ip route`/`ip rule` command backend exists; add netlink and namespace execution hardening.
 6. NAT traversal integration tests with network namespaces.
 7. Relay abuse controls, metrics, and production hardening.
