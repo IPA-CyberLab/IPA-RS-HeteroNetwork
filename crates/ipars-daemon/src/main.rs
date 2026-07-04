@@ -10,6 +10,7 @@ use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, LinuxCommandRunner, LinuxWireGuardBackend,
     NamespacedLinuxCommandRunner, PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync,
     RelaySessionState, RuntimePeerEndpointResolver, SystemCommandRunner, UdpHolePuncher,
+    UdpRelayFrameForwarder,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -211,6 +212,10 @@ struct AgentArgs {
     linux_netns: Option<String>,
     #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT")]
     relay_forwarder_endpoint: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_BIND")]
+    relay_forwarder_bind: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT")]
+    relay_forwarder_wireguard_endpoint: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -376,6 +381,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     let control_plane_base =
         control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref()).ok();
     let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
+    let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
     if !args.disable_heartbeat {
         if let Some(control_plane_url) = control_plane_base.clone() {
@@ -417,15 +423,23 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
                 control_plane_url,
                 signal_url,
                 hole_puncher,
+                relay_forwarder_supervisor.clone(),
                 Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
                 Duration::from_secs(args.signal_path_interval_seconds.max(1)),
             ));
         }
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
-    let result = serve_router(args.listen, agent_router(AgentHttpState::new(runtime))).await;
+    let result = serve_router(
+        args.listen,
+        agent_router(AgentHttpState::new(runtime.clone())),
+    )
+    .await;
     for task in background_tasks {
         task.abort();
+    }
+    if let Some(supervisor) = relay_forwarder_supervisor {
+        supervisor.shutdown_all(runtime.as_ref()).await;
     }
     result
 }
@@ -477,15 +491,17 @@ where
     let route_manager = LinuxRouteManager::new(route_runner);
     let mut applier =
         PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    if let Some(endpoint) = args.relay_forwarder_endpoint {
+    if args.relay_forwarder_endpoint.is_some() || args.relay_forwarder_bind.is_some() {
+        let mut resolver = RuntimePeerEndpointResolver::new(runtime.clone());
+        if let Some(endpoint) = args.relay_forwarder_endpoint {
+            resolver = resolver.with_relay_forwarder_endpoint(endpoint);
+        }
         tracing::info!(
-            relay_forwarder_endpoint = %endpoint,
-            "using local relay forwarder endpoint for relay-selected WireGuard peers"
+            relay_forwarder_endpoint = ?args.relay_forwarder_endpoint,
+            relay_forwarder_bind = ?args.relay_forwarder_bind,
+            "using relay-aware endpoint resolver for WireGuard peers"
         );
-        applier = applier.with_endpoint_resolver(
-            RuntimePeerEndpointResolver::new(runtime.clone())
-                .with_relay_forwarder_endpoint(endpoint),
-        );
+        applier = applier.with_endpoint_resolver(resolver);
     }
     let sync = PeerMapSync::new(
         runtime.state().node_id.clone(),
@@ -497,6 +513,139 @@ where
     Ok(tokio::spawn(async move {
         run_peer_map_sync_loop(sync, interval, interface).await;
     }))
+}
+
+fn relay_forwarder_supervisor(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<Arc<RelayForwarderSupervisor>>> {
+    let Some(bind_addr) = args.relay_forwarder_bind else {
+        return Ok(None);
+    };
+    let wireguard_endpoint = args
+        .relay_forwarder_wireguard_endpoint
+        .context("--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind")?;
+    Ok(Some(Arc::new(RelayForwarderSupervisor::new(
+        bind_addr,
+        wireguard_endpoint,
+    ))))
+}
+
+#[derive(Debug)]
+struct RelayForwarderSupervisor {
+    bind_addr: SocketAddr,
+    wireguard_endpoint: SocketAddr,
+    handles: tokio::sync::Mutex<std::collections::BTreeMap<NodeId, RelayForwarderTask>>,
+}
+
+impl RelayForwarderSupervisor {
+    fn new(bind_addr: SocketAddr, wireguard_endpoint: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            wireguard_endpoint,
+            handles: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        runtime: &AgentRuntime,
+        session: RelaySessionState,
+    ) -> anyhow::Result<SocketAddr> {
+        let existing_endpoint = {
+            let handles = self.handles.lock().await;
+            handles.get(&session.peer).and_then(|handle| {
+                if handle.session_id == session.session_id
+                    && handle.relay_endpoint == session.relay_endpoint
+                {
+                    Some(handle.local_endpoint)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(endpoint) = existing_endpoint {
+            runtime
+                .upsert_relay_forwarder_endpoint(session.peer, endpoint)
+                .await;
+            return Ok(endpoint);
+        }
+
+        self.remove(runtime, &session.peer).await;
+        let socket = tokio::net::UdpSocket::bind(self.bind_addr)
+            .await
+            .context("failed to bind relay forwarder UDP socket")?;
+        let local_endpoint = socket
+            .local_addr()
+            .context("failed to read relay forwarder local endpoint")?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let forwarder = UdpRelayFrameForwarder::new(session.clone(), self.wireguard_endpoint);
+        let task = tokio::spawn(forwarder.serve(socket, shutdown_rx));
+        self.handles.lock().await.insert(
+            session.peer.clone(),
+            RelayForwarderTask {
+                session_id: session.session_id.clone(),
+                relay_endpoint: session.relay_endpoint,
+                local_endpoint,
+                shutdown_tx,
+                task,
+            },
+        );
+        runtime
+            .upsert_relay_forwarder_endpoint(session.peer.clone(), local_endpoint)
+            .await;
+        tracing::info!(
+            peer = %session.peer,
+            relay = %session.relay_node,
+            local_endpoint = %local_endpoint,
+            wireguard_endpoint = %self.wireguard_endpoint,
+            "started relay forwarder"
+        );
+        Ok(local_endpoint)
+    }
+
+    async fn remove(&self, runtime: &AgentRuntime, peer: &NodeId) {
+        runtime.remove_relay_forwarder_endpoint(peer).await;
+        let handle = self.handles.lock().await.remove(peer);
+        if let Some(handle) = handle {
+            if let Err(error) = handle.stop().await {
+                tracing::warn!(%error, peer = %peer, "failed to stop relay forwarder");
+            }
+        }
+    }
+
+    async fn shutdown_all(&self, runtime: &AgentRuntime) {
+        let handles = {
+            let mut handles = self.handles.lock().await;
+            std::mem::take(&mut *handles)
+        };
+        for (peer, handle) in handles {
+            runtime.remove_relay_forwarder_endpoint(&peer).await;
+            if let Err(error) = handle.stop().await {
+                tracing::warn!(%error, peer = %peer, "failed to stop relay forwarder");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RelayForwarderTask {
+    session_id: String,
+    relay_endpoint: SocketAddr,
+    local_endpoint: SocketAddr,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<(), AgentError>>,
+}
+
+impl RelayForwarderTask {
+    async fn stop(self) -> anyhow::Result<()> {
+        let _ = self.shutdown_tx.send(true);
+        match self.task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error).context("relay forwarder task failed"),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error).context("relay forwarder task join failed"),
+        }
+    }
 }
 
 async fn register_agent(
@@ -666,6 +815,7 @@ fn start_signal_path_negotiation(
     control_plane_url: String,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
+    relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -675,6 +825,7 @@ fn start_signal_path_negotiation(
             control_plane_url,
             signal_url,
             hole_puncher,
+            relay_forwarder_supervisor,
             relay_session_renew_before,
             interval,
         )
@@ -687,6 +838,7 @@ async fn run_signal_path_negotiation_loop(
     control_plane_url: String,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
+    relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
     interval: Duration,
 ) {
@@ -698,6 +850,7 @@ async fn run_signal_path_negotiation_loop(
             &control_plane_url,
             &signal_url,
             &hole_puncher,
+            relay_forwarder_supervisor.as_ref(),
             relay_session_renew_before,
         )
         .await
@@ -714,6 +867,7 @@ async fn negotiate_signal_paths(
     control_plane_url: &str,
     signal_url: &str,
     hole_puncher: &UdpHolePuncher,
+    relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
     relay_session_renew_before: Duration,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
@@ -773,13 +927,29 @@ async fn negotiate_signal_paths(
                                     expires_at = %session.expires_at,
                                     "admitted relay session"
                                 );
-                                runtime.upsert_relay_session(session).await;
+                                runtime.upsert_relay_session(session.clone()).await;
+                                if let Some(supervisor) = relay_forwarder_supervisor {
+                                    if let Err(error) = supervisor.upsert(runtime, session).await {
+                                        tracing::warn!(
+                                            %error,
+                                            peer = %record.key.remote,
+                                            "failed to start relay forwarder"
+                                        );
+                                    }
+                                }
                             }
-                            Err(error) => tracing::warn!(
-                                %error,
-                                peer = %record.key.remote,
-                                "failed to admit relay session"
-                            ),
+                            Err(error) => {
+                                if let Some(supervisor) = relay_forwarder_supervisor {
+                                    supervisor.remove(runtime, &peer.node_id).await;
+                                } else {
+                                    runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                                }
+                                tracing::warn!(
+                                    %error,
+                                    peer = %record.key.remote,
+                                    "failed to admit relay session"
+                                );
+                            }
                         }
                     } else {
                         tracing::debug!(
@@ -787,16 +957,39 @@ async fn negotiate_signal_paths(
                             relay = %relay.node_id,
                             "reusing existing relay session"
                         );
+                        if let Some(supervisor) = relay_forwarder_supervisor {
+                            if let Some(session) = runtime.relay_session(&peer.node_id).await {
+                                if let Err(error) = supervisor.upsert(runtime, session).await {
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to ensure relay forwarder"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
-                None => tracing::warn!(
-                    peer = %record.key.remote,
-                    "signal selected relay path without a usable relay candidate"
-                ),
+                None => {
+                    if let Some(supervisor) = relay_forwarder_supervisor {
+                        supervisor.remove(runtime, &peer.node_id).await;
+                    } else {
+                        runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                    }
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        "signal selected relay path without a usable relay candidate"
+                    );
+                }
             }
         } else {
             let removed = runtime.remove_relay_session(&peer.node_id).await;
             if let Some(session) = removed {
+                if let Some(supervisor) = relay_forwarder_supervisor {
+                    supervisor.remove(runtime, &session.peer).await;
+                } else {
+                    runtime.remove_relay_forwarder_endpoint(&session.peer).await;
+                }
                 tracing::info!(
                     peer = %session.peer,
                     relay = %session.relay_node,
@@ -1270,6 +1463,10 @@ mod tests {
             "45",
             "--relay-forwarder-endpoint",
             "127.0.0.1:52000",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
         ])?;
 
         if let Command::Agent(args) = cli.command {
@@ -1278,6 +1475,14 @@ mod tests {
             assert_eq!(
                 args.relay_forwarder_endpoint,
                 Some(SocketAddr::from(([127, 0, 0, 1], 52_000)))
+            );
+            assert_eq!(
+                args.relay_forwarder_bind,
+                Some(SocketAddr::from(([127, 0, 0, 1], 0)))
+            );
+            assert_eq!(
+                args.relay_forwarder_wireguard_endpoint,
+                Some(SocketAddr::from(([127, 0, 0, 1], 51_820)))
             );
             return Ok(());
         }

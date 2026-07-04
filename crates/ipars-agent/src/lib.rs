@@ -130,6 +130,7 @@ pub struct AgentRuntime {
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
+    relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
 }
 
@@ -240,6 +241,7 @@ impl AgentRuntime {
             candidates: tokio::sync::RwLock::new(Vec::new()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
+            relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
         }
     }
@@ -310,6 +312,29 @@ impl AgentRuntime {
         self.relay_sessions.write().await.remove(peer)
     }
 
+    pub async fn upsert_relay_forwarder_endpoint(&self, peer: NodeId, endpoint: SocketAddr) {
+        self.relay_forwarder_endpoints
+            .write()
+            .await
+            .insert(peer, endpoint);
+    }
+
+    pub async fn relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.relay_forwarder_endpoints
+            .read()
+            .await
+            .get(peer)
+            .copied()
+    }
+
+    pub async fn remove_relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.relay_forwarder_endpoints.write().await.remove(peer)
+    }
+
+    pub async fn relay_forwarder_endpoints(&self) -> BTreeMap<NodeId, SocketAddr> {
+        self.relay_forwarder_endpoints.read().await.clone()
+    }
+
     pub async fn relay_session_needs_renewal(
         &self,
         peer: &NodeId,
@@ -333,7 +358,7 @@ impl AgentRuntime {
         &self,
         peer: &NodeId,
         now: DateTime<Utc>,
-        forwarder_endpoint: SocketAddr,
+        fallback_forwarder_endpoint: Option<SocketAddr>,
     ) -> Option<SocketAddr> {
         let path = self.path_record_for_peer(peer).await?;
         if path.selected_state != PathState::Relay {
@@ -344,15 +369,13 @@ impl AgentRuntime {
         if now >= session.expires_at {
             return None;
         }
-        if path
-            .relay_node
-            .as_ref()
-            .is_some_and(|relay_node| relay_node != &session.relay_node)
-        {
+        if path.relay_node.as_ref() != Some(&session.relay_node) {
             return None;
         }
 
-        Some(forwarder_endpoint)
+        self.relay_forwarder_endpoint(peer)
+            .await
+            .or(fallback_forwarder_endpoint)
     }
 
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
@@ -726,20 +749,15 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
         };
 
         match path.selected_state {
-            PathState::Relay => {
-                let Some(forwarder_endpoint) = self.relay_forwarder_endpoint else {
-                    return Ok(None);
-                };
-                Ok(self
-                    .runtime
-                    .relay_forwarder_endpoint_for_peer(
-                        &peer.node_id,
-                        Utc::now(),
-                        forwarder_endpoint,
-                    )
-                    .await
-                    .map(|endpoint| endpoint.to_string()))
-            }
+            PathState::Relay => Ok(self
+                .runtime
+                .relay_forwarder_endpoint_for_peer(
+                    &peer.node_id,
+                    Utc::now(),
+                    self.relay_forwarder_endpoint,
+                )
+                .await
+                .map(|endpoint| endpoint.to_string())),
             PathState::Unreachable => Ok(None),
             _ => Ok(path
                 .selected_candidate
@@ -1759,16 +1777,16 @@ mod tests {
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
             })
             .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(peer_id.clone(), forwarder_endpoint)
+            .await;
 
         let applier = PeerMapApplier::new(
             "ipars0",
             MemoryWireGuardBackend::default(),
             RecordingRouteManager::default(),
         )
-        .with_endpoint_resolver(
-            RuntimePeerEndpointResolver::new(runtime)
-                .with_relay_forwarder_endpoint(forwarder_endpoint),
-        );
+        .with_endpoint_resolver(RuntimePeerEndpointResolver::new(runtime));
         let peer = peer_record(
             peer_id.clone(),
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)),
