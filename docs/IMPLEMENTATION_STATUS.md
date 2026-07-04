@@ -39,6 +39,7 @@ This file tracks the gap between the requested final system and the current repo
 - Gated Linux network namespace integration smoke test for applying and removing routes through the namespaced route backend.
 - Agent peer-map applier that turns `PeerMap` records into WireGuard peer configs, endpoint choices, peer host routes, and advertised route plans.
 - `iparsd agent --apply-peer-map` continuous peer-map polling that fetches the control-plane peer map, applies it through selectable `linux-command` or `dry-run` runtime backends when explicitly enabled, supports `--linux-netns` namespace placement for Linux command execution, and retries without stopping the agent when the control plane is temporarily unavailable.
+- Linux command runtime preflight for `iparsd agent` that validates interface names, required `ip`/`wg` commands, `CAP_NET_ADMIN` when host networking will be mutated, and requested `/var/run/netns` namespace placement before starting data-plane application loops.
 - `iparsd agent --runtime-backend dry-run` for peer-map, Docker route, and Kubernetes underlay loops using in-memory WireGuard state and dry-run route application without mutating host networking.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only expiring credentialed opaque payload frames and enforces per-session throughput windows.
@@ -47,7 +48,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Remaining For Full Production Completion
 
-- Runtime backend hardening beyond current Linux command and dry-run selection.
+- Runtime backend hardening beyond current Linux command/dry-run selection and startup preflight.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing netlink backend and namespace lifecycle/capability hardening.
 - NAT topology validation beyond current mapping/filtering probes across reproducible NAT behaviours.

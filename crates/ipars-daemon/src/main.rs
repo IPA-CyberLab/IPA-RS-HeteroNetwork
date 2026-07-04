@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -164,6 +165,12 @@ struct AgentArgs {
     runtime_backend: AgentRuntimeBackend,
     #[arg(
         long,
+        env = "IPARS_AGENT_SKIP_RUNTIME_PREFLIGHT",
+        default_value_t = false
+    )]
+    skip_runtime_preflight: bool,
+    #[arg(
+        long,
         env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
         default_value_t = 30
     )]
@@ -326,6 +333,176 @@ impl AgentRuntimeBackend {
             Self::LinuxCommand => "linux-command",
             Self::DryRun => "dry-run",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimePreflightNeeds {
+    ip_command: bool,
+    wg_command: bool,
+    cap_net_admin: bool,
+    linux_netns: bool,
+}
+
+impl RuntimePreflightNeeds {
+    fn none() -> Self {
+        Self {
+            ip_command: false,
+            wg_command: false,
+            cap_net_admin: false,
+            linux_netns: false,
+        }
+    }
+}
+
+fn preflight_agent_runtime(args: &AgentArgs) -> anyhow::Result<()> {
+    let path = std::env::var_os("PATH");
+    preflight_agent_runtime_with_path(args, path.as_deref())
+}
+
+fn preflight_agent_runtime_with_path(args: &AgentArgs, path: Option<&OsStr>) -> anyhow::Result<()> {
+    validate_linux_interface_name(&args.wireguard_interface)?;
+    if let Some(namespace) = args.linux_netns.as_deref() {
+        LinuxNetworkNamespace::from_name(namespace)?;
+    }
+    if args.skip_runtime_preflight {
+        tracing::warn!(
+            backend = args.runtime_backend.as_str(),
+            "skipping runtime backend preflight by operator request"
+        );
+        return Ok(());
+    }
+
+    let needs = runtime_preflight_needs(args);
+    if !needs.ip_command && !needs.wg_command && !needs.cap_net_admin && !needs.linux_netns {
+        return Ok(());
+    }
+    if needs.ip_command {
+        ensure_program_in_path("ip", path)?;
+    }
+    if needs.wg_command {
+        ensure_program_in_path("wg", path)?;
+    }
+    if needs.cap_net_admin {
+        ensure_cap_net_admin_if_known()?;
+    }
+    if needs.linux_netns {
+        let namespace_name = args
+            .linux_netns
+            .as_deref()
+            .context("linux namespace preflight requested without --linux-netns")?;
+        let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
+        ensure_linux_netns_exists(&namespace)?;
+    }
+
+    tracing::info!(
+        backend = args.runtime_backend.as_str(),
+        needs_ip = needs.ip_command,
+        needs_wg = needs.wg_command,
+        needs_cap_net_admin = needs.cap_net_admin,
+        linux_netns = ?args.linux_netns,
+        "runtime backend preflight passed"
+    );
+    Ok(())
+}
+
+fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
+    if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
+        return RuntimePreflightNeeds::none();
+    }
+    let applies_routes =
+        args.apply_peer_map || args.apply_docker_routes || args.apply_kubernetes_underlay;
+    let applies_wireguard = args.apply_peer_map;
+    RuntimePreflightNeeds {
+        ip_command: applies_routes,
+        wg_command: applies_wireguard,
+        cap_net_admin: applies_routes || applies_wireguard,
+        linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+    }
+}
+
+fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("linux interface name cannot be empty");
+    }
+    if name.len() > 15 {
+        anyhow::bail!("linux interface name `{name}` exceeds 15 bytes");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    if program_exists_in_path(program, path) {
+        Ok(())
+    } else {
+        anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
+    }
+}
+
+fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).any(|directory| is_executable_file(&directory.join(program)))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
+    if let Some(false) = process_has_cap_net_admin()? {
+        anyhow::bail!("linux-command runtime backend requires CAP_NET_ADMIN");
+    }
+    Ok(())
+}
+
+fn process_has_cap_net_admin() -> anyhow::Result<Option<bool>> {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let cap_eff = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(str::trim);
+    let Some(cap_eff) = cap_eff else {
+        return Ok(None);
+    };
+    let mask = u64::from_str_radix(cap_eff, 16)
+        .with_context(|| format!("failed to parse CapEff from /proc/self/status: {cap_eff}"))?;
+    Ok(Some(mask & (1_u64 << 12) != 0))
+}
+
+fn ensure_linux_netns_exists(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+    let path = Path::new("/var/run/netns").join(namespace.name());
+    if path.exists() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "linux network namespace `{}` does not exist at {}",
+            namespace.name(),
+            path.display()
+        );
     }
 }
 
@@ -496,6 +673,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     let control_plane_base =
         control_plane_base_url(join_token.as_ref(), args.control_plane_url.as_deref()).ok();
     let signal_base = signal_base_url(join_token.as_ref(), args.signal_url.as_deref()).ok();
+    preflight_agent_runtime(&args)?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
     if !args.disable_heartbeat {
@@ -2167,6 +2345,7 @@ mod tests {
             "node-a",
             "--runtime-backend",
             "dry-run",
+            "--skip-runtime-preflight",
             "--relay-session-renew-before-seconds",
             "45",
             "--relay-forwarder-endpoint",
@@ -2201,6 +2380,7 @@ mod tests {
         if let Command::Agent(args) = cli.command {
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
             assert_eq!(args.runtime_backend, AgentRuntimeBackend::DryRun);
+            assert!(args.skip_runtime_preflight);
             assert_eq!(args.relay_session_renew_before_seconds, 45);
             assert_eq!(
                 args.relay_forwarder_endpoint,
@@ -2263,6 +2443,75 @@ mod tests {
         if let Command::Agent(args) = cli.command {
             assert_eq!(args.runtime_backend, AgentRuntimeBackend::LinuxCommand);
             assert_eq!(args.runtime_backend.as_str(), "linux-command");
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_allows_dry_run_without_host_tools() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-peer-map",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            preflight_agent_runtime_with_path(&args, Some(OsStr::new("")))?;
+            assert_eq!(
+                runtime_preflight_needs(&args),
+                RuntimePreflightNeeds::none()
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_requires_linux_tools_for_command_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-peer-map"])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.cap_net_admin);
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("missing required Linux runtime command `ip`"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_validates_linux_interface_name() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--wireguard-interface",
+            "invalid/name",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("must contain only ASCII letters"));
             return Ok(());
         }
 

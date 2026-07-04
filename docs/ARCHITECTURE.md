@@ -132,7 +132,7 @@ The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an a
 
 ## Runtime Backends
 
-The agent data-plane applier has an explicit runtime backend selector. `linux-command` is the default and applies peer maps, Docker route intents, and Kubernetes underlay intents through host `ip`/`wg` commands, optionally wrapped with validated `ip netns exec` placement. `dry-run` keeps the same peer-map polling, relay-aware endpoint resolution, Docker route planning, and Kubernetes underlay route planning loops active while using in-memory WireGuard state and dry-run route application. This lets operators validate control-plane, signal, route, and relay decisions on hosts that should not yet mutate kernel networking state.
+The agent data-plane applier has an explicit runtime backend selector. `linux-command` is the default and applies peer maps, Docker route intents, and Kubernetes underlay intents through host `ip`/`wg` commands, optionally wrapped with validated `ip netns exec` placement. Before host mutation starts, the daemon validates the Linux interface name, required runtime commands, `CAP_NET_ADMIN` when kernel networking is changed, and the requested `/var/run/netns` namespace entry. Operators can explicitly bypass that host preflight with `--skip-runtime-preflight` for constrained bootstrap flows. `dry-run` keeps the same peer-map polling, relay-aware endpoint resolution, Docker route planning, and Kubernetes underlay route planning loops active while using in-memory WireGuard state and dry-run route application. This lets operators validate control-plane, signal, route, and relay decisions on hosts that should not yet mutate kernel networking state.
 
 ## Kubernetes Support
 
