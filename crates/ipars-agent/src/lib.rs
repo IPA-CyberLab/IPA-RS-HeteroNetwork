@@ -19,10 +19,11 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
-    AgentPacketFlowMatch, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-    AgentPathProbeRequest, AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics,
-    PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+    AgentMetricsResponse, AgentPacketFlowClassification, AgentPacketFlowClassificationCount,
+    AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount, AgentPacketFlowMatch,
+    AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPathProbeRequest,
+    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
+    SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -176,6 +177,13 @@ pub struct AgentRuntime {
     packet_flow_filtered_multicast_count: AtomicU64,
     packet_flow_filtered_broadcast_count: AtomicU64,
     packet_flow_filtered_link_local_count: AtomicU64,
+    packet_flow_classification_unknown_count: AtomicU64,
+    packet_flow_classification_opening_count: AtomicU64,
+    packet_flow_classification_unreplied_count: AtomicU64,
+    packet_flow_classification_assured_count: AtomicU64,
+    packet_flow_classification_established_count: AtomicU64,
+    packet_flow_classification_closing_count: AtomicU64,
+    packet_flow_classification_closed_count: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +406,13 @@ impl AgentRuntime {
             packet_flow_filtered_multicast_count: AtomicU64::new(0),
             packet_flow_filtered_broadcast_count: AtomicU64::new(0),
             packet_flow_filtered_link_local_count: AtomicU64::new(0),
+            packet_flow_classification_unknown_count: AtomicU64::new(0),
+            packet_flow_classification_opening_count: AtomicU64::new(0),
+            packet_flow_classification_unreplied_count: AtomicU64::new(0),
+            packet_flow_classification_assured_count: AtomicU64::new(0),
+            packet_flow_classification_established_count: AtomicU64::new(0),
+            packet_flow_classification_closing_count: AtomicU64::new(0),
+            packet_flow_classification_closed_count: AtomicU64::new(0),
         }
     }
 
@@ -549,6 +564,7 @@ impl AgentRuntime {
             packet_flow_unmatched_count: self.packet_flow_unmatched_count.load(Ordering::Relaxed),
             packet_flow_filtered_count: self.packet_flow_filtered_count.load(Ordering::Relaxed),
             packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
+            packet_flow_classification_counts: self.packet_flow_classification_counts(),
             generated_at: Utc::now(),
         }
     }
@@ -746,11 +762,13 @@ impl AgentRuntime {
     pub async fn record_packet_flow_observation(
         &self,
         destination: IpAddr,
-        _observation: AgentPacketFlowObservation,
+        observation: AgentPacketFlowObservation,
         at: DateTime<Utc>,
         pin: bool,
     ) -> Option<AgentPacketFlowMatch> {
         self.packet_flow_observation_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.packet_flow_classification_counter(observation.classification())
             .fetch_add(1, Ordering::Relaxed);
         let mut lazy_connect = self.lazy_connect.write().await;
         let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
@@ -793,6 +811,45 @@ impl AgentRuntime {
             AgentPacketFlowDropReason::Multicast => &self.packet_flow_filtered_multicast_count,
             AgentPacketFlowDropReason::Broadcast => &self.packet_flow_filtered_broadcast_count,
             AgentPacketFlowDropReason::LinkLocal => &self.packet_flow_filtered_link_local_count,
+        }
+    }
+
+    fn packet_flow_classification_counts(&self) -> Vec<AgentPacketFlowClassificationCount> {
+        AgentPacketFlowClassification::ALL
+            .into_iter()
+            .map(|classification| AgentPacketFlowClassificationCount {
+                classification,
+                count: self
+                    .packet_flow_classification_counter(classification)
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn packet_flow_classification_counter(
+        &self,
+        classification: AgentPacketFlowClassification,
+    ) -> &AtomicU64 {
+        match classification {
+            AgentPacketFlowClassification::Unknown => {
+                &self.packet_flow_classification_unknown_count
+            }
+            AgentPacketFlowClassification::Opening => {
+                &self.packet_flow_classification_opening_count
+            }
+            AgentPacketFlowClassification::Unreplied => {
+                &self.packet_flow_classification_unreplied_count
+            }
+            AgentPacketFlowClassification::Assured => {
+                &self.packet_flow_classification_assured_count
+            }
+            AgentPacketFlowClassification::Established => {
+                &self.packet_flow_classification_established_count
+            }
+            AgentPacketFlowClassification::Closing => {
+                &self.packet_flow_classification_closing_count
+            }
+            AgentPacketFlowClassification::Closed => &self.packet_flow_classification_closed_count,
         }
     }
 
@@ -1913,7 +1970,9 @@ mod tests {
         DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
     };
     use ipars_stun::{BindingStunServer, Rfc5780StunServer};
-    use ipars_types::api::RelayAdmissionRequest;
+    use ipars_types::api::{
+        AgentPacketFlowConntrackStatus, AgentPacketFlowTcpState, RelayAdmissionRequest,
+    };
     use ipars_types::{
         CandidateSource, ClusterId, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy,
         PathMetrics, PeerPathKey, RelayCapability, TokenPolicy,
@@ -3105,7 +3164,16 @@ mod tests {
         assert!(runtime.should_connect_peer(&peer_a).await);
 
         let route_match = runtime
-            .record_packet_flow_activity(IpAddr::V4(Ipv4Addr::new(10, 42, 7, 25)), Utc::now(), true)
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 25)),
+                AgentPacketFlowObservation {
+                    conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
+                    tcp_state: Some(AgentPacketFlowTcpState::Established),
+                    ..Default::default()
+                },
+                Utc::now(),
+                true,
+            )
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(route_match.peer, peer_b_id);
@@ -3124,6 +3192,19 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                AgentPacketFlowObservation {
+                    conntrack_status: vec![AgentPacketFlowConntrackStatus::Unreplied],
+                    tcp_state: Some(AgentPacketFlowTcpState::SynSent),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .is_none());
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
@@ -3133,9 +3214,29 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 3);
+        assert_eq!(metrics.packet_flow_observation_count, 4);
         assert_eq!(metrics.packet_flow_match_count, 2);
-        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.packet_flow_unmatched_count, 2);
+        let classification_count = |classification| {
+            metrics
+                .packet_flow_classification_counts
+                .iter()
+                .find(|entry| entry.classification == classification)
+                .map(|entry| entry.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            classification_count(AgentPacketFlowClassification::Unknown),
+            2
+        );
+        assert_eq!(
+            classification_count(AgentPacketFlowClassification::Established),
+            1
+        );
+        assert_eq!(
+            classification_count(AgentPacketFlowClassification::Unreplied),
+            1
+        );
         assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics

@@ -1198,6 +1198,42 @@ pub mod api {
         SynSent2,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowClassification {
+        Unknown,
+        Opening,
+        Unreplied,
+        Assured,
+        Established,
+        Closing,
+        Closed,
+    }
+
+    impl AgentPacketFlowClassification {
+        pub const ALL: [Self; 7] = [
+            Self::Unknown,
+            Self::Opening,
+            Self::Unreplied,
+            Self::Assured,
+            Self::Established,
+            Self::Closing,
+            Self::Closed,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Unknown => "unknown",
+                Self::Opening => "opening",
+                Self::Unreplied => "unreplied",
+                Self::Assured => "assured",
+                Self::Established => "established",
+                Self::Closing => "closing",
+                Self::Closed => "closed",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowRequest {
         pub destination: IpAddr,
@@ -1223,6 +1259,39 @@ pub mod api {
         pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
         #[serde(default)]
         pub tcp_state: Option<AgentPacketFlowTcpState>,
+    }
+
+    impl AgentPacketFlowObservation {
+        pub fn classification(&self) -> AgentPacketFlowClassification {
+            if self
+                .conntrack_status
+                .contains(&AgentPacketFlowConntrackStatus::Unreplied)
+            {
+                return AgentPacketFlowClassification::Unreplied;
+            }
+
+            match self.tcp_state {
+                Some(AgentPacketFlowTcpState::SynSent)
+                | Some(AgentPacketFlowTcpState::SynRecv)
+                | Some(AgentPacketFlowTcpState::Listen)
+                | Some(AgentPacketFlowTcpState::SynSent2) => AgentPacketFlowClassification::Opening,
+                Some(AgentPacketFlowTcpState::Established) => {
+                    AgentPacketFlowClassification::Established
+                }
+                Some(AgentPacketFlowTcpState::FinWait)
+                | Some(AgentPacketFlowTcpState::TimeWait)
+                | Some(AgentPacketFlowTcpState::CloseWait)
+                | Some(AgentPacketFlowTcpState::LastAck) => AgentPacketFlowClassification::Closing,
+                Some(AgentPacketFlowTcpState::Close) => AgentPacketFlowClassification::Closed,
+                None if self
+                    .conntrack_status
+                    .contains(&AgentPacketFlowConntrackStatus::Assured) =>
+                {
+                    AgentPacketFlowClassification::Assured
+                }
+                None => AgentPacketFlowClassification::Unknown,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1277,6 +1346,12 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowClassificationCount {
+        pub classification: AgentPacketFlowClassification,
+        pub count: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentMetricsResponse {
         pub node_id: NodeId,
         pub candidate_count: usize,
@@ -1297,6 +1372,8 @@ pub mod api {
         pub packet_flow_unmatched_count: u64,
         pub packet_flow_filtered_count: u64,
         pub packet_flow_filtered_reason_counts: Vec<AgentPacketFlowDropReasonCount>,
+        #[serde(default)]
+        pub packet_flow_classification_counts: Vec<AgentPacketFlowClassificationCount>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1356,6 +1433,46 @@ mod tests {
 
         assert!(relay.can_admit());
         assert_eq!(relay.available_capacity(), 1);
+    }
+
+    #[test]
+    fn packet_flow_observation_classifies_conntrack_lifecycle() {
+        let opening = api::AgentPacketFlowObservation {
+            tcp_state: Some(api::AgentPacketFlowTcpState::SynSent),
+            ..Default::default()
+        };
+        assert_eq!(
+            opening.classification(),
+            api::AgentPacketFlowClassification::Opening
+        );
+
+        let unreplied = api::AgentPacketFlowObservation {
+            conntrack_status: vec![api::AgentPacketFlowConntrackStatus::Unreplied],
+            tcp_state: Some(api::AgentPacketFlowTcpState::SynSent),
+            ..Default::default()
+        };
+        assert_eq!(
+            unreplied.classification(),
+            api::AgentPacketFlowClassification::Unreplied
+        );
+
+        let established = api::AgentPacketFlowObservation {
+            tcp_state: Some(api::AgentPacketFlowTcpState::Established),
+            ..Default::default()
+        };
+        assert_eq!(
+            established.classification(),
+            api::AgentPacketFlowClassification::Established
+        );
+
+        let udp_assured = api::AgentPacketFlowObservation {
+            conntrack_status: vec![api::AgentPacketFlowConntrackStatus::Assured],
+            ..Default::default()
+        };
+        assert_eq!(
+            udp_assured.classification(),
+            api::AgentPacketFlowClassification::Assured
+        );
     }
 
     #[test]

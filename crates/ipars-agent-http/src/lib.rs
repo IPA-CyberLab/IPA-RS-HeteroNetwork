@@ -483,6 +483,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     }
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_packet_flow_classified_by_lifecycle_total Packet-flow observations classified by inferred conntrack lifecycle."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_classified_by_lifecycle_total counter"
+    );
+    for classification_count in &metrics.packet_flow_classification_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{node_id}\",classification=\"{}\"}} {}",
+            classification_count.classification.as_str(),
+            classification_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_path_state_count Number of peer paths by selected state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_path_state_count gauge");
@@ -564,8 +580,8 @@ mod tests {
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
     use ipars_types::api::{
-        AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowMatchKind,
-        AgentPacketFlowObservation, AgentPacketFlowTcpState,
+        AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
+        AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPacketFlowTcpState,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -707,6 +723,13 @@ mod tests {
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
         assert_eq!(metrics.packet_flow_filtered_count, 2);
         assert!(metrics
+            .packet_flow_classification_counts
+            .iter()
+            .any(
+                |entry| entry.classification == AgentPacketFlowClassification::Unknown
+                    && entry.count == 1
+            ));
+        assert!(metrics
             .packet_flow_filtered_reason_counts
             .iter()
             .any(|entry| entry.reason == AgentPacketFlowDropReason::Multicast && entry.count == 1));
@@ -746,9 +769,13 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_observations_total"));
         assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
         assert!(body.contains("ipars_agent_packet_flow_filtered_total"));
+        assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{prometheus_node_id}\",classification=\"unknown\"}} 1")
         ));
 
         let paths_response = app
