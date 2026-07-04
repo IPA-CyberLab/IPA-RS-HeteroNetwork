@@ -9,7 +9,8 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
-    AgentPathsResponse, AgentStatusResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    AgentPathsResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
+    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
     RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
@@ -117,8 +118,10 @@ struct JoinArgs {
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
     agent_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -269,10 +272,16 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => print_json(&init(args)?)?,
         Command::Join(args) => print_json(&join(args).await?)?,
-        Command::Status(args) => match args.agent_url.as_deref() {
-            Some(agent_url) => print_json(&agent_status(agent_url).await?)?,
-            None => print_json(&StaticStatus::status())?,
-        },
+        Command::Status(args) => {
+            match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
+                (Some(agent_url), None) => print_json(&agent_status(agent_url).await?)?,
+                (None, Some(control_plane_url)) => {
+                    print_json(&control_plane_status(control_plane_url).await?)?
+                }
+                (None, None) => print_json(&StaticStatus::status())?,
+                (Some(_), Some(_)) => unreachable!("clap prevents conflicting status URLs"),
+            }
+        }
         Command::Peers(args) => match args.control_plane_url.as_deref() {
             Some(control_plane_url) => print_json(&peer_map(control_plane_url, &args).await?)?,
             None if args.node_id.is_some() => {
@@ -772,6 +781,19 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
 
 async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
     get_json(agent_url, "/v1/status", "agent status").await
+}
+
+#[derive(Debug, Serialize)]
+struct ControlPlaneStatus {
+    metrics: ControlPlaneMetricsResponse,
+    policy: ControlPlanePolicyResponse,
+}
+
+async fn control_plane_status(control_plane_url: &str) -> anyhow::Result<ControlPlaneStatus> {
+    Ok(ControlPlaneStatus {
+        metrics: get_json(control_plane_url, "/v1/metrics", "control-plane metrics").await?,
+        policy: get_json(control_plane_url, "/v1/policy", "control-plane policy").await?,
+    })
 }
 
 async fn peer_map(control_plane_url: &str, args: &PeersArgs) -> anyhow::Result<PeerMap> {
@@ -1626,9 +1648,36 @@ mod tests {
             Cli::try_parse_from(["ipars", "status", "--agent-url", "http://127.0.0.1:9780"])?;
         if let Command::Status(args) = status.command {
             assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            assert_eq!(args.control_plane_url, None);
         } else {
             anyhow::bail!("expected status command");
         }
+
+        let status = Cli::try_parse_from([
+            "ipars",
+            "status",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+        ])?;
+        if let Command::Status(args) = status.command {
+            assert_eq!(args.agent_url, None);
+            assert_eq!(
+                args.control_plane_url.as_deref(),
+                Some("http://127.0.0.1:8443")
+            );
+        } else {
+            anyhow::bail!("expected status command");
+        }
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "status",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+        ])
+        .is_err());
 
         let path = Cli::try_parse_from([
             "ipars",

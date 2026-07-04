@@ -38,7 +38,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
 - agent peer-map applier that converts active or pinned control-plane peers into WireGuard peer configs and route plans, and prunes idle unpinned peers from WireGuard state after the cluster idle timeout
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed status/peer/route/relay/path queries when URLs are provided
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed agent/control-plane status, peer, route, relay, and path queries when URLs are provided
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
@@ -82,6 +82,7 @@ cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin targ
 ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --allowed-route 10.43.0.0/16 --allow-relay --unlimited-uses --daemon-state-dir ./ipars-state --spawn-daemons
 ipars join '<signed-token>'
 ipars status --agent-url http://127.0.0.1:9780
+ipars status --control-plane-url http://127.0.0.1:8443
 ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root --role edge --tag edge --allowed-route 10.42.0.0/16 --allow-relay --max-uses 7 --ttl-seconds 86400

@@ -14,7 +14,7 @@ The data plane must continue after the control plane is unavailable. New joins, 
 - `relay`: UDP relay that forwards opaque E2E-encrypted packets and cannot decrypt payload.
 - `stun`: public endpoint detection for NAT traversal.
 - `route-manager`: Linux routing, policy routing, Docker integration, and Kubernetes node-underlay integration.
-- `cli`: entry point for cluster init, joins, status, path/relay inspection, and typed Docker/Kubernetes install plans.
+- `cli`: entry point for cluster init, joins, agent/control-plane status, peer/route queries, path/relay inspection, and typed Docker/Kubernetes install plans.
 
 ## Trust And Identity
 
