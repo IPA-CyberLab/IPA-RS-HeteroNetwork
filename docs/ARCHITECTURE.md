@@ -110,6 +110,8 @@ Relay candidates advertise both a public UDP relay endpoint and an HTTP admissio
 
 The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Inbound relay payloads remain opaque and are forwarded toward the local WireGuard endpoint.
 
+Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
+
 ## Docker Support
 
 Docker support targets:

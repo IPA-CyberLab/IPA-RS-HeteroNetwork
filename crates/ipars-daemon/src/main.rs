@@ -181,6 +181,12 @@ struct AgentArgs {
     signal_path_interval_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_AGENT_RELAY_SESSION_RENEW_BEFORE_SECONDS",
+        default_value_t = 60
+    )]
+    relay_session_renew_before_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_AGENT_DISABLE_SIGNAL_PATHS",
         default_value_t = false
     )]
@@ -409,6 +415,7 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
                 control_plane_url,
                 signal_url,
                 hole_puncher,
+                Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
                 Duration::from_secs(args.signal_path_interval_seconds.max(1)),
             ));
         }
@@ -642,6 +649,7 @@ fn start_signal_path_negotiation(
     control_plane_url: String,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
+    relay_session_renew_before: Duration,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -650,6 +658,7 @@ fn start_signal_path_negotiation(
             control_plane_url,
             signal_url,
             hole_puncher,
+            relay_session_renew_before,
             interval,
         )
         .await;
@@ -661,6 +670,7 @@ async fn run_signal_path_negotiation_loop(
     control_plane_url: String,
     signal_url: String,
     hole_puncher: UdpHolePuncher,
+    relay_session_renew_before: Duration,
     interval: Duration,
 ) {
     let client = reqwest::Client::new();
@@ -671,6 +681,7 @@ async fn run_signal_path_negotiation_loop(
             &control_plane_url,
             &signal_url,
             &hole_puncher,
+            relay_session_renew_before,
         )
         .await
         {
@@ -686,6 +697,7 @@ async fn negotiate_signal_paths(
     control_plane_url: &str,
     signal_url: &str,
     hole_puncher: &UdpHolePuncher,
+    relay_session_renew_before: Duration,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
     let peer_map = client
@@ -727,31 +739,69 @@ async fn negotiate_signal_paths(
         }
         if record.selected_state == PathState::Relay {
             match relay_candidate {
-                Some(relay) => match admit_relay_session(client, &status, &peer, &relay).await {
-                    Ok(session) => {
-                        tracing::info!(
+                Some(relay) => {
+                    if relay_session_needs_renewal(
+                        runtime,
+                        &peer.node_id,
+                        &relay.node_id,
+                        relay_session_renew_before,
+                    )
+                    .await
+                    {
+                        match admit_relay_session(client, &status, &peer, &relay).await {
+                            Ok(session) => {
+                                tracing::info!(
+                                    peer = %record.key.remote,
+                                    relay = %session.relay_node,
+                                    expires_at = %session.expires_at,
+                                    "admitted relay session"
+                                );
+                                runtime.upsert_relay_session(session).await;
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                peer = %record.key.remote,
+                                "failed to admit relay session"
+                            ),
+                        }
+                    } else {
+                        tracing::debug!(
                             peer = %record.key.remote,
-                            relay = %session.relay_node,
-                            expires_at = %session.expires_at,
-                            "admitted relay session"
+                            relay = %relay.node_id,
+                            "reusing existing relay session"
                         );
-                        runtime.upsert_relay_session(session).await;
                     }
-                    Err(error) => tracing::warn!(
-                        %error,
-                        peer = %record.key.remote,
-                        "failed to admit relay session"
-                    ),
-                },
+                }
                 None => tracing::warn!(
                     peer = %record.key.remote,
                     "signal selected relay path without a usable relay candidate"
                 ),
             }
+        } else {
+            let removed = runtime.remove_relay_session(&peer.node_id).await;
+            if let Some(session) = removed {
+                tracing::info!(
+                    peer = %session.peer,
+                    relay = %session.relay_node,
+                    state = ?record.selected_state,
+                    "removed relay session after non-relay path selection"
+                );
+            }
         }
         runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+async fn relay_session_needs_renewal(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    relay_node: &NodeId,
+    renew_before: Duration,
+) -> bool {
+    runtime
+        .relay_session_needs_renewal(peer, relay_node, chrono::Utc::now(), renew_before)
+        .await
 }
 
 async fn admit_relay_session(
@@ -1194,10 +1244,18 @@ mod tests {
 
     #[test]
     fn agent_args_accepts_linux_netns() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from(["iparsd", "agent", "--linux-netns", "node-a"])?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--linux-netns",
+            "node-a",
+            "--relay-session-renew-before-seconds",
+            "45",
+        ])?;
 
         if let Command::Agent(args) = cli.command {
             assert_eq!(args.linux_netns.as_deref(), Some("node-a"));
+            assert_eq!(args.relay_session_renew_before_seconds, 45);
             return Ok(());
         }
 

@@ -271,6 +271,29 @@ impl AgentRuntime {
         self.relay_sessions.read().await.values().cloned().collect()
     }
 
+    pub async fn remove_relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
+        self.relay_sessions.write().await.remove(peer)
+    }
+
+    pub async fn relay_session_needs_renewal(
+        &self,
+        peer: &NodeId,
+        relay_node: &NodeId,
+        now: DateTime<Utc>,
+        renew_before: Duration,
+    ) -> bool {
+        let renew_before = chrono::Duration::from_std(renew_before)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
+        self.relay_sessions
+            .read()
+            .await
+            .get(peer)
+            .map(|session| {
+                &session.relay_node != relay_node || now + renew_before >= session.expires_at
+            })
+            .unwrap_or(true)
+    }
+
     pub async fn idle_peers_to_close(&self, now: DateTime<Utc>) -> Vec<NodeId> {
         self.lazy_connect.read().await.idle_peers_to_close(now)
     }
@@ -1111,6 +1134,61 @@ mod tests {
 
         assert_eq!(runtime.relay_session(&peer).await, Some(session));
         assert!(runtime.path_state().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_renews_relay_sessions_before_expiry_or_relay_change() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret".to_string(),
+                expires_at: now + ChronoDuration::seconds(120),
+            })
+            .await;
+
+        assert!(
+            !runtime
+                .relay_session_needs_renewal(
+                    &peer,
+                    &NodeId::from_string("relay-a"),
+                    now,
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        );
+        assert!(
+            runtime
+                .relay_session_needs_renewal(
+                    &peer,
+                    &NodeId::from_string("relay-a"),
+                    now + ChronoDuration::seconds(70),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        );
+        assert!(
+            runtime
+                .relay_session_needs_renewal(
+                    &peer,
+                    &NodeId::from_string("relay-b"),
+                    now,
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        );
+        assert!(runtime.remove_relay_session(&peer).await.is_some());
+        assert!(runtime.relay_session(&peer).await.is_none());
     }
 
     #[tokio::test]
