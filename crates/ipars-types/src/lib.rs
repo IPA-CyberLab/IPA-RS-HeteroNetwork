@@ -562,6 +562,12 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct JoinNodeRequest {
+        pub token: SignedJoinToken,
+        pub registration: RegisterNodeRequest,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PeerMap {
         pub cluster_id: ClusterId,
         pub peers: Vec<NodeRecord>,

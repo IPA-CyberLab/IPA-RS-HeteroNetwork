@@ -806,6 +806,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "ipars-crypto",
  "ipars-types",
  "ipnet",
  "thiserror 1.0.69",

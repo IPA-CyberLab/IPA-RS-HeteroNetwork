@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ipars_crypto::{verify_join_token, CryptoError};
 use ipars_types::api::{PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap};
 use ipars_types::{
-    ClusterId, ClusterPolicy, JoinTokenClaims, NodeId, NodeRecord, PathRecord, Route,
-    TokenLedgerRecord, TokenStatus, VpnIp,
+    ClusterId, ClusterPolicy, JoinTokenClaims, KeyId, NodeId, NodeRecord, PathRecord, Route,
+    SignedJoinToken, TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use ipnet::Ipv4Net;
 use thiserror::Error;
@@ -27,8 +28,18 @@ pub enum ControlPlaneError {
     TokenRejected { nonce: String, status: TokenStatus },
     #[error("token not found: {0}")]
     TokenNotFound(String),
+    #[error("issuer key not found for issuer {issuer} key {key_id}")]
+    IssuerKeyNotFound { issuer: NodeId, key_id: KeyId },
+    #[error("token verification failed: {0}")]
+    TokenVerification(String),
     #[error("store error: {0}")]
     Store(String),
+}
+
+impl From<CryptoError> for ControlPlaneError {
+    fn from(error: CryptoError) -> Self {
+        Self::TokenVerification(error.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +250,75 @@ where
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IssuerKeyRing {
+    keys: BTreeMap<(NodeId, KeyId), String>,
+}
+
+impl IssuerKeyRing {
+    pub fn insert(&mut self, issuer: NodeId, key_id: KeyId, public_key_b64: String) {
+        self.keys.insert((issuer, key_id), public_key_b64);
+    }
+
+    pub fn get(&self, issuer: &NodeId, key_id: &KeyId) -> Option<&str> {
+        self.keys
+            .get(&(issuer.clone(), key_id.clone()))
+            .map(String::as_str)
+    }
+}
+
+#[derive(Debug)]
+pub struct ControlPlaneJoinService<S, L> {
+    plane: Arc<ControlPlane<S>>,
+    admission: TokenAdmission<L>,
+    issuer_keys: IssuerKeyRing,
+}
+
+impl<S, L> ControlPlaneJoinService<S, L>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    pub fn new(
+        plane: Arc<ControlPlane<S>>,
+        token_ledger: Arc<L>,
+        issuer_keys: IssuerKeyRing,
+    ) -> Self {
+        Self {
+            plane,
+            admission: TokenAdmission::new(token_ledger),
+            issuer_keys,
+        }
+    }
+
+    pub async fn join(
+        &self,
+        token: SignedJoinToken,
+        request: RegisterNodeRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+        if !token.claims.policy.allow_join {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+
+        let issuer_public_key = self
+            .issuer_keys
+            .get(&token.claims.issuer, &token.claims.key_id)
+            .ok_or_else(|| ControlPlaneError::IssuerKeyNotFound {
+                issuer: token.claims.issuer.clone(),
+                key_id: token.claims.key_id.clone(),
+            })?;
+        verify_join_token(
+            &token,
+            issuer_public_key,
+            now,
+            &self.plane.config.cluster_id,
+        )?;
+        self.admission.admit_join(&token.claims, now).await?;
+        self.plane.register_with_claims(token.claims, request).await
+    }
+}
+
 #[derive(Debug)]
 pub struct ControlPlane<S> {
     config: ControlPlaneConfig,
@@ -256,6 +336,10 @@ where
             config,
             store,
         }
+    }
+
+    pub fn config(&self) -> &ControlPlaneConfig {
+        &self.config
     }
 
     pub async fn register_with_claims(
@@ -380,6 +464,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use chrono::{Duration, Utc};
+    use ipars_crypto::IdentityKeyPair;
     use ipars_types::api::RegisterNodeRequest;
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, KeyId, RelayCapability, Role, Tag, TokenPolicy,
@@ -405,6 +490,50 @@ mod tests {
             policy: TokenPolicy::default(),
             nonce: "test".to_string(),
         }
+    }
+
+    fn claims_for_issuer(
+        cluster_id: ClusterId,
+        issuer: NodeId,
+        key_id: KeyId,
+        nonce: &str,
+    ) -> JoinTokenClaims {
+        let mut claims = claims(cluster_id);
+        claims.issuer = issuer;
+        claims.key_id = key_id;
+        claims.nonce = nonce.to_string();
+        claims
+    }
+
+    fn registration_request(node_id: &str) -> RegisterNodeRequest {
+        RegisterNodeRequest {
+            node_id: NodeId::from_string(node_id),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wg-{node_id}"),
+            candidates: Vec::new(),
+            relay_capability: None,
+            requested_routes: Vec::new(),
+        }
+    }
+
+    fn join_service(
+        cluster_id: ClusterId,
+        issuer: &IdentityKeyPair,
+        key_id: KeyId,
+    ) -> Result<
+        ControlPlaneJoinService<InMemoryStore, InMemoryTokenLedger>,
+        Box<dyn std::error::Error>,
+    > {
+        let config =
+            ControlPlaneConfig::new(cluster_id, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?);
+        let plane = Arc::new(ControlPlane::new(
+            config,
+            Arc::new(InMemoryStore::default()),
+        ));
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert(issuer.node_id(), key_id, issuer.public_key_b64());
+        Ok(ControlPlaneJoinService::new(plane, ledger, key_ring))
     }
 
     #[tokio::test]
@@ -484,6 +613,111 @@ mod tests {
             revoked,
             Err(ControlPlaneError::TokenRejected {
                 status: TokenStatus::Revoked,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_verifies_token_and_registers_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            "join-service-valid",
+        ))?;
+        let service = join_service(cluster_id, &issuer, key_id)?;
+
+        let response = service
+            .join(token, registration_request("node-a"), Utc::now())
+            .await?;
+
+        assert_eq!(response.node.node_id, NodeId::from_string("node-a"));
+        assert_eq!(
+            response.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_rejects_cluster_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let expected_cluster = ClusterId::new();
+        let token = issuer.sign_join_token(claims_for_issuer(
+            ClusterId::new(),
+            issuer.node_id(),
+            key_id.clone(),
+            "wrong-cluster",
+        ))?;
+        let service = join_service(expected_cluster, &issuer, key_id)?;
+
+        let result = service
+            .join(token, registration_request("node-a"), Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::TokenVerification(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_rejects_bad_signature() -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let mut token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            "bad-signature",
+        ))?;
+        token.signature = "not-a-valid-signature".to_string();
+        let service = join_service(cluster_id, &issuer, key_id)?;
+
+        let result = service
+            .join(token, registration_request("node-a"), Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::TokenVerification(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_rejects_exhausted_token() -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            "single-use",
+        ))?;
+        let service = join_service(cluster_id, &issuer, key_id)?;
+
+        service
+            .join(token.clone(), registration_request("node-a"), Utc::now())
+            .await?;
+        let result = service
+            .join(token, registration_request("node-b"), Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Exhausted,
                 ..
             })
         ));

@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 ipnet.workspace = true
+ipars-crypto = { path = "../ipars-crypto" }
 ipars-types = { path = "../ipars-types" }
 thiserror.workspace = true
 tokio.workspace = true
