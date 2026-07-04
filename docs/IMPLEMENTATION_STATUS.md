@@ -12,9 +12,9 @@ This file tracks the gap between the requested final system and the current repo
 - In-memory control-plane registration and VPN IP allocation.
 - SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
 - Token ledger records, control-plane revocation API, revocation state, and max-use enforcement for in-memory and SQL stores.
-- Control-plane join service that validates signed join tokens, issuer keys, cluster/time constraints, ledger admission, CIDR-containing route policy, relay-capability policy, and node registration.
+- Control-plane join service that validates signed join tokens, issuer keys, overlapping issuer key rotation sets, cluster/time constraints, ledger admission, CIDR-containing route policy, relay-capability policy, and node registration.
 - Control-plane HTTP crate with typed health, join, peer-map, and JSON/Prometheus metrics routes backed by the join service.
-- `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage.
+- `iparsd control-plane` daemon that serves the control-plane HTTP router with in-memory, SQLite, or PostgreSQL storage and accepts extra trusted issuer public keys for token-signing key rotation overlap.
 - Signal registry, typed signal HTTP routes, and `iparsd signal` for endpoint candidate exchange, relay candidate lookup, path negotiation, and hole-punch planning.
 - RFC 5389 STUN Binding request/success response handling with `XOR-MAPPED-ADDRESS` decoding, RFC 5780 `CHANGE-REQUEST`/`RESPONSE-ORIGIN`/`OTHER-ADDRESS` support, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon support for public endpoint detection.
 - Relay admission/status HTTP API, Prometheus relay metrics, cumulative relay dataplane counters/drop reasons, expiring credentialed opaque UDP forwarding loop with per-session rate limits, and `iparsd relay`.

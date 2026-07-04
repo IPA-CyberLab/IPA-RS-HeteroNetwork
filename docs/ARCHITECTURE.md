@@ -33,7 +33,7 @@ The node ID is derived from the identity verifying key. WireGuard keys can rotat
 - issuer node ID and key ID
 - Ed25519 signature over typed claims
 
-Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. `ipars init` can generate and persist the issuer private key with restrictive file permissions, emit the concrete `iparsd` commands for control-plane, signal, STUN, and relay bootstrap services, and optionally spawn those services with per-service logs. `ipars token create` can later sign additional join tokens with that same key. Both commands expose token-policy inputs for relay permission, route allowlists, and max-use or unlimited-use admission.
+Operators can keep the issuer private key outside the control-plane process and pass only the issuer node ID, key ID, and public key to `iparsd control-plane`. Additional trusted issuer public keys can be supplied with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so key rotation can overlap old and next signing keys without stopping registration. `ipars init` can generate and persist the issuer private key with restrictive file permissions, emit the concrete `iparsd` commands for control-plane, signal, STUN, and relay bootstrap services, and optionally spawn those services with per-service logs. `ipars token create` can later sign additional join tokens with that same key or the next key ID after rotation. Both commands expose token-policy inputs for relay permission, route allowlists, and max-use or unlimited-use admission.
 
 ## Control Plane HA
 
@@ -232,7 +232,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 - Public nodes are not automatically relays; policy, health, and capacity are required.
 - Control-plane registration rejects relay capability advertisements unless the join token policy allows relay, and accepted capabilities are marked as enabled by policy by the control plane.
 - ACLs are evaluated by tag, role, route, protocol, and relay permission.
-- Key rotation supports identity and WireGuard key families separately.
+- Key rotation supports overlapping issuer token-signing keys plus identity and WireGuard key families separately.
 
 ## Failure Behavior
 

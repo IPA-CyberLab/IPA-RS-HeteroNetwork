@@ -1098,6 +1098,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_service_accepts_overlapping_issuer_keys_for_rotation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let old_issuer = IdentityKeyPair::generate();
+        let next_issuer = IdentityKeyPair::generate();
+        let old_key_id = KeyId::from_string("root");
+        let next_key_id = KeyId::from_string("root-next");
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = Arc::new(ControlPlane::new(
+            config,
+            Arc::new(InMemoryStore::default()),
+        ));
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert(
+            old_issuer.node_id(),
+            old_key_id.clone(),
+            old_issuer.public_key_b64(),
+        );
+        key_ring.insert(
+            next_issuer.node_id(),
+            next_key_id.clone(),
+            next_issuer.public_key_b64(),
+        );
+        let service = ControlPlaneJoinService::new(plane, ledger, key_ring);
+        let old_token = old_issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            old_issuer.node_id(),
+            old_key_id,
+            "old-issuer-token",
+        ))?;
+        let next_token = next_issuer.sign_join_token(claims_for_issuer(
+            cluster_id,
+            next_issuer.node_id(),
+            next_key_id,
+            "next-issuer-token",
+        ))?;
+
+        let old_response = service
+            .join(old_token, registration_request("node-old"), Utc::now())
+            .await?;
+        let next_response = service
+            .join(next_token, registration_request("node-next"), Utc::now())
+            .await?;
+
+        assert_eq!(old_response.node.node_id, NodeId::from_string("node-old"));
+        assert_eq!(next_response.node.node_id, NodeId::from_string("node-next"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn join_service_rejects_cluster_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("root");

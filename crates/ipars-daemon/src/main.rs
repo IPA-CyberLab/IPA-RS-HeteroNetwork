@@ -120,6 +120,36 @@ impl ObservabilityArgs {
     }
 }
 
+fn parse_trusted_issuer_key(value: &str) -> Result<TrustedIssuerKeyArg, String> {
+    let mut parts = value.splitn(3, ',');
+    let issuer_node_id = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted issuer key must use issuer_node_id,key_id,public_key".to_string()
+        })?;
+    let key_id = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted issuer key must use issuer_node_id,key_id,public_key".to_string()
+        })?;
+    let public_key = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted issuer key must use issuer_node_id,key_id,public_key".to_string()
+        })?;
+    Ok(TrustedIssuerKeyArg {
+        issuer_node_id: issuer_node_id.to_string(),
+        key_id: key_id.to_string(),
+        public_key: public_key.to_string(),
+    })
+}
+
 #[derive(Debug, Default)]
 struct ObservabilityGuard {
     tracer_provider: Option<SdkTracerProvider>,
@@ -157,6 +187,20 @@ struct ControlPlaneArgs {
     issuer_key_id: String,
     #[arg(long, env = "IPARS_ISSUER_PUBLIC_KEY")]
     issuer_public_key: String,
+    #[arg(
+        long = "trusted-issuer-key",
+        env = "IPARS_TRUSTED_ISSUER_KEYS",
+        value_delimiter = ';',
+        value_parser = parse_trusted_issuer_key
+    )]
+    trusted_issuer_keys: Vec<TrustedIssuerKeyArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedIssuerKeyArg {
+    issuer_node_id: String,
+    key_id: String,
+    public_key: String,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -891,6 +935,13 @@ where
         KeyId::from_string(args.issuer_key_id),
         args.issuer_public_key,
     );
+    for trusted in args.trusted_issuer_keys {
+        key_ring.insert(
+            NodeId::from_string(trusted.issuer_node_id),
+            KeyId::from_string(trusted.key_id),
+            trusted.public_key,
+        );
+    }
     let join_service = Arc::new(ControlPlaneJoinService::new(
         plane.clone(),
         token_ledger,
@@ -4143,6 +4194,54 @@ mod tests {
         assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 3);
         assert_eq!(cli.observability.log_filter, "ipars=debug");
         assert_eq!(cli.command.component(), "agent");
+    }
+
+    #[test]
+    fn control_plane_args_accept_trusted_issuer_keys() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--trusted-issuer-key",
+            "issuer-a,root-next,pub-b",
+            "--trusted-issuer-key",
+            " issuer-b , root , pub-c ",
+        ])?;
+
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        assert_eq!(
+            args.trusted_issuer_keys,
+            vec![
+                TrustedIssuerKeyArg {
+                    issuer_node_id: "issuer-a".to_string(),
+                    key_id: "root-next".to_string(),
+                    public_key: "pub-b".to_string(),
+                },
+                TrustedIssuerKeyArg {
+                    issuer_node_id: "issuer-b".to_string(),
+                    key_id: "root".to_string(),
+                    public_key: "pub-c".to_string(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_issuer_key_parser_rejects_incomplete_values() {
+        assert!(parse_trusted_issuer_key("issuer,key").is_err());
+        assert!(parse_trusted_issuer_key("issuer,,pub").is_err());
+        assert!(parse_trusted_issuer_key(",key,pub").is_err());
+        assert!(parse_trusted_issuer_key("issuer,key,").is_err());
     }
 
     #[test]
