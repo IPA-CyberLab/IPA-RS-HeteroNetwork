@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-types = { path = "../ipars-types" }
 serde_json.workspace = true
@@ -15,7 +16,6 @@ sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 ipnet.workspace = true
 tokio.workspace = true
 

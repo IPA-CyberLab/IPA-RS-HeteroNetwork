@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_types::api::{PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap};
 use ipars_types::{
-    ClusterId, ClusterPolicy, JoinTokenClaims, NodeId, NodeRecord, PathRecord, Route, VpnIp,
+    ClusterId, ClusterPolicy, JoinTokenClaims, NodeId, NodeRecord, PathRecord, Route,
+    TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use ipnet::Ipv4Net;
 use thiserror::Error;
@@ -22,6 +23,10 @@ pub enum ControlPlaneError {
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
     RouteDenied(String),
+    #[error("token {nonce} rejected with status {status}")]
+    TokenRejected { nonce: String, status: TokenStatus },
+    #[error("token not found: {0}")]
+    TokenNotFound(String),
     #[error("store error: {0}")]
     Store(String),
 }
@@ -50,6 +55,28 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
+}
+
+#[async_trait]
+pub trait TokenLedger: Send + Sync {
+    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError>;
+    async fn get_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+    ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError>;
+    async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError>;
+    async fn record_token_use(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError>;
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +123,119 @@ impl ControlPlaneStore for InMemoryStore {
             .filter(|path| &path.key.local == node_id || &path.key.remote == node_id)
             .cloned()
             .collect())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryTokenLedger {
+    tokens: RwLock<BTreeMap<String, TokenLedgerRecord>>,
+}
+
+#[async_trait]
+impl TokenLedger for InMemoryTokenLedger {
+    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
+        self.tokens
+            .write()
+            .await
+            .insert(token_key(&record.cluster_id, &record.nonce), record);
+        Ok(())
+    }
+
+    async fn get_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+    ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError> {
+        Ok(self
+            .tokens
+            .read()
+            .await
+            .get(&token_key(cluster_id, nonce))
+            .cloned())
+    }
+
+    async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut tokens = self.tokens.write().await;
+        let record = tokens
+            .get_mut(&token_key(cluster_id, nonce))
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        record.revoked_at = Some(revoked_at);
+        Ok(record.clone())
+    }
+
+    async fn record_token_use(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut tokens = self.tokens.write().await;
+        let record = tokens
+            .get_mut(&token_key(cluster_id, nonce))
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        let status = record.status(now);
+        if status != TokenStatus::Active {
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: nonce.to_string(),
+                status,
+            });
+        }
+        record.uses = record.uses.saturating_add(1);
+        Ok(record.clone())
+    }
+}
+
+#[derive(Debug)]
+pub struct TokenAdmission<L> {
+    ledger: Arc<L>,
+}
+
+impl<L> TokenAdmission<L>
+where
+    L: TokenLedger,
+{
+    pub fn new(ledger: Arc<L>) -> Self {
+        Self { ledger }
+    }
+
+    pub async fn issue_from_claims(
+        &self,
+        claims: &JoinTokenClaims,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let record = TokenLedgerRecord::from_claims(claims, created_at);
+        self.ledger.upsert_token(record.clone()).await?;
+        Ok(record)
+    }
+
+    pub async fn admit_join(
+        &self,
+        claims: &JoinTokenClaims,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let record = self
+            .ledger
+            .get_token(&claims.cluster_id, &claims.nonce)
+            .await?
+            .unwrap_or_else(|| TokenLedgerRecord::from_claims(claims, now));
+
+        if self
+            .ledger
+            .get_token(&claims.cluster_id, &claims.nonce)
+            .await?
+            .is_none()
+        {
+            self.ledger.upsert_token(record).await?;
+        }
+
+        self.ledger
+            .record_token_use(&claims.cluster_id, &claims.nonce, now)
+            .await
     }
 }
 
@@ -203,6 +343,10 @@ fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
     claims.policy.allowed_routes.contains(&route.cidr)
 }
 
+fn token_key(cluster_id: &ClusterId, nonce: &str) -> String {
+    format!("{cluster_id}:{nonce}")
+}
+
 #[derive(Debug, Clone)]
 struct VpnAllocator {
     pool: Ipv4Net,
@@ -297,6 +441,52 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         );
         assert_eq!(response.relay_map.relays.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_admission_enforces_max_uses_and_revocation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let token_claims = claims(cluster_id.clone());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let admission = TokenAdmission::new(ledger.clone());
+        admission
+            .issue_from_claims(&token_claims, Utc::now())
+            .await?;
+
+        let first_use = admission.admit_join(&token_claims, Utc::now()).await?;
+        assert_eq!(first_use.uses, 1);
+
+        let second_use = admission.admit_join(&token_claims, Utc::now()).await;
+        assert!(matches!(
+            second_use,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Exhausted,
+                ..
+            })
+        ));
+
+        let mut revoked_claims = claims(cluster_id);
+        revoked_claims.nonce = "revoked".to_string();
+        admission
+            .issue_from_claims(&revoked_claims, Utc::now())
+            .await?;
+        ledger
+            .revoke_token(
+                &revoked_claims.cluster_id,
+                &revoked_claims.nonce,
+                Utc::now(),
+            )
+            .await?;
+        let revoked = admission.admit_join(&revoked_claims, Utc::now()).await;
+        assert!(matches!(
+            revoked,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Revoked,
+                ..
+            })
+        ));
         Ok(())
     }
 }

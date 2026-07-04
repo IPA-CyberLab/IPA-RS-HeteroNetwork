@@ -464,6 +464,82 @@ pub struct SignedJoinToken {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStatus {
+    Active,
+    Revoked,
+    Expired,
+    Exhausted,
+}
+
+impl Display for TokenStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+            Self::Exhausted => "exhausted",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLedgerRecord {
+    pub cluster_id: ClusterId,
+    pub nonce: String,
+    pub issuer: NodeId,
+    pub key_id: KeyId,
+    pub role: Role,
+    pub tags: BTreeSet<Tag>,
+    pub expires_at: DateTime<Utc>,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TokenLedgerRecord {
+    pub fn from_claims(claims: &JoinTokenClaims, created_at: DateTime<Utc>) -> Self {
+        Self {
+            cluster_id: claims.cluster_id.clone(),
+            nonce: claims.nonce.clone(),
+            issuer: claims.issuer.clone(),
+            key_id: claims.key_id.clone(),
+            role: claims.role.clone(),
+            tags: claims.tags.clone(),
+            expires_at: claims.expires_at,
+            max_uses: claims.policy.max_token_uses,
+            uses: 0,
+            revoked_at: None,
+            created_at,
+        }
+    }
+
+    pub fn status(&self, now: DateTime<Utc>) -> TokenStatus {
+        if self.revoked_at.is_some() {
+            return TokenStatus::Revoked;
+        }
+        if now >= self.expires_at {
+            return TokenStatus::Expired;
+        }
+        if self
+            .max_uses
+            .map(|max_uses| self.uses >= max_uses)
+            .unwrap_or(false)
+        {
+            return TokenStatus::Exhausted;
+        }
+        TokenStatus::Active
+    }
+
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.max_uses
+            .map(|max_uses| max_uses.saturating_sub(self.uses))
+    }
+}
+
 pub mod api {
     use super::*;
 

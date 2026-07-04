@@ -10,6 +10,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - pair-scoped path state and scoring primitives
 - initial control-plane registration/IP-allocation service with in-memory test backend
 - SQLite and PostgreSQL control-plane store implementations
+- token ledger primitives for revocation and max-use enforcement
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -37,4 +38,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The next production milestone is to wire the CLI to long-running daemons, enforce token revocation/max-use in durable storage, and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to wire the CLI to long-running daemons, apply token-ledger checks during registration RPCs, and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

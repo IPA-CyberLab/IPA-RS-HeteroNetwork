@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use ipars_control_plane::{ControlPlaneError, ControlPlaneStore};
-use ipars_types::{NodeId, NodeRecord, PathRecord};
+use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
+use ipars_types::{ClusterId, NodeId, NodeRecord, PathRecord, TokenLedgerRecord, TokenStatus};
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,19 @@ impl SqliteControlPlaneStore {
                     remote_node_id TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY (local_node_id, remote_node_id)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS tokens (
+                    cluster_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (cluster_id, nonce)
                 );
                 "#,
             )
@@ -118,6 +131,79 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 }
 
+#[async_trait]
+impl TokenLedger for SqliteControlPlaneStore {
+    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (cluster_id, nonce, record_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(cluster_id, nonce)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_string(&record).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+    ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError> {
+        let row =
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = ?1 AND nonce = ?2")
+                .bind(cluster_id.as_str())
+                .bind(nonce)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        row.map(row_to_token).transpose()
+    }
+
+    async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut record = self
+            .get_token(cluster_id, nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        record.revoked_at = Some(revoked_at);
+        self.upsert_token(record.clone()).await?;
+        Ok(record)
+    }
+
+    async fn record_token_use(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut record = self
+            .get_token(cluster_id, nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        let status = record.status(now);
+        if status != TokenStatus::Active {
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: nonce.to_string(),
+                status,
+            });
+        }
+        record.uses = record.uses.saturating_add(1);
+        self.upsert_token(record.clone()).await?;
+        Ok(record)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresControlPlaneStore {
     pool: PgPool,
@@ -157,6 +243,19 @@ impl PostgresControlPlaneStore {
                     remote_node_id TEXT NOT NULL,
                     record_json JSONB NOT NULL,
                     PRIMARY KEY (local_node_id, remote_node_id)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS tokens (
+                    cluster_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    record_json JSONB NOT NULL,
+                    PRIMARY KEY (cluster_id, nonce)
                 );
                 "#,
             )
@@ -233,6 +332,79 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
     }
 }
 
+#[async_trait]
+impl TokenLedger for PostgresControlPlaneStore {
+    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (cluster_id, nonce, record_json)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(cluster_id, nonce)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_value(&record).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+    ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError> {
+        let row =
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = $1 AND nonce = $2")
+                .bind(cluster_id.as_str())
+                .bind(nonce)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        row.map(pg_row_to_token).transpose()
+    }
+
+    async fn revoke_token(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        revoked_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut record = self
+            .get_token(cluster_id, nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        record.revoked_at = Some(revoked_at);
+        self.upsert_token(record.clone()).await?;
+        Ok(record)
+    }
+
+    async fn record_token_use(
+        &self,
+        cluster_id: &ClusterId,
+        nonce: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut record = self
+            .get_token(cluster_id, nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+        let status = record.status(now);
+        if status != TokenStatus::Active {
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: nonce.to_string(),
+                status,
+            });
+        }
+        record.uses = record.uses.saturating_add(1);
+        self.upsert_token(record.clone()).await?;
+        Ok(record)
+    }
+}
+
 fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: String = row.get("record_json");
     serde_json::from_str(&record_json).map_err(json_error)
@@ -243,12 +415,22 @@ fn row_to_path(row: sqlx::sqlite::SqliteRow) -> Result<PathRecord, ControlPlaneE
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_token(row: sqlx::sqlite::SqliteRow) -> Result<TokenLedgerRecord, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
 }
 
 fn pg_row_to_path(row: sqlx::postgres::PgRow) -> Result<PathRecord, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_token(row: sqlx::postgres::PgRow) -> Result<TokenLedgerRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
 }
@@ -267,10 +449,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use chrono::Utc;
-    use ipars_control_plane::ControlPlaneStore;
+    use ipars_control_plane::{ControlPlaneStore, TokenAdmission};
     use ipars_types::{
-        ClusterId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role,
-        TokenPolicy, VpnIp,
+        ClusterId, JoinTokenClaims, KeyId, NodeRecord, PathMetrics, PathRecord, PathScore,
+        PathState, PeerPathKey, Role, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -289,6 +471,23 @@ mod tests {
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
+        }
+    }
+
+    fn claims(cluster_id: ClusterId) -> JoinTokenClaims {
+        let mut tags = BTreeSet::new();
+        tags.insert(Tag::from_string("edge"));
+        JoinTokenClaims {
+            cluster_id,
+            bootstrap_endpoints: Vec::new(),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            not_before: Utc::now() - chrono::Duration::seconds(1),
+            role: Role::edge(),
+            tags,
+            issuer: NodeId::from_string("issuer"),
+            key_id: KeyId::from_string("root"),
+            policy: TokenPolicy::default(),
+            nonce: "nonce-a".to_string(),
         }
     }
 
@@ -320,6 +519,23 @@ mod tests {
         assert_eq!(store.get_node(&local.node_id).await?, Some(local.clone()));
         assert_eq!(store.list_nodes().await?.len(), 2);
         assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 1);
+
+        let admission = TokenAdmission::new(std::sync::Arc::new(store.clone()));
+        let token_claims = claims(local.cluster_id.clone());
+        admission
+            .issue_from_claims(&token_claims, Utc::now())
+            .await?;
+        let accepted = admission.admit_join(&token_claims, Utc::now()).await?;
+        assert_eq!(accepted.uses, 1);
+
+        let rejected = admission.admit_join(&token_claims, Utc::now()).await;
+        assert!(matches!(
+            rejected,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Exhausted,
+                ..
+            })
+        ));
         Ok(())
     }
 }
