@@ -7,8 +7,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPathEventsResponse, AgentStatusResponse, AgentStunProbeRequest,
-    AgentStunProbeResponse,
+    AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
+    AgentPathEventsResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
 };
 use serde::Serialize;
 
@@ -30,6 +30,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/metrics", get(metrics))
         .route("/v1/path-events", get(path_events))
         .route("/v1/stun-probe", post(stun_probe))
+        .route("/v1/nat-classification", post(nat_classification))
         .with_state(state)
 }
 
@@ -63,6 +64,20 @@ async fn stun_probe(
     Ok((
         StatusCode::CREATED,
         Json(AgentStunProbeResponse { candidate }),
+    ))
+}
+
+async fn nat_classification(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentNatClassifyRequest>,
+) -> Result<(StatusCode, Json<AgentNatClassifyResponse>), ApiError> {
+    let classification = state
+        .runtime
+        .classify_nat(request.local_bind, request.stun_servers)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(AgentNatClassifyResponse { classification }),
     ))
 }
 

@@ -15,8 +15,9 @@ use ipars_types::api::{
     AgentMetricsResponse, AgentStatusResponse, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NodeId, NodeRecord, PathChangeEvent,
-    PathChangeKind, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
+    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
+    NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind, PathRecord,
+    PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -132,6 +133,7 @@ impl FileAgentStateStore {
 pub struct AgentRuntime {
     state: AgentNodeState,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
+    nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
@@ -244,6 +246,7 @@ impl AgentRuntime {
         Self {
             state,
             candidates: tokio::sync::RwLock::new(Vec::new()),
+            nat_classification: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -258,12 +261,14 @@ impl AgentRuntime {
 
     pub async fn status(&self) -> AgentStatusResponse {
         let candidates = self.candidates.read().await.clone();
+        let nat_classification = self.nat_classification.read().await.clone();
         AgentStatusResponse {
             node_id: self.state.node_id.clone(),
             identity_public_key: self.state.identity_public_key_b64.clone(),
             wireguard_public_key: self.state.wireguard_public_key_b64.clone(),
             candidate_count: candidates.len(),
             candidates,
+            nat_classification,
             state_updated_at: self.state.updated_at,
         }
     }
@@ -278,6 +283,53 @@ impl AgentRuntime {
             .await?;
         self.candidates.write().await.push(candidate.clone());
         Ok(candidate)
+    }
+
+    pub async fn classify_nat(
+        &self,
+        local_bind: std::net::SocketAddr,
+        stun_servers: Vec<std::net::SocketAddr>,
+    ) -> Result<NatClassification, AgentError> {
+        if stun_servers.is_empty() {
+            return Err(AgentError::Stun(StunError::InvalidResponse(
+                "at least one STUN server is required for NAT classification".to_string(),
+            )));
+        }
+
+        let observations = UdpStunProbe
+            .observe_binding_many(local_bind, &stun_servers)
+            .await?;
+        let local_addr = observations
+            .first()
+            .map(|observation| observation.local_addr)
+            .unwrap_or(local_bind);
+        let classification =
+            NatClassification::from_observations(local_addr, observations.clone(), Utc::now());
+
+        let mut candidates = self.candidates.write().await;
+        candidates.extend(
+            observations
+                .iter()
+                .map(|observation| self.stun_candidate_from_observation(observation)),
+        );
+        *self.nat_classification.write().await = Some(classification.clone());
+
+        Ok(classification)
+    }
+
+    fn stun_candidate_from_observation(
+        &self,
+        observation: &NatProbeObservation,
+    ) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: self.state.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: observation.reflexive_addr,
+            observed_at: observation.observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        }
     }
 
     pub async fn path_state(&self) -> Vec<PathRecord> {
@@ -1096,7 +1148,8 @@ mod tests {
     use ipars_stun::BindingStunServer;
     use ipars_types::api::RelayAdmissionRequest;
     use ipars_types::{
-        CandidateSource, ClusterId, PathMetrics, PeerPathKey, RelayCapability, TokenPolicy,
+        CandidateSource, ClusterId, NatMappingBehavior, NatTraversalStrategy, PathMetrics,
+        PeerPathKey, RelayCapability, TokenPolicy,
     };
 
     use super::*;
@@ -1996,6 +2049,41 @@ mod tests {
 
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(runtime.status().await.candidate_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_classifies_nat_from_multiple_stun_observations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let first_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let first_server_addr = first_server.local_addr()?;
+        let first_task = tokio::spawn(async move { first_server.serve_once().await });
+        let second_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let second_server_addr = second_server.local_addr()?;
+        let second_task = tokio::spawn(async move { second_server.serve_once().await });
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        let classification = runtime
+            .classify_nat(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                vec![first_server_addr, second_server_addr],
+            )
+            .await?;
+        first_task.await??;
+        second_task.await??;
+
+        assert_eq!(classification.observations.len(), 2);
+        assert_eq!(classification.mapping_behavior, NatMappingBehavior::NoNat);
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::DirectCandidate
+        );
+        let status = runtime.status().await;
+        assert_eq!(status.candidate_count, 2);
+        assert_eq!(status.nat_classification, Some(classification));
         Ok(())
     }
 }

@@ -2,7 +2,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ipars_types::{CandidateSource, EndpointCandidate, EndpointCandidateKind, NodeId};
+use ipars_types::{
+    CandidateSource, EndpointCandidate, EndpointCandidateKind, NatProbeObservation, NodeId,
+};
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -35,6 +37,30 @@ pub trait StunProbe: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct UdpStunProbe;
 
+impl UdpStunProbe {
+    pub async fn observe_binding(
+        &self,
+        local_bind: SocketAddr,
+        stun_server: SocketAddr,
+    ) -> Result<NatProbeObservation, StunError> {
+        let socket = UdpSocket::bind(local_bind).await?;
+        observe_binding_with_socket(&socket, stun_server).await
+    }
+
+    pub async fn observe_binding_many(
+        &self,
+        local_bind: SocketAddr,
+        stun_servers: &[SocketAddr],
+    ) -> Result<Vec<NatProbeObservation>, StunError> {
+        let socket = UdpSocket::bind(local_bind).await?;
+        let mut observations = Vec::with_capacity(stun_servers.len());
+        for stun_server in stun_servers {
+            observations.push(observe_binding_with_socket(&socket, *stun_server).await?);
+        }
+        Ok(observations)
+    }
+}
+
 #[async_trait]
 impl StunProbe for UdpStunProbe {
     async fn probe(
@@ -43,23 +69,8 @@ impl StunProbe for UdpStunProbe {
         local_bind: SocketAddr,
         stun_server: SocketAddr,
     ) -> Result<EndpointCandidate, StunError> {
-        let socket = UdpSocket::bind(local_bind).await?;
-        let transaction_id = new_transaction_id();
-        let request = encode_binding_request(transaction_id);
-        socket.send_to(&request, stun_server).await?;
-        let mut buffer = [0_u8; 1500];
-        let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
-        let observed_addr = decode_binding_success_response(&buffer[..len], transaction_id)?;
-
-        Ok(EndpointCandidate {
-            node_id,
-            kind: EndpointCandidateKind::StunReflexive,
-            addr: observed_addr,
-            observed_at: Utc::now(),
-            priority: 80,
-            cost: 20,
-            source: CandidateSource::StunProbe,
-        })
+        let observation = self.observe_binding(local_bind, stun_server).await?;
+        Ok(candidate_from_observation(node_id, &observation))
     }
 }
 
@@ -111,6 +122,39 @@ impl BindingStunServer {
 }
 
 type TransactionId = [u8; 12];
+
+async fn observe_binding_with_socket(
+    socket: &UdpSocket,
+    stun_server: SocketAddr,
+) -> Result<NatProbeObservation, StunError> {
+    let transaction_id = new_transaction_id();
+    let request = encode_binding_request(transaction_id);
+    socket.send_to(&request, stun_server).await?;
+    let mut buffer = [0_u8; 1500];
+    let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
+    let reflexive_addr = decode_binding_success_response(&buffer[..len], transaction_id)?;
+    Ok(NatProbeObservation {
+        local_addr: socket.local_addr()?,
+        stun_server,
+        reflexive_addr,
+        observed_at: Utc::now(),
+    })
+}
+
+fn candidate_from_observation(
+    node_id: NodeId,
+    observation: &NatProbeObservation,
+) -> EndpointCandidate {
+    EndpointCandidate {
+        node_id,
+        kind: EndpointCandidateKind::StunReflexive,
+        addr: observation.reflexive_addr,
+        observed_at: observation.observed_at,
+        priority: 80,
+        cost: 20,
+        source: CandidateSource::StunProbe,
+    }
+}
 
 fn new_transaction_id() -> TransactionId {
     let mut transaction_id = [0_u8; 12];
@@ -425,6 +469,36 @@ mod tests {
 
         shutdown_tx.send(true)?;
         server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_collects_multiple_binding_observations_with_single_socket(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let first_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let first_server_addr = first_server.local_addr()?;
+        let first_task = tokio::spawn(async move { first_server.serve_once().await });
+        let second_server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let second_server_addr = second_server.local_addr()?;
+        let second_task = tokio::spawn(async move { second_server.serve_once().await });
+
+        let observations = UdpStunProbe
+            .observe_binding_many(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                &[first_server_addr, second_server_addr],
+            )
+            .await?;
+        first_task.await??;
+        second_task.await??;
+
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].stun_server, first_server_addr);
+        assert_eq!(observations[1].stun_server, second_server_addr);
+        assert_eq!(observations[0].local_addr, observations[1].local_addr);
+        assert_eq!(
+            observations[0].reflexive_addr,
+            observations[1].reflexive_addr
+        );
         Ok(())
     }
 }

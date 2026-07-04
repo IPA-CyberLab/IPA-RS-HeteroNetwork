@@ -184,6 +184,142 @@ pub enum CandidateSource {
     RelayMap,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatProbeObservation {
+    pub local_addr: SocketAddr,
+    pub stun_server: SocketAddr,
+    pub reflexive_addr: SocketAddr,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatMappingBehavior {
+    Unknown,
+    NoNat,
+    EndpointIndependent,
+    AddressDependent,
+    AddressAndPortDependent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatTraversalStrategy {
+    DirectCandidate,
+    CoordinatedHolePunch,
+    RelayPreferred,
+    InsufficientData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NatClassification {
+    pub local_addr: SocketAddr,
+    pub mapping_behavior: NatMappingBehavior,
+    pub observed_endpoint: Option<SocketAddr>,
+    pub observations: Vec<NatProbeObservation>,
+    pub strategy: NatTraversalStrategy,
+    pub confidence: f32,
+    pub assessed_at: DateTime<Utc>,
+}
+
+impl NatClassification {
+    pub fn from_observations(
+        local_addr: SocketAddr,
+        observations: Vec<NatProbeObservation>,
+        assessed_at: DateTime<Utc>,
+    ) -> Self {
+        let mapping_behavior = classify_nat_mapping(local_addr, &observations);
+        let observed_endpoint = stable_observed_endpoint(&observations);
+        let strategy = nat_traversal_strategy(mapping_behavior);
+        let confidence = nat_classification_confidence(mapping_behavior, observations.len());
+
+        Self {
+            local_addr,
+            mapping_behavior,
+            observed_endpoint,
+            observations,
+            strategy,
+            confidence,
+            assessed_at,
+        }
+    }
+}
+
+fn classify_nat_mapping(
+    local_addr: SocketAddr,
+    observations: &[NatProbeObservation],
+) -> NatMappingBehavior {
+    if observations.is_empty() {
+        return NatMappingBehavior::Unknown;
+    }
+    if !local_addr.ip().is_unspecified()
+        && observations
+            .iter()
+            .all(|observation| observation.reflexive_addr == local_addr)
+    {
+        return NatMappingBehavior::NoNat;
+    }
+    if observations.len() == 1 {
+        return NatMappingBehavior::Unknown;
+    }
+    let first_reflexive = observations[0].reflexive_addr;
+    if observations
+        .iter()
+        .all(|observation| observation.reflexive_addr == first_reflexive)
+    {
+        return NatMappingBehavior::EndpointIndependent;
+    }
+    if same_stun_address_different_port_changes_mapping(observations) {
+        return NatMappingBehavior::AddressAndPortDependent;
+    }
+    NatMappingBehavior::AddressDependent
+}
+
+fn stable_observed_endpoint(observations: &[NatProbeObservation]) -> Option<SocketAddr> {
+    let first = observations.first()?.reflexive_addr;
+    observations
+        .iter()
+        .all(|observation| observation.reflexive_addr == first)
+        .then_some(first)
+}
+
+fn same_stun_address_different_port_changes_mapping(observations: &[NatProbeObservation]) -> bool {
+    observations.iter().enumerate().any(|(left_index, left)| {
+        observations.iter().skip(left_index + 1).any(|right| {
+            left.stun_server.ip() == right.stun_server.ip()
+                && left.stun_server.port() != right.stun_server.port()
+                && left.reflexive_addr != right.reflexive_addr
+        })
+    })
+}
+
+fn nat_traversal_strategy(mapping_behavior: NatMappingBehavior) -> NatTraversalStrategy {
+    match mapping_behavior {
+        NatMappingBehavior::NoNat => NatTraversalStrategy::DirectCandidate,
+        NatMappingBehavior::EndpointIndependent | NatMappingBehavior::AddressDependent => {
+            NatTraversalStrategy::CoordinatedHolePunch
+        }
+        NatMappingBehavior::AddressAndPortDependent => NatTraversalStrategy::RelayPreferred,
+        NatMappingBehavior::Unknown => NatTraversalStrategy::InsufficientData,
+    }
+}
+
+fn nat_classification_confidence(
+    mapping_behavior: NatMappingBehavior,
+    observation_count: usize,
+) -> f32 {
+    match mapping_behavior {
+        NatMappingBehavior::Unknown if observation_count == 0 => 0.0,
+        NatMappingBehavior::Unknown => 0.25,
+        NatMappingBehavior::NoNat => 1.0,
+        NatMappingBehavior::EndpointIndependent => (0.6 + observation_count as f32 * 0.1).min(0.95),
+        NatMappingBehavior::AddressDependent => (0.55 + observation_count as f32 * 0.1).min(0.9),
+        NatMappingBehavior::AddressAndPortDependent => {
+            (0.65 + observation_count as f32 * 0.1).min(0.95)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PathState {
@@ -688,13 +824,14 @@ pub mod api {
         pub right_addr: SocketAddr,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct AgentStatusResponse {
         pub node_id: NodeId,
         pub identity_public_key: String,
         pub wireguard_public_key: String,
         pub candidate_count: usize,
         pub candidates: Vec<EndpointCandidate>,
+        pub nat_classification: Option<NatClassification>,
         pub state_updated_at: DateTime<Utc>,
     }
 
@@ -707,6 +844,17 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentStunProbeResponse {
         pub candidate: EndpointCandidate,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentNatClassifyRequest {
+        pub local_bind: SocketAddr,
+        pub stun_servers: Vec<SocketAddr>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentNatClassifyResponse {
+        pub classification: NatClassification,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -777,5 +925,97 @@ mod tests {
 
         assert!(relay.can_admit());
         assert_eq!(relay.available_capacity(), 1);
+    }
+
+    #[test]
+    fn nat_classification_detects_endpoint_independent_mapping() {
+        let assessed_at = Utc::now();
+        let classification = NatClassification::from_observations(
+            std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            vec![
+                NatProbeObservation {
+                    local_addr: std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                    stun_server: std::net::SocketAddr::from(([198, 51, 100, 1], 3478)),
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr: std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                    stun_server: std::net::SocketAddr::from(([198, 51, 100, 2], 3478)),
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.mapping_behavior,
+            NatMappingBehavior::EndpointIndependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::CoordinatedHolePunch
+        );
+        assert_eq!(
+            classification.observed_endpoint,
+            Some(std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)))
+        );
+    }
+
+    #[test]
+    fn nat_classification_detects_address_and_port_dependent_mapping() {
+        let assessed_at = Utc::now();
+        let classification = NatClassification::from_observations(
+            std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            vec![
+                NatProbeObservation {
+                    local_addr: std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                    stun_server: std::net::SocketAddr::from(([198, 51, 100, 1], 3478)),
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr: std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                    stun_server: std::net::SocketAddr::from(([198, 51, 100, 1], 3479)),
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_001)),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.mapping_behavior,
+            NatMappingBehavior::AddressAndPortDependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::RelayPreferred
+        );
+        assert_eq!(classification.observed_endpoint, None);
+    }
+
+    #[test]
+    fn nat_classification_detects_no_nat_when_reflexive_matches_local() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([192, 0, 2, 10], 50_000));
+        let classification = NatClassification::from_observations(
+            local_addr,
+            vec![NatProbeObservation {
+                local_addr,
+                stun_server: std::net::SocketAddr::from(([198, 51, 100, 1], 3478)),
+                reflexive_addr: local_addr,
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+
+        assert_eq!(classification.mapping_behavior, NatMappingBehavior::NoNat);
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::DirectCandidate
+        );
+        assert_eq!(classification.confidence, 1.0);
     }
 }

@@ -136,8 +136,12 @@ struct AgentArgs {
         default_value = "/var/lib/ipars/agent.json"
     )]
     state_path: std::path::PathBuf,
-    #[arg(long, env = "IPARS_AGENT_STUN_SERVER")]
-    stun_server: Option<SocketAddr>,
+    #[arg(
+        long = "stun-server",
+        env = "IPARS_AGENT_STUN_SERVER",
+        value_delimiter = ','
+    )]
+    stun_servers: Vec<SocketAddr>,
     #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:0")]
     stun_bind: SocketAddr,
     #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
@@ -401,7 +405,11 @@ async fn run_agent(args: AgentArgs) -> anyhow::Result<()> {
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
-    if let Some(stun_server) = args.stun_server {
+    if args.stun_servers.len() > 1 {
+        runtime
+            .classify_nat(args.stun_bind, args.stun_servers.clone())
+            .await?;
+    } else if let Some(stun_server) = args.stun_servers.first().copied() {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
     let join_token = args
@@ -1932,6 +1940,7 @@ mod tests {
                     source: CandidateSource::StunProbe,
                 },
             ],
+            nat_classification: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("peer-a");

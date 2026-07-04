@@ -91,7 +91,7 @@ The default path discovery order is:
 4. Relay fallback.
 5. `UNREACHABLE`.
 
-STUN reflexive endpoint detection uses RFC 5389 Binding requests and success responses with `XOR-MAPPED-ADDRESS`; NAT classification builds on these probes.
+STUN reflexive endpoint detection uses RFC 5389 Binding requests and success responses with `XOR-MAPPED-ADDRESS`. Agents can reuse one UDP socket across multiple STUN endpoints to classify NAT mapping behavior as no NAT, endpoint-independent, address-dependent, address-and-port-dependent, or unknown; filtering behavior and topology validation build on these probes.
 
 The signal service only coordinates endpoint candidate exchange and timing. It does not forward data-plane payload.
 
@@ -182,6 +182,7 @@ Initial agent HTTP routes:
 - `GET /v1/metrics`
 - `GET /v1/path-events`
 - `POST /v1/stun-probe`
+- `POST /v1/nat-classification`
 
 ## Observability
 
