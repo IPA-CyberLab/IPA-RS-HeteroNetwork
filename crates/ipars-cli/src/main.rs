@@ -212,18 +212,32 @@ struct K8sInstallArgs {
     join_token_key: String,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
+    #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
+    agent_api_service_type: String,
+    #[arg(long = "agent-api-service-annotation", value_parser = parse_key_value, requires = "expose_agent_api")]
+    agent_api_service_annotations: Vec<KeyValueArg>,
     #[arg(
         long,
         default_value_t = false,
         requires_all = ["relay_public_endpoint", "relay_admission_url"]
     )]
     expose_relay: bool,
+    #[arg(long, default_value = "LoadBalancer", value_parser = parse_kubernetes_service_type)]
+    relay_service_type: String,
+    #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
+    relay_service_annotations: Vec<KeyValueArg>,
     #[arg(long)]
     relay_public_endpoint: Option<String>,
     #[arg(long)]
     relay_admission_url: Option<String>,
     #[arg(long)]
     relay_status_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyValueArg {
+    key: String,
+    value: String,
 }
 
 #[tokio::main]
@@ -569,6 +583,50 @@ fn api_url(base_url: &str, path: &str) -> String {
     )
 }
 
+fn parse_kubernetes_service_type(value: &str) -> Result<String, String> {
+    match value {
+        "ClusterIP" | "NodePort" | "LoadBalancer" => Ok(value.to_string()),
+        _ => Err(format!(
+            "service type must be one of ClusterIP, NodePort, or LoadBalancer; got {value}"
+        )),
+    }
+}
+
+fn parse_key_value(value: &str) -> Result<KeyValueArg, String> {
+    let (key, annotation_value) = value
+        .split_once('=')
+        .ok_or_else(|| "annotation must use key=value syntax".to_string())?;
+    if key.trim().is_empty() {
+        return Err("annotation key must not be empty".to_string());
+    }
+    Ok(KeyValueArg {
+        key: key.to_string(),
+        value: annotation_value.to_string(),
+    })
+}
+
+fn helm_set_key(key: &str) -> String {
+    let mut escaped = String::with_capacity(key.len());
+    for value in key.chars() {
+        if matches!(value, '.' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(value);
+    }
+    escaped
+}
+
+fn helm_set_string_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(',', "\\,")
+}
+
+fn append_helm_set_string(command: &mut String, key: &str, value: &str) {
+    command.push_str(&format!(
+        " --set-string {key}={}",
+        helm_set_string_value(value)
+    ));
+}
+
 fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
     value
         .map(NodeId::from_string)
@@ -794,6 +852,20 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     );
     if args.expose_agent_api {
         helm_command.push_str(" --set agent.apiService.enabled=true");
+        helm_command.push_str(&format!(
+            " --set agent.apiService.type={}",
+            args.agent_api_service_type
+        ));
+        for annotation in &args.agent_api_service_annotations {
+            append_helm_set_string(
+                &mut helm_command,
+                &format!(
+                    "agent.apiService.annotations.{}",
+                    helm_set_key(&annotation.key)
+                ),
+                &annotation.value,
+            );
+        }
     }
     if args.expose_relay {
         let relay_public_endpoint = args
@@ -808,15 +880,35 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             " --set agent.relayAdvertisement.enabled=true --set agent.relayService.enabled=true",
         );
         helm_command.push_str(&format!(
-            " --set-string agent.relayAdvertisement.publicEndpoint={relay_public_endpoint}"
+            " --set agent.relayService.type={}",
+            args.relay_service_type
         ));
-        helm_command.push_str(&format!(
-            " --set-string agent.relayAdvertisement.admissionUrl={relay_admission_url}"
-        ));
+        append_helm_set_string(
+            &mut helm_command,
+            "agent.relayAdvertisement.publicEndpoint",
+            relay_public_endpoint,
+        );
+        append_helm_set_string(
+            &mut helm_command,
+            "agent.relayAdvertisement.admissionUrl",
+            relay_admission_url,
+        );
         if let Some(relay_status_url) = args.relay_status_url.as_deref() {
-            helm_command.push_str(&format!(
-                " --set-string agent.relayAdvertisement.statusUrl={relay_status_url}"
-            ));
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayAdvertisement.statusUrl",
+                relay_status_url,
+            );
+        }
+        for annotation in &args.relay_service_annotations {
+            append_helm_set_string(
+                &mut helm_command,
+                &format!(
+                    "agent.relayService.annotations.{}",
+                    helm_set_key(&annotation.key)
+                ),
+                &annotation.value,
+            );
         }
     }
 
@@ -848,6 +940,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Service type and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
@@ -1264,7 +1357,17 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             expose_agent_api: true,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_service_annotations: vec![KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb,ip".to_string(),
+            }],
             expose_relay: true,
+            relay_service_type: "NodePort".to_string(),
+            relay_service_annotations: vec![KeyValueArg {
+                key: "metallb.universe.tf/address-pool".to_string(),
+                value: "public".to_string(),
+            }],
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: Some("http://203.0.113.10:9580".to_string()),
@@ -1278,7 +1381,12 @@ mod tests {
         );
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
+        assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip"
+        ));
         assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
+        assert!(plan.commands[2].contains("--set agent.relayService.type=NodePort"));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820"));
         assert!(plan.commands[2].contains(
@@ -1286,6 +1394,9 @@ mod tests {
         ));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public"
+        ));
         assert!(plan
             .security
             .iter()
@@ -1327,7 +1438,15 @@ mod tests {
             "--join-token-key",
             "signed-token",
             "--expose-agent-api",
+            "--agent-api-service-type",
+            "LoadBalancer",
+            "--agent-api-service-annotation",
+            "service.beta.kubernetes.io/aws-load-balancer-type=nlb",
             "--expose-relay",
+            "--relay-service-type",
+            "NodePort",
+            "--relay-service-annotation",
+            "metallb.universe.tf/address-pool=public",
             "--relay-public-endpoint",
             "203.0.113.10:51820",
             "--relay-admission-url",
@@ -1342,7 +1461,23 @@ mod tests {
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
             assert!(args.expose_agent_api);
+            assert_eq!(args.agent_api_service_type, "LoadBalancer");
+            assert_eq!(
+                args.agent_api_service_annotations,
+                vec![KeyValueArg {
+                    key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                    value: "nlb".to_string(),
+                }]
+            );
             assert!(args.expose_relay);
+            assert_eq!(args.relay_service_type, "NodePort");
+            assert_eq!(
+                args.relay_service_annotations,
+                vec![KeyValueArg {
+                    key: "metallb.universe.tf/address-pool".to_string(),
+                    value: "public".to_string(),
+                }]
+            );
             assert_eq!(
                 args.relay_public_endpoint.as_deref(),
                 Some("203.0.113.10:51820")
@@ -1369,12 +1504,38 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             expose_agent_api: false,
+            agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_service_annotations: Vec::new(),
             expose_relay: true,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
         });
         assert!(plan.is_err());
+    }
+
+    #[test]
+    fn install_plan_parsers_validate_service_types_and_annotations() {
+        assert_eq!(
+            parse_kubernetes_service_type("ClusterIP"),
+            Ok("ClusterIP".to_string())
+        );
+        assert!(parse_kubernetes_service_type("ExternalName").is_err());
+        assert_eq!(
+            parse_key_value("service.beta.kubernetes.io/aws-load-balancer-type=nlb"),
+            Ok(KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb".to_string(),
+            })
+        );
+        assert!(parse_key_value("missing-equals").is_err());
+        assert_eq!(
+            helm_set_key("service.beta.kubernetes.io/aws-load-balancer-type"),
+            "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
+        );
+        assert_eq!(helm_set_string_value("nlb,ip"), "nlb\\,ip");
     }
 
     fn temp_path(name: &str) -> PathBuf {
