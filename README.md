@@ -9,6 +9,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - signed join token creation and verification primitives
 - pair-scoped path state and scoring primitives
 - initial control-plane registration/IP-allocation service with in-memory test backend
+- SQLite and PostgreSQL control-plane store implementations
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `relay status`, `path status`, `docker install`, and `k8s install`
 - Docker Compose and Helm chart starting points
 - architecture, operations, security, and load-test plan
@@ -36,4 +37,4 @@ ipars docker install
 ipars k8s install
 ```
 
-The first production milestone after this scaffold is to replace the in-memory control-plane store with PostgreSQL/SQLite implementations, wire the CLI to the long-running daemons, and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.
+The next production milestone is to wire the CLI to long-running daemons, enforce token revocation/max-use in durable storage, and add network-namespace integration tests for direct, NAT traversal, and relay fallback paths.

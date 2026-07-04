@@ -8,6 +8,7 @@ members = [
     "crates/ipars-relay",
     "crates/ipars-route-manager",
     "crates/ipars-signal",
+    "crates/ipars-store",
     "crates/ipars-stun",
     "crates/ipars-types",
 ]
@@ -31,6 +32,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 thiserror = "1.0"
 tokio = { version = "1.39", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

@@ -10,6 +10,7 @@ This file tracks the gap between the requested final system and the current repo
 - X25519/WireGuard key generation primitive.
 - Pair-scoped path scoring with direct/IPv6/NAT traversal/relay/unreachable states.
 - In-memory control-plane registration and VPN IP allocation.
+- SQLite and PostgreSQL control-plane store implementations with SQLite round-trip tests.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
@@ -17,7 +18,6 @@ This file tracks the gap between the requested final system and the current repo
 ## Remaining For Full Production Completion
 
 - Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- PostgreSQL and SQLite store implementations.
 - Token revocation and max-use enforcement.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
