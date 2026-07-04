@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -172,6 +173,167 @@ pub trait WireGuardBackend: Send + Sync {
     async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl LinuxCommand {
+    pub fn new(
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait LinuxCommandRunner: Send + Sync {
+    async fn run(&self, command: LinuxCommand) -> Result<(), AgentError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SystemCommandRunner;
+
+#[async_trait]
+impl LinuxCommandRunner for SystemCommandRunner {
+    async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
+        let output = Command::new(&command.program)
+            .args(&command.args)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(AgentError::WireGuard(format!(
+            "{} {} failed: {}",
+            command.program,
+            command.args.join(" "),
+            stderr.trim()
+        )))
+    }
+}
+
+#[derive(Debug)]
+pub struct LinuxWireGuardBackend<R> {
+    interface: String,
+    runner: R,
+    peer_public_keys: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
+}
+
+impl<R> LinuxWireGuardBackend<R>
+where
+    R: LinuxCommandRunner,
+{
+    pub fn new(interface: impl Into<String>, runner: R) -> Self {
+        Self {
+            interface: interface.into(),
+            runner,
+            peer_public_keys: tokio::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn ensure_interface(&self) -> Result<(), AgentError> {
+        if self
+            .runner
+            .run(LinuxCommand::new(
+                "ip",
+                ["link", "show", "dev", self.interface.as_str()],
+            ))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        self.runner
+            .run(LinuxCommand::new(
+                "ip",
+                [
+                    "link",
+                    "add",
+                    "dev",
+                    self.interface.as_str(),
+                    "type",
+                    "wireguard",
+                ],
+            ))
+            .await?;
+        self.runner
+            .run(LinuxCommand::new(
+                "ip",
+                ["link", "set", "up", "dev", self.interface.as_str()],
+            ))
+            .await
+    }
+
+    fn upsert_command(&self, config: &WireGuardPeerConfig) -> LinuxCommand {
+        let mut args = vec![
+            "set".to_string(),
+            self.interface.clone(),
+            "peer".to_string(),
+            config.public_key.clone(),
+        ];
+        if !config.allowed_ips.is_empty() {
+            args.push("allowed-ips".to_string());
+            args.push(config.allowed_ips.join(","));
+        }
+        if let Some(endpoint) = &config.endpoint {
+            args.push("endpoint".to_string());
+            args.push(endpoint.clone());
+        }
+        if let Some(keepalive) = config.persistent_keepalive_seconds {
+            args.push("persistent-keepalive".to_string());
+            args.push(keepalive.to_string());
+        }
+        LinuxCommand::new("wg", args)
+    }
+}
+
+#[async_trait]
+impl<R> WireGuardBackend for LinuxWireGuardBackend<R>
+where
+    R: LinuxCommandRunner,
+{
+    async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
+        self.runner.run(self.upsert_command(&config)).await?;
+        self.peer_public_keys
+            .write()
+            .await
+            .insert(config.peer, config.public_key);
+        Ok(())
+    }
+
+    async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError> {
+        let public_key = self
+            .peer_public_keys
+            .read()
+            .await
+            .get(peer)
+            .cloned()
+            .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        self.runner
+            .run(LinuxCommand::new(
+                "wg",
+                [
+                    "set",
+                    self.interface.as_str(),
+                    "peer",
+                    public_key.as_str(),
+                    "remove",
+                ],
+            ))
+            .await?;
+        self.peer_public_keys.write().await.remove(peer);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MemoryWireGuardBackend {
     peers: tokio::sync::RwLock<BTreeMap<NodeId, WireGuardPeerConfig>>,
@@ -266,6 +428,7 @@ fn compare_score(left: &PathScore, right: &PathScore) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
 
     use chrono::Duration as ChronoDuration;
     use ipars_stun::EchoStunServer;
@@ -296,6 +459,57 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<tokio::sync::RwLock<Vec<LinuxCommand>>>,
+        fail_interface_show: bool,
+        fail_remove: bool,
+    }
+
+    impl RecordingRunner {
+        fn with_missing_interface() -> Self {
+            Self {
+                fail_interface_show: true,
+                ..Self::default()
+            }
+        }
+
+        fn with_failed_remove() -> Self {
+            Self {
+                fail_remove: true,
+                ..Self::default()
+            }
+        }
+
+        async fn commands(&self) -> Vec<LinuxCommand> {
+            self.commands.read().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl LinuxCommandRunner for RecordingRunner {
+        async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
+            let should_fail_show = self.fail_interface_show
+                && command.program == "ip"
+                && command
+                    .args
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["link", "show", "dev", "ipars0"]);
+            let should_fail_remove = self.fail_remove
+                && command.program == "wg"
+                && command.args.last().is_some_and(|arg| arg == "remove");
+            self.commands.write().await.push(command);
+            if should_fail_show {
+                Err(AgentError::WireGuard("interface missing".to_string()))
+            } else if should_fail_remove {
+                Err(AgentError::WireGuard("remove failed".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn lazy_manager_keeps_pinned_peers_open() {
         let mut manager = LazyConnectManager::new(ClusterPolicy {
@@ -323,6 +537,95 @@ mod tests {
     fn score_helper_keeps_metrics_type_in_scope() {
         let score = PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0);
         assert!(score.value > 0.0);
+    }
+
+    #[tokio::test]
+    async fn linux_wireguard_backend_generates_peer_upsert_and_remove_commands(
+    ) -> Result<(), AgentError> {
+        let runner = RecordingRunner::default();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+        let peer = NodeId::from_string("node-a");
+
+        backend
+            .upsert_peer(WireGuardPeerConfig {
+                peer: peer.clone(),
+                public_key: "peer-public".to_string(),
+                endpoint: Some("203.0.113.10:51820".to_string()),
+                allowed_ips: vec!["100.64.0.2/32".to_string()],
+                persistent_keepalive_seconds: Some(25),
+            })
+            .await?;
+        backend.remove_peer(&peer).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new(
+                    "wg",
+                    [
+                        "set",
+                        "ipars0",
+                        "peer",
+                        "peer-public",
+                        "allowed-ips",
+                        "100.64.0.2/32",
+                        "endpoint",
+                        "203.0.113.10:51820",
+                        "persistent-keepalive",
+                        "25",
+                    ],
+                ),
+                LinuxCommand::new("wg", ["set", "ipars0", "peer", "peer-public", "remove"],),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_wireguard_backend_keeps_peer_when_remove_command_fails() -> Result<(), AgentError>
+    {
+        let runner = RecordingRunner::with_failed_remove();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner);
+        let peer = NodeId::from_string("node-a");
+
+        backend
+            .upsert_peer(WireGuardPeerConfig {
+                peer: peer.clone(),
+                public_key: "peer-public".to_string(),
+                endpoint: None,
+                allowed_ips: vec!["100.64.0.2/32".to_string()],
+                persistent_keepalive_seconds: None,
+            })
+            .await?;
+        let error = backend.remove_peer(&peer).await;
+
+        assert!(matches!(
+            error,
+            Err(AgentError::WireGuard(message)) if message == "remove failed"
+        ));
+        assert_eq!(
+            backend.peer_public_keys.read().await.get(&peer).cloned(),
+            Some("peer-public".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_wireguard_backend_creates_missing_interface() -> Result<(), AgentError> {
+        let runner = RecordingRunner::with_missing_interface();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+
+        backend.ensure_interface().await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new("ip", ["link", "show", "dev", "ipars0"]),
+                LinuxCommand::new("ip", ["link", "add", "dev", "ipars0", "type", "wireguard"],),
+                LinuxCommand::new("ip", ["link", "set", "up", "dev", "ipars0"]),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

@@ -21,14 +21,14 @@ This file tracks the gap between the requested final system and the current repo
 - CLI `join <token>` creates node identity/WireGuard keys, builds `JoinNodeRequest`, and posts to the token's control-plane bootstrap endpoint.
 - Persistent agent node state, STUN candidate collection, agent status/STUN HTTP routes, and `iparsd agent`.
 - Control-plane heartbeat handling persists node health, refreshed endpoint candidates, and pair-scoped path state in memory, SQLite, and PostgreSQL stores.
+- Linux WireGuard command backend for interface creation and peer upsert/removal through explicit `ip`/`wg` commands.
 - Lazy connect and pinning primitives in the agent crate.
 - Relay session table that forwards only opaque payload frames.
 - Docker Compose and Helm chart starting points.
 
 ## Remaining For Full Production Completion
 
-- Long-running daemon binaries for control-plane, signal, STUN, relay, and agent.
-- Real WireGuard/route-manager backends and agent registration/signal-loop wiring.
+- Agent registration, signal-loop, peer-map application, and route-manager backend wiring.
 - Kernel WireGuard netlink/wgctrl backend.
 - Linux policy routing backend with netlink calls.
 - Full STUN protocol support and NAT classification.
