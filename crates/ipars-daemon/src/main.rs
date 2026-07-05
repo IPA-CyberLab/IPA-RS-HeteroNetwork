@@ -868,6 +868,7 @@ struct RuntimePreflightNeeds {
     cap_perfmon: bool,
     cap_bpf: bool,
     linux_netns: bool,
+    relay_forwarder_netns: bool,
 }
 
 impl RuntimePreflightNeeds {
@@ -888,6 +889,7 @@ impl RuntimePreflightNeeds {
             cap_perfmon: false,
             cap_bpf: false,
             linux_netns: false,
+            relay_forwarder_netns: false,
         }
     }
 
@@ -907,6 +909,7 @@ impl RuntimePreflightNeeds {
             && !self.cap_perfmon
             && !self.cap_bpf
             && !self.linux_netns
+            && !self.relay_forwarder_netns
     }
 }
 
@@ -1170,6 +1173,15 @@ fn preflight_agent_runtime_with_path_and_checks(
         let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
         (checks.linux_netns)(&namespace)?;
     }
+    if needs.relay_forwarder_netns {
+        let namespace_name = args
+            .relay_forwarder_netns
+            .as_deref()
+            .or(args.linux_netns.as_deref())
+            .context("relay forwarder namespace preflight requested without --relay-forwarder-netns or --linux-netns")?;
+        let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
+        (checks.linux_netns)(&namespace)?;
+    }
 
     tracing::info!(
         backend = args.runtime_backend.as_str(),
@@ -1189,7 +1201,9 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_cap_sys_admin = needs.cap_sys_admin,
         needs_cap_perfmon = needs.cap_perfmon,
         needs_cap_bpf = needs.cap_bpf,
+        needs_relay_forwarder_netns = needs.relay_forwarder_netns,
         linux_netns = ?args.linux_netns,
+        relay_forwarder_netns = ?args.relay_forwarder_netns,
         "runtime backend preflight passed"
     );
     Ok(())
@@ -1491,19 +1505,25 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     );
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
+    let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
+        && (args.relay_forwarder_netns.is_some() || args.linux_netns.is_some());
     if args.runtime_backend == AgentRuntimeBackend::DryRun {
         return RuntimePreflightNeeds {
             netfilter_netlink,
             docker_api_socket,
             cap_net_admin: netfilter_netlink,
+            cap_sys_admin: relay_forwarder_netns,
             cap_perfmon: ebpf_ringbuf,
             cap_bpf: ebpf_ringbuf,
+            relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
         };
     }
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
         return RuntimePreflightNeeds {
             docker_api_socket,
+            cap_sys_admin: relay_forwarder_netns,
+            relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
         };
     }
@@ -1539,10 +1559,12 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
             || (applies_wireguard && !applies_wireguard_with_userspace_command)
             || netfilter_netlink,
         cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
-        cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        cap_sys_admin: (args.linux_netns.is_some() && (applies_routes || applies_wireguard))
+            || relay_forwarder_netns,
         cap_perfmon: ebpf_ringbuf,
         cap_bpf: ebpf_ringbuf,
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        relay_forwarder_netns,
     }
 }
 
@@ -12429,6 +12451,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         anyhow::bail!("blocked test net.ipv6.conf.all.forwarding")
     }
 
+    fn preflight_fail_cap_sys_admin() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test CAP_SYS_ADMIN")
+    }
+
+    fn preflight_fail_linux_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+        anyhow::bail!("blocked test netns {}", namespace.name())
+    }
+
     fn preflight_fail_generic_netlink(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
         if protocol == RuntimeNetlinkProtocol::Generic {
             anyhow::bail!("blocked test {}", protocol.as_str());
@@ -12508,6 +12538,103 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 Err(error) => error,
             };
             assert!(error.to_string().contains("blocked test NETLINK_GENERIC"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_relay_forwarder_namespace() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-netns",
+            "relay-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
+            assert!(!needs.linux_netns);
+            assert!(needs.relay_forwarder_netns);
+            assert!(needs.cap_sys_admin);
+
+            let mut cap_checks = test_preflight_checks(preflight_noop_netlink);
+            cap_checks.cap_sys_admin = preflight_fail_cap_sys_admin;
+            let cap_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                cap_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful relay forwarder CAP preflight"),
+                Err(error) => error,
+            };
+            assert!(cap_error.to_string().contains("blocked test CAP_SYS_ADMIN"));
+
+            let mut namespace_checks = test_preflight_checks(preflight_noop_netlink);
+            namespace_checks.linux_netns = preflight_fail_linux_netns;
+            let namespace_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                namespace_checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful relay forwarder namespace preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(namespace_error
+                .to_string()
+                .contains("blocked test netns relay-a"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_relay_forwarder_inherited_linux_namespace() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--linux-netns",
+            "node-a",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.linux_netns);
+            assert!(needs.relay_forwarder_netns);
+            assert!(needs.cap_sys_admin);
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.linux_netns = preflight_fail_linux_netns;
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful inherited namespace preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("blocked test netns node-a"));
             return Ok(());
         }
 
