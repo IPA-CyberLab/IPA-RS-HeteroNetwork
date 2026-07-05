@@ -21,6 +21,8 @@ const ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
 const ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces";
+const ASYMMETRIC_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_snat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -286,6 +288,45 @@ async fn udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_
             right_reflexive_port: 50102,
             left_snat_port: Some(51101),
             right_snat_port: Some(51102),
+            expect_hole_punch_success: false,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping asymmetric address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_two_sided_snat_hole_punch_topology(
+        ASYMMETRIC_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME,
+        "asymapdnat",
+        TwoSidedSnatTopology {
+            private_second_octet: 247,
+            public_third_octet: 5,
+            left_bind_port: 40101,
+            right_bind_port: 40102,
+            left_reflexive_port: 50101,
+            right_reflexive_port: 40102,
+            left_snat_port: Some(51101),
+            right_snat_port: None,
             expect_hole_punch_success: false,
         },
     )
