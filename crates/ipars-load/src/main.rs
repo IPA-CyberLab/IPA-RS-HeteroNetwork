@@ -23,8 +23,8 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
     AgentStatusResponse, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
     JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayStatusResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    RelayAdmissionResponse, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -1465,6 +1465,30 @@ async fn check_daemon_agent_control_and_signal_readiness(
     signal_url: &str,
     statuses: &[AgentStatusResponse],
 ) -> anyhow::Result<()> {
+    let expected_agent_count = statuses.len();
+    if expected_agent_count > 0 {
+        let control_metrics: ControlPlaneMetricsResponse = get_json(
+            client,
+            format!("{control_plane_url}/v1/metrics"),
+            "daemon control-plane readiness metrics",
+        )
+        .await?;
+        if control_metrics.healthy_node_count < expected_agent_count {
+            bail!(
+                "daemon control-plane reports {} healthy nodes; expected at least {}",
+                control_metrics.healthy_node_count,
+                expected_agent_count
+            );
+        }
+        if control_metrics.degraded_node_count > 0 || control_metrics.unhealthy_node_count > 0 {
+            bail!(
+                "daemon control-plane reports degraded={} unhealthy={} nodes during readiness",
+                control_metrics.degraded_node_count,
+                control_metrics.unhealthy_node_count
+            );
+        }
+    }
+
     for status in statuses {
         let peer_map: PeerMap = get_json(
             client,
@@ -1479,6 +1503,36 @@ async fn check_daemon_agent_control_and_signal_readiness(
                 status.node_id,
                 peer_map.peers.len(),
                 expected_peer_count
+            );
+        }
+    }
+
+    if expected_agent_count > 0 {
+        let signal_metrics: SignalMetricsResponse = get_json(
+            client,
+            format!("{signal_url}/v1/metrics"),
+            "daemon signal readiness metrics",
+        )
+        .await?;
+        if signal_metrics.health_report_count < expected_agent_count {
+            bail!(
+                "daemon signal reports {} health records; expected at least {}",
+                signal_metrics.health_report_count,
+                expected_agent_count
+            );
+        }
+        if signal_metrics.healthy_node_count < expected_agent_count {
+            bail!(
+                "daemon signal reports {} healthy nodes; expected at least {}",
+                signal_metrics.healthy_node_count,
+                expected_agent_count
+            );
+        }
+        if signal_metrics.degraded_node_count > 0 || signal_metrics.unhealthy_node_count > 0 {
+            bail!(
+                "daemon signal reports degraded={} unhealthy={} nodes during readiness",
+                signal_metrics.degraded_node_count,
+                signal_metrics.unhealthy_node_count
             );
         }
     }
@@ -1977,6 +2031,14 @@ mod tests {
                     registration: register_request(index, scenario)?,
                 },
                 "readiness control-plane join",
+            )
+            .await?;
+            let heartbeat = heartbeat_request(index, &response.node)?;
+            let _: HeartbeatResponse = post_json(
+                &client,
+                format!("{}/v1/heartbeat", services.control_plane_url),
+                &heartbeat,
+                "readiness control-plane heartbeat",
             )
             .await?;
             let _: SignalNodeUpsertResponse = put_json(

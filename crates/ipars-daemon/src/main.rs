@@ -11661,10 +11661,16 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         loop {
             match std::fs::read_to_string(path) {
                 Ok(contents) => {
-                    return contents
-                        .trim()
-                        .parse::<u32>()
-                        .context("failed to parse child pid");
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        match contents.parse::<u32>() {
+                            Ok(pid) => return Ok(pid),
+                            Err(error) if started.elapsed() >= timeout => {
+                                return Err(error).context("failed to parse child pid");
+                            }
+                            Err(_) => {}
+                        }
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
