@@ -45,9 +45,9 @@ use ipars_types::api::{
     AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowClassification,
     AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowObservation,
     AgentPacketFlowTcpState, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
-    RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PathStateCount, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
     SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
@@ -2464,6 +2464,7 @@ fn apply_token_ledger_metrics(
 struct SignalOtelSnapshot {
     node_upsert_count: u64,
     path_negotiation_count: u64,
+    path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
 }
 
@@ -2472,6 +2473,7 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
         Self {
             node_upsert_count: metrics.node_upsert_count,
             path_negotiation_count: metrics.path_negotiation_count,
+            path_negotiation_state_counts: metrics.path_negotiation_state_counts.clone(),
             hole_punch_plan_count: metrics.hole_punch_plan_count,
         }
     }
@@ -2490,6 +2492,7 @@ struct SignalOtelMetrics {
     endpoint_candidate_ttl_seconds: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
+    path_negotiations_by_state: Counter<u64>,
     hole_punch_plans: Counter<u64>,
 }
 
@@ -2540,6 +2543,10 @@ impl SignalOtelMetrics {
             path_negotiations: meter
                 .u64_counter("ipars.signal.path_negotiations")
                 .with_description("Signal path negotiation requests handled.")
+                .build(),
+            path_negotiations_by_state: meter
+                .u64_counter("ipars.signal.path_negotiations.by_state")
+                .with_description("Successful signal path negotiations by selected state.")
                 .build(),
             hole_punch_plans: meter
                 .u64_counter("ipars.signal.hole_punch_plans")
@@ -2592,6 +2599,23 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        for state in [
+            PathState::DirectPublic,
+            PathState::DirectIpv6,
+            PathState::DirectNatTraversal,
+            PathState::Relay,
+            PathState::Unreachable,
+        ] {
+            let attrs = [KeyValue::new("state", path_state_label(state))];
+            self.path_negotiations_by_state.add(
+                counter_delta(
+                    signal_path_state_count(metrics, state) as u64,
+                    previous
+                        .map(|previous| signal_snapshot_path_state_count(previous, state) as u64),
+                ),
+                &attrs,
+            );
+        }
         self.hole_punch_plans.add(
             counter_delta(
                 metrics.hole_punch_plan_count,
@@ -2616,6 +2640,24 @@ fn start_signal_otel_metrics_export(
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+fn signal_path_state_count(metrics: &SignalMetricsResponse, state: PathState) -> usize {
+    metrics
+        .path_negotiation_state_counts
+        .iter()
+        .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_snapshot_path_state_count(snapshot: &SignalOtelSnapshot, state: PathState) -> usize {
+    snapshot
+        .path_negotiation_state_counts
+        .iter()
+        .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use ipars_types::api::{
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertResponse,
+    PathStateCount, SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertResponse,
     SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
@@ -29,6 +29,11 @@ pub struct SignalRegistry {
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     node_upserts: AtomicU64,
     path_negotiations: AtomicU64,
+    direct_public_negotiations: AtomicU64,
+    direct_ipv6_negotiations: AtomicU64,
+    direct_nat_traversal_negotiations: AtomicU64,
+    relay_negotiations: AtomicU64,
+    unreachable_negotiations: AtomicU64,
     hole_punch_plans: AtomicU64,
 }
 
@@ -41,6 +46,11 @@ impl SignalRegistry {
             health: RwLock::new(BTreeMap::new()),
             node_upserts: AtomicU64::new(0),
             path_negotiations: AtomicU64::new(0),
+            direct_public_negotiations: AtomicU64::new(0),
+            direct_ipv6_negotiations: AtomicU64::new(0),
+            direct_nat_traversal_negotiations: AtomicU64::new(0),
+            relay_negotiations: AtomicU64::new(0),
+            unreachable_negotiations: AtomicU64::new(0),
             hole_punch_plans: AtomicU64::new(0),
         }
     }
@@ -118,12 +128,14 @@ impl SignalRegistry {
             .get(&request.target)
             .cloned();
         let relays = self.relay_candidates().await;
-        Ok(self.coordinator.negotiate(
+        let response = self.coordinator.negotiate(
             request,
             &target,
             target_nat_classification.as_ref(),
             &relays,
-        ))
+        );
+        self.record_path_negotiation_state(response.preferred_state);
+        Ok(response)
     }
 
     pub async fn hole_punch_plan(
@@ -226,11 +238,55 @@ impl SignalRegistry {
             stale_endpoint_candidate_count,
             node_upsert_count: self.node_upserts.load(Ordering::Relaxed),
             path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
+            path_negotiation_state_counts: self.path_negotiation_state_counts(),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
             generated_at: now,
         }
+    }
+
+    fn record_path_negotiation_state(&self, state: PathState) {
+        match state {
+            PathState::DirectPublic => &self.direct_public_negotiations,
+            PathState::DirectIpv6 => &self.direct_ipv6_negotiations,
+            PathState::DirectNatTraversal => &self.direct_nat_traversal_negotiations,
+            PathState::Relay => &self.relay_negotiations,
+            PathState::Unreachable => &self.unreachable_negotiations,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn path_negotiation_state_counts(&self) -> Vec<PathStateCount> {
+        [
+            (
+                PathState::DirectPublic,
+                self.direct_public_negotiations.load(Ordering::Relaxed),
+            ),
+            (
+                PathState::DirectIpv6,
+                self.direct_ipv6_negotiations.load(Ordering::Relaxed),
+            ),
+            (
+                PathState::DirectNatTraversal,
+                self.direct_nat_traversal_negotiations
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                PathState::Relay,
+                self.relay_negotiations.load(Ordering::Relaxed),
+            ),
+            (
+                PathState::Unreachable,
+                self.unreachable_negotiations.load(Ordering::Relaxed),
+            ),
+        ]
+        .into_iter()
+        .map(|(state, count)| PathStateCount {
+            state,
+            count: count as usize,
+        })
+        .collect()
     }
 }
 
@@ -793,6 +849,11 @@ mod tests {
         assert_eq!(stale_metrics.stale_health_report_count, 1);
         assert_eq!(stale_metrics.node_upsert_count, 3);
         assert_eq!(stale_metrics.path_negotiation_count, 1);
+        assert_eq!(
+            signal_path_state_count(&stale_metrics, PathState::Unreachable),
+            1
+        );
+        assert_eq!(signal_path_state_count(&stale_metrics, PathState::Relay), 0);
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
@@ -863,5 +924,14 @@ mod tests {
             confidence: 0.9,
             assessed_at: Utc::now(),
         }
+    }
+
+    fn signal_path_state_count(metrics: &SignalMetricsResponse, state: PathState) -> usize {
+        metrics
+            .path_negotiation_state_counts
+            .iter()
+            .find(|entry| entry.state == state)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
     }
 }

@@ -11,7 +11,7 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
-use ipars_types::NodeId;
+use ipars_types::{NodeId, PathState};
 use serde::Serialize;
 
 macro_rules! prometheus_line {
@@ -203,6 +203,22 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_path_negotiation_state_total Successful signal path negotiations by selected state."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_negotiation_state_total counter"
+    );
+    for state_count in &metrics.path_negotiation_state_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_signal_path_negotiation_state_total{{state=\"{}\"}} {}",
+            path_state_label(state_count.state),
+            state_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_hole_punch_plans_total Total signal hole-punch plan requests handled."
     );
     prometheus_line!(
@@ -241,6 +257,16 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         metrics.endpoint_candidate_ttl_seconds
     );
     body
+}
+
+fn path_state_label(state: PathState) -> &'static str {
+    match state {
+        PathState::DirectPublic => "DIRECT_PUBLIC",
+        PathState::DirectIpv6 => "DIRECT_IPV6",
+        PathState::DirectNatTraversal => "DIRECT_NAT_TRAVERSAL",
+        PathState::Relay => "RELAY",
+        PathState::Unreachable => "UNREACHABLE",
+    }
 }
 
 #[derive(Debug)]
@@ -398,6 +424,10 @@ mod tests {
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
         assert_eq!(metrics.node_upsert_count, 1);
         assert_eq!(metrics.path_negotiation_count, 1);
+        assert_eq!(
+            signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
+            1
+        );
 
         let response = app
             .oneshot(
@@ -414,6 +444,21 @@ mod tests {
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
+        assert!(
+            body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
+        );
         Ok(())
+    }
+
+    fn signal_path_state_count(
+        metrics: &SignalMetricsResponse,
+        state: ipars_types::PathState,
+    ) -> usize {
+        metrics
+            .path_negotiation_state_counts
+            .iter()
+            .find(|entry| entry.state == state)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
     }
 }

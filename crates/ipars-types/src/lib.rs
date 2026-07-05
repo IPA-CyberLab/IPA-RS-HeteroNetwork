@@ -1065,6 +1065,8 @@ pub mod api {
         pub stale_endpoint_candidate_count: usize,
         pub node_upsert_count: u64,
         pub path_negotiation_count: u64,
+        #[serde(default)]
+        pub path_negotiation_state_counts: Vec<PathStateCount>,
         pub hole_punch_plan_count: u64,
         pub relay_health_ttl_seconds: u64,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
