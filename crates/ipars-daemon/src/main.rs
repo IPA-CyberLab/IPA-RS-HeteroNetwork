@@ -47,7 +47,7 @@ use ipars_types::api::{
     AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
     AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayForwarderMetrics,
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
     RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
     SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
@@ -67,8 +67,8 @@ use ipars_types::ebpf::{
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
+    KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState,
+    RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -2606,6 +2606,7 @@ struct SignalOtelSnapshot {
     hole_punch_plan_count: u64,
     hole_punch_acl_denied_count: u64,
     hole_punch_nat_suppressed_count: u64,
+    hole_punch_nat_suppressed_strategy_counts: Vec<NatTraversalStrategyCount>,
 }
 
 impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
@@ -2619,6 +2620,9 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
             hole_punch_plan_count: metrics.hole_punch_plan_count,
             hole_punch_acl_denied_count: metrics.hole_punch_acl_denied_count,
             hole_punch_nat_suppressed_count: metrics.hole_punch_nat_suppressed_count,
+            hole_punch_nat_suppressed_strategy_counts: metrics
+                .hole_punch_nat_suppressed_strategy_counts
+                .clone(),
         }
     }
 }
@@ -2647,6 +2651,7 @@ struct SignalOtelMetrics {
     hole_punch_plans: Counter<u64>,
     hole_punch_acl_denials: Counter<u64>,
     hole_punch_nat_suppressions: Counter<u64>,
+    hole_punch_nat_suppressions_by_strategy: Counter<u64>,
 }
 
 impl SignalOtelMetrics {
@@ -2748,6 +2753,12 @@ impl SignalOtelMetrics {
             hole_punch_nat_suppressions: meter
                 .u64_counter("ipars.signal.hole_punch_nat_suppressions")
                 .with_description("Signal hole-punch plans suppressed by NAT classification.")
+                .build(),
+            hole_punch_nat_suppressions_by_strategy: meter
+                .u64_counter("ipars.signal.hole_punch_nat_suppressions.by_strategy")
+                .with_description(
+                    "Hole-punch suppressing NAT classifications observed during suppressed plans by traversal strategy.",
+                )
                 .build(),
         }
     }
@@ -2865,6 +2876,20 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        for strategy in NatTraversalStrategy::ALL {
+            let attrs = [KeyValue::new("strategy", strategy.as_str())];
+            self.hole_punch_nat_suppressions_by_strategy.add(
+                counter_delta(
+                    signal_hole_punch_nat_suppression_strategy_count(metrics, strategy) as u64,
+                    previous.map(|previous| {
+                        signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                            previous, strategy,
+                        ) as u64
+                    }),
+                ),
+                &attrs,
+            );
+        }
     }
 }
 
@@ -2898,6 +2923,30 @@ fn signal_snapshot_path_state_count(snapshot: &SignalOtelSnapshot, state: PathSt
         .path_negotiation_state_counts
         .iter()
         .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_hole_punch_nat_suppression_strategy_count(
+    metrics: &SignalMetricsResponse,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    metrics
+        .hole_punch_nat_suppressed_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_snapshot_hole_punch_nat_suppression_strategy_count(
+    snapshot: &SignalOtelSnapshot,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    snapshot
+        .hole_punch_nat_suppressed_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
         .map(|entry| entry.count)
         .unwrap_or(0)
 }
@@ -9516,6 +9565,71 @@ mod tests {
     #[test]
     fn acl_rule_parser_rejects_invalid_json() {
         assert!(parse_acl_rule("not json").is_err());
+    }
+
+    #[test]
+    fn signal_otel_nat_suppression_strategy_counts_default_missing_strategies() {
+        let metrics = SignalMetricsResponse {
+            node_count: 0,
+            relay_candidate_count: 0,
+            nat_classification_count: 0,
+            stale_nat_classification_count: 0,
+            fresh_low_confidence_nat_classification_count: 0,
+            fresh_nat_classification_strategy_counts: Vec::new(),
+            health_report_count: 0,
+            healthy_node_count: 0,
+            degraded_node_count: 0,
+            unhealthy_node_count: 0,
+            stale_health_report_count: 0,
+            stale_endpoint_candidate_count: 0,
+            node_upsert_count: 0,
+            path_negotiation_count: 0,
+            path_acl_denied_count: 0,
+            relay_candidate_acl_denied_count: 0,
+            path_negotiation_state_counts: Vec::new(),
+            hole_punch_plan_count: 1,
+            hole_punch_acl_denied_count: 0,
+            hole_punch_nat_suppressed_count: 1,
+            hole_punch_nat_suppressed_strategy_counts: vec![NatTraversalStrategyCount {
+                strategy: NatTraversalStrategy::RelayPreferred,
+                count: 2,
+            }],
+            relay_health_ttl_seconds: 30,
+            endpoint_candidate_ttl_seconds: 120,
+            nat_classification_ttl_seconds: 300,
+            nat_classification_min_confidence_percent: 50,
+            generated_at: Utc::now(),
+        };
+        let snapshot = SignalOtelSnapshot::from(&metrics);
+
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &metrics,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            2
+        );
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &metrics,
+                NatTraversalStrategy::DirectCandidate,
+            ),
+            0
+        );
+        assert_eq!(
+            signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            2
+        );
+        assert_eq!(
+            signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::InsufficientData,
+            ),
+            0
+        );
     }
 
     #[test]

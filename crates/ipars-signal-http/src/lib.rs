@@ -326,6 +326,22 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_hole_punch_nat_suppressions_by_strategy_total Total hole-punch suppressing NAT classifications observed during suppressed plans by traversal strategy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_nat_suppressions_by_strategy_total counter"
+    );
+    for strategy_count in &metrics.hole_punch_nat_suppressed_strategy_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_signal_hole_punch_nat_suppressions_by_strategy_total{{strategy=\"{}\"}} {}",
+            strategy_count.strategy.as_str(),
+            strategy_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_relay_health_ttl_seconds Relay health freshness window used by signal."
     );
     prometheus_line!(
@@ -594,6 +610,12 @@ mod tests {
         assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        assert!(metrics
+            .hole_punch_nat_suppressed_strategy_counts
+            .iter()
+            .any(
+                |entry| entry.strategy == NatTraversalStrategy::DirectCandidate && entry.count == 0
+            ));
         assert_eq!(
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
             1
@@ -625,6 +647,9 @@ mod tests {
         assert!(body.contains("ipars_signal_relay_candidate_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_hole_punch_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
+        assert!(body.contains(
+            "ipars_signal_hole_punch_nat_suppressions_by_strategy_total{strategy=\"direct_candidate\"} 0"
+        ));
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
         );

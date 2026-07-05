@@ -51,6 +51,10 @@ pub struct SignalRegistry {
     hole_punch_plans: AtomicU64,
     hole_punch_acl_denials: AtomicU64,
     hole_punch_nat_suppressions: AtomicU64,
+    hole_punch_nat_suppression_direct_candidate: AtomicU64,
+    hole_punch_nat_suppression_coordinated_hole_punch: AtomicU64,
+    hole_punch_nat_suppression_relay_preferred: AtomicU64,
+    hole_punch_nat_suppression_insufficient_data: AtomicU64,
 }
 
 impl SignalRegistry {
@@ -72,6 +76,10 @@ impl SignalRegistry {
             hole_punch_plans: AtomicU64::new(0),
             hole_punch_acl_denials: AtomicU64::new(0),
             hole_punch_nat_suppressions: AtomicU64::new(0),
+            hole_punch_nat_suppression_direct_candidate: AtomicU64::new(0),
+            hole_punch_nat_suppression_coordinated_hole_punch: AtomicU64::new(0),
+            hole_punch_nat_suppression_relay_preferred: AtomicU64::new(0),
+            hole_punch_nat_suppression_insufficient_data: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +269,10 @@ impl SignalRegistry {
         ) {
             self.hole_punch_nat_suppressions
                 .fetch_add(1, Ordering::Relaxed);
+            self.record_hole_punch_nat_suppression_strategies(
+                source_nat_classification.as_ref(),
+                target_nat_classification.as_ref(),
+            );
         }
         let plan = self.coordinator.punch_plan(
             &source_node.endpoint_candidates,
@@ -389,6 +401,8 @@ impl SignalRegistry {
             hole_punch_nat_suppressed_count: self
                 .hole_punch_nat_suppressions
                 .load(Ordering::Relaxed),
+            hole_punch_nat_suppressed_strategy_counts: self
+                .hole_punch_nat_suppression_strategy_counts(),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
             nat_classification_ttl_seconds,
@@ -438,6 +452,56 @@ impl SignalRegistry {
             count: count as usize,
         })
         .collect()
+    }
+
+    fn record_hole_punch_nat_suppression_strategies(
+        &self,
+        source: Option<&NatClassification>,
+        target: Option<&NatClassification>,
+    ) {
+        for strategy in [source, target].into_iter().filter_map(|classification| {
+            nat_classification_hole_punch_suppression_strategy(
+                classification,
+                self.coordinator
+                    .policy
+                    .nat_classification_min_confidence_percent,
+            )
+        }) {
+            self.hole_punch_nat_suppression_strategy_counter(strategy)
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn hole_punch_nat_suppression_strategy_counter(
+        &self,
+        strategy: NatTraversalStrategy,
+    ) -> &AtomicU64 {
+        match strategy {
+            NatTraversalStrategy::DirectCandidate => {
+                &self.hole_punch_nat_suppression_direct_candidate
+            }
+            NatTraversalStrategy::CoordinatedHolePunch => {
+                &self.hole_punch_nat_suppression_coordinated_hole_punch
+            }
+            NatTraversalStrategy::RelayPreferred => {
+                &self.hole_punch_nat_suppression_relay_preferred
+            }
+            NatTraversalStrategy::InsufficientData => {
+                &self.hole_punch_nat_suppression_insufficient_data
+            }
+        }
+    }
+
+    fn hole_punch_nat_suppression_strategy_counts(&self) -> Vec<NatTraversalStrategyCount> {
+        NatTraversalStrategy::ALL
+            .into_iter()
+            .map(|strategy| NatTraversalStrategyCount {
+                strategy,
+                count: self
+                    .hole_punch_nat_suppression_strategy_counter(strategy)
+                    .load(Ordering::Relaxed) as usize,
+            })
+            .collect()
     }
 }
 
@@ -780,6 +844,18 @@ fn nat_classification_allows_hole_punch(
             classification.strategy,
             NatTraversalStrategy::DirectCandidate | NatTraversalStrategy::CoordinatedHolePunch
         ),
+    }
+}
+
+fn nat_classification_hole_punch_suppression_strategy(
+    classification: Option<&NatClassification>,
+    min_confidence_percent: u8,
+) -> Option<NatTraversalStrategy> {
+    let classification = classification?;
+    if nat_classification_allows_hole_punch(Some(classification), min_confidence_percent) {
+        None
+    } else {
+        Some(classification.strategy)
     }
 }
 
@@ -1541,6 +1617,20 @@ mod tests {
         assert_eq!(signal_path_state_count(&stale_metrics, PathState::Relay), 0);
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
         assert_eq!(stale_metrics.hole_punch_nat_suppressed_count, 1);
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &stale_metrics,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            1
+        );
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &stale_metrics,
+                NatTraversalStrategy::CoordinatedHolePunch,
+            ),
+            0
+        );
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
         assert_eq!(stale_metrics.nat_classification_ttl_seconds, 300);
@@ -1818,6 +1908,18 @@ mod tests {
             .path_negotiation_state_counts
             .iter()
             .find(|entry| entry.state == state)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
+    fn signal_hole_punch_nat_suppression_strategy_count(
+        metrics: &SignalMetricsResponse,
+        strategy: NatTraversalStrategy,
+    ) -> usize {
+        metrics
+            .hole_punch_nat_suppressed_strategy_counts
+            .iter()
+            .find(|entry| entry.strategy == strategy)
             .map(|entry| entry.count)
             .unwrap_or(0)
     }
