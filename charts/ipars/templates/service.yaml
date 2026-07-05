@@ -267,6 +267,9 @@ spec:
   {{- if .Values.agent.apiService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.apiService.internalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.apiService.publishNotReadyAddresses }}
+  publishNotReadyAddresses: true
+  {{- end }}
   {{- if .Values.agent.apiService.sessionAffinity }}
   sessionAffinity: {{ .Values.agent.apiService.sessionAffinity }}
   {{- end }}
@@ -329,6 +332,9 @@ spec:
   {{- end }}
   {{- if .Values.agent.relayService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.relayService.internalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.agent.relayService.publishNotReadyAddresses }}
+  publishNotReadyAddresses: true
   {{- end }}
   {{- if .Values.agent.relayService.sessionAffinity }}
   sessionAffinity: {{ .Values.agent.relayService.sessionAffinity }}

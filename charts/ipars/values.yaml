@@ -92,6 +92,7 @@ agent:
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
     appProtocol: http
+    publishNotReadyAddresses: false
     port: 9780
     nodePort: 0
   relayForwarder:
@@ -124,6 +125,7 @@ agent:
     externalTrafficPolicy: Local
     udpAppProtocol: ipars.io/relay-udp
     httpAppProtocol: http
+    publishNotReadyAddresses: false
     udpPort: 51820
     httpPort: 9580
     udpNodePort: 0

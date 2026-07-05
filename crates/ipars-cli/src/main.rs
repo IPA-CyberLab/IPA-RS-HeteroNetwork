@@ -403,6 +403,12 @@ struct K8sInstallArgs {
     agent_api_node_port: Option<u16>,
     #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
     agent_api_app_protocol: Option<String>,
+    #[arg(
+        long = "agent-api-publish-not-ready-addresses",
+        default_value_t = false,
+        requires = "expose_agent_api"
+    )]
+    agent_api_publish_not_ready_addresses: bool,
     #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
     agent_api_load_balancer_class: Option<String>,
     #[arg(long = "agent-api-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
@@ -450,6 +456,12 @@ struct K8sInstallArgs {
     relay_udp_app_protocol: Option<String>,
     #[arg(long = "relay-http-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_relay")]
     relay_http_app_protocol: Option<String>,
+    #[arg(
+        long = "relay-publish-not-ready-addresses",
+        default_value_t = false,
+        requires = "expose_relay"
+    )]
+    relay_publish_not_ready_addresses: bool,
     #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
     relay_load_balancer_class: Option<String>,
     #[arg(long = "relay-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
@@ -2462,6 +2474,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 app_protocol,
             );
         }
+        if args.agent_api_publish_not_ready_addresses {
+            helm_command.push_str(" --set agent.apiService.publishNotReadyAddresses=true");
+        }
         if let Some(load_balancer_class) = args.agent_api_load_balancer_class.as_deref() {
             append_helm_set_string(
                 &mut helm_command,
@@ -2574,6 +2589,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 "agent.relayService.httpAppProtocol",
                 app_protocol,
             );
+        }
+        if args.relay_publish_not_ready_addresses {
+            helm_command.push_str(" --set agent.relayService.publishNotReadyAddresses=true");
         }
         if let Some(load_balancer_class) = args.relay_load_balancer_class.as_deref() {
             append_helm_set_string(
@@ -3359,6 +3377,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_app_protocol.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-app-protocol requires --expose-agent-api");
     }
+    if args.agent_api_publish_not_ready_addresses && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-publish-not-ready-addresses requires --expose-agent-api");
+    }
     if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
     }
@@ -3394,6 +3415,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_http_app_protocol.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-http-app-protocol requires --expose-relay");
+    }
+    if args.relay_publish_not_ready_addresses && !args.expose_relay {
+        anyhow::bail!("--relay-publish-not-ready-addresses requires --expose-relay");
     }
     if args.relay_load_balancer_class.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
@@ -4733,6 +4757,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
             agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
+            agent_api_publish_not_ready_addresses: true,
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
             agent_api_health_check_node_port: Some(31081),
             agent_api_disable_load_balancer_node_ports: false,
@@ -4754,6 +4779,7 @@ mod tests {
             relay_http_node_port: Some(31580),
             relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
             relay_http_app_protocol: Some("http".to_string()),
+            relay_publish_not_ready_addresses: true,
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
             relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
@@ -4797,6 +4823,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+        assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
         assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
@@ -4826,6 +4853,7 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
         assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
+        assert!(plan.commands[2].contains("--set agent.relayService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
@@ -4929,6 +4957,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -4947,6 +4976,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -5934,6 +5964,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -5952,6 +5983,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6037,6 +6069,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6055,6 +6088,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6200,6 +6234,51 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-http-app-protocol"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_publish_not_ready_addresses() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_publish_not_ready_addresses = true;
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_publish_not_ready_addresses = true;
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
+        assert!(plan.commands[2].contains("--set agent.relayService.publishNotReadyAddresses=true"));
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_publish_not_ready_addresses = true;
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => {
+                panic!("agent API publishNotReadyAddresses requires exposed agent API Service")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-publish-not-ready-addresses requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_publish_not_ready_addresses = true;
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay publishNotReadyAddresses requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-publish-not-ready-addresses requires"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-api-publish-not-ready-addresses",
+        ]);
+        assert!(parsed.is_err());
 
         Ok(())
     }
@@ -6715,6 +6794,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6733,6 +6813,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6805,6 +6886,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6823,6 +6905,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6902,6 +6985,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6920,6 +7004,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6997,6 +7082,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -7015,6 +7101,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -7087,6 +7174,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -7105,6 +7193,7 @@ mod tests {
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
             relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
