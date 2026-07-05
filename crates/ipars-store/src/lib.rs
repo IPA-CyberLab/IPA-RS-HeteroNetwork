@@ -954,6 +954,17 @@ mod tests {
                 .map(|capability| capability.active_sessions),
             Some(7)
         );
+        store
+            .update_node_relay_capability(&local.node_id, None)
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .relay_capability,
+            None
+        );
         let rotated = store
             .rotate_node_wireguard_public_key(
                 &local.node_id,

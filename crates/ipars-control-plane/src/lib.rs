@@ -632,18 +632,22 @@ where
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
+        let relay_capability = request
+            .relay_capability
+            .map(|mut relay_capability| {
+                if !node.token_policy.allow_relay {
+                    return Err(ControlPlaneError::RelayDenied);
+                }
+                relay_capability.enabled_by_policy = true;
+                Ok(relay_capability)
+            })
+            .transpose()?;
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
-        if let Some(mut relay_capability) = request.relay_capability {
-            if !node.token_policy.allow_relay {
-                return Err(ControlPlaneError::RelayDenied);
-            }
-            relay_capability.enabled_by_policy = true;
-            self.store
-                .update_node_relay_capability(&request.node_id, Some(relay_capability))
-                .await?;
-        }
+        self.store
+            .update_node_relay_capability(&request.node_id, relay_capability)
+            .await?;
         self.store
             .upsert_health(request.node_id.clone(), request.health)
             .await?;
@@ -1889,7 +1893,7 @@ mod tests {
                         message: None,
                     },
                     candidates: Vec::new(),
-                    relay_capability: None,
+                    relay_capability: Some(relay_capability()),
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2910,7 +2914,7 @@ mod tests {
                         message: None,
                     },
                     candidates: Vec::new(),
-                    relay_capability: None,
+                    relay_capability: Some(relay_capability()),
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2993,7 +2997,7 @@ mod tests {
                         message: None,
                     },
                     candidates: Vec::new(),
-                    relay_capability: None,
+                    relay_capability: Some(relay_capability()),
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3060,7 +3064,7 @@ mod tests {
                         message: None,
                     },
                     candidates: Vec::new(),
-                    relay_capability: None,
+                    relay_capability: Some(relay_capability()),
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3238,6 +3242,79 @@ mod tests {
         };
         assert!(relay.enabled_by_policy);
         assert_eq!(relay.active_sessions, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_clears_relay_capability_when_not_reported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.10),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: None,
+                        message: Some("relay stopped".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        let relay_node = store
+            .get_node(&node_id("relay-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("relay-a")))?;
+        assert!(relay_node.relay_capability.is_none());
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
+
+        let source_registration = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        assert!(source_registration.relay_map.relays.is_empty());
         Ok(())
     }
 
