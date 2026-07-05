@@ -16,6 +16,9 @@
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
 {{- $agentAllowPrivilegeEscalation := printf "%v" .Values.agent.securityContext.allowPrivilegeEscalation -}}
+{{- $agentReadOnlyRootFilesystem := printf "%v" .Values.agent.securityContext.readOnlyRootFilesystem -}}
+{{- $agentSeccompProfileType := .Values.agent.securityContext.seccompProfile.type -}}
+{{- $agentSeccompLocalhostProfile := .Values.agent.securityContext.seccompProfile.localhostProfile -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
@@ -76,6 +79,21 @@
 {{- end -}}
 {{- if not (or (eq $agentAllowPrivilegeEscalation "") (eq $agentAllowPrivilegeEscalation "true") (eq $agentAllowPrivilegeEscalation "false")) -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation must be true, false, or empty" -}}
+{{- end -}}
+{{- if not (or (eq $agentReadOnlyRootFilesystem "") (eq $agentReadOnlyRootFilesystem "true") (eq $agentReadOnlyRootFilesystem "false")) -}}
+{{- fail "agent.securityContext.readOnlyRootFilesystem must be true, false, or empty" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompProfileType "") (not (or (eq $agentSeccompProfileType "RuntimeDefault") (eq $agentSeccompProfileType "Localhost") (eq $agentSeccompProfileType "Unconfined"))) -}}
+{{- fail "agent.securityContext.seccompProfile.type must be RuntimeDefault, Localhost, Unconfined, or empty" -}}
+{{- end -}}
+{{- if and (eq $agentSeccompProfileType "Localhost") (eq $agentSeccompLocalhostProfile "") -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile is required when seccompProfile.type=Localhost" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompProfileType "Localhost") (ne $agentSeccompLocalhostProfile "") -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile requires seccompProfile.type=Localhost" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompLocalhostProfile "") (or (gt (len $agentSeccompLocalhostProfile) 255) (regexMatch "^/" $agentSeccompLocalhostProfile) (regexMatch "/$" $agentSeccompLocalhostProfile) (regexMatch "(^|/)[.][.]($|/)" $agentSeccompLocalhostProfile) (regexMatch "//" $agentSeccompLocalhostProfile) (not (regexMatch "^[A-Za-z0-9._/@%+=:,-]+$" $agentSeccompLocalhostProfile))) -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile must be a relative path without '..' segments, empty segments, or unsafe characters" -}}
 {{- end -}}
 {{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
@@ -498,6 +516,16 @@ spec:
             privileged: {{ $agentPrivileged }}
             {{- if ne $agentAllowPrivilegeEscalation "" }}
             allowPrivilegeEscalation: {{ $agentAllowPrivilegeEscalation }}
+            {{- end }}
+            {{- if ne $agentReadOnlyRootFilesystem "" }}
+            readOnlyRootFilesystem: {{ $agentReadOnlyRootFilesystem }}
+            {{- end }}
+            {{- if ne $agentSeccompProfileType "" }}
+            seccompProfile:
+              type: {{ $agentSeccompProfileType | quote }}
+              {{- if eq $agentSeccompProfileType "Localhost" }}
+              localhostProfile: {{ $agentSeccompLocalhostProfile | quote }}
+              {{- end }}
             {{- end }}
             {{- if or .Values.agent.securityContext.capabilities.add .Values.agent.securityContext.capabilities.drop }}
             capabilities:

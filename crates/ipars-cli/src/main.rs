@@ -319,6 +319,12 @@ struct K8sInstallArgs {
     agent_drop_capabilities: Vec<String>,
     #[arg(long = "disable-agent-privilege-escalation", default_value_t = false)]
     disable_agent_privilege_escalation: bool,
+    #[arg(long = "agent-read-only-root-filesystem", default_value_t = false)]
+    agent_read_only_root_filesystem: bool,
+    #[arg(long = "agent-seccomp-profile", value_parser = parse_kubernetes_seccomp_profile_type)]
+    agent_seccomp_profile: Option<String>,
+    #[arg(long = "agent-seccomp-localhost-profile", value_parser = parse_kubernetes_seccomp_localhost_profile)]
+    agent_seccomp_localhost_profile: Option<String>,
     #[arg(long, default_value_t = false)]
     kubernetes_discover_services: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1408,6 +1414,15 @@ fn parse_kubernetes_dns_policy(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_kubernetes_seccomp_profile_type(value: &str) -> Result<String, String> {
+    match value {
+        "RuntimeDefault" | "Localhost" | "Unconfined" => Ok(value.to_string()),
+        _ => Err(format!(
+            "seccomp profile type must be RuntimeDefault, Localhost, or Unconfined; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_host_path_type(value: &str) -> Result<String, String> {
     match value {
         "DirectoryOrCreate" | "Directory" => Ok(value.to_string()),
@@ -1419,6 +1434,11 @@ fn parse_kubernetes_host_path_type(value: &str) -> Result<String, String> {
 
 fn parse_kubernetes_absolute_path(value: &str) -> Result<String, String> {
     validate_kubernetes_absolute_path(value, "Kubernetes path")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_seccomp_localhost_profile(value: &str) -> Result<String, String> {
+    validate_kubernetes_seccomp_localhost_profile(value)?;
     Ok(value.to_string())
 }
 
@@ -2946,7 +2966,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
@@ -3065,6 +3085,23 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     }
     if args.disable_agent_privilege_escalation {
         command.push_str(" --set agent.securityContext.allowPrivilegeEscalation=false");
+    }
+    if args.agent_read_only_root_filesystem {
+        command.push_str(" --set agent.securityContext.readOnlyRootFilesystem=true");
+    }
+    if let Some(seccomp_type) = args.agent_seccomp_profile.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.securityContext.seccompProfile.type",
+            seccomp_type,
+        );
+    }
+    if let Some(localhost_profile) = args.agent_seccomp_localhost_profile.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.securityContext.seccompProfile.localhostProfile",
+            localhost_profile,
+        );
     }
     append_helm_literal_list(
         command,
@@ -3390,6 +3427,43 @@ fn validate_kubernetes_absolute_path(path: &str, label: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn validate_kubernetes_seccomp_localhost_profile(profile: &str) -> Result<(), String> {
+    if profile.is_empty() {
+        return Err("seccomp localhost profile must not be empty".to_string());
+    }
+    if profile.starts_with('/') {
+        return Err(
+            "seccomp localhost profile must be relative to the kubelet seccomp root".to_string(),
+        );
+    }
+    if profile.ends_with('/') {
+        return Err("seccomp localhost profile must not end with '/'".to_string());
+    }
+    if profile.len() > 255 {
+        return Err("seccomp localhost profile exceeds 255 bytes".to_string());
+    }
+    if profile
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
+        return Err(
+            "seccomp localhost profile must not contain empty or '..' path segments".to_string(),
+        );
+    }
+    if !profile.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.' | b'_' | b'-' | b'@' | b'%' | b'+' | b'=' | b':' | b','
+            )
+    }) {
+        return Err(
+            "seccomp localhost profile must contain only path-safe ASCII characters".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_service_ip_families(
     flag_prefix: &str,
     policy: Option<&str>,
@@ -3553,6 +3627,30 @@ fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<
         if effective_added.contains("SYS_ADMIN") || effective_added.contains("CAP_SYS_ADMIN") {
             anyhow::bail!(
                 "--disable-agent-privilege-escalation cannot be used when SYS_ADMIN is added"
+            );
+        }
+    }
+
+    if let Some(seccomp_profile) = args.agent_seccomp_profile.as_deref() {
+        parse_kubernetes_seccomp_profile_type(seccomp_profile).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(localhost_profile) = args.agent_seccomp_localhost_profile.as_deref() {
+        validate_kubernetes_seccomp_localhost_profile(localhost_profile)
+            .map_err(anyhow::Error::msg)?;
+    }
+    match (
+        args.agent_seccomp_profile.as_deref(),
+        args.agent_seccomp_localhost_profile.as_deref(),
+    ) {
+        (Some("Localhost"), None) => {
+            anyhow::bail!(
+                "--agent-seccomp-profile Localhost requires --agent-seccomp-localhost-profile"
+            );
+        }
+        (Some("Localhost"), Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            anyhow::bail!(
+                "--agent-seccomp-localhost-profile requires --agent-seccomp-profile Localhost"
             );
         }
     }
@@ -5132,6 +5230,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5378,6 +5479,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5578,11 +5682,19 @@ mod tests {
         ];
         args.agent_drop_capabilities = vec!["MKNOD".to_string()];
         args.disable_agent_privilege_escalation = true;
+        args.agent_read_only_root_filesystem = true;
+        args.agent_seccomp_profile = Some("Localhost".to_string());
+        args.agent_seccomp_localhost_profile = Some("profiles/ipars-agent.json".to_string());
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
         assert!(helm.contains("--set agent.securityContext.allowPrivilegeEscalation=false"));
+        assert!(helm.contains("--set agent.securityContext.readOnlyRootFilesystem=true"));
+        assert!(helm.contains("--set-string agent.securityContext.seccompProfile.type=Localhost"));
+        assert!(helm.contains(
+            "--set-string agent.securityContext.seccompProfile.localhostProfile=profiles/ipars-agent.json"
+        ));
         assert!(helm.contains(
             "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_TIME}'"
         ));
@@ -5618,12 +5730,46 @@ mod tests {
         };
         assert!(error.contains("--disable-agent-privilege-escalation"));
 
+        let mut missing_localhost_profile = base_k8s_install_args();
+        missing_localhost_profile.agent_seccomp_profile = Some("Localhost".to_string());
+        let error = match k8s_install_plan(missing_localhost_profile) {
+            Ok(_) => panic!("Localhost seccomp profile should require a localhost profile path"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-seccomp-localhost-profile"));
+
+        let mut extra_localhost_profile = base_k8s_install_args();
+        extra_localhost_profile.agent_seccomp_profile = Some("RuntimeDefault".to_string());
+        extra_localhost_profile.agent_seccomp_localhost_profile =
+            Some("profiles/ipars-agent.json".to_string());
+        let error = match k8s_install_plan(extra_localhost_profile) {
+            Ok(_) => panic!("non-Localhost seccomp profile should reject localhostProfile"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-seccomp-localhost-profile"));
+
         assert!(Cli::try_parse_from([
             "ipars",
             "k8s",
             "install",
             "--agent-add-capability",
             "net_admin",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-seccomp-profile",
+            "Default",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-seccomp-localhost-profile",
+            "../profile.json",
         ])
         .is_err());
 
@@ -6163,6 +6309,9 @@ mod tests {
             "SYS_TIME",
             "--agent-drop-capability",
             "MKNOD",
+            "--agent-read-only-root-filesystem",
+            "--agent-seccomp-profile",
+            "RuntimeDefault",
             "--kubernetes-discover-services",
             "--kubernetes-discover-api-server",
             "false",
@@ -6319,6 +6468,12 @@ mod tests {
             );
             assert_eq!(args.agent_drop_capabilities, vec!["MKNOD"]);
             assert!(!args.disable_agent_privilege_escalation);
+            assert!(args.agent_read_only_root_filesystem);
+            assert_eq!(
+                args.agent_seccomp_profile.as_deref(),
+                Some("RuntimeDefault")
+            );
+            assert_eq!(args.agent_seccomp_localhost_profile, None);
             assert!(args.kubernetes_discover_services);
             assert!(!args.kubernetes_discover_api_server);
             assert_eq!(
@@ -6531,6 +6686,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6652,6 +6810,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -7639,6 +7800,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -7747,6 +7911,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -7862,6 +8029,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -7975,6 +8145,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -8083,6 +8256,9 @@ mod tests {
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),

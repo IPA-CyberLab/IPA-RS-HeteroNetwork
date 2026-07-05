@@ -51,6 +51,10 @@ agent:
   privileged: false
   securityContext:
     allowPrivilegeEscalation: ""
+    readOnlyRootFilesystem: ""
+    seccompProfile:
+      type: ""
+      localhostProfile: ""
     capabilities:
       add:
         - NET_ADMIN
