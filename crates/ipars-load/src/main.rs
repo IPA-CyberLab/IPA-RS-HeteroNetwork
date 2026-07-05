@@ -118,6 +118,7 @@ struct DaemonLoadOptions {
     control_plane_processes: usize,
     agent_processes: usize,
     keep_runtime_dir: bool,
+    relay_options: RelayLoadOptions,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -731,6 +732,7 @@ async fn run_daemon_scenario(
             control_plane_processes,
             agent_processes,
             keep_runtime_dir,
+            relay_options,
         },
     )
     .await?;
@@ -1178,6 +1180,7 @@ enum DaemonRuntimePhase {
 struct DaemonRuntimeManifest {
     scenario: ScenarioName,
     phase: DaemonRuntimePhase,
+    workload: DaemonRuntimeManifestWorkload,
     runtime_dir: PathBuf,
     control_plane_urls: Vec<String>,
     signal_url: String,
@@ -1190,6 +1193,18 @@ struct DaemonRuntimeManifest {
     updated_at: chrono::DateTime<Utc>,
     generated_at: chrono::DateTime<Utc>,
     children: Vec<DaemonRuntimeManifestChild>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonRuntimeManifestWorkload {
+    scenario_node_count: usize,
+    scenario_relay_node_count: usize,
+    scenario_route_provider_count: usize,
+    scenario_active_pair_count: usize,
+    daemon_control_plane_processes: usize,
+    daemon_agent_processes: usize,
+    relay_packets_per_session: usize,
+    relay_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1212,6 +1227,7 @@ enum DaemonRuntimeManifestChildState {
 #[derive(Debug, Clone)]
 struct DaemonRuntimeManifestSeed {
     scenario: ScenarioName,
+    workload: DaemonRuntimeManifestWorkload,
     runtime_dir: PathBuf,
     control_plane_urls: Vec<String>,
     signal_url: String,
@@ -1235,6 +1251,7 @@ impl DaemonRuntimeManifestSeed {
             DaemonRuntimeManifest {
                 scenario: self.scenario,
                 phase,
+                workload: self.workload,
                 runtime_dir: self.runtime_dir.clone(),
                 control_plane_urls: self.control_plane_urls.clone(),
                 signal_url: self.signal_url.clone(),
@@ -1309,6 +1326,16 @@ impl DaemonProcessGroup {
         let mut agent_urls = Vec::with_capacity(options.agent_processes);
         let manifest_seed = DaemonRuntimeManifestSeed {
             scenario: scenario.name,
+            workload: DaemonRuntimeManifestWorkload {
+                scenario_node_count: scenario.node_count,
+                scenario_relay_node_count: scenario.relay_count,
+                scenario_route_provider_count: scenario.route_provider_count,
+                scenario_active_pair_count: scenario.active_pair_count,
+                daemon_control_plane_processes: options.control_plane_processes,
+                daemon_agent_processes: options.agent_processes,
+                relay_packets_per_session: options.relay_options.packets_per_session,
+                relay_payload_bytes: options.relay_options.payload_bytes,
+            },
             runtime_dir: runtime_dir.clone(),
             control_plane_urls: control_plane_urls.clone(),
             signal_url: signal_url.clone(),
@@ -2819,6 +2846,7 @@ mod tests {
         let decoded: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
         assert_eq!(decoded.scenario, manifest.scenario);
         assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReady);
+        assert_eq!(decoded.workload, manifest.workload);
         assert_eq!(decoded.runtime_dir, runtime_dir);
         assert_eq!(decoded.started_at, manifest.started_at);
         assert_eq!(decoded.updated_at, manifest.updated_at);
@@ -2848,6 +2876,7 @@ mod tests {
         let initial: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(initial.phase, DaemonRuntimePhase::ReservedEndpoints);
+        assert_eq!(initial.workload, seed.workload);
         assert_eq!(initial.started_at, seed.started_at);
         assert!(initial.updated_at >= initial.started_at);
         assert_eq!(initial.generated_at, initial.updated_at);
@@ -2880,6 +2909,7 @@ mod tests {
         let updated: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(updated.phase, DaemonRuntimePhase::SignalNegotiation);
+        assert_eq!(updated.workload, seed.workload);
         assert_eq!(updated.started_at, seed.started_at);
         assert!(updated.updated_at >= initial.updated_at);
         assert_eq!(updated.generated_at, updated.updated_at);
@@ -2936,6 +2966,7 @@ mod tests {
         let decoded: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReadiness);
+        assert_eq!(decoded.workload, seed.workload);
         assert_eq!(decoded.started_at, seed.started_at);
         assert!(decoded.updated_at >= decoded.started_at);
         assert_eq!(decoded.agent_urls, agent_urls);
@@ -3346,6 +3377,7 @@ mod tests {
     fn synthetic_manifest_seed(runtime_dir: PathBuf) -> DaemonRuntimeManifestSeed {
         DaemonRuntimeManifestSeed {
             scenario: ScenarioName::Three,
+            workload: synthetic_manifest_workload(),
             runtime_dir,
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
@@ -3362,6 +3394,7 @@ mod tests {
         DaemonRuntimeManifest {
             scenario: ScenarioName::Three,
             phase: DaemonRuntimePhase::StartupReady,
+            workload: synthetic_manifest_workload(),
             runtime_dir,
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
@@ -3381,6 +3414,19 @@ mod tests {
                 exit_status: None,
                 exit_code: None,
             }],
+        }
+    }
+
+    fn synthetic_manifest_workload() -> DaemonRuntimeManifestWorkload {
+        DaemonRuntimeManifestWorkload {
+            scenario_node_count: 3,
+            scenario_relay_node_count: 1,
+            scenario_route_provider_count: 1,
+            scenario_active_pair_count: 6,
+            daemon_control_plane_processes: 2,
+            daemon_agent_processes: 2,
+            relay_packets_per_session: 1,
+            relay_payload_bytes: 64,
         }
     }
 }
