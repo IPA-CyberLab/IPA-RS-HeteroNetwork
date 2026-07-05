@@ -2949,7 +2949,7 @@ fn docker_discovered_routes(
     networks: &[DockerApiNetwork],
     filters: &[String],
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
-    let mut network_names = Vec::new();
+    let mut network_names = BTreeSet::new();
     let mut cidrs = BTreeMap::<ipnet::IpNet, String>::new();
     for network in networks {
         if !docker_network_matches(network, filters) {
@@ -2970,14 +2970,14 @@ fn docker_discovered_routes(
             found_subnet = true;
         }
         if found_subnet {
-            network_names.push(network.name.clone());
+            network_names.insert(network.name.clone());
         }
     }
     if cidrs.is_empty() {
         anyhow::bail!("Docker network discovery found no bridge networks with IPAM subnets");
     }
     Ok(DockerDiscoveredRoutes {
-        network_names,
+        network_names: network_names.into_iter().collect(),
         cidrs: cidrs.into_keys().collect(),
     })
 }
@@ -8485,17 +8485,17 @@ invalid no-destination-here
     fn docker_api_discovery_selects_bridge_network_subnets() -> anyhow::Result<()> {
         let networks = vec![
             docker_api_network(
-                "default-id",
-                "compose_default",
-                "bridge",
-                &["172.18.0.0/16"],
-            ),
-            docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
-            docker_api_network(
                 "other-id",
                 "compose_extra",
                 "bridge",
                 &["172.19.0.0/16", "172.18.0.0/16"],
+            ),
+            docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
             ),
         ];
 
