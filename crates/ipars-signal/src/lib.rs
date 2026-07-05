@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use ipars_types::api::{
@@ -177,6 +178,7 @@ impl SignalRegistry {
         let health = self.health.read().await;
         let now = Utc::now();
         let relay_health_ttl_seconds = self.coordinator.policy.relay_health_ttl_seconds;
+        let endpoint_candidate_ttl_seconds = self.coordinator.policy.endpoint_candidate_ttl_seconds;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
@@ -192,6 +194,13 @@ impl SignalRegistry {
                 stale_health_report_count += 1;
             }
         }
+        let stale_endpoint_candidate_count = nodes
+            .values()
+            .flat_map(|node| &node.endpoint_candidates)
+            .filter(|candidate| {
+                !endpoint_candidate_is_fresh(candidate, now, endpoint_candidate_ttl_seconds)
+            })
+            .count();
 
         let relay_candidate_count = nodes
             .values()
@@ -214,10 +223,12 @@ impl SignalRegistry {
             degraded_node_count,
             unhealthy_node_count,
             stale_health_report_count,
+            stale_endpoint_candidate_count,
             node_upsert_count: self.node_upserts.load(Ordering::Relaxed),
             path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
             relay_health_ttl_seconds,
+            endpoint_candidate_ttl_seconds,
             generated_at: now,
         }
     }
@@ -240,10 +251,21 @@ impl SignalCoordinator {
         target_nat_classification: Option<&NatClassification>,
         relays: &[NodeRecord],
     ) -> SignalPathResponse {
-        let preferred_state = self.preferred_state(
+        let now = Utc::now();
+        let source_candidates = fresh_endpoint_candidates(
             &request.source_candidates,
+            now,
+            self.policy.endpoint_candidate_ttl_seconds,
+        );
+        let target_candidates = fresh_endpoint_candidates(
+            &target.endpoint_candidates,
+            now,
+            self.policy.endpoint_candidate_ttl_seconds,
+        );
+        let preferred_state = self.preferred_state(
+            &source_candidates,
             request.source_nat_classification.as_ref(),
-            target,
+            &target_candidates,
             target_nat_classification,
         );
         let relay_candidates = relays
@@ -283,7 +305,7 @@ impl SignalCoordinator {
 
         SignalPathResponse {
             key: PeerPathKey::new(request.source, request.target),
-            target_candidates: target.endpoint_candidates.clone(),
+            target_candidates,
             relay_candidates,
             preferred_state: usable_state,
             score: PathScore::calculate(usable_state, &metrics, true, 0),
@@ -295,6 +317,11 @@ impl SignalCoordinator {
         source: &[EndpointCandidate],
         target: &[EndpointCandidate],
     ) -> HolePunchPlan {
+        let now = Utc::now();
+        let source =
+            fresh_endpoint_candidates(source, now, self.policy.endpoint_candidate_ttl_seconds);
+        let target =
+            fresh_endpoint_candidates(target, now, self.policy.endpoint_candidate_ttl_seconds);
         let source_reflexive = source
             .iter()
             .find(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
@@ -316,23 +343,21 @@ impl SignalCoordinator {
         &self,
         source_candidates: &[EndpointCandidate],
         source_nat_classification: Option<&NatClassification>,
-        target: &NodeRecord,
+        target_candidates: &[EndpointCandidate],
         target_nat_classification: Option<&NatClassification>,
     ) -> PathState {
         if self.policy.allow_ipv6_direct
             && source_candidates
                 .iter()
                 .any(|candidate| candidate.kind == EndpointCandidateKind::Ipv6)
-            && target
-                .endpoint_candidates
+            && target_candidates
                 .iter()
                 .any(|candidate| candidate.kind == EndpointCandidateKind::Ipv6)
         {
             return PathState::DirectIpv6;
         }
 
-        if target
-            .endpoint_candidates
+        if target_candidates
             .iter()
             .any(|candidate| candidate.kind == EndpointCandidateKind::PublicUdp)
         {
@@ -343,8 +368,7 @@ impl SignalCoordinator {
             && source_candidates
                 .iter()
                 .any(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
-            && target
-                .endpoint_candidates
+            && target_candidates
                 .iter()
                 .any(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
             && nat_classifications_allow_hole_punch(
@@ -356,6 +380,29 @@ impl SignalCoordinator {
         }
 
         PathState::Unreachable
+    }
+}
+
+fn fresh_endpoint_candidates(
+    candidates: &[EndpointCandidate],
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Vec<EndpointCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| endpoint_candidate_is_fresh(candidate, now, ttl_seconds))
+        .cloned()
+        .collect()
+}
+
+fn endpoint_candidate_is_fresh(
+    candidate: &EndpointCandidate,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now.signed_duration_since(candidate.observed_at).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
     }
 }
 
@@ -445,6 +492,12 @@ mod tests {
         }
     }
 
+    fn stale_candidate(kind: EndpointCandidateKind) -> EndpointCandidate {
+        let mut candidate = candidate(kind);
+        candidate.observed_at = Utc::now() - chrono::Duration::seconds(121);
+        candidate
+    }
+
     fn target(candidates: Vec<EndpointCandidate>) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string("node-b"),
@@ -514,6 +567,60 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::DirectPublic);
+    }
+
+    #[test]
+    fn stale_public_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![stale_candidate(EndpointCandidateKind::PublicUdp)]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
+    fn stale_reflexive_candidate_is_not_used_for_nat_traversal() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![stale_candidate(EndpointCandidateKind::StunReflexive)]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
+    fn hole_punch_plan_uses_only_fresh_reflexive_candidates() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let plan = coordinator.punch_plan(
+            &[stale_candidate(EndpointCandidateKind::StunReflexive)],
+            &[candidate(EndpointCandidateKind::StunReflexive)],
+        );
+
+        assert!(plan.source_reflexive.is_none());
+        assert_eq!(
+            plan.target_reflexive.map(|candidate| candidate.kind),
+            Some(EndpointCandidateKind::StunReflexive)
+        );
     }
 
     #[tokio::test]
@@ -640,9 +747,13 @@ mod tests {
     async fn registry_metrics_report_signal_state() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy {
             relay_health_ttl_seconds: 30,
+            endpoint_candidate_ttl_seconds: 30,
             ..ClusterPolicy::default()
         });
-        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut source = target(vec![
+            stale_candidate(EndpointCandidateKind::StunReflexive),
+            candidate(EndpointCandidateKind::StunReflexive),
+        ]);
         source.node_id = NodeId::from_string("node-a");
         let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
         registry
@@ -684,6 +795,8 @@ mod tests {
         assert_eq!(stale_metrics.path_negotiation_count, 1);
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
+        assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
+        assert_eq!(stale_metrics.stale_endpoint_candidate_count, 1);
 
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
@@ -691,6 +804,7 @@ mod tests {
         let fresh_metrics = registry.metrics().await;
         assert_eq!(fresh_metrics.relay_candidate_count, 1);
         assert_eq!(fresh_metrics.stale_health_report_count, 0);
+        assert_eq!(fresh_metrics.stale_endpoint_candidate_count, 1);
         assert_eq!(fresh_metrics.node_upsert_count, 4);
         Ok(())
     }

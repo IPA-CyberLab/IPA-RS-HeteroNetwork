@@ -259,6 +259,12 @@ struct SignalArgs {
     relay_health_ttl_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_SIGNAL_ENDPOINT_CANDIDATE_TTL_SECONDS",
+        default_value_t = 120
+    )]
+    endpoint_candidate_ttl_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
         default_value_t = false
     )]
@@ -1770,12 +1776,14 @@ async fn run_signal(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    validate_signal_runtime_config(&args)?;
     let policy = ClusterPolicy {
         allow_ipv6_direct: !args.disable_ipv6_direct,
         allow_nat_traversal: !args.disable_nat_traversal,
         allow_relay_fallback: !args.disable_relay_fallback,
         idle_timeout_seconds: args.idle_timeout_seconds,
         relay_health_ttl_seconds: args.relay_health_ttl_seconds,
+        endpoint_candidate_ttl_seconds: args.endpoint_candidate_ttl_seconds,
         ..ClusterPolicy::default()
     };
     let registry = Arc::new(SignalRegistry::new(policy));
@@ -1790,6 +1798,15 @@ async fn run_signal(
         task.abort();
     }
     result
+}
+
+fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
+    validate_positive_seconds(args.idle_timeout_seconds, "--idle-timeout-seconds")?;
+    validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
+    validate_positive_seconds(
+        args.endpoint_candidate_ttl_seconds,
+        "--endpoint-candidate-ttl-seconds",
+    )
 }
 
 async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
@@ -1943,6 +1960,8 @@ struct SignalOtelMetrics {
     health_reports: Gauge<u64>,
     stale_health_reports: Gauge<u64>,
     relay_health_ttl_seconds: Gauge<u64>,
+    stale_endpoint_candidates: Gauge<u64>,
+    endpoint_candidate_ttl_seconds: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
     hole_punch_plans: Counter<u64>,
@@ -1980,6 +1999,14 @@ impl SignalOtelMetrics {
                 .u64_gauge("ipars.signal.relay_health_ttl_seconds")
                 .with_description("Relay health freshness window used by signal.")
                 .build(),
+            stale_endpoint_candidates: meter
+                .u64_gauge("ipars.signal.stale_endpoint_candidates")
+                .with_description("Signal endpoint candidates older than the candidate TTL.")
+                .build(),
+            endpoint_candidate_ttl_seconds: meter
+                .u64_gauge("ipars.signal.endpoint_candidate_ttl_seconds")
+                .with_description("Endpoint candidate freshness window used by signal.")
+                .build(),
             node_upserts: meter
                 .u64_counter("ipars.signal.node_upserts")
                 .with_description("Signal node upsert requests handled.")
@@ -2011,6 +2038,10 @@ impl SignalOtelMetrics {
             .record(metrics.stale_health_report_count as u64, &[]);
         self.relay_health_ttl_seconds
             .record(metrics.relay_health_ttl_seconds, &[]);
+        self.stale_endpoint_candidates
+            .record(metrics.stale_endpoint_candidate_count as u64, &[]);
+        self.endpoint_candidate_ttl_seconds
+            .record(metrics.endpoint_candidate_ttl_seconds, &[]);
 
         for (state, count) in [
             (HealthState::Healthy, metrics.healthy_node_count),
@@ -7127,6 +7158,8 @@ mod tests {
             "signal",
             "--relay-health-ttl-seconds",
             "45",
+            "--endpoint-candidate-ttl-seconds",
+            "75",
             "--disable-relay-fallback",
         ])?;
 
@@ -7134,7 +7167,27 @@ mod tests {
             anyhow::bail!("expected signal command");
         };
         assert_eq!(args.relay_health_ttl_seconds, 45);
+        assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
         assert!(args.disable_relay_fallback);
+        validate_signal_runtime_config(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn signal_candidate_ttl_must_be_positive() -> anyhow::Result<()> {
+        let cli =
+            Cli::try_parse_from(["iparsd", "signal", "--endpoint-candidate-ttl-seconds", "0"])?;
+
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        let error = match validate_signal_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("unexpected valid signal runtime config"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--endpoint-candidate-ttl-seconds must be greater than zero"));
         Ok(())
     }
 

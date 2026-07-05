@@ -620,6 +620,8 @@ pub struct ClusterPolicy {
     pub idle_timeout_seconds: u64,
     #[serde(default = "default_relay_health_ttl_seconds")]
     pub relay_health_ttl_seconds: u64,
+    #[serde(default = "default_endpoint_candidate_ttl_seconds")]
+    pub endpoint_candidate_ttl_seconds: u64,
     pub pinned_roles: BTreeSet<Role>,
     pub pinned_tags: BTreeSet<Tag>,
     #[serde(default)]
@@ -636,6 +638,7 @@ impl Default for ClusterPolicy {
             allow_relay_fallback: true,
             idle_timeout_seconds: 300,
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
+            endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
             pinned_roles,
             pinned_tags: BTreeSet::new(),
             acl_rules: Vec::new(),
@@ -645,6 +648,10 @@ impl Default for ClusterPolicy {
 
 fn default_relay_health_ttl_seconds() -> u64 {
     90
+}
+
+fn default_endpoint_candidate_ttl_seconds() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,10 +930,14 @@ pub mod api {
         pub degraded_node_count: usize,
         pub unhealthy_node_count: usize,
         pub stale_health_report_count: usize,
+        #[serde(default)]
+        pub stale_endpoint_candidate_count: usize,
         pub node_upsert_count: u64,
         pub path_negotiation_count: u64,
         pub hole_punch_plan_count: u64,
         pub relay_health_ttl_seconds: u64,
+        #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
+        pub endpoint_candidate_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 

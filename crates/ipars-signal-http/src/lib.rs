@@ -167,6 +167,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_stale_endpoint_candidates Number of endpoint candidates older than the signal candidate TTL."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_stale_endpoint_candidates gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_stale_endpoint_candidates {}",
+        metrics.stale_endpoint_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_node_upserts_total Total signal node upsert requests handled."
     );
     prometheus_line!(&mut body, "# TYPE ipars_signal_node_upserts_total counter");
@@ -213,6 +226,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         &mut body,
         "ipars_signal_relay_health_ttl_seconds {}",
         metrics.relay_health_ttl_seconds
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_endpoint_candidate_ttl_seconds Endpoint candidate freshness window used by signal."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_endpoint_candidate_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_endpoint_candidate_ttl_seconds {}",
+        metrics.endpoint_candidate_ttl_seconds
     );
     body
 }
@@ -368,6 +394,8 @@ mod tests {
         let metrics: SignalMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_count, 1);
         assert_eq!(metrics.relay_candidate_count, 0);
+        assert_eq!(metrics.stale_endpoint_candidate_count, 0);
+        assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
         assert_eq!(metrics.node_upsert_count, 1);
         assert_eq!(metrics.path_negotiation_count, 1);
 
@@ -383,6 +411,8 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("ipars_signal_nodes 1"));
+        assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
+        assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
         Ok(())
     }
