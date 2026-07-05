@@ -73,6 +73,8 @@ const CAP_NET_ADMIN_BIT: u8 = 12;
 const CAP_NET_RAW_BIT: u8 = 13;
 const CAP_SYS_ADMIN_BIT: u8 = 21;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -676,6 +678,8 @@ struct RuntimePreflightNeeds {
     route_netlink: bool,
     generic_netlink: bool,
     netfilter_netlink: bool,
+    ipv4_forwarding: bool,
+    ipv6_forwarding: bool,
     cap_net_admin: bool,
     cap_net_raw: bool,
     cap_sys_admin: bool,
@@ -690,6 +694,8 @@ impl RuntimePreflightNeeds {
             route_netlink: false,
             generic_netlink: false,
             netfilter_netlink: false,
+            ipv4_forwarding: false,
+            ipv6_forwarding: false,
             cap_net_admin: false,
             cap_net_raw: false,
             cap_sys_admin: false,
@@ -703,6 +709,8 @@ impl RuntimePreflightNeeds {
             && !self.route_netlink
             && !self.generic_netlink
             && !self.netfilter_netlink
+            && !self.ipv4_forwarding
+            && !self.ipv6_forwarding
             && !self.cap_net_admin
             && !self.cap_net_raw
             && !self.cap_sys_admin
@@ -742,6 +750,8 @@ struct RuntimePreflightChecks {
     cap_sys_admin: fn() -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
+    ipv4_forwarding: fn() -> anyhow::Result<()>,
+    ipv6_forwarding: fn() -> anyhow::Result<()>,
 }
 
 impl RuntimePreflightChecks {
@@ -752,6 +762,8 @@ impl RuntimePreflightChecks {
             cap_sys_admin: ensure_cap_sys_admin_if_known,
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
+            ipv4_forwarding: ensure_ipv4_forwarding_if_known,
+            ipv6_forwarding: ensure_ipv6_forwarding_if_known,
         }
     }
 }
@@ -909,6 +921,12 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.netfilter_netlink {
         (checks.netlink)(RuntimeNetlinkProtocol::Netfilter)?;
     }
+    if needs.ipv4_forwarding {
+        (checks.ipv4_forwarding)()?;
+    }
+    if needs.ipv6_forwarding {
+        (checks.ipv6_forwarding)()?;
+    }
     if needs.cap_net_admin {
         (checks.cap_net_admin)()?;
     }
@@ -936,6 +954,8 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_route_netlink = needs.route_netlink,
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
+        needs_ipv4_forwarding = needs.ipv4_forwarding,
+        needs_ipv6_forwarding = needs.ipv6_forwarding,
         needs_cap_net_admin = needs.cap_net_admin,
         needs_cap_net_raw = needs.cap_net_raw,
         needs_cap_sys_admin = needs.cap_sys_admin,
@@ -1095,17 +1115,66 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         args.packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
+    let ipv4_forwarding = agent_routes_may_forward_ipv4(args);
+    let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
         wg_command: applies_wireguard_with_command,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
+        ipv4_forwarding,
+        ipv6_forwarding,
         cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
         cap_net_raw: applies_wireguard,
         cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
     }
+}
+
+fn agent_routes_may_forward_ipv4(args: &AgentArgs) -> bool {
+    docker_routes_may_forward_ipv4(args) || kubernetes_routes_may_forward_ipv4(args)
+}
+
+fn agent_routes_may_forward_ipv6(args: &AgentArgs) -> bool {
+    docker_routes_may_forward_ipv6(args) || kubernetes_routes_may_forward_ipv6(args)
+}
+
+fn docker_routes_may_forward_ipv4(args: &AgentArgs) -> bool {
+    args.apply_docker_routes
+        && (args.docker_discover_networks
+            || args
+                .docker_container_cidrs
+                .iter()
+                .any(|cidr| matches!(cidr, ipnet::IpNet::V4(_))))
+}
+
+fn docker_routes_may_forward_ipv6(args: &AgentArgs) -> bool {
+    args.apply_docker_routes
+        && args
+            .docker_container_cidrs
+            .iter()
+            .any(|cidr| matches!(cidr, ipnet::IpNet::V6(_)))
+}
+
+fn kubernetes_routes_may_forward_ipv4(args: &AgentArgs) -> bool {
+    args.apply_kubernetes_underlay
+        && (args.kubernetes_discover_services
+            || args.kubernetes_discover_api_server
+            || args
+                .kubernetes_service_cidrs
+                .iter()
+                .chain(args.kubernetes_api_server_cidrs.iter())
+                .any(|cidr| matches!(cidr, ipnet::IpNet::V4(_))))
+}
+
+fn kubernetes_routes_may_forward_ipv6(args: &AgentArgs) -> bool {
+    args.apply_kubernetes_underlay
+        && args
+            .kubernetes_service_cidrs
+            .iter()
+            .chain(args.kubernetes_api_server_cidrs.iter())
+            .any(|cidr| matches!(cidr, ipnet::IpNet::V6(_)))
 }
 
 fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
@@ -1309,6 +1378,54 @@ fn ensure_cap_sys_admin_if_known() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_ipv4_forwarding_if_known() -> anyhow::Result<()> {
+    ensure_proc_sysctl_enabled_if_known(
+        Path::new(PROC_SYS_IPV4_FORWARD),
+        "net.ipv4.ip_forward",
+        "Docker/Kubernetes route forwarding",
+    )
+}
+
+fn ensure_ipv6_forwarding_if_known() -> anyhow::Result<()> {
+    ensure_proc_sysctl_enabled_if_known(
+        Path::new(PROC_SYS_IPV6_FORWARDING),
+        "net.ipv6.conf.all.forwarding",
+        "IPv6 Docker/Kubernetes route forwarding",
+    )
+}
+
+fn ensure_proc_sysctl_enabled_if_known(
+    path: &Path,
+    sysctl_name: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if let Some(false) = proc_sysctl_flag(path)? {
+        anyhow::bail!("agent runtime preflight requires {sysctl_name}=1 for {reason}");
+    }
+    Ok(())
+}
+
+fn proc_sysctl_flag(path: &Path) -> anyhow::Result<Option<bool>> {
+    let value = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read Linux runtime sysctl `{}`", path.display())
+            })
+        }
+    };
+    match value.trim() {
+        "0" => Ok(Some(false)),
+        "1" => Ok(Some(true)),
+        value => anyhow::bail!(
+            "Linux runtime sysctl `{}` contains unsupported boolean value `{}`",
+            path.display(),
+            value
+        ),
+    }
 }
 
 fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
@@ -8150,6 +8267,8 @@ invalid no-destination-here
             assert!(!needs.route_netlink);
             assert!(!needs.generic_netlink);
             assert!(!needs.netfilter_netlink);
+            assert!(needs.ipv4_forwarding);
+            assert!(!needs.ipv6_forwarding);
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -8165,6 +8284,14 @@ invalid no-destination-here
 
     fn preflight_noop_netns(_namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn preflight_fail_ipv4_forwarding() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test net.ipv4.ip_forward")
+    }
+
+    fn preflight_fail_ipv6_forwarding() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test net.ipv6.conf.all.forwarding")
     }
 
     fn preflight_fail_generic_netlink(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
@@ -8190,7 +8317,28 @@ invalid no-destination-here
             cap_sys_admin: preflight_noop,
             linux_netns: preflight_noop_netns,
             netlink,
+            ipv4_forwarding: preflight_noop,
+            ipv6_forwarding: preflight_noop,
         }
+    }
+
+    fn test_preflight_checks_with_forwarding(
+        ipv4_forwarding: fn() -> anyhow::Result<()>,
+        ipv6_forwarding: fn() -> anyhow::Result<()>,
+    ) -> RuntimePreflightChecks {
+        RuntimePreflightChecks {
+            cap_net_admin: preflight_noop,
+            cap_net_raw: preflight_noop,
+            cap_sys_admin: preflight_noop,
+            linux_netns: preflight_noop_netns,
+            netlink: preflight_noop_netlink,
+            ipv4_forwarding,
+            ipv6_forwarding,
+        }
+    }
+
+    fn preflight_noop_netlink(_protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
+        Ok(())
     }
 
     #[test]
@@ -8254,6 +8402,96 @@ invalid no-destination-here
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_requires_forwarding_for_route_underlay() -> anyhow::Result<()> {
+        let docker = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--route-backend",
+            "kernel-netlink",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+
+        if let Command::Agent(args) = docker.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ipv4_forwarding);
+            assert!(!needs.ipv6_forwarding);
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                test_preflight_checks_with_forwarding(
+                    preflight_fail_ipv4_forwarding,
+                    preflight_noop,
+                ),
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("blocked test net.ipv4.ip_forward"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let kubernetes_ipv6 = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--route-backend",
+            "kernel-netlink",
+            "--kubernetes-service-cidr",
+            "fd00:96::/112",
+        ])?;
+
+        if let Command::Agent(args) = kubernetes_ipv6.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ipv4_forwarding);
+            assert!(needs.ipv6_forwarding);
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                test_preflight_checks_with_forwarding(
+                    preflight_noop,
+                    preflight_fail_ipv6_forwarding,
+                ),
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("blocked test net.ipv6.conf.all.forwarding"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn proc_sysctl_flag_parses_kernel_boolean_values() -> anyhow::Result<()> {
+        let base = unique_test_dir("sysctl-flag")?;
+        let enabled = base.join("enabled");
+        let disabled = base.join("disabled");
+        let invalid = base.join("invalid");
+        std::fs::write(&enabled, "1\n")?;
+        std::fs::write(&disabled, "0\n")?;
+        std::fs::write(&invalid, "2\n")?;
+
+        assert_eq!(proc_sysctl_flag(&enabled)?, Some(true));
+        assert_eq!(proc_sysctl_flag(&disabled)?, Some(false));
+        assert_eq!(proc_sysctl_flag(&base.join("missing"))?, None);
+        let error = match proc_sysctl_flag(&invalid) {
+            Ok(_) => anyhow::bail!("unexpected successful sysctl parse"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported boolean value"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 
     #[test]

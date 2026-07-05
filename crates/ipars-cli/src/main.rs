@@ -2035,6 +2035,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "Docker Engine with the Compose plugin".to_string(),
         "/dev/net/tun available on agent/relay hosts".to_string(),
         "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
+        "net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
     ];
     if args.rootless {
@@ -2488,6 +2489,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Helm 3".to_string(),
             "/dev/net/tun plus a writable agent state hostPath available on every scheduled node".to_string(),
             "NET_ADMIN and NET_RAW capability allowance, or equivalent --agent-add-capability overrides, for the DaemonSet agent".to_string(),
+            "net.ipv4.ip_forward=1 on Kubernetes route-provider nodes, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 Service/API CIDRs".to_string(),
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
         ],
         security: vec![
@@ -4036,6 +4038,10 @@ mod tests {
             .prerequisites
             .iter()
             .any(|requirement| requirement.contains("CAP_NET_ADMIN")));
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("net.ipv4.ip_forward")));
         assert!(plan.environment.iter().any(|environment| {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
@@ -4326,6 +4332,10 @@ mod tests {
 
         assert_eq!(plan.platform, "kubernetes-helm");
         assert_eq!(plan.manifest, "charts/ipars");
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("net.ipv4.ip_forward")));
         assert_eq!(
             plan.commands[1],
             "kubectl -n edge-system create secret generic edge-token --from-file=signed-token=./join.token --dry-run=client -o yaml | kubectl apply -f -"
