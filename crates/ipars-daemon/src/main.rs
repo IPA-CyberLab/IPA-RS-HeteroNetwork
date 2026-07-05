@@ -66,6 +66,7 @@ use opentelemetry_sdk::{
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -73,6 +74,9 @@ const CAP_NET_ADMIN_BIT: u8 = 12;
 const CAP_NET_RAW_BIT: u8 = 13;
 const CAP_SYS_ADMIN_BIT: u8 = 21;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
+const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
@@ -414,6 +418,24 @@ struct AgentArgs {
         default_value_t = 30
     )]
     packet_flow_dedup_ttl_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_BYTES",
+        default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES
+    )]
+    packet_flow_procfs_max_bytes: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES",
+        default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES
+    )]
+    packet_flow_procfs_max_line_bytes: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_FLOWS",
+        default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS
+    )]
+    packet_flow_procfs_max_flows: usize,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
     packet_flow_pin: bool,
     #[arg(
@@ -1000,6 +1022,20 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.packet_flow_poll_interval_seconds,
             "--packet-flow-poll-interval-seconds",
         )?;
+    }
+    if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
+        anyhow::ensure!(
+            args.packet_flow_procfs_max_bytes > 0,
+            "--packet-flow-procfs-max-bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.packet_flow_procfs_max_line_bytes > 0,
+            "--packet-flow-procfs-max-line-bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.packet_flow_procfs_max_flows > 0,
+            "--packet-flow-procfs-max-flows must be greater than zero"
+        );
     }
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
@@ -2870,11 +2906,15 @@ async fn run_agent(
     match args.packet_flow_detector {
         PacketFlowDetector::Disabled => {}
         PacketFlowDetector::ProcNetConntrack => {
+            let limits = ProcNetConntrackReadLimits::from_args(&args);
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
                 interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
+                max_bytes = limits.max_bytes,
+                max_line_bytes = limits.max_line_bytes,
+                max_flows = limits.max_flows,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
@@ -2883,6 +2923,7 @@ async fn run_agent(
                 conntrack_paths(args.packet_flow_conntrack_path.clone()),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                limits,
                 args.packet_flow_pin,
             ));
         }
@@ -5520,12 +5561,13 @@ fn start_proc_net_conntrack_packet_flow_detector(
     paths: Vec<PathBuf>,
     interval: Duration,
     dedup_ttl: Option<Duration>,
+    limits: ProcNetConntrackReadLimits,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut deduper = PacketFlowDeduper::new(dedup_ttl);
         loop {
-            match read_conntrack_packet_flows(&paths).await {
+            match read_conntrack_packet_flows(&paths, limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
                     log_packet_flow_duplicates(duplicate_count, "proc-net-conntrack");
@@ -5799,6 +5841,33 @@ fn conntrack_paths(custom_path: Option<PathBuf>) -> Vec<PathBuf> {
         },
         |path| vec![path],
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcNetConntrackReadLimits {
+    max_bytes: u64,
+    max_line_bytes: usize,
+    max_flows: usize,
+}
+
+impl ProcNetConntrackReadLimits {
+    fn from_args(args: &AgentArgs) -> Self {
+        Self {
+            max_bytes: args.packet_flow_procfs_max_bytes,
+            max_line_bytes: args.packet_flow_procfs_max_line_bytes,
+            max_flows: args.packet_flow_procfs_max_flows,
+        }
+    }
+}
+
+impl Default for ProcNetConntrackReadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES,
+            max_line_bytes: DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES,
+            max_flows: DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6282,16 +6351,43 @@ fn push_u32_ne(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_ne_bytes());
 }
 
-async fn read_conntrack_packet_flows(paths: &[PathBuf]) -> anyhow::Result<Vec<PacketFlowRecord>> {
+async fn read_conntrack_packet_flows(
+    paths: &[PathBuf],
+    limits: ProcNetConntrackReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
     let mut attempted = Vec::new();
     let mut last_error = None;
     for path in paths {
         attempted.push(path.display().to_string());
-        match tokio::fs::read_to_string(path).await {
-            Ok(contents) => return Ok(parse_conntrack_packet_flows(&contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => last_error = Some(error),
-        }
+        let file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let read_limit = limits
+            .max_bytes
+            .checked_add(1)
+            .context("conntrack procfs read byte limit overflow")?;
+        let mut contents = String::new();
+        file.take(read_limit)
+            .read_to_string(&mut contents)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read conntrack flow table from {}",
+                    path.display()
+                )
+            })?;
+        anyhow::ensure!(
+            contents.len() as u64 <= limits.max_bytes,
+            "conntrack flow table {} exceeds configured --packet-flow-procfs-max-bytes ({})",
+            path.display(),
+            limits.max_bytes
+        );
+        return parse_conntrack_packet_flows(&contents, limits);
     }
 
     if let Some(error) = last_error {
@@ -6303,11 +6399,25 @@ async fn read_conntrack_packet_flows(paths: &[PathBuf]) -> anyhow::Result<Vec<Pa
     anyhow::bail!("no conntrack flow table found at {}", attempted.join(", "))
 }
 
-fn parse_conntrack_packet_flows(contents: &str) -> Vec<PacketFlowRecord> {
-    contents
-        .lines()
-        .flat_map(parse_conntrack_line_packet_flows)
-        .collect()
+fn parse_conntrack_packet_flows(
+    contents: &str,
+    limits: ProcNetConntrackReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    let mut flows = Vec::new();
+    for (line_index, line) in contents.lines().enumerate() {
+        anyhow::ensure!(
+            line.len() <= limits.max_line_bytes,
+            "conntrack flow table line {} exceeds configured --packet-flow-procfs-max-line-bytes ({})",
+            line_index + 1,
+            limits.max_line_bytes
+        );
+        flows.extend(parse_conntrack_line_packet_flows(line));
+        if flows.len() >= limits.max_flows {
+            flows.truncate(limits.max_flows);
+            break;
+        }
+    }
+    Ok(flows)
 }
 
 fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
@@ -7647,6 +7757,12 @@ mod tests {
             "2",
             "--packet-flow-dedup-ttl-seconds",
             "9",
+            "--packet-flow-procfs-max-bytes",
+            "1048576",
+            "--packet-flow-procfs-max-line-bytes",
+            "2048",
+            "--packet-flow-procfs-max-flows",
+            "4096",
             "--packet-flow-pin",
         ])?;
 
@@ -7662,6 +7778,17 @@ mod tests {
             );
             assert_eq!(args.packet_flow_poll_interval_seconds, 2);
             assert_eq!(args.packet_flow_dedup_ttl_seconds, 9);
+            assert_eq!(args.packet_flow_procfs_max_bytes, 1_048_576);
+            assert_eq!(args.packet_flow_procfs_max_line_bytes, 2048);
+            assert_eq!(args.packet_flow_procfs_max_flows, 4096);
+            assert_eq!(
+                ProcNetConntrackReadLimits::from_args(&args),
+                ProcNetConntrackReadLimits {
+                    max_bytes: 1_048_576,
+                    max_line_bytes: 2048,
+                    max_flows: 4096,
+                }
+            );
             assert_eq!(packet_flow_dedup_ttl(0), None);
             assert_eq!(packet_flow_dedup_ttl(9), Some(Duration::from_secs(9)));
             assert!(args.packet_flow_pin);
@@ -7669,6 +7796,46 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_procfs_packet_flow_limits_must_be_positive() -> anyhow::Result<()> {
+        for (flag, expected) in [
+            (
+                "--packet-flow-procfs-max-bytes",
+                "--packet-flow-procfs-max-bytes must be greater than zero",
+            ),
+            (
+                "--packet-flow-procfs-max-line-bytes",
+                "--packet-flow-procfs-max-line-bytes must be greater than zero",
+            ),
+            (
+                "--packet-flow-procfs-max-flows",
+                "--packet-flow-procfs-max-flows must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "proc-net-conntrack",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -7743,7 +7910,7 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport
 ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 [UNREPLIED] src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
 invalid no-destination-here
 ";
-        let flows = parse_conntrack_packet_flows(contents);
+        let flows = parse_conntrack_packet_flows(contents, ProcNetConntrackReadLimits::default())?;
         let destinations = flows
             .iter()
             .map(|flow| flow.destination)
@@ -7781,6 +7948,71 @@ invalid no-destination-here
             vec![AgentPacketFlowConntrackStatus::Unreplied]
         );
         assert_eq!(udp.observation.tcp_state, None);
+        Ok(())
+    }
+
+    #[test]
+    fn conntrack_parser_enforces_line_and_flow_limits() -> anyhow::Result<()> {
+        let contents = "\
+ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321 [ASSURED]
+ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.64.0.12 dst=192.0.2.20 sport=51820 dport=50000
+";
+        let line_error = match parse_conntrack_packet_flows(
+            contents,
+            ProcNetConntrackReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 32,
+                max_flows: 32,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized conntrack line should be rejected"),
+            Err(error) => error,
+        };
+        assert!(line_error
+            .to_string()
+            .contains("--packet-flow-procfs-max-line-bytes"));
+
+        let flows = parse_conntrack_packet_flows(
+            contents,
+            ProcNetConntrackReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 4096,
+                max_flows: 2,
+            },
+        )?;
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
+        assert_eq!(flows[1].destination, "192.0.2.10".parse::<IpAddr>()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conntrack_reader_enforces_byte_limit() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "ipars-conntrack-reader-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(
+            &path,
+            "ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11\n",
+        )?;
+
+        let error = match read_conntrack_packet_flows(
+            std::slice::from_ref(&path),
+            ProcNetConntrackReadLimits {
+                max_bytes: 16,
+                max_line_bytes: 4096,
+                max_flows: 32,
+            },
+        )
+        .await
+        {
+            Ok(_) => anyhow::bail!("oversized conntrack file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--packet-flow-procfs-max-bytes"));
+        let _ = std::fs::remove_file(path);
         Ok(())
     }
 
