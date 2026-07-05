@@ -292,6 +292,38 @@
 {{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) (or (eq $relayHealthCheckNodePort $relayUdpNodePort) (eq $relayHealthCheckNodePort $relayHttpNodePort)) -}}
 {{- fail "agent.relayService.healthCheckNodePort must differ from relay NodePorts" -}}
 {{- end -}}
+{{- $explicitNodePorts := dict -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) -}}
+{{- $_ := set $explicitNodePorts (printf "%d" $agentApiNodePort) "agent.apiService.nodePort" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiHealthCheckNodePort 0) -}}
+{{- $portKey := printf "%d" $agentApiHealthCheckNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.apiService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $agentApiHealthCheckNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.apiService.healthCheckNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayUdpNodePort 0) -}}
+{{- $portKey := printf "%d" $relayUdpNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.udpNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayUdpNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.udpNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayHttpNodePort 0) -}}
+{{- $portKey := printf "%d" $relayHttpNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.httpNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayHttpNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.httpNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) -}}
+{{- $portKey := printf "%d" $relayHealthCheckNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayHealthCheckNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.healthCheckNodePort" -}}
+{{- end -}}
 {{- if and $relayServiceActive (not $relayAllocateLoadBalancerNodePorts) (ne .Values.agent.relayService.type "LoadBalancer") -}}
 {{- fail "agent.relayService.allocateLoadBalancerNodePorts=false requires agent.relayService.type LoadBalancer" -}}
 {{- end -}}

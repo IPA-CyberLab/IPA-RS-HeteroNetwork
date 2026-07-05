@@ -4168,6 +4168,7 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!("--relay-health-check-node-port must differ from relay NodePort overrides");
     }
+    validate_kubernetes_node_port_uniqueness(args)?;
     if args.agent_api_disable_load_balancer_node_ports
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -4228,6 +4229,56 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--expose-relay with externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy"
         );
     }
+    Ok(())
+}
+
+fn validate_kubernetes_node_port_uniqueness(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let mut node_ports = Vec::new();
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--agent-api-node-port",
+        args.agent_api_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--agent-api-health-check-node-port",
+        args.agent_api_health_check_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-udp-node-port",
+        args.relay_udp_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-http-node-port",
+        args.relay_http_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-health-check-node-port",
+        args.relay_health_check_node_port,
+    )?;
+    Ok(())
+}
+
+fn add_unique_kubernetes_node_port(
+    node_ports: &mut Vec<(u16, &'static str)>,
+    label: &'static str,
+    port: Option<u16>,
+) -> anyhow::Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+    if let Some((_, existing_label)) = node_ports
+        .iter()
+        .find(|(existing_port, _)| *existing_port == port)
+    {
+        anyhow::bail!(
+            "{label} must not reuse Kubernetes NodePort {port} already assigned to {existing_label}"
+        );
+    }
+    node_ports.push((port, label));
     Ok(())
 }
 
@@ -5723,6 +5774,12 @@ mod tests {
         ));
         assert!(service_template.contains(
             "agent.relayService.exposureAcknowledged=true requires external Service type or externalIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.udpNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
         ));
         Ok(())
     }
@@ -7290,6 +7347,25 @@ mod tests {
             error.contains("--relay-udp-node-port and --relay-http-node-port must be different")
         );
 
+        let mut duplicate_agent_relay = base_k8s_install_args();
+        duplicate_agent_relay.expose_agent_api = true;
+        duplicate_agent_relay.allow_public_service_exposure = true;
+        duplicate_agent_relay.agent_api_service_type = "NodePort".to_string();
+        duplicate_agent_relay.agent_api_node_port = Some(31080);
+        duplicate_agent_relay.expose_relay = true;
+        duplicate_agent_relay.relay_service_type = "NodePort".to_string();
+        duplicate_agent_relay.relay_udp_node_port = Some(31080);
+        duplicate_agent_relay.relay_http_node_port = Some(31580);
+        duplicate_agent_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_agent_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_agent_relay) {
+            Ok(_) => panic!("agent and relay NodePorts should be cluster-unique"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-udp-node-port must not reuse Kubernetes NodePort 31080 already assigned to --agent-api-node-port"
+        ));
+
         Ok(())
     }
 
@@ -7654,6 +7730,27 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("must differ from relay NodePort overrides"));
+
+        let mut duplicate_cross_service_health = base_k8s_install_args();
+        duplicate_cross_service_health.expose_agent_api = true;
+        duplicate_cross_service_health.allow_public_service_exposure = true;
+        duplicate_cross_service_health.allow_unrestricted_load_balancer = true;
+        duplicate_cross_service_health.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_cross_service_health.agent_api_health_check_node_port = Some(31821);
+        duplicate_cross_service_health.expose_relay = true;
+        duplicate_cross_service_health.relay_service_type = "LoadBalancer".to_string();
+        duplicate_cross_service_health.relay_health_check_node_port = Some(31821);
+        duplicate_cross_service_health.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_health.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_health) {
+            Ok(_) => panic!("agent and relay healthCheckNodePorts should be cluster-unique"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-health-check-node-port must not reuse Kubernetes NodePort 31821 already assigned to --agent-api-health-check-node-port"
+        ));
 
         Ok(())
     }
