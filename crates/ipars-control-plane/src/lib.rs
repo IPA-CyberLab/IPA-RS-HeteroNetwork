@@ -564,14 +564,19 @@ where
 
     pub async fn heartbeat(
         &self,
-        request: HeartbeatRequest,
+        mut request: HeartbeatRequest,
     ) -> Result<HeartbeatResponse, ControlPlaneError> {
         let node = self
             .store
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
-        self.validate_heartbeat_request(&request, &node, Utc::now())?;
+        let previous_health = self.store.get_health(&request.node_id).await?;
+        let now = Utc::now();
+        self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
+        if let Some(signature) = request.node_signature.as_ref() {
+            request.health.last_seen_at = signature.signed_at;
+        }
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
@@ -694,6 +699,7 @@ where
         &self,
         request: &HeartbeatRequest,
         node: &NodeRecord,
+        previous_health: Option<&NodeHealth>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
         if let Some(candidate) = request
@@ -750,6 +756,17 @@ where
                     self.config.heartbeat_signature_max_age.as_secs()
                 ),
             });
+        }
+        if let Some(previous_health) = previous_health {
+            if signed_at <= previous_health.last_seen_at {
+                return Err(ControlPlaneError::NodeSignatureRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "signed_at {signed_at} is not newer than last accepted heartbeat {}",
+                        previous_health.last_seen_at
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1289,14 +1306,20 @@ mod tests {
         identity_for_node(label).node_id()
     }
 
-    fn signed_heartbeat(label: &str, mut request: HeartbeatRequest) -> HeartbeatRequest {
+    fn signed_heartbeat(label: &str, request: HeartbeatRequest) -> HeartbeatRequest {
+        signed_heartbeat_at(label, request, Utc::now())
+    }
+
+    fn signed_heartbeat_at(
+        label: &str,
+        mut request: HeartbeatRequest,
+        signed_at: chrono::DateTime<Utc>,
+    ) -> HeartbeatRequest {
         let identity = identity_for_node(label);
-        request.node_signature = Some(
-            match identity.sign_heartbeat_request(&request, Utc::now()) {
-                Ok(signature) => signature,
-                Err(error) => panic!("test identity should sign heartbeat: {error}"),
-            },
-        );
+        request.node_signature = Some(match identity.sign_heartbeat_request(&request, signed_at) {
+            Ok(signature) => signature,
+            Err(error) => panic!("test identity should sign heartbeat: {error}"),
+        });
         request
     }
 
@@ -2075,16 +2098,17 @@ mod tests {
         plane
             .register_with_claims(claims(cluster_id), registration_request("node-a"))
             .await?;
+        let reported_at = Utc::now();
         let health = NodeHealth {
             state: HealthState::Healthy,
-            last_seen_at: Utc::now(),
+            last_seen_at: reported_at,
             latency_ms: Some(12.0),
             relay_load: None,
             message: Some("ok".to_string()),
         };
 
         let response = plane
-            .heartbeat(signed_heartbeat(
+            .heartbeat(signed_heartbeat_at(
                 "node-a",
                 HeartbeatRequest {
                     node_id: node_id("node-a"),
@@ -2094,6 +2118,7 @@ mod tests {
                     path_state: vec![path("node-a", "node-b")],
                     node_signature: None,
                 },
+                reported_at,
             ))
             .await?;
 
@@ -2109,6 +2134,53 @@ mod tests {
         );
         assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
         assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_replayed_node_signature() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let signed_at = Utc::now();
+        let request = signed_heartbeat_at(
+            "node-a",
+            HeartbeatRequest {
+                node_id: node_id("node-a"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: signed_at - Duration::seconds(30),
+                    latency_ms: Some(8.0),
+                    relay_load: None,
+                    message: Some("fresh payload".to_string()),
+                },
+                candidates: vec![candidate("node-a")],
+                relay_capability: None,
+                path_state: Vec::new(),
+                node_signature: None,
+            },
+            signed_at,
+        );
+
+        plane.heartbeat(request.clone()).await?;
+        let accepted_health = store
+            .get_health(&node_id("node-a"))
+            .await?
+            .ok_or("health should be stored")?;
+        assert_eq!(accepted_health.last_seen_at, signed_at);
+
+        let replay = plane.heartbeat(request).await;
+        assert!(matches!(
+            replay,
+            Err(ControlPlaneError::NodeSignatureRejected { .. })
+        ));
         Ok(())
     }
 
