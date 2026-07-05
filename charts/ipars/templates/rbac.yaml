@@ -1,6 +1,7 @@
 {{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
 {{- if and $rbacCreate .Values.serviceExposure.discoverServices -}}
 {{- $name := include "ipars.fullname" . -}}
+{{- $serviceAccountName := include "ipars.serviceAccountName" . -}}
 {{- $serviceAccountNamespace := .Release.Namespace -}}
 {{- if .Values.serviceExposure.namespaces -}}
 {{- range $index, $namespace := .Values.serviceExposure.namespaces }}
@@ -28,7 +29,7 @@ roleRef:
   name: {{ $name }}
 subjects:
   - kind: ServiceAccount
-    name: {{ $name }}
+    name: {{ $serviceAccountName }}
     namespace: {{ $serviceAccountNamespace }}
 {{- end }}
 {{- else }}
@@ -51,7 +52,7 @@ roleRef:
   name: {{ $name }}
 subjects:
   - kind: ServiceAccount
-    name: {{ $name }}
+    name: {{ $serviceAccountName }}
     namespace: {{ $serviceAccountNamespace }}
 {{- end }}
 {{- end }}

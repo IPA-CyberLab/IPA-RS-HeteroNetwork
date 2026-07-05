@@ -7,6 +7,7 @@
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
 {{- $rbacCreate := printf "%v" .Values.rbac.create -}}
+{{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
@@ -14,6 +15,18 @@
 {{- end -}}
 {{- if not (or (eq $rbacCreate "true") (eq $rbacCreate "false")) -}}
 {{- fail "rbac.create must be true or false" -}}
+{{- end -}}
+{{- if not (or (eq $serviceAccountCreate "true") (eq $serviceAccountCreate "false")) -}}
+{{- fail "serviceAccount.create must be true or false" -}}
+{{- end -}}
+{{- if and .Values.serviceAccount.name (or (gt (len .Values.serviceAccount.name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.serviceAccount.name))) -}}
+{{- fail "serviceAccount.name must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- if and (eq $serviceAccountCreate "false") .Values.serviceAccount.annotations -}}
+{{- fail "serviceAccount.annotations require serviceAccount.create=true" -}}
+{{- end -}}
+{{- range $key, $_ := .Values.serviceAccount.annotations -}}
+{{- include "ipars.validateAnnotationKey" (dict "path" "serviceAccount.annotations" "key" $key) -}}
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
@@ -207,7 +220,7 @@ spec:
         {{- end }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "ipars.fullname" . }}
+      serviceAccountName: {{ include "ipars.serviceAccountName" . }}
       automountServiceAccountToken: {{ $agentAutomountServiceAccountToken }}
       hostNetwork: {{ .Values.agent.hostNetwork }}
       {{- if ne $agentTerminationGracePeriodSeconds "" }}

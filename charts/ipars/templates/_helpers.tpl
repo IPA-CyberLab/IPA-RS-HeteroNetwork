@@ -10,6 +10,14 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.serviceAccountName" -}}
+{{- if .Values.serviceAccount.name -}}
+{{- .Values.serviceAccount.name -}}
+{{- else -}}
+{{- include "ipars.fullname" . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateCidr" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}

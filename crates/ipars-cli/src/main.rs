@@ -325,6 +325,12 @@ struct K8sInstallArgs {
     network_policy_acknowledge_host_network: bool,
     #[arg(long = "disable-rbac", default_value_t = false)]
     disable_rbac: bool,
+    #[arg(long = "disable-service-account-creation", default_value_t = false)]
+    disable_service_account_creation: bool,
+    #[arg(long = "service-account-name", value_parser = parse_kubernetes_service_account_name)]
+    service_account_name: Option<String>,
+    #[arg(long = "service-account-annotation", value_parser = parse_key_value)]
+    service_account_annotations: Vec<KeyValueArg>,
     #[arg(long = "agent-pod-label", value_parser = parse_kubernetes_label_pair)]
     agent_pod_labels: Vec<KeyValueArg>,
     #[arg(long = "agent-pod-annotation", value_parser = parse_key_value)]
@@ -1367,6 +1373,11 @@ fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_service_account_name(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_subdomain(value, "serviceAccount.name")?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     validate_kubernetes_resource_quantity(value, "resource quantity")?;
     Ok(value.to_string())
@@ -2128,6 +2139,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
+    validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_rollout_options(&args)?;
     validate_k8s_service_exposure(&args)?;
@@ -2142,6 +2154,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_secret,
         args.join_token_key
     );
+    append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
     append_k8s_agent_pod_values(&mut helm_command, &args);
     if args.enable_network_policy {
@@ -2395,18 +2408,38 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
             "Use --disable-agent-service-account-token only when Kubernetes Service API discovery is not required".to_string(),
+            "ServiceAccount creation can be disabled only when an equivalent ServiceAccount already exists in the target namespace".to_string(),
             "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Agent service-account token automounting, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn append_k8s_service_account_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.disable_service_account_creation {
+        command.push_str(" --set serviceAccount.create=false");
+    }
+    if let Some(name) = args.service_account_name.as_deref() {
+        append_helm_set_string(command, "serviceAccount.name", name);
+    }
+    for annotation in &args.service_account_annotations {
+        append_helm_set_string(
+            command,
+            &format!(
+                "serviceAccount.annotations.{}",
+                helm_set_key(&annotation.key)
+            ),
+            &annotation.value,
+        );
+    }
 }
 
 fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs) {
@@ -2594,6 +2627,23 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
         .map_err(anyhow::Error::msg)?;
     validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(name) = args.service_account_name.as_deref() {
+        validate_kubernetes_dns_subdomain(name, "ServiceAccount name")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if args.disable_service_account_creation && !args.service_account_annotations.is_empty() {
+        anyhow::bail!(
+            "--service-account-annotation requires ServiceAccount creation; remove --disable-service-account-creation"
+        );
+    }
+    for annotation in &args.service_account_annotations {
+        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
+        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 
@@ -3954,6 +4004,9 @@ mod tests {
             enable_network_policy: true,
             network_policy_acknowledge_host_network: true,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4124,6 +4177,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4204,6 +4260,54 @@ mod tests {
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_service_account_options() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.service_account_name = Some("edge-agent".to_string());
+        args.service_account_annotations = vec![KeyValueArg {
+            key: "eks.amazonaws.com/role-arn".to_string(),
+            value: "arn:aws:iam::123456789012:role/ipars-agent".to_string(),
+        }];
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set-string serviceAccount.name=edge-agent"));
+        assert!(helm.contains(
+            "--set-string 'serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/ipars-agent'"
+        ));
+
+        let mut external = base_k8s_install_args();
+        external.disable_service_account_creation = true;
+        external.service_account_name = Some("existing-agent".to_string());
+        let plan = k8s_install_plan(external)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set serviceAccount.create=false"));
+        assert!(helm.contains("--set-string serviceAccount.name=existing-agent"));
+
+        let mut invalid_name = base_k8s_install_args();
+        invalid_name.service_account_name = Some("system/agent".to_string());
+        let error = match k8s_install_plan(invalid_name) {
+            Ok(_) => panic!("invalid ServiceAccount name should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ServiceAccount name"));
+
+        let mut invalid_annotation = base_k8s_install_args();
+        invalid_annotation.disable_service_account_creation = true;
+        invalid_annotation.service_account_annotations = vec![KeyValueArg {
+            key: "eks.amazonaws.com/role-arn".to_string(),
+            value: "arn:aws:iam::123456789012:role/ipars-agent".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_annotation) {
+            Ok(_) => panic!("annotations without ServiceAccount creation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--service-account-annotation"));
+
         Ok(())
     }
 
@@ -4603,6 +4707,10 @@ mod tests {
             "--enable-network-policy",
             "--network-policy-acknowledge-host-network",
             "--disable-rbac",
+            "--service-account-name",
+            "edge-agent",
+            "--service-account-annotation",
+            "eks.amazonaws.com/role-arn=arn:aws:iam::123456789012:role/ipars-agent",
             "--agent-pod-label",
             "ipars.io/role=agent",
             "--agent-pod-annotation",
@@ -4730,6 +4838,15 @@ mod tests {
             assert!(args.enable_network_policy);
             assert!(args.network_policy_acknowledge_host_network);
             assert!(args.disable_rbac);
+            assert!(!args.disable_service_account_creation);
+            assert_eq!(args.service_account_name.as_deref(), Some("edge-agent"));
+            assert_eq!(
+                args.service_account_annotations,
+                vec![KeyValueArg {
+                    key: "eks.amazonaws.com/role-arn".to_string(),
+                    value: "arn:aws:iam::123456789012:role/ipars-agent".to_string(),
+                }]
+            );
             assert_eq!(
                 args.agent_pod_labels,
                 vec![KeyValueArg {
@@ -4886,6 +5003,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4972,6 +5092,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5573,6 +5696,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5646,6 +5772,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5726,6 +5855,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5804,6 +5936,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5877,6 +6012,9 @@ mod tests {
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
             disable_rbac: false,
+            disable_service_account_creation: false,
+            service_account_name: None,
+            service_account_annotations: Vec::new(),
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,

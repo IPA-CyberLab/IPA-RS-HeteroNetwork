@@ -13,6 +13,11 @@ cluster:
 rbac:
   create: true
 
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
 agent:
   interfaceName: ipars0
   joinTokenSecretName: ipars-join-token
