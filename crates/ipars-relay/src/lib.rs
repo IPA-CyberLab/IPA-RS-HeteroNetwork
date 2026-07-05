@@ -193,7 +193,7 @@ impl RelayTable {
         }
 
         let id = RelaySessionId::new(&admission.left, &admission.right);
-        validate_relay_session_admission(&id, &admission.session_token)?;
+        validate_relay_session_admission(&admission, &id)?;
         let now = Utc::now();
         let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
         self.sessions.insert(
@@ -441,13 +441,18 @@ fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFai
 }
 
 fn validate_relay_session_admission(
+    admission: &RelaySessionAdmission,
     session_id: &RelaySessionId,
-    session_token: &str,
 ) -> Result<(), RelayError> {
+    if admission.left == admission.right || admission.left_addr == admission.right_addr {
+        return Err(RelayError::AdmissionDenied);
+    }
     if session_id.as_str().len() > MAX_RELAY_SESSION_ID_BYTES {
         return Err(RelayError::AdmissionDenied);
     }
-    if session_token.is_empty() || session_token.len() > MAX_RELAY_SESSION_TOKEN_BYTES {
+    if admission.session_token.is_empty()
+        || admission.session_token.len() > MAX_RELAY_SESSION_TOKEN_BYTES
+    {
         return Err(RelayError::InvalidSessionCredential);
     }
     Ok(())
@@ -780,6 +785,36 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_self_or_same_endpoint_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+
+        let same_node = table.admit_with_token(
+            &capability,
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node-a"),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        );
+        assert!(matches!(same_node, Err(RelayError::AdmissionDenied)));
+
+        let same_endpoint = table.admit_with_token(
+            &capability,
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node-b"),
+            left_addr,
+            left_addr,
+            "relay-secret".to_string(),
+        );
+        assert!(matches!(same_endpoint, Err(RelayError::AdmissionDenied)));
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn relay_rejects_oversized_frames_and_records_drop_reason() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -1070,6 +1105,37 @@ mod tests {
         assert_eq!(status.capability.active_sessions, 1);
         assert_eq!(status.admission_attempt_count, 2);
         assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_invalid_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("left"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
         assert_eq!(status.admission_failure_count, 1);
         assert_eq!(
             status
