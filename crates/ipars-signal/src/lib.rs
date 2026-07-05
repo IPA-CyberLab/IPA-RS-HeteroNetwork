@@ -123,7 +123,7 @@ impl SignalRegistry {
 
     pub async fn negotiate(
         &self,
-        request: SignalPathRequest,
+        mut request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
         self.get_node(&request.source)
@@ -134,12 +134,13 @@ impl SignalRegistry {
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
-        let target_nat_classification = self
-            .nat_classifications
-            .read()
-            .await
-            .get(&request.target)
-            .cloned();
+        let nat_classifications = self.nat_classifications.read().await;
+        let source_nat_classification = nat_classifications.get(&request.source).cloned();
+        let target_nat_classification = nat_classifications.get(&request.target).cloned();
+        drop(nat_classifications);
+        if let Some(source_nat_classification) = source_nat_classification {
+            request.source_nat_classification = Some(source_nat_classification);
+        }
         let relays = self.relay_candidates().await;
         let response = self.coordinator.negotiate(
             request,
@@ -792,6 +793,35 @@ mod tests {
                 target: NodeId::from_string("node-b"),
                 source_candidates: source.endpoint_candidates.clone(),
                 source_nat_classification: Some(relay_preferred_nat()),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_uses_stored_source_nat_classification_for_negotiation(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(source.clone(), Some(relay_preferred_nat()))
+            .await?;
+        registry.upsert_node(target.clone()).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
                 desired_routes: Vec::new(),
             })
             .await?;
