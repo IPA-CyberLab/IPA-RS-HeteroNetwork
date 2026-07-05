@@ -16,6 +16,7 @@ agent:
   joinTokenSecretKey: token
   routeProvider: false
   hostNetwork: true
+  automountServiceAccountToken: true
   terminationGracePeriodSeconds: ""
   privileged: false
   podLabels: {}
