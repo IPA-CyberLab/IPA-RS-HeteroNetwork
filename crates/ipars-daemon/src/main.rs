@@ -67,8 +67,9 @@ use ipars_types::ebpf::{
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState,
-    RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
+    KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord,
+    PathScore, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
+    TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -7081,26 +7082,41 @@ async fn negotiate_signal_paths(
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let relay_candidates = selected_relay_candidates(&response);
         let candidate_record = signal_path_record(response, chrono::Utc::now());
-        let (record, path_selection) = stable_signal_path_record(runtime, candidate_record).await;
+        let (mut record, mut path_selection) =
+            stable_signal_path_record(runtime, candidate_record).await;
         if record.selected_state == PathState::DirectNatTraversal {
-            match fetch_hole_punch_plan(client, &signal_url, &record.key).await {
-                Ok(plan) => match hole_puncher.execute(&status.node_id, &plan).await {
-                    Ok(attempts) => tracing::info!(
-                        attempts,
-                        peer = %record.key.remote,
-                        "executed UDP hole punch plan"
-                    ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        peer = %record.key.remote,
-                        "failed to execute UDP hole punch plan"
-                    ),
-                },
-                Err(error) => tracing::warn!(
+            let hole_punch_result = match fetch_hole_punch_plan(client, &signal_url, &record.key)
+                .await
+            {
+                Ok(plan) => hole_puncher
+                    .execute(&status.node_id, &plan)
+                    .await
+                    .map(|attempts| {
+                        tracing::info!(
+                            attempts,
+                            peer = %record.key.remote,
+                            "executed UDP hole punch plan"
+                        );
+                    }),
+                Err(error) => Err(AgentError::HolePunch(format!(
+                    "failed to fetch UDP hole punch plan: {error:#}"
+                ))),
+            };
+            if let Err(error) = hole_punch_result {
+                tracing::warn!(
                     %error,
                     peer = %record.key.remote,
-                    "failed to fetch UDP hole punch plan"
-                ),
+                    "failed to prepare direct NAT traversal path"
+                );
+                if let Some(fallback) = relay_fallback_path_record(&record, &relay_candidates) {
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        relay = ?fallback.relay_node,
+                        "falling back to relay after direct NAT traversal setup failed"
+                    );
+                    record = fallback;
+                    path_selection = StableSignalPathSelection::Candidate;
+                }
             }
         }
         if record.selected_state == PathState::Relay {
@@ -7589,9 +7605,6 @@ fn relay_session_endpoint_rank(candidate: &EndpointCandidate) -> Option<u8> {
 }
 
 fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
-    if response.preferred_state != PathState::Relay {
-        return Vec::new();
-    }
     let mut candidates = response
         .relay_candidates
         .iter()
@@ -7616,6 +7629,41 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
             })
     });
     candidates
+}
+
+fn relay_fallback_path_record(
+    direct_record: &PathRecord,
+    relay_candidates: &[NodeRecord],
+) -> Option<PathRecord> {
+    let relay = relay_candidates.first()?;
+    let relay_load = relay.relay_capability.as_ref().map(|capability| {
+        if capability.max_sessions == 0 {
+            1.0
+        } else {
+            capability.active_sessions as f32 / capability.max_sessions as f32
+        }
+    });
+    let mut score = PathScore::calculate(
+        PathState::Relay,
+        &PathMetrics {
+            relay_load,
+            ..PathMetrics::default()
+        },
+        true,
+        0,
+    );
+    score
+        .reasons
+        .push("direct_nat_traversal_failed".to_string());
+    Some(PathRecord {
+        key: direct_record.key.clone(),
+        selected_state: PathState::Relay,
+        selected_candidate: None,
+        relay_node: Some(relay.node_id.clone()),
+        score,
+        updated_at: chrono::Utc::now(),
+        pinned: direct_record.pinned,
+    })
 }
 
 fn relay_admission_url(relay: &NodeRecord) -> anyhow::Result<String> {
@@ -15289,6 +15337,89 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
     }
 
+    #[test]
+    fn selected_relay_candidates_remain_available_for_direct_fallback() {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )],
+            relay_candidates: vec![relay],
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let selected = selected_relay_candidates(&response);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].node_id, NodeId::from_string("relay-a"));
+    }
+
+    #[test]
+    fn relay_fallback_path_record_marks_direct_nat_setup_failure() -> anyhow::Result<()> {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 2,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let direct = PathRecord {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: true,
+        };
+
+        let fallback = relay_fallback_path_record(&direct, &[relay])
+            .context("relay fallback should be built")?;
+
+        assert_eq!(fallback.key, direct.key);
+        assert_eq!(fallback.selected_state, PathState::Relay);
+        assert_eq!(fallback.selected_candidate, None);
+        assert_eq!(fallback.relay_node, Some(NodeId::from_string("relay-a")));
+        assert!(fallback.pinned);
+        assert!(fallback
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_load=0.20"));
+        assert!(fallback
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn relay_admission_fails_over_to_next_candidate() -> anyhow::Result<()> {
         async fn relay_admission_success(
@@ -15495,6 +15626,130 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
         assert_eq!(accepted.session_id, "session-secure");
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_falls_back_to_relay_when_hole_punch_setup_fails(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-a"),
+                session_id: "session-a".to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: peer.endpoint_candidates.clone(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("fallback path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-a")));
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_some());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
+
+        signal_task.abort();
+        control_plane_task.abort();
         relay_task.abort();
         Ok(())
     }

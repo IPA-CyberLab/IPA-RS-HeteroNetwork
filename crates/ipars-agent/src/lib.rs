@@ -771,6 +771,10 @@ impl AgentRuntime {
         }
     }
 
+    pub async fn replace_candidates(&self, candidates: Vec<EndpointCandidate>) {
+        *self.candidates.write().await = candidates;
+    }
+
     pub async fn probe_stun(
         &self,
         local_bind: std::net::SocketAddr,
@@ -4315,6 +4319,30 @@ mod tests {
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(runtime.status().await.candidate_count, 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_can_replace_endpoint_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id;
+        let candidate = EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+
+        runtime.replace_candidates(vec![candidate.clone()]).await;
+
+        let status = runtime.status().await;
+        assert_eq!(status.candidate_count, 1);
+        assert_eq!(status.candidates, vec![candidate]);
     }
 
     #[tokio::test]
