@@ -12,6 +12,7 @@
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
 {{- $agentAllowPrivilegeEscalation := printf "%v" .Values.agent.securityContext.allowPrivilegeEscalation -}}
+{{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
@@ -52,6 +53,9 @@
 {{- end -}}
 {{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
+{{- end -}}
+{{- if not (or (eq $agentDnsPolicy "ClusterFirstWithHostNet") (eq $agentDnsPolicy "ClusterFirst") (eq $agentDnsPolicy "Default") (eq $agentDnsPolicy "None")) -}}
+{{- fail "agent.dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None" -}}
 {{- end -}}
 {{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
@@ -279,6 +283,7 @@ spec:
         {{- end }}
       {{- end }}
       hostNetwork: {{ .Values.agent.hostNetwork }}
+      dnsPolicy: {{ $agentDnsPolicy | quote }}
       {{- if ne $agentTerminationGracePeriodSeconds "" }}
       terminationGracePeriodSeconds: {{ int $agentTerminationGracePeriodSeconds }}
       {{- end }}

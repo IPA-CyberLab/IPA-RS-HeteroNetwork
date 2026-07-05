@@ -353,6 +353,8 @@ struct K8sInstallArgs {
     agent_tolerations: Vec<KubernetesTolerationArg>,
     #[arg(long = "disable-agent-service-account-token", default_value_t = false)]
     disable_agent_service_account_token: bool,
+    #[arg(long = "agent-dns-policy", value_parser = parse_kubernetes_dns_policy)]
+    agent_dns_policy: Option<String>,
     #[arg(long = "agent-termination-grace-period-seconds", value_parser = parse_kubernetes_non_negative_i64)]
     agent_termination_grace_period_seconds: Option<u64>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
@@ -1232,6 +1234,15 @@ fn parse_kubernetes_session_affinity(value: &str) -> Result<String, String> {
         "None" | "ClientIP" => Ok(value.to_string()),
         _ => Err(format!(
             "session affinity must be None or ClientIP; got {value}"
+        )),
+    }
+}
+
+fn parse_kubernetes_dns_policy(value: &str) -> Result<String, String> {
+    match value {
+        "ClusterFirstWithHostNet" | "ClusterFirst" | "Default" | "None" => Ok(value.to_string()),
+        _ => Err(format!(
+            "dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None; got {value}"
         )),
     }
 }
@@ -2470,7 +2481,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2550,6 +2561,9 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_agent_service_account_token {
         command.push_str(" --set agent.automountServiceAccountToken=false");
+    }
+    if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
+        command.push_str(&format!(" --set agent.dnsPolicy={dns_policy}"));
     }
     if args.agent_privileged {
         command.push_str(" --set agent.privileged=true");
@@ -2952,6 +2966,9 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     for toleration in &args.agent_tolerations {
         validate_kubernetes_toleration_arg(toleration).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
+        parse_kubernetes_dns_policy(dns_policy).map_err(anyhow::Error::msg)?;
     }
     if let Some(seconds) = args.agent_termination_grace_period_seconds {
         if seconds > KUBERNETES_INT64_MAX {
@@ -4157,6 +4174,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -4335,6 +4353,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -4588,6 +4607,7 @@ mod tests {
         ];
         args.agent_termination_grace_period_seconds = Some(45);
         args.disable_agent_service_account_token = true;
+        args.agent_dns_policy = Some("Default".to_string());
         args.agent_resource_request_cpu = Some("100m".to_string());
         args.agent_resource_request_memory = Some("128Mi".to_string());
         args.agent_resource_limit_cpu = Some("500m".to_string());
@@ -4611,6 +4631,7 @@ mod tests {
         assert!(helm.contains("--set-string 'agent.tolerations[1].effect=NoExecute'"));
         assert!(helm.contains("--set-string 'agent.tolerations[1].tolerationSeconds=600'"));
         assert!(helm.contains("--set agent.automountServiceAccountToken=false"));
+        assert!(helm.contains("--set agent.dnsPolicy=Default"));
         assert!(helm.contains("--set agent.terminationGracePeriodSeconds=45"));
         assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
         assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
@@ -4625,6 +4646,7 @@ mod tests {
             "Example.com/role=agent",
         ]);
         assert!(parsed.is_err());
+        assert!(parse_kubernetes_dns_policy("ClusterDefault").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
 
         let mut invalid_selector = base_k8s_install_args();
@@ -4975,6 +4997,8 @@ mod tests {
             "kubernetes.io/os=linux",
             "--agent-toleration",
             "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
+            "--agent-dns-policy",
+            "ClusterFirstWithHostNet",
             "--agent-termination-grace-period-seconds",
             "45",
             "--agent-resource-request-cpu",
@@ -5144,6 +5168,10 @@ mod tests {
                     toleration_seconds: None,
                 }]
             );
+            assert_eq!(
+                args.agent_dns_policy.as_deref(),
+                Some("ClusterFirstWithHostNet")
+            );
             assert_eq!(args.agent_termination_grace_period_seconds, Some(45));
             assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
@@ -5279,6 +5307,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -5373,6 +5402,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -5982,6 +6012,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6063,6 +6094,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6151,6 +6183,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6237,6 +6270,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6318,6 +6352,7 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
+            agent_dns_policy: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
