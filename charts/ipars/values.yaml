@@ -81,6 +81,7 @@ agent:
     allowClusterExternalTrafficPolicy: false
     type: ClusterIP
     clusterIP: ""
+    clusterIPs: []
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
@@ -116,6 +117,7 @@ agent:
     allowClusterExternalTrafficPolicy: false
     type: LoadBalancer
     clusterIP: ""
+    clusterIPs: []
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""

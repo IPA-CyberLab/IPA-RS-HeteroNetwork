@@ -401,6 +401,8 @@ struct K8sInstallArgs {
     agent_api_service_type: String,
     #[arg(long = "agent-api-cluster-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
     agent_api_cluster_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_agent_api", "agent_api_cluster_ip"])]
+    agent_api_secondary_cluster_ip: Option<IpAddr>,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
     #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
@@ -456,6 +458,8 @@ struct K8sInstallArgs {
     relay_service_type: String,
     #[arg(long = "relay-cluster-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
     relay_cluster_ip: Option<IpAddr>,
+    #[arg(long = "relay-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_relay", "relay_cluster_ip"])]
+    relay_secondary_cluster_ip: Option<IpAddr>,
     #[arg(long = "relay-udp-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
@@ -2494,6 +2498,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 "agent.apiService.clusterIP",
                 &cluster_ip.to_string(),
             );
+            if let Some(secondary_cluster_ip) = args.agent_api_secondary_cluster_ip {
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.apiService.clusterIPs[0]",
+                    &cluster_ip.to_string(),
+                );
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.apiService.clusterIPs[1]",
+                    &secondary_cluster_ip.to_string(),
+                );
+            }
         }
         if let Some(node_port) = args.agent_api_node_port {
             helm_command.push_str(&format!(" --set agent.apiService.nodePort={node_port}"));
@@ -2615,6 +2631,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 "agent.relayService.clusterIP",
                 &cluster_ip.to_string(),
             );
+            if let Some(secondary_cluster_ip) = args.relay_secondary_cluster_ip {
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.relayService.clusterIPs[0]",
+                    &cluster_ip.to_string(),
+                );
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.relayService.clusterIPs[1]",
+                    &secondary_cluster_ip.to_string(),
+                );
+            }
         }
         if let Some(node_port) = args.relay_udp_node_port {
             helm_command.push_str(&format!(
@@ -2789,7 +2817,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
-            "Service type, ClusterIP, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
@@ -3233,12 +3261,19 @@ fn kubernetes_ip_family(ip: IpAddr) -> &'static str {
     }
 }
 
-fn validate_kubernetes_service_cluster_ip(
+fn validate_kubernetes_service_cluster_ips(
     flag_prefix: &str,
     cluster_ip: Option<IpAddr>,
+    secondary_cluster_ip: Option<IpAddr>,
+    policy: Option<&str>,
     families: &[String],
 ) -> anyhow::Result<()> {
     let Some(cluster_ip) = cluster_ip else {
+        if secondary_cluster_ip.is_some() {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires --{flag_prefix}-cluster-ip"
+            );
+        }
         return Ok(());
     };
     let cluster_ip_family = kubernetes_ip_family(cluster_ip);
@@ -3247,6 +3282,31 @@ fn validate_kubernetes_service_cluster_ip(
             anyhow::bail!(
                 "{flag_prefix} clusterIP family {cluster_ip_family} must match the first --{flag_prefix}-ip-family value {primary_family}"
             );
+        }
+    }
+    if let Some(secondary_cluster_ip) = secondary_cluster_ip {
+        let secondary_cluster_ip_family = kubernetes_ip_family(secondary_cluster_ip);
+        if secondary_cluster_ip_family == cluster_ip_family {
+            anyhow::bail!(
+                "{flag_prefix} secondary clusterIP family {secondary_cluster_ip_family} must differ from primary clusterIP family {cluster_ip_family}"
+            );
+        }
+        if !matches!(policy, Some("PreferDualStack" | "RequireDualStack")) {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires --{flag_prefix}-ip-family-policy PreferDualStack or RequireDualStack"
+            );
+        }
+        if families.len() != 2 {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires exactly two --{flag_prefix}-ip-family values"
+            );
+        }
+        if let Some(secondary_family) = families.get(1) {
+            if secondary_family != secondary_cluster_ip_family {
+                anyhow::bail!(
+                    "{flag_prefix} secondary clusterIP family {secondary_cluster_ip_family} must match the second --{flag_prefix}-ip-family value {secondary_family}"
+                );
+            }
         }
     }
     Ok(())
@@ -3463,6 +3523,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_cluster_ip.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-cluster-ip requires --expose-agent-api");
     }
+    if args.agent_api_secondary_cluster_ip.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-secondary-cluster-ip requires --expose-agent-api");
+    }
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
     }
@@ -3504,6 +3567,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_cluster_ip.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-cluster-ip requires --expose-relay");
+    }
+    if args.relay_secondary_cluster_ip.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-secondary-cluster-ip requires --expose-relay");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -3560,14 +3626,18 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         args.relay_ip_family_policy.as_deref(),
         &args.relay_ip_families,
     )?;
-    validate_kubernetes_service_cluster_ip(
+    validate_kubernetes_service_cluster_ips(
         "agent-api",
         args.agent_api_cluster_ip,
+        args.agent_api_secondary_cluster_ip,
+        args.agent_api_ip_family_policy.as_deref(),
         &args.agent_api_ip_families,
     )?;
-    validate_kubernetes_service_cluster_ip(
+    validate_kubernetes_service_cluster_ips(
         "relay",
         args.relay_cluster_ip,
+        args.relay_secondary_cluster_ip,
+        args.relay_ip_family_policy.as_deref(),
         &args.relay_ip_families,
     )?;
     validate_kubernetes_session_affinity_options(
@@ -4889,6 +4959,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: Some("10.96.0.40".parse()?),
+            agent_api_secondary_cluster_ip: Some("2001:db8::40".parse()?),
             agent_api_node_port: Some(31080),
             agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
             agent_api_publish_not_ready_addresses: true,
@@ -4912,6 +4983,7 @@ mod tests {
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: Some("2001:db8::40".parse()?),
+            relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
             relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
@@ -4923,7 +4995,7 @@ mod tests {
             relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
-            relay_ip_families: vec!["IPv6".to_string()],
+            relay_ip_families: vec!["IPv6".to_string(), "IPv4".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_network_policy_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: Some("Cluster".to_string()),
@@ -4960,6 +5032,12 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.clusterIP=10.96.0.40"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[0]=10.96.0.40'")
+        );
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
+        );
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
@@ -4996,6 +5074,11 @@ mod tests {
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::40"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::40'"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
+        );
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
         assert!(plan.commands[2]
@@ -5014,6 +5097,7 @@ mod tests {
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
         assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[0]=IPv6'"));
+        assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[1]=IPv4'"));
         assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
         assert!(plan.commands[2].contains("--set agent.relayService.sessionAffinity=ClientIP"));
         assert!(
@@ -5108,6 +5192,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -5128,6 +5213,7 @@ mod tests {
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -6121,6 +6207,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -6141,6 +6228,7 @@ mod tests {
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -6232,6 +6320,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -6252,6 +6341,7 @@ mod tests {
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -6994,19 +7084,32 @@ mod tests {
         valid.expose_agent_api = true;
         valid.agent_api_service_type = "ClusterIP".to_string();
         valid.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
-        valid.agent_api_ip_family_policy = Some("SingleStack".to_string());
-        valid.agent_api_ip_families = vec!["IPv4".to_string()];
+        valid.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        valid.agent_api_ip_family_policy = Some("RequireDualStack".to_string());
+        valid.agent_api_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
         valid.relay_cluster_ip = Some("2001:db8::40".parse()?);
-        valid.relay_ip_family_policy = Some("SingleStack".to_string());
-        valid.relay_ip_families = vec!["IPv6".to_string()];
+        valid.relay_secondary_cluster_ip = Some("10.96.0.41".parse()?);
+        valid.relay_ip_family_policy = Some("PreferDualStack".to_string());
+        valid.relay_ip_families = vec!["IPv6".to_string(), "IPv4".to_string()];
         valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
         valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
 
         let plan = k8s_install_plan(valid)?;
         assert!(plan.commands[2].contains("--set-string agent.apiService.clusterIP=10.96.0.40"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[0]=10.96.0.40'")
+        );
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
+        );
         assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::40"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::40'"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
+        );
 
         let mut mismatched_agent_family = base_k8s_install_args();
         mismatched_agent_family.expose_agent_api = true;
@@ -7017,6 +7120,32 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("agent-api clusterIP family IPv6 must match"));
+
+        let mut missing_dual_stack_policy = base_k8s_install_args();
+        missing_dual_stack_policy.expose_agent_api = true;
+        missing_dual_stack_policy.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        missing_dual_stack_policy.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        missing_dual_stack_policy.agent_api_ip_family_policy = Some("SingleStack".to_string());
+        missing_dual_stack_policy.agent_api_ip_families = vec!["IPv4".to_string()];
+        let error = match k8s_install_plan(missing_dual_stack_policy) {
+            Ok(_) => panic!("secondary clusterIP should require dual-stack policy"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-secondary-cluster-ip requires"));
+
+        let mut same_family_secondary = base_k8s_install_args();
+        same_family_secondary.expose_relay = true;
+        same_family_secondary.relay_cluster_ip = Some("10.96.0.40".parse()?);
+        same_family_secondary.relay_secondary_cluster_ip = Some("10.96.0.41".parse()?);
+        same_family_secondary.relay_ip_family_policy = Some("PreferDualStack".to_string());
+        same_family_secondary.relay_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
+        same_family_secondary.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        same_family_secondary.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(same_family_secondary) {
+            Ok(_) => panic!("secondary clusterIP family should differ from primary"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("secondary clusterIP family IPv4 must differ"));
 
         let mut missing_agent_exposure = base_k8s_install_args();
         missing_agent_exposure.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
@@ -7033,6 +7162,15 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-cluster-ip requires --expose-relay"));
+
+        let mut missing_primary = base_k8s_install_args();
+        missing_primary.expose_agent_api = true;
+        missing_primary.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        let error = match k8s_install_plan(missing_primary) {
+            Ok(_) => panic!("secondary clusterIP should require primary clusterIP"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-secondary-cluster-ip requires --agent-api-cluster-ip"));
 
         let parsed = Cli::try_parse_from([
             "ipars",
@@ -7103,6 +7241,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -7123,6 +7262,7 @@ mod tests {
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -7201,6 +7341,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -7221,6 +7362,7 @@ mod tests {
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -7306,6 +7448,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -7326,6 +7469,7 @@ mod tests {
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -7409,6 +7553,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -7429,6 +7574,7 @@ mod tests {
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -7507,6 +7653,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -7527,6 +7674,7 @@ mod tests {
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,

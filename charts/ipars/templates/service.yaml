@@ -11,6 +11,7 @@
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
 {{- $agentApiPort := int .Values.agent.apiService.port -}}
 {{- $agentApiClusterIP := .Values.agent.apiService.clusterIP -}}
+{{- $agentApiClusterIPs := .Values.agent.apiService.clusterIPs -}}
 {{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
 {{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
 {{- $agentApiLoadBalancerIP := .Values.agent.apiService.loadBalancerIP -}}
@@ -24,6 +25,7 @@
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
 {{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
+{{- $relayClusterIPs := .Values.agent.relayService.clusterIPs -}}
 {{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
 {{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
 {{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
@@ -48,6 +50,35 @@
 {{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.clusterIP" "value" $agentApiClusterIP) -}}
 {{- if and $agentApiIpFamilies (ne (index $agentApiIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $agentApiClusterIP))) -}}
 {{- fail "agent.apiService.clusterIP family must match the first agent.apiService.ipFamilies value" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiClusterIPs -}}
+{{- if eq $agentApiClusterIP "" -}}
+{{- fail "agent.apiService.clusterIPs requires agent.apiService.clusterIP" -}}
+{{- end -}}
+{{- if gt (len $agentApiClusterIPs) 2 -}}
+{{- fail "agent.apiService.clusterIPs accepts at most two values" -}}
+{{- end -}}
+{{- range $ip := $agentApiClusterIPs -}}
+{{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.clusterIPs" "value" $ip) -}}
+{{- end -}}
+{{- if ne (printf "%v" (index $agentApiClusterIPs 0)) $agentApiClusterIP -}}
+{{- fail "agent.apiService.clusterIPs[0] must match agent.apiService.clusterIP" -}}
+{{- end -}}
+{{- if eq (len $agentApiClusterIPs) 2 -}}
+{{- $agentApiSecondaryClusterIP := printf "%v" (index $agentApiClusterIPs 1) -}}
+{{- if eq (ternary "IPv6" "IPv4" (contains ":" $agentApiClusterIP)) (ternary "IPv6" "IPv4" (contains ":" $agentApiSecondaryClusterIP)) -}}
+{{- fail "agent.apiService.clusterIPs must contain one IPv4 and one IPv6 address when two values are set" -}}
+{{- end -}}
+{{- if not $agentApiIpFamilyPolicyDual -}}
+{{- fail "agent.apiService.clusterIPs with two values require ipFamilyPolicy PreferDualStack or RequireDualStack" -}}
+{{- end -}}
+{{- if ne (len $agentApiIpFamilies) 2 -}}
+{{- fail "agent.apiService.clusterIPs with two values require two ipFamilies values" -}}
+{{- end -}}
+{{- if ne (index $agentApiIpFamilies 1) (ternary "IPv6" "IPv4" (contains ":" $agentApiSecondaryClusterIP)) -}}
+{{- fail "agent.apiService.clusterIPs[1] family must match agent.apiService.ipFamilies[1]" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (not $agentApiExternal) -}}
@@ -129,6 +160,35 @@
 {{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}
 {{- if and $relayIpFamilies (ne (index $relayIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP))) -}}
 {{- fail "agent.relayService.clusterIP family must match the first agent.relayService.ipFamilies value" -}}
+{{- end -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayClusterIPs -}}
+{{- if eq $relayClusterIP "" -}}
+{{- fail "agent.relayService.clusterIPs requires agent.relayService.clusterIP" -}}
+{{- end -}}
+{{- if gt (len $relayClusterIPs) 2 -}}
+{{- fail "agent.relayService.clusterIPs accepts at most two values" -}}
+{{- end -}}
+{{- range $ip := $relayClusterIPs -}}
+{{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.clusterIPs" "value" $ip) -}}
+{{- end -}}
+{{- if ne (printf "%v" (index $relayClusterIPs 0)) $relayClusterIP -}}
+{{- fail "agent.relayService.clusterIPs[0] must match agent.relayService.clusterIP" -}}
+{{- end -}}
+{{- if eq (len $relayClusterIPs) 2 -}}
+{{- $relaySecondaryClusterIP := printf "%v" (index $relayClusterIPs 1) -}}
+{{- if eq (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP)) (ternary "IPv6" "IPv4" (contains ":" $relaySecondaryClusterIP)) -}}
+{{- fail "agent.relayService.clusterIPs must contain one IPv4 and one IPv6 address when two values are set" -}}
+{{- end -}}
+{{- if not $relayIpFamilyPolicyDual -}}
+{{- fail "agent.relayService.clusterIPs with two values require ipFamilyPolicy PreferDualStack or RequireDualStack" -}}
+{{- end -}}
+{{- if ne (len $relayIpFamilies) 2 -}}
+{{- fail "agent.relayService.clusterIPs with two values require two ipFamilies values" -}}
+{{- end -}}
+{{- if ne (index $relayIpFamilies 1) (ternary "IPv6" "IPv4" (contains ":" $relaySecondaryClusterIP)) -}}
+{{- fail "agent.relayService.clusterIPs[1] family must match agent.relayService.ipFamilies[1]" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0)) (not $relayExternal) -}}
@@ -290,6 +350,10 @@ spec:
   {{- if .Values.agent.apiService.clusterIP }}
   clusterIP: {{ .Values.agent.apiService.clusterIP | quote }}
   {{- end }}
+  {{- if .Values.agent.apiService.clusterIPs }}
+  clusterIPs:
+{{- toYaml .Values.agent.apiService.clusterIPs | nindent 4 }}
+  {{- end }}
   {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.apiService.loadBalancerSourceRanges | nindent 4 }}
@@ -365,6 +429,10 @@ spec:
   type: {{ .Values.agent.relayService.type }}
   {{- if .Values.agent.relayService.clusterIP }}
   clusterIP: {{ .Values.agent.relayService.clusterIP | quote }}
+  {{- end }}
+  {{- if .Values.agent.relayService.clusterIPs }}
+  clusterIPs:
+{{- toYaml .Values.agent.relayService.clusterIPs | nindent 4 }}
   {{- end }}
   {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
