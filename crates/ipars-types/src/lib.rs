@@ -624,6 +624,8 @@ pub struct ClusterPolicy {
     pub relay_health_ttl_seconds: u64,
     #[serde(default = "default_endpoint_candidate_ttl_seconds")]
     pub endpoint_candidate_ttl_seconds: u64,
+    #[serde(default = "default_nat_classification_ttl_seconds")]
+    pub nat_classification_ttl_seconds: u64,
     pub pinned_roles: BTreeSet<Role>,
     pub pinned_tags: BTreeSet<Tag>,
     #[serde(default)]
@@ -641,6 +643,7 @@ impl Default for ClusterPolicy {
             idle_timeout_seconds: 300,
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
+            nat_classification_ttl_seconds: default_nat_classification_ttl_seconds(),
             pinned_roles,
             pinned_tags: BTreeSet::new(),
             acl_rules: Vec::new(),
@@ -654,6 +657,10 @@ fn default_relay_health_ttl_seconds() -> u64 {
 
 fn default_endpoint_candidate_ttl_seconds() -> u64 {
     120
+}
+
+fn default_nat_classification_ttl_seconds() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1056,6 +1063,8 @@ pub mod api {
         pub node_count: usize,
         pub relay_candidate_count: usize,
         pub nat_classification_count: usize,
+        #[serde(default)]
+        pub stale_nat_classification_count: usize,
         pub health_report_count: usize,
         pub healthy_node_count: usize,
         pub degraded_node_count: usize,
@@ -1071,6 +1080,8 @@ pub mod api {
         pub relay_health_ttl_seconds: u64,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,
+        #[serde(default = "super::default_nat_classification_ttl_seconds")]
+        pub nat_classification_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 

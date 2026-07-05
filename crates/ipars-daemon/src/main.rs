@@ -301,6 +301,12 @@ struct SignalArgs {
     endpoint_candidate_ttl_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_SIGNAL_NAT_CLASSIFICATION_TTL_SECONDS",
+        default_value_t = 300
+    )]
+    nat_classification_ttl_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
         default_value_t = false
     )]
@@ -2164,6 +2170,7 @@ async fn run_signal(
         idle_timeout_seconds: args.idle_timeout_seconds,
         relay_health_ttl_seconds: args.relay_health_ttl_seconds,
         endpoint_candidate_ttl_seconds: args.endpoint_candidate_ttl_seconds,
+        nat_classification_ttl_seconds: args.nat_classification_ttl_seconds,
         ..ClusterPolicy::default()
     };
     let registry = Arc::new(SignalRegistry::new(policy));
@@ -2186,6 +2193,10 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     validate_positive_seconds(
         args.endpoint_candidate_ttl_seconds,
         "--endpoint-candidate-ttl-seconds",
+    )?;
+    validate_positive_seconds(
+        args.nat_classification_ttl_seconds,
+        "--nat-classification-ttl-seconds",
     )
 }
 
@@ -2484,12 +2495,14 @@ struct SignalOtelMetrics {
     nodes: Gauge<u64>,
     relay_candidates: Gauge<u64>,
     nat_classifications: Gauge<u64>,
+    stale_nat_classifications: Gauge<u64>,
     health_report_total: Gauge<u64>,
     health_reports: Gauge<u64>,
     stale_health_reports: Gauge<u64>,
     relay_health_ttl_seconds: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
+    nat_classification_ttl_seconds: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
@@ -2511,6 +2524,12 @@ impl SignalOtelMetrics {
             nat_classifications: meter
                 .u64_gauge("ipars.signal.nat_classifications")
                 .with_description("Nodes with NAT classification registered in signal.")
+                .build(),
+            stale_nat_classifications: meter
+                .u64_gauge("ipars.signal.stale_nat_classifications")
+                .with_description(
+                    "Signal NAT classifications older than the NAT classification TTL.",
+                )
                 .build(),
             health_report_total: meter
                 .u64_gauge("ipars.signal.health_reports.total")
@@ -2535,6 +2554,10 @@ impl SignalOtelMetrics {
             endpoint_candidate_ttl_seconds: meter
                 .u64_gauge("ipars.signal.endpoint_candidate_ttl_seconds")
                 .with_description("Endpoint candidate freshness window used by signal.")
+                .build(),
+            nat_classification_ttl_seconds: meter
+                .u64_gauge("ipars.signal.nat_classification_ttl_seconds")
+                .with_description("NAT classification freshness window used by signal.")
                 .build(),
             node_upserts: meter
                 .u64_counter("ipars.signal.node_upserts")
@@ -2565,6 +2588,8 @@ impl SignalOtelMetrics {
             .record(metrics.relay_candidate_count as u64, &[]);
         self.nat_classifications
             .record(metrics.nat_classification_count as u64, &[]);
+        self.stale_nat_classifications
+            .record(metrics.stale_nat_classification_count as u64, &[]);
         self.health_report_total
             .record(metrics.health_report_count as u64, &[]);
         self.stale_health_reports
@@ -2575,6 +2600,8 @@ impl SignalOtelMetrics {
             .record(metrics.stale_endpoint_candidate_count as u64, &[]);
         self.endpoint_candidate_ttl_seconds
             .record(metrics.endpoint_candidate_ttl_seconds, &[]);
+        self.nat_classification_ttl_seconds
+            .record(metrics.nat_classification_ttl_seconds, &[]);
 
         for (state, count) in [
             (HealthState::Healthy, metrics.healthy_node_count),
@@ -8440,6 +8467,8 @@ mod tests {
             "45",
             "--endpoint-candidate-ttl-seconds",
             "75",
+            "--nat-classification-ttl-seconds",
+            "180",
             "--disable-relay-fallback",
         ])?;
 
@@ -8448,6 +8477,7 @@ mod tests {
         };
         assert_eq!(args.relay_health_ttl_seconds, 45);
         assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
+        assert_eq!(args.nat_classification_ttl_seconds, 180);
         assert!(args.disable_relay_fallback);
         validate_signal_runtime_config(&args)?;
         Ok(())
@@ -8498,6 +8528,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--endpoint-candidate-ttl-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_nat_classification_ttl_must_be_positive() -> anyhow::Result<()> {
+        let cli =
+            Cli::try_parse_from(["iparsd", "signal", "--nat-classification-ttl-seconds", "0"])?;
+
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        let error = match validate_signal_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("unexpected valid signal runtime config"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--nat-classification-ttl-seconds must be greater than zero"));
         Ok(())
     }
 

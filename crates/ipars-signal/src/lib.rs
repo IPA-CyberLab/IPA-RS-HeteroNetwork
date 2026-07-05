@@ -130,13 +130,28 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
         validate_endpoint_candidate_owners(&request.source, &request.source_candidates)?;
+        let now = Utc::now();
         let target = self
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
         let nat_classifications = self.nat_classifications.read().await;
-        let source_nat_classification = nat_classifications.get(&request.source).cloned();
-        let target_nat_classification = nat_classifications.get(&request.target).cloned();
+        let source_nat_classification = fresh_stored_nat_classification(
+            nat_classifications.get(&request.source),
+            request.source_nat_classification.take(),
+            now,
+            self.coordinator.policy.nat_classification_ttl_seconds,
+        );
+        let target_nat_classification = nat_classifications
+            .get(&request.target)
+            .filter(|classification| {
+                nat_classification_is_fresh(
+                    classification,
+                    now,
+                    self.coordinator.policy.nat_classification_ttl_seconds,
+                )
+            })
+            .cloned();
         drop(nat_classifications);
         if let Some(source_nat_classification) = source_nat_classification {
             request.source_nat_classification = Some(source_nat_classification);
@@ -205,6 +220,7 @@ impl SignalRegistry {
         let now = Utc::now();
         let relay_health_ttl_seconds = self.coordinator.policy.relay_health_ttl_seconds;
         let endpoint_candidate_ttl_seconds = self.coordinator.policy.endpoint_candidate_ttl_seconds;
+        let nat_classification_ttl_seconds = self.coordinator.policy.nat_classification_ttl_seconds;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
@@ -227,6 +243,12 @@ impl SignalRegistry {
                 !endpoint_candidate_is_fresh(candidate, now, endpoint_candidate_ttl_seconds)
             })
             .count();
+        let stale_nat_classification_count = nat_classifications
+            .values()
+            .filter(|classification| {
+                !nat_classification_is_fresh(classification, now, nat_classification_ttl_seconds)
+            })
+            .count();
 
         let relay_candidate_count = nodes
             .values()
@@ -244,6 +266,7 @@ impl SignalRegistry {
             node_count: nodes.len(),
             relay_candidate_count,
             nat_classification_count: nat_classifications.len(),
+            stale_nat_classification_count,
             health_report_count: health.len(),
             healthy_node_count,
             degraded_node_count,
@@ -256,6 +279,7 @@ impl SignalRegistry {
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
+            nat_classification_ttl_seconds,
             generated_at: now,
         }
     }
@@ -467,6 +491,36 @@ fn validate_endpoint_candidate_owners(
         });
     }
     Ok(())
+}
+
+fn fresh_stored_nat_classification(
+    stored: Option<&NatClassification>,
+    requested: Option<NatClassification>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Option<NatClassification> {
+    stored
+        .filter(|classification| nat_classification_is_fresh(classification, now, ttl_seconds))
+        .cloned()
+        .or_else(|| {
+            requested.filter(|classification| {
+                nat_classification_is_fresh(classification, now, ttl_seconds)
+            })
+        })
+}
+
+fn nat_classification_is_fresh(
+    classification: &NatClassification,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now
+        .signed_duration_since(classification.assessed_at)
+        .to_std()
+    {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
 }
 
 fn fresh_endpoint_candidates(
@@ -832,6 +886,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_ignores_stale_source_nat_classification_for_negotiation(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            nat_classification_ttl_seconds: 30,
+            ..ClusterPolicy::default()
+        });
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut stale_nat = relay_preferred_nat();
+        stale_nat.assessed_at = Utc::now() - chrono::Duration::seconds(60);
+        registry
+            .upsert_node_with_nat(source.clone(), Some(stale_nat))
+            .await?;
+        registry.upsert_node(target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.nat_classification_count, 1);
+        assert_eq!(metrics.stale_nat_classification_count, 1);
+        assert_eq!(metrics.nat_classification_ttl_seconds, 30);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_requires_fresh_healthy_relay_health() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
         registry.upsert_node(source(Vec::new())).await?;
@@ -917,6 +1005,7 @@ mod tests {
         assert_eq!(stale_metrics.node_count, 3);
         assert_eq!(stale_metrics.relay_candidate_count, 0);
         assert_eq!(stale_metrics.nat_classification_count, 1);
+        assert_eq!(stale_metrics.stale_nat_classification_count, 0);
         assert_eq!(stale_metrics.health_report_count, 3);
         assert_eq!(stale_metrics.healthy_node_count, 3);
         assert_eq!(stale_metrics.stale_health_report_count, 1);
@@ -930,6 +1019,7 @@ mod tests {
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
+        assert_eq!(stale_metrics.nat_classification_ttl_seconds, 300);
         assert_eq!(stale_metrics.stale_endpoint_candidate_count, 1);
 
         registry
