@@ -2610,6 +2610,7 @@ struct SignalOtelSnapshot {
     path_negotiation_count: u64,
     path_acl_denied_count: u64,
     relay_candidate_acl_denied_count: u64,
+    fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
     path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
     hole_punch_acl_denied_count: u64,
@@ -2624,6 +2625,9 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
             path_negotiation_count: metrics.path_negotiation_count,
             path_acl_denied_count: metrics.path_acl_denied_count,
             relay_candidate_acl_denied_count: metrics.relay_candidate_acl_denied_count,
+            fresh_nat_classification_strategy_counts: metrics
+                .fresh_nat_classification_strategy_counts
+                .clone(),
             path_negotiation_state_counts: metrics.path_negotiation_state_counts.clone(),
             hole_punch_plan_count: metrics.hole_punch_plan_count,
             hole_punch_acl_denied_count: metrics.hole_punch_acl_denied_count,
@@ -2781,10 +2785,10 @@ impl SignalOtelMetrics {
             .record(metrics.relay_candidate_count as u64, &[]);
         self.nat_classifications
             .record(metrics.nat_classification_count as u64, &[]);
-        for strategy_count in &metrics.fresh_nat_classification_strategy_counts {
-            let attrs = [KeyValue::new("strategy", strategy_count.strategy.as_str())];
+        for strategy in NatTraversalStrategy::ALL {
+            let attrs = [KeyValue::new("strategy", strategy.as_str())];
             self.fresh_nat_classifications_by_strategy
-                .record(strategy_count.count as u64, &attrs);
+                .record(signal_nat_strategy_count(metrics, strategy) as u64, &attrs);
         }
         self.fresh_low_confidence_nat_classifications.record(
             metrics.fresh_low_confidence_nat_classification_count as u64,
@@ -2931,6 +2935,31 @@ fn signal_snapshot_path_state_count(snapshot: &SignalOtelSnapshot, state: PathSt
         .path_negotiation_state_counts
         .iter()
         .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_nat_strategy_count(
+    metrics: &SignalMetricsResponse,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    metrics
+        .fresh_nat_classification_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn signal_snapshot_nat_strategy_count(
+    snapshot: &SignalOtelSnapshot,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    snapshot
+        .fresh_nat_classification_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
         .map(|entry| entry.count)
         .unwrap_or(0)
 }
@@ -9658,7 +9687,10 @@ mod tests {
             nat_classification_count: 0,
             stale_nat_classification_count: 0,
             fresh_low_confidence_nat_classification_count: 0,
-            fresh_nat_classification_strategy_counts: Vec::new(),
+            fresh_nat_classification_strategy_counts: vec![NatTraversalStrategyCount {
+                strategy: NatTraversalStrategy::CoordinatedHolePunch,
+                count: 3,
+            }],
             health_report_count: 0,
             healthy_node_count: 0,
             degraded_node_count: 0,
@@ -9685,6 +9717,25 @@ mod tests {
         };
         let snapshot = SignalOtelSnapshot::from(&metrics);
 
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::CoordinatedHolePunch),
+            3
+        );
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::DirectCandidate),
+            0
+        );
+        assert_eq!(
+            signal_snapshot_nat_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::CoordinatedHolePunch,
+            ),
+            3
+        );
+        assert_eq!(
+            signal_snapshot_nat_strategy_count(&snapshot, NatTraversalStrategy::RelayPreferred),
+            0
+        );
         assert_eq!(
             signal_hole_punch_nat_suppression_strategy_count(
                 &metrics,
