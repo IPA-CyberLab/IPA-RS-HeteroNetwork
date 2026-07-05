@@ -15,7 +15,7 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
     RotateWireGuardKeyResponse,
 };
-use ipars_types::{NodeId, PathState};
+use ipars_types::{NodeId, PathMetricsValidationError, PathState};
 use serde::Serialize;
 
 macro_rules! prometheus_line {
@@ -187,6 +187,7 @@ async fn path_probe(
     State(state): State<AgentHttpState>,
     Json(request): Json<AgentPathProbeRequest>,
 ) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
+    request.metrics.validate()?;
     let recorded_at = chrono::Utc::now();
     let path = state.runtime.record_path_probe(request, recorded_at).await;
     Ok((
@@ -644,17 +645,32 @@ fn prometheus_label(value: &str) -> String {
 }
 
 #[derive(Debug)]
-pub struct ApiError(AgentError);
+pub enum ApiError {
+    Agent(AgentError),
+    BadRequest(String),
+}
 
 impl From<AgentError> for ApiError {
     fn from(error: AgentError) -> Self {
-        Self(error)
+        Self::Agent(error)
+    }
+}
+
+impl From<PathMetricsValidationError> for ApiError {
+    fn from(error: PathMetricsValidationError) -> Self {
+        Self::BadRequest(error.to_string())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
+        let error = match self {
+            ApiError::BadRequest(error) => {
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+            }
+            ApiError::Agent(error) => error,
+        };
+        let status = match error {
             AgentError::Io(_)
             | AgentError::Json(_)
             | AgentError::Crypto(_)
@@ -671,7 +687,7 @@ impl IntoResponse for ApiError {
         (
             status,
             Json(ErrorResponse {
-                error: self.0.to_string(),
+                error: error.to_string(),
             }),
         )
             .into_response()
@@ -1171,6 +1187,50 @@ mod tests {
         let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
         assert_eq!(events.events.len(), 1);
         assert_eq!(events.events[0].new_state, PathState::DirectNatTraversal);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_invalid_path_probe_metrics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let metrics_runtime = Arc::clone(&runtime);
+        let app = router(AgentHttpState::new(runtime));
+        let request = AgentPathProbeRequest {
+            peer: NodeId::from_string("peer-probed"),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: None,
+            relay_node: None,
+            metrics: PathMetrics {
+                latency_ms: Some(-1.0),
+                ..PathMetrics::default()
+            },
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("latency_ms"));
+        assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
         Ok(())
     }
 

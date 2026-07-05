@@ -485,6 +485,75 @@ impl Default for PathMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMetricsValidationError {
+    field: &'static str,
+    message: &'static str,
+}
+
+impl PathMetricsValidationError {
+    fn new(field: &'static str, message: &'static str) -> Self {
+        Self { field, message }
+    }
+
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl Display for PathMetricsValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "path metric {} {}", self.field, self.message)
+    }
+}
+
+impl std::error::Error for PathMetricsValidationError {}
+
+impl PathMetrics {
+    pub fn validate(&self) -> Result<(), PathMetricsValidationError> {
+        validate_optional_non_negative_metric("latency_ms", self.latency_ms)?;
+        validate_optional_non_negative_metric("jitter_ms", self.jitter_ms)?;
+        validate_optional_unit_metric("relay_load", self.relay_load)?;
+        validate_unit_metric("stability", self.stability)?;
+        Ok(())
+    }
+}
+
+fn validate_optional_non_negative_metric(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), PathMetricsValidationError> {
+    if let Some(value) = value {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PathMetricsValidationError::new(
+                field,
+                "must be a finite non-negative value",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_unit_metric(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), PathMetricsValidationError> {
+    if let Some(value) = value {
+        validate_unit_metric(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_unit_metric(field: &'static str, value: f32) -> Result<(), PathMetricsValidationError> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(PathMetricsValidationError::new(
+            field,
+            "must be a finite value between 0 and 1",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathScore {
     pub value: f32,
@@ -515,7 +584,7 @@ impl PathScore {
         let mut reasons = vec![format!("state={state:?}")];
 
         if let Some(latency_ms) = metrics.latency_ms {
-            value -= latency_ms.min(500.0) / 10.0;
+            value -= bounded_metric(latency_ms, 0.0, 500.0, 500.0) / 10.0;
             reasons.push(format!("latency_ms={latency_ms:.1}"));
         }
         if metrics.loss_ppm > 0 {
@@ -523,20 +592,28 @@ impl PathScore {
             reasons.push(format!("loss_ppm={}", metrics.loss_ppm));
         }
         if let Some(jitter_ms) = metrics.jitter_ms {
-            value -= jitter_ms.min(200.0) / 20.0;
+            value -= bounded_metric(jitter_ms, 0.0, 200.0, 200.0) / 20.0;
             reasons.push(format!("jitter_ms={jitter_ms:.1}"));
         }
         if let Some(relay_load) = metrics.relay_load {
-            value -= relay_load.clamp(0.0, 1.0) * 20.0;
+            value -= bounded_metric(relay_load, 0.0, 1.0, 1.0) * 20.0;
             reasons.push(format!("relay_load={relay_load:.2}"));
         }
-        let stability = metrics.stability.clamp(0.0, 1.0);
+        let stability = bounded_metric(metrics.stability, 0.0, 1.0, 0.0);
         value += stability * 15.0;
         reasons.push(format!("stability={stability:.2}"));
         value -= cost.min(10_000) as f32 / 100.0;
         reasons.push(format!("cost={cost}"));
 
         Self { value, reasons }
+    }
+}
+
+fn bounded_metric(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
     }
 }
 
@@ -1802,6 +1879,67 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "stability=0.90"));
+    }
+
+    #[test]
+    fn path_metrics_reject_invalid_probe_values() {
+        let mut metrics = PathMetrics {
+            latency_ms: Some(-1.0),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("negative latency must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "latency_ms");
+
+        metrics = PathMetrics {
+            jitter_ms: Some(-0.1),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("negative jitter must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "jitter_ms");
+
+        metrics = PathMetrics {
+            relay_load: Some(1.1),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("out-of-range relay load must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "relay_load");
+
+        metrics = PathMetrics {
+            stability: f32::NAN,
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("NaN stability must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "stability");
+    }
+
+    #[test]
+    fn path_score_bounds_invalid_metrics_defensively() {
+        let score = PathScore::calculate(
+            PathState::DirectPublic,
+            &PathMetrics {
+                latency_ms: Some(f32::NAN),
+                loss_ppm: 0,
+                jitter_ms: Some(f32::INFINITY),
+                relay_load: Some(f32::NAN),
+                stability: f32::NAN,
+            },
+            true,
+            0,
+        );
+
+        assert!(score.value.is_finite());
     }
 
     #[test]

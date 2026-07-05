@@ -1064,7 +1064,7 @@ fn path_probe_request(
     args: &PathProbeArgs,
     observed_at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<AgentPathProbeRequest> {
-    Ok(AgentPathProbeRequest {
+    let request = AgentPathProbeRequest {
         peer: NodeId::from_string(args.peer.clone()),
         selected_state: args.state,
         selected_candidate: path_probe_candidate(args, observed_at)?,
@@ -1079,7 +1079,9 @@ fn path_probe_request(
         policy_allowed: !args.policy_denied,
         cost: args.cost,
         pin: args.pin,
-    })
+    };
+    request.metrics.validate()?;
+    Ok(request)
 }
 
 fn path_probe_candidate(
@@ -3917,6 +3919,33 @@ mod tests {
         assert!(error
             .to_string()
             .contains("candidate metadata requires --candidate-addr"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_invalid_metrics() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--latency-ms=-1",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => panic!("negative latency must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("latency_ms"));
         Ok(())
     }
 
