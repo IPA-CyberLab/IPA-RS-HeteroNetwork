@@ -92,6 +92,7 @@ agent:
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    trafficDistribution: ""
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
@@ -128,6 +129,7 @@ agent:
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    trafficDistribution: ""
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local

@@ -4,6 +4,8 @@
 {{- $relayServiceTypeValid := or (eq .Values.agent.relayService.type "ClusterIP") (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
 {{- $agentApiInternalTrafficPolicyValid := or (eq .Values.agent.apiService.internalTrafficPolicy "") (eq .Values.agent.apiService.internalTrafficPolicy "Local") (eq .Values.agent.apiService.internalTrafficPolicy "Cluster") -}}
 {{- $relayInternalTrafficPolicyValid := or (eq .Values.agent.relayService.internalTrafficPolicy "") (eq .Values.agent.relayService.internalTrafficPolicy "Local") (eq .Values.agent.relayService.internalTrafficPolicy "Cluster") -}}
+{{- $agentApiTrafficDistributionValid := or (eq .Values.agent.apiService.trafficDistribution "") (eq .Values.agent.apiService.trafficDistribution "PreferSameZone") (eq .Values.agent.apiService.trafficDistribution "PreferSameNode") (eq .Values.agent.apiService.trafficDistribution "PreferClose") -}}
+{{- $relayTrafficDistributionValid := or (eq .Values.agent.relayService.trafficDistribution "") (eq .Values.agent.relayService.trafficDistribution "PreferSameZone") (eq .Values.agent.relayService.trafficDistribution "PreferSameNode") (eq .Values.agent.relayService.trafficDistribution "PreferClose") -}}
 {{- $agentApiSessionAffinityValid := or (eq .Values.agent.apiService.sessionAffinity "") (eq .Values.agent.apiService.sessionAffinity "None") (eq .Values.agent.apiService.sessionAffinity "ClientIP") -}}
 {{- $relaySessionAffinityValid := or (eq .Values.agent.relayService.sessionAffinity "") (eq .Values.agent.relayService.sessionAffinity "None") (eq .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
@@ -275,6 +277,12 @@
 {{- if and $relayServiceActive (not $relayInternalTrafficPolicyValid) -}}
 {{- fail "agent.relayService.internalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiTrafficDistributionValid) -}}
+{{- fail "agent.apiService.trafficDistribution must be PreferSameZone, PreferSameNode, or PreferClose" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayTrafficDistributionValid) -}}
+{{- fail "agent.relayService.trafficDistribution must be PreferSameZone, PreferSameNode, or PreferClose" -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiSessionAffinityValid) -}}
 {{- fail "agent.apiService.sessionAffinity must be None or ClientIP" -}}
 {{- end -}}
@@ -387,6 +395,9 @@ spec:
   {{- if .Values.agent.apiService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.apiService.internalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.apiService.trafficDistribution }}
+  trafficDistribution: {{ .Values.agent.apiService.trafficDistribution }}
+  {{- end }}
   {{- if .Values.agent.apiService.publishNotReadyAddresses }}
   publishNotReadyAddresses: true
   {{- end }}
@@ -466,6 +477,9 @@ spec:
   {{- end }}
   {{- if .Values.agent.relayService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.relayService.internalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.agent.relayService.trafficDistribution }}
+  trafficDistribution: {{ .Values.agent.relayService.trafficDistribution }}
   {{- end }}
   {{- if .Values.agent.relayService.publishNotReadyAddresses }}
   publishNotReadyAddresses: true
