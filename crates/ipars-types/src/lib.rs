@@ -384,9 +384,10 @@ fn nat_traversal_strategy(
     }
     match filtering_behavior {
         NatFilteringBehavior::AddressAndPortDependent => NatTraversalStrategy::RelayPreferred,
-        NatFilteringBehavior::EndpointIndependent
-        | NatFilteringBehavior::AddressDependent
-        | NatFilteringBehavior::Unknown => NatTraversalStrategy::CoordinatedHolePunch,
+        NatFilteringBehavior::EndpointIndependent | NatFilteringBehavior::AddressDependent => {
+            NatTraversalStrategy::CoordinatedHolePunch
+        }
+        NatFilteringBehavior::Unknown => NatTraversalStrategy::InsufficientData,
     }
 }
 
@@ -1972,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn nat_classification_detects_endpoint_independent_mapping() {
+    fn nat_classification_requires_filtering_evidence_for_hole_punch_strategy() {
         let assessed_at = Utc::now();
         let classification = NatClassification::from_observations(
             std::net::SocketAddr::from(([10, 0, 0, 10], 50_000)),
@@ -2003,7 +2004,7 @@ mod tests {
         );
         assert_eq!(
             classification.strategy,
-            NatTraversalStrategy::CoordinatedHolePunch
+            NatTraversalStrategy::InsufficientData
         );
         assert_eq!(
             classification.observed_endpoint,
