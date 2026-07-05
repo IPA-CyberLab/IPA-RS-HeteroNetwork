@@ -1424,12 +1424,19 @@ pub mod api {
         Redis,
         Prometheus,
         OpenTelemetry,
+        Kafka,
+        Nats,
+        Mqtt,
+        Amqp,
+        Cassandra,
+        MongoDb,
+        Elasticsearch,
         WireGuard,
         Icmp,
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 14] = [
+        pub const ALL: [Self; 21] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1442,6 +1449,13 @@ pub mod api {
             Self::Redis,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Kafka,
+            Self::Nats,
+            Self::Mqtt,
+            Self::Amqp,
+            Self::Cassandra,
+            Self::MongoDb,
+            Self::Elasticsearch,
             Self::WireGuard,
             Self::Icmp,
         ];
@@ -1460,6 +1474,13 @@ pub mod api {
                 Self::Redis => "redis",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Kafka => "kafka",
+                Self::Nats => "nats",
+                Self::Mqtt => "mqtt",
+                Self::Amqp => "amqp",
+                Self::Cassandra => "cassandra",
+                Self::MongoDb => "mongodb",
+                Self::Elasticsearch => "elasticsearch",
                 Self::WireGuard => "wireguard",
                 Self::Icmp => "icmp",
             }
@@ -1573,6 +1594,35 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
+            }
+            if (self.involves_port(9092) || self.involves_port(9093))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Kafka;
+            }
+            if self.involves_port(4222) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Nats;
+            }
+            if (self.involves_port(1883) || self.involves_port(8883))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Mqtt;
+            }
+            if (self.involves_port(5671) || self.involves_port(5672))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Amqp;
+            }
+            if self.involves_port(9042) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Cassandra;
+            }
+            if self.involves_port(27017) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::MongoDb;
+            }
+            if (self.involves_port(9200) || self.involves_port(9300))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Elasticsearch;
             }
             AgentPacketFlowApplication::Unknown
         }
@@ -1860,6 +1910,64 @@ mod tests {
         assert_eq!(
             opentelemetry.application(),
             api::AgentPacketFlowApplication::OpenTelemetry
+        );
+
+        let kafka = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9092),
+            ..Default::default()
+        };
+        assert_eq!(kafka.application(), api::AgentPacketFlowApplication::Kafka);
+
+        let nats = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(4222),
+            ..Default::default()
+        };
+        assert_eq!(nats.application(), api::AgentPacketFlowApplication::Nats);
+
+        let mqtt = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1883),
+            ..Default::default()
+        };
+        assert_eq!(mqtt.application(), api::AgentPacketFlowApplication::Mqtt);
+
+        let amqp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(5672),
+            ..Default::default()
+        };
+        assert_eq!(amqp.application(), api::AgentPacketFlowApplication::Amqp);
+
+        let cassandra = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9042),
+            ..Default::default()
+        };
+        assert_eq!(
+            cassandra.application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+
+        let mongodb = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(27017),
+            ..Default::default()
+        };
+        assert_eq!(
+            mongodb.application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+
+        let elasticsearch = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9200),
+            ..Default::default()
+        };
+        assert_eq!(
+            elasticsearch.application(),
+            api::AgentPacketFlowApplication::Elasticsearch
         );
     }
 
