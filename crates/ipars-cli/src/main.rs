@@ -303,6 +303,12 @@ struct K8sInstallArgs {
     join_token_secret: String,
     #[arg(long, default_value = "token")]
     join_token_key: String,
+    #[arg(long = "image-repository", value_parser = parse_container_image_repository)]
+    image_repository: Option<String>,
+    #[arg(long = "image-tag", value_parser = parse_container_image_tag)]
+    image_tag: Option<String>,
+    #[arg(long = "image-pull-policy", value_parser = parse_kubernetes_image_pull_policy)]
+    image_pull_policy: Option<String>,
     #[arg(long = "image-pull-secret", value_parser = parse_kubernetes_image_pull_secret_name)]
     image_pull_secrets: Vec<String>,
     #[arg(long = "agent-privileged", default_value_t = false)]
@@ -1584,6 +1590,25 @@ fn parse_kubernetes_image_pull_secret_name(value: &str) -> Result<String, String
     Ok(value.to_string())
 }
 
+fn parse_container_image_repository(value: &str) -> Result<String, String> {
+    validate_container_image_repository(value, "image repository")?;
+    Ok(value.to_string())
+}
+
+fn parse_container_image_tag(value: &str) -> Result<String, String> {
+    validate_container_image_tag(value, "image tag")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_image_pull_policy(value: &str) -> Result<String, String> {
+    match value {
+        "Always" | "IfNotPresent" | "Never" => Ok(value.to_string()),
+        _ => Err(format!(
+            "image pull policy must be Always, IfNotPresent, or Never; got {value}"
+        )),
+    }
+}
+
 fn parse_linux_capability(value: &str) -> Result<String, String> {
     validate_linux_capability_name(value, "Linux capability")?;
     Ok(value.to_string())
@@ -1897,6 +1922,81 @@ fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(),
         .is_some_and(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(format!("{label} must end with a digit or suffix letter"));
+    }
+    Ok(())
+}
+
+fn validate_container_image_repository(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 255 {
+        return Err(format!("{label} exceeds 255 bytes"));
+    }
+    if value.starts_with('/') || value.ends_with('/') || value.contains("//") {
+        return Err(format!(
+            "{label} must be a non-empty slash-separated image repository path"
+        ));
+    }
+    if value.contains('@') {
+        return Err(format!(
+            "{label} must not include a digest; pin an immutable tag with --image-tag"
+        ));
+    }
+    if value.bytes().any(|byte| {
+        !matches!(
+            byte,
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' | b'/' | b':'
+        )
+    }) {
+        return Err(format!(
+            "{label} may contain only lowercase ASCII letters, digits, '.', '_', '-', '/', and registry port ':'"
+        ));
+    }
+    let components = value.split('/').collect::<Vec<_>>();
+    if components
+        .last()
+        .is_some_and(|segment| segment.contains(':'))
+    {
+        return Err(format!(
+            "{label} must not include a tag; use --image-tag instead"
+        ));
+    }
+    for (index, component) in components.iter().enumerate() {
+        if let Some((_, port)) = component.rsplit_once(':') {
+            if index != 0 || components.len() == 1 || port.is_empty() {
+                return Err(format!(
+                    "{label} registry port may only appear before the first '/'"
+                ));
+            }
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{label} registry port must be numeric"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_container_image_tag(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 128 {
+        return Err(format!("{label} exceeds 128 bytes"));
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(format!("{label} must not be empty"));
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return Err(format!(
+            "{label} must start with an ASCII letter, digit, or '_'"
+        ));
+    }
+    if bytes.any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))) {
+        return Err(format!(
+            "{label} may contain only ASCII letters, digits, '_', '.', and '-'"
+        ));
     }
     Ok(())
 }
@@ -2845,7 +2945,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
+            "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
@@ -2856,6 +2956,15 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
 }
 
 fn append_k8s_image_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(repository) = args.image_repository.as_deref() {
+        append_helm_set_string(command, "image.repository", repository);
+    }
+    if let Some(tag) = args.image_tag.as_deref() {
+        append_helm_set_string(command, "image.tag", tag);
+    }
+    if let Some(pull_policy) = args.image_pull_policy.as_deref() {
+        append_helm_set_string(command, "image.pullPolicy", pull_policy);
+    }
     for (index, secret) in args.image_pull_secrets.iter().enumerate() {
         append_helm_set_string(command, &format!("imagePullSecrets[{index}]"), secret);
     }
@@ -3125,6 +3234,16 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
 }
 
 fn validate_k8s_image_pull_secrets(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(repository) = args.image_repository.as_deref() {
+        validate_container_image_repository(repository, "image repository")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(tag) = args.image_tag.as_deref() {
+        validate_container_image_tag(tag, "image tag").map_err(anyhow::Error::msg)?;
+    }
+    if let Some(pull_policy) = args.image_pull_policy.as_deref() {
+        parse_kubernetes_image_pull_policy(pull_policy).map_err(anyhow::Error::msg)?;
+    }
     let mut names = BTreeSet::new();
     for secret in &args.image_pull_secrets {
         validate_kubernetes_dns_subdomain(secret, "image pull Secret name")
@@ -5005,6 +5124,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -5248,6 +5370,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -5381,11 +5506,17 @@ mod tests {
     #[test]
     fn k8s_install_plan_wires_image_pull_secrets() -> anyhow::Result<()> {
         let mut args = base_k8s_install_args();
+        args.image_repository = Some("registry.example.com/platform/ipars".to_string());
+        args.image_tag = Some("2026.07.05".to_string());
+        args.image_pull_policy = Some("Always".to_string());
         args.image_pull_secrets = vec!["registry-cred".to_string(), "mirror.cred".to_string()];
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
+        assert!(helm.contains("--set-string image.repository=registry.example.com/platform/ipars"));
+        assert!(helm.contains("--set-string image.tag=2026.07.05"));
+        assert!(helm.contains("--set-string image.pullPolicy=Always"));
         assert!(helm.contains("--set-string 'imagePullSecrets[0]=registry-cred'"));
         assert!(helm.contains("--set-string 'imagePullSecrets[1]=mirror.cred'"));
 
@@ -5404,6 +5535,33 @@ mod tests {
             "install",
             "--image-pull-secret",
             "bad secret",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-repository",
+            "registry.example.com/platform/ipars:latest",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-repository",
+            "registry.example.com:https/platform/ipars",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["ipars", "k8s", "install", "--image-tag", "bad tag",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-pull-policy",
+            "Sometimes",
         ])
         .is_err());
 
@@ -5988,6 +6146,12 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--image-repository",
+            "registry.example.com/platform/ipars",
+            "--image-tag",
+            "2026.07.05",
+            "--image-pull-policy",
+            "Always",
             "--image-pull-secret",
             "registry-cred",
             "--agent-privileged",
@@ -6141,6 +6305,12 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert_eq!(
+                args.image_repository.as_deref(),
+                Some("registry.example.com/platform/ipars")
+            );
+            assert_eq!(args.image_tag.as_deref(), Some("2026.07.05"));
+            assert_eq!(args.image_pull_policy.as_deref(), Some("Always"));
             assert_eq!(args.image_pull_secrets, vec!["registry-cred"]);
             assert!(args.agent_privileged);
             assert_eq!(
@@ -6353,6 +6523,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -6471,6 +6644,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -7455,6 +7631,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -7560,6 +7739,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -7672,6 +7854,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -7782,6 +7967,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
@@ -7887,6 +8075,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
