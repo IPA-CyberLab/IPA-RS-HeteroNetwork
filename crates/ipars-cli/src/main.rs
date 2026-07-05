@@ -297,6 +297,8 @@ struct K8sInstallArgs {
     allow_public_service_exposure: bool,
     #[arg(long, default_value_t = false)]
     allow_unrestricted_load_balancer: bool,
+    #[arg(long, default_value_t = false)]
+    allow_cluster_external_traffic_policy: bool,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
@@ -1482,6 +1484,10 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.apiService.externalTrafficPolicy={}",
                 args.agent_api_external_traffic_policy
             ));
+            if args.agent_api_external_traffic_policy == "Cluster" {
+                helm_command
+                    .push_str(" --set agent.apiService.allowClusterExternalTrafficPolicy=true");
+            }
         }
         if args.agent_api_service_type == "LoadBalancer"
             && args.agent_api_allow_source_cidrs.is_empty()
@@ -1527,6 +1533,10 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.externalTrafficPolicy={}",
                 args.relay_external_traffic_policy
             ));
+            if args.relay_external_traffic_policy == "Cluster" {
+                helm_command
+                    .push_str(" --set agent.relayService.allowClusterExternalTrafficPolicy=true");
+            }
         }
         if args.relay_service_type == "LoadBalancer"
             && args.relay_allow_source_cidrs.is_empty()
@@ -1594,6 +1604,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
+            "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
@@ -1648,6 +1659,24 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "--expose-relay with LoadBalancer requires --relay-allow-source-cidr or --allow-unrestricted-load-balancer"
+        );
+    }
+    if args.expose_agent_api
+        && is_external_kubernetes_service_type(&args.agent_api_service_type)
+        && args.agent_api_external_traffic_policy == "Cluster"
+        && !args.allow_cluster_external_traffic_policy
+    {
+        anyhow::bail!(
+            "--expose-agent-api with externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy"
+        );
+    }
+    if args.expose_relay
+        && is_external_kubernetes_service_type(&args.relay_service_type)
+        && args.relay_external_traffic_policy == "Cluster"
+        && !args.allow_cluster_external_traffic_policy
+    {
+        anyhow::bail!(
+            "--expose-relay with externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy"
         );
     }
     Ok(())
@@ -2393,6 +2422,7 @@ mod tests {
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2515,6 +2545,7 @@ mod tests {
             "signed-token",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
+            "--allow-cluster-external-traffic-policy",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -2548,6 +2579,7 @@ mod tests {
             assert_eq!(args.join_token_key, "signed-token");
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
+            assert!(args.allow_cluster_external_traffic_policy);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(
@@ -2604,6 +2636,7 @@ mod tests {
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2641,6 +2674,7 @@ mod tests {
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2658,6 +2692,64 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_requires_acknowledgement_for_cluster_external_traffic_policy(
+    ) -> anyhow::Result<()> {
+        let without_ack = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_external_traffic_policy: "Cluster".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: true,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_external_traffic_policy: "Cluster".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
+            relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_status_url: None,
+        });
+        assert!(without_ack.is_err());
+
+        let acknowledged = k8s_install_plan(K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            expose_agent_api: true,
+            allow_public_service_exposure: true,
+            allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: true,
+            agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_external_traffic_policy: "Cluster".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: true,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_external_traffic_policy: "Cluster".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
+            relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_status_url: None,
+        })?;
+        assert!(acknowledged.commands[2]
+            .contains("--set agent.apiService.allowClusterExternalTrafficPolicy=true"));
+        assert!(acknowledged.commands[2]
+            .contains("--set agent.relayService.allowClusterExternalTrafficPolicy=true"));
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_rejects_source_ranges_without_load_balancer() -> anyhow::Result<()> {
         let plan = k8s_install_plan(K8sInstallArgs {
             release: "edge".to_string(),
@@ -2668,6 +2760,7 @@ mod tests {
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2697,6 +2790,7 @@ mod tests {
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -2721,6 +2815,7 @@ mod tests {
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
+            allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),

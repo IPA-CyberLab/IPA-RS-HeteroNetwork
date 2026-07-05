@@ -21,6 +21,7 @@ agent:
     enabled: false
     exposureAcknowledged: false
     allowUnrestrictedLoadBalancer: false
+    allowClusterExternalTrafficPolicy: false
     type: ClusterIP
     annotations: {}
     loadBalancerSourceRanges: []
@@ -41,6 +42,7 @@ agent:
     enabled: false
     exposureAcknowledged: false
     allowUnrestrictedLoadBalancer: false
+    allowClusterExternalTrafficPolicy: false
     type: LoadBalancer
     annotations: {}
     loadBalancerSourceRanges: []
