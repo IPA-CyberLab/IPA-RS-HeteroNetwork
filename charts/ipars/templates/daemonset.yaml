@@ -16,7 +16,10 @@
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
+{{- $agentLivenessProbeEnabled := printf "%v" .Values.agent.probes.liveness.enabled -}}
+{{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
 {{- $absolutePathPattern := "^/[A-Za-z0-9._/@%+=:,/-]+$" -}}
+{{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
@@ -69,6 +72,35 @@
 {{- end -}}
 {{- if or (eq $agentStateMountPath "") (eq $agentStateMountPath "/") (gt (len $agentStateMountPath) 4096) (not (regexMatch $absolutePathPattern $agentStateMountPath)) (regexMatch "(^|/)[.][.]($|/)" $agentStateMountPath) (regexMatch "/$" $agentStateMountPath) -}}
 {{- fail "agent.state.mountPath must be an absolute container path other than '/' without '..' segments or trailing '/'" -}}
+{{- end -}}
+{{- if not (or (eq $agentLivenessProbeEnabled "true") (eq $agentLivenessProbeEnabled "false")) -}}
+{{- fail "agent.probes.liveness.enabled must be true or false" -}}
+{{- end -}}
+{{- if not (or (eq $agentReadinessProbeEnabled "true") (eq $agentReadinessProbeEnabled "false")) -}}
+{{- fail "agent.probes.readiness.enabled must be true or false" -}}
+{{- end -}}
+{{- range $probeName, $probe := .Values.agent.probes -}}
+{{- $probePath := $probe.path -}}
+{{- if or (eq $probePath "") (gt (len $probePath) 256) (not (regexMatch $httpPathPattern $probePath)) -}}
+{{- fail (printf "agent.probes.%s.path must be an absolute HTTP path of at most 256 bytes" $probeName) -}}
+{{- end -}}
+{{- $initialDelaySeconds := printf "%v" $probe.initialDelaySeconds -}}
+{{- $periodSeconds := printf "%v" $probe.periodSeconds -}}
+{{- $timeoutSeconds := printf "%v" $probe.timeoutSeconds -}}
+{{- $failureThreshold := printf "%v" $probe.failureThreshold -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold) -}}
+{{- if lt (int $periodSeconds) 1 -}}
+{{- fail (printf "agent.probes.%s.periodSeconds must be greater than zero" $probeName) -}}
+{{- end -}}
+{{- if lt (int $timeoutSeconds) 1 -}}
+{{- fail (printf "agent.probes.%s.timeoutSeconds must be greater than zero" $probeName) -}}
+{{- end -}}
+{{- if lt (int $failureThreshold) 1 -}}
+{{- fail (printf "agent.probes.%s.failureThreshold must be greater than zero" $probeName) -}}
+{{- end -}}
 {{- end -}}
 {{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
@@ -457,6 +489,26 @@ spec:
               memory: {{ .Values.agent.resources.limits.memory | quote }}
               {{- end }}
             {{- end }}
+          {{- end }}
+          {{- if eq $agentLivenessProbeEnabled "true" }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.agent.probes.liveness.path | quote }}
+              port: 9780
+            initialDelaySeconds: {{ int .Values.agent.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.agent.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.agent.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.agent.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if eq $agentReadinessProbeEnabled "true" }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.agent.probes.readiness.path | quote }}
+              port: 9780
+            initialDelaySeconds: {{ int .Values.agent.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.agent.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.agent.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.agent.probes.readiness.failureThreshold }}
           {{- end }}
           volumeMounts:
             - name: agent-state

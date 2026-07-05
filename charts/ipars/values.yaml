@@ -32,6 +32,21 @@ agent:
     hostPath: /var/lib/ipars
     hostPathType: DirectoryOrCreate
     mountPath: /var/lib/ipars
+  probes:
+    liveness:
+      enabled: true
+      path: /healthz
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 1
+      failureThreshold: 3
+    readiness:
+      enabled: true
+      path: /healthz
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 1
+      failureThreshold: 3
   terminationGracePeriodSeconds: ""
   privileged: false
   securityContext:
