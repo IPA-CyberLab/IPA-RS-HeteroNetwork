@@ -169,7 +169,7 @@ impl Scenario {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LoadReport {
     transport: TransportMode,
     scenario: ScenarioName,
@@ -280,8 +280,177 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
     };
+    report.validate_success()?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+impl LoadReport {
+    fn validate_success(&self) -> anyhow::Result<()> {
+        match self.transport {
+            TransportMode::InMemory | TransportMode::Http => {
+                self.validate_registration_and_paths("load scenario", true)?;
+                if self.relay_count > 0 && self.relay_candidates < self.relay_count {
+                    bail!(
+                        "load scenario reported {} relay candidates, expected at least {}",
+                        self.relay_candidates,
+                        self.relay_count
+                    );
+                }
+            }
+            TransportMode::RelayUdp => {
+                self.validate_relay_measurement("relay UDP scenario")?;
+            }
+            TransportMode::Daemon => {
+                self.validate_registration_and_paths("daemon load scenario", false)?;
+                self.validate_relay_measurement("daemon load scenario")?;
+                let expected_processes =
+                    self.daemon_agent_processes + self.daemon_control_plane_processes + 3;
+                if self.daemon_processes != expected_processes {
+                    bail!(
+                        "daemon load scenario reported {} processes, expected {expected_processes}",
+                        self.daemon_processes
+                    );
+                }
+                if !self.daemon_control_plane_metrics_consistent {
+                    bail!("daemon load scenario control-plane metrics are inconsistent");
+                }
+                if self.daemon_control_plane_healthy_nodes_min != self.node_count
+                    || self.daemon_control_plane_healthy_nodes_max != self.node_count
+                    || self.daemon_control_plane_degraded_nodes_max != 0
+                    || self.daemon_control_plane_unhealthy_nodes_max != 0
+                {
+                    bail!(
+                        "daemon load scenario health mismatch: healthy min/max={}/{}, degraded max={}, unhealthy max={}, expected {} healthy nodes",
+                        self.daemon_control_plane_healthy_nodes_min,
+                        self.daemon_control_plane_healthy_nodes_max,
+                        self.daemon_control_plane_degraded_nodes_max,
+                        self.daemon_control_plane_unhealthy_nodes_max,
+                        self.node_count
+                    );
+                }
+                if self.daemon_signal_health_reports < self.node_count
+                    || self.daemon_signal_healthy_nodes != self.node_count
+                    || self.daemon_signal_degraded_nodes != 0
+                    || self.daemon_signal_unhealthy_nodes != 0
+                {
+                    bail!(
+                        "daemon load scenario signal health mismatch: reports={}, healthy={}, degraded={}, unhealthy={}, expected {} healthy nodes",
+                        self.daemon_signal_health_reports,
+                        self.daemon_signal_healthy_nodes,
+                        self.daemon_signal_degraded_nodes,
+                        self.daemon_signal_unhealthy_nodes,
+                        self.node_count
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_registration_and_paths(
+        &self,
+        context: &str,
+        allow_partial_unreachable: bool,
+    ) -> anyhow::Result<()> {
+        if self.registrations != self.node_count {
+            bail!(
+                "{context} registered {} nodes, expected {}",
+                self.registrations,
+                self.node_count
+            );
+        }
+        if self.peer_map_requests != self.node_count {
+            bail!(
+                "{context} made {} peer-map requests, expected {}",
+                self.peer_map_requests,
+                self.node_count
+            );
+        }
+        let expected_peer_edges = self
+            .node_count
+            .saturating_mul(self.node_count.saturating_sub(1));
+        if self.peer_map_edges_seen != expected_peer_edges {
+            bail!(
+                "{context} saw {} peer-map edges, expected {expected_peer_edges}",
+                self.peer_map_edges_seen
+            );
+        }
+        if self.signal_negotiations != self.active_pair_count {
+            bail!(
+                "{context} completed {} signal negotiations, expected {}",
+                self.signal_negotiations,
+                self.active_pair_count
+            );
+        }
+        let observed_paths = self.direct_public_paths
+            + self.direct_ipv6_paths
+            + self.direct_nat_paths
+            + self.relay_paths
+            + self.unreachable_paths;
+        if observed_paths != self.signal_negotiations {
+            bail!(
+                "{context} reported {observed_paths} path results for {} negotiations",
+                self.signal_negotiations
+            );
+        }
+        let reachable_paths = observed_paths.saturating_sub(self.unreachable_paths);
+        if reachable_paths == 0 && self.signal_negotiations > 0 {
+            bail!("{context} reported no reachable paths");
+        }
+        if self.unreachable_paths != 0 && !allow_partial_unreachable {
+            bail!(
+                "{context} reported {} unreachable paths",
+                self.unreachable_paths
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_relay_measurement(&self, context: &str) -> anyhow::Result<()> {
+        let expected_packets = self
+            .active_pair_count
+            .saturating_mul(self.relay_packets_per_session);
+        if expected_packets == 0 {
+            bail!("{context} did not schedule relay packets");
+        }
+        if self.relay_udp_packets_sent != expected_packets {
+            bail!(
+                "{context} sent {} relay UDP packets, expected {expected_packets}",
+                self.relay_udp_packets_sent
+            );
+        }
+        if self.relay_udp_packets_received != expected_packets {
+            bail!(
+                "{context} received {} relay UDP packets, expected {expected_packets}",
+                self.relay_udp_packets_received
+            );
+        }
+        if self.relay_udp_payload_bytes_sent != self.relay_udp_payload_bytes_received {
+            bail!(
+                "{context} relay payload byte mismatch: sent {}, received {}",
+                self.relay_udp_payload_bytes_sent,
+                self.relay_udp_payload_bytes_received
+            );
+        }
+        if self.relay_forwarded_bytes_reported < self.relay_udp_payload_bytes_received {
+            bail!(
+                "{context} relay metrics reported {} forwarded bytes, below received payload bytes {}",
+                self.relay_forwarded_bytes_reported,
+                self.relay_udp_payload_bytes_received
+            );
+        }
+        if self.relay_admission_successes_reported < self.active_pair_count as u64
+            || self.relay_admission_failures_reported != 0
+        {
+            bail!(
+                "{context} relay admission mismatch: successes={}, failures={}",
+                self.relay_admission_successes_reported,
+                self.relay_admission_failures_reported
+            );
+        }
+        Ok(())
+    }
 }
 
 async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
@@ -2709,6 +2878,7 @@ mod tests {
         assert_eq!(report.signal_http_requests, 0);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
+        report.validate_success()?;
         Ok(())
     }
 
@@ -2727,6 +2897,7 @@ mod tests {
         assert_eq!(report.signal_http_requests, 9);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
+        report.validate_success()?;
         Ok(())
     }
 
@@ -2765,6 +2936,42 @@ mod tests {
         assert_eq!(report.relay_http_requests, 8);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
+        report.validate_success()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_report_success_validation_rejects_degraded_results() -> anyhow::Result<()> {
+        let report = run_in_memory_scenario(Scenario::from_name(ScenarioName::Three)).await?;
+
+        let mut all_unreachable = report.clone();
+        all_unreachable.direct_public_paths = 0;
+        all_unreachable.direct_ipv6_paths = 0;
+        all_unreachable.direct_nat_paths = 0;
+        all_unreachable.relay_paths = 0;
+        all_unreachable.unreachable_paths = all_unreachable.signal_negotiations;
+        let error = match all_unreachable.validate_success() {
+            Ok(_) => bail!("all-unreachable load paths should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no reachable paths"));
+
+        let relay_report = run_relay_udp_scenario(
+            Scenario::from_name(ScenarioName::Three),
+            RelayLoadOptions {
+                packets_per_session: 1,
+                payload_bytes: 64,
+            },
+        )
+        .await?;
+        let mut dropped_packet = relay_report.clone();
+        dropped_packet.relay_udp_packets_received -= 1;
+        let error = match dropped_packet.validate_success() {
+            Ok(_) => bail!("dropped relay packet should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("received"));
+
         Ok(())
     }
 
