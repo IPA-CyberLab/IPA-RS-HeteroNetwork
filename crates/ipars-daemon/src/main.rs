@@ -1666,6 +1666,7 @@ fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
 
 fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
     let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
     for cidr in cidrs {
         if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
             anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
@@ -1674,6 +1675,15 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
         if !seen.insert(route) {
             anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
         }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping Docker container CIDR routes {overlap} and {route}"
+            );
+        }
+        routes.push(route);
     }
     Ok(())
 }
@@ -1738,6 +1748,14 @@ fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'stat
     restricted
         .iter()
         .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ip_cidrs_overlap(left: &ipnet::IpNet, right: &ipnet::IpNet) -> bool {
+    match (left, right) {
+        (ipnet::IpNet::V4(left), ipnet::IpNet::V4(right)) => ipv4_cidrs_overlap(left, right),
+        (ipnet::IpNet::V6(left), ipnet::IpNet::V6(right)) => ipv6_cidrs_overlap(left, right),
+        _ => false,
+    }
 }
 
 fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
@@ -5168,7 +5186,7 @@ fn docker_discovered_routes(
     filters: &[String],
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
     let mut network_names = BTreeSet::new();
-    let mut cidrs = BTreeMap::<ipnet::IpNet, String>::new();
+    let mut cidrs = Vec::<ipnet::IpNet>::new();
     let requested_filters = filters.iter().cloned().collect::<BTreeSet<_>>();
     let mut matched_filters = BTreeSet::new();
     let mut bridge_matched_filters = BTreeSet::new();
@@ -5204,7 +5222,7 @@ fn docker_discovered_routes(
                     network.name
                 )
             })?;
-            cidrs.entry(cidr).or_insert_with(|| network.name.clone());
+            cidrs.push(cidr);
             found_subnet = true;
         }
         if found_subnet {
@@ -5249,8 +5267,8 @@ fn docker_discovered_routes(
     if cidrs.is_empty() {
         anyhow::bail!("Docker network discovery found no bridge networks with IPAM subnets");
     }
-    let cidrs = cidrs.into_keys().collect::<Vec<_>>();
     validate_docker_container_cidrs("Docker network discovery", &cidrs)?;
+    cidrs.sort();
     Ok(DockerDiscoveredRoutes {
         network_names: network_names.into_iter().collect(),
         cidrs,
@@ -13927,6 +13945,21 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "--docker-container-cidr must not repeat Docker container CIDR route 172.18.0.0/16"
         ));
 
+        let overlapping = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-container-cidr",
+            "172.18.10.0/24",
+        ])?;
+        assert!(overlapping.contains(
+            "--docker-container-cidr must not include overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24"
+        ));
+
         Ok(())
     }
 
@@ -14055,12 +14088,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     #[test]
     fn docker_api_discovery_selects_bridge_network_subnets() -> anyhow::Result<()> {
         let networks = vec![
-            docker_api_network(
-                "other-id",
-                "compose_extra",
-                "bridge",
-                &["172.19.0.0/16", "172.18.0.0/16"],
-            ),
+            docker_api_network("other-id", "compose_extra", "bridge", &["172.19.0.0/16"]),
             docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
             docker_api_network(
                 "default-id",
@@ -14131,6 +14159,45 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert!(error.contains(
             "Docker network discovery must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_duplicate_or_overlapping_discovered_cidrs() -> anyhow::Result<()>
+    {
+        let duplicate_networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_extra", "bridge", &["172.18.0.0/16"]),
+        ];
+        let duplicate = match docker_discovered_routes(&duplicate_networks, &[]) {
+            Ok(_) => anyhow::bail!("duplicate Docker API subnets should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(duplicate.contains(
+            "Docker network discovery must not repeat Docker container CIDR route 172.18.0.0/16"
+        ));
+
+        let overlapping_networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_extra", "bridge", &["172.18.10.0/24"]),
+        ];
+        let overlapping = match docker_discovered_routes(&overlapping_networks, &[]) {
+            Ok(_) => anyhow::bail!("overlapping Docker API subnets should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(overlapping.contains(
+            "Docker network discovery must not include overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24"
         ));
         Ok(())
     }
