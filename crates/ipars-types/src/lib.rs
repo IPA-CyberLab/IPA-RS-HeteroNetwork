@@ -1077,6 +1077,8 @@ pub mod api {
         #[serde(default)]
         pub path_negotiation_state_counts: Vec<PathStateCount>,
         pub hole_punch_plan_count: u64,
+        #[serde(default)]
+        pub hole_punch_nat_suppressed_count: u64,
         pub relay_health_ttl_seconds: u64,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,

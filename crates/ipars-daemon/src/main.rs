@@ -2477,6 +2477,7 @@ struct SignalOtelSnapshot {
     path_negotiation_count: u64,
     path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
+    hole_punch_nat_suppressed_count: u64,
 }
 
 impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
@@ -2486,6 +2487,7 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
             path_negotiation_count: metrics.path_negotiation_count,
             path_negotiation_state_counts: metrics.path_negotiation_state_counts.clone(),
             hole_punch_plan_count: metrics.hole_punch_plan_count,
+            hole_punch_nat_suppressed_count: metrics.hole_punch_nat_suppressed_count,
         }
     }
 }
@@ -2507,6 +2509,7 @@ struct SignalOtelMetrics {
     path_negotiations: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
     hole_punch_plans: Counter<u64>,
+    hole_punch_nat_suppressions: Counter<u64>,
 }
 
 impl SignalOtelMetrics {
@@ -2574,6 +2577,10 @@ impl SignalOtelMetrics {
             hole_punch_plans: meter
                 .u64_counter("ipars.signal.hole_punch_plans")
                 .with_description("Signal hole-punch plan requests handled.")
+                .build(),
+            hole_punch_nat_suppressions: meter
+                .u64_counter("ipars.signal.hole_punch_nat_suppressions")
+                .with_description("Signal hole-punch plans suppressed by NAT classification.")
                 .build(),
         }
     }
@@ -2647,6 +2654,13 @@ impl SignalOtelMetrics {
             counter_delta(
                 metrics.hole_punch_plan_count,
                 previous.map(|previous| previous.hole_punch_plan_count),
+            ),
+            &[],
+        );
+        self.hole_punch_nat_suppressions.add(
+            counter_delta(
+                metrics.hole_punch_nat_suppressed_count,
+                previous.map(|previous| previous.hole_punch_nat_suppressed_count),
             ),
             &[],
         );

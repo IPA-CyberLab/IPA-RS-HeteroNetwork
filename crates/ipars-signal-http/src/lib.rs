@@ -245,6 +245,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_hole_punch_nat_suppressions_total Total hole-punch plans suppressed by fresh NAT classification strategy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_nat_suppressions_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_hole_punch_nat_suppressions_total {}",
+        metrics.hole_punch_nat_suppressed_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_relay_health_ttl_seconds Relay health freshness window used by signal."
     );
     prometheus_line!(
@@ -479,6 +492,7 @@ mod tests {
         assert_eq!(metrics.nat_classification_ttl_seconds, 300);
         assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         assert_eq!(
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
             1
@@ -501,6 +515,7 @@ mod tests {
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_nat_classification_ttl_seconds 300"));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
+        assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
         );

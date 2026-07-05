@@ -40,6 +40,7 @@ pub struct SignalRegistry {
     relay_negotiations: AtomicU64,
     unreachable_negotiations: AtomicU64,
     hole_punch_plans: AtomicU64,
+    hole_punch_nat_suppressions: AtomicU64,
 }
 
 impl SignalRegistry {
@@ -57,6 +58,7 @@ impl SignalRegistry {
             relay_negotiations: AtomicU64::new(0),
             unreachable_negotiations: AtomicU64::new(0),
             hole_punch_plans: AtomicU64::new(0),
+            hole_punch_nat_suppressions: AtomicU64::new(0),
         }
     }
 
@@ -204,6 +206,13 @@ impl SignalRegistry {
             })
             .cloned();
         drop(nat_classifications);
+        if !nat_classifications_allow_hole_punch(
+            source_nat_classification.as_ref(),
+            target_nat_classification.as_ref(),
+        ) {
+            self.hole_punch_nat_suppressions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let plan = self.coordinator.punch_plan(
             &source_node.endpoint_candidates,
             source_nat_classification.as_ref(),
@@ -302,6 +311,9 @@ impl SignalRegistry {
             path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
             path_negotiation_state_counts: self.path_negotiation_state_counts(),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
+            hole_punch_nat_suppressed_count: self
+                .hole_punch_nat_suppressions
+                .load(Ordering::Relaxed),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
             nat_classification_ttl_seconds,
@@ -1058,6 +1070,7 @@ mod tests {
         );
         assert_eq!(signal_path_state_count(&stale_metrics, PathState::Relay), 0);
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
+        assert_eq!(stale_metrics.hole_punch_nat_suppressed_count, 1);
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
         assert_eq!(stale_metrics.nat_classification_ttl_seconds, 300);
@@ -1114,6 +1127,9 @@ mod tests {
         assert!(plan.source_reflexive.is_some());
         assert!(plan.target_reflexive.is_some());
         assert_eq!(plan.start_after_millis, 50);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         Ok(())
     }
 
@@ -1133,6 +1149,9 @@ mod tests {
 
         assert!(plan.source_reflexive.is_none());
         assert!(plan.target_reflexive.is_none());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 1);
         Ok(())
     }
 
@@ -1158,6 +1177,9 @@ mod tests {
 
         assert!(plan.source_reflexive.is_some());
         assert!(plan.target_reflexive.is_some());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         Ok(())
     }
 
