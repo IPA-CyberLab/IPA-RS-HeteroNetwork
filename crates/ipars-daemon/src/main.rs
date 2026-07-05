@@ -948,6 +948,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
         }
     }
+    if args.apply_kubernetes_underlay {
+        validate_kubernetes_underlay_config(args)?;
+    }
     if let Some(namespace) = args.linux_netns.as_deref() {
         LinuxNetworkNamespace::from_name(namespace)?;
     }
@@ -1079,6 +1082,65 @@ fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Docker network filter `{filter}` must contain only ASCII letters, digits, '.', '_' or '-'"
         );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
+    for namespace in &args.kubernetes_namespaces {
+        validate_kubernetes_namespace(namespace)?;
+    }
+    if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
+        validate_kubernetes_label_selector(selector)?;
+    }
+    if !args.kubernetes_discover_services {
+        if !args.kubernetes_namespaces.is_empty() {
+            anyhow::bail!("--kubernetes-namespace requires --kubernetes-discover-services");
+        }
+        if args.kubernetes_service_label_selector.is_some() {
+            anyhow::bail!(
+                "--kubernetes-service-label-selector requires --kubernetes-discover-services"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_namespace(namespace: &str) -> anyhow::Result<()> {
+    if namespace.is_empty() {
+        anyhow::bail!("Kubernetes namespace cannot be empty");
+    }
+    if namespace.len() > 63 {
+        anyhow::bail!("Kubernetes namespace `{namespace}` exceeds 63 bytes");
+    }
+    let valid_body = namespace
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let valid_edges = namespace
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && namespace
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !valid_body || !valid_edges {
+        anyhow::bail!(
+            "Kubernetes namespace `{namespace}` must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges"
+        );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
+    if selector.is_empty() {
+        anyhow::bail!("Kubernetes service label selector cannot be empty");
+    }
+    if selector.len() > 1024 {
+        anyhow::bail!("Kubernetes service label selector exceeds 1024 bytes");
+    }
+    if selector.chars().any(char::is_control) {
+        anyhow::bail!("Kubernetes service label selector cannot contain control characters");
     }
     Ok(())
 }
@@ -8369,6 +8431,92 @@ invalid no-destination-here
             assert_eq!(routes[0].via, Some(NodeId::from_string("route-provider-a")));
             assert_eq!(routes[1].id, "k8s-1");
             assert_eq!(routes[1].cidr, "10.96.0.0/12".parse::<ipnet::IpNet>()?);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_discovery_validates_namespace_and_label_selector_syntax() {
+        for namespace in ["default", "platform-1", "a", "ns0"] {
+            assert!(
+                validate_kubernetes_namespace(namespace).is_ok(),
+                "{namespace} should be valid"
+            );
+        }
+        for namespace in ["", "Platform", "platform/team", "-bad", "bad-"] {
+            assert!(
+                validate_kubernetes_namespace(namespace).is_err(),
+                "{namespace} should be invalid"
+            );
+        }
+        let too_long = "a".repeat(64);
+        assert!(validate_kubernetes_namespace(&too_long).is_err());
+
+        for selector in [
+            "ipars.io/expose=true",
+            "tier in (frontend,backend),env!=dev",
+        ] {
+            assert!(
+                validate_kubernetes_label_selector(selector).is_ok(),
+                "{selector} should be valid"
+            );
+        }
+        for selector in ["", "ipars.io/expose=true\n"] {
+            assert!(
+                validate_kubernetes_label_selector(selector).is_err(),
+                "{selector:?} should be invalid"
+            );
+        }
+        let too_long = "a".repeat(1025);
+        assert!(validate_kubernetes_label_selector(&too_long).is_err());
+    }
+
+    #[test]
+    fn kubernetes_discovery_options_require_api_discovery() -> anyhow::Result<()> {
+        let namespace_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-namespace",
+            "default",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = namespace_cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("Kubernetes namespace without discovery should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-namespace requires --kubernetes-discover-services"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let selector_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-service-label-selector",
+            "ipars.io/expose=true",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = selector_cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("Kubernetes selector without discovery should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--kubernetes-service-label-selector requires --kubernetes-discover-services"
+            ));
             return Ok(());
         }
 

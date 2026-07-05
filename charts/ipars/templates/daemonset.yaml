@@ -59,6 +59,14 @@ spec:
             - {{ .Values.serviceExposure.routeIntervalSeconds | quote }}
             {{- if .Values.serviceExposure.discoverServices }}
             - --kubernetes-discover-services
+            {{- range .Values.serviceExposure.namespaces }}
+            - --kubernetes-namespace
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.serviceExposure.serviceLabelSelector }}
+            - --kubernetes-service-label-selector
+            - {{ .Values.serviceExposure.serviceLabelSelector | quote }}
+            {{- end }}
             {{- end }}
             {{- range .Values.serviceExposure.apiServerCidrs }}
             - --kubernetes-api-server-cidr
@@ -67,14 +75,6 @@ spec:
             {{- range .Values.serviceExposure.serviceCidrs }}
             - --kubernetes-service-cidr
             - {{ . | quote }}
-            {{- end }}
-            {{- range .Values.serviceExposure.namespaces }}
-            - --kubernetes-namespace
-            - {{ . | quote }}
-            {{- end }}
-            {{- if .Values.serviceExposure.serviceLabelSelector }}
-            - --kubernetes-service-label-selector
-            - {{ .Values.serviceExposure.serviceLabelSelector | quote }}
             {{- end }}
             {{- if .Values.serviceExposure.routeProviderNodeId }}
             - --kubernetes-route-provider
