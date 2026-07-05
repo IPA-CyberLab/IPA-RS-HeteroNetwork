@@ -6180,15 +6180,10 @@ async fn heartbeat_request(
 ) -> anyhow::Result<HeartbeatRequest> {
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
+    let health = agent_health_from_status(&status, "agent heartbeat");
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
-        health: NodeHealth {
-            state: HealthState::Healthy,
-            last_seen_at: chrono::Utc::now(),
-            latency_ms: None,
-            relay_load: None,
-            message: Some("agent heartbeat".to_string()),
-        },
+        health,
         candidates: status.candidates,
         relay_capability,
         path_state,
@@ -6298,17 +6293,60 @@ async fn signal_node_upsert_request(
     mut node: NodeRecord,
 ) -> SignalNodeUpsertRequest {
     let status = runtime.status().await;
+    let health = agent_health_from_status(&status, "agent signal registration");
     node.endpoint_candidates = status.candidates;
     SignalNodeUpsertRequest {
         node,
         nat_classification: status.nat_classification,
-        health: Some(NodeHealth {
-            state: HealthState::Healthy,
-            last_seen_at: chrono::Utc::now(),
-            latency_ms: None,
-            relay_load: None,
-            message: Some("agent signal registration".to_string()),
-        }),
+        health: Some(health),
+    }
+}
+
+fn agent_health_from_status(
+    status: &ipars_types::api::AgentStatusResponse,
+    healthy_message: &str,
+) -> NodeHealth {
+    let mut health = NodeHealth {
+        state: HealthState::Healthy,
+        last_seen_at: chrono::Utc::now(),
+        latency_ms: None,
+        relay_load: None,
+        message: Some(healthy_message.to_string()),
+    };
+    let Some(process) = status.userspace_wireguard_process.as_ref() else {
+        return health;
+    };
+
+    match process.state {
+        AgentManagedProcessState::Disabled | AgentManagedProcessState::Ready => health,
+        AgentManagedProcessState::Starting
+        | AgentManagedProcessState::Stopping
+        | AgentManagedProcessState::Stopped => {
+            health.state = HealthState::Degraded;
+            health.message = Some(format!(
+                "userspace WireGuard process state={}",
+                process.state.as_str()
+            ));
+            health
+        }
+        AgentManagedProcessState::Exited | AgentManagedProcessState::Failed => {
+            health.state = HealthState::Unhealthy;
+            health.message = Some(format!(
+                "userspace WireGuard process state={}{}{}",
+                process.state.as_str(),
+                process
+                    .exit_status
+                    .as_deref()
+                    .map(|status| format!(", exit_status={status}"))
+                    .unwrap_or_default(),
+                process
+                    .message
+                    .as_deref()
+                    .map(|message| format!(", message={message}"))
+                    .unwrap_or_default()
+            ));
+            health
+        }
     }
 }
 
@@ -13921,6 +13959,33 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[tokio::test]
+    async fn heartbeat_request_marks_failed_userspace_wireguard_unhealthy() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Failed,
+                Some(4242),
+                Some("signal: 9 (SIGKILL)".to_string()),
+                Some("failed to stop userspace WireGuard process cleanly".to_string()),
+            )
+            .await;
+        let identity = runtime.state().identity_key_pair()?;
+
+        let request = heartbeat_request(&runtime, &identity, None).await?;
+
+        assert_eq!(request.health.state, HealthState::Unhealthy);
+        let message = request.health.message.as_deref().unwrap_or_default();
+        assert!(message.contains("state=failed"));
+        assert!(message.contains("exit_status=signal: 9 (SIGKILL)"));
+        assert!(message.contains("failed to stop userspace WireGuard process cleanly"));
+        assert!(request.node_signature.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn signal_node_upsert_request_uses_runtime_candidates() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -13936,6 +14001,36 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             request.health.as_ref().map(|health| health.state),
             Some(HealthState::Healthy)
         );
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_reports_userspace_wireguard_exit_health() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Exited,
+                Some(4242),
+                Some("exit status: 1".to_string()),
+                None,
+            )
+            .await;
+        let node = node_record("node-a");
+
+        let request = signal_node_upsert_request(&runtime, node).await;
+
+        let health = match request.health {
+            Some(health) => health,
+            None => panic!("signal upsert should include health"),
+        };
+        assert_eq!(health.state, HealthState::Unhealthy);
+        assert!(health
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("state=exited"));
     }
 
     #[tokio::test]
