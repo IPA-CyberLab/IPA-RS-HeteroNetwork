@@ -2209,6 +2209,9 @@ struct ControlPlaneOtelMetrics {
     relay_candidates: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
+    vpn_pool_total: Gauge<u64>,
+    vpn_pool_allocated: Gauge<u64>,
+    vpn_pool_available: Gauge<u64>,
     node_health: Gauge<u64>,
     paths: Gauge<u64>,
     paths_by_state: Gauge<u64>,
@@ -2235,6 +2238,18 @@ impl ControlPlaneOtelMetrics {
                 .with_description(
                     "Endpoint candidate freshness window used by control-plane peer maps.",
                 )
+                .build(),
+            vpn_pool_total: meter
+                .u64_gauge("ipars.control_plane.vpn_pool.total")
+                .with_description("Usable VPN IP addresses in the configured pool.")
+                .build(),
+            vpn_pool_allocated: meter
+                .u64_gauge("ipars.control_plane.vpn_pool.allocated")
+                .with_description("Allocated VPN IP addresses in the configured pool.")
+                .build(),
+            vpn_pool_available: meter
+                .u64_gauge("ipars.control_plane.vpn_pool.available")
+                .with_description("Unallocated usable VPN IP addresses in the configured pool.")
                 .build(),
             node_health: meter
                 .u64_gauge("ipars.control_plane.node_health")
@@ -2265,6 +2280,12 @@ impl ControlPlaneOtelMetrics {
         );
         self.endpoint_candidate_ttl_seconds
             .record(metrics.endpoint_candidate_ttl_seconds, &cluster_attrs);
+        self.vpn_pool_total
+            .record(metrics.vpn_pool_total_count, &cluster_attrs);
+        self.vpn_pool_allocated
+            .record(metrics.vpn_pool_allocated_count, &cluster_attrs);
+        self.vpn_pool_available
+            .record(metrics.vpn_pool_available_count, &cluster_attrs);
         self.paths.record(metrics.path_count as u64, &cluster_attrs);
 
         for (state, count) in [
@@ -8105,6 +8126,9 @@ mod tests {
             degraded_node_count: 1,
             unhealthy_node_count: 0,
             stale_endpoint_candidate_count: 0,
+            vpn_pool_total_count: 6,
+            vpn_pool_allocated_count: 2,
+            vpn_pool_available_count: 4,
             path_count: 3,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,

@@ -800,6 +800,13 @@ where
                 )
             })
             .count();
+        let vpn_pool_total_count = vpn_pool_usable_host_count(self.config.vpn_pool);
+        let vpn_pool_allocated_count = assigned_ipv4_vpn_ips(&nodes)
+            .into_iter()
+            .filter(|ip| vpn_pool_contains_usable_host(self.config.vpn_pool, *ip))
+            .count() as u64;
+        let vpn_pool_available_count =
+            vpn_pool_total_count.saturating_sub(vpn_pool_allocated_count);
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
         for node in &nodes {
@@ -828,6 +835,9 @@ where
             degraded_node_count,
             unhealthy_node_count,
             stale_endpoint_candidate_count,
+            vpn_pool_total_count,
+            vpn_pool_allocated_count,
+            vpn_pool_available_count,
             path_count: paths.len(),
             path_state_counts: path_state_counts
                 .into_iter()
@@ -1200,6 +1210,19 @@ fn assigned_ipv4_vpn_ips(nodes: &[NodeRecord]) -> BTreeSet<Ipv4Addr> {
         .collect()
 }
 
+fn vpn_pool_usable_host_count(pool: Ipv4Net) -> u64 {
+    let network = u32::from(pool.network());
+    let broadcast = u32::from(pool.broadcast());
+    broadcast.saturating_sub(network).saturating_sub(1) as u64
+}
+
+fn vpn_pool_contains_usable_host(pool: Ipv4Net, ip: Ipv4Addr) -> bool {
+    let ip = u32::from(ip);
+    let network = u32::from(pool.network());
+    let broadcast = u32::from(pool.broadcast());
+    ip > network && ip < broadcast
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1553,6 +1576,10 @@ mod tests {
             response.relay_map.relays.is_empty(),
             "relay candidates require a fresh healthy heartbeat"
         );
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.vpn_pool_total_count, 2);
+        assert_eq!(metrics.vpn_pool_allocated_count, 1);
+        assert_eq!(metrics.vpn_pool_available_count, 1);
         Ok(())
     }
 

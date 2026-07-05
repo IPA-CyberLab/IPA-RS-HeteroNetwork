@@ -989,6 +989,12 @@ pub mod api {
         pub unhealthy_node_count: usize,
         #[serde(default)]
         pub stale_endpoint_candidate_count: usize,
+        #[serde(default)]
+        pub vpn_pool_total_count: u64,
+        #[serde(default)]
+        pub vpn_pool_allocated_count: u64,
+        #[serde(default)]
+        pub vpn_pool_available_count: u64,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]

@@ -256,6 +256,42 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_vpn_pool_total Usable VPN IP addresses in the configured pool."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_vpn_pool_total gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_vpn_pool_total{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.vpn_pool_total_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_vpn_pool_allocated Allocated VPN IP addresses in the configured pool."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_vpn_pool_allocated gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_vpn_pool_allocated{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.vpn_pool_allocated_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_vpn_pool_available Unallocated usable VPN IP addresses in the configured pool."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_vpn_pool_available gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_vpn_pool_available{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.vpn_pool_available_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_node_health Registered nodes by last reported health."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_node_health gauge");
@@ -659,6 +695,9 @@ mod tests {
         assert_eq!(metrics.healthy_node_count, 1);
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
+        assert_eq!(metrics.vpn_pool_total_count, 6);
+        assert_eq!(metrics.vpn_pool_allocated_count, 1);
+        assert_eq!(metrics.vpn_pool_available_count, 5);
 
         let response = app
             .oneshot(
@@ -680,6 +719,9 @@ mod tests {
         assert!(body.contains("ipars_control_plane_nodes"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
+        assert!(body.contains("ipars_control_plane_vpn_pool_total"));
+        assert!(body.contains("ipars_control_plane_vpn_pool_allocated"));
+        assert!(body.contains("ipars_control_plane_vpn_pool_available"));
         assert!(body.contains("ipars_control_plane_node_health"));
         Ok(())
     }
