@@ -21,6 +21,8 @@ const ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
 const ONE_SIDED_PORT_PRESERVING_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_network_namespaces";
+const ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_does_not_traverse_one_sided_address_port_dependent_snat_network_namespaces";
 const ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces";
 const ASYMMETRIC_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
@@ -391,6 +393,46 @@ async fn udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_n
             left_reflexive_port: 40101,
             left_snat_port: None,
             right_bind_port: 40102,
+            expect_left_packet: true,
+            expect_right_packet: true,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_does_not_traverse_one_sided_address_port_dependent_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_one_sided_snat_hole_punch_topology_with(
+        ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME,
+        OneSidedSnatTopology {
+            label: "oneapdnat",
+            private_second_octet: 249,
+            public_third_octet: 7,
+            left_bind_port: 40101,
+            left_reflexive_port: 50101,
+            left_snat_port: Some(51101),
+            right_bind_port: 40102,
+            expect_left_packet: false,
+            expect_right_packet: true,
         },
     )
 }
@@ -587,6 +629,8 @@ struct OneSidedSnatTopology {
     left_reflexive_port: u16,
     left_snat_port: Option<u16>,
     right_bind_port: u16,
+    expect_left_packet: bool,
+    expect_right_packet: bool,
 }
 
 fn run_one_sided_snat_hole_punch_topology(
@@ -602,6 +646,8 @@ fn run_one_sided_snat_hole_punch_topology(
             left_reflexive_port: 50101,
             left_snat_port: Some(50101),
             right_bind_port: 40102,
+            expect_left_packet: true,
+            expect_right_packet: true,
         },
     )
 }
@@ -682,12 +728,22 @@ fn run_one_sided_snat_hole_punch_topology_with(
     let right_bind = format!("{}:{}", right_public_ip, topology.right_bind_port);
     let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
     let target_reflexive = right_bind.clone();
+    let left_child_role = if topology.expect_left_packet {
+        "nat-duplex"
+    } else {
+        "nat-duplex-timeout"
+    };
+    let right_child_role = if topology.expect_right_packet {
+        "nat-duplex"
+    } else {
+        "nat-duplex-timeout"
+    };
 
     let left = spawn_child(
         test_name,
         &left_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", left_child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
             ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
             (
@@ -707,7 +763,7 @@ fn run_one_sided_snat_hole_punch_topology_with(
         test_name,
         &right_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", right_child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
             ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
             (
