@@ -8774,28 +8774,44 @@ fn control_plane_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
-        token.map(|token| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "control-plane URL")
+    } else if let Some(token) = token {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
                 .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let base_urls =
-        base_urls.context("control-plane URL is required and no control-plane bootstrap exists")?;
-    let base_urls = dedupe_urls_preserve_order(
-        base_urls
-            .into_iter()
-            .map(|base_url| normalize_base_url(&base_url)),
-    );
+                .collect::<Vec<_>>(),
+            "control-plane bootstrap endpoint",
+        )
+    } else {
+        anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
+    };
+    let base_urls = normalize_http_base_urls(base_urls, name)?;
     if base_urls.is_empty() {
         anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
     }
     Ok(base_urls)
+}
+
+fn normalize_http_base_urls(
+    base_urls: impl IntoIterator<Item = String>,
+    name: &str,
+) -> anyhow::Result<Vec<String>> {
+    Ok(dedupe_urls_preserve_order(
+        base_urls
+            .into_iter()
+            .map(|base_url| normalize_http_base_url(&base_url, name))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    ))
+}
+
+fn normalize_http_base_url(base_url: &str, name: &str) -> anyhow::Result<String> {
+    validate_http_url(base_url, name)?;
+    Ok(normalize_base_url(base_url))
 }
 
 fn normalize_base_url(base_url: &str) -> String {
@@ -8828,23 +8844,23 @@ fn signal_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
-        token.map(|token| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "signal URL")
+    } else if let Some(token) = token {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
                 .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let base_urls = base_urls.context("signal URL is required and no signal bootstrap exists")?;
-    let base_urls = dedupe_urls_preserve_order(
-        base_urls
-            .into_iter()
-            .map(|base_url| normalize_base_url(&base_url)),
-    );
+                .collect::<Vec<_>>(),
+            "signal bootstrap endpoint",
+        )
+    } else {
+        anyhow::bail!("signal URL is required and no signal bootstrap exists");
+    };
+    let base_urls = normalize_http_base_urls(base_urls, name)?;
     if base_urls.is_empty() {
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
     }
@@ -14441,6 +14457,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn control_plane_base_urls_reject_non_http_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+
+        let error = match control_plane_base_urls(Some(&token), None) {
+            Ok(_) => anyhow::bail!("non-HTTP control-plane bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("control-plane bootstrap endpoint must use http or https"));
+        Ok(())
+    }
+
+    #[test]
     fn agent_control_plane_base_urls_prefer_registration_and_dedupe() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
             BootstrapEndpoint {
@@ -14491,6 +14524,18 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn control_plane_base_url_override_must_be_http() -> anyhow::Result<()> {
+        let error = match control_plane_base_url(None, Some("udp://127.0.0.1:8443")) {
+            Ok(_) => anyhow::bail!("non-HTTP control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("control-plane URL must use http or https"));
+        Ok(())
+    }
+
+    #[test]
     fn signal_base_url_uses_token_bootstrap() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
             BootstrapEndpoint {
@@ -14532,6 +14577,35 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             signal_base_urls(Some(&token), Some("http://127.0.0.1:9443/"))?,
             vec!["http://127.0.0.1:9443".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_urls_reject_non_http_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:9443".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }]);
+
+        let error = match signal_base_urls(Some(&token), None) {
+            Ok(_) => anyhow::bail!("non-HTTP signal bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("signal bootstrap endpoint must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_override_must_be_http() -> anyhow::Result<()> {
+        let error = match signal_base_url(None, Some("udp://127.0.0.1:9443")) {
+            Ok(_) => anyhow::bail!("non-HTTP signal override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("signal URL must use http or https"));
         Ok(())
     }
 
