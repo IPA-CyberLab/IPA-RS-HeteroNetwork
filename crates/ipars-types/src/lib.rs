@@ -1594,6 +1594,7 @@ pub mod api {
         Memcached,
         Prometheus,
         OpenTelemetry,
+        Grpc,
         Kafka,
         Nats,
         Mqtt,
@@ -1606,7 +1607,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 22] = [
+        pub const ALL: [Self; 23] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1620,6 +1621,7 @@ pub mod api {
             Self::Memcached,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Grpc,
             Self::Kafka,
             Self::Nats,
             Self::Mqtt,
@@ -1646,6 +1648,7 @@ pub mod api {
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
                 Self::Mqtt => "mqtt",
@@ -1787,6 +1790,9 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
+            }
+            if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Grpc;
             }
             if (self.involves_port(9092) || self.involves_port(9093))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
@@ -1969,6 +1975,9 @@ pub mod api {
             if path_starts_with_any(path, &[b"/v1/traces", b"/v1/metrics", b"/v1/logs"]) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if grpc_http_payload(payload) {
+                return Some(AgentPacketFlowApplication::Grpc);
+            }
             if path_starts_with_any(
                 path,
                 &[
@@ -1990,6 +1999,11 @@ pub mod api {
             return Some(AgentPacketFlowApplication::Http);
         }
         None
+    }
+
+    fn grpc_http_payload(payload: &[u8]) -> bool {
+        contains_ascii_case_insensitive(payload, b"content-type: application/grpc")
+            || contains_ascii_case_insensitive(payload, b"content-type: application/grpc-web")
     }
 
     fn dns_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -2752,6 +2766,13 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
 
+        let grpc = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(50051),
+            ..Default::default()
+        };
+        assert_eq!(grpc.application(), api::AgentPacketFlowApplication::Grpc);
+
         let kafka = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(9092),
@@ -2870,6 +2891,13 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"POST /v1/traces HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /package.Service/Method HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Grpc
         );
         assert_eq!(
             observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
