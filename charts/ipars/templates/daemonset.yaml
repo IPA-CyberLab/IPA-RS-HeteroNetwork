@@ -4,6 +4,26 @@
 {{- if or (eq .Values.agent.joinTokenSecretKey "") (gt (len .Values.agent.joinTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.joinTokenSecretKey)) -}}
 {{- fail "agent.joinTokenSecretKey must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
+{{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
+{{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
+{{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- end -}}
+{{- if not (regexMatch $clusterUrlPattern .Values.cluster.signalUrl) -}}
+{{- fail "cluster.signalUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- end -}}
+{{- if and .Values.cluster.stunEndpoint (not (regexMatch $hostPortPattern .Values.cluster.stunEndpoint)) -}}
+{{- fail "cluster.stunEndpoint must be host:port or [ipv6]:port" -}}
+{{- end -}}
+{{- if and .Values.cluster.stunEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 65535)) -}}
+{{- fail "cluster.stunEndpoint port must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and .Values.cluster.relayEndpoint (not (regexMatch $hostPortPattern .Values.cluster.relayEndpoint)) -}}
+{{- fail "cluster.relayEndpoint must be host:port or [ipv6]:port" -}}
+{{- end -}}
+{{- if and .Values.cluster.relayEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 65535)) -}}
+{{- fail "cluster.relayEndpoint port must be between 1 and 65535" -}}
+{{- end -}}
 {{- if .Values.agent.relayAdvertisement.enabled -}}
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
