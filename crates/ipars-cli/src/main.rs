@@ -1644,6 +1644,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 }
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
+    validate_k8s_install_metadata(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_route_discovery(&args)?;
     let chart = args.chart.display().to_string();
@@ -1856,6 +1857,61 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.kubernetes_route_interval_seconds == 0 {
         anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    validate_helm_release_name(&args.release).map_err(anyhow::Error::msg)?;
+    validate_kubernetes_namespace(&args.namespace)?;
+    validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
+        .map_err(anyhow::Error::msg)?;
+    validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn validate_helm_release_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Helm release name must not be empty".to_string());
+    }
+    if name.len() > 53 {
+        return Err("Helm release name exceeds 53 bytes".to_string());
+    }
+    let valid_body = name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let valid_edges = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && name
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !valid_body || !valid_edges {
+        return Err(
+            "Helm release name must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_secret_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("join token Secret key must not be empty".to_string());
+    }
+    if key.len() > 253 {
+        return Err("join token Secret key exceeds 253 bytes".to_string());
+    }
+    let valid = key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(
+            "join token Secret key must contain only ASCII letters, digits, '-', '_' or '.'"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -2933,6 +2989,41 @@ mod tests {
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
         Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_invalid_install_metadata() {
+        let mut invalid_release = base_k8s_install_args();
+        invalid_release.release = "Edge".to_string();
+        let error = match k8s_install_plan(invalid_release) {
+            Ok(_) => panic!("invalid Helm release should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Helm release name"));
+
+        let mut invalid_namespace = base_k8s_install_args();
+        invalid_namespace.namespace = "edge_system".to_string();
+        let error = match k8s_install_plan(invalid_namespace) {
+            Ok(_) => panic!("invalid install namespace should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Kubernetes namespace"));
+
+        let mut invalid_secret = base_k8s_install_args();
+        invalid_secret.join_token_secret = "bad secret".to_string();
+        let error = match k8s_install_plan(invalid_secret) {
+            Ok(_) => panic!("invalid join token Secret name should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("join token Secret name"));
+
+        let mut invalid_key = base_k8s_install_args();
+        invalid_key.join_token_key = "../token".to_string();
+        let error = match k8s_install_plan(invalid_key) {
+            Ok(_) => panic!("invalid join token Secret key should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("join token Secret key"));
     }
 
     #[test]
