@@ -1770,6 +1770,7 @@ struct SignalOtelMetrics {
     nodes: Gauge<u64>,
     relay_candidates: Gauge<u64>,
     nat_classifications: Gauge<u64>,
+    health_report_total: Gauge<u64>,
     health_reports: Gauge<u64>,
     stale_health_reports: Gauge<u64>,
     relay_health_ttl_seconds: Gauge<u64>,
@@ -1793,6 +1794,10 @@ impl SignalOtelMetrics {
             nat_classifications: meter
                 .u64_gauge("ipars.signal.nat_classifications")
                 .with_description("Nodes with NAT classification registered in signal.")
+                .build(),
+            health_report_total: meter
+                .u64_gauge("ipars.signal.health_reports.total")
+                .with_description("Total signal health reports stored.")
                 .build(),
             health_reports: meter
                 .u64_gauge("ipars.signal.health_reports")
@@ -1831,6 +1836,8 @@ impl SignalOtelMetrics {
             .record(metrics.relay_candidate_count as u64, &[]);
         self.nat_classifications
             .record(metrics.nat_classification_count as u64, &[]);
+        self.health_report_total
+            .record(metrics.health_report_count as u64, &[]);
         self.stale_health_reports
             .record(metrics.stale_health_report_count as u64, &[]);
         self.relay_health_ttl_seconds
