@@ -1817,6 +1817,9 @@ pub mod api {
                 return None;
             }
             let payload = self.payload_prefix.as_slice();
+            if dns_payload(payload, self.protocol) {
+                return Some(AgentPacketFlowApplication::Dns);
+            }
             if protocol_is(self.protocol, TransportProtocol::Udp)
                 && self.involves_port(443)
                 && quic_long_header_payload(payload)
@@ -1969,6 +1972,88 @@ pub mod api {
             return Some(AgentPacketFlowApplication::Http);
         }
         None
+    }
+
+    fn dns_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            Some(TransportProtocol::Udp) => dns_message_payload(payload),
+            Some(TransportProtocol::Tcp) => dns_tcp_payload(payload),
+            None => dns_message_payload(payload) || dns_tcp_payload(payload),
+            Some(TransportProtocol::Any | TransportProtocol::Icmp) => false,
+        }
+    }
+
+    fn dns_tcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 14 {
+            return false;
+        }
+        let message_len = u16::from_be_bytes([payload[0], payload[1]]);
+        (12..=4096).contains(&message_len) && dns_message_payload(&payload[2..])
+    }
+
+    fn dns_message_payload(payload: &[u8]) -> bool {
+        if payload.len() < 12 {
+            return false;
+        }
+        let flags = u16::from_be_bytes([payload[2], payload[3]]);
+        let opcode = (flags >> 11) & 0x0f;
+        let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+        if opcode > 5 || qdcount == 0 || flags & 0x0040 != 0 {
+            return false;
+        }
+        dns_question_payload(payload)
+    }
+
+    fn dns_question_payload(payload: &[u8]) -> bool {
+        let mut offset = 12_usize;
+        let mut labels = 0_usize;
+        let mut name_len = 0_usize;
+        loop {
+            let Some(&len) = payload.get(offset) else {
+                return false;
+            };
+            if len & 0xc0 != 0 {
+                return false;
+            }
+            offset += 1;
+            if len == 0 {
+                break;
+            }
+            if len > 63 {
+                return false;
+            }
+            let len = len as usize;
+            let Some(label_end) = offset.checked_add(len) else {
+                return false;
+            };
+            let Some(label) = payload.get(offset..label_end) else {
+                return false;
+            };
+            if !label
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return false;
+            }
+            labels += 1;
+            name_len += len + 1;
+            if labels > 32 || name_len > 255 {
+                return false;
+            }
+            offset = label_end;
+        }
+        if labels == 0 {
+            return false;
+        }
+        let Some(question_end) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(question) = payload.get(offset..question_end) else {
+            return false;
+        };
+        let qtype = u16::from_be_bytes([question[0], question[1]]);
+        let qclass = u16::from_be_bytes([question[2], question[3]]);
+        qtype != 0 && qclass != 0
     }
 
     fn tls_handshake_payload(payload: &[u8]) -> bool {
@@ -2669,6 +2754,35 @@ mod tests {
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
+        let dns_query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
+            b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l', b'o', b'c',
+            b'a', b'l', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+
+        let dns_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1053),
+            payload_prefix: dns_query.clone(),
+            ..Default::default()
+        };
+        assert_eq!(dns_udp.application(), api::AgentPacketFlowApplication::Dns);
+        let mut dns_tcp_payload = (dns_query.len() as u16).to_be_bytes().to_vec();
+        dns_tcp_payload.extend_from_slice(&dns_query);
+        assert_eq!(
+            observation_for_payload(&dns_tcp_payload).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let malformed_dns_like = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1053),
+            payload_prefix: vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0xff],
+            ..Default::default()
+        };
+        assert_eq!(
+            malformed_dns_like.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
 
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
