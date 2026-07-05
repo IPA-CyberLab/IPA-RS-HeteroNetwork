@@ -579,6 +579,7 @@ async fn run_daemon_scenario(
     let cluster_id = ClusterId::from_string(format!("load-daemon-{:?}", scenario.name));
     let mut services = DaemonProcessGroup::start(
         iparsd_bin,
+        scenario,
         cluster_id.clone(),
         &issuer,
         &key_id,
@@ -946,6 +947,7 @@ struct DaemonProcessGroup {
 impl DaemonProcessGroup {
     async fn start(
         iparsd_bin: &Path,
+        scenario: Scenario,
         cluster_id: ClusterId,
         issuer: &IdentityKeyPair,
         key_id: &KeyId,
@@ -1059,7 +1061,7 @@ impl DaemonProcessGroup {
                 &issuer.node_id(),
                 key_id,
                 index,
-                Scenario::from_name(ScenarioName::Three),
+                scenario,
             )?)?;
             let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
             startup.children.push(spawn_iparsd(
@@ -1883,6 +1885,36 @@ mod tests {
         assert!(too_many.contains("cannot exceed scenario node count"));
 
         assert_eq!(validate_daemon_agent_processes(3, scenario)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("load-key");
+        let cluster_id = ClusterId::from_string("load-scenario");
+        let three_node_claims = join_claims(
+            &cluster_id,
+            &issuer.node_id(),
+            &key_id,
+            1,
+            Scenario::from_name(ScenarioName::Three),
+        )?;
+        let ten_node_claims = join_claims(
+            &cluster_id,
+            &issuer.node_id(),
+            &key_id,
+            1,
+            Scenario::from_name(ScenarioName::Ten),
+        )?;
+
+        assert!(!three_node_claims.policy.allow_relay);
+        assert!(three_node_claims
+            .tags
+            .contains(&Tag::from_string("route-provider")));
+        assert!(ten_node_claims.policy.allow_relay);
+        assert_eq!(ten_node_claims.role, Role::from_string("relay"));
+        assert!(ten_node_claims.tags.contains(&Tag::from_string("public")));
         Ok(())
     }
 
