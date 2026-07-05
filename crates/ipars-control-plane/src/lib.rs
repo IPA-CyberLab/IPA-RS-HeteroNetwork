@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
-    node_id_from_public_key_b64, verify_heartbeat_request_signature, verify_join_token, CryptoError,
+    node_id_from_public_key_b64, validate_wireguard_public_key_b64,
+    verify_heartbeat_request_signature, verify_join_token, CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
@@ -981,6 +982,12 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
             reason: format!("identity public key derives node ID {derived_node_id}"),
         });
     }
+    validate_wireguard_public_key_b64(&request.wireguard_public_key).map_err(|error| {
+        ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!("wireguard public key is invalid: {error}"),
+        }
+    })?;
     if let Some(candidate) = request
         .candidates
         .iter()
@@ -1062,7 +1069,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use chrono::{Duration, Utc};
-    use ipars_crypto::IdentityKeyPair;
+    use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest};
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
@@ -1111,7 +1118,7 @@ mod tests {
         RegisterNodeRequest {
             node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
-            wireguard_public_key: format!("wg-{node_id}"),
+            wireguard_public_key: wireguard_public_key_for_node(node_id),
             candidates: Vec::new(),
             relay_capability: None,
             requested_routes: Vec::new(),
@@ -1125,7 +1132,7 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: identity.public_key_b64(),
-            wireguard_public_key: format!("wg-{node_id}"),
+            wireguard_public_key: wireguard_public_key_for_node(node_id),
             role: Role::edge(),
             tags: BTreeSet::new(),
             endpoint_candidates: Vec::new(),
@@ -1145,6 +1152,17 @@ mod tests {
             seed[0] = 1;
         }
         IdentityKeyPair::from_signing_bytes(seed)
+    }
+
+    fn wireguard_public_key_for_node(node_id: &str) -> String {
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in format!("wg-{node_id}").as_bytes().iter().enumerate() {
+            bytes[index % 32] = bytes[index % 32].wrapping_add(*byte);
+        }
+        if bytes.iter().all(|byte| *byte == 0) {
+            bytes[0] = 1;
+        }
+        encode_bytes(&bytes)
     }
 
     fn node_id(label: &str) -> NodeId {
@@ -1330,7 +1348,7 @@ mod tests {
         let request = RegisterNodeRequest {
             node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
-            wireguard_public_key: "wg".to_string(),
+            wireguard_public_key: wireguard_public_key_for_node("node-a"),
             candidates: Vec::new(),
             relay_capability: Some(relay_capability()),
             requested_routes: Vec::new(),
@@ -1615,6 +1633,48 @@ mod tests {
             .await
         {
             Ok(_) => return Err("unexpected successful mismatched identity registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_wireguard_public_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.wireguard_public_key = "not-valid-base64".to_string();
+
+        let error = match plane
+            .register_with_claims(claims(cluster_id.clone()), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful WireGuard key registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+
+        let mut short_key = registration_request("node-b");
+        short_key.wireguard_public_key = encode_bytes(&[1, 2, 3]);
+        let error = match plane
+            .register_with_claims(claims(cluster_id), short_key)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful short WireGuard key registration".into()),
             Err(error) => error,
         };
 

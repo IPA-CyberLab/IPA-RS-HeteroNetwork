@@ -15,6 +15,8 @@ pub enum CryptoError {
     Base64(#[from] base64::DecodeError),
     #[error("ed25519 key material is invalid")]
     InvalidEd25519Key,
+    #[error("wireguard public key material is invalid")]
+    InvalidWireGuardKey,
     #[error("ed25519 signature is invalid")]
     InvalidSignature,
     #[error("token serialization failed")]
@@ -161,6 +163,14 @@ pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> 
         .map_err(|_| CryptoError::InvalidEd25519Key)
 }
 
+pub fn validate_wireguard_public_key_b64(value: &str) -> Result<(), CryptoError> {
+    let bytes = STANDARD.decode(value)?;
+    if bytes.len() != 32 {
+        return Err(CryptoError::InvalidWireGuardKey);
+    }
+    Ok(())
+}
+
 pub fn node_id_from_public_key_b64(value: &str) -> Result<NodeId, CryptoError> {
     let key_bytes = decode_32(value)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
@@ -225,12 +235,22 @@ mod tests {
     }
 
     #[test]
-    fn wireguard_keys_are_distinct() {
+    fn wireguard_keys_are_distinct() -> Result<(), CryptoError> {
         let first = WireGuardKeyPair::generate();
         let second = WireGuardKeyPair::generate();
 
         assert_ne!(first.private_key_b64, second.private_key_b64);
         assert_ne!(first.public_key_b64, second.public_key_b64);
+        validate_wireguard_public_key_b64(&first.public_key_b64)?;
+        assert!(matches!(
+            validate_wireguard_public_key_b64("not-valid-base64"),
+            Err(CryptoError::Base64(_))
+        ));
+        assert!(matches!(
+            validate_wireguard_public_key_b64(&encode_bytes(&[1, 2, 3])),
+            Err(CryptoError::InvalidWireGuardKey)
+        ));
+        Ok(())
     }
 
     #[test]

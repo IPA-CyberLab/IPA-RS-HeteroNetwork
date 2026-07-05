@@ -345,7 +345,7 @@ mod tests {
         ControlPlaneConfig, ControlPlaneJoinService, InMemoryStore, InMemoryTokenLedger,
         IssuerKeyRing,
     };
-    use ipars_crypto::IdentityKeyPair;
+    use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
         ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest,
         HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse,
@@ -387,7 +387,7 @@ mod tests {
         RegisterNodeRequest {
             node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
-            wireguard_public_key: format!("wg-{node_id}"),
+            wireguard_public_key: wireguard_public_key_for_node(node_id),
             candidates: Vec::new(),
             relay_capability: None,
             requested_routes: Vec::new(),
@@ -403,6 +403,17 @@ mod tests {
             seed[0] = 1;
         }
         IdentityKeyPair::from_signing_bytes(seed)
+    }
+
+    fn wireguard_public_key_for_node(node_id: &str) -> String {
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in format!("wg-{node_id}").as_bytes().iter().enumerate() {
+            bytes[index % 32] = bytes[index % 32].wrapping_add(*byte);
+        }
+        if bytes.iter().all(|byte| *byte == 0) {
+            bytes[0] = 1;
+        }
+        encode_bytes(&bytes)
     }
 
     fn node_id(label: &str) -> NodeId {

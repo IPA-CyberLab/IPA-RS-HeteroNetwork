@@ -15,7 +15,7 @@ use ipars_control_plane::{
     IssuerKeyRing,
 };
 use ipars_control_plane_http::{router as control_plane_router, ControlPlaneHttpState};
-use ipars_crypto::IdentityKeyPair;
+use ipars_crypto::{encode_bytes, IdentityKeyPair};
 use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
@@ -1612,11 +1612,21 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
     Ok(RegisterNodeRequest {
         node_id,
         identity_public_key: identity.public_key_b64(),
-        wireguard_public_key: format!("wireguard-public-{index}"),
+        wireguard_public_key: wireguard_public_key_for_index(index),
         candidates: endpoint_candidates(index, scenario),
         relay_capability: relay_capability(index, scenario),
         requested_routes: advertised_routes(index, scenario)?,
     })
+}
+
+fn wireguard_public_key_for_index(index: usize) -> String {
+    let mut bytes = [0_u8; 32];
+    for (offset, byte) in index.to_le_bytes().iter().enumerate() {
+        bytes[offset] = *byte;
+    }
+    bytes[8] = 0x77;
+    bytes[9] = 0x67;
+    encode_bytes(&bytes)
 }
 
 fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<HeartbeatRequest> {
