@@ -1170,6 +1170,42 @@ struct DaemonRuntimeManifestChild {
     log_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct DaemonRuntimeManifestSeed {
+    scenario: ScenarioName,
+    runtime_dir: PathBuf,
+    control_plane_urls: Vec<String>,
+    signal_url: String,
+    relay_http_url: String,
+    relay_udp_addr: SocketAddr,
+    stun_addr: SocketAddr,
+    keep_runtime_dir: bool,
+}
+
+impl DaemonRuntimeManifestSeed {
+    fn write(&self, agent_urls: &[String], children: &[DaemonChild]) -> anyhow::Result<PathBuf> {
+        write_daemon_runtime_manifest(
+            &self.runtime_dir,
+            DaemonRuntimeManifest {
+                scenario: self.scenario,
+                runtime_dir: self.runtime_dir.clone(),
+                control_plane_urls: self.control_plane_urls.clone(),
+                signal_url: self.signal_url.clone(),
+                relay_http_url: self.relay_http_url.clone(),
+                relay_udp_addr: self.relay_udp_addr,
+                stun_addr: self.stun_addr,
+                agent_urls: agent_urls.to_vec(),
+                keep_runtime_dir: self.keep_runtime_dir,
+                generated_at: Utc::now(),
+                children: children
+                    .iter()
+                    .map(DaemonRuntimeManifestChild::from_child)
+                    .collect(),
+            },
+        )
+    }
+}
+
 impl DaemonRuntimeManifestChild {
     fn from_child(child: &DaemonChild) -> Self {
         Self {
@@ -1209,6 +1245,18 @@ impl DaemonProcessGroup {
             .context("at least one daemon control-plane URL is required")?;
         let signal_url = format!("http://{signal_addr}");
         let relay_http_url = format!("http://{relay_http_addr}");
+        let mut agent_urls = Vec::with_capacity(options.agent_processes);
+        let manifest_seed = DaemonRuntimeManifestSeed {
+            scenario: scenario.name,
+            runtime_dir: runtime_dir.clone(),
+            control_plane_urls: control_plane_urls.clone(),
+            signal_url: signal_url.clone(),
+            relay_http_url: relay_http_url.clone(),
+            relay_udp_addr,
+            stun_addr,
+            keep_runtime_dir: options.keep_runtime_dir,
+        };
+        manifest_seed.write(&agent_urls, &startup.children)?;
         let control_plane_database_url =
             daemon_sqlite_database_url(&runtime_dir.join("control-plane.sqlite"));
         let client = reqwest::Client::new();
@@ -1234,6 +1282,7 @@ impl DaemonProcessGroup {
                 &role,
                 &runtime_dir,
             )?);
+            manifest_seed.write(&agent_urls, &startup.children)?;
             wait_for_http_ok(
                 &client,
                 format!("{}/healthz", control_plane_urls[index]),
@@ -1252,6 +1301,7 @@ impl DaemonProcessGroup {
             "signal",
             &runtime_dir,
         )?);
+        manifest_seed.write(&agent_urls, &startup.children)?;
         startup.children.push(spawn_iparsd(
             iparsd_bin,
             &[
@@ -1274,6 +1324,7 @@ impl DaemonProcessGroup {
             "relay",
             &runtime_dir,
         )?);
+        manifest_seed.write(&agent_urls, &startup.children)?;
         startup.children.push(spawn_iparsd(
             iparsd_bin,
             &[
@@ -1284,6 +1335,7 @@ impl DaemonProcessGroup {
             "stun",
             &runtime_dir,
         )?);
+        manifest_seed.write(&agent_urls, &startup.children)?;
 
         wait_for_http_ok(
             &client,
@@ -1300,7 +1352,6 @@ impl DaemonProcessGroup {
         )
         .await?;
 
-        let mut agent_urls = Vec::with_capacity(options.agent_processes);
         for index in 0..options.agent_processes {
             let agent_addr = reserve_tcp_addr().await?;
             let agent_url = format!("http://{agent_addr}");
@@ -1344,14 +1395,18 @@ impl DaemonProcessGroup {
                 "agent",
                 &runtime_dir,
             )?);
+            agent_urls.push(agent_url);
+            manifest_seed.write(&agent_urls, &startup.children)?;
             wait_for_http_ok(
                 &client,
-                format!("{agent_url}/healthz"),
+                format!(
+                    "{}/healthz",
+                    agent_urls.last().context("agent URL was not recorded")?
+                ),
                 "agent",
                 &mut startup.children,
             )
             .await?;
-            agent_urls.push(agent_url);
         }
         wait_for_daemon_agents_ready(
             &client,
@@ -1361,26 +1416,7 @@ impl DaemonProcessGroup {
             &mut startup.children,
         )
         .await?;
-        write_daemon_runtime_manifest(
-            &runtime_dir,
-            DaemonRuntimeManifest {
-                scenario: scenario.name,
-                runtime_dir: runtime_dir.clone(),
-                control_plane_urls: control_plane_urls.clone(),
-                signal_url: signal_url.clone(),
-                relay_http_url: relay_http_url.clone(),
-                relay_udp_addr,
-                stun_addr,
-                agent_urls: agent_urls.clone(),
-                keep_runtime_dir: options.keep_runtime_dir,
-                generated_at: Utc::now(),
-                children: startup
-                    .children
-                    .iter()
-                    .map(DaemonRuntimeManifestChild::from_child)
-                    .collect(),
-            },
-        )?;
+        manifest_seed.write(&agent_urls, &startup.children)?;
 
         let children = startup.finish();
         Ok(Self {
@@ -2592,6 +2628,50 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_manifest_seed_updates_partial_startup_state() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("manifest-seed");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let seed = synthetic_manifest_seed(runtime_dir.clone());
+
+        let manifest_path = seed.write(&[], &[])?;
+        let initial: DaemonRuntimeManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert!(initial.agent_urls.is_empty());
+        assert!(initial.children.is_empty());
+
+        let log_path = runtime_dir.join("0001-signal.log");
+        std::fs::write(&log_path, "signal log\n")?;
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn synthetic daemon child for manifest seed test")?;
+        let pid = child.id();
+        let mut children = vec![DaemonChild {
+            role: "signal".to_string(),
+            child,
+            log_path: Some(log_path.clone()),
+        }];
+
+        let agent_urls = vec!["http://127.0.0.1:31006".to_string()];
+        seed.write(&agent_urls, &children)?;
+        let updated: DaemonRuntimeManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert_eq!(updated.agent_urls, agent_urls);
+        assert_eq!(updated.children.len(), 1);
+        assert_eq!(updated.children[0].role, "signal");
+        assert_eq!(updated.children[0].pid, Some(pid));
+        assert_eq!(updated.children[0].log_path.as_ref(), Some(&log_path));
+
+        let _ = children[0].child.kill();
+        let _ = children[0].child.wait();
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("load-key");
@@ -2952,6 +3032,19 @@ mod tests {
             runtime_dir,
             keep_runtime_dir,
             children: Vec::new(),
+        }
+    }
+
+    fn synthetic_manifest_seed(runtime_dir: PathBuf) -> DaemonRuntimeManifestSeed {
+        DaemonRuntimeManifestSeed {
+            scenario: ScenarioName::Three,
+            runtime_dir,
+            control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
+            signal_url: "http://127.0.0.1:31002".to_string(),
+            relay_http_url: "http://127.0.0.1:31003".to_string(),
+            relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
+            stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
+            keep_runtime_dir: true,
         }
     }
 
