@@ -862,6 +862,17 @@ where
     ) -> Result<(), ControlPlaneError> {
         for path in &request.path_state {
             match (path.selected_state, path.relay_node.as_ref()) {
+                (PathState::Relay, Some(relay_node))
+                    if relay_node == &path.key.local || relay_node == &path.key.remote =>
+                {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "relay path {} -> {} uses endpoint {relay_node} as relay",
+                            path.key.local, path.key.remote
+                        ),
+                    });
+                }
                 (PathState::Relay, Some(_)) => {}
                 (PathState::Relay, None) => {
                     return Err(ControlPlaneError::NodeUpdateRejected {
@@ -2786,6 +2797,51 @@ mod tests {
         assert!(error
             .to_string()
             .contains("is not an eligible relay candidate"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_using_endpoint_as_relay(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("node-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful endpoint relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("uses endpoint"));
         Ok(())
     }
 

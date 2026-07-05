@@ -453,6 +453,7 @@ impl SignalCoordinator {
         );
         let relay_candidates = relays
             .iter()
+            .filter(|relay| relay.node_id != request.source && relay.node_id != request.target)
             .filter(|relay| {
                 relay
                     .relay_capability
@@ -819,6 +820,18 @@ mod tests {
         node_record("node-b", candidates)
     }
 
+    fn relay_capability() -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
+            admission_url: Some("http://203.0.113.20:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
     fn relay() -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string("relay-a"),
@@ -829,15 +842,7 @@ mod tests {
             role: Role::from_string("relay"),
             tags: BTreeSet::new(),
             endpoint_candidates: Vec::new(),
-            relay_capability: Some(RelayCapability {
-                enabled_by_policy: true,
-                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
-                admission_url: Some("http://203.0.113.20:9580".to_string()),
-                max_sessions: 10,
-                active_sessions: 0,
-                max_mbps: 1000,
-                e2e_only: true,
-            }),
+            relay_capability: Some(relay_capability()),
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
@@ -992,6 +997,58 @@ mod tests {
 
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_excludes_path_endpoints_from_relay_candidates() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut source_relay = source(Vec::new());
+        source_relay.relay_capability = Some(relay_capability());
+        let mut target_relay = target(Vec::new());
+        target_relay.relay_capability = Some(relay_capability());
+        registry
+            .upsert_node_with_nat_and_health(source_relay, None, Some(healthy_health()))
+            .await?;
+        registry
+            .upsert_node_with_nat_and_health(target_relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![NodeId::from_string("relay-a")]
+        );
         Ok(())
     }
 
