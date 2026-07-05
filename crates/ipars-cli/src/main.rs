@@ -1431,6 +1431,10 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
 }
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    validate_linux_interface_name(&args.docker_host_interface)?;
+    if let Some(namespace) = args.docker_container_namespace.as_deref() {
+        validate_linux_namespace_name(namespace)?;
+    }
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
@@ -1441,6 +1445,42 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     }
     for filter in &args.docker_networks {
         validate_docker_network_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("linux interface name cannot be empty");
+    }
+    if name.len() > 15 {
+        anyhow::bail!("linux interface name `{name}` exceeds 15 bytes");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
+}
+
+fn validate_linux_namespace_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("linux network namespace name cannot be empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("linux network namespace name `{name}` exceeds 64 bytes");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "linux network namespace name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        );
     }
     Ok(())
 }
@@ -2616,6 +2656,42 @@ mod tests {
         assert!(invalid_filter
             .to_string()
             .contains("must contain only ASCII letters"));
+
+        let invalid_host_interface = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker/0".to_string(),
+            docker_container_cidrs: Vec::new(),
+        }) {
+            Ok(_) => anyhow::bail!("invalid Docker host interface should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_host_interface
+            .to_string()
+            .contains("linux interface name"));
+
+        let invalid_namespace = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: Some("../compose".to_string()),
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+        }) {
+            Ok(_) => anyhow::bail!("invalid Docker container namespace should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_namespace
+            .to_string()
+            .contains("linux network namespace name"));
         Ok(())
     }
 
