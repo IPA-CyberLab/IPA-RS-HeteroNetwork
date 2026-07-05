@@ -355,6 +355,12 @@ struct K8sInstallArgs {
     disable_agent_service_account_token: bool,
     #[arg(long = "agent-dns-policy", value_parser = parse_kubernetes_dns_policy)]
     agent_dns_policy: Option<String>,
+    #[arg(long = "agent-state-host-path", value_parser = parse_kubernetes_absolute_path)]
+    agent_state_host_path: Option<String>,
+    #[arg(long = "agent-state-mount-path", value_parser = parse_kubernetes_absolute_path)]
+    agent_state_mount_path: Option<String>,
+    #[arg(long = "agent-state-host-path-type", value_parser = parse_kubernetes_host_path_type)]
+    agent_state_host_path_type: Option<String>,
     #[arg(long = "agent-termination-grace-period-seconds", value_parser = parse_kubernetes_non_negative_i64)]
     agent_termination_grace_period_seconds: Option<u64>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
@@ -1245,6 +1251,20 @@ fn parse_kubernetes_dns_policy(value: &str) -> Result<String, String> {
             "dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None; got {value}"
         )),
     }
+}
+
+fn parse_kubernetes_host_path_type(value: &str) -> Result<String, String> {
+    match value {
+        "DirectoryOrCreate" | "Directory" => Ok(value.to_string()),
+        _ => Err(format!(
+            "hostPath type must be DirectoryOrCreate or Directory; got {value}"
+        )),
+    }
+}
+
+fn parse_kubernetes_absolute_path(value: &str) -> Result<String, String> {
+    validate_kubernetes_absolute_path(value, "Kubernetes path")?;
+    Ok(value.to_string())
 }
 
 const KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN: u32 = 1;
@@ -2460,7 +2480,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites: vec![
             "kubectl access with permission to create namespaces, Secrets, DaemonSets, and RBAC when Kubernetes Service discovery is enabled".to_string(),
             "Helm 3".to_string(),
-            "/dev/net/tun available on every scheduled node".to_string(),
+            "/dev/net/tun plus a writable agent state hostPath available on every scheduled node".to_string(),
             "NET_ADMIN and NET_RAW capability allowance, or equivalent --agent-add-capability overrides, for the DaemonSet agent".to_string(),
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
         ],
@@ -2481,7 +2501,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2564,6 +2584,15 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         command.push_str(&format!(" --set agent.dnsPolicy={dns_policy}"));
+    }
+    if let Some(host_path) = args.agent_state_host_path.as_deref() {
+        append_helm_set_string(command, "agent.state.hostPath", host_path);
+    }
+    if let Some(mount_path) = args.agent_state_mount_path.as_deref() {
+        append_helm_set_string(command, "agent.state.mountPath", mount_path);
+    }
+    if let Some(host_path_type) = args.agent_state_host_path_type.as_deref() {
+        command.push_str(&format!(" --set agent.state.hostPathType={host_path_type}"));
     }
     if args.agent_privileged {
         command.push_str(" --set agent.privileged=true");
@@ -2835,6 +2864,39 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_kubernetes_absolute_path(path: &str, label: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if !path.starts_with('/') {
+        return Err(format!("{label} `{path}` must be absolute"));
+    }
+    if path == "/" {
+        return Err(format!("{label} must not be '/'"));
+    }
+    if path.ends_with('/') {
+        return Err(format!("{label} `{path}` must not end with '/'"));
+    }
+    if path.len() > 4096 {
+        return Err(format!("{label} `{path}` exceeds 4096 bytes"));
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err(format!("{label} `{path}` must not contain '..' segments"));
+    }
+    if !path.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.' | b'_' | b'-' | b'@' | b'%' | b'+' | b'=' | b':' | b','
+            )
+    }) {
+        return Err(format!(
+            "{label} `{path}` must contain only path-safe ASCII characters"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_service_ip_families(
     flag_prefix: &str,
     policy: Option<&str>,
@@ -2969,6 +3031,17 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         parse_kubernetes_dns_policy(dns_policy).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(host_path) = args.agent_state_host_path.as_deref() {
+        validate_kubernetes_absolute_path(host_path, "agent state host path")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(mount_path) = args.agent_state_mount_path.as_deref() {
+        validate_kubernetes_absolute_path(mount_path, "agent state mount path")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(host_path_type) = args.agent_state_host_path_type.as_deref() {
+        parse_kubernetes_host_path_type(host_path_type).map_err(anyhow::Error::msg)?;
     }
     if let Some(seconds) = args.agent_termination_grace_period_seconds {
         if seconds > KUBERNETES_INT64_MAX {
@@ -4175,6 +4248,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -4354,6 +4430,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -4608,6 +4687,9 @@ mod tests {
         args.agent_termination_grace_period_seconds = Some(45);
         args.disable_agent_service_account_token = true;
         args.agent_dns_policy = Some("Default".to_string());
+        args.agent_state_host_path = Some("/opt/ipars/state".to_string());
+        args.agent_state_mount_path = Some("/run/ipars/state".to_string());
+        args.agent_state_host_path_type = Some("Directory".to_string());
         args.agent_resource_request_cpu = Some("100m".to_string());
         args.agent_resource_request_memory = Some("128Mi".to_string());
         args.agent_resource_limit_cpu = Some("500m".to_string());
@@ -4632,6 +4714,9 @@ mod tests {
         assert!(helm.contains("--set-string 'agent.tolerations[1].tolerationSeconds=600'"));
         assert!(helm.contains("--set agent.automountServiceAccountToken=false"));
         assert!(helm.contains("--set agent.dnsPolicy=Default"));
+        assert!(helm.contains("--set-string agent.state.hostPath=/opt/ipars/state"));
+        assert!(helm.contains("--set-string agent.state.mountPath=/run/ipars/state"));
+        assert!(helm.contains("--set agent.state.hostPathType=Directory"));
         assert!(helm.contains("--set agent.terminationGracePeriodSeconds=45"));
         assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
         assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
@@ -4647,6 +4732,8 @@ mod tests {
         ]);
         assert!(parsed.is_err());
         assert!(parse_kubernetes_dns_policy("ClusterDefault").is_err());
+        assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
+        assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
 
         let mut invalid_selector = base_k8s_install_args();
@@ -4999,6 +5086,12 @@ mod tests {
             "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
             "--agent-dns-policy",
             "ClusterFirstWithHostNet",
+            "--agent-state-host-path",
+            "/opt/ipars/state",
+            "--agent-state-mount-path",
+            "/run/ipars/state",
+            "--agent-state-host-path-type",
+            "Directory",
             "--agent-termination-grace-period-seconds",
             "45",
             "--agent-resource-request-cpu",
@@ -5172,6 +5265,18 @@ mod tests {
                 args.agent_dns_policy.as_deref(),
                 Some("ClusterFirstWithHostNet")
             );
+            assert_eq!(
+                args.agent_state_host_path.as_deref(),
+                Some("/opt/ipars/state")
+            );
+            assert_eq!(
+                args.agent_state_mount_path.as_deref(),
+                Some("/run/ipars/state")
+            );
+            assert_eq!(
+                args.agent_state_host_path_type.as_deref(),
+                Some("Directory")
+            );
             assert_eq!(args.agent_termination_grace_period_seconds, Some(45));
             assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
@@ -5308,6 +5413,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -5403,6 +5511,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6013,6 +6124,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6095,6 +6209,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6184,6 +6301,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6271,6 +6391,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -6353,6 +6476,9 @@ mod tests {
             agent_tolerations: Vec::new(),
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
+            agent_state_host_path: None,
+            agent_state_mount_path: None,
+            agent_state_host_path_type: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,

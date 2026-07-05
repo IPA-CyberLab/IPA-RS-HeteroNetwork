@@ -28,6 +28,10 @@ agent:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
   automountServiceAccountToken: true
+  state:
+    hostPath: /var/lib/ipars
+    hostPathType: DirectoryOrCreate
+    mountPath: /var/lib/ipars
   terminationGracePeriodSeconds: ""
   privileged: false
   securityContext:
