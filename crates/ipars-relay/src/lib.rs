@@ -194,13 +194,17 @@ impl RelayTable {
         capability: &RelayCapability,
         admission: RelaySessionAdmission,
     ) -> Result<RelaySessionCredentials, RelayError> {
+        let now = Utc::now();
+        self.purge_expired(now);
         if !capability.can_admit() {
             return Err(RelayError::AdmissionDenied);
         }
 
         let id = RelaySessionId::new(&admission.left, &admission.right);
         validate_relay_session_admission(&admission, &id)?;
-        let now = Utc::now();
+        if self.has_session_pair(&admission.left, &admission.right) {
+            return Err(RelayError::AdmissionDenied);
+        }
         let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
         self.sessions.insert(
             id.clone(),
@@ -358,6 +362,13 @@ impl RelayTable {
 
     pub fn dataplane_metrics(&self) -> RelayDataplaneMetrics {
         self.dataplane.clone()
+    }
+
+    fn has_session_pair(&self, left: &NodeId, right: &NodeId) -> bool {
+        self.sessions.values().any(|session| {
+            (session.left == *left && session.right == *right)
+                || (session.left == *right && session.right == *left)
+        })
     }
 
     fn remove_expired_session(
@@ -869,6 +880,63 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_duplicate_node_pair_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("node-a");
+        let right = NodeId::from_string("node-b");
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let duplicate_same_direction = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            SocketAddr::from(([10, 0, 0, 1], 10001)),
+            SocketAddr::from(([10, 0, 0, 2], 10001)),
+            "replacement-secret".to_string(),
+        );
+        assert!(matches!(
+            duplicate_same_direction,
+            Err(RelayError::AdmissionDenied)
+        ));
+
+        let duplicate_reversed = table.admit_with_token(
+            &capability,
+            right.clone(),
+            left.clone(),
+            right_addr,
+            left_addr,
+            "replacement-secret".to_string(),
+        );
+        assert!(matches!(
+            duplicate_reversed,
+            Err(RelayError::AdmissionDenied)
+        ));
+        assert_eq!(table.session_count(), 1);
+
+        assert_eq!(
+            table.forward_target(&RelayFrame {
+                session_id: credentials.session_id,
+                session_token: credentials.session_token,
+                source: left,
+                destination: right,
+                ciphertext_payload: b"opaque".to_vec(),
+            })?,
+            right_addr
+        );
+        Ok(())
+    }
+
+    #[test]
     fn relay_rejects_oversized_frames_and_records_drop_reason() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -1151,6 +1219,45 @@ mod tests {
                 right: NodeId::from_string("right-b"),
                 left_addr: SocketAddr::from(([10, 0, 0, 3], 10000)),
                 right_addr: SocketAddr::from(([10, 0, 0, 4], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_duplicate_pair_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("right"),
+                right: NodeId::from_string("left"),
+                left_addr: SocketAddr::from(([10, 0, 0, 2], 10001)),
+                right_addr: SocketAddr::from(([10, 0, 0, 1], 10001)),
             })
             .await;
 
