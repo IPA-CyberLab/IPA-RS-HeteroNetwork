@@ -1337,6 +1337,11 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             validate_docker_discovery_config(args)?;
         } else if !args.docker_networks.is_empty() {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
+        } else {
+            validate_docker_container_cidrs(
+                "--docker-container-cidr",
+                &args.docker_container_cidrs,
+            )?;
         }
     }
     if args.apply_kubernetes_underlay {
@@ -1657,6 +1662,96 @@ fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
+        }
+        let route = cidr.trunc();
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
+        }
+    }
+    Ok(())
+}
+
+fn restricted_docker_container_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        ipnet::IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        ipnet::IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 fn validate_docker_api_version(version: &str) -> anyhow::Result<()> {
@@ -5154,9 +5249,11 @@ fn docker_discovered_routes(
     if cidrs.is_empty() {
         anyhow::bail!("Docker network discovery found no bridge networks with IPAM subnets");
     }
+    let cidrs = cidrs.into_keys().collect::<Vec<_>>();
+    validate_docker_container_cidrs("Docker network discovery", &cidrs)?;
     Ok(DockerDiscoveredRoutes {
         network_names: network_names.into_iter().collect(),
-        cidrs: cidrs.into_keys().collect(),
+        cidrs,
     })
 }
 
@@ -5269,6 +5366,7 @@ fn docker_network_intent(args: &AgentArgs) -> anyhow::Result<DockerNetworkIntent
     if args.docker_container_cidrs.is_empty() {
         anyhow::bail!("--apply-docker-routes requires at least one --docker-container-cidr");
     }
+    validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
 
     Ok(DockerNetworkIntent {
         container_namespace,
@@ -13782,6 +13880,57 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn docker_explicit_container_cidrs_reject_unsafe_ranges() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "0.0.0.0/0",
+                "--docker-container-cidr must not include unrestricted Docker container CIDR 0.0.0.0/0",
+            ),
+            (
+                "127.0.0.0/8",
+                "--docker-container-cidr must not include loopback Docker container CIDR 127.0.0.0/8",
+            ),
+            (
+                "fe80::/64",
+                "--docker-container-cidr must not include link-local Docker container CIDR fe80::/64",
+            ),
+        ];
+
+        for (cidr, expected) in cases {
+            let error = agent_runtime_config_error(vec![
+                "iparsd",
+                "agent",
+                "--apply-docker-routes",
+                "--docker-container-namespace",
+                "compose-default",
+                "--docker-container-cidr",
+                cidr,
+            ])?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+
+        let duplicate = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(duplicate.contains(
+            "--docker-container-cidr must not repeat Docker container CIDR route 172.18.0.0/16"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn agent_runtime_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
         let cases = vec![
             (
@@ -13963,6 +14112,26 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
         assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_unsafe_discovered_cidrs() -> anyhow::Result<()> {
+        let networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["0.0.0.0/0"],
+        )];
+
+        let error = match docker_discovered_routes(&networks, &[]) {
+            Ok(_) => anyhow::bail!("unsafe Docker API subnet should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(
+            "Docker network discovery must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
         Ok(())
     }
 

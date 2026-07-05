@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -2427,10 +2427,101 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
             "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
         );
     }
+    validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
     for filter in &args.docker_networks {
         validate_docker_network_filter(filter)?;
     }
     Ok(())
+}
+
+fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
+        }
+        let route = cidr.trunc();
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
+        }
+    }
+    Ok(())
+}
+
+fn restricted_docker_container_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        ipnet::IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        ipnet::IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
@@ -5159,6 +5250,24 @@ mod tests {
         Ok(())
     }
 
+    fn docker_install_test_args() -> DockerInstallArgs {
+        DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+        }
+    }
+
     #[test]
     fn docker_install_plan_lists_compose_commands_and_requirements() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
@@ -5538,6 +5647,43 @@ mod tests {
         assert!(invalid_shutdown_timeout
             .to_string()
             .contains("--userspace-wireguard-shutdown-timeout-seconds"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rejects_unsafe_container_cidrs() -> anyhow::Result<()> {
+        let unrestricted = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["0.0.0.0/0".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("unrestricted Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(unrestricted.to_string().contains(
+            "--docker-container-cidr must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
+
+        let loopback = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["127.0.0.0/8".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("loopback Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(loopback.to_string().contains(
+            "--docker-container-cidr must not include loopback Docker container CIDR 127.0.0.0/8"
+        ));
+
+        let duplicate = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?, "172.20.0.0/16".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("duplicate Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate.to_string().contains(
+            "--docker-container-cidr must not repeat Docker container CIDR route 172.20.0.0/16"
+        ));
         Ok(())
     }
 
