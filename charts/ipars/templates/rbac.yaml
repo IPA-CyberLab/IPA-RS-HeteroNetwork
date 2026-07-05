@@ -1,21 +1,57 @@
+{{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
+{{- if and $rbacCreate .Values.serviceExposure.discoverServices -}}
+{{- $name := include "ipars.fullname" . -}}
+{{- $serviceAccountNamespace := .Release.Namespace -}}
+{{- if .Values.serviceExposure.namespaces -}}
+{{- range $index, $namespace := .Values.serviceExposure.namespaces }}
+{{- if gt $index 0 }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $serviceAccountNamespace }}
+{{- end }}
+{{- else }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "ipars.fullname" . }}
+  name: {{ $name }}
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "services", "endpoints", "pods"]
+    resources: ["services"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "ipars.fullname" . }}
+  name: {{ $name }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "ipars.fullname" . }}
+  name: {{ $name }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "ipars.fullname" . }}
-    namespace: {{ .Release.Namespace }}
+    name: {{ $name }}
+    namespace: {{ $serviceAccountNamespace }}
+{{- end }}
+{{- end }}

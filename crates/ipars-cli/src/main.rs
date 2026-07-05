@@ -323,6 +323,8 @@ struct K8sInstallArgs {
         requires = "enable_network_policy"
     )]
     network_policy_acknowledge_host_network: bool,
+    #[arg(long = "disable-rbac", default_value_t = false)]
+    disable_rbac: bool,
     #[arg(long = "agent-pod-label", value_parser = parse_kubernetes_label_pair)]
     agent_pod_labels: Vec<KeyValueArg>,
     #[arg(long = "agent-pod-annotation", value_parser = parse_key_value)]
@@ -2379,7 +2381,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         ],
         environment: Vec::new(),
         prerequisites: vec![
-            "kubectl access with permission to create namespaces, Secrets, RBAC, and DaemonSets".to_string(),
+            "kubectl access with permission to create namespaces, Secrets, DaemonSets, and RBAC when Kubernetes Service discovery is enabled".to_string(),
             "Helm 3".to_string(),
             "/dev/net/tun available on every scheduled node".to_string(),
             "NET_ADMIN and NET_RAW capability allowance for the DaemonSet agent".to_string(),
@@ -2393,6 +2395,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
             "Use --disable-agent-service-account-token only when Kubernetes Service API discovery is not required".to_string(),
+            "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
@@ -2407,6 +2410,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
 }
 
 fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.disable_rbac {
+        command.push_str(" --set rbac.create=false");
+    }
     command.push_str(&format!(
         " --set serviceExposure.discoverApiServer={}",
         args.kubernetes_discover_api_server
@@ -2551,8 +2557,12 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
 }
 
 fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let mut namespaces = BTreeSet::new();
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
+        if !namespaces.insert(namespace) {
+            anyhow::bail!("--kubernetes-namespace `{namespace}` must not be repeated");
+        }
     }
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
@@ -3943,6 +3953,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: true,
             network_policy_acknowledge_host_network: true,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4112,6 +4123,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4175,10 +4187,12 @@ mod tests {
         args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
+        args.disable_rbac = true;
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
+        assert!(helm.contains("--set rbac.create=false"));
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
         assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
         assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
@@ -4477,6 +4491,16 @@ mod tests {
             .to_string()
             .contains("must be a DNS label using lowercase ASCII letters"));
 
+        let mut duplicate_namespace = base_k8s_install_args();
+        duplicate_namespace.kubernetes_discover_services = true;
+        duplicate_namespace.kubernetes_namespaces =
+            vec!["platform".to_string(), "platform".to_string()];
+        let error = match k8s_install_plan(duplicate_namespace) {
+            Ok(_) => panic!("duplicate namespace should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be repeated"));
+
         let mut invalid_selector = base_k8s_install_args();
         invalid_selector.kubernetes_discover_services = true;
         invalid_selector.kubernetes_service_label_selector =
@@ -4578,6 +4602,7 @@ mod tests {
             "--allow-cluster-external-traffic-policy",
             "--enable-network-policy",
             "--network-policy-acknowledge-host-network",
+            "--disable-rbac",
             "--agent-pod-label",
             "ipars.io/role=agent",
             "--agent-pod-annotation",
@@ -4704,6 +4729,7 @@ mod tests {
             assert!(args.allow_cluster_external_traffic_policy);
             assert!(args.enable_network_policy);
             assert!(args.network_policy_acknowledge_host_network);
+            assert!(args.disable_rbac);
             assert_eq!(
                 args.agent_pod_labels,
                 vec![KeyValueArg {
@@ -4859,6 +4885,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -4944,6 +4971,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5544,6 +5572,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5616,6 +5645,7 @@ mod tests {
             allow_cluster_external_traffic_policy: true,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5695,6 +5725,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5772,6 +5803,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
@@ -5844,6 +5876,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            disable_rbac: false,
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,

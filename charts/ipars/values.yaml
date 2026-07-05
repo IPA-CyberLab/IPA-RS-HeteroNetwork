@@ -10,6 +10,9 @@ cluster:
   relayEndpoint: "ipars-relay:51820"
   relayAdmissionUrl: "http://ipars-relay:9580"
 
+rbac:
+  create: true
+
 agent:
   interfaceName: ipars0
   joinTokenSecretName: ipars-join-token

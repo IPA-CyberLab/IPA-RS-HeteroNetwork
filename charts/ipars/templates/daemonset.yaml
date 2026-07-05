@@ -6,10 +6,14 @@
 {{- end -}}
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
+{{- $rbacCreate := printf "%v" .Values.rbac.create -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if not (or (eq $rbacCreate "true") (eq $rbacCreate "false")) -}}
+{{- fail "rbac.create must be true or false" -}}
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
@@ -143,10 +147,15 @@
 {{- if and (eq $agentAutomountServiceAccountToken "false") .Values.serviceExposure.discoverServices -}}
 {{- fail "agent.automountServiceAccountToken=false cannot be used with serviceExposure.discoverServices=true" -}}
 {{- end -}}
+{{- $serviceExposureNamespaces := dict -}}
 {{- range .Values.serviceExposure.namespaces -}}
 {{- if or (eq . "") (gt (len .) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" .)) -}}
 {{- fail (printf "serviceExposure.namespaces entry %q must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges" .) -}}
 {{- end -}}
+{{- if hasKey $serviceExposureNamespaces . -}}
+{{- fail (printf "serviceExposure.namespaces entry %q must not be repeated" .) -}}
+{{- end -}}
+{{- $_ := set $serviceExposureNamespaces . true -}}
 {{- end -}}
 {{- if and .Values.serviceExposure.serviceLabelSelector (gt (len .Values.serviceExposure.serviceLabelSelector) 1024) -}}
 {{- fail "serviceExposure.serviceLabelSelector must not exceed 1024 bytes" -}}
