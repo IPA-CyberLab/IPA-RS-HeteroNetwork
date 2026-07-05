@@ -397,6 +397,10 @@ struct K8sInstallArgs {
     agent_min_ready_seconds: Option<u32>,
     #[arg(long = "agent-revision-history-limit", value_parser = parse_kubernetes_non_negative_i32)]
     agent_revision_history_limit: Option<u32>,
+    #[arg(long = "agent-pdb-min-available", value_parser = parse_kubernetes_int_or_percent)]
+    agent_pdb_min_available: Option<String>,
+    #[arg(long = "agent-pdb-max-unavailable", value_parser = parse_kubernetes_int_or_percent)]
+    agent_pdb_max_unavailable: Option<String>,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-cluster-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
@@ -2461,6 +2465,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_security_context(&args)?;
     validate_k8s_agent_rollout_options(&args)?;
+    validate_k8s_agent_pdb_options(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
@@ -2840,6 +2845,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -3050,6 +3056,23 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
         command.push_str(&format!(
             " --set agent.rollout.revisionHistoryLimit={revision_history_limit}"
         ));
+    }
+    if args.agent_pdb_min_available.is_some() || args.agent_pdb_max_unavailable.is_some() {
+        command.push_str(" --set agent.podDisruptionBudget.enabled=true");
+    }
+    if let Some(min_available) = args.agent_pdb_min_available.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.podDisruptionBudget.minAvailable",
+            min_available,
+        );
+    }
+    if let Some(max_unavailable) = args.agent_pdb_max_unavailable.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.podDisruptionBudget.maxUnavailable",
+            max_unavailable,
+        );
     }
 }
 
@@ -3505,6 +3528,26 @@ fn validate_k8s_agent_rollout_options(args: &K8sInstallArgs) -> anyhow::Result<(
     {
         anyhow::bail!(
             "--agent-rollout-max-unavailable cannot be zero when --agent-rollout-max-surge is zero or unset"
+        );
+    }
+    Ok(())
+}
+
+fn validate_k8s_agent_pdb_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(min_available) = args.agent_pdb_min_available.as_deref() {
+        validate_kubernetes_int_or_percent(min_available, "agent PodDisruptionBudget minAvailable")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(max_unavailable) = args.agent_pdb_max_unavailable.as_deref() {
+        validate_kubernetes_int_or_percent(
+            max_unavailable,
+            "agent PodDisruptionBudget maxUnavailable",
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    if args.agent_pdb_min_available.is_some() && args.agent_pdb_max_unavailable.is_some() {
+        anyhow::bail!(
+            "--agent-pdb-min-available and --agent-pdb-max-unavailable are mutually exclusive"
         );
     }
     Ok(())
@@ -4992,6 +5035,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: Some("10.96.0.40".parse()?),
             agent_api_secondary_cluster_ip: Some("2001:db8::40".parse()?),
@@ -5232,6 +5277,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -5687,6 +5734,57 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_plan_wires_and_validates_agent_pdb_options() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_pdb_min_available = Some("80%".to_string());
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.podDisruptionBudget.enabled=true"));
+        assert!(helm.contains("--set-string agent.podDisruptionBudget.minAvailable=80%"));
+
+        let mut max_unavailable = base_k8s_install_args();
+        max_unavailable.agent_pdb_max_unavailable = Some("1".to_string());
+        let plan = k8s_install_plan(max_unavailable)?;
+        assert!(
+            plan.commands[2].contains("--set-string agent.podDisruptionBudget.maxUnavailable=1")
+        );
+
+        let both = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-pdb-min-available",
+            "1",
+            "--agent-pdb-max-unavailable",
+            "1",
+        ])?;
+        if let Command::K8s {
+            command: K8sCommand::Install(args),
+        } = both.command
+        {
+            let error = match k8s_install_plan(*args) {
+                Ok(_) => panic!("PDB minAvailable and maxUnavailable should be exclusive"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("mutually exclusive"));
+        } else {
+            anyhow::bail!("expected k8s install command");
+        }
+
+        let invalid_percent = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-pdb-min-available",
+            "101%",
+        ]);
+        assert!(invalid_percent.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_plan_rejects_invalid_install_metadata() {
         let mut invalid_release = base_k8s_install_args();
         invalid_release.release = "Edge".to_string();
@@ -5931,6 +6029,8 @@ mod tests {
             "15",
             "--agent-revision-history-limit",
             "5",
+            "--agent-pdb-min-available",
+            "80%",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -6112,6 +6212,8 @@ mod tests {
             assert_eq!(args.agent_rollout_max_surge.as_deref(), Some("1"));
             assert_eq!(args.agent_min_ready_seconds, Some(15));
             assert_eq!(args.agent_revision_history_limit, Some(5));
+            assert_eq!(args.agent_pdb_min_available.as_deref(), Some("80%"));
+            assert_eq!(args.agent_pdb_max_unavailable, None);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_node_port, Some(31080));
@@ -6261,6 +6363,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -6376,6 +6480,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -7348,6 +7454,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -7450,6 +7558,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -7559,6 +7669,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -7666,6 +7778,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
@@ -7768,6 +7882,8 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,

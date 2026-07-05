@@ -74,6 +74,10 @@ agent:
     maxSurge: ""
     minReadySeconds: ""
     revisionHistoryLimit: ""
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: ""
+    maxUnavailable: ""
   apiService:
     enabled: false
     exposureAcknowledged: false

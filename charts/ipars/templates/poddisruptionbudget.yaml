@@ -1,0 +1,35 @@
+{{- $pdbEnabled := printf "%v" .Values.agent.podDisruptionBudget.enabled -}}
+{{- $pdbMinAvailable := printf "%v" .Values.agent.podDisruptionBudget.minAvailable -}}
+{{- $pdbMaxUnavailable := printf "%v" .Values.agent.podDisruptionBudget.maxUnavailable -}}
+{{- if not (or (eq $pdbEnabled "true") (eq $pdbEnabled "false")) -}}
+{{- fail "agent.podDisruptionBudget.enabled must be true or false" -}}
+{{- end -}}
+{{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.minAvailable" "value" $pdbMinAvailable) -}}
+{{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.maxUnavailable" "value" $pdbMaxUnavailable) -}}
+{{- if and (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "") -}}
+{{- fail "agent.podDisruptionBudget.minAvailable and agent.podDisruptionBudget.maxUnavailable are mutually exclusive" -}}
+{{- end -}}
+{{- if and (eq $pdbEnabled "false") (or (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "")) -}}
+{{- fail "agent.podDisruptionBudget minAvailable or maxUnavailable requires agent.podDisruptionBudget.enabled=true" -}}
+{{- end -}}
+{{- if and (eq $pdbEnabled "true") (eq $pdbMinAvailable "") (eq $pdbMaxUnavailable "") -}}
+{{- fail "agent.podDisruptionBudget.enabled=true requires minAvailable or maxUnavailable" -}}
+{{- end -}}
+{{- if eq $pdbEnabled "true" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ipars.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ipars.name" . }}
+  {{- if ne $pdbMinAvailable "" }}
+  minAvailable: {{- if regexMatch "%$" $pdbMinAvailable }} {{ $pdbMinAvailable | quote }}{{- else }} {{ int $pdbMinAvailable }}{{- end }}
+  {{- end }}
+  {{- if ne $pdbMaxUnavailable "" }}
+  maxUnavailable: {{- if regexMatch "%$" $pdbMaxUnavailable }} {{ $pdbMaxUnavailable | quote }}{{- else }} {{ int $pdbMaxUnavailable }}{{- end }}
+  {{- end }}
+{{- end }}
