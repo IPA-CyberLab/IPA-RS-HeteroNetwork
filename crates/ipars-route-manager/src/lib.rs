@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::task::{ready, Context, Poll};
@@ -36,6 +36,8 @@ pub enum RouteManagerError {
     Backend(String),
     #[error("invalid linux network namespace name: {0}")]
     InvalidNamespace(String),
+    #[error("invalid Docker network intent: {0}")]
+    InvalidDockerNetworkIntent(String),
     #[error("invalid policy rule: {0}")]
     InvalidPolicyRule(String),
 }
@@ -321,6 +323,140 @@ pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
             fwmark: Some(0x6473),
         }],
     }
+}
+
+pub fn checked_docker_route_plan(
+    intent: DockerNetworkIntent,
+) -> Result<RoutePlan, RouteManagerError> {
+    validate_docker_network_intent(&intent)?;
+    Ok(docker_route_plan(intent))
+}
+
+pub fn validate_docker_network_intent(
+    intent: &DockerNetworkIntent,
+) -> Result<(), RouteManagerError> {
+    validate_docker_container_cidrs(&intent.container_cidrs)
+}
+
+fn validate_docker_container_cidrs(cidrs: &[IpNet]) -> Result<(), RouteManagerError> {
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+            return Err(invalid_docker_network_intent(format!(
+                "must not include {reason} Docker container CIDR {cidr}"
+            )));
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            return Err(invalid_docker_network_intent(format!(
+                "must use canonical Docker container CIDR route {route}, not {cidr}"
+            )));
+        }
+        if !seen.insert(route) {
+            return Err(invalid_docker_network_intent(format!(
+                "must not repeat Docker container CIDR route {route}"
+            )));
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            return Err(invalid_docker_network_intent(format!(
+                "must not include overlapping Docker container CIDR routes {overlap} and {route}"
+            )));
+        }
+        routes.push(route);
+    }
+    Ok(())
+}
+
+fn invalid_docker_network_intent(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidDockerNetworkIntent(message.into())
+}
+
+fn restricted_docker_container_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ip_cidrs_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => ipv4_cidrs_overlap(left, right),
+        (IpNet::V6(left), IpNet::V6(right)) => ipv6_cidrs_overlap(left, right),
+        _ => false,
+    }
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
@@ -729,7 +865,7 @@ where
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = docker_route_plan(intent);
+        let plan = checked_docker_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -898,7 +1034,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = docker_route_plan(intent);
+        let plan = checked_docker_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -1004,7 +1140,7 @@ impl RouteManager for DryRunLinuxRouteManager {
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        Ok(docker_route_plan(intent))
+        checked_docker_route_plan(intent)
     }
 
     async fn apply_kubernetes_intent(
@@ -1212,6 +1348,55 @@ mod tests {
         assert_eq!(plan.interface, "ipars0");
         assert_eq!(plan.routes.len(), 1);
         assert_eq!(plan.policy_rules[0].table, 10_064);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn docker_intent_rejects_invalid_container_cidrs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            (vec!["0.0.0.0/0"], "unrestricted Docker container CIDR"),
+            (vec!["127.0.0.0/8"], "loopback Docker container CIDR"),
+            (
+                vec!["172.18.0.1/16"],
+                "canonical Docker container CIDR route 172.18.0.0/16",
+            ),
+            (
+                vec!["172.18.0.0/16", "172.18.0.0/16"],
+                "repeat Docker container CIDR route 172.18.0.0/16",
+            ),
+            (
+                vec!["172.18.0.0/16", "172.18.10.0/24"],
+                "overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24",
+            ),
+        ];
+
+        for (cidrs, expected) in cases {
+            let error = match manager
+                .apply_docker_intent(DockerNetworkIntent {
+                    container_namespace: "container-a".to_string(),
+                    host_interface: "eth0".to_string(),
+                    overlay_interface: "ipars0".to_string(),
+                    container_cidrs: cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<IpNet>, _>>()?,
+                    expose_host_routes: true,
+                })
+                .await
+            {
+                Ok(plan) => {
+                    return Err(format!("invalid Docker CIDR should be rejected: {plan:?}").into());
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, RouteManagerError::InvalidDockerNetworkIntent(ref message) if message.contains(expected)),
+                "unexpected error: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -1513,6 +1698,43 @@ mod tests {
                 ),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_rejects_invalid_docker_intent_before_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let error = match manager
+            .apply_docker_intent(DockerNetworkIntent {
+                container_namespace: "container-a".to_string(),
+                host_interface: "eth0".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                container_cidrs: vec!["172.18.0.1/16".parse()?],
+                expose_host_routes: true,
+            })
+            .await
+        {
+            Ok(plan) => {
+                return Err(format!(
+                    "invalid Docker intent should fail before route commands: {plan:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                RouteManagerError::InvalidDockerNetworkIntent(ref message)
+                    if message.contains("canonical Docker container CIDR route 172.18.0.0/16")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(runner.commands().await.is_empty());
         Ok(())
     }
 }
