@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
+const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -87,11 +88,19 @@ struct RelayLoadOptions {
 }
 
 impl RelayLoadOptions {
-    fn normalized(self) -> Self {
-        Self {
-            packets_per_session: self.packets_per_session.max(1),
-            payload_bytes: self.payload_bytes.clamp(1, 60_000),
+    fn validate(self) -> anyhow::Result<Self> {
+        if self.packets_per_session == 0 {
+            bail!("--relay-packets-per-session must be greater than zero");
         }
+        if self.payload_bytes == 0 {
+            bail!("--relay-payload-bytes must be greater than zero");
+        }
+        if self.payload_bytes > MAX_RELAY_PAYLOAD_BYTES {
+            bail!(
+                "--relay-payload-bytes must be at most {MAX_RELAY_PAYLOAD_BYTES} bytes for UDP load tests"
+            );
+        }
+        Ok(self)
     }
 }
 
@@ -448,7 +457,7 @@ async fn run_relay_udp_scenario(
     scenario: Scenario,
     options: RelayLoadOptions,
 ) -> anyhow::Result<LoadReport> {
-    let options = options.normalized();
+    let options = options.validate()?;
     let services = RelayNetworkedServices::start().await?;
     let client = reqwest::Client::new();
     let left_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
@@ -563,8 +572,8 @@ async fn run_daemon_scenario(
     requested_agent_processes: usize,
     relay_options: RelayLoadOptions,
 ) -> anyhow::Result<LoadReport> {
-    let relay_options = relay_options.normalized();
-    let agent_processes = requested_agent_processes.clamp(1, scenario.node_count);
+    let relay_options = relay_options.validate()?;
+    let agent_processes = validate_daemon_agent_processes(requested_agent_processes, scenario)?;
     let issuer = IdentityKeyPair::generate();
     let key_id = KeyId::from_string("load-key");
     let cluster_id = ClusterId::from_string(format!("load-daemon-{:?}", scenario.name));
@@ -755,6 +764,22 @@ async fn run_daemon_scenario(
         signal_millis,
         relay_millis,
     })
+}
+
+fn validate_daemon_agent_processes(
+    requested_agent_processes: usize,
+    scenario: Scenario,
+) -> anyhow::Result<usize> {
+    if requested_agent_processes == 0 {
+        bail!("--daemon-agent-processes must be greater than zero");
+    }
+    if requested_agent_processes > scenario.node_count {
+        bail!(
+            "--daemon-agent-processes ({requested_agent_processes}) cannot exceed scenario node count ({})",
+            scenario.node_count
+        );
+    }
+    Ok(requested_agent_processes)
 }
 
 #[derive(Debug, Default)]
@@ -1793,6 +1818,71 @@ mod tests {
         assert_eq!(report.relay_udp_payload_bytes_received, 768);
         assert_eq!(report.relay_forwarded_bytes_reported, 768);
         assert_eq!(report.relay_http_requests, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_load_options_reject_invalid_bounds() -> anyhow::Result<()> {
+        let zero_packets = match (RelayLoadOptions {
+            packets_per_session: 0,
+            payload_bytes: 64,
+        }
+        .validate())
+        {
+            Ok(_) => bail!("zero relay packet count should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(zero_packets.contains("--relay-packets-per-session"));
+
+        let zero_payload = match (RelayLoadOptions {
+            packets_per_session: 1,
+            payload_bytes: 0,
+        }
+        .validate())
+        {
+            Ok(_) => bail!("zero relay payload size should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(zero_payload.contains("--relay-payload-bytes"));
+
+        let oversized_payload = match (RelayLoadOptions {
+            packets_per_session: 1,
+            payload_bytes: MAX_RELAY_PAYLOAD_BYTES + 1,
+        }
+        .validate())
+        {
+            Ok(_) => bail!("oversized relay payload should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(oversized_payload.contains("at most 60000 bytes"));
+
+        let valid = RelayLoadOptions {
+            packets_per_session: 3,
+            payload_bytes: MAX_RELAY_PAYLOAD_BYTES,
+        }
+        .validate()?;
+        assert_eq!(valid.packets_per_session, 3);
+        assert_eq!(valid.payload_bytes, MAX_RELAY_PAYLOAD_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_agent_processes_reject_invalid_scenario_bounds() -> anyhow::Result<()> {
+        let scenario = Scenario::from_name(ScenarioName::Three);
+
+        let zero = match validate_daemon_agent_processes(0, scenario) {
+            Ok(_) => bail!("zero daemon agent process count should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(zero.contains("--daemon-agent-processes"));
+
+        let too_many = match validate_daemon_agent_processes(4, scenario) {
+            Ok(_) => bail!("oversized daemon agent process count should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(too_many.contains("cannot exceed scenario node count"));
+
+        assert_eq!(validate_daemon_agent_processes(3, scenario)?, 3);
         Ok(())
     }
 
