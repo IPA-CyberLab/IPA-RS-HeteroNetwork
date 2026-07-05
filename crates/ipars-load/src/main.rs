@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static DAEMON_MANIFEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
@@ -2104,6 +2105,7 @@ fn spawn_iparsd(
     let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .private_on_unix()
         .open(&log_path)
         .with_context(|| format!("failed to open iparsd {role} log at {}", log_path.display()))?;
     writeln!(log_file, "ipars-load starting iparsd {role}")
@@ -2279,43 +2281,102 @@ fn daemon_runtime_manifest_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(DAEMON_RUNTIME_MANIFEST_FILE)
 }
 
+fn daemon_runtime_manifest_temp_path(runtime_dir: &Path) -> PathBuf {
+    let serial = DAEMON_MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    runtime_dir.join(format!(
+        ".{DAEMON_RUNTIME_MANIFEST_FILE}.{}.{serial}.tmp",
+        std::process::id()
+    ))
+}
+
 fn write_daemon_runtime_manifest(
     runtime_dir: &Path,
     manifest: DaemonRuntimeManifest,
 ) -> anyhow::Result<PathBuf> {
     let manifest_path = daemon_runtime_manifest_path(runtime_dir);
+    let manifest_tmp_path = daemon_runtime_manifest_temp_path(runtime_dir);
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .context("failed to serialize daemon runtime manifest")?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&manifest_path)
+        .create_new(true)
+        .private_on_unix()
+        .open(&manifest_tmp_path)
         .with_context(|| {
             format!(
-                "failed to open daemon runtime manifest {}",
-                manifest_path.display()
+                "failed to open temporary daemon runtime manifest {}",
+                manifest_tmp_path.display()
             )
         })?;
     file.write_all(&manifest_json).with_context(|| {
         format!(
-            "failed to write daemon runtime manifest {}",
-            manifest_path.display()
+            "failed to write temporary daemon runtime manifest {}",
+            manifest_tmp_path.display()
         )
     })?;
     file.write_all(b"\n").with_context(|| {
         format!(
-            "failed to finalize daemon runtime manifest {}",
-            manifest_path.display()
+            "failed to finalize temporary daemon runtime manifest {}",
+            manifest_tmp_path.display()
         )
     })?;
     file.sync_all().with_context(|| {
         format!(
-            "failed to sync daemon runtime manifest {}",
-            manifest_path.display()
+            "failed to sync temporary daemon runtime manifest {}",
+            manifest_tmp_path.display()
         )
     })?;
+    drop(file);
+    if let Err(error) = std::fs::rename(&manifest_tmp_path, &manifest_path) {
+        let _ = std::fs::remove_file(&manifest_tmp_path);
+        bail!(
+            "failed to atomically replace daemon runtime manifest {} with {}: {error}",
+            manifest_path.display(),
+            manifest_tmp_path.display()
+        );
+    }
+    sync_daemon_runtime_dir(runtime_dir)?;
     Ok(manifest_path)
+}
+
+fn sync_daemon_runtime_dir(runtime_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(runtime_dir)
+            .with_context(|| {
+                format!(
+                    "failed to open daemon runtime dir {}",
+                    runtime_dir.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "failed to sync daemon runtime dir {}",
+                    runtime_dir.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_dir;
+    }
+    Ok(())
+}
+
+trait PrivateOpenOptionsExt {
+    fn private_on_unix(&mut self) -> &mut Self;
+}
+
+impl PrivateOpenOptionsExt for std::fs::OpenOptions {
+    fn private_on_unix(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            self.mode(0o600);
+        }
+        self
+    }
 }
 
 fn write_daemon_join_token<Token: Serialize>(
@@ -3633,8 +3694,11 @@ mod tests {
         let log_path = runtime_dir.join("0000-control-plane-0.log");
         std::fs::write(&log_path, "control-plane diagnostic\n")?;
         let manifest = synthetic_manifest(runtime_dir.clone(), log_path.clone());
+        let stale_manifest_path = daemon_runtime_manifest_path(&runtime_dir);
+        std::fs::write(&stale_manifest_path, "stale manifest")?;
 
         let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest.clone())?;
+        assert_eq!(manifest_path, stale_manifest_path);
         assert_eq!(
             manifest_path.file_name().and_then(|name| name.to_str()),
             Some(DAEMON_RUNTIME_MANIFEST_FILE)
@@ -3642,7 +3706,23 @@ mod tests {
         let contents = std::fs::read_to_string(&manifest_path)?;
         assert!(contents.contains("control-plane-0"));
         assert!(contents.contains("127.0.0.1:31001"));
+        assert!(!contents.contains("stale manifest"));
         assert!(!contents.contains("join-token"));
+        let stale_temp_manifest_count = std::fs::read_dir(&runtime_dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(DAEMON_RUNTIME_MANIFEST_FILE) && name.ends_with(".tmp")
+                })
+            })
+            .count();
+        assert_eq!(stale_temp_manifest_count, 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&manifest_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let decoded: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
         assert_eq!(decoded.scenario, manifest.scenario);
@@ -4020,6 +4100,39 @@ mod tests {
         let _ = children[0].child.wait();
         let _ = std::fs::remove_file(&log_path);
         bail!("synthetic daemon child did not exit before liveness timeout")
+    }
+
+    #[test]
+    fn daemon_spawned_child_log_is_owner_only_and_sanitized() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("private-log");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut child = spawn_iparsd(
+            Path::new("sh"),
+            &["-c".to_string(), "sleep 30".to_string()],
+            "agent/with spaces",
+            &runtime_dir,
+        )?;
+        let log_path = child
+            .log_path
+            .clone()
+            .context("spawned daemon child did not record a log path")?;
+
+        assert!(log_path.starts_with(&runtime_dir));
+        assert!(log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("agent_with_spaces")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = child.child.kill();
+        let _ = child.child.wait();
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
     }
 
     #[test]
