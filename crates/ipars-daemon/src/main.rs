@@ -7169,18 +7169,50 @@ async fn negotiate_signal_paths(
                                 }
                             }
                             Err(error) => {
-                                if let Some(supervisor) =
-                                    options.relay_forwarder_supervisor.as_ref()
+                                if let Some(session) =
+                                    active_relay_session(runtime, &peer.node_id).await
                                 {
-                                    supervisor.remove(runtime, &peer.node_id).await;
+                                    record.relay_node = Some(session.relay_node.clone());
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        relay = %session.relay_node,
+                                        expires_at = %session.expires_at,
+                                        "failed relay admission renewal; retaining existing relay session"
+                                    );
+                                    if let Some(supervisor) =
+                                        options.relay_forwarder_supervisor.as_ref()
+                                    {
+                                        if let Err(error) =
+                                            supervisor.upsert(runtime, session).await
+                                        {
+                                            tracing::warn!(
+                                                %error,
+                                                peer = %record.key.remote,
+                                                "failed to ensure existing relay forwarder"
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                                    remove_relay_session_for_peer(
+                                        runtime,
+                                        options.relay_forwarder_supervisor.as_ref(),
+                                        &peer.node_id,
+                                        Some(PathState::Unreachable),
+                                        "removed relay session after relay admission failed",
+                                    )
+                                    .await;
+                                    record = unreachable_path_record(
+                                        &record,
+                                        "relay_admission_failed",
+                                        chrono::Utc::now(),
+                                    );
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to admit relay session; marking path unreachable"
+                                    );
                                 }
-                                tracing::warn!(
-                                    %error,
-                                    peer = %record.key.remote,
-                                    "failed to admit relay session"
-                                );
                             }
                         }
                     } else {
@@ -7204,20 +7236,44 @@ async fn negotiate_signal_paths(
                     }
                 }
                 None => {
+                    let mut retained_existing_session = false;
                     if path_selection == StableSignalPathSelection::CurrentRelay {
-                        tracing::debug!(
-                            peer = %record.key.remote,
-                            "keeping existing relay path without fresh relay candidates"
-                        );
-                    } else {
-                        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-                            supervisor.remove(runtime, &peer.node_id).await;
-                        } else {
-                            runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                        if let Some(session) = active_relay_session(runtime, &peer.node_id).await {
+                            record.relay_node = Some(session.relay_node.clone());
+                            retained_existing_session = true;
+                            tracing::debug!(
+                                peer = %record.key.remote,
+                                relay = %session.relay_node,
+                                "keeping existing relay path without fresh relay candidates"
+                            );
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+                                if let Err(error) = supervisor.upsert(runtime, session).await {
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to ensure existing relay forwarder"
+                                    );
+                                }
+                            }
                         }
+                    }
+                    if !retained_existing_session {
+                        remove_relay_session_for_peer(
+                            runtime,
+                            options.relay_forwarder_supervisor.as_ref(),
+                            &peer.node_id,
+                            Some(PathState::Unreachable),
+                            "removed relay session after relay candidates disappeared",
+                        )
+                        .await;
+                        record = unreachable_path_record(
+                            &record,
+                            "no_usable_relay_candidate",
+                            chrono::Utc::now(),
+                        );
                         tracing::warn!(
                             peer = %record.key.remote,
-                            "signal selected relay path without a usable relay candidate"
+                            "signal selected relay path without a usable relay candidate; marking path unreachable"
                         );
                     }
                 }
@@ -7318,6 +7374,10 @@ async fn remove_relay_session_for_peer(
             state = ?selected_state,
             "{message}"
         );
+    } else if let Some(supervisor) = relay_forwarder_supervisor {
+        supervisor.remove(runtime, peer).await;
+    } else {
+        runtime.remove_relay_forwarder_endpoint(peer).await;
     }
 }
 
@@ -7491,6 +7551,15 @@ async fn relay_session_needs_renewal(
         .await
 }
 
+async fn active_relay_session(runtime: &AgentRuntime, peer: &NodeId) -> Option<RelaySessionState> {
+    let session = runtime.relay_session(peer).await?;
+    if session.expires_at > chrono::Utc::now() {
+        Some(session)
+    } else {
+        None
+    }
+}
+
 async fn admit_relay_session(
     client: &reqwest::Client,
     status: &ipars_types::api::AgentStatusResponse,
@@ -7638,6 +7707,24 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
             })
     });
     candidates
+}
+
+fn unreachable_path_record(
+    previous: &PathRecord,
+    reason: &'static str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> PathRecord {
+    let mut score = PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), true, 0);
+    score.reasons.push(reason.to_string());
+    PathRecord {
+        key: previous.key.clone(),
+        selected_state: PathState::Unreachable,
+        selected_candidate: None,
+        relay_node: None,
+        score,
+        updated_at,
+        pinned: previous.pinned,
+    }
 }
 
 fn relay_fallback_path_record(
@@ -15771,6 +15858,228 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         signal_task.abort();
         control_plane_task.abort();
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_marks_relay_unreachable_when_admission_fails() -> anyhow::Result<()>
+    {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unused_http_base_url().await?),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("unreachable path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Unreachable);
+        assert_eq!(record.relay_node, None);
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_admission_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+
+        signal_task.abort();
+        control_plane_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_retains_active_relay_session_when_renewal_fails(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.node_id.clone(),
+                relay_node: NodeId::from_string("relay-old"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 30], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-old".to_string(),
+                session_token: "token-old".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+
+        let mut relay = node_record("relay-new");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unused_http_base_url().await?),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(120),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-old")));
+        let session = runtime
+            .relay_session(&peer.node_id)
+            .await
+            .context("existing relay session should be retained")?;
+        assert_eq!(session.relay_node, NodeId::from_string("relay-old"));
+        assert_eq!(session.session_id, "session-old");
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+
+        signal_task.abort();
+        control_plane_task.abort();
         Ok(())
     }
 
