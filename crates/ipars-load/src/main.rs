@@ -67,6 +67,9 @@ struct Cli {
 
     #[arg(long, default_value_t = 1)]
     daemon_control_plane_processes: usize,
+
+    #[arg(long)]
+    daemon_keep_runtime_dir: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -107,6 +110,13 @@ impl RelayLoadOptions {
         }
         Ok(self)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DaemonLoadOptions {
+    control_plane_processes: usize,
+    agent_processes: usize,
+    keep_runtime_dir: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +198,7 @@ struct LoadReport {
     relay_admission_failures_by_reason_reported: BTreeMap<RelayAdmissionFailureReason, u64>,
     relay_mbps: f64,
     daemon_processes: usize,
+    daemon_runtime_dir: Option<PathBuf>,
     daemon_agent_processes: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
@@ -236,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
                 &cli.iparsd_bin,
                 cli.daemon_control_plane_processes,
                 cli.daemon_agent_processes,
+                cli.daemon_keep_runtime_dir,
                 RelayLoadOptions {
                     packets_per_session: cli.relay_packets_per_session,
                     payload_bytes: cli.relay_payload_bytes,
@@ -352,6 +364,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
+        daemon_runtime_dir: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -519,6 +532,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
+        daemon_runtime_dir: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -660,6 +674,7 @@ async fn run_relay_udp_scenario(
         relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: 0,
+        daemon_runtime_dir: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -691,6 +706,7 @@ async fn run_daemon_scenario(
     iparsd_bin: &Path,
     requested_control_plane_processes: usize,
     requested_agent_processes: usize,
+    keep_runtime_dir: bool,
     relay_options: RelayLoadOptions,
 ) -> anyhow::Result<LoadReport> {
     let relay_options = relay_options.validate()?;
@@ -706,8 +722,11 @@ async fn run_daemon_scenario(
         cluster_id.clone(),
         &issuer,
         &key_id,
-        control_plane_processes,
-        agent_processes,
+        DaemonLoadOptions {
+            control_plane_processes,
+            agent_processes,
+            keep_runtime_dir,
+        },
     )
     .await?;
     let client = reqwest::Client::new();
@@ -904,6 +923,7 @@ async fn run_daemon_scenario(
         relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: services.process_count(),
+        daemon_runtime_dir: keep_runtime_dir.then(|| services.runtime_dir.clone()),
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
@@ -1118,6 +1138,7 @@ struct DaemonProcessGroup {
     relay_udp_addr: SocketAddr,
     agent_urls: Vec<String>,
     runtime_dir: PathBuf,
+    keep_runtime_dir: bool,
     children: Vec<DaemonChild>,
 }
 
@@ -1128,16 +1149,15 @@ impl DaemonProcessGroup {
         cluster_id: ClusterId,
         issuer: &IdentityKeyPair,
         key_id: &KeyId,
-        control_plane_processes: usize,
-        agent_processes: usize,
+        options: DaemonLoadOptions,
     ) -> anyhow::Result<Self> {
         if !iparsd_bin.exists() && iparsd_bin.components().count() > 1 {
             bail!("iparsd binary does not exist at {}", iparsd_bin.display());
         }
         let runtime_dir = daemon_runtime_dir()?;
         std::fs::create_dir_all(&runtime_dir)?;
-        let mut startup = DaemonStartupGuard::new(runtime_dir.clone());
-        let control_addrs = reserve_tcp_addrs(control_plane_processes).await?;
+        let mut startup = DaemonStartupGuard::new(runtime_dir.clone(), options.keep_runtime_dir);
+        let control_addrs = reserve_tcp_addrs(options.control_plane_processes).await?;
         let signal_addr = reserve_tcp_addr().await?;
         let relay_http_addr = reserve_tcp_addr().await?;
         let relay_udp_addr = reserve_udp_addr().await?;
@@ -1242,8 +1262,8 @@ impl DaemonProcessGroup {
         )
         .await?;
 
-        let mut agent_urls = Vec::with_capacity(agent_processes);
-        for index in 0..agent_processes {
+        let mut agent_urls = Vec::with_capacity(options.agent_processes);
+        for index in 0..options.agent_processes {
             let agent_addr = reserve_tcp_addr().await?;
             let agent_url = format!("http://{agent_addr}");
             let state_path = runtime_dir.join(format!("agent-{index:04}.json"));
@@ -1312,6 +1332,7 @@ impl DaemonProcessGroup {
             relay_udp_addr,
             agent_urls,
             runtime_dir,
+            keep_runtime_dir: options.keep_runtime_dir,
             children,
         })
     }
@@ -1328,7 +1349,9 @@ impl DaemonProcessGroup {
 impl Drop for DaemonProcessGroup {
     fn drop(&mut self) {
         kill_daemon_children(&mut self.children);
-        let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        if !self.keep_runtime_dir {
+            let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        }
     }
 }
 
@@ -1336,14 +1359,16 @@ struct DaemonStartupGuard {
     runtime_dir: PathBuf,
     children: Vec<DaemonChild>,
     active: bool,
+    keep_runtime_dir: bool,
 }
 
 impl DaemonStartupGuard {
-    fn new(runtime_dir: PathBuf) -> Self {
+    fn new(runtime_dir: PathBuf, keep_runtime_dir: bool) -> Self {
         Self {
             runtime_dir,
             children: Vec::new(),
             active: true,
+            keep_runtime_dir,
         }
     }
 
@@ -1357,7 +1382,9 @@ impl Drop for DaemonStartupGuard {
     fn drop(&mut self) {
         if self.active {
             kill_daemon_children(&mut self.children);
-            let _ = std::fs::remove_dir_all(&self.runtime_dir);
+            if !self.keep_runtime_dir {
+                let _ = std::fs::remove_dir_all(&self.runtime_dir);
+            }
         }
     }
 }
@@ -2389,6 +2416,47 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_cleanup_policy_removes_or_retains_directory() -> anyhow::Result<()> {
+        let cleanup_dir = synthetic_runtime_dir("cleanup");
+        std::fs::create_dir_all(&cleanup_dir)?;
+        std::fs::write(cleanup_dir.join("marker.log"), "cleanup")?;
+        {
+            let _group = synthetic_daemon_group(cleanup_dir.clone(), false);
+        }
+        assert!(!cleanup_dir.exists());
+
+        let retained_dir = synthetic_runtime_dir("retained");
+        std::fs::create_dir_all(&retained_dir)?;
+        std::fs::write(retained_dir.join("marker.log"), "retain")?;
+        {
+            let _group = synthetic_daemon_group(retained_dir.clone(), true);
+        }
+        assert!(retained_dir.join("marker.log").exists());
+        std::fs::remove_dir_all(&retained_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_startup_guard_cleanup_policy_removes_or_retains_failed_runtime_dir(
+    ) -> anyhow::Result<()> {
+        let cleanup_dir = synthetic_runtime_dir("startup-cleanup");
+        std::fs::create_dir_all(&cleanup_dir)?;
+        {
+            let _guard = DaemonStartupGuard::new(cleanup_dir.clone(), false);
+        }
+        assert!(!cleanup_dir.exists());
+
+        let retained_dir = synthetic_runtime_dir("startup-retained");
+        std::fs::create_dir_all(&retained_dir)?;
+        {
+            let _guard = DaemonStartupGuard::new(retained_dir.clone(), true);
+        }
+        assert!(retained_dir.exists());
+        std::fs::remove_dir_all(&retained_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("load-key");
@@ -2606,6 +2674,7 @@ mod tests {
             &iparsd_bin,
             2,
             2,
+            false,
             RelayLoadOptions {
                 packets_per_session: 1,
                 payload_bytes: 64,
@@ -2619,6 +2688,7 @@ mod tests {
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
         assert_eq!(report.daemon_processes, 7);
+        assert!(report.daemon_runtime_dir.is_none());
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
@@ -2725,6 +2795,27 @@ mod tests {
             path_state_counts: Vec::new(),
             endpoint_candidate_ttl_seconds: 0,
             generated_at: Utc::now(),
+        }
+    }
+
+    fn synthetic_runtime_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ipars-load-{label}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn synthetic_daemon_group(runtime_dir: PathBuf, keep_runtime_dir: bool) -> DaemonProcessGroup {
+        DaemonProcessGroup {
+            control_plane_urls: Vec::new(),
+            signal_url: "http://127.0.0.1:1".to_string(),
+            relay_http_url: "http://127.0.0.1:1".to_string(),
+            relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            agent_urls: Vec::new(),
+            runtime_dir,
+            keep_runtime_dir,
+            children: Vec::new(),
         }
     }
 }
