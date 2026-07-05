@@ -101,11 +101,12 @@ impl SignalRegistry {
 
     pub async fn upsert_node_with_nat_and_health(
         &self,
-        node: NodeRecord,
+        mut node: NodeRecord,
         nat_classification: Option<NatClassification>,
         health: Option<NodeHealth>,
     ) -> Result<SignalNodeUpsertResponse, SignalError> {
         validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates)?;
+        normalize_relay_capability(&mut node);
         let registered_at = Utc::now();
         match nat_classification {
             Some(classification) => {
@@ -503,6 +504,17 @@ impl SignalRegistry {
             })
             .collect()
     }
+}
+
+fn normalize_relay_capability(node: &mut NodeRecord) {
+    if node
+        .relay_capability
+        .as_ref()
+        .is_some_and(|capability| capability.can_admit())
+    {
+        return;
+    }
+    node.relay_capability = None;
 }
 
 fn nat_classification_strategy_counts(
@@ -1580,6 +1592,56 @@ mod tests {
             .await?;
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_clears_non_admissible_relay_capability_on_upsert() -> Result<(), SignalError>
+    {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut invalid_capabilities = Vec::new();
+
+        let mut policy_disabled = relay_capability();
+        policy_disabled.enabled_by_policy = false;
+        invalid_capabilities.push(policy_disabled);
+
+        let mut missing_public_endpoint = relay_capability();
+        missing_public_endpoint.public_endpoint = None;
+        invalid_capabilities.push(missing_public_endpoint);
+
+        let mut missing_admission_url = relay_capability();
+        missing_admission_url.admission_url = None;
+        invalid_capabilities.push(missing_admission_url);
+
+        let mut full_capacity = relay_capability();
+        full_capacity.active_sessions = full_capacity.max_sessions;
+        invalid_capabilities.push(full_capacity);
+
+        let mut zero_bandwidth = relay_capability();
+        zero_bandwidth.max_mbps = 0;
+        invalid_capabilities.push(zero_bandwidth);
+
+        let mut decrypting_relay = relay_capability();
+        decrypting_relay.e2e_only = false;
+        invalid_capabilities.push(decrypting_relay);
+
+        for capability in invalid_capabilities {
+            let mut relay = relay();
+            relay.relay_capability = Some(capability);
+
+            let response = registry
+                .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+                .await?;
+
+            assert!(response.node.relay_capability.is_none());
+            let stored = match registry.get_node(&NodeId::from_string("relay-a")).await {
+                Some(node) => node,
+                None => panic!("relay node should be stored"),
+            };
+            assert!(stored.relay_capability.is_none());
+            assert!(registry.relay_candidates().await.is_empty());
+        }
+
         Ok(())
     }
 
