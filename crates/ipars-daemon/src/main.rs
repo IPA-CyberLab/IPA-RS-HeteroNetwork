@@ -77,6 +77,7 @@ const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
+const DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS: usize = 131_072;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
@@ -436,6 +437,12 @@ struct AgentArgs {
         default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS
     )]
     packet_flow_procfs_max_flows: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_NETLINK_MAX_FLOWS",
+        default_value_t = DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS
+    )]
+    packet_flow_netlink_max_flows: usize,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
     packet_flow_pin: bool,
     #[arg(
@@ -1035,6 +1042,15 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
             args.packet_flow_procfs_max_flows > 0,
             "--packet-flow-procfs-max-flows must be greater than zero"
+        );
+    }
+    if matches!(
+        args.packet_flow_detector,
+        PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
+    ) {
+        anyhow::ensure!(
+            args.packet_flow_netlink_max_flows > 0,
+            "--packet-flow-netlink-max-flows must be greater than zero"
         );
     }
     if args.apply_docker_routes {
@@ -2928,10 +2944,12 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::ConntrackNetlink => {
+            let limits = ConntrackNetlinkReadLimits::from_args(&args);
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
+                max_flows = limits.max_flows,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
@@ -2939,14 +2957,17 @@ async fn run_agent(
                 runtime.clone(),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                limits,
                 args.packet_flow_pin,
             ));
         }
         PacketFlowDetector::ConntrackNetlinkEvents => {
+            let limits = ConntrackNetlinkReadLimits::from_args(&args);
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
+                max_flows = limits.max_flows,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
@@ -2954,6 +2975,7 @@ async fn run_agent(
                 runtime.clone(),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                limits,
                 args.packet_flow_pin,
             ));
         }
@@ -5599,12 +5621,13 @@ fn start_conntrack_netlink_packet_flow_detector(
     runtime: Arc<AgentRuntime>,
     interval: Duration,
     dedup_ttl: Option<Duration>,
+    limits: ConntrackNetlinkReadLimits,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut deduper = PacketFlowDeduper::new(dedup_ttl);
         loop {
-            match read_conntrack_netlink_packet_flows().await {
+            match read_conntrack_netlink_packet_flows(limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
                     log_packet_flow_duplicates(duplicate_count, "conntrack-netlink");
@@ -5636,6 +5659,7 @@ fn start_conntrack_netlink_event_packet_flow_detector(
     runtime: Arc<AgentRuntime>,
     idle_poll_interval: Duration,
     dedup_ttl: Option<Duration>,
+    limits: ConntrackNetlinkReadLimits,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -5648,6 +5672,7 @@ fn start_conntrack_netlink_event_packet_flow_detector(
                         &socket,
                         idle_poll_interval,
                         &mut deduper,
+                        limits,
                         pin,
                     )
                     .await
@@ -5758,12 +5783,15 @@ async fn run_conntrack_netlink_event_detector_once(
     socket: &Socket,
     idle_poll_interval: Duration,
     deduper: &mut PacketFlowDeduper,
+    limits: ConntrackNetlinkReadLimits,
     pin: bool,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
     loop {
         let mut recorded_any = false;
-        while let Some(flows) = read_conntrack_netlink_event_packet_flows(socket, &mut buffer)? {
+        while let Some(flows) =
+            read_conntrack_netlink_event_packet_flows(socket, &mut buffer, limits)?
+        {
             recorded_any = true;
             let (flows, duplicate_count) = deduper.retain_new(flows);
             log_packet_flow_duplicates(duplicate_count, "conntrack-netlink-events");
@@ -5870,6 +5898,27 @@ impl Default for ProcNetConntrackReadLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConntrackNetlinkReadLimits {
+    max_flows: usize,
+}
+
+impl ConntrackNetlinkReadLimits {
+    fn from_args(args: &AgentArgs) -> Self {
+        Self {
+            max_flows: args.packet_flow_netlink_max_flows,
+        }
+    }
+}
+
+impl Default for ConntrackNetlinkReadLimits {
+    fn default() -> Self {
+        Self {
+            max_flows: DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PacketFlowRecord {
     destination: IpAddr,
@@ -5904,13 +5953,17 @@ fn is_ipv6_unicast_link_local(address: Ipv6Addr) -> bool {
     address.segments()[0] & 0xffc0 == 0xfe80
 }
 
-async fn read_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>> {
-    tokio::task::spawn_blocking(dump_conntrack_netlink_packet_flows)
+async fn read_conntrack_netlink_packet_flows(
+    limits: ConntrackNetlinkReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    tokio::task::spawn_blocking(move || dump_conntrack_netlink_packet_flows(limits))
         .await
         .context("conntrack netlink reader task failed")?
 }
 
-fn dump_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>> {
+fn dump_conntrack_netlink_packet_flows(
+    limits: ConntrackNetlinkReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
     let mut socket =
         Socket::new(NETLINK_NETFILTER).context("failed to open NETLINK_NETFILTER socket")?;
     socket
@@ -5936,8 +5989,16 @@ fn dump_conntrack_netlink_packet_flows() -> anyhow::Result<Vec<PacketFlowRecord>
         let received = socket
             .recv(&mut &mut buffer[..], 0)
             .context("failed to receive conntrack netlink dump response")?;
-        let result = parse_conntrack_netlink_datagram_packet_flows(&buffer[..received])?;
+        let remaining_capacity = limits.max_flows.saturating_sub(flows.len());
+        if remaining_capacity == 0 {
+            return Ok(flows);
+        }
+        let result =
+            parse_conntrack_netlink_datagram_packet_flows(&buffer[..received], remaining_capacity)?;
         flows.extend(result.flows);
+        if result.truncated || flows.len() >= limits.max_flows {
+            return Ok(flows);
+        }
         if result.done {
             return Ok(flows);
         }
@@ -5962,10 +6023,14 @@ fn open_conntrack_netlink_event_socket() -> anyhow::Result<Socket> {
 fn read_conntrack_netlink_event_packet_flows(
     socket: &Socket,
     buffer: &mut [u8],
+    limits: ConntrackNetlinkReadLimits,
 ) -> anyhow::Result<Option<Vec<PacketFlowRecord>>> {
     match socket.recv(&mut &mut buffer[..], 0) {
         Ok(received) => {
-            let datagram = parse_conntrack_netlink_datagram_packet_flows(&buffer[..received])?;
+            let datagram = parse_conntrack_netlink_datagram_packet_flows(
+                &buffer[..received],
+                limits.max_flows,
+            )?;
             Ok(Some(datagram.flows))
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -5977,6 +6042,7 @@ fn read_conntrack_netlink_event_packet_flows(
 struct ConntrackNetlinkDatagram {
     flows: Vec<PacketFlowRecord>,
     done: bool,
+    truncated: bool,
 }
 
 const CONNTRACK_NETLINK_RECV_BUFFER_BYTES: usize = 256 * 1024;
@@ -6032,10 +6098,15 @@ fn conntrack_netlink_dump_request(sequence_number: u32) -> Vec<u8> {
 
 fn parse_conntrack_netlink_datagram_packet_flows(
     datagram: &[u8],
+    max_flows: usize,
 ) -> anyhow::Result<ConntrackNetlinkDatagram> {
     let mut result = ConntrackNetlinkDatagram::default();
     let mut offset = 0_usize;
     while offset < datagram.len() {
+        if result.flows.len() >= max_flows {
+            result.truncated = true;
+            break;
+        }
         let remaining = &datagram[offset..];
         if remaining.len() < NLMSG_HDR_LEN {
             if remaining.iter().all(|byte| *byte == 0) {
@@ -6073,7 +6144,13 @@ fn parse_conntrack_netlink_datagram_packet_flows(
             NLMSG_DONE => result.done = true,
             NLMSG_ERROR => handle_netlink_error(payload)?,
             message_type if ctnetlink_subsystem(message_type) == NFNL_SUBSYS_CTNETLINK => {
-                result.flows.extend(parse_ctnetlink_packet_flows(payload)?);
+                let remaining_capacity = max_flows.saturating_sub(result.flows.len());
+                let mut flows = parse_ctnetlink_packet_flows(payload)?;
+                if flows.len() > remaining_capacity {
+                    flows.truncate(remaining_capacity);
+                    result.truncated = true;
+                }
+                result.flows.extend(flows);
             }
             _ => {}
         }
@@ -7847,6 +7924,8 @@ mod tests {
             "conntrack-netlink",
             "--packet-flow-poll-interval-seconds",
             "3",
+            "--packet-flow-netlink-max-flows",
+            "8192",
         ])?;
 
         if let Command::Agent(args) = cli.command {
@@ -7856,6 +7935,11 @@ mod tests {
             );
             assert_eq!(args.packet_flow_detector.as_str(), "conntrack-netlink");
             assert_eq!(args.packet_flow_poll_interval_seconds, 3);
+            assert_eq!(args.packet_flow_netlink_max_flows, 8192);
+            assert_eq!(
+                ConntrackNetlinkReadLimits::from_args(&args),
+                ConntrackNetlinkReadLimits { max_flows: 8192 }
+            );
             return Ok(());
         }
 
@@ -7869,6 +7953,8 @@ mod tests {
             "agent",
             "--packet-flow-detector",
             "conntrack-netlink-events",
+            "--packet-flow-netlink-max-flows",
+            "4096",
             "--packet-flow-pin",
         ])?;
 
@@ -7881,11 +7967,38 @@ mod tests {
                 args.packet_flow_detector.as_str(),
                 "conntrack-netlink-events"
             );
+            assert_eq!(args.packet_flow_netlink_max_flows, 4096);
             assert!(args.packet_flow_pin);
             return Ok(());
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_netlink_packet_flow_limit_must_be_positive() -> anyhow::Result<()> {
+        for detector in ["conntrack-netlink", "conntrack-netlink-events"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                detector,
+                "--packet-flow-netlink-max-flows",
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(error
+                    .to_string()
+                    .contains("--packet-flow-netlink-max-flows must be greater than zero"));
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -8259,7 +8372,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let mut datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
         datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
 
-        let result = parse_conntrack_netlink_datagram_packet_flows(&datagram)?;
+        let result = parse_conntrack_netlink_datagram_packet_flows(
+            &datagram,
+            ConntrackNetlinkReadLimits::default().max_flows,
+        )?;
         let destinations = result
             .flows
             .iter()
@@ -8287,6 +8403,39 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn conntrack_netlink_parser_truncates_to_flow_limit() -> anyhow::Result<()> {
+        let first_destination = Ipv4Addr::new(100, 64, 0, 44);
+        let second_destination = Ipv4Addr::new(100, 64, 0, 45);
+        let first_tuple = test_nla(
+            CTA_TUPLE_ORIG | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_IP_V4_DST, &first_destination.octets()),
+            ),
+        );
+        let second_tuple = test_nla(
+            CTA_TUPLE_REPLY | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_TUPLE_IP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_IP_V4_DST, &second_destination.octets()),
+            ),
+        );
+        let mut payload = vec![0, NFNETLINK_V0, 0, 0];
+        payload.extend(first_tuple);
+        payload.extend(second_tuple);
+        let mut datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
+        datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
+
+        let result = parse_conntrack_netlink_datagram_packet_flows(&datagram, 1)?;
+
+        assert!(result.truncated);
+        assert!(!result.done);
+        assert_eq!(result.flows.len(), 1);
+        assert_eq!(result.flows[0].destination, IpAddr::from(first_destination));
+        Ok(())
+    }
+
+    #[test]
     fn conntrack_netlink_event_parser_does_not_require_done_message() -> anyhow::Result<()> {
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 77);
         let tuple = test_nla(
@@ -8300,7 +8449,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         payload.extend(tuple);
         let datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
 
-        let result = parse_conntrack_netlink_datagram_packet_flows(&datagram)?;
+        let result = parse_conntrack_netlink_datagram_packet_flows(
+            &datagram,
+            ConntrackNetlinkReadLimits::default().max_flows,
+        )?;
 
         assert!(!result.done);
         assert_eq!(
