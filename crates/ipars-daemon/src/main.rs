@@ -6216,12 +6216,17 @@ fn relay_session_state_from_admission(
     response: RelayAdmissionResponse,
     relay_endpoint: SocketAddr,
 ) -> RelaySessionState {
+    let (admitted_local_addr, admitted_peer_addr) = if response.left == peer.node_id {
+        (response.right_addr, response.left_addr)
+    } else {
+        (response.left_addr, response.right_addr)
+    };
     RelaySessionState {
         peer: peer.node_id.clone(),
         relay_node: relay.node_id.clone(),
         relay_endpoint,
-        admitted_local_addr: response.left_addr,
-        admitted_peer_addr: response.right_addr,
+        admitted_local_addr,
+        admitted_peer_addr,
         session_id: response.session_id,
         session_token: response.session_token,
         expires_at: response.expires_at,
@@ -6232,11 +6237,30 @@ fn relay_admission_request(
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
 ) -> Option<RelayAdmissionRequest> {
+    let local_addr = relay_session_endpoint(&status.candidates)?;
+    let peer_addr = relay_session_endpoint(&peer.endpoint_candidates)?;
+    let local_is_left = status.node_id <= peer.node_id;
+    let (left, right, left_addr, right_addr) = if local_is_left {
+        (
+            status.node_id.clone(),
+            peer.node_id.clone(),
+            local_addr,
+            peer_addr,
+        )
+    } else {
+        (
+            peer.node_id.clone(),
+            status.node_id.clone(),
+            peer_addr,
+            local_addr,
+        )
+    };
+
     Some(RelayAdmissionRequest {
-        left: status.node_id.clone(),
-        right: peer.node_id.clone(),
-        left_addr: relay_session_endpoint(&status.candidates)?,
-        right_addr: relay_session_endpoint(&peer.endpoint_candidates)?,
+        left,
+        right,
+        left_addr,
+        right_addr,
     })
 }
 
@@ -9285,6 +9309,42 @@ mod tests {
         assert_eq!(session.peer, NodeId::from_string("node-b"));
         assert_eq!(session.relay_node, NodeId::from_string("relay-advertised"));
         assert_eq!(session.relay_endpoint, relay_endpoint);
+        assert_eq!(
+            session.admitted_local_addr,
+            SocketAddr::from(([203, 0, 113, 10], 51_820))
+        );
+        assert_eq!(
+            session.admitted_peer_addr,
+            SocketAddr::from(([203, 0, 113, 11], 51_820))
+        );
+    }
+
+    #[test]
+    fn relay_session_state_maps_admitted_addrs_to_local_view() {
+        let peer = node_record("node-a");
+        let relay = node_record("relay-advertised");
+        let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
+        let response = RelayAdmissionResponse {
+            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            session_id: "node-a:node-z".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: Utc::now() + ChronoDuration::seconds(300),
+            left: peer.node_id.clone(),
+            right: NodeId::from_string("node-z"),
+            left_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
+            right_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+        };
+
+        let session = relay_session_state_from_admission(&peer, &relay, response, relay_endpoint);
+
+        assert_eq!(
+            session.admitted_local_addr,
+            SocketAddr::from(([203, 0, 113, 10], 51_820))
+        );
+        assert_eq!(
+            session.admitted_peer_addr,
+            SocketAddr::from(([203, 0, 113, 11], 51_820))
+        );
     }
 
     #[test]
@@ -12629,6 +12689,51 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 right: peer,
                 left_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
                 right_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            })
+        );
+    }
+
+    #[test]
+    fn relay_admission_request_uses_deterministic_node_order() {
+        let local = NodeId::from_string("node-z");
+        let peer = NodeId::from_string("node-a");
+        let status = ipars_types::api::AgentStatusResponse {
+            node_id: local.clone(),
+            identity_public_key: "identity-local".to_string(),
+            wireguard_public_key: "wg-local".to_string(),
+            candidate_count: 1,
+            candidates: vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }],
+            nat_classification: None,
+            state_updated_at: Utc::now(),
+        };
+        let mut peer_record = node_record("node-a");
+        peer_record.endpoint_candidates = vec![EndpointCandidate {
+            node_id: peer.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }];
+
+        let request = relay_admission_request(&status, &peer_record);
+
+        assert_eq!(
+            request,
+            Some(RelayAdmissionRequest {
+                left: peer,
+                right: local,
+                left_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                right_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
             })
         );
     }

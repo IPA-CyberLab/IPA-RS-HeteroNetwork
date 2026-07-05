@@ -531,9 +531,30 @@ where
 
         let relay_capability = relay_capability_allowed(request.relay_capability.clone(), &claims)?;
         let now = Utc::now();
-        let node = self
-            .insert_node_with_fresh_vpn_ip(claims, request, relay_capability, now)
-            .await?;
+        let node = match self
+            .insert_node_with_fresh_vpn_ip(
+                claims.clone(),
+                request.clone(),
+                relay_capability.clone(),
+                now,
+            )
+            .await
+        {
+            Ok(node) => node,
+            Err(ControlPlaneError::NodeAlreadyExists(_)) => {
+                self.rejoin_existing_node(claims, request, relay_capability)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        self.registration_response_for_node(node, now).await
+    }
+
+    async fn registration_response_for_node(
+        &self,
+        node: NodeRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RegisterNodeResponse, ControlPlaneError> {
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let peer_map = self.filtered_peer_map_for_node(&node, &peers, now);
@@ -545,6 +566,39 @@ where
             relay_map,
             cluster_policy: self.config.cluster_policy.clone(),
         })
+    }
+
+    async fn rejoin_existing_node(
+        &self,
+        claims: JoinTokenClaims,
+        request: RegisterNodeRequest,
+        relay_capability: Option<RelayCapability>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let existing = self
+            .store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if existing.cluster_id != claims.cluster_id
+            || existing.identity_public_key != request.identity_public_key
+            || existing.wireguard_public_key != request.wireguard_public_key
+            || existing.role != claims.role
+            || existing.tags != claims.tags
+            || existing.routes != request.requested_routes
+        {
+            return Err(ControlPlaneError::NodeAlreadyExists(request.node_id));
+        }
+
+        self.store
+            .update_node_candidates(&request.node_id, request.candidates)
+            .await?;
+        self.store
+            .update_node_relay_capability(&request.node_id, relay_capability)
+            .await?;
+        self.store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id))
     }
 
     async fn insert_node_with_fresh_vpn_ip(
@@ -1791,6 +1845,69 @@ mod tests {
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_is_idempotent_for_same_node_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store);
+        let mut request = registration_request("node-a");
+        request.candidates = vec![EndpointCandidate {
+            node_id: request.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: "198.51.100.10:40000".parse()?,
+            observed_at: Utc::now(),
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        }];
+
+        let first = plane
+            .register_with_claims(claims(cluster_id.clone()), request.clone())
+            .await?;
+        request.candidates[0].addr = "198.51.100.10:40001".parse()?;
+        let second = plane
+            .register_with_claims(claims(cluster_id), request.clone())
+            .await?;
+
+        assert_eq!(second.node.node_id, first.node.node_id);
+        assert_eq!(second.node.vpn_ip, first.node.vpn_ip);
+        assert_eq!(second.node.endpoint_candidates, request.candidates);
+        assert_eq!(plane.peer_map_for(&request.node_id).await?.peers.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_existing_node_with_different_wireguard_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store);
+        let mut request = registration_request("node-a");
+        plane
+            .register_with_claims(claims(cluster_id.clone()), request.clone())
+            .await?;
+
+        request.wireguard_public_key = wireguard_public_key_for_node("node-a-replacement");
+        let error = plane
+            .register_with_claims(claims(cluster_id), request)
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(ControlPlaneError::NodeAlreadyExists(_))
+        ));
         Ok(())
     }
 
