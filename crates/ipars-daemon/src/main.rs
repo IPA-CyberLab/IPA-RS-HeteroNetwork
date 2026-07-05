@@ -860,6 +860,7 @@ struct RuntimePreflightNeeds {
     generic_netlink: bool,
     netfilter_netlink: bool,
     docker_api_socket: bool,
+    ebpf_jsonl_event_path: bool,
     ipv4_forwarding: bool,
     ipv6_forwarding: bool,
     cap_net_admin: bool,
@@ -881,6 +882,7 @@ impl RuntimePreflightNeeds {
             generic_netlink: false,
             netfilter_netlink: false,
             docker_api_socket: false,
+            ebpf_jsonl_event_path: false,
             ipv4_forwarding: false,
             ipv6_forwarding: false,
             cap_net_admin: false,
@@ -901,6 +903,7 @@ impl RuntimePreflightNeeds {
             && !self.generic_netlink
             && !self.netfilter_netlink
             && !self.docker_api_socket
+            && !self.ebpf_jsonl_event_path
             && !self.ipv4_forwarding
             && !self.ipv6_forwarding
             && !self.cap_net_admin
@@ -1137,6 +1140,13 @@ fn preflight_agent_runtime_with_path_and_checks(
         let socket = docker_api_socket_path(args)?;
         (checks.docker_api_socket)(&socket)?;
     }
+    if needs.ebpf_jsonl_event_path {
+        let event_path = args
+            .packet_flow_ebpf_event_path
+            .as_deref()
+            .context("--packet-flow-ebpf-event-path is required")?;
+        ensure_ebpf_jsonl_event_path_ready(event_path)?;
+    }
     if needs.ipv4_forwarding {
         (checks.ipv4_forwarding)()?;
     }
@@ -1194,6 +1204,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
         needs_docker_api_socket = needs.docker_api_socket,
+        needs_ebpf_jsonl_event_path = needs.ebpf_jsonl_event_path,
         needs_ipv4_forwarding = needs.ipv4_forwarding,
         needs_ipv6_forwarding = needs.ipv6_forwarding,
         needs_cap_net_admin = needs.cap_net_admin,
@@ -1504,6 +1515,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
+    let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
     let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
         && (args.relay_forwarder_netns.is_some() || args.linux_netns.is_some());
@@ -1511,6 +1523,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         return RuntimePreflightNeeds {
             netfilter_netlink,
             docker_api_socket,
+            ebpf_jsonl_event_path: ebpf_jsonl,
             cap_net_admin: netfilter_netlink,
             cap_sys_admin: relay_forwarder_netns,
             cap_perfmon: ebpf_ringbuf,
@@ -1522,6 +1535,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
         return RuntimePreflightNeeds {
             docker_api_socket,
+            ebpf_jsonl_event_path: ebpf_jsonl,
             cap_sys_admin: relay_forwarder_netns,
             relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
@@ -1553,6 +1567,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
         docker_api_socket,
+        ebpf_jsonl_event_path: ebpf_jsonl,
         ipv4_forwarding,
         ipv6_forwarding,
         cap_net_admin: applies_routes
@@ -1869,6 +1884,32 @@ fn ensure_ebpf_object_file_ready(path: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         metadata.len() > 0,
         "eBPF packet-flow object {} is empty",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_ebpf_jsonl_event_path_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "eBPF packet-flow JSONL event path {} is not readable",
+                    path.display()
+                )
+            })
+        }
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "eBPF packet-flow JSONL event path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "eBPF packet-flow JSONL event path {} must be a regular file when it exists",
         path.display()
     );
     Ok(())
@@ -8741,6 +8782,7 @@ async fn read_ebpf_jsonl_packet_flows(
     cursor: &mut EbpfJsonlReadCursor,
     limits: EbpfJsonlReadLimits,
 ) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    ensure_ebpf_jsonl_event_path_ready(path)?;
     let mut file = tokio::fs::File::open(path).await.with_context(|| {
         format!(
             "failed to open eBPF packet-flow event file {}",
@@ -10808,6 +10850,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_preflight_checks_ebpf_jsonl_event_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-path-preflight")?;
+        let regular = base.join("events.jsonl");
+        std::fs::write(&regular, b"")?;
+        let missing = base.join("missing.jsonl");
+        let directory = base.join("events-dir");
+        std::fs::create_dir(&directory)?;
+
+        ensure_ebpf_jsonl_event_path_ready(&regular)?;
+        ensure_ebpf_jsonl_event_path_ready(&missing)?;
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-jsonl",
+            "--packet-flow-ebpf-event-path",
+            directory.to_str().context("non-UTF-8 temp path")?,
+        ])?;
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(needs.ebpf_jsonl_event_path);
+
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful eBPF JSONL path preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must be a regular file"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ebpf_jsonl_event_path_preflight_rejects_symlink() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-path-symlink")?;
+        let target = base.join("events.jsonl");
+        let link = base.join("events-link.jsonl");
+        std::fs::write(&target, b"")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_ebpf_jsonl_event_path_ready(&link) {
+            Ok(()) => anyhow::bail!("unexpected successful eBPF JSONL symlink preflight"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
     fn agent_args_accept_ebpf_ringbuf_packet_flow_detector() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -11243,6 +11345,35 @@ mod tests {
         assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Tcp));
 
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ebpf_jsonl_reader_rejects_symlinked_event_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-reader-symlink")?;
+        let target = base.join("events.jsonl");
+        let link = base.join("events-link.jsonl");
+        std::fs::write(&target, "{\"destination\":\"100.64.0.11\"}\n")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match read_ebpf_jsonl_packet_flows(
+            &link,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        )
+        .await
+        {
+            Ok(_) => anyhow::bail!("unexpected successful symlinked eBPF JSONL read"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(base);
         Ok(())
     }
 
