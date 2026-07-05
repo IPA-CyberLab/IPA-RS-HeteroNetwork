@@ -768,18 +768,40 @@ where
                 ),
             });
         }
-        if let Some(path) = request
-            .path_state
-            .iter()
-            .find(|path| path.key.local != request.node_id && path.key.remote != request.node_id)
-        {
-            return Err(ControlPlaneError::NodeUpdateRejected {
-                node_id: request.node_id.clone(),
-                reason: format!(
-                    "path {} -> {} does not include reporting node",
-                    path.key.local, path.key.remote
-                ),
-            });
+        for path in &request.path_state {
+            let peer = if path.key.local == request.node_id {
+                &path.key.remote
+            } else if path.key.remote == request.node_id {
+                &path.key.local
+            } else {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} does not include reporting node",
+                        path.key.local, path.key.remote
+                    ),
+                });
+            };
+            if let Some(candidate) = &path.selected_candidate {
+                if &candidate.node_id != peer {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate belongs to node {} instead of path peer {}",
+                            candidate.node_id, peer
+                        ),
+                    });
+                }
+                if let Err(reason) = candidate.validate_kind_address() {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} is invalid: {reason}",
+                            candidate.kind, candidate.addr
+                        ),
+                    });
+                }
+            }
         }
         if request.node_signature.is_none() {
             if self.config.require_heartbeat_signature {
@@ -2478,6 +2500,103 @@ mod tests {
             result,
             Err(ControlPlaneError::NodeUpdateRejected { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_unowned_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(candidate("node-c"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("selected candidate belongs to node"));
+        assert!(error.to_string().contains("instead of path peer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_invalid_selected_candidate_address(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(invalid_ipv6_candidate("node-b"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
         Ok(())
     }
 
