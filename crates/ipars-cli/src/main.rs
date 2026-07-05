@@ -333,6 +333,8 @@ struct K8sInstallArgs {
     agent_node_selectors: Vec<KeyValueArg>,
     #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
     agent_tolerations: Vec<KubernetesTolerationArg>,
+    #[arg(long = "agent-termination-grace-period-seconds", value_parser = parse_kubernetes_non_negative_i64)]
+    agent_termination_grace_period_seconds: Option<u64>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
     agent_resource_request_cpu: Option<String>,
     #[arg(long = "agent-resource-request-memory", value_parser = parse_kubernetes_resource_quantity)]
@@ -1376,6 +1378,7 @@ fn parse_kubernetes_daemonset_update_strategy(value: &str) -> Result<String, Str
 }
 
 const KUBERNETES_INT32_MAX: u32 = 2_147_483_647;
+const KUBERNETES_INT64_MAX: u64 = 9_223_372_036_854_775_807;
 
 fn parse_kubernetes_non_negative_i32(value: &str) -> Result<u32, String> {
     let parsed = value.parse::<u32>().map_err(|_| {
@@ -1390,6 +1393,10 @@ fn parse_kubernetes_non_negative_i32(value: &str) -> Result<u32, String> {
     }
 }
 
+fn parse_kubernetes_non_negative_i64(value: &str) -> Result<u64, String> {
+    validate_kubernetes_non_negative_integer_text(value, "value", Some(KUBERNETES_INT64_MAX))
+}
+
 fn parse_kubernetes_int_or_percent(value: &str) -> Result<String, String> {
     validate_kubernetes_int_or_percent(value, "rollout value")?;
     Ok(value.to_string())
@@ -1399,8 +1406,12 @@ fn validate_kubernetes_int_or_percent(value: &str, label: &str) -> Result<(), St
     if let Some(percent) = value.strip_suffix('%') {
         validate_kubernetes_non_negative_integer_text(percent, label, Some(100)).map(|_| ())
     } else {
-        validate_kubernetes_non_negative_integer_text(value, label, Some(KUBERNETES_INT32_MAX))
-            .map(|_| ())
+        validate_kubernetes_non_negative_integer_text(
+            value,
+            label,
+            Some(u64::from(KUBERNETES_INT32_MAX)),
+        )
+        .map(|_| ())
     }
 }
 
@@ -1411,8 +1422,8 @@ fn kubernetes_int_or_percent_is_zero(value: &str) -> bool {
 fn validate_kubernetes_non_negative_integer_text(
     value: &str,
     label: &str,
-    max: Option<u32>,
-) -> Result<u32, String> {
+    max: Option<u64>,
+) -> Result<u64, String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
     }
@@ -1423,7 +1434,7 @@ fn validate_kubernetes_non_negative_integer_text(
         return Err(format!("{label} must be a non-negative integer"));
     }
     let parsed = value
-        .parse::<u32>()
+        .parse::<u64>()
         .map_err(|_| format!("{label} must be a non-negative integer"))?;
     if let Some(max) = max {
         if parsed > max {
@@ -2384,7 +2395,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Agent pod labels, annotations, priority class, node selectors, tolerations, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "Agent pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2486,6 +2497,11 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
                 &seconds.to_string(),
             );
         }
+    }
+    if let Some(seconds) = args.agent_termination_grace_period_seconds {
+        command.push_str(&format!(
+            " --set agent.terminationGracePeriodSeconds={seconds}"
+        ));
     }
     if let Some(cpu) = args.agent_resource_request_cpu.as_deref() {
         append_helm_set_string(command, "agent.resources.requests.cpu", cpu);
@@ -2726,6 +2742,11 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     for toleration in &args.agent_tolerations {
         validate_kubernetes_toleration_arg(toleration).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(seconds) = args.agent_termination_grace_period_seconds {
+        if seconds > KUBERNETES_INT64_MAX {
+            anyhow::bail!("--agent-termination-grace-period-seconds must be a non-negative int64");
+        }
     }
     for (label, quantity) in [
         (
@@ -3916,6 +3937,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -4083,6 +4105,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -4189,6 +4212,7 @@ mod tests {
                 toleration_seconds: Some(600),
             },
         ];
+        args.agent_termination_grace_period_seconds = Some(45);
         args.agent_resource_request_cpu = Some("100m".to_string());
         args.agent_resource_request_memory = Some("128Mi".to_string());
         args.agent_resource_limit_cpu = Some("500m".to_string());
@@ -4211,6 +4235,7 @@ mod tests {
         );
         assert!(helm.contains("--set-string 'agent.tolerations[1].effect=NoExecute'"));
         assert!(helm.contains("--set-string 'agent.tolerations[1].tolerationSeconds=600'"));
+        assert!(helm.contains("--set agent.terminationGracePeriodSeconds=45"));
         assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
         assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
         assert!(helm.contains("--set-string agent.resources.limits.cpu=500m"));
@@ -4258,6 +4283,14 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("no key requires operator Exists"));
+
+        let mut invalid_grace = base_k8s_install_args();
+        invalid_grace.agent_termination_grace_period_seconds = Some(u64::MAX);
+        let error = match k8s_install_plan(invalid_grace) {
+            Ok(_) => panic!("termination grace period over int64 should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("termination-grace-period"));
 
         Ok(())
     }
@@ -4516,6 +4549,8 @@ mod tests {
             "kubernetes.io/os=linux",
             "--agent-toleration",
             "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
+            "--agent-termination-grace-period-seconds",
+            "45",
             "--agent-resource-request-cpu",
             "100m",
             "--agent-resource-request-memory",
@@ -4665,6 +4700,7 @@ mod tests {
                     toleration_seconds: None,
                 }]
             );
+            assert_eq!(args.agent_termination_grace_period_seconds, Some(45));
             assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
             assert_eq!(args.agent_resource_limit_cpu.as_deref(), Some("500m"));
@@ -4789,6 +4825,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -4872,6 +4909,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5470,6 +5508,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5540,6 +5579,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5617,6 +5657,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5692,6 +5733,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5762,6 +5804,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5923,6 +5966,11 @@ mod tests {
             Ok(2_147_483_647)
         );
         assert!(parse_kubernetes_non_negative_i32("2147483648").is_err());
+        assert_eq!(
+            parse_kubernetes_non_negative_i64("9223372036854775807"),
+            Ok(9_223_372_036_854_775_807)
+        );
+        assert!(parse_kubernetes_non_negative_i64("9223372036854775808").is_err());
         assert_eq!(parse_kubernetes_node_port("30000"), Ok(30000));
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());

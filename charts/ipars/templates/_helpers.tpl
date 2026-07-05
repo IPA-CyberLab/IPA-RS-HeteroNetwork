@@ -67,6 +67,15 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateNonNegativeInt64" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- include "ipars.validateNonNegativeInteger" . -}}
+{{- if and (ne $value "") (or (gt (len $value) 19) (and (eq (len $value) 19) (gt $value "9223372036854775807"))) -}}
+{{- fail (printf "%s %q must be a non-negative int64" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateIntOrPercent" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}

@@ -6,9 +6,11 @@
 {{- end -}}
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
+{{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
 {{- if or (gt (len .Values.agent.priorityClassName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.priorityClassName)) -}}
 {{- fail "agent.priorityClassName must be a Kubernetes DNS subdomain" -}}
@@ -191,6 +193,9 @@ spec:
     spec:
       serviceAccountName: {{ include "ipars.fullname" . }}
       hostNetwork: {{ .Values.agent.hostNetwork }}
+      {{- if ne $agentTerminationGracePeriodSeconds "" }}
+      terminationGracePeriodSeconds: {{ int $agentTerminationGracePeriodSeconds }}
+      {{- end }}
       {{- if .Values.agent.priorityClassName }}
       priorityClassName: {{ .Values.agent.priorityClassName | quote }}
       {{- end }}
