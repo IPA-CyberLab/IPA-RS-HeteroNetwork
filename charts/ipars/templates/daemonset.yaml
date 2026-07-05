@@ -1,3 +1,25 @@
+{{- if .Values.serviceExposure.enabled -}}
+{{- if not (gt (int .Values.serviceExposure.routeIntervalSeconds) 0) -}}
+{{- fail "serviceExposure.routeIntervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if and (not .Values.serviceExposure.discoverServices) .Values.serviceExposure.namespaces -}}
+{{- fail "serviceExposure.namespaces requires serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- if and (not .Values.serviceExposure.discoverServices) .Values.serviceExposure.serviceLabelSelector -}}
+{{- fail "serviceExposure.serviceLabelSelector requires serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- range .Values.serviceExposure.namespaces -}}
+{{- if or (eq . "") (gt (len .) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" .)) -}}
+{{- fail (printf "serviceExposure.namespaces entry %q must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.serviceExposure.serviceLabelSelector (gt (len .Values.serviceExposure.serviceLabelSelector) 1024) -}}
+{{- fail "serviceExposure.serviceLabelSelector must not exceed 1024 bytes" -}}
+{{- end -}}
+{{- if and .Values.serviceExposure.serviceLabelSelector (regexMatch "[[:cntrl:]]" .Values.serviceExposure.serviceLabelSelector) -}}
+{{- fail "serviceExposure.serviceLabelSelector must not contain control characters" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
