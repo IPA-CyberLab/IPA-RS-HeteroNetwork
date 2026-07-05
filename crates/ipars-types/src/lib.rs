@@ -1164,6 +1164,22 @@ pub mod api {
         pub state_updated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub struct AgentWireGuardKeyRotationRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub control_plane_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AgentWireGuardKeyRotationResponse {
+        pub node_id: NodeId,
+        pub previous_wireguard_public_key: String,
+        pub next_wireguard_public_key: String,
+        pub control_plane_node: NodeRecord,
+        pub rotated_at: DateTime<Utc>,
+        pub state_updated_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentStunProbeRequest {
         pub local_bind: SocketAddr,

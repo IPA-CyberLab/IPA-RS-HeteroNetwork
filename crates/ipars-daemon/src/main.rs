@@ -3439,7 +3439,7 @@ async fn run_agent(
         if !control_plane_bases.is_empty() {
             background_tasks.push(start_signal_path_negotiation(
                 runtime.clone(),
-                control_plane_bases,
+                control_plane_bases.clone(),
                 signal_bases,
                 hole_puncher,
                 relay_forwarder_supervisor.clone(),
@@ -3451,7 +3451,11 @@ async fn run_agent(
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     let result = serve_router(
         args.listen,
-        agent_router(AgentHttpState::new(runtime.clone())),
+        agent_router(AgentHttpState::with_wireguard_key_rotation(
+            runtime.clone(),
+            store,
+            control_plane_bases,
+        )),
     )
     .await;
     for task in background_tasks {

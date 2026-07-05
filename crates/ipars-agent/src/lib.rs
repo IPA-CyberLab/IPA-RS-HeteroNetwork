@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,7 +23,8 @@ use ipars_types::api::{
     AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
     AgentPacketFlowDropReasonCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
     AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
-    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
+    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
+    SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -110,6 +111,14 @@ impl AgentNodeState {
             &self.identity_private_key_b64,
         )?)
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentWireGuardKeyRotationPlan {
+    pub next_state: AgentNodeState,
+    pub request: RotateWireGuardKeyRequest,
+    pub previous_wireguard_public_key: String,
+    pub next_wireguard_public_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -363,7 +372,7 @@ fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), Agent
 
 #[derive(Debug)]
 pub struct AgentRuntime {
-    state: AgentNodeState,
+    state: RwLock<AgentNodeState>,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
@@ -600,7 +609,7 @@ impl UdpRelayFrameForwarder {
 impl AgentRuntime {
     pub fn new(state: AgentNodeState, policy: ClusterPolicy) -> Self {
         Self {
-            state,
+            state: RwLock::new(state),
             candidates: tokio::sync::RwLock::new(Vec::new()),
             nat_classification: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -641,21 +650,70 @@ impl AgentRuntime {
         }
     }
 
-    pub fn state(&self) -> &AgentNodeState {
-        &self.state
+    pub fn state(&self) -> AgentNodeState {
+        match self.state.read() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn replace_state(&self, state: AgentNodeState) {
+        match self.state.write() {
+            Ok(mut current) => *current = state,
+            Err(poisoned) => *poisoned.into_inner() = state,
+        }
+    }
+
+    pub fn wireguard_key_rotation_request(
+        &self,
+        next_wireguard_public_key: String,
+        signed_at: DateTime<Utc>,
+    ) -> Result<RotateWireGuardKeyRequest, AgentError> {
+        let state = self.state();
+        let identity = state.identity_key_pair()?;
+        let mut request = RotateWireGuardKeyRequest {
+            node_id: state.node_id,
+            previous_wireguard_public_key: state.wireguard_public_key_b64,
+            next_wireguard_public_key,
+            node_signature: None,
+        };
+        request.node_signature =
+            Some(identity.sign_wireguard_key_rotation_request(&request, signed_at)?);
+        Ok(request)
+    }
+
+    pub fn plan_wireguard_key_rotation(
+        &self,
+        signed_at: DateTime<Utc>,
+    ) -> Result<AgentWireGuardKeyRotationPlan, AgentError> {
+        let current_state = self.state();
+        let next_wireguard = WireGuardKeyPair::generate();
+        let mut next_state = current_state.clone();
+        next_state.wireguard_private_key_b64 = next_wireguard.private_key_b64;
+        next_state.wireguard_public_key_b64 = next_wireguard.public_key_b64.clone();
+        next_state.updated_at = signed_at;
+        let request =
+            self.wireguard_key_rotation_request(next_wireguard.public_key_b64.clone(), signed_at)?;
+        Ok(AgentWireGuardKeyRotationPlan {
+            next_state,
+            request,
+            previous_wireguard_public_key: current_state.wireguard_public_key_b64,
+            next_wireguard_public_key: next_wireguard.public_key_b64,
+        })
     }
 
     pub async fn status(&self) -> AgentStatusResponse {
+        let state = self.state();
         let candidates = self.candidates.read().await.clone();
         let nat_classification = self.nat_classification.read().await.clone();
         AgentStatusResponse {
-            node_id: self.state.node_id.clone(),
-            identity_public_key: self.state.identity_public_key_b64.clone(),
-            wireguard_public_key: self.state.wireguard_public_key_b64.clone(),
+            node_id: state.node_id,
+            identity_public_key: state.identity_public_key_b64,
+            wireguard_public_key: state.wireguard_public_key_b64,
             candidate_count: candidates.len(),
             candidates,
             nat_classification,
-            state_updated_at: self.state.updated_at,
+            state_updated_at: state.updated_at,
         }
     }
 
@@ -665,7 +723,7 @@ impl AgentRuntime {
         stun_server: std::net::SocketAddr,
     ) -> Result<EndpointCandidate, AgentError> {
         let candidate = UdpStunProbe
-            .probe(self.state.node_id.clone(), local_bind, stun_server)
+            .probe(self.state().node_id, local_bind, stun_server)
             .await?;
         self.candidates.write().await.push(candidate.clone());
         Ok(candidate)
@@ -719,7 +777,7 @@ impl AgentRuntime {
         observation: &NatProbeObservation,
     ) -> EndpointCandidate {
         EndpointCandidate {
-            node_id: self.state.node_id.clone(),
+            node_id: self.state().node_id,
             kind: EndpointCandidateKind::StunReflexive,
             addr: observation.reflexive_addr,
             observed_at: observation.observed_at,
@@ -755,8 +813,9 @@ impl AgentRuntime {
             *path_state_counts.entry(path.selected_state).or_default() += 1;
         }
 
+        let state = self.state();
         AgentMetricsResponse {
-            node_id: self.state.node_id.clone(),
+            node_id: state.node_id,
             candidate_count: candidates.len(),
             path_count: path_state.len(),
             relay_session_count: relay_sessions.len(),
@@ -799,7 +858,7 @@ impl AgentRuntime {
         self.path_state
             .read()
             .await
-            .get(&(self.state.node_id.clone(), peer.clone()))
+            .get(&(self.state().node_id, peer.clone()))
             .cloned()
     }
 
@@ -809,7 +868,7 @@ impl AgentRuntime {
         recorded_at: DateTime<Utc>,
     ) -> PathRecord {
         let path = PathRecord {
-            key: ipars_types::PeerPathKey::new(self.state.node_id.clone(), request.peer),
+            key: ipars_types::PeerPathKey::new(self.state().node_id, request.peer),
             selected_state: request.selected_state,
             selected_candidate: request.selected_candidate,
             relay_node: request.relay_node,

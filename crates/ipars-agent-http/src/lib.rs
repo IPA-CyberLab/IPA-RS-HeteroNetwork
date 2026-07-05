@@ -6,14 +6,16 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ipars_agent::{AgentError, AgentRuntime};
+use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
     AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
     AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
+    AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse,
 };
-use ipars_types::PathState;
+use ipars_types::{NodeId, PathState};
 use serde::Serialize;
 
 macro_rules! prometheus_line {
@@ -25,11 +27,29 @@ macro_rules! prometheus_line {
 #[derive(Debug, Clone)]
 pub struct AgentHttpState {
     runtime: Arc<AgentRuntime>,
+    state_store: Option<FileAgentStateStore>,
+    control_plane_urls: Vec<String>,
 }
 
 impl AgentHttpState {
     pub fn new(runtime: Arc<AgentRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            state_store: None,
+            control_plane_urls: Vec::new(),
+        }
+    }
+
+    pub fn with_wireguard_key_rotation(
+        runtime: Arc<AgentRuntime>,
+        state_store: FileAgentStateStore,
+        control_plane_urls: Vec<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            state_store: Some(state_store),
+            control_plane_urls,
+        }
     }
 }
 
@@ -46,6 +66,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/nat-classification", post(nat_classification))
         .route("/v1/peer-activity", post(peer_activity))
         .route("/v1/packet-flow", post(packet_flow))
+        .route("/v1/wireguard-key/rotate", post(rotate_wireguard_key))
         .with_state(state)
 }
 
@@ -55,6 +76,82 @@ async fn healthz() -> Json<HealthResponse> {
 
 async fn status(State(state): State<AgentHttpState>) -> Json<AgentStatusResponse> {
     Json(state.runtime.status().await)
+}
+
+async fn rotate_wireguard_key(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentWireGuardKeyRotationRequest>,
+) -> Result<Json<AgentWireGuardKeyRotationResponse>, ApiError> {
+    let state_store = state.state_store.clone().ok_or_else(|| {
+        AgentError::ControlPlaneClient(
+            "agent state store is required for WireGuard key rotation".to_string(),
+        )
+    })?;
+    let control_plane_urls = request
+        .control_plane_url
+        .map(|url| vec![url])
+        .unwrap_or_else(|| state.control_plane_urls.clone());
+    if control_plane_urls.is_empty() {
+        return Err(AgentError::ControlPlaneClient(
+            "control-plane URL is required for WireGuard key rotation".to_string(),
+        )
+        .into());
+    }
+
+    let rotated_at = chrono::Utc::now();
+    let plan = state.runtime.plan_wireguard_key_rotation(rotated_at)?;
+    let control_plane_response = send_wireguard_key_rotation_to_control_planes(
+        &reqwest::Client::new(),
+        &control_plane_urls,
+        plan.request.clone(),
+    )
+    .await?;
+    let mut next_state = plan.next_state;
+    next_state.updated_at = control_plane_response.rotated_at;
+    state_store.save(&next_state)?;
+    state.runtime.replace_state(next_state.clone());
+
+    Ok(Json(AgentWireGuardKeyRotationResponse {
+        node_id: next_state.node_id,
+        previous_wireguard_public_key: plan.previous_wireguard_public_key,
+        next_wireguard_public_key: plan.next_wireguard_public_key,
+        control_plane_node: control_plane_response.node,
+        rotated_at: control_plane_response.rotated_at,
+        state_updated_at: next_state.updated_at,
+    }))
+}
+
+async fn send_wireguard_key_rotation_to_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    request: RotateWireGuardKeyRequest,
+) -> Result<RotateWireGuardKeyResponse, AgentError> {
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let url = wireguard_key_rotation_url(control_plane_url, &request.node_id);
+        match client.put(&url).json(&request).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json().await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => failures.push(format!("{url}: decode failed: {error}")),
+                },
+                Err(error) => failures.push(format!("{url}: rejected: {error}")),
+            },
+            Err(error) => failures.push(format!("{url}: send failed: {error}")),
+        }
+    }
+    Err(AgentError::ControlPlaneClient(format!(
+        "all control-plane WireGuard key rotation endpoints failed: {}",
+        failures.join("; ")
+    )))
+}
+
+fn wireguard_key_rotation_url(control_plane_url: &str, node_id: &NodeId) -> String {
+    format!(
+        "{}/v1/nodes/{}/wireguard-key",
+        control_plane_url.trim_end_matches('/'),
+        node_id
+    )
 }
 
 async fn metrics(State(state): State<AgentHttpState>) -> Json<AgentMetricsResponse> {
@@ -595,11 +692,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use chrono::Utc;
-    use ipars_agent::{AgentNodeState, AgentRuntime, RelayForwarderStats};
+    use ipars_agent::{AgentNodeState, AgentRuntime, FileAgentStateStore, RelayForwarderStats};
     use ipars_types::api::{
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
         AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-        AgentPacketFlowTcpState,
+        AgentPacketFlowTcpState, AgentWireGuardKeyRotationRequest,
+        AgentWireGuardKeyRotationResponse, PeerMap, RelayMap, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -626,6 +725,74 @@ mod tests {
         }
     }
 
+    fn temp_state_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ipars-agent-http-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    #[derive(Clone)]
+    struct RotationCapture {
+        request: Arc<tokio::sync::Mutex<Option<RotateWireGuardKeyRequest>>>,
+    }
+
+    async fn control_plane_rotation_handler(
+        axum::extract::State(capture): axum::extract::State<RotationCapture>,
+        axum::extract::Path(node_id): axum::extract::Path<String>,
+        Json(request): Json<RotateWireGuardKeyRequest>,
+    ) -> Json<RotateWireGuardKeyResponse> {
+        assert_eq!(node_id, request.node_id.as_str());
+        assert!(request.node_signature.is_some());
+        *capture.request.lock().await = Some(request.clone());
+        let node = NodeRecord {
+            node_id: request.node_id.clone(),
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: "identity-public".to_string(),
+            wireguard_public_key: request.next_wireguard_public_key.clone(),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        Json(RotateWireGuardKeyResponse {
+            node,
+            peer_map: PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                generated_at: Utc::now(),
+            },
+            relay_map: RelayMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                relays: Vec::new(),
+                generated_at: Utc::now(),
+            },
+            rotated_at: Utc::now(),
+        })
+    }
+
+    async fn spawn_rotation_control_plane(
+        capture: RotationCapture,
+    ) -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = Router::new()
+            .route(
+                "/v1/nodes/{node_id}/wireguard-key",
+                axum::routing::put(control_plane_rotation_handler),
+            )
+            .with_state(capture);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
     #[tokio::test]
     async fn http_agent_status_returns_node_keys() -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
@@ -649,6 +816,90 @@ mod tests {
         let status: AgentStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(status.node_id, node_id);
         assert_eq!(status.candidate_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rotates_wireguard_key_with_control_plane(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let previous_wireguard_public_key = state.wireguard_public_key_b64.clone();
+        let state_dir = temp_state_dir("wireguard-rotation");
+        let state_path = state_dir.join("state.json");
+        let store = FileAgentStateStore::new(&state_path);
+        store.save(&state)?;
+        let runtime = Arc::new(AgentRuntime::new(state.clone(), ClusterPolicy::default()));
+        let capture = RotationCapture {
+            request: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let (control_plane_url, control_plane_task) =
+            spawn_rotation_control_plane(capture.clone()).await?;
+        let app = router(AgentHttpState::with_wireguard_key_rotation(
+            runtime.clone(),
+            store.clone(),
+            vec![control_plane_url],
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/wireguard-key/rotate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &AgentWireGuardKeyRotationRequest::default(),
+                    )?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: AgentWireGuardKeyRotationResponse = serde_json::from_slice(&body)?;
+        assert_eq!(
+            response.previous_wireguard_public_key,
+            previous_wireguard_public_key
+        );
+        assert_ne!(
+            response.next_wireguard_public_key,
+            previous_wireguard_public_key
+        );
+        assert_eq!(
+            response.control_plane_node.wireguard_public_key,
+            response.next_wireguard_public_key
+        );
+
+        let sent_request = capture
+            .request
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| std::io::Error::other("control-plane did not receive rotation"))?;
+        assert_eq!(
+            sent_request.previous_wireguard_public_key,
+            previous_wireguard_public_key
+        );
+        assert_eq!(
+            sent_request.next_wireguard_public_key,
+            response.next_wireguard_public_key
+        );
+        assert!(sent_request.node_signature.is_some());
+
+        let persisted = store.load()?;
+        assert_eq!(
+            persisted.wireguard_public_key_b64,
+            response.next_wireguard_public_key
+        );
+        assert_ne!(
+            persisted.wireguard_private_key_b64,
+            state.wireguard_private_key_b64
+        );
+        assert_eq!(
+            runtime.status().await.wireguard_public_key,
+            response.next_wireguard_public_key
+        );
+
+        control_plane_task.abort();
+        let _ = std::fs::remove_dir_all(state_dir);
         Ok(())
     }
 
