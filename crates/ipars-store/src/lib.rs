@@ -320,20 +320,42 @@ impl TokenLedger for SqliteControlPlaneStore {
         nonce: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut record = self
-            .get_token(cluster_id, nonce)
-            .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        let status = record.status(now);
-        if status != TokenStatus::Active {
-            return Err(ControlPlaneError::TokenRejected {
-                nonce: nonce.to_string(),
-                status,
-            });
+        loop {
+            let record = self
+                .get_token(cluster_id, nonce)
+                .await?
+                .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+            let status = record.status(now);
+            if status != TokenStatus::Active {
+                return Err(ControlPlaneError::TokenRejected {
+                    nonce: nonce.to_string(),
+                    status,
+                });
+            }
+            let previous_json = serde_json::to_string(&record).map_err(json_error)?;
+            let mut updated = record;
+            updated.uses = updated.uses.saturating_add(1);
+            let updated_json = serde_json::to_string(&updated).map_err(json_error)?;
+            let result = sqlx::query(
+                r#"
+                UPDATE tokens
+                SET record_json = ?4
+                WHERE cluster_id = ?1
+                  AND nonce = ?2
+                  AND record_json = ?3
+                "#,
+            )
+            .bind(cluster_id.as_str())
+            .bind(nonce)
+            .bind(previous_json)
+            .bind(updated_json)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+            if result.rows_affected() == 1 {
+                return Ok(updated);
+            }
         }
-        record.uses = record.uses.saturating_add(1);
-        self.upsert_token(record.clone()).await?;
-        Ok(record)
     }
 }
 
@@ -651,20 +673,42 @@ impl TokenLedger for PostgresControlPlaneStore {
         nonce: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut record = self
-            .get_token(cluster_id, nonce)
-            .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        let status = record.status(now);
-        if status != TokenStatus::Active {
-            return Err(ControlPlaneError::TokenRejected {
-                nonce: nonce.to_string(),
-                status,
-            });
+        loop {
+            let record = self
+                .get_token(cluster_id, nonce)
+                .await?
+                .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
+            let status = record.status(now);
+            if status != TokenStatus::Active {
+                return Err(ControlPlaneError::TokenRejected {
+                    nonce: nonce.to_string(),
+                    status,
+                });
+            }
+            let previous_json = serde_json::to_value(&record).map_err(json_error)?;
+            let mut updated = record;
+            updated.uses = updated.uses.saturating_add(1);
+            let updated_json = serde_json::to_value(&updated).map_err(json_error)?;
+            let result = sqlx::query(
+                r#"
+                UPDATE tokens
+                SET record_json = $4
+                WHERE cluster_id = $1
+                  AND nonce = $2
+                  AND record_json = $3
+                "#,
+            )
+            .bind(cluster_id.as_str())
+            .bind(nonce)
+            .bind(previous_json)
+            .bind(updated_json)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+            if result.rows_affected() == 1 {
+                return Ok(updated);
+            }
         }
-        record.uses = record.uses.saturating_add(1);
-        self.upsert_token(record.clone()).await?;
-        Ok(record)
     }
 }
 
@@ -734,6 +778,7 @@ fn json_error(error: serde_json::Error) -> ControlPlaneError {
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
 
     use chrono::Utc;
     use ipars_control_plane::{ControlPlaneStore, TokenAdmission};
@@ -801,6 +846,15 @@ mod tests {
             max_mbps: 1000,
             e2e_only: true,
         }
+    }
+
+    fn temp_sqlite_url(name: &str) -> (String, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ipars-store-{name}-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        (format!("sqlite://{}?mode=rwc", path.display()), path)
     }
 
     #[tokio::test]
@@ -912,6 +966,64 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_token_admission_enforces_max_uses_under_concurrency(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("token-concurrency");
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let admission = Arc::new(TokenAdmission::new(Arc::new(store.clone())));
+        let cluster_id = ClusterId::new();
+        let mut token_claims = claims(cluster_id.clone());
+        token_claims.nonce = "concurrent-token".to_string();
+        token_claims.policy.max_token_uses = Some(1);
+        admission
+            .issue_from_claims(&token_claims, Utc::now())
+            .await?;
+
+        let task_count = 16;
+        let barrier = Arc::new(tokio::sync::Barrier::new(task_count));
+        let mut tasks = Vec::new();
+        for _ in 0..task_count {
+            let admission = Arc::clone(&admission);
+            let claims = token_claims.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                admission.admit_join(&claims, Utc::now()).await
+            }));
+        }
+
+        let mut accepted = 0;
+        let mut exhausted = 0;
+        for task in tasks {
+            match task.await? {
+                Ok(record) => {
+                    accepted += 1;
+                    assert_eq!(record.uses, 1);
+                }
+                Err(ControlPlaneError::TokenRejected {
+                    status: TokenStatus::Exhausted,
+                    ..
+                }) => exhausted += 1,
+                Err(error) => {
+                    return Err(format!("unexpected token admission error: {error}").into())
+                }
+            }
+        }
+
+        assert_eq!(accepted, 1);
+        assert_eq!(exhausted, task_count - 1);
+        let final_record = store
+            .get_token(&cluster_id, &token_claims.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(token_claims.nonce.clone()))?;
+        assert_eq!(final_record.uses, 1);
+        assert_eq!(final_record.status(Utc::now()), TokenStatus::Exhausted);
+
+        let _ = std::fs::remove_file(database_path);
         Ok(())
     }
 }
