@@ -982,6 +982,12 @@ fn validate_agent_relay_capability_config(args: &AgentArgs) -> anyhow::Result<()
             "--relay-public-endpoint and --relay-admission-url must be set together for relay capability advertisement"
         );
     }
+    if let Some(admission_url) = args.relay_admission_url.as_deref() {
+        validate_http_url(admission_url, "--relay-admission-url")?;
+    }
+    if let Some(status_url) = args.relay_status_url.as_deref() {
+        validate_http_url(status_url, "--relay-status-url")?;
+    }
     if args.relay_max_sessions == 0 {
         anyhow::bail!(
             "--relay-max-sessions must be greater than zero when relay capability is advertised"
@@ -991,6 +997,18 @@ fn validate_agent_relay_capability_config(args: &AgentArgs) -> anyhow::Result<()
         anyhow::bail!(
             "--relay-max-mbps must be greater than zero when relay capability is advertised"
         );
+    }
+    Ok(())
+}
+
+fn validate_http_url(value: &str, name: &str) -> anyhow::Result<()> {
+    let url =
+        reqwest::Url::parse(value).with_context(|| format!("{name} must be an absolute URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{name} must use http or https");
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("{name} must include a host");
     }
     Ok(())
 }
@@ -2509,6 +2527,7 @@ async fn run_relay(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    validate_relay_config(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
     let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
@@ -2545,6 +2564,19 @@ async fn run_relay(
         task.abort();
     }
     http_result
+}
+
+fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
+    if let Some(admission_url) = args.admission_url.as_deref() {
+        validate_http_url(admission_url, "--admission-url")?;
+    }
+    if args.max_sessions == 0 {
+        anyhow::bail!("--max-sessions must be greater than zero");
+    }
+    if args.max_mbps == 0 {
+        anyhow::bail!("--max-mbps must be greater than zero");
+    }
+    Ok(())
 }
 
 async fn run_agent(
@@ -7151,6 +7183,54 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-max-mbps must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let invalid_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "relay-a",
+        ])?;
+        if let Command::Agent(args) = invalid_admission_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-admission-url must be an absolute URL"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let invalid_status_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-status-url",
+            "ftp://relay-a/status",
+        ])?;
+        if let Command::Agent(args) = invalid_status_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-status-url must use http or https"));
             return Ok(());
         }
 
@@ -9091,6 +9171,70 @@ invalid no-destination-here
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected relay command"))
+    }
+
+    #[test]
+    fn relay_config_rejects_invalid_admission_url_and_zero_capacity() -> anyhow::Result<()> {
+        let invalid_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--admission-url",
+            "relay-a",
+        ])?;
+        if let Command::Relay(args) = invalid_admission_url.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--admission-url must be an absolute URL"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let zero_sessions = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--max-sessions",
+            "0",
+        ])?;
+        if let Command::Relay(args) = zero_sessions.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--max-sessions must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let zero_mbps = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--max-mbps",
+            "0",
+        ])?;
+        if let Command::Relay(args) = zero_mbps.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--max-mbps must be greater than zero"));
             return Ok(());
         }
 

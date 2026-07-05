@@ -5,6 +5,12 @@
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
+{{- if not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.admissionUrl) -}}
+{{- fail "agent.relayAdvertisement.admissionUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- end -}}
+{{- if and .Values.agent.relayAdvertisement.statusUrl (not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.statusUrl)) -}}
+{{- fail "agent.relayAdvertisement.statusUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- end -}}
 {{- if not (gt (int .Values.agent.relayAdvertisement.maxSessions) 0) -}}
 {{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
 {{- end -}}
