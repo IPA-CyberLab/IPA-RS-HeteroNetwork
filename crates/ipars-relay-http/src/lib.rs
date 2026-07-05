@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,11 +20,38 @@ macro_rules! prometheus_line {
 #[derive(Debug, Clone)]
 pub struct RelayHttpState {
     relay: Arc<RelayService>,
+    admission_bearer_token: Option<String>,
 }
 
 impl RelayHttpState {
     pub fn new(relay: Arc<RelayService>) -> Self {
-        Self { relay }
+        Self {
+            relay,
+            admission_bearer_token: None,
+        }
+    }
+
+    pub fn require_admission_bearer_token(mut self, token: String) -> Self {
+        self.admission_bearer_token = Some(token);
+        self
+    }
+
+    fn authorize_admission(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let Some(expected) = self.admission_bearer_token.as_deref() else {
+            return Ok(());
+        };
+        let Some(provided) = bearer_token_from_headers(headers) else {
+            return Err(ApiError::unauthorized(
+                "relay admission bearer token is required",
+            ));
+        };
+        if relay_admission_token_matches(expected, provided) {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized(
+                "relay admission bearer token was rejected",
+            ))
+        }
     }
 }
 
@@ -58,8 +85,10 @@ async fn prometheus_metrics(State(state): State<RelayHttpState>) -> impl IntoRes
 
 async fn admit(
     State(state): State<RelayHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RelayAdmissionRequest>,
 ) -> Result<(StatusCode, Json<RelayAdmissionResponse>), ApiError> {
+    state.authorize_admission(&headers)?;
     Ok((StatusCode::CREATED, Json(state.relay.admit(request).await?)))
 }
 
@@ -252,18 +281,74 @@ fn prometheus_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn relay_admission_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty()
+        || provided.is_empty()
+        || expected.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES
+    {
+        return false;
+    }
+
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
+}
+
 #[derive(Debug)]
-pub struct ApiError(RelayError);
+pub enum ApiError {
+    Relay(RelayError),
+    Unauthorized(&'static str),
+}
+
+impl ApiError {
+    fn unauthorized(message: &'static str) -> Self {
+        Self::Unauthorized(message)
+    }
+}
 
 impl From<RelayError> for ApiError {
     fn from(error: RelayError) -> Self {
-        Self(error)
+        Self::Relay(error)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
+        let error = match self {
+            ApiError::Relay(error) => error,
+            ApiError::Unauthorized(message) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                    Json(ErrorResponse {
+                        error: message.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let status = match error {
             RelayError::AdmissionDenied => StatusCode::FORBIDDEN,
             RelayError::UnknownSession => StatusCode::NOT_FOUND,
             RelayError::SessionExpired => StatusCode::GONE,
@@ -276,7 +361,7 @@ impl IntoResponse for ApiError {
         (
             status,
             Json(ErrorResponse {
-                error: self.0.to_string(),
+                error: error.to_string(),
             }),
         )
             .into_response()
@@ -386,6 +471,76 @@ mod tests {
         assert!(body.contains(
             "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"malformed_frame\"} 1"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_relay_admission_can_require_bearer_token(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let relay = Arc::new(RelayService::new(
+            NodeId::from_string("relay-a"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                admission_url: Some("http://203.0.113.10:9580".to_string()),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+        ));
+        let app = router(
+            RelayHttpState::new(relay)
+                .require_admission_bearer_token("cluster-relay-secret".to_string()),
+        );
+
+        let request_body = serde_json::to_vec(&RelayAdmissionRequest {
+            left: NodeId::from_string("left"),
+            right: NodeId::from_string("right"),
+            left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+            right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+        })?;
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers().get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static("Bearer"))
+        );
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer wrong-secret")
+                    .body(Body::from(request_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer cluster-relay-secret")
+                    .body(Body::from(request_body))?,
+            )
+            .await?;
+
+        assert_eq!(accepted.status(), StatusCode::CREATED);
         Ok(())
     }
 }

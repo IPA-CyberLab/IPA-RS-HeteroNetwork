@@ -103,6 +103,7 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
+const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
@@ -342,6 +343,8 @@ struct RelayArgs {
     max_mbps: u32,
     #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
     session_ttl_seconds: u64,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
+    admission_bearer_token: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -388,6 +391,8 @@ struct AgentArgs {
     relay_admission_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_RELAY_STATUS_URL")]
     relay_status_url: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")]
+    relay_admission_bearer_token: Option<String>,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     relay_max_sessions: u32,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_MBPS", default_value_t = 1000)]
@@ -1255,6 +1260,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
         );
     }
+    if let Some(token) = args.relay_admission_bearer_token.as_deref() {
+        validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
     Ok(())
 }
 
@@ -1268,6 +1276,22 @@ fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
 fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_relay_admission_bearer_token(value: &str, name: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{name} cannot be empty");
+    }
+    if value.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{name} exceeds {MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes");
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        anyhow::bail!("{name} must not contain whitespace or control characters");
     }
     Ok(())
 }
@@ -3194,8 +3218,11 @@ async fn run_relay(
         )
     });
     tracing::info!(%udp_addr, http_listen = %args.http_listen, "relay listening");
-    let http_result =
-        serve_router(args.http_listen, relay_router(RelayHttpState::new(service))).await;
+    let mut http_state = RelayHttpState::new(service);
+    if let Some(token) = args.admission_bearer_token {
+        http_state = http_state.require_admission_bearer_token(token);
+    }
+    let http_result = serve_router(args.http_listen, relay_router(http_state)).await;
     udp_task.abort();
     if let Some(task) = otel_metrics_task {
         task.abort();
@@ -3214,6 +3241,9 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
         anyhow::bail!("--max-mbps must be greater than zero");
     }
     validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
+    if let Some(token) = args.admission_bearer_token.as_deref() {
+        validate_relay_admission_bearer_token(token, "--admission-bearer-token")?;
+    }
     Ok(())
 }
 
@@ -3442,9 +3472,14 @@ async fn run_agent(
                 control_plane_bases.clone(),
                 signal_bases,
                 hole_puncher,
-                relay_forwarder_supervisor.clone(),
-                Duration::from_secs(args.relay_session_renew_before_seconds),
-                Duration::from_secs(args.signal_path_interval_seconds),
+                SignalPathNegotiationOptions {
+                    relay_forwarder_supervisor: relay_forwarder_supervisor.clone(),
+                    relay_admission_bearer_token: args.relay_admission_bearer_token.clone(),
+                    relay_session_renew_before: Duration::from_secs(
+                        args.relay_session_renew_before_seconds,
+                    ),
+                    interval: Duration::from_secs(args.signal_path_interval_seconds),
+                },
             ));
         }
     }
@@ -5381,14 +5416,19 @@ async fn signal_node_upsert_request(
     }
 }
 
+struct SignalPathNegotiationOptions {
+    relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
+    relay_admission_bearer_token: Option<String>,
+    relay_session_renew_before: Duration,
+    interval: Duration,
+}
+
 fn start_signal_path_negotiation(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
     signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
-    relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
-    relay_session_renew_before: Duration,
-    interval: Duration,
+    options: SignalPathNegotiationOptions,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_signal_path_negotiation_loop(
@@ -5396,9 +5436,7 @@ fn start_signal_path_negotiation(
             control_plane_urls,
             signal_urls,
             hole_puncher,
-            relay_forwarder_supervisor,
-            relay_session_renew_before,
-            interval,
+            options,
         )
         .await;
     })
@@ -5409,9 +5447,7 @@ async fn run_signal_path_negotiation_loop(
     control_plane_urls: Vec<String>,
     signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
-    relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
-    relay_session_renew_before: Duration,
-    interval: Duration,
+    options: SignalPathNegotiationOptions,
 ) {
     let client = reqwest::Client::new();
     loop {
@@ -5421,14 +5457,13 @@ async fn run_signal_path_negotiation_loop(
             &control_plane_urls,
             &signal_urls,
             &hole_puncher,
-            relay_forwarder_supervisor.as_ref(),
-            relay_session_renew_before,
+            &options,
         )
         .await
         {
             tracing::warn!(%error, "failed to negotiate signal paths; will retry");
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(options.interval).await;
     }
 }
 
@@ -5438,8 +5473,7 @@ async fn negotiate_signal_paths(
     control_plane_urls: &[String],
     signal_urls: &[String],
     hole_puncher: &UdpHolePuncher,
-    relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
-    relay_session_renew_before: Duration,
+    options: &SignalPathNegotiationOptions,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
     let peer_map = fetch_peer_map_from_control_planes(client, control_plane_urls, &status.node_id)
@@ -5450,7 +5484,7 @@ async fn negotiate_signal_paths(
     for peer in peer_set.skipped {
         remove_relay_session_for_peer(
             runtime,
-            relay_forwarder_supervisor,
+            options.relay_forwarder_supervisor.as_ref(),
             &peer,
             None,
             "removed relay session for idle lazy-connect peer",
@@ -5492,7 +5526,7 @@ async fn negotiate_signal_paths(
                         runtime,
                         &peer.node_id,
                         &preferred_relay.node_id,
-                        relay_session_renew_before,
+                        options.relay_session_renew_before,
                     )
                     .await
                     {
@@ -5502,6 +5536,7 @@ async fn negotiate_signal_paths(
                             &status,
                             &peer,
                             &relay_candidates,
+                            options.relay_admission_bearer_token.as_deref(),
                         )
                         .await
                         {
@@ -5513,7 +5548,9 @@ async fn negotiate_signal_paths(
                                     "admitted relay session"
                                 );
                                 runtime.upsert_relay_session(session.clone()).await;
-                                if let Some(supervisor) = relay_forwarder_supervisor {
+                                if let Some(supervisor) =
+                                    options.relay_forwarder_supervisor.as_ref()
+                                {
                                     if let Err(error) = supervisor.upsert(runtime, session).await {
                                         tracing::warn!(
                                             %error,
@@ -5524,7 +5561,9 @@ async fn negotiate_signal_paths(
                                 }
                             }
                             Err(error) => {
-                                if let Some(supervisor) = relay_forwarder_supervisor {
+                                if let Some(supervisor) =
+                                    options.relay_forwarder_supervisor.as_ref()
+                                {
                                     supervisor.remove(runtime, &peer.node_id).await;
                                 } else {
                                     runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
@@ -5542,7 +5581,7 @@ async fn negotiate_signal_paths(
                             relay = %preferred_relay.node_id,
                             "reusing existing relay session"
                         );
-                        if let Some(supervisor) = relay_forwarder_supervisor {
+                        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
                             if let Some(session) = runtime.relay_session(&peer.node_id).await {
                                 if let Err(error) = supervisor.upsert(runtime, session).await {
                                     tracing::warn!(
@@ -5556,7 +5595,7 @@ async fn negotiate_signal_paths(
                     }
                 }
                 None => {
-                    if let Some(supervisor) = relay_forwarder_supervisor {
+                    if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
                         supervisor.remove(runtime, &peer.node_id).await;
                     } else {
                         runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
@@ -5570,7 +5609,7 @@ async fn negotiate_signal_paths(
         } else {
             remove_relay_session_for_peer(
                 runtime,
-                relay_forwarder_supervisor,
+                options.relay_forwarder_supervisor.as_ref(),
                 &peer.node_id,
                 Some(record.selected_state),
                 "removed relay session after non-relay path selection",
@@ -5802,13 +5841,16 @@ async fn admit_relay_session(
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
     relay: &NodeRecord,
+    relay_admission_bearer_token: Option<&str>,
 ) -> anyhow::Result<RelaySessionState> {
     let request = relay_admission_request(status, peer)
         .context("relay session requires endpoint candidates")?;
     let relay_endpoint = relay_public_endpoint(relay)?;
-    let response = client
-        .post(relay_admission_url(relay)?)
-        .json(&request)
+    let mut request_builder = client.post(relay_admission_url(relay)?).json(&request);
+    if let Some(token) = relay_admission_bearer_token {
+        request_builder = request_builder.bearer_auth(token);
+    }
+    let response = request_builder
         .send()
         .await
         .context("failed to send relay admission request")?
@@ -5832,11 +5874,12 @@ async fn admit_relay_session_from_candidates(
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
     relays: &[NodeRecord],
+    relay_admission_bearer_token: Option<&str>,
 ) -> anyhow::Result<RelaySessionState> {
     let mut errors = Vec::new();
     for relay in relays {
         runtime.record_relay_admission_attempt();
-        match admit_relay_session(client, status, peer, relay).await {
+        match admit_relay_session(client, status, peer, relay, relay_admission_bearer_token).await {
             Ok(session) => {
                 runtime.record_relay_admission_success();
                 return Ok(session);
@@ -8474,6 +8517,8 @@ mod tests {
             "http://relay-a:9580",
             "--relay-status-url",
             "http://relay-a:9580",
+            "--relay-admission-bearer-token",
+            "cluster-relay-secret",
             "--relay-max-sessions",
             "500",
             "--relay-max-mbps",
@@ -8532,6 +8577,10 @@ mod tests {
             let reporter =
                 agent_relay_capability_reporter(&args).context("expected relay reporter")?;
             assert_eq!(reporter.status_url.as_deref(), Some("http://relay-a:9580"));
+            assert_eq!(
+                args.relay_admission_bearer_token.as_deref(),
+                Some("cluster-relay-secret")
+            );
             assert!(!relay_capability.enabled_by_policy);
             assert_eq!(relay_capability.max_sessions, 500);
             assert_eq!(relay_capability.max_mbps, 250);
@@ -8729,6 +8778,27 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-status-url must use http or https"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let invalid_bearer = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-admission-bearer-token",
+            "not allowed",
+        ])?;
+        if let Command::Agent(args) = invalid_bearer.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-admission-bearer-token must not contain whitespace"));
             return Ok(());
         }
 
@@ -11886,11 +11956,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "http://relay-a:9580",
             "--session-ttl-seconds",
             "60",
+            "--admission-bearer-token",
+            "cluster-relay-secret",
         ])?;
 
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
+            assert_eq!(
+                args.admission_bearer_token.as_deref(),
+                Some("cluster-relay-secret")
+            );
             return Ok(());
         }
 
@@ -11975,6 +12051,26 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--session-ttl-seconds must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let invalid_bearer = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--admission-bearer-token",
+            "not allowed",
+        ])?;
+        if let Command::Relay(args) = invalid_bearer.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--admission-bearer-token must not contain whitespace"));
             return Ok(());
         }
 
@@ -12244,6 +12340,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             &status,
             &peer,
             &ordered_relays,
+            None,
         )
         .await?;
 
@@ -12256,6 +12353,94 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_admission_sends_configured_bearer_token() -> anyhow::Result<()> {
+        async fn relay_admission_requires_bearer(
+            headers: axum::http::HeaderMap,
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> Result<axum::Json<RelayAdmissionResponse>, axum::http::StatusCode> {
+            if headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                != Some("Bearer cluster-relay-secret")
+            {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            Ok(axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-secure"),
+                session_id: "session-secure".to_string(),
+                session_token: "token-secure".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            }))
+        }
+
+        let (relay_base, relay_task) = spawn_test_http_service(Router::new().route(
+            "/v1/sessions",
+            axum::routing::post(relay_admission_requires_bearer),
+        ))
+        .await?;
+        let mut relay = node_record("relay-secure");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let local = NodeId::from_string("local");
+        let status = ipars_types::api::AgentStatusResponse {
+            node_id: local.clone(),
+            identity_public_key: "identity-local".to_string(),
+            wireguard_public_key: "wg-local".to_string(),
+            candidate_count: 1,
+            candidates: vec![EndpointCandidate {
+                node_id: local,
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }],
+            nat_classification: None,
+            state_updated_at: Utc::now(),
+        };
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![EndpointCandidate {
+            node_id: peer.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }];
+
+        let rejected =
+            admit_relay_session(&reqwest::Client::new(), &status, &peer, &relay, None).await;
+        assert!(rejected.is_err());
+
+        let accepted = admit_relay_session(
+            &reqwest::Client::new(),
+            &status,
+            &peer,
+            &relay,
+            Some("cluster-relay-secret"),
+        )
+        .await?;
+
+        assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
+        assert_eq!(accepted.session_id, "session-secure");
         relay_task.abort();
         Ok(())
     }
