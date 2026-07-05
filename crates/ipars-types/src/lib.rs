@@ -982,6 +982,7 @@ pub mod api {
         InvalidSessionCredential,
         RateLimited,
         MalformedFrame,
+        FrameTooLarge,
         SocketError,
     }
 
@@ -994,6 +995,7 @@ pub mod api {
                 Self::InvalidSessionCredential => "invalid_session_credential",
                 Self::RateLimited => "rate_limited",
                 Self::MalformedFrame => "malformed_frame",
+                Self::FrameTooLarge => "frame_too_large",
                 Self::SocketError => "socket_error",
             }
         }

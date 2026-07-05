@@ -16,7 +16,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
-- relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, and `iparsd relay`
+- relay session admission/status HTTP API, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed opaque UDP payload forwarding with per-session rate limits, bounded relay-frame metadata/payload sizes, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoints with ordered failover
 - persistent agent node state with owner-only state directory creation, atomic file writes, and symlink rejection, agent status/path/path-probe/STUN probe/NAT classification/peer-activity/packet-flow HTTP API, and `iparsd agent`

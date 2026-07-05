@@ -270,6 +270,7 @@ impl IntoResponse for ApiError {
             RelayError::InvalidSessionCredential => StatusCode::FORBIDDEN,
             RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             RelayError::MalformedFrame => StatusCode::BAD_REQUEST,
+            RelayError::FrameTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             RelayError::Socket(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (

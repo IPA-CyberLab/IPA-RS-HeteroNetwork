@@ -28,6 +28,8 @@ pub enum RelayError {
     RateLimited,
     #[error("malformed relay frame")]
     MalformedFrame,
+    #[error("relay frame exceeds size limit")]
+    FrameTooLarge,
     #[error("udp socket error: {0}")]
     Socket(#[from] std::io::Error),
 }
@@ -95,18 +97,23 @@ struct RelayDatagram {
 }
 
 const RELAY_FRAME_MAGIC: &[u8] = b"IPARS-RLY1";
+const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
+const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
+const MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES: usize = 128 * 1024;
 
 pub fn encode_relay_datagram(
     session_id: &str,
     session_token: &str,
     ciphertext_payload: &[u8],
 ) -> Result<Vec<u8>, RelayError> {
-    if session_id.len() > u16::MAX as usize
-        || session_token.len() > u16::MAX as usize
-        || ciphertext_payload.is_empty()
-    {
+    if session_id.is_empty() || session_token.is_empty() || ciphertext_payload.is_empty() {
         return Err(RelayError::MalformedFrame);
     }
+    validate_relay_frame_sizes(
+        session_id.len(),
+        session_token.len(),
+        ciphertext_payload.len(),
+    )?;
 
     let mut datagram = Vec::with_capacity(
         RELAY_FRAME_MAGIC.len()
@@ -184,6 +191,7 @@ impl RelayTable {
         }
 
         let id = RelaySessionId::new(&admission.left, &admission.right);
+        validate_relay_session_admission(&id, &admission.session_token)?;
         let now = Utc::now();
         let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
         self.sessions.insert(
@@ -243,6 +251,11 @@ impl RelayTable {
         frame: &RelayFrame,
         now: DateTime<Utc>,
     ) -> Result<SocketAddr, RelayError> {
+        validate_relay_frame_sizes(
+            frame.session_id.as_str().len(),
+            frame.session_token.len(),
+            frame.ciphertext_payload.len(),
+        )?;
         self.remove_expired_session(&frame.session_id, now)?;
         let session = self
             .sessions
@@ -363,7 +376,7 @@ impl RelaySession {
     }
 
     fn verify_token(&self, session_token: &str) -> Result<(), RelayError> {
-        if self.session_token == session_token {
+        if relay_session_token_matches(&self.session_token, session_token) {
             Ok(())
         } else {
             Err(RelayError::InvalidSessionCredential)
@@ -405,8 +418,57 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
         RelayError::InvalidSessionCredential => RelayDataplaneDropReason::InvalidSessionCredential,
         RelayError::RateLimited => RelayDataplaneDropReason::RateLimited,
         RelayError::MalformedFrame => RelayDataplaneDropReason::MalformedFrame,
+        RelayError::FrameTooLarge => RelayDataplaneDropReason::FrameTooLarge,
         RelayError::Socket(_) => RelayDataplaneDropReason::SocketError,
     }
+}
+
+fn validate_relay_session_admission(
+    session_id: &RelaySessionId,
+    session_token: &str,
+) -> Result<(), RelayError> {
+    if session_id.as_str().len() > MAX_RELAY_SESSION_ID_BYTES {
+        return Err(RelayError::AdmissionDenied);
+    }
+    if session_token.is_empty() || session_token.len() > MAX_RELAY_SESSION_TOKEN_BYTES {
+        return Err(RelayError::InvalidSessionCredential);
+    }
+    Ok(())
+}
+
+fn validate_relay_frame_sizes(
+    session_id_len: usize,
+    session_token_len: usize,
+    ciphertext_payload_len: usize,
+) -> Result<(), RelayError> {
+    if session_id_len > MAX_RELAY_SESSION_ID_BYTES
+        || session_token_len > MAX_RELAY_SESSION_TOKEN_BYTES
+        || ciphertext_payload_len > MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES
+    {
+        return Err(RelayError::FrameTooLarge);
+    }
+    if session_id_len > u16::MAX as usize || session_token_len > u16::MAX as usize {
+        return Err(RelayError::FrameTooLarge);
+    }
+    Ok(())
+}
+
+fn relay_session_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.len() > MAX_RELAY_SESSION_TOKEN_BYTES
+        || provided.len() > MAX_RELAY_SESSION_TOKEN_BYTES
+    {
+        return false;
+    }
+
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_RELAY_SESSION_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
@@ -426,11 +488,15 @@ fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
     let session_start = fixed_header_len;
     let token_start = session_start + session_len;
     let payload_start = token_start + token_len;
-    if session_len == 0
-        || token_len == 0
-        || payload_start >= datagram.len()
-        || token_start > datagram.len()
-    {
+    if session_len == 0 || token_len == 0 {
+        return Err(RelayError::MalformedFrame);
+    }
+    validate_relay_frame_sizes(
+        session_len,
+        token_len,
+        datagram.len().saturating_sub(payload_start),
+    )?;
+    if token_start > datagram.len() || payload_start >= datagram.len() {
         return Err(RelayError::MalformedFrame);
     }
 
@@ -645,6 +711,67 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_oversized_frames_and_records_drop_reason() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let oversized_payload = vec![0_u8; MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES + 1];
+        assert!(matches!(
+            encode_relay_datagram(
+                credentials.session_id.as_str(),
+                &credentials.session_token,
+                &oversized_payload,
+            ),
+            Err(RelayError::FrameTooLarge)
+        ));
+        assert!(matches!(
+            encode_relay_datagram(
+                credentials.session_id.as_str(),
+                &"s".repeat(MAX_RELAY_SESSION_TOKEN_BYTES + 1),
+                b"opaque",
+            ),
+            Err(RelayError::FrameTooLarge)
+        ));
+
+        let error = table.forward_target(&RelayFrame {
+            session_id: credentials.session_id,
+            session_token: credentials.session_token,
+            source: left,
+            destination: right,
+            ciphertext_payload: oversized_payload,
+        });
+
+        assert!(matches!(error, Err(RelayError::FrameTooLarge)));
+        let metrics = table.dataplane_metrics();
+        assert_eq!(metrics.datagrams_received, 1);
+        assert_eq!(metrics.datagrams_forwarded, 0);
+        assert_eq!(metrics.datagrams_dropped, 1);
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::FrameTooLarge),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayDataplaneDropReason::FrameTooLarge.as_str(),
+            "frame_too_large"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn relay_removes_expired_session_before_forwarding() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -771,6 +898,16 @@ mod tests {
         let invalid = table.forward_datagram_for_addr(left_addr, &invalid);
         assert!(matches!(invalid, Err(RelayError::InvalidSessionCredential)));
 
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(RELAY_FRAME_MAGIC);
+        oversized.extend_from_slice(&1_u16.to_be_bytes());
+        oversized.extend_from_slice(&((MAX_RELAY_SESSION_TOKEN_BYTES + 1) as u16).to_be_bytes());
+        oversized.extend_from_slice(b"s");
+        oversized.extend_from_slice(&vec![b't'; MAX_RELAY_SESSION_TOKEN_BYTES + 1]);
+        oversized.extend_from_slice(b"opaque");
+        let oversized = table.forward_datagram_for_addr(left_addr, &oversized);
+        assert!(matches!(oversized, Err(RelayError::FrameTooLarge)));
+
         let valid = encode_relay_datagram(
             credentials.session_id.as_str(),
             &credentials.session_token,
@@ -780,9 +917,9 @@ mod tests {
 
         let metrics = table.dataplane_metrics();
         assert_eq!(payload, b"opaque");
-        assert_eq!(metrics.datagrams_received, 4);
+        assert_eq!(metrics.datagrams_received, 5);
         assert_eq!(metrics.datagrams_forwarded, 1);
-        assert_eq!(metrics.datagrams_dropped, 3);
+        assert_eq!(metrics.datagrams_dropped, 4);
         assert_eq!(metrics.payload_bytes_forwarded, 6);
         assert_eq!(
             metrics
@@ -800,6 +937,12 @@ mod tests {
             metrics
                 .drops_by_reason
                 .get(&RelayDataplaneDropReason::InvalidSessionCredential),
+            Some(&1)
+        );
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::FrameTooLarge),
             Some(&1)
         );
         Ok(())

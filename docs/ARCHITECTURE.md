@@ -114,7 +114,7 @@ Public nodes are relay candidates only when policy, health, and capacity permit 
 - abuse/rate-limit status
 - health status
 
-Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an outer relay frame containing session metadata and an expiring bearer credential, enforce per-session throughput windows, strip the relay frame before forwarding, and never receive keys that can decrypt tenant payload.
+Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an outer relay frame containing session metadata and an expiring bearer credential, enforce bounded session metadata and payload sizes before forwarding, enforce per-session throughput windows, strip the relay frame before forwarding, and never receive keys that can decrypt tenant payload. Oversized relay frames are counted separately in dataplane drop-reason metrics.
 
 Relay candidates advertise both a public UDP relay endpoint and an HTTP admission URL. When signal negotiation selects `RELAY`, the agent ranks admissible relay candidates by load and capacity, attempts admission in that order, fails over to the next candidate when an admission endpoint is unavailable or rejects the session, and keeps the returned credential in transient runtime state rather than reporting it back through control-plane heartbeat.
 
