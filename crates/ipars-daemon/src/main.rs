@@ -7563,6 +7563,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
             source_port,
             destination_port,
             detector: Some("ebpf-ringbuf".to_string()),
+            application: None,
             conntrack_status,
             tcp_state,
         },
@@ -7936,6 +7937,7 @@ impl ConntrackTupleFields {
                 source_port: self.source_port,
                 destination_port: self.destination_port,
                 detector: None,
+                application: None,
                 conntrack_status: self.conntrack_status,
                 tcp_state: self.tcp_state,
             },
@@ -10195,7 +10197,7 @@ mod tests {
     fn ebpf_jsonl_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
         let mut cursor = EbpfJsonlReadCursor::default();
         let flows = parse_ebpf_jsonl_packet_flow_bytes(
-            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","conntrack_status":["assured"]}
+            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","application":"postgres","conntrack_status":["assured"]}
 {"destination":"fd00::42","source":"2001:db8::1","protocol":"tcp","source_port":443,"destination_port":51820,"tcp_state":"established"}
 "#,
             &mut cursor,
@@ -10214,6 +10216,14 @@ mod tests {
         assert_eq!(flows[0].observation.source_port, Some(50000));
         assert_eq!(flows[0].observation.destination_port, Some(51820));
         assert_eq!(flows[0].observation.detector.as_deref(), Some("xdp-flow"));
+        assert_eq!(
+            flows[0].observation.application,
+            Some(AgentPacketFlowApplication::Postgres)
+        );
+        assert_eq!(
+            flows[0].observation.application(),
+            AgentPacketFlowApplication::Postgres
+        );
         assert_eq!(
             flows[0].observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]

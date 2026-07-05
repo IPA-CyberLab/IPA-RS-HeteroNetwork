@@ -1620,6 +1620,8 @@ pub mod api {
         pub destination_port: Option<u16>,
         #[serde(default)]
         pub detector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<AgentPacketFlowApplication>,
         #[serde(default)]
         pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
         #[serde(default)]
@@ -1659,6 +1661,9 @@ pub mod api {
         }
 
         pub fn application(&self) -> AgentPacketFlowApplication {
+            if let Some(application) = self.application {
+                return application;
+            }
             if self.protocol == Some(TransportProtocol::Icmp) {
                 return AgentPacketFlowApplication::Icmp;
             }
@@ -2151,6 +2156,17 @@ mod tests {
         assert_eq!(
             elasticsearch.application(),
             api::AgentPacketFlowApplication::Elasticsearch
+        );
+
+        let detector_hint_overrides_port_guess = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            application: Some(api::AgentPacketFlowApplication::Postgres),
+            ..Default::default()
+        };
+        assert_eq!(
+            detector_hint_overrides_port_guess.application(),
+            api::AgentPacketFlowApplication::Postgres
         );
     }
 
