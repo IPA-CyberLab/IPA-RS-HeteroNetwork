@@ -1343,6 +1343,8 @@ pub mod api {
         pub candidate_count: usize,
         pub candidates: Vec<EndpointCandidate>,
         pub nat_classification: Option<NatClassification>,
+        #[serde(default)]
+        pub userspace_wireguard_process: Option<AgentManagedProcessStatus>,
         pub state_updated_at: DateTime<Utc>,
     }
 
@@ -1934,6 +1936,27 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "stability=0.90"));
+    }
+
+    #[test]
+    fn agent_status_defaults_missing_userspace_wireguard_process() {
+        let status: api::AgentStatusResponse = match serde_json::from_str(
+            r#"{
+                "node_id": "node-a",
+                "identity_public_key": "identity-a",
+                "wireguard_public_key": "wireguard-a",
+                "candidate_count": 0,
+                "candidates": [],
+                "nat_classification": null,
+                "state_updated_at": "2026-07-05T00:00:00Z"
+            }"#,
+        ) {
+            Ok(status) => status,
+            Err(error) => panic!("legacy status response should decode: {error}"),
+        };
+
+        assert_eq!(status.node_id, NodeId::from_string("node-a"));
+        assert!(status.userspace_wireguard_process.is_none());
     }
 
     #[test]

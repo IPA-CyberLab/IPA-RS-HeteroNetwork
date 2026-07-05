@@ -13606,6 +13606,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 },
             ],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("peer-a");
@@ -13756,6 +13757,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 source: CandidateSource::StunProbe,
             }],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -13852,6 +13854,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 source: CandidateSource::StunProbe,
             }],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");

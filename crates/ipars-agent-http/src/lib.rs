@@ -837,6 +837,14 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         ));
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Ready,
+                Some(4242),
+                None,
+                None,
+            )
+            .await;
         let node_id = runtime.state().node_id.clone();
         let app = router(AgentHttpState::new(runtime));
 
@@ -854,6 +862,20 @@ mod tests {
         let status: AgentStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(status.node_id, node_id);
         assert_eq!(status.candidate_count, 0);
+        assert_eq!(
+            status
+                .userspace_wireguard_process
+                .as_ref()
+                .map(|process| process.state),
+            Some(AgentManagedProcessState::Ready)
+        );
+        assert_eq!(
+            status
+                .userspace_wireguard_process
+                .as_ref()
+                .and_then(|process| process.pid),
+            Some(4242)
+        );
         Ok(())
     }
 

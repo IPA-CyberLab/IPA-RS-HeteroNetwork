@@ -1997,6 +1997,7 @@ mod tests {
                 candidate_count: response.node.endpoint_candidates.len(),
                 candidates: response.node.endpoint_candidates,
                 nat_classification: None,
+                userspace_wireguard_process: None,
                 state_updated_at: Utc::now(),
             });
         }

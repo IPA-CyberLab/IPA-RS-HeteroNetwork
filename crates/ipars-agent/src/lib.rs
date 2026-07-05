@@ -754,6 +754,7 @@ impl AgentRuntime {
         let state = self.state();
         let candidates = self.candidates.read().await.clone();
         let nat_classification = self.nat_classification.read().await.clone();
+        let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         AgentStatusResponse {
             node_id: state.node_id,
             identity_public_key: state.identity_public_key_b64,
@@ -761,6 +762,7 @@ impl AgentRuntime {
             candidate_count: candidates.len(),
             candidates,
             nat_classification,
+            userspace_wireguard_process,
             state_updated_at: state.updated_at,
         }
     }
