@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init(InitArgs),
+    Init(Box<InitArgs>),
     Join(JoinArgs),
     Status(StatusArgs),
     Peers(PeersArgs),
@@ -254,7 +254,7 @@ enum DockerCommand {
 
 #[derive(Debug, Subcommand)]
 enum K8sCommand {
-    Install(K8sInstallArgs),
+    Install(Box<K8sInstallArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +321,8 @@ struct K8sInstallArgs {
     agent_api_node_port: Option<u16>,
     #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
     agent_api_load_balancer_class: Option<String>,
+    #[arg(long = "agent-api-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
+    agent_api_health_check_node_port: Option<u16>,
     #[arg(
         long = "agent-api-disable-load-balancer-node-ports",
         default_value_t = false,
@@ -351,6 +353,8 @@ struct K8sInstallArgs {
     relay_http_node_port: Option<u16>,
     #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
     relay_load_balancer_class: Option<String>,
+    #[arg(long = "relay-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
+    relay_health_check_node_port: Option<u16>,
     #[arg(
         long = "relay-disable-load-balancer-node-ports",
         default_value_t = false,
@@ -385,7 +389,7 @@ struct KeyValueArg {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init(args) => print_json(&init(args)?)?,
+        Command::Init(args) => print_json(&init(*args)?)?,
         Command::Join(args) => print_json(&join(args).await?)?,
         Command::Status(args) => {
             match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
@@ -439,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
         } => print_json(&docker_install_plan(args)?)?,
         Command::K8s {
             command: K8sCommand::Install(args),
-        } => print_json(&k8s_install_plan(args)?)?,
+        } => print_json(&k8s_install_plan(*args)?)?,
     };
     Ok(())
 }
@@ -1778,6 +1782,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 load_balancer_class,
             );
         }
+        if let Some(health_check_node_port) = args.agent_api_health_check_node_port {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.healthCheckNodePort={health_check_node_port}"
+            ));
+        }
         if args.agent_api_disable_load_balancer_node_ports {
             helm_command.push_str(" --set agent.apiService.allocateLoadBalancerNodePorts=false");
         }
@@ -1856,6 +1865,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 "agent.relayService.loadBalancerClass",
                 load_balancer_class,
             );
+        }
+        if let Some(health_check_node_port) = args.relay_health_check_node_port {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.healthCheckNodePort={health_check_node_port}"
+            ));
         }
         if args.relay_disable_load_balancer_node_ports {
             helm_command.push_str(" --set agent.relayService.allocateLoadBalancerNodePorts=false");
@@ -2160,6 +2174,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
     }
+    if args.agent_api_health_check_node_port.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-health-check-node-port requires --expose-agent-api");
+    }
     if args.agent_api_disable_load_balancer_node_ports && !args.expose_agent_api {
         anyhow::bail!("--agent-api-disable-load-balancer-node-ports requires --expose-agent-api");
     }
@@ -2177,6 +2194,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_load_balancer_class.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
+    }
+    if args.relay_health_check_node_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-health-check-node-port requires --expose-relay");
     }
     if args.relay_disable_load_balancer_node_ports && !args.expose_relay {
         anyhow::bail!("--relay-disable-load-balancer-node-ports requires --expose-relay");
@@ -2247,6 +2267,38 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_load_balancer_class.is_some() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-load-balancer-class only applies to LoadBalancer services");
+    }
+    if args.agent_api_health_check_node_port.is_some()
+        && args.agent_api_service_type != "LoadBalancer"
+    {
+        anyhow::bail!("--agent-api-health-check-node-port only applies to LoadBalancer services");
+    }
+    if args.relay_health_check_node_port.is_some() && args.relay_service_type != "LoadBalancer" {
+        anyhow::bail!("--relay-health-check-node-port only applies to LoadBalancer services");
+    }
+    if args.agent_api_health_check_node_port.is_some()
+        && args.agent_api_external_traffic_policy != "Local"
+    {
+        anyhow::bail!(
+            "--agent-api-health-check-node-port requires --agent-api-external-traffic-policy Local"
+        );
+    }
+    if args.relay_health_check_node_port.is_some() && args.relay_external_traffic_policy != "Local"
+    {
+        anyhow::bail!(
+            "--relay-health-check-node-port requires --relay-external-traffic-policy Local"
+        );
+    }
+    if args.agent_api_health_check_node_port.is_some()
+        && args.agent_api_health_check_node_port == args.agent_api_node_port
+    {
+        anyhow::bail!("--agent-api-health-check-node-port must differ from --agent-api-node-port");
+    }
+    if args.relay_health_check_node_port.is_some()
+        && (args.relay_health_check_node_port == args.relay_udp_node_port
+            || args.relay_health_check_node_port == args.relay_http_node_port)
+    {
+        anyhow::bail!("--relay-health-check-node-port must differ from relay NodePort overrides");
     }
     if args.agent_api_disable_load_balancer_node_ports
         && args.agent_api_service_type != "LoadBalancer"
@@ -3180,6 +3232,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
+            agent_api_health_check_node_port: Some(31081),
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
             agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
@@ -3194,6 +3247,7 @@ mod tests {
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
+            relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
             relay_ip_families: vec!["IPv6".to_string()],
@@ -3222,6 +3276,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
+        assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
@@ -3239,6 +3294,7 @@ mod tests {
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
+        assert!(plan.commands[2].contains("--set agent.relayService.healthCheckNodePort=31821"));
         assert!(
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
@@ -3300,6 +3356,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -3311,6 +3368,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -3527,6 +3585,8 @@ mod tests {
             "31080",
             "--agent-api-load-balancer-class",
             "example.com/internal-api",
+            "--agent-api-health-check-node-port",
+            "31081",
             "--agent-api-ip-family-policy",
             "RequireDualStack",
             "--agent-api-ip-family",
@@ -3548,6 +3608,8 @@ mod tests {
             "31580",
             "--relay-load-balancer-class",
             "example.com/internal-relay",
+            "--relay-health-check-node-port",
+            "31821",
             "--relay-ip-family-policy",
             "PreferDualStack",
             "--relay-ip-family",
@@ -3601,6 +3663,7 @@ mod tests {
                 args.agent_api_load_balancer_class.as_deref(),
                 Some("example.com/internal-api")
             );
+            assert_eq!(args.agent_api_health_check_node_port, Some(31081));
             assert_eq!(
                 args.agent_api_ip_family_policy.as_deref(),
                 Some("RequireDualStack")
@@ -3626,6 +3689,7 @@ mod tests {
                 args.relay_load_balancer_class.as_deref(),
                 Some("example.com/internal-relay")
             );
+            assert_eq!(args.relay_health_check_node_port, Some(31821));
             assert_eq!(
                 args.relay_ip_family_policy.as_deref(),
                 Some("PreferDualStack")
@@ -3683,6 +3747,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -3694,6 +3759,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -3740,6 +3806,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -3751,6 +3818,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -3929,6 +3997,91 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_health_check_node_ports() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.allow_public_service_exposure = true;
+        valid.allow_unrestricted_load_balancer = true;
+        valid.agent_api_service_type = "LoadBalancer".to_string();
+        valid.agent_api_health_check_node_port = Some(31081);
+        valid.expose_relay = true;
+        valid.relay_service_type = "LoadBalancer".to_string();
+        valid.relay_health_check_node_port = Some(31821);
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
+        assert!(plan.commands[2].contains("--set agent.relayService.healthCheckNodePort=31821"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-health-check-node-port",
+            "29999",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut node_port_agent = base_k8s_install_args();
+        node_port_agent.expose_agent_api = true;
+        node_port_agent.allow_public_service_exposure = true;
+        node_port_agent.agent_api_service_type = "NodePort".to_string();
+        node_port_agent.agent_api_health_check_node_port = Some(31081);
+        let error = match k8s_install_plan(node_port_agent) {
+            Ok(_) => panic!("NodePort agent healthCheckNodePort should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-health-check-node-port only applies"));
+
+        let mut cluster_relay = base_k8s_install_args();
+        cluster_relay.expose_relay = true;
+        cluster_relay.allow_public_service_exposure = true;
+        cluster_relay.allow_cluster_external_traffic_policy = true;
+        cluster_relay.relay_service_type = "LoadBalancer".to_string();
+        cluster_relay.relay_external_traffic_policy = "Cluster".to_string();
+        cluster_relay.relay_health_check_node_port = Some(31821);
+        cluster_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        cluster_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(cluster_relay) {
+            Ok(_) => panic!("Cluster relay healthCheckNodePort should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-health-check-node-port requires"));
+
+        let mut duplicate_agent = base_k8s_install_args();
+        duplicate_agent.expose_agent_api = true;
+        duplicate_agent.allow_public_service_exposure = true;
+        duplicate_agent.allow_unrestricted_load_balancer = true;
+        duplicate_agent.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_agent.agent_api_node_port = Some(31081);
+        duplicate_agent.agent_api_health_check_node_port = Some(31081);
+        let error = match k8s_install_plan(duplicate_agent) {
+            Ok(_) => panic!("agent healthCheckNodePort should not reuse nodePort"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("must differ from --agent-api-node-port"));
+
+        let mut duplicate_relay = base_k8s_install_args();
+        duplicate_relay.expose_relay = true;
+        duplicate_relay.allow_public_service_exposure = true;
+        duplicate_relay.allow_unrestricted_load_balancer = true;
+        duplicate_relay.relay_service_type = "LoadBalancer".to_string();
+        duplicate_relay.relay_udp_node_port = Some(31821);
+        duplicate_relay.relay_health_check_node_port = Some(31821);
+        duplicate_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_relay) {
+            Ok(_) => panic!("relay healthCheckNodePort should not reuse service nodePort"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("must differ from relay NodePort overrides"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_wires_and_validates_ip_families() -> anyhow::Result<()> {
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
@@ -4017,6 +4170,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -4028,6 +4182,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -4061,6 +4216,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -4072,6 +4228,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -4112,6 +4269,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -4123,6 +4281,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -4161,6 +4320,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -4172,6 +4332,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
@@ -4205,6 +4366,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
+            agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
@@ -4216,6 +4378,7 @@ mod tests {
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_load_balancer_class: None,
+            relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
