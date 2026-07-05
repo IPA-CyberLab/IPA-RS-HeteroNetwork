@@ -1,3 +1,17 @@
+{{- if .Values.agent.relayAdvertisement.enabled -}}
+{{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
+{{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
+{{- end -}}
+{{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
+{{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
+{{- end -}}
+{{- if not (gt (int .Values.agent.relayAdvertisement.maxSessions) 0) -}}
+{{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int .Values.agent.relayAdvertisement.maxMbps) 0) -}}
+{{- fail "agent.relayAdvertisement.maxMbps must be greater than zero" -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.serviceExposure.enabled -}}
 {{- if not (gt (int .Values.serviceExposure.routeIntervalSeconds) 0) -}}
 {{- fail "serviceExposure.routeIntervalSeconds must be greater than zero" -}}
