@@ -1294,6 +1294,7 @@ pub mod api {
     pub enum RelayAdmissionFailureReason {
         Unauthorized,
         AdmissionDenied,
+        RateLimited,
         InvalidSessionCredential,
         SocketError,
         InternalError,
@@ -1304,6 +1305,7 @@ pub mod api {
             match self {
                 Self::Unauthorized => "unauthorized",
                 Self::AdmissionDenied => "admission_denied",
+                Self::RateLimited => "rate_limited",
                 Self::InvalidSessionCredential => "invalid_session_credential",
                 Self::SocketError => "socket_error",
                 Self::InternalError => "internal_error",

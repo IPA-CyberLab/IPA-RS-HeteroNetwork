@@ -31,7 +31,7 @@ use ipars_control_plane::{
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_crypto::IdentityKeyPair;
-use ipars_relay::{RelayService, UdpRelay};
+use ipars_relay::{RelayAdmissionRateLimit, RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
     kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
@@ -357,6 +357,14 @@ struct RelayArgs {
     max_mbps: u32,
     #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
     session_ttl_seconds: u64,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_RATE_LIMIT", default_value_t = 4096)]
+    admission_rate_limit: u32,
+    #[arg(
+        long,
+        env = "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
+        default_value_t = 60
+    )]
+    admission_rate_limit_window_seconds: u64,
     #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
     admission_bearer_token: Option<String>,
 }
@@ -3808,7 +3816,11 @@ async fn run_relay(
         .admission_url
         .clone()
         .unwrap_or_else(|| format!("http://{}", args.http_listen));
-    let service = Arc::new(RelayService::with_session_ttl(
+    let admission_rate_limit = (args.admission_rate_limit > 0).then_some(RelayAdmissionRateLimit {
+        max_attempts: args.admission_rate_limit,
+        window: chrono::Duration::seconds(args.admission_rate_limit_window_seconds as i64),
+    });
+    let service = Arc::new(RelayService::with_session_ttl_and_admission_rate_limit(
         NodeId::from_string(args.relay_node_id),
         RelayCapability {
             enabled_by_policy: true,
@@ -3820,6 +3832,7 @@ async fn run_relay(
             e2e_only: true,
         },
         chrono::Duration::seconds(args.session_ttl_seconds as i64),
+        admission_rate_limit,
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
@@ -3853,6 +3866,12 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
         anyhow::bail!("--max-mbps must be greater than zero");
     }
     validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
+    if args.admission_rate_limit > 0 {
+        validate_positive_seconds(
+            args.admission_rate_limit_window_seconds,
+            "--admission-rate-limit-window-seconds",
+        )?;
+    }
     if let Some(token) = args.admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--admission-bearer-token")?;
     }
@@ -13924,12 +13943,18 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "http://relay-a:9580",
             "--session-ttl-seconds",
             "60",
+            "--admission-rate-limit",
+            "120",
+            "--admission-rate-limit-window-seconds",
+            "30",
             "--admission-bearer-token",
             "cluster-relay-secret",
         ])?;
 
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
+            assert_eq!(args.admission_rate_limit, 120);
+            assert_eq!(args.admission_rate_limit_window_seconds, 30);
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.admission_bearer_token.as_deref(),
@@ -14019,6 +14044,26 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--session-ttl-seconds must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let zero_rate_window = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--admission-rate-limit-window-seconds",
+            "0",
+        ])?;
+        if let Command::Relay(args) = zero_rate_window.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--admission-rate-limit-window-seconds must be greater than zero"));
         } else {
             anyhow::bail!("expected relay command");
         }

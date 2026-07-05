@@ -82,6 +82,12 @@ pub struct RelaySessionAdmission {
     pub session_ttl: chrono::Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayAdmissionRateLimit {
+    pub max_attempts: u32,
+    pub window: chrono::Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayFrame {
     pub session_id: RelaySessionId,
@@ -428,13 +434,13 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
 fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFailureReason {
     match error {
         RelayError::AdmissionDenied => RelayAdmissionFailureReason::AdmissionDenied,
+        RelayError::RateLimited => RelayAdmissionFailureReason::RateLimited,
         RelayError::InvalidSessionCredential => {
             RelayAdmissionFailureReason::InvalidSessionCredential
         }
         RelayError::Socket(_) => RelayAdmissionFailureReason::SocketError,
         RelayError::UnknownSession
         | RelayError::SessionExpired
-        | RelayError::RateLimited
         | RelayError::MalformedFrame
         | RelayError::FrameTooLarge => RelayAdmissionFailureReason::InternalError,
     }
@@ -540,10 +546,18 @@ pub struct RelayService {
     capability: RwLock<RelayCapability>,
     table: std::sync::Arc<RwLock<RelayTable>>,
     session_ttl: chrono::Duration,
+    admission_rate_limit: Option<RelayAdmissionRateLimit>,
+    admission_rate_window: Mutex<RelayAdmissionRateWindow>,
     admission_attempts: AtomicU64,
     admission_successes: AtomicU64,
     admission_failures: AtomicU64,
     admission_failures_by_reason: Mutex<BTreeMap<RelayAdmissionFailureReason, u64>>,
+}
+
+#[derive(Debug)]
+struct RelayAdmissionRateWindow {
+    started_at: DateTime<Utc>,
+    attempts: u32,
 }
 
 impl RelayService {
@@ -556,11 +570,25 @@ impl RelayService {
         capability: RelayCapability,
         session_ttl: chrono::Duration,
     ) -> Self {
+        Self::with_session_ttl_and_admission_rate_limit(relay_node, capability, session_ttl, None)
+    }
+
+    pub fn with_session_ttl_and_admission_rate_limit(
+        relay_node: NodeId,
+        capability: RelayCapability,
+        session_ttl: chrono::Duration,
+        admission_rate_limit: Option<RelayAdmissionRateLimit>,
+    ) -> Self {
         Self {
             relay_node,
             capability: RwLock::new(capability),
             table: std::sync::Arc::new(RwLock::new(RelayTable::default())),
             session_ttl: session_ttl.max(chrono::Duration::milliseconds(1)),
+            admission_rate_limit,
+            admission_rate_window: Mutex::new(RelayAdmissionRateWindow {
+                started_at: Utc::now(),
+                attempts: 0,
+            }),
             admission_attempts: AtomicU64::new(0),
             admission_successes: AtomicU64::new(0),
             admission_failures: AtomicU64::new(0),
@@ -577,7 +605,10 @@ impl RelayService {
         request: RelayAdmissionRequest,
     ) -> Result<RelayAdmissionResponse, RelayError> {
         self.admission_attempts.fetch_add(1, Ordering::Relaxed);
-        let result = self.admit_inner(request).await;
+        let result = match self.record_admission_attempt_for_limit(Utc::now()) {
+            Ok(()) => self.admit_inner(request).await,
+            Err(error) => Err(error),
+        };
         match &result {
             Ok(_) => {
                 self.admission_successes.fetch_add(1, Ordering::Relaxed);
@@ -592,6 +623,29 @@ impl RelayService {
     pub fn record_unauthorized_admission_attempt(&self) {
         self.admission_attempts.fetch_add(1, Ordering::Relaxed);
         self.record_admission_failure(RelayAdmissionFailureReason::Unauthorized);
+    }
+
+    fn record_admission_attempt_for_limit(&self, now: DateTime<Utc>) -> Result<(), RelayError> {
+        let Some(limit) = self.admission_rate_limit else {
+            return Ok(());
+        };
+        if limit.max_attempts == 0 || limit.window <= chrono::Duration::zero() {
+            return Ok(());
+        }
+
+        let mut window = self
+            .admission_rate_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if now.signed_duration_since(window.started_at) >= limit.window {
+            window.started_at = now;
+            window.attempts = 0;
+        }
+        if window.attempts >= limit.max_attempts {
+            return Err(RelayError::RateLimited);
+        }
+        window.attempts = window.attempts.saturating_add(1);
+        Ok(())
     }
 
     fn record_admission_failure(&self, reason: RelayAdmissionFailureReason) {
@@ -1142,6 +1196,78 @@ mod tests {
                 .admission_failures_by_reason
                 .get(&RelayAdmissionFailureReason::AdmissionDenied),
             Some(&1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_rate_limit_window_resets() -> Result<(), RelayError> {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 1,
+                window: chrono::Duration::seconds(1),
+            }),
+        );
+        let now = Utc::now();
+
+        service.record_admission_attempt_for_limit(now)?;
+        let limited = service.record_admission_attempt_for_limit(now);
+        assert!(matches!(limited, Err(RelayError::RateLimited)));
+        service.record_admission_attempt_for_limit(now + chrono::Duration::seconds(1))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_rate_limited_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 2,
+                window: chrono::Duration::seconds(60),
+            }),
+        );
+
+        for index in 0..2 {
+            service
+                .admit(RelayAdmissionRequest {
+                    left: NodeId::from_string(format!("left-{index}")),
+                    right: NodeId::from_string(format!("right-{index}")),
+                    left_addr: SocketAddr::from(([10, 0, 0, 1], 10000 + index)),
+                    right_addr: SocketAddr::from(([10, 0, 0, 2], 10000 + index)),
+                })
+                .await?;
+        }
+
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-limited"),
+                right: NodeId::from_string("right-limited"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 12000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 12000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::RateLimited)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 2);
+        assert_eq!(status.admission_attempt_count, 3);
+        assert_eq!(status.admission_success_count, 2);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::RateLimited),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayAdmissionFailureReason::RateLimited.as_str(),
+            "rate_limited"
         );
         Ok(())
     }
