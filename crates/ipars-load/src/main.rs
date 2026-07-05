@@ -1185,6 +1185,8 @@ struct DaemonRuntimeManifest {
     stun_addr: SocketAddr,
     agent_urls: Vec<String>,
     keep_runtime_dir: bool,
+    started_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
     generated_at: chrono::DateTime<Utc>,
     children: Vec<DaemonRuntimeManifestChild>,
 }
@@ -1206,6 +1208,7 @@ struct DaemonRuntimeManifestSeed {
     relay_udp_addr: SocketAddr,
     stun_addr: SocketAddr,
     keep_runtime_dir: bool,
+    started_at: chrono::DateTime<Utc>,
 }
 
 impl DaemonRuntimeManifestSeed {
@@ -1215,6 +1218,7 @@ impl DaemonRuntimeManifestSeed {
         agent_urls: &[String],
         children: &[DaemonChild],
     ) -> anyhow::Result<PathBuf> {
+        let updated_at = Utc::now();
         write_daemon_runtime_manifest(
             &self.runtime_dir,
             DaemonRuntimeManifest {
@@ -1228,7 +1232,9 @@ impl DaemonRuntimeManifestSeed {
                 stun_addr: self.stun_addr,
                 agent_urls: agent_urls.to_vec(),
                 keep_runtime_dir: self.keep_runtime_dir,
-                generated_at: Utc::now(),
+                started_at: self.started_at,
+                updated_at,
+                generated_at: updated_at,
                 children: children
                     .iter()
                     .map(DaemonRuntimeManifestChild::from_child)
@@ -1287,6 +1293,7 @@ impl DaemonProcessGroup {
             relay_udp_addr,
             stun_addr,
             keep_runtime_dir: options.keep_runtime_dir,
+            started_at: Utc::now(),
         };
         manifest_seed.write(
             DaemonRuntimePhase::ReservedEndpoints,
@@ -2685,6 +2692,9 @@ mod tests {
         assert_eq!(decoded.scenario, manifest.scenario);
         assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReady);
         assert_eq!(decoded.runtime_dir, runtime_dir);
+        assert_eq!(decoded.started_at, manifest.started_at);
+        assert_eq!(decoded.updated_at, manifest.updated_at);
+        assert_eq!(decoded.generated_at, manifest.updated_at);
         assert_eq!(decoded.children.len(), 1);
         assert_eq!(decoded.children[0].role, "control-plane-0");
         assert_eq!(decoded.children[0].pid, Some(4242));
@@ -2704,6 +2714,9 @@ mod tests {
         let initial: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(initial.phase, DaemonRuntimePhase::ReservedEndpoints);
+        assert_eq!(initial.started_at, seed.started_at);
+        assert!(initial.updated_at >= initial.started_at);
+        assert_eq!(initial.generated_at, initial.updated_at);
         assert!(initial.agent_urls.is_empty());
         assert!(initial.children.is_empty());
 
@@ -2732,6 +2745,9 @@ mod tests {
         let updated: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(updated.phase, DaemonRuntimePhase::SignalNegotiation);
+        assert_eq!(updated.started_at, seed.started_at);
+        assert!(updated.updated_at >= initial.updated_at);
+        assert_eq!(updated.generated_at, updated.updated_at);
         assert_eq!(updated.agent_urls, agent_urls);
         assert_eq!(updated.children.len(), 1);
         assert_eq!(updated.children[0].role, "signal");
@@ -3120,10 +3136,12 @@ mod tests {
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
             keep_runtime_dir: true,
+            started_at: Utc::now(),
         }
     }
 
     fn synthetic_manifest(runtime_dir: PathBuf, log_path: PathBuf) -> DaemonRuntimeManifest {
+        let now = Utc::now();
         DaemonRuntimeManifest {
             scenario: ScenarioName::Three,
             phase: DaemonRuntimePhase::StartupReady,
@@ -3135,7 +3153,9 @@ mod tests {
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
             agent_urls: vec!["http://127.0.0.1:31006".to_string()],
             keep_runtime_dir: true,
-            generated_at: Utc::now(),
+            started_at: now,
+            updated_at: now,
+            generated_at: now,
             children: vec![DaemonRuntimeManifestChild {
                 role: "control-plane-0".to_string(),
                 pid: Some(4242),
