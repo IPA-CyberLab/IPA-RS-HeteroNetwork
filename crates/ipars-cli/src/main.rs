@@ -289,6 +289,16 @@ struct DockerInstallArgs {
     userspace_wireguard_command: Option<String>,
     #[arg(long = "userspace-wireguard-arg")]
     userspace_wireguard_args: Vec<String>,
+    #[arg(
+        long = "userspace-wireguard-ready-timeout-seconds",
+        default_value_t = 10
+    )]
+    userspace_wireguard_ready_timeout_seconds: u64,
+    #[arg(
+        long = "userspace-wireguard-shutdown-timeout-seconds",
+        default_value_t = 5
+    )]
+    userspace_wireguard_shutdown_timeout_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -2359,6 +2369,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
+        "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
@@ -2423,6 +2434,14 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
 }
 
 fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    validate_positive_docker_seconds(
+        args.userspace_wireguard_ready_timeout_seconds,
+        "--userspace-wireguard-ready-timeout-seconds",
+    )?;
+    validate_positive_docker_seconds(
+        args.userspace_wireguard_shutdown_timeout_seconds,
+        "--userspace-wireguard-shutdown-timeout-seconds",
+    )?;
     if !args.userspace_wireguard_args.is_empty() && args.userspace_wireguard_command.is_none() {
         anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
     }
@@ -2441,6 +2460,13 @@ fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow:
         if argument.chars().any(|character| character == '\0') {
             anyhow::bail!("--userspace-wireguard-arg must not contain NUL bytes");
         }
+    }
+    Ok(())
+}
+
+fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{label} must be greater than zero");
     }
     Ok(())
 }
@@ -2565,6 +2591,18 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         environment.push(InstallEnvironment {
             name: "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
             value: args.userspace_wireguard_args.join(","),
+        });
+    }
+    if args.rootless || args.userspace_wireguard_command.is_some() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+            value: args.userspace_wireguard_ready_timeout_seconds.to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+            value: args
+                .userspace_wireguard_shutdown_timeout_seconds
+                .to_string(),
         });
     }
     let container_namespace = args
@@ -4997,6 +5035,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         })?;
 
         assert_eq!(plan.platform, "docker-compose");
@@ -5064,6 +5104,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         })?;
 
         assert_eq!(
@@ -5087,6 +5129,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: vec!["ipars0".to_string()],
+            userspace_wireguard_ready_timeout_seconds: 30,
+            userspace_wireguard_shutdown_timeout_seconds: 20,
         })?;
 
         assert!(plan
@@ -5120,6 +5164,20 @@ mod tests {
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"),
             Some("ipars0")
+        );
+        assert_eq!(
+            environment_value(
+                &plan,
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"
+            ),
+            Some("30")
+        );
+        assert_eq!(
+            environment_value(
+                &plan,
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"
+            ),
+            Some("20")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
@@ -5168,6 +5226,8 @@ mod tests {
             .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
         assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
@@ -5199,6 +5259,8 @@ mod tests {
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         }) {
             Ok(_) => anyhow::bail!("ambiguous Docker install settings should be rejected"),
             Err(error) => error,
@@ -5219,6 +5281,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         }) {
             Ok(_) => anyhow::bail!("unused Docker network filter should be rejected"),
             Err(error) => error,
@@ -5239,6 +5303,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker network filter should be rejected"),
             Err(error) => error,
@@ -5259,6 +5325,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker host interface should be rejected"),
             Err(error) => error,
@@ -5279,6 +5347,8 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker container namespace should be rejected"),
             Err(error) => error,
@@ -5286,6 +5356,50 @@ mod tests {
         assert!(invalid_namespace
             .to_string()
             .contains("linux network namespace name"));
+
+        let invalid_ready_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 0,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+        }) {
+            Ok(_) => anyhow::bail!("zero userspace WireGuard ready timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_ready_timeout
+            .to_string()
+            .contains("--userspace-wireguard-ready-timeout-seconds"));
+
+        let invalid_shutdown_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 0,
+        }) {
+            Ok(_) => anyhow::bail!("zero userspace WireGuard shutdown timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_shutdown_timeout
+            .to_string()
+            .contains("--userspace-wireguard-shutdown-timeout-seconds"));
         Ok(())
     }
 
@@ -6370,6 +6484,10 @@ mod tests {
             "wireguard-go",
             "--userspace-wireguard-arg",
             "ipars0",
+            "--userspace-wireguard-ready-timeout-seconds",
+            "30",
+            "--userspace-wireguard-shutdown-timeout-seconds",
+            "20",
         ])?;
         if let Command::Docker {
             command: DockerCommand::Install(args),
@@ -6395,6 +6513,8 @@ mod tests {
                 Some("wireguard-go")
             );
             assert_eq!(args.userspace_wireguard_args, vec!["ipars0".to_string()]);
+            assert_eq!(args.userspace_wireguard_ready_timeout_seconds, 30);
+            assert_eq!(args.userspace_wireguard_shutdown_timeout_seconds, 20);
         } else {
             anyhow::bail!("expected docker install command");
         }
