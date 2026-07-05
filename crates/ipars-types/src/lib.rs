@@ -889,6 +889,14 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct WireGuardKeyRotationSignaturePayload {
+        pub node_id: NodeId,
+        pub previous_wireguard_public_key: String,
+        pub next_wireguard_public_key: String,
+        pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatRequest {
         pub node_id: NodeId,
         pub health: NodeHealth,
@@ -911,6 +919,37 @@ pub mod api {
                 signed_at,
             }
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RotateWireGuardKeyRequest {
+        pub node_id: NodeId,
+        pub previous_wireguard_public_key: String,
+        pub next_wireguard_public_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_signature: Option<NodeRequestSignature>,
+    }
+
+    impl RotateWireGuardKeyRequest {
+        pub fn signature_payload(
+            &self,
+            signed_at: DateTime<Utc>,
+        ) -> WireGuardKeyRotationSignaturePayload {
+            WireGuardKeyRotationSignaturePayload {
+                node_id: self.node_id.clone(),
+                previous_wireguard_public_key: self.previous_wireguard_public_key.clone(),
+                next_wireguard_public_key: self.next_wireguard_public_key.clone(),
+                signed_at,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RotateWireGuardKeyResponse {
+        pub node: NodeRecord,
+        pub peer_map: PeerMap,
+        pub relay_map: RelayMap,
+        pub rotated_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use ipars_types::api::{HeartbeatRequest, NodeRequestSignature};
+use ipars_types::api::{HeartbeatRequest, NodeRequestSignature, RotateWireGuardKeyRequest};
 use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -89,6 +89,19 @@ impl IdentityKeyPair {
             signature: encode_bytes(&signature.to_bytes()),
         })
     }
+
+    pub fn sign_wireguard_key_rotation_request(
+        &self,
+        request: &RotateWireGuardKeyRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeRequestSignature, CryptoError> {
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at))?;
+        let signature = self.signing_key.sign(&payload);
+        Ok(NodeRequestSignature {
+            signed_at,
+            signature: encode_bytes(&signature.to_bytes()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +169,26 @@ pub fn verify_heartbeat_request_signature(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+pub fn verify_wireguard_key_rotation_signature(
+    request: &RotateWireGuardKeyRequest,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let node_signature = request
+        .node_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let key_bytes = decode_32(node_public_key_b64)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let signature_bytes = STANDARD.decode(&node_signature.signature)?;
+    let signature = Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(&request.signature_payload(node_signature.signed_at))?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> {
     let key_bytes = decode_32(value)?;
     VerifyingKey::from_bytes(&key_bytes)
@@ -199,7 +232,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use chrono::Duration;
-    use ipars_types::api::HeartbeatRequest;
+    use ipars_types::api::{HeartbeatRequest, RotateWireGuardKeyRequest};
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, Role, Tag,
         TokenPolicy,
@@ -296,6 +329,29 @@ mod tests {
         request.health.message = Some("tampered".to_string());
         assert!(matches!(
             verify_heartbeat_request_signature(&request, &key.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_wireguard_key_rotation_request_round_trips() -> Result<(), CryptoError> {
+        let key = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let old_wireguard = WireGuardKeyPair::generate();
+        let next_wireguard = WireGuardKeyPair::generate();
+        let mut request = RotateWireGuardKeyRequest {
+            node_id: key.node_id(),
+            previous_wireguard_public_key: old_wireguard.public_key_b64,
+            next_wireguard_public_key: next_wireguard.public_key_b64,
+            node_signature: None,
+        };
+        request.node_signature = Some(key.sign_wireguard_key_rotation_request(&request, now)?);
+
+        verify_wireguard_key_rotation_signature(&request, &key.public_key_b64())?;
+        request.next_wireguard_public_key = WireGuardKeyPair::generate().public_key_b64;
+        assert!(matches!(
+            verify_wireguard_key_rotation_signature(&request, &key.public_key_b64()),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

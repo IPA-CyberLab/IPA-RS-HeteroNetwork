@@ -158,6 +158,46 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(())
     }
 
+    async fn rotate_node_wireguard_public_key(
+        &self,
+        node_id: &NodeId,
+        expected_current_public_key: &str,
+        next_public_key: String,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.wireguard_public_key != expected_current_public_key {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "wireguard public key changed before rotation completed".to_string(),
+            });
+        }
+        node.wireguard_public_key = next_public_key;
+        let result = sqlx::query(
+            r#"
+            UPDATE nodes
+            SET record_json = ?3
+            WHERE node_id = ?1
+              AND json_extract(record_json, '$.wireguard_public_key') = ?2
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(expected_current_public_key)
+        .bind(serde_json::to_string(&node).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "wireguard public key changed before rotation completed".to_string(),
+            });
+        }
+        Ok(node)
+    }
+
     async fn upsert_health(
         &self,
         node_id: NodeId,
@@ -447,6 +487,46 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .await
             .map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn rotate_node_wireguard_public_key(
+        &self,
+        node_id: &NodeId,
+        expected_current_public_key: &str,
+        next_public_key: String,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.wireguard_public_key != expected_current_public_key {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "wireguard public key changed before rotation completed".to_string(),
+            });
+        }
+        node.wireguard_public_key = next_public_key;
+        let result = sqlx::query(
+            r#"
+            UPDATE nodes
+            SET record_json = $3
+            WHERE node_id = $1
+              AND record_json->>'wireguard_public_key' = $2
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(expected_current_public_key)
+        .bind(serde_json::to_value(&node).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "wireguard public key changed before rotation completed".to_string(),
+            });
+        }
+        Ok(node)
     }
 
     async fn upsert_health(
@@ -786,6 +866,24 @@ mod tests {
                 .map(|capability| capability.active_sessions),
             Some(7)
         );
+        let rotated = store
+            .rotate_node_wireguard_public_key(
+                &local.node_id,
+                &local.wireguard_public_key,
+                "wg-node-a-rotated".to_string(),
+            )
+            .await?;
+        assert_eq!(rotated.wireguard_public_key, "wg-node-a-rotated");
+        assert!(matches!(
+            store
+                .rotate_node_wireguard_public_key(
+                    &local.node_id,
+                    &local.wireguard_public_key,
+                    "wg-node-a-stale".to_string()
+                )
+                .await,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
         let health = NodeHealth {
             state: HealthState::Healthy,
             last_seen_at: Utc::now(),

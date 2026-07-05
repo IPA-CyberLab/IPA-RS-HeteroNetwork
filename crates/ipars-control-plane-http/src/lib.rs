@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use ipars_control_plane::{
@@ -13,6 +13,7 @@ use ipars_control_plane::{
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
     JoinNodeRequest, PeerMap, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathState};
 use serde::Serialize;
@@ -63,6 +64,10 @@ where
         .route("/v1/metrics", get(metrics::<S, L>))
         .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
+        .route(
+            "/v1/nodes/{node_id}/wireguard-key",
+            put(rotate_wireguard_key::<S, L>),
+        )
         .route("/v1/tokens/revoke", post(revoke_token::<S, L>))
         .with_state(state)
 }
@@ -167,6 +172,29 @@ where
     L: TokenLedger,
 {
     Ok(Json(state.plane.heartbeat(request).await?))
+}
+
+async fn rotate_wireguard_key<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(node_id): Path<String>,
+    Json(request): Json<RotateWireGuardKeyRequest>,
+) -> Result<Json<RotateWireGuardKeyResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let path_node_id = NodeId::from_string(node_id);
+    if request.node_id != path_node_id {
+        return Err(ControlPlaneError::NodeUpdateRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "path node ID {path_node_id} does not match request node ID {}",
+                request.node_id
+            ),
+        }
+        .into());
+    }
+    Ok(Json(state.plane.rotate_wireguard_key(request).await?))
 }
 
 #[derive(Debug, Serialize)]
@@ -349,7 +377,8 @@ mod tests {
     use ipars_types::api::{
         ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest,
         HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse,
-        RevokeTokenRequest, RevokeTokenResponse,
+        RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState,
@@ -431,6 +460,27 @@ mod tests {
         request
     }
 
+    fn signed_wireguard_key_rotation(
+        label: &str,
+        previous_wireguard_public_key: String,
+        next_wireguard_public_key: String,
+    ) -> RotateWireGuardKeyRequest {
+        let identity = identity_for_node(label);
+        let mut request = RotateWireGuardKeyRequest {
+            node_id: identity.node_id(),
+            previous_wireguard_public_key,
+            next_wireguard_public_key,
+            node_signature: None,
+        };
+        request.node_signature = Some(
+            match identity.sign_wireguard_key_rotation_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign wireguard key rotation: {error}"),
+            },
+        );
+        request
+    }
+
     #[tokio::test]
     async fn http_join_registers_node() -> Result<(), Box<dyn std::error::Error>> {
         let issuer = IdentityKeyPair::generate();
@@ -501,6 +551,31 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RegisterNodeResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.node.node_id, node_id("node-http"));
+        let previous_wireguard_public_key = response.node.wireguard_public_key.clone();
+        let next_wireguard_public_key = wireguard_public_key_for_node("node-http-rotated");
+
+        let rotation = signed_wireguard_key_rotation(
+            "node-http",
+            previous_wireguard_public_key,
+            next_wireguard_public_key.clone(),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/nodes/{}/wireguard-key", node_id("node-http")))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&rotation)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: RotateWireGuardKeyResponse = serde_json::from_slice(&body)?;
+        assert_eq!(
+            response.node.wireguard_public_key,
+            next_wireguard_public_key
+        );
 
         let response = app
             .clone()

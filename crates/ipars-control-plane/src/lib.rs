@@ -7,11 +7,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
-    verify_heartbeat_request_signature, verify_join_token, CryptoError,
+    verify_heartbeat_request_signature, verify_join_token, verify_wireguard_key_rotation_signature,
+    CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse,
 };
 use ipars_types::{
     AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
@@ -101,6 +103,12 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         relay_capability: Option<RelayCapability>,
     ) -> Result<(), ControlPlaneError>;
+    async fn rotate_node_wireguard_public_key(
+        &self,
+        node_id: &NodeId,
+        expected_current_public_key: &str,
+        next_public_key: String,
+    ) -> Result<NodeRecord, ControlPlaneError>;
     async fn upsert_health(
         &self,
         node_id: NodeId,
@@ -183,6 +191,26 @@ impl ControlPlaneStore for InMemoryStore {
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.relay_capability = relay_capability;
         Ok(())
+    }
+
+    async fn rotate_node_wireguard_public_key(
+        &self,
+        node_id: &NodeId,
+        expected_current_public_key: &str,
+        next_public_key: String,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.wireguard_public_key != expected_current_public_key {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "wireguard public key changed before rotation completed".to_string(),
+            });
+        }
+        node.wireguard_public_key = next_public_key;
+        Ok(node.clone())
     }
 
     async fn upsert_health(
@@ -568,6 +596,98 @@ where
             policy_version: 0,
             peer_delta_available: false,
         })
+    }
+
+    pub async fn rotate_wireguard_key(
+        &self,
+        request: RotateWireGuardKeyRequest,
+    ) -> Result<RotateWireGuardKeyResponse, ControlPlaneError> {
+        let node = self
+            .store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        self.validate_wireguard_key_rotation_request(&request, &node, Utc::now())?;
+        let rotated_at = Utc::now();
+        let updated_node = self
+            .store
+            .rotate_node_wireguard_public_key(
+                &request.node_id,
+                &request.previous_wireguard_public_key,
+                request.next_wireguard_public_key,
+            )
+            .await?;
+        let peers = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&peers).await?;
+        let peer_map = self.filtered_peer_map_for_node(&updated_node, &peers, rotated_at);
+        let relay_map =
+            self.filtered_relay_map_for_node(&updated_node, &peers, &health_by_node, rotated_at);
+
+        Ok(RotateWireGuardKeyResponse {
+            node: updated_node,
+            peer_map,
+            relay_map,
+            rotated_at,
+        })
+    }
+
+    fn validate_wireguard_key_rotation_request(
+        &self,
+        request: &RotateWireGuardKeyRequest,
+        node: &NodeRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        validate_wireguard_public_key_b64(&request.previous_wireguard_public_key).map_err(
+            |error| ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!("previous wireguard public key is invalid: {error}"),
+            },
+        )?;
+        validate_wireguard_public_key_b64(&request.next_wireguard_public_key).map_err(|error| {
+            ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!("next wireguard public key is invalid: {error}"),
+            }
+        })?;
+        if request.node_signature.is_none() {
+            return Err(ControlPlaneError::NodeSignatureRequired(
+                request.node_id.clone(),
+            ));
+        }
+        verify_wireguard_key_rotation_signature(request, &node.identity_public_key).map_err(
+            |error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: error.to_string(),
+            },
+        )?;
+        let Some(signature) = request.node_signature.as_ref() else {
+            return Err(ControlPlaneError::NodeSignatureRequired(
+                request.node_id.clone(),
+            ));
+        };
+        let signed_at = signature.signed_at;
+        if !timestamp_within_skew(signed_at, now, self.config.heartbeat_signature_max_age) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "signed_at {signed_at} is outside the allowed {}s window",
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+        if request.previous_wireguard_public_key != node.wireguard_public_key {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "previous wireguard public key does not match registered key".to_string(),
+            });
+        }
+        if request.next_wireguard_public_key == node.wireguard_public_key {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "next wireguard public key matches registered key".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_heartbeat_request(
@@ -1070,7 +1190,7 @@ mod tests {
 
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
-    use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest};
+    use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest, RotateWireGuardKeyRequest};
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
         EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics,
@@ -1180,6 +1300,27 @@ mod tests {
         request
     }
 
+    fn signed_wireguard_key_rotation(
+        label: &str,
+        previous_wireguard_public_key: String,
+        next_wireguard_public_key: String,
+    ) -> RotateWireGuardKeyRequest {
+        let identity = identity_for_node(label);
+        let mut request = RotateWireGuardKeyRequest {
+            node_id: identity.node_id(),
+            previous_wireguard_public_key,
+            next_wireguard_public_key,
+            node_signature: None,
+        };
+        request.node_signature = Some(
+            match identity.sign_wireguard_key_rotation_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign wireguard key rotation: {error}"),
+            },
+        );
+        request
+    }
+
     fn relay_capability() -> RelayCapability {
         RelayCapability {
             enabled_by_policy: false,
@@ -1239,6 +1380,21 @@ mod tests {
         ) -> Result<(), ControlPlaneError> {
             self.inner
                 .update_node_relay_capability(node_id, relay_capability)
+                .await
+        }
+
+        async fn rotate_node_wireguard_public_key(
+            &self,
+            node_id: &NodeId,
+            expected_current_public_key: &str,
+            next_public_key: String,
+        ) -> Result<NodeRecord, ControlPlaneError> {
+            self.inner
+                .rotate_node_wireguard_public_key(
+                    node_id,
+                    expected_current_public_key,
+                    next_public_key,
+                )
                 .await
         }
 
@@ -1681,6 +1837,56 @@ mod tests {
         assert!(matches!(
             error,
             ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_wireguard_key_rotation_updates_registered_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let registration = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let previous_key = registration.node.wireguard_public_key;
+        let next_key = wireguard_public_key_for_node("node-a-rotated");
+
+        let rotation =
+            signed_wireguard_key_rotation("node-a", previous_key.clone(), next_key.clone());
+        let response = plane.rotate_wireguard_key(rotation.clone()).await?;
+
+        assert_eq!(response.node.node_id, node_id("node-a"));
+        assert_eq!(response.node.wireguard_public_key, next_key);
+        assert!(response.peer_map.peers.is_empty());
+
+        let replay = plane.rotate_wireguard_key(rotation).await;
+        assert!(matches!(
+            replay,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
+
+        let mut tampered =
+            signed_wireguard_key_rotation("node-a", next_key.clone(), previous_key.clone());
+        tampered.next_wireguard_public_key = wireguard_public_key_for_node("node-a-tampered");
+        assert!(matches!(
+            plane.rotate_wireguard_key(tampered).await,
+            Err(ControlPlaneError::NodeSignatureRejected { .. })
+        ));
+
+        let unsigned = RotateWireGuardKeyRequest {
+            node_id: node_id("node-a"),
+            previous_wireguard_public_key: next_key,
+            next_wireguard_public_key: wireguard_public_key_for_node("node-a-next"),
+            node_signature: None,
+        };
+        assert!(matches!(
+            plane.rotate_wireguard_key(unsigned).await,
+            Err(ControlPlaneError::NodeSignatureRequired(_))
         ));
         Ok(())
     }

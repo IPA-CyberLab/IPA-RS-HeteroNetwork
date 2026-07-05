@@ -13,7 +13,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - token ledger primitives and control-plane revocation API for revocation and max-use enforcement
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, relay-capability policy, WireGuard public-key format, identity-derived node IDs, and candidate/route ownership before registration
 - signed node heartbeat updates for health, endpoint candidates, relay capacity, and pair-scoped path state
-- typed control-plane HTTP routes for health, join registration, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics
+- typed control-plane HTTP routes for health, join registration, signed WireGuard key rotation, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
@@ -128,7 +128,7 @@ ipars k8s install --release ipars --namespace ipars-system --join-token-secret i
 
 Join tokens are single-use by default. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, relay permission with `--allow-relay`, and admission limits with `--max-uses` or `--unlimited-uses`.
 
-For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`.
+For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`. Registered nodes can rotate WireGuard data-plane keys through `PUT /v1/nodes/{node_id}/wireguard-key` with a node-identity signature over the previous and next WireGuard public keys; the control plane rejects stale, unsigned, malformed, or non-current transitions before updating the durable node record.
 
 Control-plane ACLs can be loaded with repeated `iparsd control-plane --acl-rule '<json>'` values, or semicolon-separated JSON objects in `IPARS_ACL_RULES`. Each object uses the typed `AclRule` shape with `id`, `from_roles`, `from_tags`, `to_roles`, `to_tags`, `routes`, `protocol`, and `action`; an empty ACL list keeps default allow-all peer visibility, while configured deny rules take precedence over allow rules.
 
