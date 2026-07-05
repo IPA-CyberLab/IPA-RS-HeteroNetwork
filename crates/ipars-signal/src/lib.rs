@@ -290,6 +290,16 @@ impl SignalRegistry {
                 !nat_classification_is_fresh(classification, now, nat_classification_ttl_seconds)
             })
             .count();
+        let fresh_low_confidence_nat_classification_count = nat_classifications
+            .values()
+            .filter(|classification| {
+                nat_classification_is_fresh(classification, now, nat_classification_ttl_seconds)
+                    && !nat_classification_meets_confidence(
+                        classification,
+                        nat_classification_min_confidence_percent,
+                    )
+            })
+            .count();
         let fresh_nat_classification_strategy_counts = nat_classification_strategy_counts(
             &nat_classifications,
             now,
@@ -313,6 +323,7 @@ impl SignalRegistry {
             relay_candidate_count,
             nat_classification_count: nat_classifications.len(),
             stale_nat_classification_count,
+            fresh_low_confidence_nat_classification_count,
             fresh_nat_classification_strategy_counts,
             health_report_count: health.len(),
             healthy_node_count,
@@ -990,6 +1001,7 @@ mod tests {
         assert_eq!(response.preferred_state, PathState::Unreachable);
         let metrics = registry.metrics().await;
         assert_eq!(metrics.nat_classification_min_confidence_percent, 80);
+        assert_eq!(metrics.fresh_low_confidence_nat_classification_count, 1);
         assert_eq!(
             signal_path_state_count(&metrics, PathState::DirectNatTraversal),
             0
@@ -1153,6 +1165,10 @@ mod tests {
         assert_eq!(stale_metrics.nat_classification_count, 1);
         assert_eq!(stale_metrics.stale_nat_classification_count, 0);
         assert_eq!(
+            stale_metrics.fresh_low_confidence_nat_classification_count,
+            0
+        );
+        assert_eq!(
             signal_nat_strategy_count(&stale_metrics, NatTraversalStrategy::RelayPreferred),
             1
         );
@@ -1281,6 +1297,7 @@ mod tests {
         assert_eq!(metrics.hole_punch_plan_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 1);
         assert_eq!(metrics.nat_classification_min_confidence_percent, 80);
+        assert_eq!(metrics.fresh_low_confidence_nat_classification_count, 1);
         Ok(())
     }
 

@@ -150,6 +150,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_fresh_low_confidence_nat_classifications Number of fresh signal NAT classifications below the configured confidence threshold."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_fresh_low_confidence_nat_classifications gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_fresh_low_confidence_nat_classifications {}",
+        metrics.fresh_low_confidence_nat_classification_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_fresh_nat_classifications_by_strategy Number of fresh signal NAT classifications by traversal strategy."
     );
     prometheus_line!(
@@ -516,6 +529,7 @@ mod tests {
         assert_eq!(metrics.node_count, 2);
         assert_eq!(metrics.relay_candidate_count, 0);
         assert_eq!(metrics.stale_nat_classification_count, 0);
+        assert_eq!(metrics.fresh_low_confidence_nat_classification_count, 0);
         assert!(metrics
             .fresh_nat_classification_strategy_counts
             .iter()
@@ -547,6 +561,7 @@ mod tests {
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("ipars_signal_nodes 2"));
         assert!(body.contains("ipars_signal_stale_nat_classifications 0"));
+        assert!(body.contains("ipars_signal_fresh_low_confidence_nat_classifications 0"));
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_nat_classification_ttl_seconds 300"));

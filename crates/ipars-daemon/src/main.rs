@@ -2516,6 +2516,7 @@ struct SignalOtelMetrics {
     relay_candidates: Gauge<u64>,
     nat_classifications: Gauge<u64>,
     fresh_nat_classifications_by_strategy: Gauge<u64>,
+    fresh_low_confidence_nat_classifications: Gauge<u64>,
     stale_nat_classifications: Gauge<u64>,
     health_report_total: Gauge<u64>,
     health_reports: Gauge<u64>,
@@ -2551,6 +2552,12 @@ impl SignalOtelMetrics {
             fresh_nat_classifications_by_strategy: meter
                 .u64_gauge("ipars.signal.nat_classifications.fresh.by_strategy")
                 .with_description("Fresh signal NAT classifications by traversal strategy.")
+                .build(),
+            fresh_low_confidence_nat_classifications: meter
+                .u64_gauge("ipars.signal.nat_classifications.fresh.low_confidence")
+                .with_description(
+                    "Fresh signal NAT classifications below the configured confidence threshold.",
+                )
                 .build(),
             stale_nat_classifications: meter
                 .u64_gauge("ipars.signal.stale_nat_classifications")
@@ -2630,6 +2637,10 @@ impl SignalOtelMetrics {
             self.fresh_nat_classifications_by_strategy
                 .record(strategy_count.count as u64, &attrs);
         }
+        self.fresh_low_confidence_nat_classifications.record(
+            metrics.fresh_low_confidence_nat_classification_count as u64,
+            &[],
+        );
         self.stale_nat_classifications
             .record(metrics.stale_nat_classification_count as u64, &[]);
         self.health_report_total

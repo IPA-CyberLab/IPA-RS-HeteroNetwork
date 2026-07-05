@@ -1093,6 +1093,8 @@ pub mod api {
         #[serde(default)]
         pub stale_nat_classification_count: usize,
         #[serde(default)]
+        pub fresh_low_confidence_nat_classification_count: usize,
+        #[serde(default)]
         pub fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
         pub health_report_count: usize,
         pub healthy_node_count: usize,
