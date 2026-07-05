@@ -1,5 +1,22 @@
 {{- $agentApiExternal := or (eq .Values.agent.apiService.type "NodePort") (eq .Values.agent.apiService.type "LoadBalancer") -}}
 {{- $relayExternal := or (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
+{{- $agentApiServiceTypeValid := or (eq .Values.agent.apiService.type "ClusterIP") (eq .Values.agent.apiService.type "NodePort") (eq .Values.agent.apiService.type "LoadBalancer") -}}
+{{- $relayServiceTypeValid := or (eq .Values.agent.relayService.type "ClusterIP") (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
+{{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
+{{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
+{{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
+{{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayServiceTypeValid) -}}
+{{- fail "agent.relayService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
+{{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayExternal (not $relayExternalTrafficPolicyValid) -}}
+{{- fail "agent.relayService.externalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not .Values.agent.apiService.exposureAcknowledged) -}}
 {{- fail "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" -}}
 {{- end -}}
@@ -9,13 +26,13 @@
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") (not .Values.agent.apiService.allowClusterExternalTrafficPolicy) -}}
 {{- fail "agent.apiService externalTrafficPolicy=Cluster requires agent.apiService.allowClusterExternalTrafficPolicy=true" -}}
 {{- end -}}
-{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
+{{- if and $relayServiceActive $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
 {{- fail "agent.relayService external exposure requires agent.relayService.exposureAcknowledged=true" -}}
 {{- end -}}
-{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled (eq .Values.agent.relayService.type "LoadBalancer") (not .Values.agent.relayService.loadBalancerSourceRanges) (not .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
+{{- if and $relayServiceActive (eq .Values.agent.relayService.type "LoadBalancer") (not .Values.agent.relayService.loadBalancerSourceRanges) (not .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
 {{- fail "agent.relayService LoadBalancer exposure requires agent.relayService.loadBalancerSourceRanges or agent.relayService.allowUnrestrictedLoadBalancer=true" -}}
 {{- end -}}
-{{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled $relayExternal (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") (not .Values.agent.relayService.allowClusterExternalTrafficPolicy) -}}
+{{- if and $relayServiceActive $relayExternal (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") (not .Values.agent.relayService.allowClusterExternalTrafficPolicy) -}}
 {{- fail "agent.relayService externalTrafficPolicy=Cluster requires agent.relayService.allowClusterExternalTrafficPolicy=true" -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled }}
