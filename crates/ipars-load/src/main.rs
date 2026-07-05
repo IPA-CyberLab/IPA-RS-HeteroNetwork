@@ -40,6 +40,7 @@ static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
+const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -62,6 +63,9 @@ struct Cli {
 
     #[arg(long, default_value_t = 4)]
     daemon_agent_processes: usize,
+
+    #[arg(long, default_value_t = 1)]
+    daemon_control_plane_processes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -174,6 +178,8 @@ struct LoadReport {
     relay_mbps: f64,
     daemon_processes: usize,
     daemon_agent_processes: usize,
+    daemon_control_plane_processes: usize,
+    daemon_control_plane_metrics_endpoints: usize,
     daemon_control_plane_healthy_nodes: usize,
     daemon_control_plane_degraded_nodes: usize,
     daemon_control_plane_unhealthy_nodes: usize,
@@ -208,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
             run_daemon_scenario(
                 scenario,
                 &cli.iparsd_bin,
+                cli.daemon_control_plane_processes,
                 cli.daemon_agent_processes,
                 RelayLoadOptions {
                     packets_per_session: cli.relay_packets_per_session,
@@ -316,6 +323,8 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_processes: 0,
+        daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_degraded_nodes: 0,
         daemon_control_plane_unhealthy_nodes: 0,
@@ -462,6 +471,8 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_processes: 0,
+        daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_degraded_nodes: 0,
         daemon_control_plane_unhealthy_nodes: 0,
@@ -582,6 +593,8 @@ async fn run_relay_udp_scenario(
         relay_mbps,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_processes: 0,
+        daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_degraded_nodes: 0,
         daemon_control_plane_unhealthy_nodes: 0,
@@ -599,10 +612,13 @@ async fn run_relay_udp_scenario(
 async fn run_daemon_scenario(
     scenario: Scenario,
     iparsd_bin: &Path,
+    requested_control_plane_processes: usize,
     requested_agent_processes: usize,
     relay_options: RelayLoadOptions,
 ) -> anyhow::Result<LoadReport> {
     let relay_options = relay_options.validate()?;
+    let control_plane_processes =
+        validate_daemon_control_plane_processes(requested_control_plane_processes)?;
     let agent_processes = validate_daemon_agent_processes(requested_agent_processes, scenario)?;
     let issuer = IdentityKeyPair::generate();
     let key_id = KeyId::from_string("load-key");
@@ -613,6 +629,7 @@ async fn run_daemon_scenario(
         cluster_id.clone(),
         &issuer,
         &key_id,
+        control_plane_processes,
         agent_processes,
     )
     .await?;
@@ -630,10 +647,12 @@ async fn run_daemon_scenario(
     let peer_map_started = Instant::now();
     let mut peer_map_edges_seen = 0;
     let mut peer_records = Vec::new();
-    for status in &agent_statuses {
+    for (index, status) in agent_statuses.iter().enumerate() {
+        let control_plane_url =
+            &services.control_plane_urls[index % services.control_plane_urls.len()];
         let peer_map: PeerMap = get_json(
             &client,
-            format!("{}/v1/peers/{}", services.control_plane_url, status.node_id),
+            format!("{control_plane_url}/v1/peers/{}", status.node_id),
             "daemon control-plane peer map",
         )
         .await?;
@@ -757,12 +776,8 @@ async fn run_daemon_scenario(
     } else {
         relay_payload_bytes_received as f64 * 8.0 / relay_elapsed.as_secs_f64() / 1_000_000.0
     };
-    let control_metrics: ControlPlaneMetricsResponse = get_json(
-        &client,
-        format!("{}/v1/metrics", services.control_plane_url),
-        "daemon control-plane metrics",
-    )
-    .await?;
+    let control_summary =
+        control_plane_health_summary(&client, &services.control_plane_urls, "daemon").await?;
     let signal_metrics: SignalMetricsResponse = get_json(
         &client,
         format!("{}/v1/metrics", services.signal_url),
@@ -783,13 +798,13 @@ async fn run_daemon_scenario(
         peer_map_requests: agent_statuses.len(),
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
-        relay_candidates: control_metrics.relay_candidate_count,
+        relay_candidates: control_summary.relay_candidate_count,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: agent_statuses.len() + agent_statuses.len() + 1,
+        control_plane_http_requests: (agent_statuses.len() * 2) + control_summary.endpoint_count,
         signal_http_requests: peer_records.len() + active_pair_count + 1,
         relay_http_requests: active_pair_count + 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
@@ -803,9 +818,11 @@ async fn run_daemon_scenario(
         relay_mbps,
         daemon_processes: services.process_count(),
         daemon_agent_processes: agent_processes,
-        daemon_control_plane_healthy_nodes: control_metrics.healthy_node_count,
-        daemon_control_plane_degraded_nodes: control_metrics.degraded_node_count,
-        daemon_control_plane_unhealthy_nodes: control_metrics.unhealthy_node_count,
+        daemon_control_plane_processes: services.control_plane_urls.len(),
+        daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
+        daemon_control_plane_healthy_nodes: control_summary.healthy_node_count,
+        daemon_control_plane_degraded_nodes: control_summary.degraded_node_count,
+        daemon_control_plane_unhealthy_nodes: control_summary.unhealthy_node_count,
         daemon_signal_health_reports: signal_metrics.health_report_count,
         daemon_signal_healthy_nodes: signal_metrics.healthy_node_count,
         daemon_signal_degraded_nodes: signal_metrics.degraded_node_count,
@@ -831,6 +848,20 @@ fn validate_daemon_agent_processes(
         );
     }
     Ok(requested_agent_processes)
+}
+
+fn validate_daemon_control_plane_processes(
+    requested_control_plane_processes: usize,
+) -> anyhow::Result<usize> {
+    if requested_control_plane_processes == 0 {
+        bail!("--daemon-control-plane-processes must be greater than zero");
+    }
+    if requested_control_plane_processes > MAX_DAEMON_CONTROL_PLANE_PROCESSES {
+        bail!(
+            "--daemon-control-plane-processes ({requested_control_plane_processes}) cannot exceed {MAX_DAEMON_CONTROL_PLANE_PROCESSES}"
+        );
+    }
+    Ok(requested_control_plane_processes)
 }
 
 #[derive(Debug, Default)]
@@ -985,7 +1016,7 @@ impl Drop for RelayNetworkedServices {
 }
 
 struct DaemonProcessGroup {
-    control_plane_url: String,
+    control_plane_urls: Vec<String>,
     signal_url: String,
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
@@ -1001,6 +1032,7 @@ impl DaemonProcessGroup {
         cluster_id: ClusterId,
         issuer: &IdentityKeyPair,
         key_id: &KeyId,
+        control_plane_processes: usize,
         agent_processes: usize,
     ) -> anyhow::Result<Self> {
         if !iparsd_bin.exists() && iparsd_bin.components().count() > 1 {
@@ -1009,32 +1041,53 @@ impl DaemonProcessGroup {
         let runtime_dir = daemon_runtime_dir()?;
         std::fs::create_dir_all(&runtime_dir)?;
         let mut startup = DaemonStartupGuard::new(runtime_dir.clone());
-        let control_addr = reserve_tcp_addr().await?;
+        let control_addrs = reserve_tcp_addrs(control_plane_processes).await?;
         let signal_addr = reserve_tcp_addr().await?;
         let relay_http_addr = reserve_tcp_addr().await?;
         let relay_udp_addr = reserve_udp_addr().await?;
         let stun_addr = reserve_udp_addr().await?;
-        let control_plane_url = format!("http://{control_addr}");
+        let control_plane_urls = control_addrs
+            .iter()
+            .map(|addr| format!("http://{addr}"))
+            .collect::<Vec<_>>();
+        control_plane_urls
+            .first()
+            .context("at least one daemon control-plane URL is required")?;
         let signal_url = format!("http://{signal_addr}");
         let relay_http_url = format!("http://{relay_http_addr}");
-        startup.children.push(spawn_iparsd(
-            iparsd_bin,
-            &[
-                "control-plane".to_string(),
-                "--listen".to_string(),
-                control_addr.to_string(),
-                "--cluster-id".to_string(),
-                cluster_id.to_string(),
-                "--issuer-node-id".to_string(),
-                issuer.node_id().to_string(),
-                "--issuer-key-id".to_string(),
-                key_id.to_string(),
-                "--issuer-public-key".to_string(),
-                issuer.public_key_b64(),
-            ],
-            "control-plane",
-            &runtime_dir,
-        )?);
+        let control_plane_database_url =
+            daemon_sqlite_database_url(&runtime_dir.join("control-plane.sqlite"));
+        let client = reqwest::Client::new();
+        for (index, control_addr) in control_addrs.iter().enumerate() {
+            let role = format!("control-plane-{index}");
+            startup.children.push(spawn_iparsd(
+                iparsd_bin,
+                &[
+                    "control-plane".to_string(),
+                    "--listen".to_string(),
+                    control_addr.to_string(),
+                    "--cluster-id".to_string(),
+                    cluster_id.to_string(),
+                    "--database-url".to_string(),
+                    control_plane_database_url.clone(),
+                    "--issuer-node-id".to_string(),
+                    issuer.node_id().to_string(),
+                    "--issuer-key-id".to_string(),
+                    key_id.to_string(),
+                    "--issuer-public-key".to_string(),
+                    issuer.public_key_b64(),
+                ],
+                &role,
+                &runtime_dir,
+            )?);
+            wait_for_http_ok(
+                &client,
+                format!("{}/healthz", control_plane_urls[index]),
+                &role,
+                &mut startup.children,
+            )
+            .await?;
+        }
         startup.children.push(spawn_iparsd(
             iparsd_bin,
             &[
@@ -1078,14 +1131,6 @@ impl DaemonProcessGroup {
             &runtime_dir,
         )?);
 
-        let client = reqwest::Client::new();
-        wait_for_http_ok(
-            &client,
-            format!("{control_plane_url}/healthz"),
-            "control-plane",
-            &mut startup.children,
-        )
-        .await?;
         wait_for_http_ok(
             &client,
             format!("{signal_url}/healthz"),
@@ -1106,12 +1151,13 @@ impl DaemonProcessGroup {
             let agent_addr = reserve_tcp_addr().await?;
             let agent_url = format!("http://{agent_addr}");
             let state_path = runtime_dir.join(format!("agent-{index:04}.json"));
-            let token = issuer.sign_join_token(join_claims(
+            let token = issuer.sign_join_token(join_claims_with_control_plane_urls(
                 &cluster_id,
                 &issuer.node_id(),
                 key_id,
                 index,
                 scenario,
+                &control_plane_urls,
             )?)?;
             let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
             startup.children.push(spawn_iparsd(
@@ -1124,8 +1170,6 @@ impl DaemonProcessGroup {
                     state_path.display().to_string(),
                     "--join-token-path".to_string(),
                     token_path.display().to_string(),
-                    "--control-plane-url".to_string(),
-                    control_plane_url.clone(),
                     "--signal-url".to_string(),
                     signal_url.clone(),
                     "--stun-server".to_string(),
@@ -1157,7 +1201,7 @@ impl DaemonProcessGroup {
         }
         wait_for_daemon_agents_ready(
             &client,
-            &control_plane_url,
+            &control_plane_urls,
             &signal_url,
             &agent_urls,
             &mut startup.children,
@@ -1166,7 +1210,7 @@ impl DaemonProcessGroup {
 
         let children = startup.finish();
         Ok(Self {
-            control_plane_url,
+            control_plane_urls,
             signal_url,
             relay_http_url,
             relay_udp_addr,
@@ -1421,9 +1465,26 @@ async fn reserve_tcp_addr() -> anyhow::Result<SocketAddr> {
     Ok(listener.local_addr()?)
 }
 
+async fn reserve_tcp_addrs(count: usize) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut listeners = Vec::with_capacity(count);
+    let mut addrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await?;
+        addrs.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    Ok(addrs)
+}
+
 async fn reserve_udp_addr() -> anyhow::Result<SocketAddr> {
     let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
     Ok(socket.local_addr()?)
+}
+
+fn daemon_sqlite_database_url(path: &Path) -> String {
+    format!("sqlite://{}?mode=rwc", path.display())
 }
 
 async fn wait_for_http_ok(
@@ -1458,7 +1519,7 @@ async fn wait_for_http_ok(
 
 async fn wait_for_daemon_agents_ready(
     client: &reqwest::Client,
-    control_plane_url: &str,
+    control_plane_urls: &[String],
     signal_url: &str,
     agent_urls: &[String],
     children: &mut [DaemonChild],
@@ -1469,7 +1530,7 @@ async fn wait_for_daemon_agents_ready(
         match daemon_agent_statuses(client, agent_urls).await {
             Ok(statuses) => match check_daemon_agent_control_and_signal_readiness(
                 client,
-                control_plane_url,
+                control_plane_urls,
                 signal_url,
                 &statuses,
             )
@@ -1507,51 +1568,101 @@ async fn daemon_agent_statuses(
     Ok(statuses)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ControlPlaneHealthSummary {
+    endpoint_count: usize,
+    relay_candidate_count: usize,
+    healthy_node_count: usize,
+    degraded_node_count: usize,
+    unhealthy_node_count: usize,
+}
+
+async fn control_plane_health_summary(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    context: &str,
+) -> anyhow::Result<ControlPlaneHealthSummary> {
+    if control_plane_urls.is_empty() {
+        bail!("at least one daemon control-plane URL is required");
+    }
+
+    let mut summary: Option<ControlPlaneHealthSummary> = None;
+    for control_plane_url in control_plane_urls {
+        let request_context = format!("{context} control-plane metrics");
+        let metrics: ControlPlaneMetricsResponse = get_json(
+            client,
+            format!("{control_plane_url}/v1/metrics"),
+            &request_context,
+        )
+        .await?;
+        summary = Some(match summary {
+            Some(summary) => ControlPlaneHealthSummary {
+                endpoint_count: summary.endpoint_count + 1,
+                relay_candidate_count: summary
+                    .relay_candidate_count
+                    .min(metrics.relay_candidate_count),
+                healthy_node_count: summary.healthy_node_count.min(metrics.healthy_node_count),
+                degraded_node_count: summary.degraded_node_count.max(metrics.degraded_node_count),
+                unhealthy_node_count: summary
+                    .unhealthy_node_count
+                    .max(metrics.unhealthy_node_count),
+            },
+            None => ControlPlaneHealthSummary {
+                endpoint_count: 1,
+                relay_candidate_count: metrics.relay_candidate_count,
+                healthy_node_count: metrics.healthy_node_count,
+                degraded_node_count: metrics.degraded_node_count,
+                unhealthy_node_count: metrics.unhealthy_node_count,
+            },
+        });
+    }
+
+    summary.context("daemon control-plane metrics summary was empty")
+}
+
 async fn check_daemon_agent_control_and_signal_readiness(
     client: &reqwest::Client,
-    control_plane_url: &str,
+    control_plane_urls: &[String],
     signal_url: &str,
     statuses: &[AgentStatusResponse],
 ) -> anyhow::Result<()> {
     let expected_agent_count = statuses.len();
     if expected_agent_count > 0 {
-        let control_metrics: ControlPlaneMetricsResponse = get_json(
-            client,
-            format!("{control_plane_url}/v1/metrics"),
-            "daemon control-plane readiness metrics",
-        )
-        .await?;
-        if control_metrics.healthy_node_count < expected_agent_count {
+        let control_summary =
+            control_plane_health_summary(client, control_plane_urls, "daemon readiness").await?;
+        if control_summary.healthy_node_count < expected_agent_count {
             bail!(
-                "daemon control-plane reports {} healthy nodes; expected at least {}",
-                control_metrics.healthy_node_count,
+                "daemon control-plane endpoints report at least {} healthy nodes; expected at least {}",
+                control_summary.healthy_node_count,
                 expected_agent_count
             );
         }
-        if control_metrics.degraded_node_count > 0 || control_metrics.unhealthy_node_count > 0 {
+        if control_summary.degraded_node_count > 0 || control_summary.unhealthy_node_count > 0 {
             bail!(
-                "daemon control-plane reports degraded={} unhealthy={} nodes during readiness",
-                control_metrics.degraded_node_count,
-                control_metrics.unhealthy_node_count
+                "daemon control-plane endpoints report degraded={} unhealthy={} nodes during readiness",
+                control_summary.degraded_node_count,
+                control_summary.unhealthy_node_count
             );
         }
     }
 
-    for status in statuses {
-        let peer_map: PeerMap = get_json(
-            client,
-            format!("{control_plane_url}/v1/peers/{}", status.node_id),
-            "daemon control-plane readiness peer map",
-        )
-        .await?;
-        let expected_peer_count = statuses.len().saturating_sub(1);
-        if peer_map.peers.len() < expected_peer_count {
-            bail!(
-                "daemon control-plane peer map for {} has {} peers; expected at least {}",
-                status.node_id,
-                peer_map.peers.len(),
-                expected_peer_count
-            );
+    for control_plane_url in control_plane_urls {
+        for status in statuses {
+            let peer_map: PeerMap = get_json(
+                client,
+                format!("{control_plane_url}/v1/peers/{}", status.node_id),
+                "daemon control-plane readiness peer map",
+            )
+            .await?;
+            let expected_peer_count = statuses.len().saturating_sub(1);
+            if peer_map.peers.len() < expected_peer_count {
+                bail!(
+                    "daemon control-plane peer map at {control_plane_url} for {} has {} peers; expected at least {}",
+                    status.node_id,
+                    peer_map.peers.len(),
+                    expected_peer_count
+                );
+            }
         }
     }
 
@@ -1766,6 +1877,27 @@ fn join_claims(
     index: usize,
     scenario: Scenario,
 ) -> anyhow::Result<JoinTokenClaims> {
+    join_claims_with_control_plane_urls(
+        cluster_id,
+        issuer,
+        key_id,
+        index,
+        scenario,
+        &["http://127.0.0.1:8443".to_string()],
+    )
+}
+
+fn join_claims_with_control_plane_urls(
+    cluster_id: &ClusterId,
+    issuer: &NodeId,
+    key_id: &KeyId,
+    index: usize,
+    scenario: Scenario,
+    control_plane_urls: &[String],
+) -> anyhow::Result<JoinTokenClaims> {
+    if control_plane_urls.is_empty() {
+        bail!("join token requires at least one control-plane bootstrap URL");
+    }
     let now = Utc::now();
     let mut tags = BTreeSet::new();
     tags.insert(Tag::from_string(if index < scenario.relay_count {
@@ -1777,10 +1909,13 @@ fn join_claims(
     }));
     Ok(JoinTokenClaims {
         cluster_id: cluster_id.clone(),
-        bootstrap_endpoints: vec![BootstrapEndpoint {
-            url: "http://127.0.0.1:8443".to_string(),
-            kind: BootstrapEndpointKind::ControlPlane,
-        }],
+        bootstrap_endpoints: control_plane_urls
+            .iter()
+            .map(|url| BootstrapEndpoint {
+                url: url.clone(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            })
+            .collect(),
         expires_at: now + chrono::Duration::minutes(30),
         not_before: now - chrono::Duration::seconds(1),
         role: if index < scenario.relay_count {
@@ -2030,6 +2165,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_control_plane_processes_reject_invalid_bounds() -> anyhow::Result<()> {
+        let zero = match validate_daemon_control_plane_processes(0) {
+            Ok(_) => bail!("zero daemon control-plane process count should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(zero.contains("--daemon-control-plane-processes"));
+
+        let too_many =
+            match validate_daemon_control_plane_processes(MAX_DAEMON_CONTROL_PLANE_PROCESSES + 1) {
+                Ok(_) => {
+                    bail!("oversized daemon control-plane process count should fail validation")
+                }
+                Err(error) => error.to_string(),
+            };
+        assert!(too_many.contains("cannot exceed"));
+
+        assert_eq!(validate_daemon_control_plane_processes(2)?, 2);
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("load-key");
@@ -2056,6 +2212,38 @@ mod tests {
         assert!(ten_node_claims.policy.allow_relay);
         assert_eq!(ten_node_claims.role, Role::from_string("relay"));
         assert!(ten_node_claims.tags.contains(&Tag::from_string("public")));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_join_claims_include_runtime_control_plane_bootstrap_urls() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("load-key");
+        let cluster_id = ClusterId::from_string("load-daemon-bootstrap");
+        let urls = vec![
+            "http://127.0.0.1:31001".to_string(),
+            "http://127.0.0.1:31002".to_string(),
+        ];
+
+        let claims = join_claims_with_control_plane_urls(
+            &cluster_id,
+            &issuer.node_id(),
+            &key_id,
+            0,
+            Scenario::from_name(ScenarioName::Three),
+            &urls,
+        )?;
+
+        let claim_urls = claims
+            .bootstrap_endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(claim_urls, urls);
+        assert!(claims
+            .bootstrap_endpoints
+            .iter()
+            .all(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane));
         Ok(())
     }
 
@@ -2120,7 +2308,7 @@ mod tests {
 
         check_daemon_agent_control_and_signal_readiness(
             &client,
-            &services.control_plane_url,
+            std::slice::from_ref(&services.control_plane_url),
             &services.signal_url,
             &statuses,
         )
@@ -2214,6 +2402,7 @@ mod tests {
             Scenario::from_name(ScenarioName::Three),
             &iparsd_bin,
             2,
+            2,
             RelayLoadOptions {
                 packets_per_session: 1,
                 payload_bytes: 64,
@@ -2222,9 +2411,11 @@ mod tests {
         .await?;
 
         assert_eq!(report.transport, TransportMode::Daemon);
+        assert_eq!(report.daemon_control_plane_processes, 2);
+        assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
-        assert_eq!(report.daemon_processes, 6);
+        assert_eq!(report.daemon_processes, 7);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
         assert_eq!(report.daemon_control_plane_degraded_nodes, 0);
         assert_eq!(report.daemon_control_plane_unhealthy_nodes, 0);
