@@ -311,9 +311,12 @@ impl IntoResponse for ApiError {
             ControlPlaneError::TokenNotFound(_) | ControlPlaneError::IssuerKeyNotFound { .. } => {
                 StatusCode::UNAUTHORIZED
             }
+            ControlPlaneError::NodeSignatureRequired(_)
+            | ControlPlaneError::NodeSignatureRejected { .. } => StatusCode::UNAUTHORIZED,
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)
             | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,
+            ControlPlaneError::NodeUpdateRejected { .. } => StatusCode::FORBIDDEN,
             ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
             ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -379,14 +382,37 @@ mod tests {
     }
 
     fn registration(node_id: &str) -> RegisterNodeRequest {
+        let identity = identity_for_node(node_id);
         RegisterNodeRequest {
             node_id: NodeId::from_string(node_id),
-            identity_public_key: format!("identity-{node_id}"),
+            identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             candidates: Vec::new(),
             relay_capability: None,
             requested_routes: Vec::new(),
         }
+    }
+
+    fn identity_for_node(node_id: &str) -> IdentityKeyPair {
+        let mut seed = [0_u8; 32];
+        for (index, byte) in node_id.as_bytes().iter().enumerate() {
+            seed[index % seed.len()] = seed[index % seed.len()].wrapping_add(*byte);
+        }
+        if seed.iter().all(|byte| *byte == 0) {
+            seed[0] = 1;
+        }
+        IdentityKeyPair::from_signing_bytes(seed)
+    }
+
+    fn signed_heartbeat(mut request: HeartbeatRequest) -> HeartbeatRequest {
+        let identity = identity_for_node(request.node_id.as_str());
+        request.node_signature = Some(
+            match identity.sign_heartbeat_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign heartbeat: {error}"),
+            },
+        );
+        request
     }
 
     #[tokio::test]
@@ -494,7 +520,7 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let heartbeat = HeartbeatRequest {
+        let heartbeat = signed_heartbeat(HeartbeatRequest {
             node_id: NodeId::from_string("node-http"),
             health: NodeHealth {
                 state: HealthState::Healthy,
@@ -506,7 +532,8 @@ mod tests {
             candidates: Vec::new(),
             relay_capability: None,
             path_state: Vec::new(),
-        };
+            node_signature: None,
+        });
         let response = app
             .clone()
             .oneshot(

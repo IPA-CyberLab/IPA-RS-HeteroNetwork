@@ -22,6 +22,7 @@ ipars-agent = { path = "../ipars-agent" }
 ipars-agent-http = { path = "../ipars-agent-http" }
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
+ipars-crypto = { path = "../ipars-crypto" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-relay-http = { path = "../ipars-relay-http" }
 ipars-route-manager = { path = "../ipars-route-manager" }

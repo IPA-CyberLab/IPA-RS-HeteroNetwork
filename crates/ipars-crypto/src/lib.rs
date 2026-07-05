@@ -2,6 +2,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ipars_types::api::{HeartbeatRequest, NodeRequestSignature};
 use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -73,6 +74,19 @@ impl IdentityKeyPair {
             signature: encode_bytes(&signature.to_bytes()),
         })
     }
+
+    pub fn sign_heartbeat_request(
+        &self,
+        request: &HeartbeatRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeRequestSignature, CryptoError> {
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at))?;
+        let signature = self.signing_key.sign(&payload);
+        Ok(NodeRequestSignature {
+            signed_at,
+            signature: encode_bytes(&signature.to_bytes()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +134,26 @@ pub fn verify_join_token(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+pub fn verify_heartbeat_request_signature(
+    request: &HeartbeatRequest,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let node_signature = request
+        .node_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let key_bytes = decode_32(node_public_key_b64)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let signature_bytes = STANDARD.decode(&node_signature.signature)?;
+    let signature = Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(&request.signature_payload(node_signature.signed_at))?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 pub fn node_id_from_public_key(public_key: &[u8]) -> NodeId {
     let digest = Sha256::digest(public_key);
     NodeId::from_string(format!("node-{}", hex::encode(&digest[..16])))
@@ -142,7 +176,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     use chrono::Duration;
-    use ipars_types::{BootstrapEndpoint, BootstrapEndpointKind, KeyId, Role, Tag, TokenPolicy};
+    use ipars_types::api::HeartbeatRequest;
+    use ipars_types::{
+        BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, Role, Tag,
+        TokenPolicy,
+    };
 
     use super::*;
 
@@ -189,6 +227,35 @@ mod tests {
 
         assert_eq!(key.node_id(), restored.node_id());
         assert_eq!(key.public_key_b64(), restored.public_key_b64());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_heartbeat_request_round_trips() -> Result<(), CryptoError> {
+        let key = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let mut request = HeartbeatRequest {
+            node_id: key.node_id(),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: now,
+                latency_ms: Some(1.0),
+                relay_load: None,
+                message: Some("ok".to_string()),
+            },
+            candidates: Vec::new(),
+            relay_capability: None,
+            path_state: Vec::new(),
+            node_signature: None,
+        };
+        request.node_signature = Some(key.sign_heartbeat_request(&request, now)?);
+
+        verify_heartbeat_request_signature(&request, &key.public_key_b64())?;
+        request.health.message = Some("tampered".to_string());
+        assert!(matches!(
+            verify_heartbeat_request_signature(&request, &key.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
         Ok(())
     }
 }

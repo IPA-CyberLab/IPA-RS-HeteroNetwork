@@ -29,6 +29,7 @@ use ipars_control_plane::{
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
+use ipars_crypto::IdentityKeyPair;
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
@@ -3283,6 +3284,10 @@ async fn run_agent(
     if !args.disable_heartbeat && !control_plane_bases.is_empty() {
         background_tasks.push(start_heartbeat_reporting(
             runtime.clone(),
+            runtime
+                .state()
+                .identity_key_pair()
+                .context("failed to load agent identity key for heartbeat signing")?,
             control_plane_bases.clone(),
             Duration::from_secs(args.heartbeat_interval_seconds),
             relay_capability_reporter.clone(),
@@ -5140,6 +5145,7 @@ async fn register_agent(
 
 fn start_heartbeat_reporting(
     runtime: Arc<AgentRuntime>,
+    identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
@@ -5147,6 +5153,7 @@ fn start_heartbeat_reporting(
     tokio::spawn(async move {
         run_heartbeat_loop(
             runtime,
+            identity,
             control_plane_urls,
             interval,
             relay_capability_reporter,
@@ -5157,6 +5164,7 @@ fn start_heartbeat_reporting(
 
 async fn run_heartbeat_loop(
     runtime: Arc<AgentRuntime>,
+    identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
@@ -5165,7 +5173,15 @@ async fn run_heartbeat_loop(
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
-        let request = heartbeat_request(runtime.as_ref(), relay_capability.clone()).await;
+        let request =
+            match heartbeat_request(runtime.as_ref(), &identity, relay_capability.clone()).await {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
         match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
             Ok(response) => tracing::info!(
                 accepted = response.accepted,
@@ -5224,11 +5240,12 @@ async fn send_heartbeat(
 
 async fn heartbeat_request(
     runtime: &AgentRuntime,
+    identity: &IdentityKeyPair,
     relay_capability: Option<RelayCapability>,
-) -> HeartbeatRequest {
+) -> anyhow::Result<HeartbeatRequest> {
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
-    HeartbeatRequest {
+    let mut request = HeartbeatRequest {
         node_id: status.node_id,
         health: NodeHealth {
             state: HealthState::Healthy,
@@ -5240,7 +5257,14 @@ async fn heartbeat_request(
         candidates: status.candidates,
         relay_capability,
         path_state,
-    }
+        node_signature: None,
+    };
+    request.node_signature = Some(
+        identity
+            .sign_heartbeat_request(&request, chrono::Utc::now())
+            .context("failed to sign agent heartbeat request")?,
+    );
+    Ok(request)
 }
 
 fn start_signal_registration(
@@ -12233,7 +12257,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[tokio::test]
-    async fn heartbeat_request_uses_runtime_state() {
+    async fn heartbeat_request_uses_runtime_state() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -12253,13 +12277,16 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
         runtime.upsert_path_state(path.clone()).await;
 
-        let request = heartbeat_request(&runtime, None).await;
+        let identity = runtime.state().identity_key_pair()?;
+        let request = heartbeat_request(&runtime, &identity, None).await?;
 
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
+        assert!(request.node_signature.is_some());
         assert!(request.candidates.is_empty());
         assert!(request.relay_capability.is_none());
         assert_eq!(request.path_state, vec![path]);
+        Ok(())
     }
 
     #[tokio::test]

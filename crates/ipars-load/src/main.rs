@@ -344,10 +344,11 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         .await
         .with_context(|| format!("failed to join synthetic node {index} over HTTP"))?;
         if index < scenario.relay_count {
+            let heartbeat = heartbeat_request(&response.node)?;
             let _: HeartbeatResponse = post_json(
                 &client,
                 format!("{}/v1/heartbeat", services.control_plane_url),
-                &heartbeat_request(&response.node),
+                &heartbeat,
                 "control-plane heartbeat",
             )
             .await
@@ -1606,9 +1607,11 @@ where
 }
 
 fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<RegisterNodeRequest> {
+    let node_id = node_id(index);
+    let identity = identity_for_node(&node_id);
     Ok(RegisterNodeRequest {
-        node_id: node_id(index),
-        identity_public_key: format!("identity-public-{index}"),
+        node_id,
+        identity_public_key: identity.public_key_b64(),
         wireguard_public_key: format!("wireguard-public-{index}"),
         candidates: endpoint_candidates(index, scenario),
         relay_capability: relay_capability(index, scenario),
@@ -1616,14 +1619,21 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
     })
 }
 
-fn heartbeat_request(node: &NodeRecord) -> HeartbeatRequest {
-    HeartbeatRequest {
+fn heartbeat_request(node: &NodeRecord) -> anyhow::Result<HeartbeatRequest> {
+    let mut request = HeartbeatRequest {
         node_id: node.node_id.clone(),
         health: healthy_node_health(),
         candidates: node.endpoint_candidates.clone(),
         relay_capability: None,
         path_state: Vec::new(),
-    }
+        node_signature: None,
+    };
+    request.node_signature = Some(
+        identity_for_node(&request.node_id)
+            .sign_heartbeat_request(&request, Utc::now())
+            .context("failed to sign synthetic load heartbeat")?,
+    );
+    Ok(request)
 }
 
 fn healthy_node_health() -> NodeHealth {
@@ -1761,6 +1771,17 @@ fn relay_capability(index: usize, scenario: Scenario) -> Option<RelayCapability>
 
 fn node_id(index: usize) -> NodeId {
     NodeId::from_string(format!("load-node-{index:04}"))
+}
+
+fn identity_for_node(node_id: &NodeId) -> IdentityKeyPair {
+    let mut seed = [0_u8; 32];
+    for (index, byte) in node_id.as_str().as_bytes().iter().enumerate() {
+        seed[index % seed.len()] = seed[index % seed.len()].wrapping_add(*byte);
+    }
+    if seed.iter().all(|byte| *byte == 0) {
+        seed[0] = 1;
+    }
+    IdentityKeyPair::from_signing_bytes(seed)
 }
 
 #[cfg(test)]

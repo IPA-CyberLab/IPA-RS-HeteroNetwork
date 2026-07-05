@@ -1182,6 +1182,7 @@ dependencies = [
  "ipars-agent-http",
  "ipars-control-plane",
  "ipars-control-plane-http",
+ "ipars-crypto",
  "ipars-relay",
  "ipars-relay-http",
  "ipars-route-manager",

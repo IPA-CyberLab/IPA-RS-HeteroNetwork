@@ -873,6 +873,22 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct NodeRequestSignature {
+        pub signed_at: DateTime<Utc>,
+        pub signature: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct HeartbeatSignaturePayload {
+        pub node_id: NodeId,
+        pub health: NodeHealth,
+        pub candidates: Vec<EndpointCandidate>,
+        pub relay_capability: Option<RelayCapability>,
+        pub path_state: Vec<PathRecord>,
+        pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatRequest {
         pub node_id: NodeId,
         pub health: NodeHealth,
@@ -880,6 +896,21 @@ pub mod api {
         #[serde(default)]
         pub relay_capability: Option<RelayCapability>,
         pub path_state: Vec<PathRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_signature: Option<NodeRequestSignature>,
+    }
+
+    impl HeartbeatRequest {
+        pub fn signature_payload(&self, signed_at: DateTime<Utc>) -> HeartbeatSignaturePayload {
+            HeartbeatSignaturePayload {
+                node_id: self.node_id.clone(),
+                health: self.health.clone(),
+                candidates: self.candidates.clone(),
+                relay_capability: self.relay_capability.clone(),
+                path_state: self.path_state.clone(),
+                signed_at,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ipars_crypto::{verify_join_token, CryptoError};
+use ipars_crypto::{verify_heartbeat_request_signature, verify_join_token, CryptoError};
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
     RegisterNodeRequest, RegisterNodeResponse, RelayMap,
@@ -28,6 +28,12 @@ pub enum ControlPlaneError {
     NodeAlreadyExists(NodeId),
     #[error("VPN IP {0} is already allocated")]
     VpnIpAlreadyAllocated(VpnIp),
+    #[error("node {0} heartbeat signature is required")]
+    NodeSignatureRequired(NodeId),
+    #[error("node {node_id} heartbeat signature rejected: {reason}")]
+    NodeSignatureRejected { node_id: NodeId, reason: String },
+    #[error("node {node_id} heartbeat update rejected: {reason}")]
+    NodeUpdateRejected { node_id: NodeId, reason: String },
     #[error("node not found: {0}")]
     NodeNotFound(NodeId),
     #[error("no available VPN IP in pool")]
@@ -59,6 +65,8 @@ pub struct ControlPlaneConfig {
     pub cluster_id: ClusterId,
     pub vpn_pool: Ipv4Net,
     pub cluster_policy: ClusterPolicy,
+    pub require_heartbeat_signature: bool,
+    pub heartbeat_signature_max_age: Duration,
 }
 
 impl ControlPlaneConfig {
@@ -67,6 +75,8 @@ impl ControlPlaneConfig {
             cluster_id,
             vpn_pool,
             cluster_policy: ClusterPolicy::default(),
+            require_heartbeat_signature: true,
+            heartbeat_signature_max_age: Duration::from_secs(300),
         }
     }
 }
@@ -522,15 +532,16 @@ where
         &self,
         request: HeartbeatRequest,
     ) -> Result<HeartbeatResponse, ControlPlaneError> {
+        let node = self
+            .store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        self.validate_heartbeat_request(&request, &node, Utc::now())?;
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
         if let Some(mut relay_capability) = request.relay_capability {
-            let node = self
-                .store
-                .get_node(&request.node_id)
-                .await?
-                .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
             if !node.token_policy.allow_relay {
                 return Err(ControlPlaneError::RelayDenied);
             }
@@ -551,6 +562,70 @@ where
             policy_version: 0,
             peer_delta_available: false,
         })
+    }
+
+    fn validate_heartbeat_request(
+        &self,
+        request: &HeartbeatRequest,
+        node: &NodeRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        if let Some(candidate) = request
+            .candidates
+            .iter()
+            .find(|candidate| candidate.node_id != request.node_id)
+        {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "candidate belongs to node {} instead of {}",
+                    candidate.node_id, request.node_id
+                ),
+            });
+        }
+        if let Some(path) = request
+            .path_state
+            .iter()
+            .find(|path| path.key.local != request.node_id && path.key.remote != request.node_id)
+        {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "path {} -> {} does not include reporting node",
+                    path.key.local, path.key.remote
+                ),
+            });
+        }
+        if request.node_signature.is_none() {
+            if self.config.require_heartbeat_signature {
+                return Err(ControlPlaneError::NodeSignatureRequired(
+                    request.node_id.clone(),
+                ));
+            }
+            return Ok(());
+        }
+        verify_heartbeat_request_signature(request, &node.identity_public_key).map_err(
+            |error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: error.to_string(),
+            },
+        )?;
+        let Some(signature) = request.node_signature.as_ref() else {
+            return Err(ControlPlaneError::NodeSignatureRequired(
+                request.node_id.clone(),
+            ));
+        };
+        let signed_at = signature.signed_at;
+        if !timestamp_within_skew(signed_at, now, self.config.heartbeat_signature_max_age) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "signed_at {signed_at} is outside the allowed {}s window",
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub async fn metrics(&self) -> Result<ControlPlaneMetricsResponse, ControlPlaneError> {
@@ -719,6 +794,17 @@ fn endpoint_candidate_is_fresh(
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
+}
+
+fn timestamp_within_skew(
+    timestamp: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    max_skew: Duration,
+) -> bool {
+    let Ok(max_skew) = chrono::Duration::from_std(max_skew) else {
+        return false;
+    };
+    timestamp >= now - max_skew && timestamp <= now + max_skew
 }
 
 fn relay_candidate_allowed(
@@ -973,9 +1059,10 @@ mod tests {
     }
 
     fn registration_request(node_id: &str) -> RegisterNodeRequest {
+        let identity = identity_for_node(node_id);
         RegisterNodeRequest {
             node_id: NodeId::from_string(node_id),
-            identity_public_key: format!("identity-{node_id}"),
+            identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             candidates: Vec::new(),
             relay_capability: None,
@@ -984,11 +1071,12 @@ mod tests {
     }
 
     fn node_record(node_id: &str) -> NodeRecord {
+        let identity = identity_for_node(node_id);
         NodeRecord {
             node_id: NodeId::from_string(node_id),
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
-            identity_public_key: format!("identity-{node_id}"),
+            identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             role: Role::edge(),
             tags: BTreeSet::new(),
@@ -998,6 +1086,28 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    fn identity_for_node(node_id: &str) -> IdentityKeyPair {
+        let mut seed = [0_u8; 32];
+        for (index, byte) in node_id.as_bytes().iter().enumerate() {
+            seed[index % seed.len()] = seed[index % seed.len()].wrapping_add(*byte);
+        }
+        if seed.iter().all(|byte| *byte == 0) {
+            seed[0] = 1;
+        }
+        IdentityKeyPair::from_signing_bytes(seed)
+    }
+
+    fn signed_heartbeat(mut request: HeartbeatRequest) -> HeartbeatRequest {
+        let identity = identity_for_node(request.node_id.as_str());
+        request.node_signature = Some(
+            match identity.sign_heartbeat_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign heartbeat: {error}"),
+            },
+        );
+        request
     }
 
     fn relay_capability() -> RelayCapability {
@@ -1218,7 +1328,7 @@ mod tests {
         assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
 
         plane
-            .heartbeat(HeartbeatRequest {
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
                 node_id: NodeId::from_string("relay-a"),
                 health: NodeHealth {
                     state: HealthState::Healthy,
@@ -1230,7 +1340,8 @@ mod tests {
                 candidates: Vec::new(),
                 relay_capability: None,
                 path_state: Vec::new(),
-            })
+                node_signature: None,
+            }))
             .await?;
         assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
 
@@ -1567,13 +1678,14 @@ mod tests {
         };
 
         let response = plane
-            .heartbeat(HeartbeatRequest {
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
                 node_id: NodeId::from_string("node-a"),
                 health: health.clone(),
                 candidates: vec![candidate("node-a")],
                 relay_capability: None,
                 path_state: vec![path("node-a", "node-b")],
-            })
+                node_signature: None,
+            }))
             .await?;
 
         assert!(response.accepted);
@@ -1603,6 +1715,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_requires_valid_node_signature() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let unsigned = HeartbeatRequest {
+            node_id: NodeId::from_string("node-a"),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: None,
+                relay_load: None,
+                message: None,
+            },
+            candidates: Vec::new(),
+            relay_capability: None,
+            path_state: Vec::new(),
+            node_signature: None,
+        };
+
+        let result = plane.heartbeat(unsigned.clone()).await;
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeSignatureRequired(_))
+        ));
+
+        let mut tampered = signed_heartbeat(unsigned);
+        tampered.health.message = Some("changed after signing".to_string());
+        let result = plane.heartbeat(tampered).await;
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeSignatureRejected { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_updates_for_other_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: None,
+            relay_load: None,
+            message: None,
+        };
+
+        let result = plane
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("node-a"),
+                health: health.clone(),
+                candidates: vec![candidate("node-b")],
+                relay_capability: None,
+                path_state: Vec::new(),
+                node_signature: None,
+            }))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
+                node_id: NodeId::from_string("node-a"),
+                health,
+                candidates: Vec::new(),
+                relay_capability: None,
+                path_state: vec![path("node-b", "node-c")],
+                node_signature: None,
+            }))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_updates_relay_capability_when_policy_allows(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -1622,7 +1827,7 @@ mod tests {
         heartbeat_relay.active_sessions = 7;
 
         let response = plane
-            .heartbeat(HeartbeatRequest {
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
                 node_id: NodeId::from_string("node-a"),
                 health: NodeHealth {
                     state: HealthState::Healthy,
@@ -1634,7 +1839,8 @@ mod tests {
                 candidates: Vec::new(),
                 relay_capability: Some(heartbeat_relay),
                 path_state: Vec::new(),
-            })
+                node_signature: None,
+            }))
             .await?;
 
         assert!(response.accepted);
@@ -1664,7 +1870,7 @@ mod tests {
             .await?;
 
         let result = plane
-            .heartbeat(HeartbeatRequest {
+            .heartbeat(signed_heartbeat(HeartbeatRequest {
                 node_id: NodeId::from_string("node-a"),
                 health: NodeHealth {
                     state: HealthState::Healthy,
@@ -1676,7 +1882,8 @@ mod tests {
                 candidates: Vec::new(),
                 relay_capability: Some(relay_capability()),
                 path_state: Vec::new(),
-            })
+                node_signature: None,
+            }))
             .await;
 
         assert!(matches!(result, Err(ControlPlaneError::RelayDenied)));
