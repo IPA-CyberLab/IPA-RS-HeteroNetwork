@@ -2052,6 +2052,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
+        "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.rootless {
@@ -2192,34 +2193,40 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
     }
     if let Some(socket) = args.docker_api_socket.as_ref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: socket.display().to_string(),
         });
     } else if args.rootless {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
         });
     }
-    if let Some(namespace) = args.docker_container_namespace.as_ref() {
-        environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
-            value: namespace.clone(),
-        });
-    }
+    let container_namespace = args
+        .docker_container_namespace
+        .clone()
+        .unwrap_or_else(|| "compose-default".to_string());
+    environment.push(InstallEnvironment {
+        name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+        value: container_namespace,
+    });
     environment.push(InstallEnvironment {
         name: "IPARS_DOCKER_HOST_INTERFACE".to_string(),
         value: args.docker_host_interface.clone(),
     });
-    if !args.docker_container_cidrs.is_empty() {
-        environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
-            value: args
-                .docker_container_cidrs
+    if !args.docker_discover_networks {
+        let container_cidrs = if args.docker_container_cidrs.is_empty() {
+            "172.18.0.0/16".to_string()
+        } else {
+            args.docker_container_cidrs
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
-                .join(","),
+                .join(",")
+        };
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+            value: container_cidrs,
         });
     }
     environment
@@ -4046,6 +4053,14 @@ mod tests {
         assert!(plan.environment.iter().any(|environment| {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
+            Some("compose-default")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
+            Some("172.18.0.0/16")
+        );
         assert!(plan
             .security
             .iter()
@@ -4113,7 +4128,7 @@ mod tests {
             Some("edge_default,edge_apps")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET"),
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
             Some("${XDG_RUNTIME_DIR}/docker.sock")
         );
         assert_eq!(
@@ -4132,6 +4147,31 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("userspace WireGuard backend")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("IPARS_DOCKER_API_SOCKET_HOST")));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_compose_consumes_docker_install_environment_contract() -> anyhow::Result<()> {
+        let compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.yaml")
+            .canonicalize()?;
+        let compose = std::fs::read_to_string(compose_path)?;
+
+        assert!(compose
+            .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
+        assert!(compose
+            .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
+        assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
+        assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
+        assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+        assert!(compose.contains(
+            "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
+        ));
         Ok(())
     }
 
