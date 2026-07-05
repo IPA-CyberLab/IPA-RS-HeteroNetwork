@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const DAEMON_LOG_TAIL_BYTES: usize = 8192;
+const DAEMON_LOG_TAIL_LINES: usize = 40;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -925,6 +931,7 @@ impl DaemonProcessGroup {
         }
         let runtime_dir = daemon_runtime_dir()?;
         std::fs::create_dir_all(&runtime_dir)?;
+        let mut startup = DaemonStartupGuard::new(runtime_dir.clone());
         let control_addr = reserve_tcp_addr().await?;
         let signal_addr = reserve_tcp_addr().await?;
         let relay_http_addr = reserve_tcp_addr().await?;
@@ -933,85 +940,87 @@ impl DaemonProcessGroup {
         let control_plane_url = format!("http://{control_addr}");
         let signal_url = format!("http://{signal_addr}");
         let relay_http_url = format!("http://{relay_http_addr}");
-        let mut children = vec![
-            spawn_iparsd(
-                iparsd_bin,
-                &[
-                    "control-plane".to_string(),
-                    "--listen".to_string(),
-                    control_addr.to_string(),
-                    "--cluster-id".to_string(),
-                    cluster_id.to_string(),
-                    "--issuer-node-id".to_string(),
-                    issuer.node_id().to_string(),
-                    "--issuer-key-id".to_string(),
-                    key_id.to_string(),
-                    "--issuer-public-key".to_string(),
-                    issuer.public_key_b64(),
-                ],
-                "control-plane",
-            )?,
-            spawn_iparsd(
-                iparsd_bin,
-                &[
-                    "signal".to_string(),
-                    "--listen".to_string(),
-                    signal_addr.to_string(),
-                ],
-                "signal",
-            )?,
-            spawn_iparsd(
-                iparsd_bin,
-                &[
-                    "relay".to_string(),
-                    "--relay-node-id".to_string(),
-                    "daemon-relay".to_string(),
-                    "--udp-listen".to_string(),
-                    relay_udp_addr.to_string(),
-                    "--http-listen".to_string(),
-                    relay_http_addr.to_string(),
-                    "--public-endpoint".to_string(),
-                    relay_udp_addr.to_string(),
-                    "--admission-url".to_string(),
-                    relay_http_url.clone(),
-                    "--max-sessions".to_string(),
-                    "10000".to_string(),
-                    "--max-mbps".to_string(),
-                    "10000".to_string(),
-                ],
-                "relay",
-            )?,
-            spawn_iparsd(
-                iparsd_bin,
-                &[
-                    "stun".to_string(),
-                    "--listen".to_string(),
-                    stun_addr.to_string(),
-                ],
-                "stun",
-            )?,
-        ];
+        startup.children.push(spawn_iparsd(
+            iparsd_bin,
+            &[
+                "control-plane".to_string(),
+                "--listen".to_string(),
+                control_addr.to_string(),
+                "--cluster-id".to_string(),
+                cluster_id.to_string(),
+                "--issuer-node-id".to_string(),
+                issuer.node_id().to_string(),
+                "--issuer-key-id".to_string(),
+                key_id.to_string(),
+                "--issuer-public-key".to_string(),
+                issuer.public_key_b64(),
+            ],
+            "control-plane",
+            &runtime_dir,
+        )?);
+        startup.children.push(spawn_iparsd(
+            iparsd_bin,
+            &[
+                "signal".to_string(),
+                "--listen".to_string(),
+                signal_addr.to_string(),
+            ],
+            "signal",
+            &runtime_dir,
+        )?);
+        startup.children.push(spawn_iparsd(
+            iparsd_bin,
+            &[
+                "relay".to_string(),
+                "--relay-node-id".to_string(),
+                "daemon-relay".to_string(),
+                "--udp-listen".to_string(),
+                relay_udp_addr.to_string(),
+                "--http-listen".to_string(),
+                relay_http_addr.to_string(),
+                "--public-endpoint".to_string(),
+                relay_udp_addr.to_string(),
+                "--admission-url".to_string(),
+                relay_http_url.clone(),
+                "--max-sessions".to_string(),
+                "10000".to_string(),
+                "--max-mbps".to_string(),
+                "10000".to_string(),
+            ],
+            "relay",
+            &runtime_dir,
+        )?);
+        startup.children.push(spawn_iparsd(
+            iparsd_bin,
+            &[
+                "stun".to_string(),
+                "--listen".to_string(),
+                stun_addr.to_string(),
+            ],
+            "stun",
+            &runtime_dir,
+        )?);
 
         let client = reqwest::Client::new();
         wait_for_http_ok(
             &client,
             format!("{control_plane_url}/healthz"),
             "control-plane",
-            &mut children,
+            &mut startup.children,
         )
         .await?;
         wait_for_http_ok(
             &client,
             format!("{signal_url}/healthz"),
             "signal",
-            &mut children,
+            &mut startup.children,
         )
         .await?;
         wait_for_http_ok(
             &client,
             format!("{relay_http_url}/healthz"),
             "relay",
-            &mut children,
+            &mut startup.children,
         )
         .await?;
 
@@ -1027,7 +1036,7 @@ impl DaemonProcessGroup {
                 index,
                 Scenario::from_name(ScenarioName::Three),
             )?)?;
-            children.push(spawn_iparsd(
+            startup.children.push(spawn_iparsd(
                 iparsd_bin,
                 &[
                     "agent".to_string(),
@@ -1057,12 +1066,13 @@ impl DaemonProcessGroup {
                     "1".to_string(),
                 ],
                 "agent",
+                &runtime_dir,
             )?);
             wait_for_http_ok(
                 &client,
                 format!("{agent_url}/healthz"),
                 "agent",
-                &mut children,
+                &mut startup.children,
             )
             .await?;
             agent_urls.push(agent_url);
@@ -1072,10 +1082,11 @@ impl DaemonProcessGroup {
             &control_plane_url,
             &signal_url,
             &agent_urls,
-            &mut children,
+            &mut startup.children,
         )
         .await?;
 
+        let children = startup.finish();
         Ok(Self {
             control_plane_url,
             signal_url,
@@ -1098,31 +1109,91 @@ impl DaemonProcessGroup {
 
 impl Drop for DaemonProcessGroup {
     fn drop(&mut self) {
-        for daemon_child in &mut self.children {
-            let _ = daemon_child.child.kill();
-            let _ = daemon_child.child.wait();
-        }
+        kill_daemon_children(&mut self.children);
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
+    }
+}
+
+struct DaemonStartupGuard {
+    runtime_dir: PathBuf,
+    children: Vec<DaemonChild>,
+    active: bool,
+}
+
+impl DaemonStartupGuard {
+    fn new(runtime_dir: PathBuf) -> Self {
+        Self {
+            runtime_dir,
+            children: Vec::new(),
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> Vec<DaemonChild> {
+        self.active = false;
+        std::mem::take(&mut self.children)
+    }
+}
+
+impl Drop for DaemonStartupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            kill_daemon_children(&mut self.children);
+            let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        }
     }
 }
 
 struct DaemonChild {
     role: String,
     child: Child,
+    log_path: Option<PathBuf>,
 }
 
-fn spawn_iparsd(iparsd_bin: &Path, args: &[String], role: &str) -> anyhow::Result<DaemonChild> {
+fn spawn_iparsd(
+    iparsd_bin: &Path,
+    args: &[String],
+    role: &str,
+    runtime_dir: &Path,
+) -> anyhow::Result<DaemonChild> {
+    let log_path = daemon_child_log_path(runtime_dir, role);
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open iparsd {role} log at {}", log_path.display()))?;
+    writeln!(log_file, "ipars-load starting iparsd {role}")
+        .with_context(|| format!("failed to write iparsd {role} log header"))?;
+    let stdout = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone iparsd {role} log for stdout"))?;
+    let stderr = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone iparsd {role} log for stderr"))?;
     let child = Command::new(iparsd_bin)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .with_context(|| format!("failed to spawn iparsd {role} process"))?;
+        .with_context(|| {
+            format!(
+                "failed to spawn iparsd {role} process; log={}",
+                log_path.display()
+            )
+        })?;
     Ok(DaemonChild {
         role: role.to_string(),
         child,
+        log_path: Some(log_path),
     })
+}
+
+fn kill_daemon_children(children: &mut [DaemonChild]) {
+    for daemon_child in children {
+        let _ = daemon_child.child.kill();
+        let _ = daemon_child.child.wait();
+    }
 }
 
 fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Result<()> {
@@ -1133,14 +1204,84 @@ fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Resul
                 daemon_child.role
             )
         })? {
+            let log_tail = daemon_child
+                .log_tail()
+                .map(|tail| format!("\n{tail}"))
+                .unwrap_or_default();
             bail!(
-                "iparsd {} process exited before daemon load scenario completed: {}",
+                "iparsd {} process exited before daemon load scenario completed: {}{}",
                 daemon_child.role,
-                status
+                status,
+                log_tail
             );
         }
     }
     Ok(())
+}
+
+impl DaemonChild {
+    fn log_tail(&self) -> Option<String> {
+        let path = self.log_path.as_ref()?;
+        match daemon_log_tail(path) {
+            Ok(tail) if !tail.trim().is_empty() => Some(format!(
+                "iparsd {} log tail ({}):\n{}",
+                self.role,
+                path.display(),
+                tail
+            )),
+            Ok(_) => Some(format!(
+                "iparsd {} log tail ({}) is empty",
+                self.role,
+                path.display()
+            )),
+            Err(error) => Some(format!(
+                "iparsd {} log tail unavailable ({}): {error}",
+                self.role,
+                path.display()
+            )),
+        }
+    }
+}
+
+fn daemon_children_log_summary(children: &[DaemonChild]) -> String {
+    let summaries = children
+        .iter()
+        .filter_map(DaemonChild::log_tail)
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        "daemon logs unavailable".to_string()
+    } else {
+        summaries.join("\n---\n")
+    }
+}
+
+fn daemon_log_tail(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read daemon log {}", path.display()))?;
+    let start = bytes.len().saturating_sub(DAEMON_LOG_TAIL_BYTES);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let mut lines = text
+        .lines()
+        .rev()
+        .take(DAEMON_LOG_TAIL_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
+fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
+    let serial = DAEMON_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sanitized_role = role
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    runtime_dir.join(format!("{serial:04}-{sanitized_role}.log"))
 }
 
 fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
@@ -1186,7 +1327,11 @@ async fn wait_for_http_ok(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{context} readiness timed out")))
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("{context} readiness timed out"));
+    bail!(
+        "{context} readiness failed: {error}\n{}",
+        daemon_children_log_summary(children)
+    )
 }
 
 async fn wait_for_daemon_agents_ready(
@@ -1215,7 +1360,11 @@ async fn wait_for_daemon_agents_ready(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon agent readiness timed out")))
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("daemon agent readiness timed out"));
+    bail!(
+        "daemon agent readiness failed: {error}\n{}",
+        daemon_children_log_summary(children)
+    )
 }
 
 async fn daemon_agent_statuses(
@@ -1663,6 +1812,14 @@ mod tests {
 
     #[test]
     fn daemon_child_liveness_reports_role_and_exit_status() -> anyhow::Result<()> {
+        let log_path = std::env::temp_dir().join(format!(
+            "ipars-load-synthetic-child-{}-{}.log",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&log_path, "first line\nchild diagnostic line\n").with_context(|| {
+            format!("failed to write synthetic child log {}", log_path.display())
+        })?;
         let child = Command::new("sh")
             .args(["-c", "exit 7"])
             .stdin(Stdio::null())
@@ -1673,6 +1830,7 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "synthetic".to_string(),
             child,
+            log_path: Some(log_path.clone()),
         }];
 
         for _ in 0..50 {
@@ -1682,6 +1840,8 @@ mod tests {
                     let message = error.to_string();
                     assert!(message.contains("iparsd synthetic process exited"));
                     assert!(message.contains("7"));
+                    assert!(message.contains("child diagnostic line"));
+                    let _ = std::fs::remove_file(&log_path);
                     return Ok(());
                 }
             }
@@ -1689,6 +1849,7 @@ mod tests {
 
         let _ = children[0].child.kill();
         let _ = children[0].child.wait();
+        let _ = std::fs::remove_file(&log_path);
         bail!("synthetic daemon child did not exit before liveness timeout")
     }
 

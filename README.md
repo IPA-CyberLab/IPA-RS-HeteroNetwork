@@ -65,7 +65,7 @@ The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuar
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
 HTTP admission plus UDP forwarding with `--transport relay-udp`, or across spawned `iparsd`
-control-plane/signal/STUN/relay/agent processes with `--transport daemon`. Daemon transport watches child process liveness while waiting for service health, agent registration visibility in the control plane, and signal negotiation readiness before measuring:
+control-plane/signal/STUN/relay/agent processes with `--transport daemon`. Daemon transport captures each child process stdout/stderr log and reports log tails when liveness or readiness checks fail while waiting for service health, agent registration visibility in the control plane, and signal negotiation readiness before measuring:
 
 ```bash
 cargo run -p ipars-load -- --scenario three
