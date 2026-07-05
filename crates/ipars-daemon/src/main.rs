@@ -7119,6 +7119,13 @@ async fn negotiate_signal_paths(
                 }
             }
         }
+        if record.selected_state == PathState::Relay
+            && path_selection == StableSignalPathSelection::Candidate
+        {
+            if let Some(preferred_relay) = relay_candidates.first() {
+                record.relay_node = Some(preferred_relay.node_id.clone());
+            }
+        }
         if record.selected_state == PathState::Relay {
             match relay_candidates.first() {
                 Some(preferred_relay) => {
@@ -7141,6 +7148,7 @@ async fn negotiate_signal_paths(
                         .await
                         {
                             Ok(session) => {
+                                record.relay_node = Some(session.relay_node.clone());
                                 tracing::info!(
                                     peer = %record.key.remote,
                                     relay = %session.relay_node,
@@ -7181,8 +7189,9 @@ async fn negotiate_signal_paths(
                             relay = %preferred_relay.node_id,
                             "reusing existing relay session"
                         );
-                        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-                            if let Some(session) = runtime.relay_session(&peer.node_id).await {
+                        if let Some(session) = runtime.relay_session(&peer.node_id).await {
+                            record.relay_node = Some(session.relay_node.clone());
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
                                 if let Err(error) = supervisor.upsert(runtime, session).await {
                                     tracing::warn!(
                                         %error,
@@ -15626,6 +15635,141 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
         assert_eq!(accepted.session_id, "session-secure");
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_records_relay_selected_after_admission_failover(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-good"),
+                session_id: "session-good".to_string(),
+                session_token: "token-good".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let unavailable = unused_http_base_url().await?;
+        let mut relay_bad = node_record("relay-bad");
+        relay_bad.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unavailable),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay_good = node_record("relay-good");
+        relay_good.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay_good, relay_bad],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-good")));
+        let session = runtime
+            .relay_session(&peer.node_id)
+            .await
+            .context("relay session should be stored")?;
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+
+        signal_task.abort();
+        control_plane_task.abort();
         relay_task.abort();
         Ok(())
     }

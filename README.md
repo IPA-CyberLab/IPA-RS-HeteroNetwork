@@ -25,7 +25,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, advertised route updates, relay capability updates, and path state, retrying across known control-plane endpoints
 - `iparsd agent` signal-service node registration that refreshes the registered NodeRecord, endpoint candidates, and relay capability across known signal endpoints, with signal-side non-admissible relay capability normalization
 - `iparsd agent` signal path negotiation loop that fetches peer maps across known control-plane endpoints, fails over across known signal endpoints, records pair-scoped path state, and reports it in heartbeat payloads
-- `iparsd agent` relay admission for signal-selected relay paths, failing over across ranked relay candidates and storing expiring relay credentials only in transient agent runtime state
+- `iparsd agent` relay admission for signal-selected relay paths, failing over across ranked relay candidates, aligning stored path state to the admitted relay, and storing expiring relay credentials only in transient agent runtime state
 - relay session renewal window handling and stale relay credential removal when paths return to direct/non-relay states
 - agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
 - agent relay capability advertisement for public nodes with explicit relay endpoint/admission URL settings, still gated by join-token relay policy at control-plane registration
