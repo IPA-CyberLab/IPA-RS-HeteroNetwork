@@ -6,7 +6,7 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -397,6 +397,12 @@ struct AgentArgs {
         default_value_t = 5
     )]
     packet_flow_poll_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_DEDUP_TTL_SECONDS",
+        default_value_t = 30
+    )]
+    packet_flow_dedup_ttl_seconds: u64,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
     packet_flow_pin: bool,
     #[arg(
@@ -2476,6 +2482,7 @@ async fn run_agent(
                 detector = args.packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
                 interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
@@ -2483,6 +2490,7 @@ async fn run_agent(
                 runtime.clone(),
                 conntrack_paths(args.packet_flow_conntrack_path.clone()),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
         }
@@ -2490,12 +2498,14 @@ async fn run_agent(
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
             background_tasks.push(start_conntrack_netlink_packet_flow_detector(
                 runtime.clone(),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
         }
@@ -2503,12 +2513,14 @@ async fn run_agent(
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
             background_tasks.push(start_conntrack_netlink_event_packet_flow_detector(
                 runtime.clone(),
                 Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
         }
@@ -5025,12 +5037,16 @@ fn start_proc_net_conntrack_packet_flow_detector(
     runtime: Arc<AgentRuntime>,
     paths: Vec<PathBuf>,
     interval: Duration,
+    dedup_ttl: Option<Duration>,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut deduper = PacketFlowDeduper::new(dedup_ttl);
         loop {
             match read_conntrack_packet_flows(&paths).await {
                 Ok(flows) => {
+                    let (flows, duplicate_count) = deduper.retain_new(flows);
+                    log_packet_flow_duplicates(duplicate_count, "proc-net-conntrack");
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -5058,12 +5074,16 @@ fn start_proc_net_conntrack_packet_flow_detector(
 fn start_conntrack_netlink_packet_flow_detector(
     runtime: Arc<AgentRuntime>,
     interval: Duration,
+    dedup_ttl: Option<Duration>,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut deduper = PacketFlowDeduper::new(dedup_ttl);
         loop {
             match read_conntrack_netlink_packet_flows().await {
                 Ok(flows) => {
+                    let (flows, duplicate_count) = deduper.retain_new(flows);
+                    log_packet_flow_duplicates(duplicate_count, "conntrack-netlink");
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -5091,9 +5111,11 @@ fn start_conntrack_netlink_packet_flow_detector(
 fn start_conntrack_netlink_event_packet_flow_detector(
     runtime: Arc<AgentRuntime>,
     idle_poll_interval: Duration,
+    dedup_ttl: Option<Duration>,
     pin: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut deduper = PacketFlowDeduper::new(dedup_ttl);
         loop {
             match open_conntrack_netlink_event_socket() {
                 Ok(socket) => {
@@ -5101,6 +5123,7 @@ fn start_conntrack_netlink_event_packet_flow_detector(
                         runtime.as_ref(),
                         &socket,
                         idle_poll_interval,
+                        &mut deduper,
                         pin,
                     )
                     .await
@@ -5121,10 +5144,96 @@ fn start_conntrack_netlink_event_packet_flow_detector(
     })
 }
 
+fn packet_flow_dedup_ttl(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn log_packet_flow_duplicates(duplicate_count: usize, source: &'static str) {
+    if duplicate_count > 0 {
+        tracing::debug!(
+            suppressed = duplicate_count,
+            source,
+            "suppressed duplicate packet-flow observations"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct PacketFlowDeduper {
+    ttl: Option<Duration>,
+    seen: BTreeMap<PacketFlowFingerprint, Instant>,
+}
+
+impl PacketFlowDeduper {
+    fn new(ttl: Option<Duration>) -> Self {
+        Self {
+            ttl,
+            seen: BTreeMap::new(),
+        }
+    }
+
+    fn retain_new(&mut self, flows: Vec<PacketFlowRecord>) -> (Vec<PacketFlowRecord>, usize) {
+        let Some(ttl) = self.ttl else {
+            return (flows, 0);
+        };
+        let now = Instant::now();
+        self.seen
+            .retain(|_, last_seen| now.saturating_duration_since(*last_seen) < ttl);
+
+        let mut retained = Vec::with_capacity(flows.len());
+        let mut duplicate_count = 0_usize;
+        for flow in flows {
+            let fingerprint = PacketFlowFingerprint::from(&flow);
+            if self.seen.contains_key(&fingerprint) {
+                duplicate_count += 1;
+                continue;
+            }
+            self.seen.insert(fingerprint, now);
+            retained.push(flow);
+        }
+        (retained, duplicate_count)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PacketFlowFingerprint {
+    destination: IpAddr,
+    source: Option<IpAddr>,
+    protocol: Option<u8>,
+    source_port: Option<u16>,
+    destination_port: Option<u16>,
+    conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
+    tcp_state: Option<AgentPacketFlowTcpState>,
+}
+
+impl From<&PacketFlowRecord> for PacketFlowFingerprint {
+    fn from(flow: &PacketFlowRecord) -> Self {
+        Self {
+            destination: flow.destination,
+            source: flow.observation.source,
+            protocol: flow.observation.protocol.map(transport_protocol_number),
+            source_port: flow.observation.source_port,
+            destination_port: flow.observation.destination_port,
+            conntrack_status: flow.observation.conntrack_status.clone(),
+            tcp_state: flow.observation.tcp_state,
+        }
+    }
+}
+
+fn transport_protocol_number(protocol: TransportProtocol) -> u8 {
+    match protocol {
+        TransportProtocol::Any => 0,
+        TransportProtocol::Icmp => 1,
+        TransportProtocol::Tcp => 6,
+        TransportProtocol::Udp => 17,
+    }
+}
+
 async fn run_conntrack_netlink_event_detector_once(
     runtime: &AgentRuntime,
     socket: &Socket,
     idle_poll_interval: Duration,
+    deduper: &mut PacketFlowDeduper,
     pin: bool,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
@@ -5132,6 +5241,8 @@ async fn run_conntrack_netlink_event_detector_once(
         let mut recorded_any = false;
         while let Some(flows) = read_conntrack_netlink_event_packet_flows(socket, &mut buffer)? {
             recorded_any = true;
+            let (flows, duplicate_count) = deduper.retain_new(flows);
+            log_packet_flow_duplicates(duplicate_count, "conntrack-netlink-events");
             let matched_count =
                 record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events")
                     .await;
@@ -6863,6 +6974,8 @@ mod tests {
             "/tmp/ipars-conntrack",
             "--packet-flow-poll-interval-seconds",
             "2",
+            "--packet-flow-dedup-ttl-seconds",
+            "9",
             "--packet-flow-pin",
         ])?;
 
@@ -6877,6 +6990,9 @@ mod tests {
                 Some(Path::new("/tmp/ipars-conntrack"))
             );
             assert_eq!(args.packet_flow_poll_interval_seconds, 2);
+            assert_eq!(args.packet_flow_dedup_ttl_seconds, 9);
+            assert_eq!(packet_flow_dedup_ttl(0), None);
+            assert_eq!(packet_flow_dedup_ttl(9), Some(Duration::from_secs(9)));
             assert!(args.packet_flow_pin);
             return Ok(());
         }
@@ -7050,6 +7166,45 @@ invalid no-destination-here
             Some(AgentPacketFlowDropReason::LinkLocal)
         );
         assert_eq!(AgentPacketFlowDropReason::LinkLocal.as_str(), "link_local");
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_deduper_suppresses_same_flow_but_keeps_lifecycle_changes() -> anyhow::Result<()>
+    {
+        let base = PacketFlowRecord {
+            destination: "100.64.0.11".parse()?,
+            observation: AgentPacketFlowObservation {
+                source: Some("192.0.2.10".parse()?),
+                protocol: Some(TransportProtocol::Tcp),
+                source_port: Some(54_321),
+                destination_port: Some(443),
+                conntrack_status: vec![AgentPacketFlowConntrackStatus::Unreplied],
+                tcp_state: Some(AgentPacketFlowTcpState::SynSent),
+                ..AgentPacketFlowObservation::default()
+            },
+        };
+        let mut established = base.clone();
+        established.observation.conntrack_status = vec![AgentPacketFlowConntrackStatus::Assured];
+        established.observation.tcp_state = Some(AgentPacketFlowTcpState::Established);
+
+        let mut deduper = PacketFlowDeduper::new(Some(Duration::from_secs(60)));
+        let (retained, duplicates) =
+            deduper.retain_new(vec![base.clone(), base.clone(), established.clone()]);
+        assert_eq!(retained, vec![base.clone(), established.clone()]);
+        assert_eq!(duplicates, 1);
+
+        let (retained, duplicates) = deduper.retain_new(vec![base, established]);
+        assert!(retained.is_empty());
+        assert_eq!(duplicates, 2);
+
+        let mut disabled = PacketFlowDeduper::new(None);
+        let (retained, duplicates) = disabled.retain_new(vec![PacketFlowRecord {
+            destination: "100.64.0.12".parse()?,
+            observation: AgentPacketFlowObservation::default(),
+        }]);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(duplicates, 0);
         Ok(())
     }
 
