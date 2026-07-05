@@ -7562,12 +7562,7 @@ async fn relay_session_needs_renewal(
 }
 
 async fn active_relay_session(runtime: &AgentRuntime, peer: &NodeId) -> Option<RelaySessionState> {
-    let session = runtime.relay_session(peer).await?;
-    if session.expires_at > chrono::Utc::now() {
-        Some(session)
-    } else {
-        None
-    }
+    runtime.active_relay_session(peer, chrono::Utc::now()).await
 }
 
 async fn admit_relay_session(

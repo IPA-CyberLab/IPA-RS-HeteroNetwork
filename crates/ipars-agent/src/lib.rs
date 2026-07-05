@@ -859,6 +859,7 @@ impl AgentRuntime {
     }
 
     pub async fn metrics(&self) -> AgentMetricsResponse {
+        self.purge_expired_relay_sessions(Utc::now()).await;
         let candidates = self.candidates.read().await;
         let path_state = self.path_state.read().await;
         let relay_sessions = self.relay_sessions.read().await;
@@ -994,6 +995,49 @@ impl AgentRuntime {
 
     pub async fn relay_sessions(&self) -> Vec<RelaySessionState> {
         self.relay_sessions.read().await.values().cloned().collect()
+    }
+
+    pub async fn active_relay_session(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+    ) -> Option<RelaySessionState> {
+        let expired = {
+            let mut relay_sessions = self.relay_sessions.write().await;
+            match relay_sessions.get(peer) {
+                Some(session) if session.expires_at > now => return Some(session.clone()),
+                Some(_) => relay_sessions.remove(peer),
+                None => None,
+            }
+        };
+        if expired.is_some() {
+            self.remove_relay_forwarder_endpoint(peer).await;
+        }
+        None
+    }
+
+    pub async fn purge_expired_relay_sessions(&self, now: DateTime<Utc>) -> Vec<RelaySessionState> {
+        let expired = {
+            let mut relay_sessions = self.relay_sessions.write().await;
+            let expired_peers = relay_sessions
+                .iter()
+                .filter(|(_, session)| session.expires_at <= now)
+                .map(|(peer, _)| peer.clone())
+                .collect::<Vec<_>>();
+            expired_peers
+                .into_iter()
+                .filter_map(|peer| relay_sessions.remove(&peer))
+                .collect::<Vec<_>>()
+        };
+        if !expired.is_empty() {
+            let mut relay_forwarder_endpoints = self.relay_forwarder_endpoints.write().await;
+            let mut relay_forwarder_metrics = self.relay_forwarder_metrics.write().await;
+            for session in &expired {
+                relay_forwarder_endpoints.remove(&session.peer);
+                relay_forwarder_metrics.remove(&session.peer);
+            }
+        }
+        expired
     }
 
     pub async fn remove_relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
@@ -3081,6 +3125,138 @@ mod tests {
 
         assert_eq!(runtime.relay_session(&peer).await, Some(session));
         assert!(runtime.path_state().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_purges_expired_relay_sessions_and_forwarder_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        let active_peer = NodeId::from_string("peer-active");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: active_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 21], 40000)),
+                session_id: "session-active".to_string(),
+                session_token: "secret-active".to_string(),
+                expires_at: now + ChronoDuration::seconds(60),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                active_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50001)),
+            )
+            .await;
+
+        let removed = runtime.purge_expired_relay_sessions(now).await;
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].peer, expired_peer);
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+        assert!(runtime.relay_session(&active_peer).await.is_some());
+        assert_eq!(
+            runtime.relay_forwarder_endpoint(&active_peer).await,
+            Some(SocketAddr::from(([127, 0, 0, 1], 50001)))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_metrics_exclude_expired_relay_sessions() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        let metrics = runtime.metrics().await;
+
+        assert_eq!(metrics.relay_session_count, 0);
+        assert_eq!(metrics.relay_forwarder_count, 0);
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_active_relay_session_removes_expired_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(runtime.active_relay_session(&peer, now).await.is_none());
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
     #[tokio::test]
