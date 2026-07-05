@@ -413,6 +413,7 @@ pub struct AgentRuntime {
     packet_flow_application_postgres_count: AtomicU64,
     packet_flow_application_mysql_count: AtomicU64,
     packet_flow_application_redis_count: AtomicU64,
+    packet_flow_application_memcached_count: AtomicU64,
     packet_flow_application_prometheus_count: AtomicU64,
     packet_flow_application_opentelemetry_count: AtomicU64,
     packet_flow_application_kafka_count: AtomicU64,
@@ -664,6 +665,7 @@ impl AgentRuntime {
             packet_flow_application_postgres_count: AtomicU64::new(0),
             packet_flow_application_mysql_count: AtomicU64::new(0),
             packet_flow_application_redis_count: AtomicU64::new(0),
+            packet_flow_application_memcached_count: AtomicU64::new(0),
             packet_flow_application_prometheus_count: AtomicU64::new(0),
             packet_flow_application_opentelemetry_count: AtomicU64::new(0),
             packet_flow_application_kafka_count: AtomicU64::new(0),
@@ -1221,6 +1223,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Postgres => &self.packet_flow_application_postgres_count,
             AgentPacketFlowApplication::Mysql => &self.packet_flow_application_mysql_count,
             AgentPacketFlowApplication::Redis => &self.packet_flow_application_redis_count,
+            AgentPacketFlowApplication::Memcached => &self.packet_flow_application_memcached_count,
             AgentPacketFlowApplication::Prometheus => {
                 &self.packet_flow_application_prometheus_count
             }
@@ -3996,6 +3999,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(kafka_match.peer, peer_b_id);
+        let memcached_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 30)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(11211),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(memcached_match.peer, peer_b_id);
         let hinted_postgres_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 29)),
@@ -4020,8 +4037,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 8);
-        assert_eq!(metrics.packet_flow_match_count, 6);
+        assert_eq!(metrics.packet_flow_observation_count, 9);
+        assert_eq!(metrics.packet_flow_match_count, 7);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -4033,7 +4050,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            6
+            7
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -4060,6 +4077,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Prometheus), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Kafka), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
         assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics

@@ -1591,6 +1591,7 @@ pub mod api {
         Postgres,
         Mysql,
         Redis,
+        Memcached,
         Prometheus,
         OpenTelemetry,
         Kafka,
@@ -1605,7 +1606,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 21] = [
+        pub const ALL: [Self; 22] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1616,6 +1617,7 @@ pub mod api {
             Self::Postgres,
             Self::Mysql,
             Self::Redis,
+            Self::Memcached,
             Self::Prometheus,
             Self::OpenTelemetry,
             Self::Kafka,
@@ -1641,6 +1643,7 @@ pub mod api {
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
                 Self::Redis => "redis",
+                Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Kafka => "kafka",
@@ -1769,6 +1772,14 @@ pub mod api {
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
             }
+            if self.involves_port(11211)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Memcached;
+            }
             if self.involves_port(9090) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Prometheus;
             }
@@ -1843,6 +1854,9 @@ pub mod api {
                 })
                 .or_else(|| mysql_payload(payload).then_some(AgentPacketFlowApplication::Mysql))
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
+                .or_else(|| {
+                    memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
+                })
                 .or_else(|| kafka_payload(payload).then_some(AgentPacketFlowApplication::Kafka))
                 .or_else(|| nats_payload(payload).then_some(AgentPacketFlowApplication::Nats))
                 .or_else(|| mqtt_payload(payload).then_some(AgentPacketFlowApplication::Mqtt))
@@ -2149,6 +2163,53 @@ pub mod api {
         commands
             .iter()
             .any(|command| contains_ascii_case_insensitive(payload, command))
+    }
+
+    fn memcached_payload(payload: &[u8]) -> bool {
+        memcached_text_payload(payload) || memcached_binary_payload(payload)
+    }
+
+    fn memcached_text_payload(payload: &[u8]) -> bool {
+        let commands: [&[u8]; 20] = [
+            b"get",
+            b"gets",
+            b"gat",
+            b"gats",
+            b"set",
+            b"add",
+            b"replace",
+            b"append",
+            b"prepend",
+            b"cas",
+            b"delete",
+            b"incr",
+            b"decr",
+            b"touch",
+            b"stats",
+            b"version",
+            b"flush_all",
+            b"verbosity",
+            b"quit",
+            b"slabs",
+        ];
+        commands
+            .iter()
+            .any(|command| starts_ascii_word(payload, command))
+    }
+
+    fn memcached_binary_payload(payload: &[u8]) -> bool {
+        if payload.len() < 24 || !matches!(payload[0], 0x80 | 0x81) {
+            return false;
+        }
+        let opcode = payload[1];
+        let key_len = u16::from_be_bytes([payload[2], payload[3]]) as u32;
+        let extras_len = payload[4] as u32;
+        let data_type = payload[5];
+        let total_body_len = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        data_type == 0
+            && opcode <= 0x22
+            && key_len.saturating_add(extras_len) <= total_body_len
+            && total_body_len <= 1_048_576
     }
 
     fn kafka_payload(payload: &[u8]) -> bool {
@@ -2661,6 +2722,16 @@ mod tests {
         };
         assert_eq!(redis.application(), api::AgentPacketFlowApplication::Redis);
 
+        let memcached = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(11211),
+            ..Default::default()
+        };
+        assert_eq!(
+            memcached.application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+
         let prometheus = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(9090),
@@ -2843,6 +2914,18 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").application(),
             api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x80, 0x00, 0x00, 0x03, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0,
+                b'k', b'e', b'y',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Memcached
         );
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
