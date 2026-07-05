@@ -1377,6 +1377,7 @@ mod tests {
                             destination_port: Some(51820),
                             detector: Some("unit-test".to_string()),
                             application: Some(AgentPacketFlowApplication::WireGuard),
+                            payload_prefix: Vec::new(),
                             conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
                             tcp_state: Some(AgentPacketFlowTcpState::Established),
                         },

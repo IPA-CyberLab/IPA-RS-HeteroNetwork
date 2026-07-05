@@ -8071,6 +8071,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
             destination_port,
             detector: Some("ebpf-ringbuf".to_string()),
             application: None,
+            payload_prefix: Vec::new(),
             conntrack_status,
             tcp_state,
         },
@@ -8445,6 +8446,7 @@ impl ConntrackTupleFields {
                 destination_port: self.destination_port,
                 detector: None,
                 application: None,
+                payload_prefix: Vec::new(),
                 conntrack_status: self.conntrack_status,
                 tcp_state: self.tcp_state,
             },
@@ -10903,6 +10905,7 @@ mod tests {
         let flows = parse_ebpf_jsonl_packet_flow_bytes(
             br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","application":"postgres","conntrack_status":["assured"]}
 {"destination":"fd00::42","source":"2001:db8::1","protocol":"tcp","source_port":443,"destination_port":51820,"tcp_state":"established"}
+{"destination":"100.64.0.12","protocol":"tcp","payload_prefix":"GET /metrics HTTP/1.1\r\n"}
 "#,
             &mut cursor,
             EbpfJsonlReadLimits {
@@ -10913,7 +10916,7 @@ mod tests {
         )?;
 
         assert!(cursor.partial_line.is_empty());
-        assert_eq!(flows.len(), 2);
+        assert_eq!(flows.len(), 3);
         assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
         assert_eq!(flows[0].observation.source, Some("192.0.2.10".parse()?));
         assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Udp));
@@ -10937,6 +10940,15 @@ mod tests {
         assert_eq!(
             flows[1].observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
+        );
+        assert_eq!(flows[2].destination, "100.64.0.12".parse::<IpAddr>()?);
+        assert_eq!(
+            flows[2].observation.payload_prefix,
+            b"GET /metrics HTTP/1.1\r\n"
+        );
+        assert_eq!(
+            flows[2].observation.application(),
+            AgentPacketFlowApplication::Prometheus
         );
         Ok(())
     }

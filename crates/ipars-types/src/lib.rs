@@ -1661,6 +1661,8 @@ pub mod api {
         pub observation: AgentPacketFlowObservation,
     }
 
+    pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
+
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowObservation {
         #[serde(default)]
@@ -1675,6 +1677,12 @@ pub mod api {
         pub detector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub application: Option<AgentPacketFlowApplication>,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_packet_flow_payload_prefix"
+        )]
+        pub payload_prefix: Vec<u8>,
         #[serde(default)]
         pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
         #[serde(default)]
@@ -1794,16 +1802,309 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Elasticsearch;
             }
+            if let Some(application) = self.payload_prefix_application() {
+                return application;
+            }
             AgentPacketFlowApplication::Unknown
         }
 
         fn involves_port(&self, port: u16) -> bool {
             self.source_port == Some(port) || self.destination_port == Some(port)
         }
+
+        fn payload_prefix_application(&self) -> Option<AgentPacketFlowApplication> {
+            if self.payload_prefix.is_empty() || !protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return None;
+            }
+            let payload = self.payload_prefix.as_slice();
+            http_payload_application(payload)
+                .or_else(|| ssh_payload(payload).then_some(AgentPacketFlowApplication::Ssh))
+                .or_else(|| {
+                    postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
+                })
+                .or_else(|| mysql_payload(payload).then_some(AgentPacketFlowApplication::Mysql))
+                .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
+                .or_else(|| kafka_payload(payload).then_some(AgentPacketFlowApplication::Kafka))
+                .or_else(|| nats_payload(payload).then_some(AgentPacketFlowApplication::Nats))
+                .or_else(|| mqtt_payload(payload).then_some(AgentPacketFlowApplication::Mqtt))
+                .or_else(|| amqp_payload(payload).then_some(AgentPacketFlowApplication::Amqp))
+                .or_else(|| {
+                    cassandra_payload(payload).then_some(AgentPacketFlowApplication::Cassandra)
+                })
+                .or_else(|| mongodb_payload(payload).then_some(AgentPacketFlowApplication::MongoDb))
+        }
     }
 
     fn protocol_is(protocol: Option<TransportProtocol>, expected: TransportProtocol) -> bool {
         protocol.is_none() || protocol == Some(expected)
+    }
+
+    fn deserialize_packet_flow_payload_prefix<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PayloadPrefixVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PayloadPrefixVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a packet-flow payload prefix string or byte array up to {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                )
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Vec::new())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Vec::new())
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(value.as_bytes())
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(value)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(&value)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::new();
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                        )));
+                    }
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(PayloadPrefixVisitor)
+    }
+
+    fn bounded_packet_flow_payload_prefix<E>(bytes: &[u8]) -> Result<Vec<u8>, E>
+    where
+        E: serde::de::Error,
+    {
+        if bytes.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return Err(E::custom(format!(
+                "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    const HTTP_REQUEST_METHODS: [&[u8]; 9] = [
+        b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE", b"CONNECT",
+    ];
+
+    fn http_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if let Some(path) = http_request_path(payload) {
+            if path_starts_with_any(path, &[b"/metrics", b"/federate"])
+                || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
+            {
+                return Some(AgentPacketFlowApplication::Prometheus);
+            }
+            if path_starts_with_any(path, &[b"/v1/traces", b"/v1/metrics", b"/v1/logs"]) {
+                return Some(AgentPacketFlowApplication::OpenTelemetry);
+            }
+            if path_starts_with_any(
+                path,
+                &[
+                    b"/_bulk",
+                    b"/_search",
+                    b"/_msearch",
+                    b"/_cluster",
+                    b"/_cat",
+                    b"/_nodes",
+                ],
+            ) || path_contains_any(path, &[b"/_bulk", b"/_search", b"/_msearch"])
+            {
+                return Some(AgentPacketFlowApplication::Elasticsearch);
+            }
+            return Some(AgentPacketFlowApplication::Http);
+        }
+        if payload.starts_with(b"HTTP/") || payload.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        {
+            return Some(AgentPacketFlowApplication::Http);
+        }
+        None
+    }
+
+    fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
+        HTTP_REQUEST_METHODS.iter().find_map(|method| {
+            let method_len = method.len();
+            if payload.get(..method_len)? != *method || payload.get(method_len) != Some(&b' ') {
+                return None;
+            }
+            let rest = payload.get(method_len + 1..)?;
+            let end = rest
+                .iter()
+                .position(|byte| matches!(byte, b' ' | b'\r' | b'\n'))
+                .unwrap_or(rest.len());
+            let tail = rest.get(end..)?;
+            (end > 0 && tail.starts_with(b" HTTP/")).then_some(&rest[..end])
+        })
+    }
+
+    fn ssh_payload(payload: &[u8]) -> bool {
+        payload.starts_with(b"SSH-")
+    }
+
+    fn postgres_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let length = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        (8..=10_000).contains(&length) && matches!(code, 196_608 | 80_877_102 | 80_877_103)
+    }
+
+    fn mysql_payload(payload: &[u8]) -> bool {
+        payload.len() >= 5 && payload[3] == 0 && payload[4] == 10
+    }
+
+    fn redis_payload(payload: &[u8]) -> bool {
+        if !payload.starts_with(b"*") {
+            return false;
+        }
+        let commands: [&[u8]; 14] = [
+            b"PING",
+            b"ECHO",
+            b"GET",
+            b"SET",
+            b"DEL",
+            b"EXISTS",
+            b"SUBSCRIBE",
+            b"PUBLISH",
+            b"AUTH",
+            b"SELECT",
+            b"HELLO",
+            b"CLIENT",
+            b"EVAL",
+            b"XADD",
+        ];
+        commands
+            .iter()
+            .any(|command| contains_ascii_case_insensitive(payload, command))
+    }
+
+    fn kafka_payload(payload: &[u8]) -> bool {
+        if payload.len() < 12 {
+            return false;
+        }
+        let frame_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let api_key = u16::from_be_bytes([payload[4], payload[5]]);
+        let api_version = u16::from_be_bytes([payload[6], payload[7]]);
+        (8..=100_000_000).contains(&frame_len) && api_key <= 75 && api_version <= 20
+    }
+
+    fn nats_payload(payload: &[u8]) -> bool {
+        let commands: [&[u8]; 8] = [
+            b"INFO", b"CONNECT", b"PUB", b"HPUB", b"SUB", b"UNSUB", b"MSG", b"HMSG",
+        ];
+        commands
+            .iter()
+            .any(|command| starts_ascii_word(payload, command))
+    }
+
+    fn mqtt_payload(payload: &[u8]) -> bool {
+        payload.len() >= 8 && payload[0] & 0xf0 == 0x10 && payload.windows(4).any(|w| w == b"MQTT")
+    }
+
+    fn amqp_payload(payload: &[u8]) -> bool {
+        payload.starts_with(b"AMQP")
+    }
+
+    fn cassandra_payload(payload: &[u8]) -> bool {
+        if payload.len() < 9 {
+            return false;
+        }
+        let version = payload[0] & 0x7f;
+        let opcode = payload[4];
+        let body_len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
+        (3..=5).contains(&version) && (1..=0x10).contains(&opcode) && body_len <= 16_777_216
+    }
+
+    fn mongodb_payload(payload: &[u8]) -> bool {
+        if payload.len() < 16 {
+            return false;
+        }
+        let message_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let opcode = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+        (16..=100_000_000).contains(&message_len)
+            && matches!(
+                opcode,
+                1 | 1000
+                    | 2001
+                    | 2002
+                    | 2003
+                    | 2004
+                    | 2005
+                    | 2006
+                    | 2007
+                    | 2010
+                    | 2011
+                    | 2012
+                    | 2013
+            )
+    }
+
+    fn starts_ascii_word(payload: &[u8], word: &[u8]) -> bool {
+        let Some(head) = payload.get(..word.len()) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case(word) {
+            return false;
+        }
+        payload
+            .get(word.len())
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
+    fn path_starts_with_any(path: &[u8], prefixes: &[&[u8]]) -> bool {
+        prefixes.iter().any(|prefix| path.starts_with(prefix))
+    }
+
+    fn path_contains_any(path: &[u8], needles: &[&[u8]]) -> bool {
+        needles
+            .iter()
+            .any(|needle| path.windows(needle.len()).any(|window| window == *needle))
+    }
+
+    fn contains_ascii_case_insensitive(payload: &[u8], needle: &[u8]) -> bool {
+        payload
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2315,6 +2616,96 @@ mod tests {
             detector_hint_overrides_port_guess.application(),
             api::AgentPacketFlowApplication::Postgres
         );
+    }
+
+    #[test]
+    fn packet_flow_observation_classifies_payload_prefix_application_protocol() {
+        let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /metrics HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/traces HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0\r\n").application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&[0x4a, 0, 0, 0, 10, b'8', b'.', b'0']).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT {\"verbose\":false}\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(b"AMQP\0\0\x09\x01").application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0,])
+                .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+    }
+
+    #[test]
+    fn packet_flow_payload_prefix_deserialization_is_bounded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"payload_prefix":"GET / HTTP/1.1\r\n"}"#)?;
+        assert_eq!(parsed.payload_prefix, b"GET / HTTP/1.1\r\n");
+
+        let oversized_payload = vec!["1"; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1].join(",");
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"payload_prefix":[{oversized_payload}]}}"#
+        )) {
+            Ok(_) => return Err("oversized payload_prefix should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow payload_prefix exceeds"));
+        Ok(())
     }
 
     #[test]
