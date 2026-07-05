@@ -181,9 +181,34 @@ impl SignalRegistry {
             .get_node(&target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
+        let now = Utc::now();
+        let nat_classifications = self.nat_classifications.read().await;
+        let source_nat_classification = nat_classifications
+            .get(&source)
+            .filter(|classification| {
+                nat_classification_is_fresh(
+                    classification,
+                    now,
+                    self.coordinator.policy.nat_classification_ttl_seconds,
+                )
+            })
+            .cloned();
+        let target_nat_classification = nat_classifications
+            .get(&target)
+            .filter(|classification| {
+                nat_classification_is_fresh(
+                    classification,
+                    now,
+                    self.coordinator.policy.nat_classification_ttl_seconds,
+                )
+            })
+            .cloned();
+        drop(nat_classifications);
         let plan = self.coordinator.punch_plan(
             &source_node.endpoint_candidates,
+            source_nat_classification.as_ref(),
             &target_node.endpoint_candidates,
+            target_nat_classification.as_ref(),
         );
 
         Ok(SignalHolePunchPlanResponse {
@@ -409,9 +434,23 @@ impl SignalCoordinator {
     pub fn punch_plan(
         &self,
         source: &[EndpointCandidate],
+        source_nat_classification: Option<&NatClassification>,
         target: &[EndpointCandidate],
+        target_nat_classification: Option<&NatClassification>,
     ) -> HolePunchPlan {
         let now = Utc::now();
+        if !nat_classifications_allow_hole_punch(
+            source_nat_classification,
+            target_nat_classification,
+        ) {
+            return HolePunchPlan {
+                source_reflexive: None,
+                target_reflexive: None,
+                start_after_millis: 50,
+                expires_at: now + chrono::Duration::seconds(5),
+            };
+        }
+
         let source =
             fresh_endpoint_candidates(source, now, self.policy.endpoint_candidate_ttl_seconds);
         let target =
@@ -429,7 +468,7 @@ impl SignalCoordinator {
             source_reflexive,
             target_reflexive,
             start_after_millis: 50,
-            expires_at: Utc::now() + chrono::Duration::seconds(5),
+            expires_at: now + chrono::Duration::seconds(5),
         }
     }
 
@@ -765,7 +804,9 @@ mod tests {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
         let plan = coordinator.punch_plan(
             &[stale_candidate(EndpointCandidateKind::StunReflexive)],
+            None,
             &[candidate(EndpointCandidateKind::StunReflexive)],
+            None,
         );
 
         assert!(plan.source_reflexive.is_none());
@@ -1073,6 +1114,50 @@ mod tests {
         assert!(plan.source_reflexive.is_some());
         assert!(plan.target_reflexive.is_some());
         assert_eq!(plan.start_after_millis, 50);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_blocks_hole_punch_plan_when_nat_prefers_relay() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(source, Some(relay_preferred_nat()))
+            .await?;
+        registry.upsert_node(target).await?;
+
+        let plan = registry
+            .hole_punch_plan(NodeId::from_string("node-a"), NodeId::from_string("node-b"))
+            .await?;
+
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_ignores_stale_nat_classification_for_hole_punch_plan(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            nat_classification_ttl_seconds: 30,
+            ..ClusterPolicy::default()
+        });
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut stale_nat = relay_preferred_nat();
+        stale_nat.assessed_at = Utc::now() - chrono::Duration::seconds(60);
+        registry
+            .upsert_node_with_nat(source, Some(stale_nat))
+            .await?;
+        registry.upsert_node(target).await?;
+
+        let plan = registry
+            .hole_punch_plan(NodeId::from_string("node-a"), NodeId::from_string("node-b"))
+            .await?;
+
+        assert!(plan.source_reflexive.is_some());
+        assert!(plan.target_reflexive.is_some());
         Ok(())
     }
 
