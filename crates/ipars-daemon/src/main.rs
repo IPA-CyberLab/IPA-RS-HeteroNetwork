@@ -3697,14 +3697,15 @@ async fn run_agent(
     let relay_capability = relay_capability_reporter
         .as_ref()
         .map(|reporter| reporter.advertised.clone());
-    if args.stun_servers.len() > 1 {
+    let join_token = agent_join_token(&args)?;
+    let stun_servers = agent_stun_servers(&args, join_token.as_ref()).await?;
+    if stun_servers.len() > 1 {
         runtime
-            .classify_nat(args.stun_bind, args.stun_servers.clone())
+            .classify_nat(args.stun_bind, stun_servers.clone())
             .await?;
-    } else if let Some(stun_server) = args.stun_servers.first().copied() {
+    } else if let Some(stun_server) = stun_servers.first().copied() {
         runtime.probe_stun(args.stun_bind, stun_server).await?;
     }
-    let join_token = agent_join_token(&args)?;
     let mut registered_control_plane_base = None;
     let registered_node = if let Some(token) = &join_token {
         let requested_routes = agent_requested_routes(&args, runtime.state().node_id.clone())
@@ -8848,6 +8849,63 @@ fn signal_base_urls(
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
     }
     Ok(base_urls)
+}
+
+async fn agent_stun_servers(
+    args: &AgentArgs,
+    token: Option<&SignedJoinToken>,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut servers = args.stun_servers.clone();
+    if let Some(token) = token {
+        for endpoint in token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
+        {
+            servers
+                .extend(resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await?);
+        }
+    }
+    Ok(dedupe_socket_addrs_preserve_order(servers))
+}
+
+async fn resolve_udp_bootstrap_socket_addrs(
+    url: &str,
+    name: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{name} must be an absolute URL"))?;
+    if parsed.scheme() != "udp" {
+        anyhow::bail!("{name} must use udp");
+    }
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{name} must include a host"))?;
+    let port = parsed
+        .port()
+        .with_context(|| format!("{name} must include a port"))?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve {name} {url}"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        anyhow::bail!("{name} {url} resolved to no socket addresses");
+    }
+    Ok(addrs)
+}
+
+fn dedupe_socket_addrs_preserve_order(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for addr in addrs {
+        if seen.insert(addr) {
+            deduped.push(addr);
+        }
+    }
+    deduped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14474,6 +14532,57 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             signal_base_urls(Some(&token), Some("http://127.0.0.1:9443/"))?,
             vec!["http://127.0.0.1:9443".to_string()]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_merge_explicit_and_token_bootstraps() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--stun-server", "203.0.113.9:3478"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "udp://203.0.113.9:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.10:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.11:3479".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ]);
+
+        assert_eq!(
+            agent_stun_servers(&args, Some(&token)).await?,
+            vec![
+                SocketAddr::from(([203, 0, 113, 9], 3478)),
+                SocketAddr::from(([203, 0, 113, 10], 3478)),
+                SocketAddr::from(([203, 0, 113, 11], 3479)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_reject_invalid_token_bootstraps() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+
+        let error = match agent_stun_servers(&args, Some(&token)).await {
+            Ok(_) => anyhow::bail!("invalid STUN bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("STUN bootstrap must use udp"));
         Ok(())
     }
 
