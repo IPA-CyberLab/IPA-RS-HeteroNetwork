@@ -7308,14 +7308,24 @@ async fn stable_signal_path_record(
             && candidate.selected_state.is_direct()
             && !PathSelector::should_promote(&current, &candidate)
         {
-            current.updated_at = candidate.updated_at;
+            if let Some(session) = active_relay_session(runtime, &candidate.key.remote).await {
+                current.updated_at = candidate.updated_at;
+                current.relay_node = Some(session.relay_node.clone());
+                tracing::debug!(
+                    peer = %candidate.key.remote,
+                    relay = %session.relay_node,
+                    relay_score = current.score.value,
+                    direct_score = candidate.score.value,
+                    "keeping relay path until direct candidate score clears promotion margin"
+                );
+                return (current, StableSignalPathSelection::CurrentRelay);
+            }
             tracing::debug!(
                 peer = %candidate.key.remote,
                 relay_score = current.score.value,
                 direct_score = candidate.score.value,
-                "keeping relay path until direct candidate score clears promotion margin"
+                "accepting direct candidate because current relay path has no active session"
             );
-            return (current, StableSignalPathSelection::CurrentRelay);
         }
     }
 
@@ -16503,6 +16513,18 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             pinned: false,
         };
         runtime.upsert_path_state(current).await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 31], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
         let candidate_updated_at = Utc::now();
         let candidate_record = PathRecord {
             key: PeerPathKey::new(local, peer),
@@ -16527,6 +16549,110 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(selected.selected_state, PathState::Relay);
         assert_eq!(selected.relay_node, Some(NodeId::from_string("relay-a")));
         assert_eq!(selected.updated_at, candidate_updated_at);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_without_active_relay_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_when_relay_session_expired() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 31], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() - ChronoDuration::seconds(1),
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
     }
 
     #[tokio::test]

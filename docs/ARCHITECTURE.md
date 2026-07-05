@@ -74,7 +74,7 @@ Path selection scores candidates using:
 - route/relay cost
 - stability
 
-Direct paths are preferred when allowed and healthy. Relay paths remain encrypted end to end and are demoted automatically when direct paths recover. Important peers, Kubernetes control-plane nodes, relays, and route providers can be pinned so lazy connection cleanup does not tear them down.
+Direct paths are preferred when allowed and healthy. Relay paths remain encrypted end to end and are demoted automatically when direct paths recover. The agent applies a small relay-to-direct promotion margin to avoid flapping only while an unexpired relay credential is still usable; credentialless or expired relay state does not suppress a fresh direct candidate. Important peers, Kubernetes control-plane nodes, relays, and route providers can be pinned so lazy connection cleanup does not tear them down.
 
 ## ACL And Peer Visibility
 
