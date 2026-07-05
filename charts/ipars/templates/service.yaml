@@ -10,6 +10,7 @@
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
 {{- $agentApiPort := int .Values.agent.apiService.port -}}
+{{- $agentApiClusterIP := .Values.agent.apiService.clusterIP -}}
 {{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
 {{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
 {{- $agentApiLoadBalancerIP := .Values.agent.apiService.loadBalancerIP -}}
@@ -22,6 +23,7 @@
 {{- $agentApiSessionAffinityTimeoutSeconds := int .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
+{{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
 {{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
 {{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
 {{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
@@ -41,6 +43,12 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (or (lt $agentApiPort 1) (gt $agentApiPort 65535)) -}}
 {{- fail "agent.apiService.port must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiClusterIP "") -}}
+{{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.clusterIP" "value" $agentApiClusterIP) -}}
+{{- if and $agentApiIpFamilies (ne (index $agentApiIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $agentApiClusterIP))) -}}
+{{- fail "agent.apiService.clusterIP family must match the first agent.apiService.ipFamilies value" -}}
+{{- end -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (not $agentApiExternal) -}}
 {{- fail "agent.apiService.nodePort requires agent.apiService.type NodePort or LoadBalancer" -}}
@@ -116,6 +124,12 @@
 {{- end -}}
 {{- if and $relayServiceActive (or (lt $relayHttpPort 1) (gt $relayHttpPort 65535)) -}}
 {{- fail "agent.relayService.httpPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayClusterIP "") -}}
+{{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}
+{{- if and $relayIpFamilies (ne (index $relayIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP))) -}}
+{{- fail "agent.relayService.clusterIP family must match the first agent.relayService.ipFamilies value" -}}
+{{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0)) (not $relayExternal) -}}
 {{- fail "agent.relayService udpNodePort/httpNodePort require agent.relayService.type NodePort or LoadBalancer" -}}
@@ -273,6 +287,9 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.apiService.type }}
+  {{- if .Values.agent.apiService.clusterIP }}
+  clusterIP: {{ .Values.agent.apiService.clusterIP | quote }}
+  {{- end }}
   {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.apiService.loadBalancerSourceRanges | nindent 4 }}
@@ -346,6 +363,9 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.relayService.type }}
+  {{- if .Values.agent.relayService.clusterIP }}
+  clusterIP: {{ .Values.agent.relayService.clusterIP | quote }}
+  {{- end }}
   {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.relayService.loadBalancerSourceRanges | nindent 4 }}

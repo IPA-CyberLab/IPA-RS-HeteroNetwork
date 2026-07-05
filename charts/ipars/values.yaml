@@ -80,6 +80,7 @@ agent:
     allowUnrestrictedLoadBalancer: false
     allowClusterExternalTrafficPolicy: false
     type: ClusterIP
+    clusterIP: ""
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
@@ -114,6 +115,7 @@ agent:
     allowUnrestrictedLoadBalancer: false
     allowClusterExternalTrafficPolicy: false
     type: LoadBalancer
+    clusterIP: ""
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
