@@ -29,7 +29,7 @@ use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_relay::{RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
+    kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
     LinuxNetlinkRouteManager, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
     NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
 };
@@ -2882,12 +2882,23 @@ fn docker_route_source(args: &AgentArgs) -> anyhow::Result<DockerRouteSource> {
 }
 
 async fn agent_requested_routes(args: &AgentArgs, node_id: NodeId) -> anyhow::Result<Vec<Route>> {
-    if !args.apply_docker_routes || !args.docker_expose_host_routes {
+    let expose_docker_routes = args.apply_docker_routes && args.docker_expose_host_routes;
+    if !expose_docker_routes && !args.apply_kubernetes_underlay {
         return Ok(Vec::new());
     }
     validate_agent_runtime_config(args)?;
-    let intent = docker_route_source(args)?.resolve_intent().await?;
-    Ok(docker_advertised_routes(&node_id, intent.container_cidrs))
+    let mut routes = Vec::new();
+    if expose_docker_routes {
+        let intent = docker_route_source(args)?.resolve_intent().await?;
+        routes.extend(docker_advertised_routes(&node_id, intent.container_cidrs));
+    }
+    if args.apply_kubernetes_underlay {
+        let intent = kubernetes_route_source(args, node_id.clone())?
+            .resolve_intent()
+            .await?;
+        routes.extend(kubernetes_route_plan(intent).routes);
+    }
+    Ok(routes)
 }
 
 fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<Route> {
@@ -8326,6 +8337,38 @@ invalid no-destination-here
                 intent.service_cidrs,
                 vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
             );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn kubernetes_underlay_builds_agent_requested_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-node-name",
+            "worker-a",
+            "--kubernetes-api-server-cidr",
+            "10.0.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let node_id = NodeId::from_string("route-provider-a");
+            let routes = agent_requested_routes(&args, node_id.clone()).await?;
+
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[0].id, "k8s-0");
+            assert_eq!(routes[0].cidr, "10.0.0.1/32".parse::<ipnet::IpNet>()?);
+            assert_eq!(routes[0].advertised_by, node_id);
+            assert_eq!(routes[0].via, Some(NodeId::from_string("route-provider-a")));
+            assert_eq!(routes[1].id, "k8s-1");
+            assert_eq!(routes[1].cidr, "10.96.0.0/12".parse::<ipnet::IpNet>()?);
             return Ok(());
         }
 
