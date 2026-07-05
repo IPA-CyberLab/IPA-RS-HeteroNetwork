@@ -1813,12 +1813,23 @@ pub mod api {
         }
 
         fn payload_prefix_application(&self) -> Option<AgentPacketFlowApplication> {
-            if self.payload_prefix.is_empty() || !protocol_is(self.protocol, TransportProtocol::Tcp)
-            {
+            if self.payload_prefix.is_empty() {
                 return None;
             }
             let payload = self.payload_prefix.as_slice();
+            if protocol_is(self.protocol, TransportProtocol::Udp)
+                && self.involves_port(443)
+                && quic_long_header_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Https);
+            }
+            if !protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return None;
+            }
             http_payload_application(payload)
+                .or_else(|| {
+                    tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
+                })
                 .or_else(|| ssh_payload(payload).then_some(AgentPacketFlowApplication::Ssh))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
@@ -1958,6 +1969,39 @@ pub mod api {
             return Some(AgentPacketFlowApplication::Http);
         }
         None
+    }
+
+    fn tls_handshake_payload(payload: &[u8]) -> bool {
+        if payload.len() < 6 {
+            return false;
+        }
+        let record_len = u16::from_be_bytes([payload[3], payload[4]]);
+        payload[0] == 0x16
+            && payload[1] == 0x03
+            && (0x01..=0x04).contains(&payload[2])
+            && (1..=16_384).contains(&record_len)
+            && matches!(payload[5], 0x01 | 0x02)
+    }
+
+    fn quic_long_header_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] & 0xc0 != 0xc0 {
+            return false;
+        }
+        let version = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        if version == 0 {
+            return false;
+        }
+        let dcid_len = payload[5] as usize;
+        let Some(scid_len_index) = 6_usize.checked_add(dcid_len) else {
+            return false;
+        };
+        let Some(scid_len) = payload.get(scid_len_index).map(|len| *len as usize) else {
+            return false;
+        };
+        scid_len_index
+            .checked_add(1)
+            .and_then(|offset| offset.checked_add(scid_len))
+            .is_some_and(|minimum_len| payload.len() >= minimum_len)
     }
 
     fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
@@ -2641,6 +2685,30 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let quic = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(quic.application(), api::AgentPacketFlowApplication::Https);
+        let non_quic_udp_443 = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: b"not-quic".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            non_quic_udp_443.application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"SSH-2.0-OpenSSH_9.0\r\n").application(),
