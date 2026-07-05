@@ -9,6 +9,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipars -d ipars"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   control-plane:
     build:
@@ -34,7 +39,14 @@ services:
     ports:
       - "8443:8443"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8443/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
 
   signal:
     build:
@@ -50,6 +62,12 @@ services:
       IPARS_ROLE: signal
     ports:
       - "9443:9443"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9443/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
 
   stun:
     build:
@@ -87,6 +105,12 @@ services:
     ports:
       - "51820:51820/udp"
       - "9580:9580"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9580/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     cap_add:
       - NET_ADMIN
     devices:
@@ -108,7 +132,8 @@ services:
       - 127.0.0.1:3478
     environment:
       IPARS_ROLE: agent
-      IPARS_CONTROL_PLANE_URL: http://control-plane:8443
+      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:8443
+      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:9443
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
       IPARS_DOCKER_CONTAINER_NAMESPACE: compose-default
       IPARS_DOCKER_HOST_INTERFACE: docker0
@@ -122,6 +147,21 @@ services:
       IPARS_AGENT_RELAY_MAX_MBPS: "1000"
       IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS: "1024"
       IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: "5"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      signal:
+        condition: service_healthy
+      stun:
+        condition: service_started
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9780/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     network_mode: host
     cap_add:
       - NET_ADMIN

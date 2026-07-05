@@ -2049,6 +2049,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     let mut notes = vec![
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
+        "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.rootless {
@@ -4041,6 +4042,10 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("healthchecks") && note.contains("loopback URLs")));
         Ok(())
     }
 
