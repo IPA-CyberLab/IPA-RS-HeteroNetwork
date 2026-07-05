@@ -243,7 +243,8 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
                 None,
                 Some(healthy_node_health()),
             )
-            .await;
+            .await
+            .with_context(|| format!("failed to upsert synthetic signal node {index}"))?;
         nodes.push(response.node);
     }
     let registration_millis = registration_started.elapsed().as_millis();

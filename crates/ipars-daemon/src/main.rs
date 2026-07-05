@@ -13175,7 +13175,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     #[tokio::test]
     async fn signal_path_request_fails_over_to_available_signal_service() -> anyhow::Result<()> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        registry.upsert_node(node_record("node-b")).await;
+        registry.upsert_node(node_record("node-a")).await?;
+        registry.upsert_node(node_record("node-b")).await?;
         let (base, task) = spawn_test_signal_service(registry.clone()).await?;
         let unavailable = unused_http_base_url().await?;
         let client = reqwest::Client::new();

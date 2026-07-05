@@ -79,7 +79,7 @@ async fn upsert_node(
                 request.nat_classification,
                 request.health,
             )
-            .await,
+            .await?,
     ))
 }
 
@@ -293,6 +293,13 @@ impl IntoResponse for ApiError {
             Self::Signal(SignalError::NodeNotFound(node_id)) => {
                 (StatusCode::NOT_FOUND, format!("node not found: {node_id}"))
             }
+            Self::Signal(SignalError::CandidateOwnerMismatch {
+                node_id,
+                candidate_node_id,
+            }) => (
+                StatusCode::BAD_REQUEST,
+                format!("candidate for node {node_id} belongs to {candidate_node_id}"),
+            ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
         };
         (status, Json(ErrorResponse { error })).into_response()
@@ -357,10 +364,30 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
         let app = router(SignalHttpState::new(registry));
+        let source = node(
+            "node-a",
+            vec![candidate("node-a", EndpointCandidateKind::StunReflexive)],
+        );
         let target = node(
             "node-b",
             vec![candidate("node-b", EndpointCandidateKind::PublicUdp)],
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
+                        node: source,
+                        nat_classification: None,
+                        health: None,
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
@@ -418,11 +445,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let metrics: SignalMetricsResponse = serde_json::from_slice(&body)?;
-        assert_eq!(metrics.node_count, 1);
+        assert_eq!(metrics.node_count, 2);
         assert_eq!(metrics.relay_candidate_count, 0);
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
-        assert_eq!(metrics.node_upsert_count, 1);
+        assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
         assert_eq!(
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
@@ -440,13 +467,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
-        assert!(body.contains("ipars_signal_nodes 1"));
+        assert!(body.contains("ipars_signal_nodes 2"));
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_signal_rejects_unowned_endpoint_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let app = router(SignalHttpState::new(registry));
+        let node = node(
+            "node-a",
+            vec![candidate("node-b", EndpointCandidateKind::StunReflexive)],
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
+                        node,
+                        nat_classification: None,
+                        health: None,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("candidate for node node-a belongs to node-b"));
         Ok(())
     }
 

@@ -19,6 +19,11 @@ use tokio::sync::RwLock;
 pub enum SignalError {
     #[error("node not found: {0}")]
     NodeNotFound(NodeId),
+    #[error("candidate for node {node_id} belongs to {candidate_node_id}")]
+    CandidateOwnerMismatch {
+        node_id: NodeId,
+        candidate_node_id: NodeId,
+    },
 }
 
 #[derive(Debug)]
@@ -55,7 +60,10 @@ impl SignalRegistry {
         }
     }
 
-    pub async fn upsert_node(&self, node: NodeRecord) -> SignalNodeUpsertResponse {
+    pub async fn upsert_node(
+        &self,
+        node: NodeRecord,
+    ) -> Result<SignalNodeUpsertResponse, SignalError> {
         self.upsert_node_with_nat(node, None).await
     }
 
@@ -63,7 +71,7 @@ impl SignalRegistry {
         &self,
         node: NodeRecord,
         nat_classification: Option<NatClassification>,
-    ) -> SignalNodeUpsertResponse {
+    ) -> Result<SignalNodeUpsertResponse, SignalError> {
         self.upsert_node_with_nat_and_health(node, nat_classification, None)
             .await
     }
@@ -73,7 +81,8 @@ impl SignalRegistry {
         node: NodeRecord,
         nat_classification: Option<NatClassification>,
         health: Option<NodeHealth>,
-    ) -> SignalNodeUpsertResponse {
+    ) -> Result<SignalNodeUpsertResponse, SignalError> {
+        validate_endpoint_candidate_owners(&node.node_id, &node.endpoint_candidates)?;
         let registered_at = Utc::now();
         match nat_classification {
             Some(classification) => {
@@ -102,10 +111,10 @@ impl SignalRegistry {
             .await
             .insert(node.node_id.clone(), node.clone());
         self.node_upserts.fetch_add(1, Ordering::Relaxed);
-        SignalNodeUpsertResponse {
+        Ok(SignalNodeUpsertResponse {
             node,
             registered_at,
-        }
+        })
     }
 
     pub async fn get_node(&self, node_id: &NodeId) -> Option<NodeRecord> {
@@ -117,6 +126,10 @@ impl SignalRegistry {
         request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
+        self.get_node(&request.source)
+            .await
+            .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
+        validate_endpoint_candidate_owners(&request.source, &request.source_candidates)?;
         let target = self
             .get_node(&request.target)
             .await
@@ -439,6 +452,22 @@ impl SignalCoordinator {
     }
 }
 
+fn validate_endpoint_candidate_owners(
+    node_id: &NodeId,
+    candidates: &[EndpointCandidate],
+) -> Result<(), SignalError> {
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.node_id != *node_id)
+    {
+        return Err(SignalError::CandidateOwnerMismatch {
+            node_id: node_id.clone(),
+            candidate_node_id: candidate.node_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn fresh_endpoint_candidates(
     candidates: &[EndpointCandidate],
     now: chrono::DateTime<Utc>,
@@ -554,9 +583,13 @@ mod tests {
         candidate
     }
 
-    fn target(candidates: Vec<EndpointCandidate>) -> NodeRecord {
+    fn node_record(node_id: &str, mut candidates: Vec<EndpointCandidate>) -> NodeRecord {
+        let node_id = NodeId::from_string(node_id);
+        for candidate in &mut candidates {
+            candidate.node_id = node_id.clone();
+        }
         NodeRecord {
-            node_id: NodeId::from_string("node-b"),
+            node_id,
             cluster_id: ClusterId::new(),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: "identity".to_string(),
@@ -569,6 +602,14 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    fn source(candidates: Vec<EndpointCandidate>) -> NodeRecord {
+        node_record("node-a", candidates)
+    }
+
+    fn target(candidates: Vec<EndpointCandidate>) -> NodeRecord {
+        node_record("node-b", candidates)
     }
 
     fn relay() -> NodeRecord {
@@ -682,10 +723,11 @@ mod tests {
     #[tokio::test]
     async fn registry_uses_relay_fallback_when_direct_is_unreachable() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
-        registry.upsert_node(target(Vec::new())).await;
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
-            .await;
+            .await?;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -709,10 +751,11 @@ mod tests {
         if let Some(capability) = relay.relay_capability.as_mut() {
             capability.admission_url = None;
         }
-        registry.upsert_node(target(Vec::new())).await;
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
         registry
             .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
-            .await;
+            .await?;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -733,15 +776,15 @@ mod tests {
     async fn registry_uses_relay_when_nat_classification_prefers_relay() -> Result<(), SignalError>
     {
         let registry = SignalRegistry::new(ClusterPolicy::default());
-        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
-        source.node_id = NodeId::from_string("node-a");
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
         let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source.clone()).await?;
         registry
             .upsert_node_with_nat(target, Some(relay_preferred_nat()))
-            .await;
+            .await?;
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
-            .await;
+            .await?;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -761,28 +804,29 @@ mod tests {
     #[tokio::test]
     async fn registry_requires_fresh_healthy_relay_health() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
-        registry.upsert_node(target(Vec::new())).await;
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
 
-        registry.upsert_node(relay()).await;
+        registry.upsert_node(relay()).await?;
         assert!(registry.relay_candidates().await.is_empty());
 
         let mut unhealthy = healthy_health();
         unhealthy.state = HealthState::Unhealthy;
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(unhealthy))
-            .await;
+            .await?;
         assert!(registry.relay_candidates().await.is_empty());
 
         let mut stale = healthy_health();
         stale.last_seen_at = Utc::now() - chrono::Duration::seconds(120);
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(stale))
-            .await;
+            .await?;
         assert!(registry.relay_candidates().await.is_empty());
 
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
-            .await;
+            .await?;
         assert_eq!(registry.relay_candidates().await.len(), 1);
 
         let response = registry
@@ -806,11 +850,10 @@ mod tests {
             endpoint_candidate_ttl_seconds: 30,
             ..ClusterPolicy::default()
         });
-        let mut source = target(vec![
+        let source = source(vec![
             stale_candidate(EndpointCandidateKind::StunReflexive),
             candidate(EndpointCandidateKind::StunReflexive),
         ]);
-        source.node_id = NodeId::from_string("node-a");
         let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
         registry
             .upsert_node_with_nat_and_health(
@@ -818,15 +861,15 @@ mod tests {
                 Some(relay_preferred_nat()),
                 Some(healthy_health()),
             )
-            .await;
+            .await?;
         registry
             .upsert_node_with_nat_and_health(target.clone(), None, Some(healthy_health()))
-            .await;
+            .await?;
         let mut stale = healthy_health();
         stale.last_seen_at = Utc::now() - chrono::Duration::seconds(60);
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(stale))
-            .await;
+            .await?;
         registry
             .negotiate(SignalPathRequest {
                 source: source.node_id.clone(),
@@ -861,7 +904,7 @@ mod tests {
 
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
-            .await;
+            .await?;
         let fresh_metrics = registry.metrics().await;
         assert_eq!(fresh_metrics.relay_candidate_count, 1);
         assert_eq!(fresh_metrics.stale_health_report_count, 0);
@@ -873,11 +916,13 @@ mod tests {
     #[tokio::test]
     async fn registry_clears_nat_classification_when_upsert_omits_it() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
         let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source.clone()).await?;
         registry
             .upsert_node_with_nat(target.clone(), Some(relay_preferred_nat()))
-            .await;
-        registry.upsert_node(target).await;
+            .await?;
+        registry.upsert_node(target).await?;
 
         let response = registry
             .negotiate(SignalPathRequest {
@@ -896,11 +941,10 @@ mod tests {
     #[tokio::test]
     async fn registry_builds_hole_punch_plan_for_reflexive_candidates() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
-        let mut source = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
-        source.node_id = NodeId::from_string("node-a");
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
         let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
-        registry.upsert_node(source).await;
-        registry.upsert_node(target).await;
+        registry.upsert_node(source).await?;
+        registry.upsert_node(target).await?;
 
         let plan = registry
             .hole_punch_plan(NodeId::from_string("node-a"), NodeId::from_string("node-b"))
@@ -909,6 +953,39 @@ mod tests {
         assert!(plan.source_reflexive.is_some());
         assert!(plan.target_reflexive.is_some());
         assert_eq!(plan.start_after_millis, 50);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_unowned_endpoint_candidates() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut unowned_node = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        unowned_node.endpoint_candidates[0].node_id = NodeId::from_string("other-node");
+
+        assert!(matches!(
+            registry.upsert_node(unowned_node).await,
+            Err(SignalError::CandidateOwnerMismatch { .. })
+        ));
+
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        let mut unowned_candidate = candidate(EndpointCandidateKind::StunReflexive);
+        unowned_candidate.node_id = target.node_id.clone();
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id,
+                    target: target.node_id,
+                    source_candidates: vec![unowned_candidate],
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                })
+                .await,
+            Err(SignalError::CandidateOwnerMismatch { .. })
+        ));
         Ok(())
     }
 
