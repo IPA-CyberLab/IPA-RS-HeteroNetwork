@@ -3920,56 +3920,28 @@ async fn run_agent(
 }
 
 struct ManagedUserspaceWireGuardProcess {
-    child: tokio::process::Child,
     label: String,
-    shutdown_timeout: Duration,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl ManagedUserspaceWireGuardProcess {
     async fn shutdown(mut self) {
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
+        if let Some(shutdown) = self.shutdown.take() {
+            if shutdown.send(()).is_err() {
                 tracing::info!(
                     command = %self.label,
-                    %status,
-                    "userspace WireGuard process already exited"
-                );
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    command = %self.label,
-                    %error,
-                    "failed to inspect userspace WireGuard process before shutdown"
+                    "userspace WireGuard process monitor already stopped"
                 );
             }
         }
 
-        if let Err(error) = self.child.start_kill() {
+        if let Err(error) = self.task.await {
             tracing::warn!(
                 command = %self.label,
                 %error,
-                "failed to signal userspace WireGuard process shutdown"
+                "userspace WireGuard process monitor task failed"
             );
-            return;
-        }
-        match tokio::time::timeout(self.shutdown_timeout, self.child.wait()).await {
-            Ok(Ok(status)) => tracing::info!(
-                command = %self.label,
-                %status,
-                "userspace WireGuard process stopped"
-            ),
-            Ok(Err(error)) => tracing::warn!(
-                command = %self.label,
-                %error,
-                "failed waiting for userspace WireGuard process shutdown"
-            ),
-            Err(_) => tracing::warn!(
-                command = %self.label,
-                timeout_seconds = self.shutdown_timeout.as_secs(),
-                "timed out waiting for userspace WireGuard process shutdown"
-            ),
         }
     }
 }
@@ -3999,10 +3971,17 @@ async fn start_userspace_wireguard_process(
         cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout).await;
         return Err(error);
     }
-    Ok(Some(ManagedUserspaceWireGuardProcess {
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(monitor_userspace_wireguard_process(
         child,
-        label,
+        label.clone(),
+        shutdown_rx,
         shutdown_timeout,
+    ));
+    Ok(Some(ManagedUserspaceWireGuardProcess {
+        label,
+        shutdown: Some(shutdown),
+        task,
     }))
 }
 
@@ -4015,13 +3994,95 @@ async fn cleanup_unready_userspace_wireguard_process(
         command = %label,
         "stopping userspace WireGuard process after readiness failure"
     );
-    ManagedUserspaceWireGuardProcess {
-        child,
-        label,
-        shutdown_timeout,
+    let mut child = child;
+    stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+}
+
+async fn monitor_userspace_wireguard_process(
+    mut child: tokio::process::Child,
+    label: String,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    shutdown_timeout: Duration,
+) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    command = %label,
+                    %status,
+                    "userspace WireGuard process exited unexpectedly"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    command = %label,
+                    %error,
+                    "failed to inspect userspace WireGuard process"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = &mut shutdown => {
+                stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
-    .shutdown()
-    .await;
+}
+
+async fn stop_userspace_wireguard_child(
+    child: &mut tokio::process::Child,
+    label: &str,
+    shutdown_timeout: Duration,
+) {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            tracing::info!(
+                command = %label,
+                %status,
+                "userspace WireGuard process already exited"
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed to inspect userspace WireGuard process before shutdown"
+            );
+        }
+    }
+
+    if let Err(error) = child.start_kill() {
+        tracing::warn!(
+            command = %label,
+            %error,
+            "failed to signal userspace WireGuard process shutdown"
+        );
+        return;
+    }
+    match tokio::time::timeout(shutdown_timeout, child.wait()).await {
+        Ok(Ok(status)) => tracing::info!(
+            command = %label,
+            %status,
+            "userspace WireGuard process stopped"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            command = %label,
+            %error,
+            "failed waiting for userspace WireGuard process shutdown"
+        ),
+        Err(_) => tracing::warn!(
+            command = %label,
+            timeout_seconds = shutdown_timeout.as_secs(),
+            "timed out waiting for userspace WireGuard process shutdown"
+        ),
+    }
 }
 
 async fn wait_for_userspace_wireguard_ready(
@@ -11272,7 +11333,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         std::fs::create_dir(&temp_dir)?;
         let pid_path = temp_dir.join("child.pid");
         let pid_arg = pid_path.display().to_string();
-        let shell_script = r#"printf '%s\n' "$$" > "$1"; while :; do sleep 1; done"#;
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
         let cli = Cli::try_parse_from(vec![
             "iparsd".to_string(),
             "agent".to_string(),
@@ -11323,6 +11384,73 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_monitor_shutdown_stops_child_process() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "iparsd-userspace-wg-monitor-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(shell_script)
+            .arg("ipars-monitor")
+            .arg(&pid_arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start monitor test child")?;
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(monitor_userspace_wireguard_process(
+            child,
+            "monitor-test".to_string(),
+            shutdown_rx,
+            Duration::from_secs(1),
+        ));
+
+        assert!(shutdown.send(()).is_ok());
+        task.await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "userspace WireGuard monitor child process {pid} was left running after shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    async fn wait_for_pid_file(path: &Path, timeout: Duration) -> anyhow::Result<u32> {
+        let started = Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    return contents
+                        .trim()
+                        .parse::<u32>()
+                        .context("failed to parse child pid");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read child pid file {}", path.display())
+                    });
+                }
+            }
+            anyhow::ensure!(
+                started.elapsed() < timeout,
+                "timed out waiting for child pid file {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
