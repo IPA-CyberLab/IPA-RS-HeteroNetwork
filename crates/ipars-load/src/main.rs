@@ -32,7 +32,7 @@ use ipars_types::{
     EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
     NodeId, NodeRecord, PathState, RelayCapability, Role, Route, Tag, TokenPolicy,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -40,6 +40,7 @@ use tokio::task::JoinHandle;
 static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
+const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 
@@ -72,7 +73,7 @@ struct Cli {
     daemon_keep_runtime_dir: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ScenarioName {
     Three,
@@ -199,6 +200,7 @@ struct LoadReport {
     relay_mbps: f64,
     daemon_processes: usize,
     daemon_runtime_dir: Option<PathBuf>,
+    daemon_runtime_manifest: Option<PathBuf>,
     daemon_agent_processes: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
@@ -365,6 +367,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_runtime_dir: None,
+        daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -533,6 +536,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_runtime_dir: None,
+        daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -675,6 +679,7 @@ async fn run_relay_udp_scenario(
         relay_mbps,
         daemon_processes: 0,
         daemon_runtime_dir: None,
+        daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
@@ -924,6 +929,7 @@ async fn run_daemon_scenario(
         relay_mbps,
         daemon_processes: services.process_count(),
         daemon_runtime_dir: keep_runtime_dir.then(|| services.runtime_dir.clone()),
+        daemon_runtime_manifest: keep_runtime_dir.then(|| services.manifest_path()),
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
@@ -1142,6 +1148,38 @@ struct DaemonProcessGroup {
     children: Vec<DaemonChild>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonRuntimeManifest {
+    scenario: ScenarioName,
+    runtime_dir: PathBuf,
+    control_plane_urls: Vec<String>,
+    signal_url: String,
+    relay_http_url: String,
+    relay_udp_addr: SocketAddr,
+    stun_addr: SocketAddr,
+    agent_urls: Vec<String>,
+    keep_runtime_dir: bool,
+    generated_at: chrono::DateTime<Utc>,
+    children: Vec<DaemonRuntimeManifestChild>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonRuntimeManifestChild {
+    role: String,
+    pid: Option<u32>,
+    log_path: Option<PathBuf>,
+}
+
+impl DaemonRuntimeManifestChild {
+    fn from_child(child: &DaemonChild) -> Self {
+        Self {
+            role: child.role.clone(),
+            pid: Some(child.child.id()),
+            log_path: child.log_path.clone(),
+        }
+    }
+}
+
 impl DaemonProcessGroup {
     async fn start(
         iparsd_bin: &Path,
@@ -1323,6 +1361,26 @@ impl DaemonProcessGroup {
             &mut startup.children,
         )
         .await?;
+        write_daemon_runtime_manifest(
+            &runtime_dir,
+            DaemonRuntimeManifest {
+                scenario: scenario.name,
+                runtime_dir: runtime_dir.clone(),
+                control_plane_urls: control_plane_urls.clone(),
+                signal_url: signal_url.clone(),
+                relay_http_url: relay_http_url.clone(),
+                relay_udp_addr,
+                stun_addr,
+                agent_urls: agent_urls.clone(),
+                keep_runtime_dir: options.keep_runtime_dir,
+                generated_at: Utc::now(),
+                children: startup
+                    .children
+                    .iter()
+                    .map(DaemonRuntimeManifestChild::from_child)
+                    .collect(),
+            },
+        )?;
 
         let children = startup.finish();
         Ok(Self {
@@ -1343,6 +1401,10 @@ impl DaemonProcessGroup {
 
     fn ensure_running(&mut self) -> anyhow::Result<()> {
         ensure_daemon_children_running(&mut self.children)
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        daemon_runtime_manifest_path(&self.runtime_dir)
     }
 }
 
@@ -1527,6 +1589,49 @@ fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
         })
         .collect::<String>();
     runtime_dir.join(format!("{serial:04}-{sanitized_role}.log"))
+}
+
+fn daemon_runtime_manifest_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(DAEMON_RUNTIME_MANIFEST_FILE)
+}
+
+fn write_daemon_runtime_manifest(
+    runtime_dir: &Path,
+    manifest: DaemonRuntimeManifest,
+) -> anyhow::Result<PathBuf> {
+    let manifest_path = daemon_runtime_manifest_path(runtime_dir);
+    let manifest_json = serde_json::to_vec_pretty(&manifest)
+        .context("failed to serialize daemon runtime manifest")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&manifest_path)
+        .with_context(|| {
+            format!(
+                "failed to open daemon runtime manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    file.write_all(&manifest_json).with_context(|| {
+        format!(
+            "failed to write daemon runtime manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "failed to finalize daemon runtime manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to sync daemon runtime manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest_path)
 }
 
 fn write_daemon_join_token<Token: Serialize>(
@@ -2457,6 +2562,36 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_manifest_writer_records_diagnostics_without_token_paths() -> anyhow::Result<()>
+    {
+        let runtime_dir = synthetic_runtime_dir("manifest");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let log_path = runtime_dir.join("0000-control-plane-0.log");
+        let manifest = synthetic_manifest(runtime_dir.clone(), log_path.clone());
+
+        let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest.clone())?;
+        assert_eq!(
+            manifest_path.file_name().and_then(|name| name.to_str()),
+            Some(DAEMON_RUNTIME_MANIFEST_FILE)
+        );
+        let contents = std::fs::read_to_string(&manifest_path)?;
+        assert!(contents.contains("control-plane-0"));
+        assert!(contents.contains("127.0.0.1:31001"));
+        assert!(!contents.contains("join-token"));
+
+        let decoded: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
+        assert_eq!(decoded.scenario, manifest.scenario);
+        assert_eq!(decoded.runtime_dir, runtime_dir);
+        assert_eq!(decoded.children.len(), 1);
+        assert_eq!(decoded.children[0].role, "control-plane-0");
+        assert_eq!(decoded.children[0].pid, Some(4242));
+        assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
+
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("load-key");
@@ -2689,6 +2824,7 @@ mod tests {
         assert_eq!(report.registrations, 2);
         assert_eq!(report.daemon_processes, 7);
         assert!(report.daemon_runtime_dir.is_none());
+        assert!(report.daemon_runtime_manifest.is_none());
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
@@ -2816,6 +2952,26 @@ mod tests {
             runtime_dir,
             keep_runtime_dir,
             children: Vec::new(),
+        }
+    }
+
+    fn synthetic_manifest(runtime_dir: PathBuf, log_path: PathBuf) -> DaemonRuntimeManifest {
+        DaemonRuntimeManifest {
+            scenario: ScenarioName::Three,
+            runtime_dir,
+            control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
+            signal_url: "http://127.0.0.1:31002".to_string(),
+            relay_http_url: "http://127.0.0.1:31003".to_string(),
+            relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
+            stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
+            agent_urls: vec!["http://127.0.0.1:31006".to_string()],
+            keep_runtime_dir: true,
+            generated_at: Utc::now(),
+            children: vec![DaemonRuntimeManifestChild {
+                role: "control-plane-0".to_string(),
+                pid: Some(4242),
+                log_path: Some(log_path),
+            }],
         }
     }
 }
