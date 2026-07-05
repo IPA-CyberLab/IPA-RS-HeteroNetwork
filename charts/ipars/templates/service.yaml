@@ -50,6 +50,9 @@
 {{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerClass "") -}}
 {{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.loadBalancerClass" "value" $agentApiLoadBalancerClass) -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne .Values.agent.apiService.appProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.appProtocol" "value" .Values.agent.apiService.appProtocol) -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiHealthCheckNodePort 0) (ne .Values.agent.apiService.type "LoadBalancer") -}}
 {{- fail "agent.apiService.healthCheckNodePort requires agent.apiService.type LoadBalancer" -}}
 {{- end -}}
@@ -116,6 +119,12 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayLoadBalancerClass "") -}}
 {{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.loadBalancerClass" "value" $relayLoadBalancerClass) -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne .Values.agent.relayService.udpAppProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.udpAppProtocol" "value" .Values.agent.relayService.udpAppProtocol) -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne .Values.agent.relayService.httpAppProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.httpAppProtocol" "value" .Values.agent.relayService.httpAppProtocol) -}}
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) (ne .Values.agent.relayService.type "LoadBalancer") -}}
 {{- fail "agent.relayService.healthCheckNodePort requires agent.relayService.type LoadBalancer" -}}
@@ -271,6 +280,9 @@ spec:
   ports:
     - name: http
       protocol: TCP
+      {{- if .Values.agent.apiService.appProtocol }}
+      appProtocol: {{ .Values.agent.apiService.appProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.apiService.port }}
       targetPort: 9780
       {{- if and $agentApiExternal (ne $agentApiNodePort 0) }}
@@ -331,6 +343,9 @@ spec:
   ports:
     - name: relay-udp
       protocol: UDP
+      {{- if .Values.agent.relayService.udpAppProtocol }}
+      appProtocol: {{ .Values.agent.relayService.udpAppProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.relayService.udpPort }}
       targetPort: {{ .Values.agent.relayService.udpPort }}
       {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
@@ -338,6 +353,9 @@ spec:
       {{- end }}
     - name: relay-http
       protocol: TCP
+      {{- if .Values.agent.relayService.httpAppProtocol }}
+      appProtocol: {{ .Values.agent.relayService.httpAppProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.relayService.httpPort }}
       targetPort: {{ .Values.agent.relayService.httpPort }}
       {{- if and $relayExternal (ne $relayHttpNodePort 0) }}

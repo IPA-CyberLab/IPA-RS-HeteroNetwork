@@ -91,6 +91,7 @@ agent:
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
+    appProtocol: http
     port: 9780
     nodePort: 0
   relayForwarder:
@@ -121,6 +122,8 @@ agent:
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
+    udpAppProtocol: ipars.io/relay-udp
+    httpAppProtocol: http
     udpPort: 51820
     httpPort: 9580
     udpNodePort: 0

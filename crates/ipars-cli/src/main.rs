@@ -401,6 +401,8 @@ struct K8sInstallArgs {
     agent_api_service_type: String,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
+    #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
+    agent_api_app_protocol: Option<String>,
     #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
     agent_api_load_balancer_class: Option<String>,
     #[arg(long = "agent-api-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
@@ -444,6 +446,10 @@ struct K8sInstallArgs {
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_http_node_port: Option<u16>,
+    #[arg(long = "relay-udp-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_relay")]
+    relay_udp_app_protocol: Option<String>,
+    #[arg(long = "relay-http-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_relay")]
+    relay_http_app_protocol: Option<String>,
     #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
     relay_load_balancer_class: Option<String>,
     #[arg(long = "relay-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
@@ -1421,6 +1427,11 @@ fn parse_kubernetes_load_balancer_class(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_app_protocol(value: &str) -> Result<String, String> {
+    validate_kubernetes_app_protocol(value)?;
+    Ok(value.to_string())
+}
+
 fn is_external_kubernetes_service_type(service_type: &str) -> bool {
     matches!(service_type, "NodePort" | "LoadBalancer")
 }
@@ -1719,6 +1730,22 @@ fn validate_kubernetes_load_balancer_class(value: &str) -> Result<(), String> {
         validate_kubernetes_dns_subdomain(prefix, "loadBalancerClass prefix")?;
     }
     validate_kubernetes_qualified_name(name, "loadBalancerClass name")
+}
+
+fn validate_kubernetes_app_protocol(value: &str) -> Result<(), String> {
+    let (prefix, name) = match value.split_once('/') {
+        Some((prefix, name)) => {
+            if name.contains('/') {
+                return Err("appProtocol must contain at most one '/' separator".to_string());
+            }
+            (Some(prefix), name)
+        }
+        None => (None, value),
+    };
+    if let Some(prefix) = prefix {
+        validate_kubernetes_dns_subdomain(prefix, "appProtocol prefix")?;
+    }
+    validate_kubernetes_qualified_name(name, "appProtocol name")
 }
 
 fn validate_kubernetes_dns_subdomain(value: &str, label: &str) -> Result<(), String> {
@@ -2428,6 +2455,13 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if let Some(node_port) = args.agent_api_node_port {
             helm_command.push_str(&format!(" --set agent.apiService.nodePort={node_port}"));
         }
+        if let Some(app_protocol) = args.agent_api_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.appProtocol",
+                app_protocol,
+            );
+        }
         if let Some(load_balancer_class) = args.agent_api_load_balancer_class.as_deref() {
             append_helm_set_string(
                 &mut helm_command,
@@ -2526,6 +2560,20 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             helm_command.push_str(&format!(
                 " --set agent.relayService.httpNodePort={node_port}"
             ));
+        }
+        if let Some(app_protocol) = args.relay_udp_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.udpAppProtocol",
+                app_protocol,
+            );
+        }
+        if let Some(app_protocol) = args.relay_http_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.httpAppProtocol",
+                app_protocol,
+            );
         }
         if let Some(load_balancer_class) = args.relay_load_balancer_class.as_deref() {
             append_helm_set_string(
@@ -3308,6 +3356,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
     }
+    if args.agent_api_app_protocol.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-app-protocol requires --expose-agent-api");
+    }
     if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
     }
@@ -3337,6 +3388,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_http_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-http-node-port requires --expose-relay");
+    }
+    if args.relay_udp_app_protocol.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-app-protocol requires --expose-relay");
+    }
+    if args.relay_http_app_protocol.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-app-protocol requires --expose-relay");
     }
     if args.relay_load_balancer_class.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
@@ -3382,6 +3439,18 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         args.relay_session_affinity.as_deref(),
         args.relay_session_affinity_timeout_seconds,
     )?;
+    if let Some(app_protocol) = args.agent_api_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--agent-api-app-protocol {error}"))?;
+    }
+    if let Some(app_protocol) = args.relay_udp_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--relay-udp-app-protocol {error}"))?;
+    }
+    if let Some(app_protocol) = args.relay_http_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--relay-http-app-protocol {error}"))?;
+    }
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
         && !args.allow_public_service_exposure
@@ -4663,6 +4732,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
+            agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
             agent_api_health_check_node_port: Some(31081),
             agent_api_disable_load_balancer_node_ports: false,
@@ -4682,6 +4752,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
+            relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
+            relay_http_app_protocol: Some("http".to_string()),
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
             relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
@@ -4724,6 +4796,8 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+        assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
         assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
@@ -4749,6 +4823,9 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
@@ -4851,6 +4928,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -4867,6 +4945,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -5853,6 +5933,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -5869,6 +5950,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -5953,6 +6036,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -5969,6 +6053,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6054,6 +6140,66 @@ mod tests {
         assert!(
             error.contains("--relay-udp-node-port and --relay-http-node-port must be different")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_service_app_protocols() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_app_protocol = Some("ipars.io/agent-http".to_string());
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        valid.relay_http_app_protocol = Some("http".to_string());
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-app-protocol",
+            "bad/proto/extra",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_app_protocol = Some("http".to_string());
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent API appProtocol requires exposed agent API Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-app-protocol requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay appProtocol requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-udp-app-protocol requires"));
+
+        let mut direct_invalid = base_k8s_install_args();
+        direct_invalid.expose_relay = true;
+        direct_invalid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        direct_invalid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        direct_invalid.relay_http_app_protocol = Some("bad/proto/extra".to_string());
+        let error = match k8s_install_plan(direct_invalid) {
+            Ok(_) => panic!("invalid relay HTTP appProtocol should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-http-app-protocol"));
 
         Ok(())
     }
@@ -6568,6 +6714,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6584,6 +6731,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6655,6 +6804,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6671,6 +6821,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6749,6 +6901,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6765,6 +6918,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6841,6 +6996,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6857,6 +7013,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
@@ -6928,6 +7086,7 @@ mod tests {
             agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
             agent_api_load_balancer_class: None,
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
@@ -6944,6 +7103,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
             relay_load_balancer_class: None,
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
