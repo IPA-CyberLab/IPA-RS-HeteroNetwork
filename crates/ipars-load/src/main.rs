@@ -736,6 +736,7 @@ async fn run_daemon_scenario(
     .await?;
     let client = reqwest::Client::new();
 
+    services.write_manifest(DaemonRuntimePhase::RegistrationProbe)?;
     let registration_started = Instant::now();
     let mut agent_statuses: Vec<AgentStatusResponse> = Vec::with_capacity(agent_processes);
     for url in &services.agent_urls {
@@ -745,6 +746,7 @@ async fn run_daemon_scenario(
     services.ensure_running()?;
     let registration_millis = registration_started.elapsed().as_millis();
 
+    services.write_manifest(DaemonRuntimePhase::PeerMapProbe)?;
     let peer_map_started = Instant::now();
     let mut peer_map_edges_seen = 0;
     let mut peer_records = Vec::new();
@@ -763,6 +765,7 @@ async fn run_daemon_scenario(
     services.ensure_running()?;
     let peer_map_millis = peer_map_started.elapsed().as_millis();
 
+    services.write_manifest(DaemonRuntimePhase::SignalUpsert)?;
     for peer in &peer_records {
         let _: SignalNodeUpsertResponse = put_json(
             &client,
@@ -778,6 +781,7 @@ async fn run_daemon_scenario(
     }
     services.ensure_running()?;
 
+    services.write_manifest(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_started = Instant::now();
     let advertised_routes = peer_records.iter().map(|node| node.routes.len()).sum();
     let active_pair_count = if agent_statuses.len() > 1 {
@@ -808,6 +812,7 @@ async fn run_daemon_scenario(
     services.ensure_running()?;
     let signal_millis = signal_started.elapsed().as_millis();
 
+    services.write_manifest(DaemonRuntimePhase::RelayMeasurement)?;
     let relay_started = Instant::now();
     let left_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
     let right_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
@@ -859,6 +864,7 @@ async fn run_daemon_scenario(
     services.ensure_running()?;
     let relay_elapsed = relay_started.elapsed();
     let relay_millis = relay_elapsed.as_millis();
+    services.write_manifest(DaemonRuntimePhase::FinalMetrics)?;
     let status: RelayStatusResponse = get_json(
         &client,
         format!("{}/v1/status", services.relay_http_url),
@@ -886,6 +892,7 @@ async fn run_daemon_scenario(
     )
     .await?;
     services.ensure_running()?;
+    services.write_manifest(DaemonRuntimePhase::Completed)?;
 
     Ok(LoadReport {
         transport: TransportMode::Daemon,
@@ -1144,13 +1151,32 @@ struct DaemonProcessGroup {
     relay_udp_addr: SocketAddr,
     agent_urls: Vec<String>,
     runtime_dir: PathBuf,
+    manifest_seed: DaemonRuntimeManifestSeed,
     keep_runtime_dir: bool,
     children: Vec<DaemonChild>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonRuntimePhase {
+    ReservedEndpoints,
+    ControlPlaneStartup,
+    ServiceStartup,
+    AgentStartup,
+    StartupReady,
+    RegistrationProbe,
+    PeerMapProbe,
+    SignalUpsert,
+    SignalNegotiation,
+    RelayMeasurement,
+    FinalMetrics,
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonRuntimeManifest {
     scenario: ScenarioName,
+    phase: DaemonRuntimePhase,
     runtime_dir: PathBuf,
     control_plane_urls: Vec<String>,
     signal_url: String,
@@ -1183,11 +1209,17 @@ struct DaemonRuntimeManifestSeed {
 }
 
 impl DaemonRuntimeManifestSeed {
-    fn write(&self, agent_urls: &[String], children: &[DaemonChild]) -> anyhow::Result<PathBuf> {
+    fn write(
+        &self,
+        phase: DaemonRuntimePhase,
+        agent_urls: &[String],
+        children: &[DaemonChild],
+    ) -> anyhow::Result<PathBuf> {
         write_daemon_runtime_manifest(
             &self.runtime_dir,
             DaemonRuntimeManifest {
                 scenario: self.scenario,
+                phase,
                 runtime_dir: self.runtime_dir.clone(),
                 control_plane_urls: self.control_plane_urls.clone(),
                 signal_url: self.signal_url.clone(),
@@ -1256,7 +1288,11 @@ impl DaemonProcessGroup {
             stun_addr,
             keep_runtime_dir: options.keep_runtime_dir,
         };
-        manifest_seed.write(&agent_urls, &startup.children)?;
+        manifest_seed.write(
+            DaemonRuntimePhase::ReservedEndpoints,
+            &agent_urls,
+            &startup.children,
+        )?;
         let control_plane_database_url =
             daemon_sqlite_database_url(&runtime_dir.join("control-plane.sqlite"));
         let client = reqwest::Client::new();
@@ -1282,7 +1318,11 @@ impl DaemonProcessGroup {
                 &role,
                 &runtime_dir,
             )?);
-            manifest_seed.write(&agent_urls, &startup.children)?;
+            manifest_seed.write(
+                DaemonRuntimePhase::ControlPlaneStartup,
+                &agent_urls,
+                &startup.children,
+            )?;
             wait_for_http_ok(
                 &client,
                 format!("{}/healthz", control_plane_urls[index]),
@@ -1301,7 +1341,11 @@ impl DaemonProcessGroup {
             "signal",
             &runtime_dir,
         )?);
-        manifest_seed.write(&agent_urls, &startup.children)?;
+        manifest_seed.write(
+            DaemonRuntimePhase::ServiceStartup,
+            &agent_urls,
+            &startup.children,
+        )?;
         startup.children.push(spawn_iparsd(
             iparsd_bin,
             &[
@@ -1324,7 +1368,11 @@ impl DaemonProcessGroup {
             "relay",
             &runtime_dir,
         )?);
-        manifest_seed.write(&agent_urls, &startup.children)?;
+        manifest_seed.write(
+            DaemonRuntimePhase::ServiceStartup,
+            &agent_urls,
+            &startup.children,
+        )?;
         startup.children.push(spawn_iparsd(
             iparsd_bin,
             &[
@@ -1335,7 +1383,11 @@ impl DaemonProcessGroup {
             "stun",
             &runtime_dir,
         )?);
-        manifest_seed.write(&agent_urls, &startup.children)?;
+        manifest_seed.write(
+            DaemonRuntimePhase::ServiceStartup,
+            &agent_urls,
+            &startup.children,
+        )?;
 
         wait_for_http_ok(
             &client,
@@ -1396,7 +1448,11 @@ impl DaemonProcessGroup {
                 &runtime_dir,
             )?);
             agent_urls.push(agent_url);
-            manifest_seed.write(&agent_urls, &startup.children)?;
+            manifest_seed.write(
+                DaemonRuntimePhase::AgentStartup,
+                &agent_urls,
+                &startup.children,
+            )?;
             wait_for_http_ok(
                 &client,
                 format!(
@@ -1416,7 +1472,11 @@ impl DaemonProcessGroup {
             &mut startup.children,
         )
         .await?;
-        manifest_seed.write(&agent_urls, &startup.children)?;
+        manifest_seed.write(
+            DaemonRuntimePhase::StartupReady,
+            &agent_urls,
+            &startup.children,
+        )?;
 
         let children = startup.finish();
         Ok(Self {
@@ -1426,6 +1486,7 @@ impl DaemonProcessGroup {
             relay_udp_addr,
             agent_urls,
             runtime_dir,
+            manifest_seed,
             keep_runtime_dir: options.keep_runtime_dir,
             children,
         })
@@ -1441,6 +1502,11 @@ impl DaemonProcessGroup {
 
     fn manifest_path(&self) -> PathBuf {
         daemon_runtime_manifest_path(&self.runtime_dir)
+    }
+
+    fn write_manifest(&self, phase: DaemonRuntimePhase) -> anyhow::Result<PathBuf> {
+        self.manifest_seed
+            .write(phase, &self.agent_urls, &self.children)
     }
 }
 
@@ -2617,6 +2683,7 @@ mod tests {
 
         let decoded: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
         assert_eq!(decoded.scenario, manifest.scenario);
+        assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReady);
         assert_eq!(decoded.runtime_dir, runtime_dir);
         assert_eq!(decoded.children.len(), 1);
         assert_eq!(decoded.children[0].role, "control-plane-0");
@@ -2633,9 +2700,10 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir)?;
         let seed = synthetic_manifest_seed(runtime_dir.clone());
 
-        let manifest_path = seed.write(&[], &[])?;
+        let manifest_path = seed.write(DaemonRuntimePhase::ReservedEndpoints, &[], &[])?;
         let initial: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert_eq!(initial.phase, DaemonRuntimePhase::ReservedEndpoints);
         assert!(initial.agent_urls.is_empty());
         assert!(initial.children.is_empty());
 
@@ -2656,9 +2724,14 @@ mod tests {
         }];
 
         let agent_urls = vec!["http://127.0.0.1:31006".to_string()];
-        seed.write(&agent_urls, &children)?;
+        seed.write(
+            DaemonRuntimePhase::SignalNegotiation,
+            &agent_urls,
+            &children,
+        )?;
         let updated: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert_eq!(updated.phase, DaemonRuntimePhase::SignalNegotiation);
         assert_eq!(updated.agent_urls, agent_urls);
         assert_eq!(updated.children.len(), 1);
         assert_eq!(updated.children[0].role, "signal");
@@ -3023,6 +3096,7 @@ mod tests {
     }
 
     fn synthetic_daemon_group(runtime_dir: PathBuf, keep_runtime_dir: bool) -> DaemonProcessGroup {
+        let manifest_seed = synthetic_manifest_seed(runtime_dir.clone());
         DaemonProcessGroup {
             control_plane_urls: Vec::new(),
             signal_url: "http://127.0.0.1:1".to_string(),
@@ -3030,6 +3104,7 @@ mod tests {
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             agent_urls: Vec::new(),
             runtime_dir,
+            manifest_seed,
             keep_runtime_dir,
             children: Vec::new(),
         }
@@ -3051,6 +3126,7 @@ mod tests {
     fn synthetic_manifest(runtime_dir: PathBuf, log_path: PathBuf) -> DaemonRuntimeManifest {
         DaemonRuntimeManifest {
             scenario: ScenarioName::Three,
+            phase: DaemonRuntimePhase::StartupReady,
             runtime_dir,
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
