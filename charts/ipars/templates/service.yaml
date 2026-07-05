@@ -128,7 +128,7 @@
 {{- $agentApiLoadBalancerSourceRangeSet := dict -}}
 {{- range $range := $agentApiLoadBalancerSourceRanges -}}
 {{- $rangeValue := printf "%v" $range -}}
-{{- include "ipars.validateCidr" (dict "path" "agent.apiService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "agent.apiService.loadBalancerSourceRanges" "value" $rangeValue) -}}
 {{- if hasKey $agentApiLoadBalancerSourceRangeSet $rangeValue -}}
 {{- fail (printf "agent.apiService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
 {{- end -}}
@@ -270,7 +270,7 @@
 {{- $relayLoadBalancerSourceRangeSet := dict -}}
 {{- range $range := $relayLoadBalancerSourceRanges -}}
 {{- $rangeValue := printf "%v" $range -}}
-{{- include "ipars.validateCidr" (dict "path" "agent.relayService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "agent.relayService.loadBalancerSourceRanges" "value" $rangeValue) -}}
 {{- if hasKey $relayLoadBalancerSourceRangeSet $rangeValue -}}
 {{- fail (printf "agent.relayService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
 {{- end -}}

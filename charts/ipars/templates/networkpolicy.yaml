@@ -25,7 +25,7 @@
 {{- end -}}
 {{- if $agentApiNetworkPolicyEnabled -}}
 {{- range .Values.networkPolicy.agentApi.allowedCidrs -}}
-{{- include "ipars.validateCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" .) -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" .) -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -55,7 +55,7 @@ spec:
 {{- end }}
 {{- if $relayNetworkPolicyEnabled -}}
 {{- range .Values.networkPolicy.relay.allowedCidrs -}}
-{{- include "ipars.validateCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" .) -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" .) -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

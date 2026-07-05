@@ -3018,6 +3018,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
             "LoadBalancer IP and externalIPs reject unspecified, loopback, link-local, multicast, and broadcast addresses".to_string(),
+            "LoadBalancer source ranges and NetworkPolicy CIDR allowlists reject unrestricted all-source CIDRs".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement when host networking remains enabled because enforcement is CNI-dependent for host-networked pods".to_string(),
@@ -3646,6 +3647,19 @@ fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyho
     Ok(())
 }
 
+fn validate_kubernetes_restricted_cidrs(
+    flag: &str,
+    cidrs: &[ipnet::IpNet],
+    guidance: &str,
+) -> anyhow::Result<()> {
+    for cidr in cidrs {
+        if cidr.prefix_len() == 0 {
+            anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_service_cluster_ips(
     flag_prefix: &str,
     cluster_ip: Option<IpAddr>,
@@ -3953,6 +3967,16 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--enable-network-policy requires --network-policy-acknowledge-host-network because the chart runs agents with hostNetwork=true and NetworkPolicy enforcement is CNI-dependent"
         );
     }
+    validate_kubernetes_restricted_cidrs(
+        "--agent-api-network-policy-cidr",
+        &args.agent_api_network_policy_cidrs,
+        "NetworkPolicy allowlists must narrow ingress sources",
+    )?;
+    validate_kubernetes_restricted_cidrs(
+        "--relay-network-policy-cidr",
+        &args.relay_network_policy_cidrs,
+        "NetworkPolicy allowlists must narrow ingress sources",
+    )?;
     Ok(())
 }
 
@@ -4137,6 +4161,16 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if !args.relay_allow_source_cidrs.is_empty() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-allow-source-cidr only applies to LoadBalancer services");
     }
+    validate_kubernetes_restricted_cidrs(
+        "--agent-api-allow-source-cidr",
+        &args.agent_api_allow_source_cidrs,
+        "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+    )?;
+    validate_kubernetes_restricted_cidrs(
+        "--relay-allow-source-cidr",
+        &args.relay_allow_source_cidrs,
+        "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+    )?;
     if args.agent_api_node_port.is_some()
         && !is_external_kubernetes_service_type(&args.agent_api_service_type)
     {
@@ -5773,21 +5807,37 @@ mod tests {
 
     #[test]
     fn bundled_chart_validates_load_balancer_source_ranges() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
         let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/service.yaml")
             .canonicalize()?;
+        let network_policy_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/networkpolicy.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
         let service_template = std::fs::read_to_string(service_template_path)?;
+        let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
 
+        assert!(helpers.contains("ipars.validateRestrictedCidr"));
+        assert!(helpers.contains("must not be an unrestricted CIDR"));
         assert!(service_template.contains(
-            "ipars.validateCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
         ));
         assert!(service_template
             .contains("agent.apiService.loadBalancerSourceRanges entry %q must not be repeated"));
         assert!(service_template.contains(
-            "ipars.validateCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
         ));
         assert!(service_template
             .contains("agent.relayService.loadBalancerSourceRanges entry %q must not be repeated"));
+        assert!(network_policy_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+        ));
+        assert!(network_policy_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+        ));
         Ok(())
     }
 
@@ -8155,6 +8205,36 @@ mod tests {
         };
         assert!(error.contains("--relay-network-policy-cidr requires --expose-relay"));
 
+        let mut unrestricted_agent_policy = base_k8s_install_args();
+        unrestricted_agent_policy.enable_network_policy = true;
+        unrestricted_agent_policy.network_policy_acknowledge_host_network = true;
+        unrestricted_agent_policy.expose_agent_api = true;
+        unrestricted_agent_policy.agent_api_network_policy_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not include unrestricted CIDR 0.0.0.0/0"
+        ));
+
+        let mut unrestricted_relay_policy = base_k8s_install_args();
+        unrestricted_relay_policy.enable_network_policy = true;
+        unrestricted_relay_policy.network_policy_acknowledge_host_network = true;
+        unrestricted_relay_policy.expose_relay = true;
+        unrestricted_relay_policy.relay_service_type = "ClusterIP".to_string();
+        unrestricted_relay_policy.relay_network_policy_cidrs = vec!["::/0".parse()?];
+        unrestricted_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        unrestricted_relay_policy.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unrestricted_relay_policy) {
+            Ok(_) => panic!("relay NetworkPolicy should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-network-policy-cidr must not include unrestricted CIDR ::/0")
+        );
+
         Ok(())
     }
 
@@ -8912,6 +8992,34 @@ mod tests {
             .contains("--set agent.apiService.allowUnrestrictedLoadBalancer=true"));
         assert!(unrestricted.commands[2]
             .contains("--set agent.relayService.allowUnrestrictedLoadBalancer=true"));
+
+        let mut unrestricted_agent_source_range = base_k8s_install_args();
+        unrestricted_agent_source_range.expose_agent_api = true;
+        unrestricted_agent_source_range.allow_public_service_exposure = true;
+        unrestricted_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        unrestricted_agent_source_range.agent_api_allow_source_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not include unrestricted CIDR 0.0.0.0/0"
+        ));
+
+        let mut unrestricted_relay_source_range = base_k8s_install_args();
+        unrestricted_relay_source_range.expose_relay = true;
+        unrestricted_relay_source_range.allow_public_service_exposure = true;
+        unrestricted_relay_source_range.relay_service_type = "LoadBalancer".to_string();
+        unrestricted_relay_source_range.relay_allow_source_cidrs = vec!["::/0".parse()?];
+        unrestricted_relay_source_range.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        unrestricted_relay_source_range.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unrestricted_relay_source_range) {
+            Ok(_) => panic!("relay source ranges should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-allow-source-cidr must not include unrestricted CIDR ::/0"));
         Ok(())
     }
 

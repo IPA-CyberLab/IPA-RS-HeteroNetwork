@@ -21,10 +21,20 @@
 {{- define "ipars.validateCidr" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
-{{- $ipv4 := regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$" $value -}}
+{{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- $ipv4 := regexMatch (printf "^%s\\.%s\\.%s\\.%s/([0-9]|[1-2][0-9]|3[0-2])$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $value -}}
 {{- $ipv6 := regexMatch "^[0-9A-Fa-f:.]+/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$" $value -}}
 {{- if not (or $ipv4 $ipv6) -}}
 {{- fail (printf "%s entry %q must be an IPv4 or IPv6 CIDR" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateRestrictedCidr" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- include "ipars.validateCidr" (dict "path" $path "value" $value) -}}
+{{- if or (eq $value "0.0.0.0/0") (regexMatch "^[0:]+/0$" $value) -}}
+{{- fail (printf "%s entry %q must not be an unrestricted CIDR" $path $value) -}}
 {{- end -}}
 {{- end -}}
 
