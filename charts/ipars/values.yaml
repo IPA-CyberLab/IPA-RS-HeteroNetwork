@@ -81,3 +81,13 @@ serviceExposure:
   serviceLabelSelector: ""
   routeProviderNodeId: ""
   routeIntervalSeconds: 60
+
+networkPolicy:
+  enabled: false
+  acknowledgeHostNetwork: false
+  agentApi:
+    enabled: false
+    allowedCidrs: []
+  relay:
+    enabled: false
+    allowedCidrs: []

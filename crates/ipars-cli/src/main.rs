@@ -315,6 +315,14 @@ struct K8sInstallArgs {
     allow_unrestricted_load_balancer: bool,
     #[arg(long, default_value_t = false)]
     allow_cluster_external_traffic_policy: bool,
+    #[arg(long = "enable-network-policy", default_value_t = false)]
+    enable_network_policy: bool,
+    #[arg(
+        long = "network-policy-acknowledge-host-network",
+        default_value_t = false,
+        requires = "enable_network_policy"
+    )]
+    network_policy_acknowledge_host_network: bool,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
@@ -335,6 +343,11 @@ struct K8sInstallArgs {
     agent_api_ip_families: Vec<String>,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
     agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(
+        long = "agent-api-network-policy-cidr",
+        requires_all = ["enable_network_policy", "expose_agent_api"]
+    )]
+    agent_api_network_policy_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "agent-api-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_agent_api")]
     agent_api_internal_traffic_policy: Option<String>,
     #[arg(long = "agent-api-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_agent_api")]
@@ -373,6 +386,11 @@ struct K8sInstallArgs {
     relay_ip_families: Vec<String>,
     #[arg(long = "relay-allow-source-cidr", requires = "expose_relay")]
     relay_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(
+        long = "relay-network-policy-cidr",
+        requires_all = ["enable_network_policy", "expose_relay"]
+    )]
+    relay_network_policy_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "relay-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_relay")]
     relay_internal_traffic_policy: Option<String>,
     #[arg(long = "relay-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_relay")]
@@ -1806,6 +1824,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
     validate_k8s_service_exposure(&args)?;
+    validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
@@ -1817,6 +1836,28 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_key
     );
     append_k8s_route_discovery_values(&mut helm_command, &args);
+    if args.enable_network_policy {
+        helm_command.push_str(" --set networkPolicy.enabled=true");
+        if args.network_policy_acknowledge_host_network {
+            helm_command.push_str(" --set networkPolicy.acknowledgeHostNetwork=true");
+        }
+        if !args.agent_api_network_policy_cidrs.is_empty() {
+            helm_command.push_str(" --set networkPolicy.agentApi.enabled=true");
+            append_helm_ipnet_list(
+                &mut helm_command,
+                "networkPolicy.agentApi.allowedCidrs",
+                &args.agent_api_network_policy_cidrs,
+            );
+        }
+        if !args.relay_network_policy_cidrs.is_empty() {
+            helm_command.push_str(" --set networkPolicy.relay.enabled=true");
+            append_helm_ipnet_list(
+                &mut helm_command,
+                "networkPolicy.relay.allowedCidrs",
+                &args.relay_network_policy_cidrs,
+            );
+        }
+    }
     if args.expose_agent_api {
         helm_command.push_str(" --set agent.apiService.enabled=true");
         helm_command.push_str(&format!(
@@ -2036,6 +2077,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Helm 3".to_string(),
             "/dev/net/tun available on every scheduled node".to_string(),
             "NET_ADMIN and NET_RAW capability allowance for the DaemonSet agent".to_string(),
+            "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
         ],
         security: vec![
             "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
@@ -2043,12 +2085,14 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
+            "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
@@ -2270,6 +2314,38 @@ fn validate_kubernetes_session_affinity_options(
                 "--{flag_prefix}-session-affinity-timeout-seconds requires --{flag_prefix}-session-affinity ClientIP"
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if args.network_policy_acknowledge_host_network && !args.enable_network_policy {
+        anyhow::bail!("--network-policy-acknowledge-host-network requires --enable-network-policy");
+    }
+    if !args.agent_api_network_policy_cidrs.is_empty() && !args.enable_network_policy {
+        anyhow::bail!("--agent-api-network-policy-cidr requires --enable-network-policy");
+    }
+    if !args.relay_network_policy_cidrs.is_empty() && !args.enable_network_policy {
+        anyhow::bail!("--relay-network-policy-cidr requires --enable-network-policy");
+    }
+    if !args.agent_api_network_policy_cidrs.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-network-policy-cidr requires --expose-agent-api");
+    }
+    if !args.relay_network_policy_cidrs.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-network-policy-cidr requires --expose-relay");
+    }
+    if args.enable_network_policy
+        && args.agent_api_network_policy_cidrs.is_empty()
+        && args.relay_network_policy_cidrs.is_empty()
+    {
+        anyhow::bail!(
+            "--enable-network-policy requires at least one --agent-api-network-policy-cidr or --relay-network-policy-cidr"
+        );
+    }
+    if args.enable_network_policy && !args.network_policy_acknowledge_host_network {
+        anyhow::bail!(
+            "--enable-network-policy requires --network-policy-acknowledge-host-network because the chart runs agents with hostNetwork=true and NetworkPolicy enforcement is CNI-dependent"
+        );
     }
     Ok(())
 }
@@ -3364,6 +3440,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: true,
+            network_policy_acknowledge_host_network: true,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
@@ -3372,6 +3450,7 @@ mod tests {
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
             agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_network_policy_cidrs: vec!["10.0.0.0/8".parse()?],
             agent_api_internal_traffic_policy: Some("Local".to_string()),
             agent_api_session_affinity: Some("ClientIP".to_string()),
             agent_api_session_affinity_timeout_seconds: Some(600),
@@ -3390,6 +3469,7 @@ mod tests {
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
             relay_ip_families: vec!["IPv6".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_network_policy_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: Some("Cluster".to_string()),
             relay_session_affinity: Some("ClientIP".to_string()),
             relay_session_affinity_timeout_seconds: Some(900),
@@ -3412,6 +3492,11 @@ mod tests {
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
         assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
         assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
+        assert!(plan.commands[2].contains("--set networkPolicy.enabled=true"));
+        assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
+        assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
+        assert!(plan.commands[2]
+            .contains("--set-string networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
@@ -3434,6 +3519,9 @@ mod tests {
             "--set-string agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip"
         ));
         assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
+        assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
+        assert!(plan.commands[2]
+            .contains("--set-string networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24"));
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
@@ -3504,6 +3592,8 @@ mod tests {
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -3512,6 +3602,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -3527,6 +3618,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -3735,6 +3827,8 @@ mod tests {
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
+            "--enable-network-policy",
+            "--network-policy-acknowledge-host-network",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -3752,6 +3846,8 @@ mod tests {
             "IPv6",
             "--agent-api-allow-source-cidr",
             "198.51.100.0/24",
+            "--agent-api-network-policy-cidr",
+            "10.0.0.0/8",
             "--agent-api-internal-traffic-policy",
             "Local",
             "--agent-api-session-affinity",
@@ -3778,6 +3874,8 @@ mod tests {
             "--relay-ip-family",
             "IPv6",
             "--relay-allow-source-cidr",
+            "203.0.113.0/24",
+            "--relay-network-policy-cidr",
             "203.0.113.0/24",
             "--relay-internal-traffic-policy",
             "Cluster",
@@ -3825,6 +3923,8 @@ mod tests {
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
+            assert!(args.enable_network_policy);
+            assert!(args.network_policy_acknowledge_host_network);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_node_port, Some(31080));
@@ -3841,6 +3941,10 @@ mod tests {
             assert_eq!(
                 args.agent_api_allow_source_cidrs,
                 vec!["198.51.100.0/24".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.agent_api_network_policy_cidrs,
+                vec!["10.0.0.0/8".parse::<ipnet::IpNet>()?]
             );
             assert_eq!(
                 args.agent_api_internal_traffic_policy.as_deref(),
@@ -3872,6 +3976,10 @@ mod tests {
             assert_eq!(args.relay_ip_families, vec!["IPv6"]);
             assert_eq!(
                 args.relay_allow_source_cidrs,
+                vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.relay_network_policy_cidrs,
                 vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
             );
             assert_eq!(
@@ -3925,6 +4033,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -3933,6 +4043,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -3948,6 +4059,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -3990,6 +4102,8 @@ mod tests {
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -3998,6 +4112,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4013,6 +4128,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -4407,6 +4523,84 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_network_policy() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.enable_network_policy = true;
+        valid.network_policy_acknowledge_host_network = true;
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_network_policy_cidrs = vec!["203.0.113.0/24".parse()?];
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set networkPolicy.enabled=true"));
+        assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
+        assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
+        assert!(plan.commands[2]
+            .contains("--set-string networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8"));
+        assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
+        assert!(plan.commands[2]
+            .contains("--set-string networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--enable-network-policy",
+            "--network-policy-acknowledge-host-network",
+            "--expose-agent-api",
+            "--agent-api-network-policy-cidr",
+            "not-a-cidr",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_ack = base_k8s_install_args();
+        missing_ack.enable_network_policy = true;
+        missing_ack.expose_agent_api = true;
+        missing_ack.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(missing_ack) {
+            Ok(_) => panic!("NetworkPolicy on hostNetwork agents should require acknowledgement"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--network-policy-acknowledge-host-network"));
+
+        let mut no_cidrs = base_k8s_install_args();
+        no_cidrs.enable_network_policy = true;
+        no_cidrs.network_policy_acknowledge_host_network = true;
+        let error = match k8s_install_plan(no_cidrs) {
+            Ok(_) => panic!("NetworkPolicy without CIDR allowlists should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("requires at least one"));
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.enable_network_policy = true;
+        missing_agent_exposure.network_policy_acknowledge_host_network = true;
+        missing_agent_exposure.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent API NetworkPolicy CIDRs should require agent API exposure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-network-policy-cidr requires --expose-agent-api"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.enable_network_policy = true;
+        missing_relay_exposure.network_policy_acknowledge_host_network = true;
+        missing_relay_exposure.relay_network_policy_cidrs = vec!["203.0.113.0/24".parse()?];
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay NetworkPolicy CIDRs should require relay exposure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-network-policy-cidr requires --expose-relay"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_wires_and_validates_ip_families() -> anyhow::Result<()> {
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
@@ -4492,6 +4686,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4500,6 +4696,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4515,6 +4712,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -4544,6 +4742,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: true,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4552,6 +4752,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4567,6 +4768,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -4603,6 +4805,8 @@ mod tests {
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4611,6 +4815,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4626,6 +4831,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -4660,6 +4866,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4668,6 +4876,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4683,6 +4892,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
@@ -4712,6 +4922,8 @@ mod tests {
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
             allow_cluster_external_traffic_policy: false,
+            enable_network_policy: false,
+            network_policy_acknowledge_host_network: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4720,6 +4932,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
@@ -4735,6 +4948,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,

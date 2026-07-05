@@ -10,6 +10,16 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateCidr" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- $ipv4 := regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$" $value -}}
+{{- $ipv6 := regexMatch "^[0-9A-Fa-f:.]+/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$" $value -}}
+{{- if not (or $ipv4 $ipv6) -}}
+{{- fail (printf "%s entry %q must be an IPv4 or IPv6 CIDR" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateAnnotationKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}
