@@ -957,9 +957,39 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
         LinuxNetworkNamespace::from_name(namespace)?;
     }
+    validate_agent_relay_capability_config(args)?;
     if args.relay_forwarder_bind.is_some() && args.relay_forwarder_max_sessions == 0 {
         anyhow::bail!(
             "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
+        );
+    }
+    Ok(())
+}
+
+fn validate_agent_relay_capability_config(args: &AgentArgs) -> anyhow::Result<()> {
+    let advertises_relay =
+        args.relay_public_endpoint.is_some() || args.relay_admission_url.is_some();
+    if args.relay_status_url.is_some() && !advertises_relay {
+        anyhow::bail!(
+            "--relay-status-url requires --relay-public-endpoint and --relay-admission-url"
+        );
+    }
+    if !advertises_relay {
+        return Ok(());
+    }
+    if args.relay_public_endpoint.is_none() || args.relay_admission_url.is_none() {
+        anyhow::bail!(
+            "--relay-public-endpoint and --relay-admission-url must be set together for relay capability advertisement"
+        );
+    }
+    if args.relay_max_sessions == 0 {
+        anyhow::bail!(
+            "--relay-max-sessions must be greater than zero when relay capability is advertised"
+        );
+    }
+    if args.relay_max_mbps == 0 {
+        anyhow::bail!(
+            "--relay-max-mbps must be greater than zero when relay capability is advertised"
         );
     }
     Ok(())
@@ -7050,6 +7080,81 @@ mod tests {
             "http://relay-a:9580",
         ]);
         assert!(missing_endpoint.is_err());
+    }
+
+    #[test]
+    fn agent_relay_capability_config_rejects_incomplete_or_zero_capacity() -> anyhow::Result<()> {
+        let status_without_advertisement = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-status-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Agent(args) = status_without_advertisement.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--relay-status-url requires --relay-public-endpoint and --relay-admission-url"
+            ));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let zero_sessions = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-max-sessions",
+            "0",
+        ])?;
+        if let Command::Agent(args) = zero_sessions.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-max-sessions must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let zero_mbps = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-max-mbps",
+            "0",
+        ])?;
+        if let Command::Agent(args) = zero_mbps.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-max-mbps must be greater than zero"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]
