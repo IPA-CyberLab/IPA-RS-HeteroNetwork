@@ -1228,6 +1228,21 @@ fn append_helm_ipnet_list(command: &mut String, key: &str, values: &[ipnet::IpNe
     }
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        })
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
     value
         .map(NodeId::from_string)
@@ -1471,7 +1486,8 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let compose_file = args.compose_file.display().to_string();
     let compose_prefix = format!(
         "docker compose -p {} -f {}",
-        args.project_name, compose_file
+        shell_word(&args.project_name),
+        shell_word(&compose_file)
     );
     let environment = docker_install_environment(&args);
     let mut prerequisites = vec![
@@ -1650,7 +1666,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
         "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
-        args.release, chart, args.namespace, args.join_token_secret, args.join_token_key
+        args.release,
+        shell_word(&chart),
+        args.namespace,
+        args.join_token_secret,
+        args.join_token_key
     );
     append_k8s_route_discovery_values(&mut helm_command, &args);
     if args.expose_agent_api {
@@ -2692,6 +2712,27 @@ mod tests {
     }
 
     #[test]
+    fn docker_install_plan_quotes_compose_manifest_path() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose file.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+        })?;
+
+        assert_eq!(
+            plan.commands[0],
+            "docker compose -p edge -f 'ops/compose file.yaml' config"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn docker_install_plan_exports_rootless_multi_network_settings() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
@@ -2925,6 +2966,19 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("disabled by default")));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_quotes_chart_path() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.chart = PathBuf::from("charts/ipars chart");
+
+        let plan = k8s_install_plan(args)?;
+
+        assert_eq!(plan.manifest, "charts/ipars chart");
+        assert!(plan.commands[2]
+            .contains("helm upgrade --install edge 'charts/ipars chart' --namespace edge-system"));
         Ok(())
     }
 
@@ -3562,6 +3616,9 @@ mod tests {
             "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
         );
         assert_eq!(helm_set_string_value("nlb,ip"), "nlb\\,ip");
+        assert_eq!(shell_word("charts/ipars"), "charts/ipars");
+        assert_eq!(shell_word("charts/ipars chart"), "'charts/ipars chart'");
+        assert_eq!(shell_word("charts/ipars'chart"), "'charts/ipars'\\''chart'");
     }
 
     fn temp_path(name: &str) -> PathBuf {
