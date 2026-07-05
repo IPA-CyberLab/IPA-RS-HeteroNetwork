@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    TokenLedgerRecord, TokenStatus,
+    TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -90,12 +90,14 @@ impl SqliteControlPlaneStore {
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
+        let node_id = node.node_id.clone();
+        let vpn_ip = node.vpn_ip;
         sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES (?1, ?2)")
             .bind(node.node_id.as_str())
             .bind(serde_json::to_string(&node).map_err(json_error)?)
             .execute(&self.pool)
             .await
-            .map_err(sql_error)?;
+            .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
         Ok(())
     }
 
@@ -379,12 +381,14 @@ impl PostgresControlPlaneStore {
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
+        let node_id = node.node_id.clone();
+        let vpn_ip = node.vpn_ip;
         sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES ($1, $2)")
             .bind(node.node_id.as_str())
             .bind(serde_json::to_value(&node).map_err(json_error)?)
             .execute(&self.pool)
             .await
-            .map_err(sql_error)?;
+            .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
         Ok(())
     }
 
@@ -628,6 +632,20 @@ fn sql_error(error: sqlx::Error) -> ControlPlaneError {
     ControlPlaneError::Store(error.to_string())
 }
 
+fn node_insert_error(error: sqlx::Error, node_id: &NodeId, vpn_ip: &VpnIp) -> ControlPlaneError {
+    if let sqlx::Error::Database(database_error) = &error {
+        let constraint = database_error.constraint().unwrap_or_default();
+        let message = database_error.message();
+        if constraint == "nodes_pkey" || message.contains("nodes.node_id") {
+            return ControlPlaneError::NodeAlreadyExists(node_id.clone());
+        }
+        if constraint == "nodes_vpn_ip_unique" || message.contains("nodes_vpn_ip_unique") {
+            return ControlPlaneError::VpnIpAlreadyAllocated(*vpn_ip);
+        }
+    }
+    sql_error(error)
+}
+
 fn json_error(error: serde_json::Error) -> ControlPlaneError {
     ControlPlaneError::Store(error.to_string())
 }
@@ -716,7 +734,13 @@ mod tests {
         let duplicate_ip = node("node-c", Ipv4Addr::new(100, 64, 0, 1));
         assert!(matches!(
             store.insert_node(duplicate_ip).await,
-            Err(ControlPlaneError::Store(_))
+            Err(ControlPlaneError::VpnIpAlreadyAllocated(_))
+        ));
+        let mut duplicate_node_id = local.clone();
+        duplicate_node_id.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)));
+        assert!(matches!(
+            store.insert_node(duplicate_node_id).await,
+            Err(ControlPlaneError::NodeAlreadyExists(_))
         ));
 
         let path = PathRecord {

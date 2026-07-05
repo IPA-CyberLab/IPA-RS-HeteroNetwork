@@ -26,6 +26,8 @@ pub enum ControlPlaneError {
     JoinDenied,
     #[error("node {0} already exists")]
     NodeAlreadyExists(NodeId),
+    #[error("VPN IP {0} is already allocated")]
+    VpnIpAlreadyAllocated(VpnIp),
     #[error("node not found: {0}")]
     NodeNotFound(NodeId),
     #[error("no available VPN IP in pool")]
@@ -444,31 +446,11 @@ where
             }
         }
 
-        let relay_capability = relay_capability_allowed(request.relay_capability, &claims)?;
-        let existing_nodes = self.store.list_nodes().await?;
-        let reserved_vpn_ips = assigned_ipv4_vpn_ips(&existing_nodes);
-        let vpn_ip = self
-            .allocator
-            .write()
-            .await
-            .allocate_next(&reserved_vpn_ips)?;
+        let relay_capability = relay_capability_allowed(request.relay_capability.clone(), &claims)?;
         let now = Utc::now();
-        let node = NodeRecord {
-            node_id: request.node_id,
-            cluster_id: claims.cluster_id,
-            vpn_ip,
-            identity_public_key: request.identity_public_key,
-            wireguard_public_key: request.wireguard_public_key,
-            role: claims.role,
-            tags: claims.tags,
-            endpoint_candidates: request.candidates,
-            relay_capability,
-            token_policy: claims.policy,
-            routes: request.requested_routes,
-            registered_at: now,
-        };
-
-        self.store.insert_node(node.clone()).await?;
+        let node = self
+            .insert_node_with_fresh_vpn_ip(claims, request, relay_capability, now)
+            .await?;
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let peer_map = self.filtered_peer_map_for_node(&node, &peers, now);
@@ -480,6 +462,44 @@ where
             relay_map,
             cluster_policy: self.config.cluster_policy.clone(),
         })
+    }
+
+    async fn insert_node_with_fresh_vpn_ip(
+        &self,
+        claims: JoinTokenClaims,
+        request: RegisterNodeRequest,
+        relay_capability: Option<RelayCapability>,
+        registered_at: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        loop {
+            let existing_nodes = self.store.list_nodes().await?;
+            let reserved_vpn_ips = assigned_ipv4_vpn_ips(&existing_nodes);
+            let vpn_ip = self
+                .allocator
+                .write()
+                .await
+                .allocate_next(&reserved_vpn_ips)?;
+            let node = NodeRecord {
+                node_id: request.node_id.clone(),
+                cluster_id: claims.cluster_id.clone(),
+                vpn_ip,
+                identity_public_key: request.identity_public_key.clone(),
+                wireguard_public_key: request.wireguard_public_key.clone(),
+                role: claims.role.clone(),
+                tags: claims.tags.clone(),
+                endpoint_candidates: request.candidates.clone(),
+                relay_capability: relay_capability.clone(),
+                token_policy: claims.policy.clone(),
+                routes: request.requested_routes.clone(),
+                registered_at,
+            };
+
+            match self.store.insert_node(node.clone()).await {
+                Ok(()) => return Ok(node),
+                Err(ControlPlaneError::VpnIpAlreadyAllocated(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub async fn peer_map_for(&self, node_id: &NodeId) -> Result<PeerMap, ControlPlaneError> {
@@ -905,6 +925,7 @@ fn assigned_ipv4_vpn_ips(nodes: &[NodeRecord]) -> BTreeSet<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use chrono::{Duration, Utc};
     use ipars_crypto::IdentityKeyPair;
@@ -988,6 +1009,83 @@ mod tests {
             active_sessions: 0,
             max_mbps: 1000,
             e2e_only: true,
+        }
+    }
+
+    #[derive(Default)]
+    struct RacingVpnIpStore {
+        inner: InMemoryStore,
+        race_once: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ControlPlaneStore for RacingVpnIpStore {
+        async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
+            if node.vpn_ip.0 == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+                && !self.race_once.swap(true, Ordering::SeqCst)
+            {
+                let mut competing_node = node_record("node-racing-peer");
+                competing_node.cluster_id = node.cluster_id.clone();
+                competing_node.vpn_ip = node.vpn_ip;
+                self.inner.insert_node(competing_node).await?;
+                return Err(ControlPlaneError::VpnIpAlreadyAllocated(node.vpn_ip));
+            }
+            self.inner.insert_node(node).await
+        }
+
+        async fn get_node(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Option<NodeRecord>, ControlPlaneError> {
+            self.inner.get_node(node_id).await
+        }
+
+        async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+            self.inner.list_nodes().await
+        }
+
+        async fn update_node_candidates(
+            &self,
+            node_id: &NodeId,
+            candidates: Vec<EndpointCandidate>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.update_node_candidates(node_id, candidates).await
+        }
+
+        async fn update_node_relay_capability(
+            &self,
+            node_id: &NodeId,
+            relay_capability: Option<RelayCapability>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner
+                .update_node_relay_capability(node_id, relay_capability)
+                .await
+        }
+
+        async fn upsert_health(
+            &self,
+            node_id: NodeId,
+            health: NodeHealth,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.upsert_health(node_id, health).await
+        }
+
+        async fn get_health(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Option<NodeHealth>, ControlPlaneError> {
+            self.inner.get_health(node_id).await
+        }
+
+        async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
+            self.inner.upsert_path(path).await
+        }
+
+        async fn list_paths_for(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Vec<PathRecord>, ControlPlaneError> {
+            self.inner.list_paths_for(node_id).await
         }
     }
 
@@ -1201,6 +1299,34 @@ mod tests {
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_retries_after_vpn_ip_insert_race(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(RacingVpnIpStore::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store.clone());
+
+        let response = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        assert_eq!(
+            response.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
+        );
+        let nodes = store.list_nodes().await?;
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().any(|node| {
+            node.node_id == NodeId::from_string("node-racing-peer")
+                && node.vpn_ip.0 == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+        }));
         Ok(())
     }
 

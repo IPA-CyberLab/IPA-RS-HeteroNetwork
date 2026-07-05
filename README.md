@@ -8,8 +8,8 @@ The repository is being built toward a complete system rather than an MVP. The c
 - typed node, peer, path, relay, token, policy, ACL, route, and health models
 - signed join token creation and verification primitives
 - pair-scoped path state and scoring primitives
-- control-plane registration/IP-allocation service that skips already assigned VPN IPs when backed by durable node state
-- SQLite and PostgreSQL control-plane store implementations with VPN IP uniqueness guards
+- control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
+- SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards
 - token ledger primitives and control-plane revocation API for revocation and max-use enforcement
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, and relay-capability policy before registration
 - typed control-plane HTTP routes for health, join registration, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics

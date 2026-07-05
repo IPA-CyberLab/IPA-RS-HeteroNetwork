@@ -312,7 +312,8 @@ impl IntoResponse for ApiError {
                 StatusCode::UNAUTHORIZED
             }
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
-            ControlPlaneError::NodeAlreadyExists(_) => StatusCode::CONFLICT,
+            ControlPlaneError::NodeAlreadyExists(_)
+            | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,
             ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
             ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
