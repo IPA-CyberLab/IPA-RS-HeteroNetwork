@@ -8,6 +8,7 @@
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
 {{- $rbacCreate := printf "%v" .Values.rbac.create -}}
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
+{{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
@@ -40,6 +41,9 @@
 {{- if not (or (eq $serviceAccountCreate "true") (eq $serviceAccountCreate "false")) -}}
 {{- fail "serviceAccount.create must be true or false" -}}
 {{- end -}}
+{{- if not (or (eq $agentHostNetwork "true") (eq $agentHostNetwork "false")) -}}
+{{- fail "agent.hostNetwork must be true or false" -}}
+{{- end -}}
 {{- if and .Values.serviceAccount.name (or (gt (len .Values.serviceAccount.name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.serviceAccount.name))) -}}
 {{- fail "serviceAccount.name must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
@@ -63,6 +67,9 @@
 {{- end -}}
 {{- if not (or (eq $agentDnsPolicy "ClusterFirstWithHostNet") (eq $agentDnsPolicy "ClusterFirst") (eq $agentDnsPolicy "Default") (eq $agentDnsPolicy "None")) -}}
 {{- fail "agent.dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None" -}}
+{{- end -}}
+{{- if and (eq $agentHostNetwork "false") (eq $agentDnsPolicy "ClusterFirstWithHostNet") -}}
+{{- fail "agent.dnsPolicy=ClusterFirstWithHostNet requires agent.hostNetwork=true" -}}
 {{- end -}}
 {{- if or (eq $agentStateHostPath "") (gt (len $agentStateHostPath) 4096) (not (regexMatch $absolutePathPattern $agentStateHostPath)) (regexMatch "(^|/)[.][.]($|/)" $agentStateHostPath) (regexMatch "/$" $agentStateHostPath) -}}
 {{- fail "agent.state.hostPath must be an absolute host path without '..' segments or trailing '/'" -}}
@@ -327,7 +334,7 @@ spec:
         - name: {{ . | quote }}
         {{- end }}
       {{- end }}
-      hostNetwork: {{ .Values.agent.hostNetwork }}
+      hostNetwork: {{ $agentHostNetwork }}
       dnsPolicy: {{ $agentDnsPolicy | quote }}
       {{- if ne $agentTerminationGracePeriodSeconds "" }}
       terminationGracePeriodSeconds: {{ int $agentTerminationGracePeriodSeconds }}

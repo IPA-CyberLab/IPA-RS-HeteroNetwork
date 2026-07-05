@@ -363,6 +363,8 @@ struct K8sInstallArgs {
     agent_node_selectors: Vec<KeyValueArg>,
     #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
     agent_tolerations: Vec<KubernetesTolerationArg>,
+    #[arg(long = "disable-agent-host-network", default_value_t = false)]
+    disable_agent_host_network: bool,
     #[arg(long = "disable-agent-service-account-token", default_value_t = false)]
     disable_agent_service_account_token: bool,
     #[arg(long = "agent-dns-policy", value_parser = parse_kubernetes_dns_policy)]
@@ -2832,7 +2834,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
-            "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
+            "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement when host networking remains enabled because enforcement is CNI-dependent for host-networked pods".to_string(),
             "Use --disable-agent-service-account-token only when Kubernetes Service API discovery is not required".to_string(),
             "ServiceAccount creation can be disabled only when an equivalent ServiceAccount already exists in the target namespace".to_string(),
             "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
@@ -2923,11 +2925,16 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
 }
 
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.disable_agent_host_network {
+        command.push_str(" --set agent.hostNetwork=false");
+    }
     if args.disable_agent_service_account_token {
         command.push_str(" --set agent.automountServiceAccountToken=false");
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         command.push_str(&format!(" --set agent.dnsPolicy={dns_policy}"));
+    } else if args.disable_agent_host_network {
+        command.push_str(" --set agent.dnsPolicy=ClusterFirst");
     }
     if let Some(host_path) = args.agent_state_host_path.as_deref() {
         append_helm_set_string(command, "agent.state.hostPath", host_path);
@@ -3456,6 +3463,11 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         parse_kubernetes_dns_policy(dns_policy).map_err(anyhow::Error::msg)?;
+        if args.disable_agent_host_network && dns_policy == "ClusterFirstWithHostNet" {
+            anyhow::bail!(
+                "--agent-dns-policy ClusterFirstWithHostNet requires hostNetwork; omit it or choose ClusterFirst/Default/None when --disable-agent-host-network is set"
+            );
+        }
     }
     if let Some(host_path) = args.agent_state_host_path.as_deref() {
         validate_kubernetes_absolute_path(host_path, "agent state host path")
@@ -3577,7 +3589,10 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--enable-network-policy requires at least one --agent-api-network-policy-cidr or --relay-network-policy-cidr"
         );
     }
-    if args.enable_network_policy && !args.network_policy_acknowledge_host_network {
+    if args.enable_network_policy
+        && !args.disable_agent_host_network
+        && !args.network_policy_acknowledge_host_network
+    {
         anyhow::bail!(
             "--enable-network-policy requires --network-policy-acknowledge-host-network because the chart runs agents with hostNetwork=true and NetworkPolicy enforcement is CNI-dependent"
         );
@@ -5018,6 +5033,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -5260,6 +5276,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -5551,6 +5568,7 @@ mod tests {
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
+        assert!(!helm.contains("--set agent.hostNetwork=false"));
         assert!(helm.contains("--set-string 'agent.podLabels.ipars\\.io/role=agent'"));
         assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
         assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
@@ -5590,6 +5608,21 @@ mod tests {
         assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
         assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+
+        let mut pod_network = base_k8s_install_args();
+        pod_network.disable_agent_host_network = true;
+        let plan = k8s_install_plan(pod_network)?;
+        assert!(plan.commands[2].contains("--set agent.hostNetwork=false"));
+        assert!(plan.commands[2].contains("--set agent.dnsPolicy=ClusterFirst"));
+
+        let mut invalid_dns_policy = base_k8s_install_args();
+        invalid_dns_policy.disable_agent_host_network = true;
+        invalid_dns_policy.agent_dns_policy = Some("ClusterFirstWithHostNet".to_string());
+        let error = match k8s_install_plan(invalid_dns_policy) {
+            Ok(_) => panic!("ClusterFirstWithHostNet should require hostNetwork"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ClusterFirstWithHostNet requires hostNetwork"));
 
         let mut invalid_selector = base_k8s_install_args();
         invalid_selector.agent_node_selectors = vec![KeyValueArg {
@@ -5645,12 +5678,14 @@ mod tests {
             "ipars",
             "k8s",
             "install",
+            "--disable-agent-host-network",
             "--disable-agent-service-account-token",
         ])?;
         if let Command::K8s {
             command: K8sCommand::Install(args),
         } = parsed.command
         {
+            assert!(args.disable_agent_host_network);
             assert!(args.disable_agent_service_account_token);
         } else {
             anyhow::bail!("expected k8s install command");
@@ -6346,6 +6381,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6463,6 +6499,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -7196,6 +7233,15 @@ mod tests {
         };
         assert!(error.contains("--network-policy-acknowledge-host-network"));
 
+        let mut pod_network_policy = base_k8s_install_args();
+        pod_network_policy.disable_agent_host_network = true;
+        pod_network_policy.enable_network_policy = true;
+        pod_network_policy.expose_agent_api = true;
+        pod_network_policy.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
+        let plan = k8s_install_plan(pod_network_policy)?;
+        assert!(plan.commands[2].contains("--set agent.hostNetwork=false"));
+        assert!(!plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
+
         let mut no_cidrs = base_k8s_install_args();
         no_cidrs.enable_network_policy = true;
         no_cidrs.network_policy_acknowledge_host_network = true;
@@ -7437,6 +7483,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -7541,6 +7588,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -7652,6 +7700,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -7761,6 +7810,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -7865,6 +7915,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
