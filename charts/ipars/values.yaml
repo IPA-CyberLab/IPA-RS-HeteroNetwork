@@ -83,6 +83,8 @@ agent:
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
+    loadBalancerIP: ""
+    externalIPs: []
     healthCheckNodePort: 0
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""
@@ -115,6 +117,8 @@ agent:
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
+    loadBalancerIP: ""
+    externalIPs: []
     healthCheckNodePort: 0
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""

@@ -28,6 +28,17 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateIPAddress" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- $ipv4 := regexMatch (printf "^%s\\.%s\\.%s\\.%s$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $value -}}
+{{- $ipv6 := and (contains ":" $value) (regexMatch "^[0-9A-Fa-f:.]+$" $value) -}}
+{{- if not (or $ipv4 $ipv6) -}}
+{{- fail (printf "%s value %q must be an IPv4 or IPv6 address" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateLabelKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}

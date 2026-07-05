@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -411,6 +411,10 @@ struct K8sInstallArgs {
     agent_api_publish_not_ready_addresses: bool,
     #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
     agent_api_load_balancer_class: Option<String>,
+    #[arg(long = "agent-api-load-balancer-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
+    agent_api_load_balancer_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-external-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
+    agent_api_external_ips: Vec<IpAddr>,
     #[arg(long = "agent-api-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_health_check_node_port: Option<u16>,
     #[arg(
@@ -464,6 +468,10 @@ struct K8sInstallArgs {
     relay_publish_not_ready_addresses: bool,
     #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
     relay_load_balancer_class: Option<String>,
+    #[arg(long = "relay-load-balancer-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
+    relay_load_balancer_ip: Option<IpAddr>,
+    #[arg(long = "relay-external-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
+    relay_external_ips: Vec<IpAddr>,
     #[arg(long = "relay-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_health_check_node_port: Option<u16>,
     #[arg(
@@ -1418,6 +1426,12 @@ fn parse_kubernetes_ip_family(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_kubernetes_service_ip(value: &str) -> Result<IpAddr, String> {
+    value
+        .parse::<IpAddr>()
+        .map_err(|_| format!("Service IP address must be IPv4 or IPv6; got {value}"))
+}
+
 const KUBERNETES_NODE_PORT_MIN: u16 = 30000;
 const KUBERNETES_NODE_PORT_MAX: u16 = 32767;
 
@@ -1889,6 +1903,12 @@ fn append_helm_ipnet_list(command: &mut String, key: &str, values: &[ipnet::IpNe
 fn append_helm_string_list(command: &mut String, key: &str, values: &[String]) {
     for (index, value) in values.iter().enumerate() {
         append_helm_set_string(command, &format!("{key}[{index}]"), value);
+    }
+}
+
+fn append_helm_ipaddr_list(command: &mut String, key: &str, values: &[IpAddr]) {
+    for (index, value) in values.iter().enumerate() {
+        append_helm_set_string(command, &format!("{key}[{index}]"), &value.to_string());
     }
 }
 
@@ -2484,6 +2504,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 load_balancer_class,
             );
         }
+        if let Some(load_balancer_ip) = args.agent_api_load_balancer_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.loadBalancerIP",
+                &load_balancer_ip.to_string(),
+            );
+        }
+        append_helm_ipaddr_list(
+            &mut helm_command,
+            "agent.apiService.externalIPs",
+            &args.agent_api_external_ips,
+        );
         if let Some(health_check_node_port) = args.agent_api_health_check_node_port {
             helm_command.push_str(&format!(
                 " --set agent.apiService.healthCheckNodePort={health_check_node_port}"
@@ -2600,6 +2632,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 load_balancer_class,
             );
         }
+        if let Some(load_balancer_ip) = args.relay_load_balancer_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.loadBalancerIP",
+                &load_balancer_ip.to_string(),
+            );
+        }
+        append_helm_ipaddr_list(
+            &mut helm_command,
+            "agent.relayService.externalIPs",
+            &args.relay_external_ips,
+        );
         if let Some(health_check_node_port) = args.relay_health_check_node_port {
             helm_command.push_str(&format!(
                 " --set agent.relayService.healthCheckNodePort={health_check_node_port}"
@@ -2711,6 +2755,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
+            "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
@@ -2726,7 +2771,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
-            "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "Service type, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
@@ -3383,6 +3428,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
     }
+    if args.agent_api_load_balancer_ip.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-load-balancer-ip requires --expose-agent-api");
+    }
+    if !args.agent_api_external_ips.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-external-ip requires --expose-agent-api");
+    }
     if args.agent_api_health_check_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-health-check-node-port requires --expose-agent-api");
     }
@@ -3421,6 +3472,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_load_balancer_class.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
+    }
+    if args.relay_load_balancer_ip.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-load-balancer-ip requires --expose-relay");
+    }
+    if !args.relay_external_ips.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-external-ip requires --expose-relay");
     }
     if args.relay_health_check_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-health-check-node-port requires --expose-relay");
@@ -3525,6 +3582,22 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_load_balancer_class.is_some() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-load-balancer-class only applies to LoadBalancer services");
+    }
+    if args.agent_api_load_balancer_ip.is_some() && args.agent_api_service_type != "LoadBalancer" {
+        anyhow::bail!("--agent-api-load-balancer-ip only applies to LoadBalancer services");
+    }
+    if args.relay_load_balancer_ip.is_some() && args.relay_service_type != "LoadBalancer" {
+        anyhow::bail!("--relay-load-balancer-ip only applies to LoadBalancer services");
+    }
+    if !args.agent_api_external_ips.is_empty() && !args.allow_public_service_exposure {
+        anyhow::bail!(
+            "--agent-api-external-ip requires --allow-public-service-exposure because externalIPs can expose the Service outside the cluster"
+        );
+    }
+    if !args.relay_external_ips.is_empty() && !args.allow_public_service_exposure {
+        anyhow::bail!(
+            "--relay-external-ip requires --allow-public-service-exposure because externalIPs can expose the Service outside the cluster"
+        );
     }
     if args.agent_api_health_check_node_port.is_some()
         && args.agent_api_service_type != "LoadBalancer"
@@ -4759,6 +4832,8 @@ mod tests {
             agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
             agent_api_publish_not_ready_addresses: true,
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
+            agent_api_load_balancer_ip: Some("198.51.100.10".parse()?),
+            agent_api_external_ips: vec!["198.51.100.11".parse()?, "2001:db8::11".parse()?],
             agent_api_health_check_node_port: Some(31081),
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
@@ -4781,6 +4856,8 @@ mod tests {
             relay_http_app_protocol: Some("http".to_string()),
             relay_publish_not_ready_addresses: true,
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
+            relay_load_balancer_ip: Some("203.0.113.10".parse()?),
+            relay_external_ips: vec!["203.0.113.11".parse()?],
             relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
@@ -4826,6 +4903,13 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
+        assert!(
+            plan.commands[2].contains("--set-string agent.apiService.loadBalancerIP=198.51.100.10")
+        );
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[1]=2001:db8::11'"));
         assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
         assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[0]=IPv4'"));
@@ -4857,6 +4941,10 @@ mod tests {
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.loadBalancerIP=203.0.113.10"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.externalIPs[0]=203.0.113.11'"));
         assert!(plan.commands[2].contains("--set agent.relayService.healthCheckNodePort=31821"));
         assert!(
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
@@ -4959,6 +5047,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -4978,6 +5068,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -5966,6 +6058,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -5985,6 +6079,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6071,6 +6167,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6090,6 +6188,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6373,6 +6473,87 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-disable-load-balancer-node-ports only applies"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_service_external_addresses() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.allow_public_service_exposure = true;
+        valid.allow_unrestricted_load_balancer = true;
+        valid.agent_api_service_type = "LoadBalancer".to_string();
+        valid.agent_api_load_balancer_ip = Some("198.51.100.10".parse()?);
+        valid.agent_api_external_ips = vec!["198.51.100.11".parse()?, "2001:db8::11".parse()?];
+        valid.expose_relay = true;
+        valid.relay_service_type = "LoadBalancer".to_string();
+        valid.relay_load_balancer_ip = Some("203.0.113.10".parse()?);
+        valid.relay_external_ips = vec!["203.0.113.11".parse()?];
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(
+            plan.commands[2].contains("--set-string agent.apiService.loadBalancerIP=198.51.100.10")
+        );
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[1]=2001:db8::11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.loadBalancerIP=203.0.113.10"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.externalIPs[0]=203.0.113.11'"));
+
+        let mut cluster_ip_agent = base_k8s_install_args();
+        cluster_ip_agent.expose_agent_api = true;
+        cluster_ip_agent.agent_api_service_type = "ClusterIP".to_string();
+        cluster_ip_agent.agent_api_load_balancer_ip = Some("198.51.100.10".parse()?);
+        let error = match k8s_install_plan(cluster_ip_agent) {
+            Ok(_) => panic!("ClusterIP agent loadBalancerIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-load-balancer-ip only applies"));
+
+        let mut cluster_ip_relay = base_k8s_install_args();
+        cluster_ip_relay.expose_relay = true;
+        cluster_ip_relay.relay_service_type = "ClusterIP".to_string();
+        cluster_ip_relay.relay_load_balancer_ip = Some("203.0.113.10".parse()?);
+        cluster_ip_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        cluster_ip_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(cluster_ip_relay) {
+            Ok(_) => panic!("ClusterIP relay loadBalancerIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-load-balancer-ip only applies"));
+
+        let mut unacknowledged_agent_external_ip = base_k8s_install_args();
+        unacknowledged_agent_external_ip.expose_agent_api = true;
+        unacknowledged_agent_external_ip.agent_api_external_ips = vec!["198.51.100.11".parse()?];
+        let error = match k8s_install_plan(unacknowledged_agent_external_ip) {
+            Ok(_) => panic!("agent externalIPs should require exposure acknowledgement"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-external-ip requires --allow-public-service-exposure"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_external_ips = vec!["203.0.113.11".parse()?];
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay externalIPs require exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-external-ip requires --expose-relay"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-load-balancer-ip",
+            "198.51.100.10/32",
+        ]);
+        assert!(parsed.is_err());
 
         Ok(())
     }
@@ -6796,6 +6977,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6815,6 +6998,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6888,6 +7073,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6907,6 +7094,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6987,6 +7176,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -7006,6 +7197,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -7084,6 +7277,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -7103,6 +7298,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -7176,6 +7373,8 @@ mod tests {
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -7195,6 +7394,8 @@ mod tests {
             relay_http_app_protocol: None,
             relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
