@@ -48,8 +48,8 @@ use ipars_types::api::{
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, SignedJoinToken,
-    TransportProtocol,
+    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
+    SignedJoinToken, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -2477,11 +2477,15 @@ async fn run_agent(
     let join_token = agent_join_token(&args)?;
     let mut registered_control_plane_base = None;
     let registered_node = if let Some(token) = &join_token {
+        let requested_routes = agent_requested_routes(&args, runtime.state().node_id.clone())
+            .await
+            .context("failed to build agent requested routes")?;
         let registration = register_agent(
             runtime.as_ref(),
             token,
             args.control_plane_url.as_deref(),
             relay_capability.clone(),
+            requested_routes,
         )
         .await
         .context("failed to register agent with control plane")?;
@@ -2875,6 +2879,30 @@ fn docker_route_source(args: &AgentArgs) -> anyhow::Result<DockerRouteSource> {
     } else {
         Ok(DockerRouteSource::Explicit(docker_network_intent(args)?))
     }
+}
+
+async fn agent_requested_routes(args: &AgentArgs, node_id: NodeId) -> anyhow::Result<Vec<Route>> {
+    if !args.apply_docker_routes || !args.docker_expose_host_routes {
+        return Ok(Vec::new());
+    }
+    validate_agent_runtime_config(args)?;
+    let intent = docker_route_source(args)?.resolve_intent().await?;
+    Ok(docker_advertised_routes(&node_id, intent.container_cidrs))
+}
+
+fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<Route> {
+    cidrs
+        .into_iter()
+        .enumerate()
+        .map(|(index, cidr)| Route {
+            id: format!("docker-{index}"),
+            cidr,
+            advertised_by: node_id.clone(),
+            via: Some(node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        })
+        .collect()
 }
 
 fn docker_api_networks_url(api_version: &str) -> String {
@@ -4163,6 +4191,7 @@ async fn register_agent(
     token: &SignedJoinToken,
     control_plane_url: Option<&str>,
     relay_capability: Option<RelayCapability>,
+    requested_routes: Vec<Route>,
 ) -> anyhow::Result<AgentRegistration> {
     let control_plane_urls = control_plane_base_urls(Some(token), control_plane_url)?;
     let status = runtime.status().await;
@@ -4174,7 +4203,7 @@ async fn register_agent(
             wireguard_public_key: status.wireguard_public_key,
             candidates: status.candidates,
             relay_capability,
-            requested_routes: Vec::new(),
+            requested_routes,
         },
     };
 
@@ -8626,6 +8655,38 @@ invalid no-destination-here
             assert!(error
                 .to_string()
                 .contains("--docker-network requires --docker-discover-networks"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn docker_explicit_cidrs_build_agent_requested_routes() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-container-cidr",
+            "172.19.0.0/16",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let node_id = NodeId::from_string("node-a");
+            let routes = agent_requested_routes(&args, node_id.clone()).await?;
+
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[0].id, "docker-0");
+            assert_eq!(routes[0].cidr, "172.18.0.0/16".parse::<ipnet::IpNet>()?);
+            assert_eq!(routes[0].advertised_by, node_id);
+            assert_eq!(routes[0].via, Some(NodeId::from_string("node-a")));
+            assert_eq!(routes[1].id, "docker-1");
+            assert_eq!(routes[1].cidr, "172.19.0.0/16".parse::<ipnet::IpNet>()?);
             return Ok(());
         }
 
