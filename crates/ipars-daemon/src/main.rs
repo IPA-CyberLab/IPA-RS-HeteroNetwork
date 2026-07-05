@@ -18,10 +18,10 @@ use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommandRunner,
-    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats, RelaySessionState,
-    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
-    WireGuardBackend,
+    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
+    PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats,
+    RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher,
+    UdpRelayFrameForwarder, WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -5804,7 +5804,8 @@ async fn negotiate_signal_paths(
         let (signal_url, response) =
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let relay_candidates = selected_relay_candidates(&response);
-        let record = signal_path_record(response, chrono::Utc::now());
+        let candidate_record = signal_path_record(response, chrono::Utc::now());
+        let (record, path_selection) = stable_signal_path_record(runtime, candidate_record).await;
         if record.selected_state == PathState::DirectNatTraversal {
             match fetch_hole_punch_plan(client, &signal_url, &record.key).await {
                 Ok(plan) => match hole_puncher.execute(&status.node_id, &plan).await {
@@ -5902,15 +5903,22 @@ async fn negotiate_signal_paths(
                     }
                 }
                 None => {
-                    if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-                        supervisor.remove(runtime, &peer.node_id).await;
+                    if path_selection == StableSignalPathSelection::CurrentRelay {
+                        tracing::debug!(
+                            peer = %record.key.remote,
+                            "keeping existing relay path without fresh relay candidates"
+                        );
                     } else {
-                        runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+                            supervisor.remove(runtime, &peer.node_id).await;
+                        } else {
+                            runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                        }
+                        tracing::warn!(
+                            peer = %record.key.remote,
+                            "signal selected relay path without a usable relay candidate"
+                        );
                     }
-                    tracing::warn!(
-                        peer = %record.key.remote,
-                        "signal selected relay path without a usable relay candidate"
-                    );
                 }
             }
         } else {
@@ -5926,6 +5934,35 @@ async fn negotiate_signal_paths(
         runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableSignalPathSelection {
+    Candidate,
+    CurrentRelay,
+}
+
+async fn stable_signal_path_record(
+    runtime: &AgentRuntime,
+    candidate: PathRecord,
+) -> (PathRecord, StableSignalPathSelection) {
+    if let Some(mut current) = runtime.path_record_for_peer(&candidate.key.remote).await {
+        if current.selected_state == PathState::Relay
+            && candidate.selected_state.is_direct()
+            && !PathSelector::should_promote(&current, &candidate)
+        {
+            current.updated_at = candidate.updated_at;
+            tracing::debug!(
+                peer = %candidate.key.remote,
+                relay_score = current.score.value,
+                direct_score = candidate.score.value,
+                "keeping relay path until direct candidate score clears promotion margin"
+            );
+            return (current, StableSignalPathSelection::CurrentRelay);
+        }
+    }
+
+    (candidate, StableSignalPathSelection::Candidate)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13039,6 +13076,99 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_keeps_relay_when_direct_gain_is_small() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        let current = PathRecord {
+            key: PeerPathKey::new(local.clone(), peer.clone()),
+            selected_state: PathState::Relay,
+            selected_candidate: None,
+            relay_node: Some(NodeId::from_string("relay-a")),
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now() - ChronoDuration::seconds(10),
+            pinned: false,
+        };
+        runtime.upsert_path_state(current).await;
+        let candidate_updated_at = Utc::now();
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: candidate_updated_at,
+            pinned: false,
+        };
+
+        let (selected, selection) = stable_signal_path_record(&runtime, candidate_record).await;
+
+        assert_eq!(selection, StableSignalPathSelection::CurrentRelay);
+        assert_eq!(selected.selected_state, PathState::Relay);
+        assert_eq!(selected.relay_node, Some(NodeId::from_string("relay-a")));
+        assert_eq!(selected.updated_at, candidate_updated_at);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_when_gain_clears_margin() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 75.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
     }
 
     #[test]
