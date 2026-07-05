@@ -2026,6 +2026,9 @@ pub mod api {
             if path_starts_with_any(path, &[b"/v1/traces", b"/v1/metrics", b"/v1/logs"]) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if opentelemetry_grpc_path(path) {
+                return Some(AgentPacketFlowApplication::OpenTelemetry);
+            }
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
             }
@@ -2047,7 +2050,7 @@ pub mod api {
         }
         if payload.starts_with(b"HTTP/") || payload.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
         {
-            return Some(AgentPacketFlowApplication::Http);
+            return http2_payload_application(payload).or(Some(AgentPacketFlowApplication::Http));
         }
         None
     }
@@ -2055,6 +2058,33 @@ pub mod api {
     fn grpc_http_payload(payload: &[u8]) -> bool {
         contains_ascii_case_insensitive(payload, b"content-type: application/grpc")
             || contains_ascii_case_insensitive(payload, b"content-type: application/grpc-web")
+    }
+
+    fn http2_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        if !payload.starts_with(HTTP2_PREFACE) {
+            return None;
+        }
+        let frames = payload.get(HTTP2_PREFACE.len()..).unwrap_or_default();
+        if contains_ascii_case_insensitive(frames, b"/opentelemetry.proto.collector.") {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if grpc_http_payload(frames) || contains_ascii_case_insensitive(frames, b"application/grpc")
+        {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        None
+    }
+
+    fn opentelemetry_grpc_path(path: &[u8]) -> bool {
+        path_starts_with_any(
+            path,
+            &[
+                b"/opentelemetry.proto.collector.trace.v1.TraceService/",
+                b"/opentelemetry.proto.collector.metrics.v1.MetricsService/",
+                b"/opentelemetry.proto.collector.logs.v1.LogsService/",
+            ],
+        )
     }
 
     fn dns_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -3032,6 +3062,25 @@ mod tests {
             )
             .application(),
             api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /opentelemetry.proto.collector.trace.v1.TraceService/Export HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0*application/grpc")
+                .application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
         );
         assert_eq!(
             observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
