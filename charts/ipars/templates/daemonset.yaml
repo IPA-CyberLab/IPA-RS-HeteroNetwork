@@ -313,6 +313,23 @@
 {{- if and (eq $agentAutomountServiceAccountToken "false") .Values.serviceExposure.discoverServices -}}
 {{- fail "agent.automountServiceAccountToken=false cannot be used with serviceExposure.discoverServices=true" -}}
 {{- end -}}
+{{- $serviceExposureRouteCidrs := dict -}}
+{{- range .Values.serviceExposure.apiServerCidrs -}}
+{{- $cidr := printf "%v" . -}}
+{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.apiServerCidrs" "value" $cidr) -}}
+{{- if hasKey $serviceExposureRouteCidrs $cidr -}}
+{{- fail (printf "serviceExposure.apiServerCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
+{{- end -}}
+{{- $_ := set $serviceExposureRouteCidrs $cidr true -}}
+{{- end -}}
+{{- range .Values.serviceExposure.serviceCidrs -}}
+{{- $cidr := printf "%v" . -}}
+{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.serviceCidrs" "value" $cidr) -}}
+{{- if hasKey $serviceExposureRouteCidrs $cidr -}}
+{{- fail (printf "serviceExposure.serviceCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
+{{- end -}}
+{{- $_ := set $serviceExposureRouteCidrs $cidr true -}}
+{{- end -}}
 {{- $serviceExposureNamespaces := dict -}}
 {{- range .Values.serviceExposure.namespaces -}}
 {{- if or (eq . "") (gt (len .) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" .)) -}}

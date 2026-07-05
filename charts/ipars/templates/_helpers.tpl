@@ -38,6 +38,53 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateKubernetesRouteCidr" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" $path "value" $value) -}}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value -}}
+{{- $parts := splitList "/" $value -}}
+{{- $octets := splitList "." (index $parts 0) -}}
+{{- $prefix := int (index $parts 1) -}}
+{{- $ip := add (mul (int (index $octets 0)) 16777216) (mul (int (index $octets 1)) 65536) (mul (int (index $octets 2)) 256) (int (index $octets 3)) -}}
+{{- $blockSizes := list 4294967296 2147483648 1073741824 536870912 268435456 134217728 67108864 33554432 16777216 8388608 4194304 2097152 1048576 524288 262144 131072 65536 32768 16384 8192 4096 2048 1024 512 256 128 64 32 16 8 4 2 1 -}}
+{{- $size := int (index $blockSizes $prefix) -}}
+{{- $start := mul (div $ip $size) $size -}}
+{{- $end := add $start (sub $size 1) -}}
+{{- if ne $ip $start -}}
+{{- fail (printf "%s entry %q must be a canonical IPv4 CIDR route" $path $value) -}}
+{{- end -}}
+{{- if and (le $start 16777215) (le 0 $end) -}}
+{{- fail (printf "%s entry %q must not include unspecified route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if and (le $start 2147483647) (le 2130706432 $end) -}}
+{{- fail (printf "%s entry %q must not include loopback route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if and (le $start 2852061183) (le 2851995648 $end) -}}
+{{- fail (printf "%s entry %q must not include link-local route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if and (le $start 4026531839) (le 3758096384 $end) -}}
+{{- fail (printf "%s entry %q must not include multicast route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if and (le $start 4294967295) (le 4294967295 $end) -}}
+{{- fail (printf "%s entry %q must not include broadcast route CIDRs" $path $value) -}}
+{{- end -}}
+{{- else if contains ":" $value -}}
+{{- if regexMatch "^([0:]+|0*:)/" $value -}}
+{{- fail (printf "%s entry %q must not include unspecified route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if or (regexMatch "^::1/" $value) (regexMatch "^0:0:0:0:0:0:0:1/" $value) -}}
+{{- fail (printf "%s entry %q must not include loopback route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if regexMatch "^[Ff][Ee][89AaBb][0-9A-Fa-f]:" $value -}}
+{{- fail (printf "%s entry %q must not include link-local route CIDRs" $path $value) -}}
+{{- end -}}
+{{- if regexMatch "^[Ff][Ff]" $value -}}
+{{- fail (printf "%s entry %q must not include multicast route CIDRs" $path $value) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateIPAddress" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
