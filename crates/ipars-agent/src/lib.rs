@@ -2468,6 +2468,8 @@ impl LazyConnectManager {
 #[derive(Debug, Clone)]
 pub struct PathSelector;
 
+const DIRECT_PROMOTION_SCORE_MARGIN: f32 = 5.0;
+
 impl PathSelector {
     pub fn best_path(paths: &[PathRecord]) -> Option<PathRecord> {
         paths
@@ -2480,7 +2482,7 @@ impl PathSelector {
     pub fn should_promote(current: &PathRecord, candidate: &PathRecord) -> bool {
         candidate.selected_state.is_direct()
             && current.selected_state == PathState::Relay
-            && candidate.score.value > current.score.value
+            && candidate.score.value >= current.score.value + DIRECT_PROMOTION_SCORE_MARGIN
     }
 }
 
@@ -2810,6 +2812,14 @@ mod tests {
     }
 
     #[test]
+    fn selector_keeps_relay_when_direct_score_gain_is_too_small() {
+        let relay = path("peer-a", PathState::Relay, 70.0);
+        let direct = path("peer-a", PathState::DirectNatTraversal, 74.9);
+
+        assert!(!PathSelector::should_promote(&relay, &direct));
+    }
+
+    #[test]
     fn score_helper_keeps_metrics_type_in_scope() {
         let score = PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0);
         assert!(score.value > 0.0);
@@ -2925,6 +2935,11 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "jitter_ms=5.0"));
+        assert!(path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "stability=0.80"));
         assert_eq!(runtime.metrics().await.path_probe_record_count, 1);
         assert!(runtime.should_connect_peer(&peer).await);
         assert_eq!(

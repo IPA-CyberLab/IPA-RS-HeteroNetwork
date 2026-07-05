@@ -530,7 +530,9 @@ impl PathScore {
             value -= relay_load.clamp(0.0, 1.0) * 20.0;
             reasons.push(format!("relay_load={relay_load:.2}"));
         }
-        value += metrics.stability.clamp(0.0, 1.0) * 15.0;
+        let stability = metrics.stability.clamp(0.0, 1.0);
+        value += stability * 15.0;
+        reasons.push(format!("stability={stability:.2}"));
         value -= cost.min(10_000) as f32 / 100.0;
         reasons.push(format!("cost={cost}"));
 
@@ -1796,6 +1798,10 @@ mod tests {
         let relay = PathScore::calculate(PathState::Relay, &metrics, true, 10);
 
         assert!(direct.value > relay.value);
+        assert!(direct
+            .reasons
+            .iter()
+            .any(|reason| reason == "stability=0.90"));
     }
 
     #[test]
