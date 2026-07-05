@@ -3994,12 +3994,34 @@ async fn start_userspace_wireguard_process(
         interface = %args.wireguard_interface,
         "started userspace WireGuard process"
     );
-    wait_for_userspace_wireguard_ready(args, &mut child, &label).await?;
+    let shutdown_timeout = Duration::from_secs(args.userspace_wireguard_shutdown_timeout_seconds);
+    if let Err(error) = wait_for_userspace_wireguard_ready(args, &mut child, &label).await {
+        cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout).await;
+        return Err(error);
+    }
     Ok(Some(ManagedUserspaceWireGuardProcess {
         child,
         label,
-        shutdown_timeout: Duration::from_secs(args.userspace_wireguard_shutdown_timeout_seconds),
+        shutdown_timeout,
     }))
+}
+
+async fn cleanup_unready_userspace_wireguard_process(
+    child: tokio::process::Child,
+    label: String,
+    shutdown_timeout: Duration,
+) {
+    tracing::warn!(
+        command = %label,
+        "stopping userspace WireGuard process after readiness failure"
+    );
+    ManagedUserspaceWireGuardProcess {
+        child,
+        label,
+        shutdown_timeout,
+    }
+    .shutdown()
+    .await;
 }
 
 async fn wait_for_userspace_wireguard_ready(
@@ -4053,29 +4075,24 @@ fn userspace_wireguard_launch_command(args: &AgentArgs) -> anyhow::Result<Option
         args.userspace_wireguard_args.clone()
     };
     let command = LinuxCommand::new(program, command_args);
-    userspace_wireguard_maybe_namespaced_command(args, command)
+    Ok(Some(userspace_wireguard_namespaced_command(args, command)?))
 }
 
 fn userspace_wireguard_ready_command(args: &AgentArgs) -> anyhow::Result<LinuxCommand> {
-    match userspace_wireguard_maybe_namespaced_command(
+    userspace_wireguard_namespaced_command(
         args,
         LinuxCommand::new("wg", ["show", args.wireguard_interface.as_str()]),
-    )? {
-        Some(command) => Ok(command),
-        None => anyhow::bail!("userspace WireGuard ready command was unexpectedly absent"),
-    }
+    )
 }
 
-fn userspace_wireguard_maybe_namespaced_command(
+fn userspace_wireguard_namespaced_command(
     args: &AgentArgs,
     command: LinuxCommand,
-) -> anyhow::Result<Option<LinuxCommand>> {
+) -> anyhow::Result<LinuxCommand> {
     if let Some(namespace) = args.linux_netns.as_deref() {
-        Ok(Some(command.in_namespace(
-            &LinuxNetworkNamespace::from_name(namespace)?,
-        )))
+        Ok(command.in_namespace(&LinuxNetworkNamespace::from_name(namespace)?))
     } else {
-        Ok(Some(command))
+        Ok(command)
     }
 }
 
@@ -11233,6 +11250,83 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_start_failure_stops_child_process() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "iparsd-userspace-wg-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; while :; do sleep 1; done"#;
+        let cli = Cli::try_parse_from(vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--wireguard-backend".to_string(),
+            "userspace-command".to_string(),
+            "--userspace-wireguard-command".to_string(),
+            "/bin/sh".to_string(),
+            "--userspace-wireguard-arg=-c".to_string(),
+            "--userspace-wireguard-arg".to_string(),
+            shell_script.to_string(),
+            "--userspace-wireguard-arg=ipars-test-wg".to_string(),
+            "--userspace-wireguard-arg".to_string(),
+            pid_arg,
+            "--userspace-wireguard-ready-timeout-seconds".to_string(),
+            "1".to_string(),
+            "--userspace-wireguard-shutdown-timeout-seconds".to_string(),
+            "1".to_string(),
+            "--runtime-command-timeout-seconds".to_string(),
+            "1".to_string(),
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match start_userspace_wireguard_process(&args).await {
+                Ok(Some(process)) => {
+                    process.shutdown().await;
+                    anyhow::bail!("unexpected ready userspace WireGuard process")
+                }
+                Ok(None) => anyhow::bail!("expected userspace WireGuard launch command"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not expose interface ipars0 within 1 seconds"),
+                "unexpected readiness error: {error}"
+            );
+            let pid = std::fs::read_to_string(&pid_path)?
+                .trim()
+                .parse::<u32>()
+                .context("failed to parse child pid")?;
+            assert!(
+                wait_for_process_absent(pid, Duration::from_secs(2)).await,
+                "userspace WireGuard child process {pid} was left running after readiness failure"
+            );
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Ok(());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let started = Instant::now();
+        loop {
+            if !proc_path.exists() {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]
