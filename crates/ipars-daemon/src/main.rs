@@ -8990,6 +8990,16 @@ mod tests {
         }
     }
 
+    fn ipv6_candidate(node_id: &str, cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            addr: SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+            ..candidate(node_id, EndpointCandidateKind::Ipv6, cost)
+        }
+    }
+
     fn node_record(node_id: &str) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(node_id),
@@ -14339,6 +14349,35 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 .as_ref()
                 .map(|candidate| candidate.kind),
             Some(EndpointCandidateKind::PublicUdp)
+        );
+        assert_eq!(record.relay_node, None);
+    }
+
+    #[test]
+    fn signal_path_record_selects_ipv6_candidate() {
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![
+                candidate("peer-a", EndpointCandidateKind::PublicUdp, 1),
+                ipv6_candidate("peer-a", 50),
+            ],
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectIpv6,
+            score: PathScore {
+                value: 120.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::DirectIpv6);
+        assert_eq!(
+            record
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.kind),
+            Some(EndpointCandidateKind::Ipv6)
         );
         assert_eq!(record.relay_node, None);
     }

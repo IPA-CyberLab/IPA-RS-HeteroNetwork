@@ -381,6 +381,15 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 format!("candidate for node {node_id} belongs to {candidate_node_id}"),
             ),
+            Self::Signal(SignalError::CandidateInvalid {
+                node_id,
+                kind,
+                addr,
+                reason,
+            }) => (
+                StatusCode::BAD_REQUEST,
+                format!("candidate {kind:?} at {addr} for node {node_id} is invalid: {reason}"),
+            ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
         };
         (status, Json(ErrorResponse { error })).into_response()
@@ -605,6 +614,37 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("candidate for node node-a belongs to node-b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_signal_rejects_invalid_endpoint_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let app = router(SignalHttpState::new(registry));
+        let node = node(
+            "node-a",
+            vec![candidate("node-a", EndpointCandidateKind::Ipv6)],
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
+                        node,
+                        nat_classification: None,
+                        health: None,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("IPv6 candidates must use an IPv6 socket address"));
         Ok(())
     }
 

@@ -167,6 +167,17 @@ pub struct EndpointCandidate {
     pub source: CandidateSource,
 }
 
+impl EndpointCandidate {
+    pub fn validate_kind_address(&self) -> Result<(), &'static str> {
+        match self.kind {
+            EndpointCandidateKind::Ipv6 if !self.addr.is_ipv6() => {
+                Err("IPv6 candidates must use an IPv6 socket address")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointCandidateKind {
@@ -1918,6 +1929,29 @@ pub mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_candidate_ipv6_kind_requires_ipv6_address() {
+        let mut candidate = EndpointCandidate {
+            node_id: NodeId::from_string("node-a"),
+            kind: EndpointCandidateKind::Ipv6,
+            addr: std::net::SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::InterfaceScan,
+        };
+
+        assert_eq!(
+            candidate.validate_kind_address(),
+            Err("IPv6 candidates must use an IPv6 socket address")
+        );
+        candidate.addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+            51820,
+        );
+        assert_eq!(candidate.validate_kind_address(), Ok(()));
+    }
 
     #[test]
     fn direct_path_scores_above_relay_when_metrics_are_close() {

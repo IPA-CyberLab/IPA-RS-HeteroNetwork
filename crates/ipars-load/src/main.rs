@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1950,10 +1950,7 @@ fn endpoint_candidates(index: usize, scenario: Scenario) -> Vec<EndpointCandidat
     vec![EndpointCandidate {
         node_id: node_id(index),
         kind,
-        addr: SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, (index % 250 + 1) as u8)),
-            30_000 + (index % 30_000) as u16,
-        ),
+        addr: endpoint_candidate_addr(kind, index),
         observed_at: Utc::now(),
         priority: 100,
         cost: if kind == EndpointCandidateKind::PublicUdp {
@@ -1963,6 +1960,29 @@ fn endpoint_candidates(index: usize, scenario: Scenario) -> Vec<EndpointCandidat
         },
         source: CandidateSource::ControlPlane,
     }]
+}
+
+fn endpoint_candidate_addr(kind: EndpointCandidateKind, index: usize) -> SocketAddr {
+    let port = 30_000 + (index % 30_000) as u16;
+    match kind {
+        EndpointCandidateKind::Ipv6 => SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0x0db8,
+                ((index >> 48) & 0xffff) as u16,
+                ((index >> 32) & 0xffff) as u16,
+                ((index >> 16) & 0xffff) as u16,
+                (index & 0xffff) as u16,
+                0,
+                1,
+            )),
+            port,
+        ),
+        _ => SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, (index % 250 + 1) as u8)),
+            port,
+        ),
+    }
 }
 
 fn advertised_routes(index: usize, scenario: Scenario) -> anyhow::Result<Vec<Route>> {

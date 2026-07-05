@@ -754,6 +754,20 @@ where
                 ),
             });
         }
+        if let Some((candidate, reason)) = request.candidates.iter().find_map(|candidate| {
+            candidate
+                .validate_kind_address()
+                .err()
+                .map(|reason| (candidate, reason))
+        }) {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "candidate {:?} at {} is invalid: {reason}",
+                    candidate.kind, candidate.addr
+                ),
+            });
+        }
         if let Some(path) = request
             .path_state
             .iter()
@@ -1249,6 +1263,20 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
             ),
         });
     }
+    if let Some((candidate, reason)) = request.candidates.iter().find_map(|candidate| {
+        candidate
+            .validate_kind_address()
+            .err()
+            .map(|reason| (candidate, reason))
+    }) {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "candidate {:?} at {} is invalid: {reason}",
+                candidate.kind, candidate.addr
+            ),
+        });
+    }
     if let Some(route) = request
         .requested_routes
         .iter()
@@ -1595,6 +1623,13 @@ mod tests {
         }
     }
 
+    fn invalid_ipv6_candidate(node_id: &str) -> EndpointCandidate {
+        EndpointCandidate {
+            kind: EndpointCandidateKind::Ipv6,
+            ..candidate(node_id)
+        }
+    }
+
     fn stale_candidate(node_id: &str) -> EndpointCandidate {
         let mut candidate = candidate(node_id);
         candidate.observed_at = Utc::now() - Duration::seconds(60);
@@ -1905,6 +1940,34 @@ mod tests {
             error,
             ControlPlaneError::NodeRegistrationRejected { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_candidate_kind_addresses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.candidates = vec![invalid_ipv6_candidate("node-a")];
+
+        let error = match plane
+            .register_with_claims(claims(cluster_id), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful candidate registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
         Ok(())
     }
 
@@ -2415,6 +2478,50 @@ mod tests {
             result,
             Err(ControlPlaneError::NodeUpdateRejected { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_candidate_kind_addresses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: vec![invalid_ipv6_candidate("node-a")],
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat candidate update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
         Ok(())
     }
 

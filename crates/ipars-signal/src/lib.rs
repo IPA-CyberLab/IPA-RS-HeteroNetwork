@@ -24,6 +24,13 @@ pub enum SignalError {
         node_id: NodeId,
         candidate_node_id: NodeId,
     },
+    #[error("candidate {kind:?} at {addr} for node {node_id} is invalid: {reason}")]
+    CandidateInvalid {
+        node_id: NodeId,
+        kind: EndpointCandidateKind,
+        addr: std::net::SocketAddr,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -84,7 +91,7 @@ impl SignalRegistry {
         nat_classification: Option<NatClassification>,
         health: Option<NodeHealth>,
     ) -> Result<SignalNodeUpsertResponse, SignalError> {
-        validate_endpoint_candidate_owners(&node.node_id, &node.endpoint_candidates)?;
+        validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates)?;
         let registered_at = Utc::now();
         match nat_classification {
             Some(classification) => {
@@ -131,7 +138,7 @@ impl SignalRegistry {
         self.get_node(&request.source)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
-        validate_endpoint_candidate_owners(&request.source, &request.source_candidates)?;
+        validate_endpoint_candidates(&request.source, &request.source_candidates)?;
         let now = Utc::now();
         let target = self
             .get_node(&request.target)
@@ -575,7 +582,7 @@ impl SignalCoordinator {
     }
 }
 
-fn validate_endpoint_candidate_owners(
+fn validate_endpoint_candidates(
     node_id: &NodeId,
     candidates: &[EndpointCandidate],
 ) -> Result<(), SignalError> {
@@ -586,6 +593,19 @@ fn validate_endpoint_candidate_owners(
         return Err(SignalError::CandidateOwnerMismatch {
             node_id: node_id.clone(),
             candidate_node_id: candidate.node_id.clone(),
+        });
+    }
+    if let Some((candidate, reason)) = candidates.iter().find_map(|candidate| {
+        candidate
+            .validate_kind_address()
+            .err()
+            .map(|reason| (candidate, reason))
+    }) {
+        return Err(SignalError::CandidateInvalid {
+            node_id: node_id.clone(),
+            kind: candidate.kind,
+            addr: candidate.addr,
+            reason,
         });
     }
     Ok(())
@@ -727,7 +747,7 @@ pub struct HolePunchPlan {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use ipars_types::{
         CandidateSource, ClusterId, HealthState, NatMappingBehavior, NodeHealth, NodeId,
@@ -746,6 +766,22 @@ mod tests {
             cost: 10,
             source: CandidateSource::StunProbe,
         }
+    }
+
+    fn ipv6_candidate() -> EndpointCandidate {
+        EndpointCandidate {
+            addr: SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+            ..candidate(EndpointCandidateKind::Ipv6)
+        }
+    }
+
+    fn stale_ipv6_candidate() -> EndpointCandidate {
+        let mut candidate = ipv6_candidate();
+        candidate.observed_at = Utc::now() - chrono::Duration::seconds(121);
+        candidate
     }
 
     fn stale_candidate(kind: EndpointCandidateKind) -> EndpointCandidate {
@@ -835,6 +871,48 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::DirectPublic);
+    }
+
+    #[test]
+    fn direct_ipv6_is_preferred_when_both_nodes_have_ipv6_candidates() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate(),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectIpv6);
+    }
+
+    #[test]
+    fn stale_ipv6_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![stale_ipv6_candidate()]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
     }
 
     #[test]
@@ -1358,6 +1436,42 @@ mod tests {
                 })
                 .await,
             Err(SignalError::CandidateOwnerMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_ipv6_candidates_with_ipv4_addresses() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let invalid_node = source(vec![candidate(EndpointCandidateKind::Ipv6)]);
+
+        assert!(matches!(
+            registry.upsert_node(invalid_node).await,
+            Err(SignalError::CandidateInvalid {
+                kind: EndpointCandidateKind::Ipv6,
+                ..
+            })
+        ));
+
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id,
+                    target: target.node_id,
+                    source_candidates: vec![candidate(EndpointCandidateKind::Ipv6)],
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                })
+                .await,
+            Err(SignalError::CandidateInvalid {
+                kind: EndpointCandidateKind::Ipv6,
+                ..
+            })
         ));
         Ok(())
     }
