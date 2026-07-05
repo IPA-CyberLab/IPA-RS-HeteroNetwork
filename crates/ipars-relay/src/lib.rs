@@ -20,6 +20,8 @@ const DEFAULT_SESSION_TTL_SECONDS: i64 = 300;
 pub enum RelayError {
     #[error("relay admission denied")]
     AdmissionDenied,
+    #[error("relay node session limit exceeded")]
+    NodeSessionLimitExceeded,
     #[error("unknown relay session")]
     UnknownSession,
     #[error("relay session expired")]
@@ -356,6 +358,13 @@ impl RelayTable {
         self.sessions.len()
     }
 
+    pub fn active_session_count_for_node(&self, node: &NodeId) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.left == *node || session.right == *node)
+            .count()
+    }
+
     pub fn bytes_forwarded(&self) -> u64 {
         self.dataplane.payload_bytes_forwarded
     }
@@ -432,6 +441,7 @@ fn default_session_ttl() -> chrono::Duration {
 fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
     match error {
         RelayError::AdmissionDenied => RelayDataplaneDropReason::AdmissionDenied,
+        RelayError::NodeSessionLimitExceeded => RelayDataplaneDropReason::AdmissionDenied,
         RelayError::UnknownSession => RelayDataplaneDropReason::UnknownSession,
         RelayError::SessionExpired => RelayDataplaneDropReason::SessionExpired,
         RelayError::InvalidSessionCredential => RelayDataplaneDropReason::InvalidSessionCredential,
@@ -445,6 +455,9 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
 fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFailureReason {
     match error {
         RelayError::AdmissionDenied => RelayAdmissionFailureReason::AdmissionDenied,
+        RelayError::NodeSessionLimitExceeded => {
+            RelayAdmissionFailureReason::NodeSessionLimitExceeded
+        }
         RelayError::RateLimited => RelayAdmissionFailureReason::RateLimited,
         RelayError::InvalidSessionCredential => {
             RelayAdmissionFailureReason::InvalidSessionCredential
@@ -558,6 +571,7 @@ pub struct RelayService {
     table: std::sync::Arc<RwLock<RelayTable>>,
     session_ttl: chrono::Duration,
     admission_rate_limit: Option<RelayAdmissionRateLimit>,
+    max_sessions_per_node: Option<u32>,
     admission_rate_window: Mutex<RelayAdmissionRateWindow>,
     admission_attempts: AtomicU64,
     admission_successes: AtomicU64,
@@ -590,12 +604,29 @@ impl RelayService {
         session_ttl: chrono::Duration,
         admission_rate_limit: Option<RelayAdmissionRateLimit>,
     ) -> Self {
+        Self::with_session_ttl_admission_controls(
+            relay_node,
+            capability,
+            session_ttl,
+            admission_rate_limit,
+            None,
+        )
+    }
+
+    pub fn with_session_ttl_admission_controls(
+        relay_node: NodeId,
+        capability: RelayCapability,
+        session_ttl: chrono::Duration,
+        admission_rate_limit: Option<RelayAdmissionRateLimit>,
+        max_sessions_per_node: Option<u32>,
+    ) -> Self {
         Self {
             relay_node,
             capability: RwLock::new(capability),
             table: std::sync::Arc::new(RwLock::new(RelayTable::default())),
             session_ttl: session_ttl.max(chrono::Duration::milliseconds(1)),
             admission_rate_limit,
+            max_sessions_per_node: max_sessions_per_node.filter(|limit| *limit > 0),
             admission_rate_window: Mutex::new(RelayAdmissionRateWindow {
                 started_at: Utc::now(),
                 attempts: 0,
@@ -684,17 +715,25 @@ impl RelayService {
         let mut table = self.table.write().await;
         table.purge_expired(Utc::now());
         capability.active_sessions = table.session_count() as u32;
-        let credentials = table.admit_with_options(
-            &capability,
-            RelaySessionAdmission {
-                left: request.left.clone(),
-                right: request.right.clone(),
-                left_addr: request.left_addr,
-                right_addr: request.right_addr,
-                session_token: Uuid::new_v4().to_string(),
-                session_ttl: self.session_ttl,
-            },
-        )?;
+        let admission = RelaySessionAdmission {
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+            session_token: Uuid::new_v4().to_string(),
+            session_ttl: self.session_ttl,
+        };
+        let session_id = RelaySessionId::new(&admission.left, &admission.right);
+        validate_relay_session_admission(&admission, &session_id)?;
+        if table.has_session_pair(&admission.left, &admission.right) {
+            return Err(RelayError::AdmissionDenied);
+        }
+        if self.node_session_limit_exceeded(&table, &admission.left)
+            || self.node_session_limit_exceeded(&table, &admission.right)
+        {
+            return Err(RelayError::NodeSessionLimitExceeded);
+        }
+        let credentials = table.admit_with_options(&capability, admission)?;
         capability.active_sessions = table.session_count() as u32;
 
         Ok(RelayAdmissionResponse {
@@ -722,8 +761,15 @@ impl RelayService {
             admission_success_count: self.admission_successes.load(Ordering::Relaxed),
             admission_failure_count: self.admission_failures.load(Ordering::Relaxed),
             admission_failures_by_reason: self.admission_failures_by_reason(),
+            max_sessions_per_node: self.max_sessions_per_node,
             dataplane: table.dataplane_metrics(),
         }
+    }
+
+    fn node_session_limit_exceeded(&self, table: &RelayTable, node: &NodeId) -> bool {
+        self.max_sessions_per_node
+            .map(|limit| table.active_session_count_for_node(node) >= limit as usize)
+            .unwrap_or(false)
     }
 }
 
@@ -1272,6 +1318,56 @@ mod tests {
                 .admission_failures_by_reason
                 .get(&RelayAdmissionFailureReason::AdmissionDenied),
             Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_enforces_per_node_session_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::with_session_ttl_admission_controls(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            None,
+            Some(1),
+        );
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("shared-left"),
+                right: NodeId::from_string("right-a"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("shared-left"),
+                right: NodeId::from_string("right-b"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10001)),
+                right_addr: SocketAddr::from(([10, 0, 0, 3], 10000)),
+            })
+            .await;
+
+        assert!(matches!(
+            rejected,
+            Err(RelayError::NodeSessionLimitExceeded)
+        ));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.max_sessions_per_node, Some(1));
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::NodeSessionLimitExceeded),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayAdmissionFailureReason::NodeSessionLimitExceeded.as_str(),
+            "node_session_limit_exceeded"
         );
         Ok(())
     }

@@ -1294,6 +1294,7 @@ pub mod api {
     pub enum RelayAdmissionFailureReason {
         Unauthorized,
         AdmissionDenied,
+        NodeSessionLimitExceeded,
         RateLimited,
         InvalidSessionCredential,
         SocketError,
@@ -1305,6 +1306,7 @@ pub mod api {
             match self {
                 Self::Unauthorized => "unauthorized",
                 Self::AdmissionDenied => "admission_denied",
+                Self::NodeSessionLimitExceeded => "node_session_limit_exceeded",
                 Self::RateLimited => "rate_limited",
                 Self::InvalidSessionCredential => "invalid_session_credential",
                 Self::SocketError => "socket_error",
@@ -1362,6 +1364,8 @@ pub mod api {
         pub admission_failure_count: u64,
         #[serde(default)]
         pub admission_failures_by_reason: BTreeMap<RelayAdmissionFailureReason, u64>,
+        #[serde(default)]
+        pub max_sessions_per_node: Option<u32>,
         #[serde(default)]
         pub dataplane: RelayDataplaneMetrics,
     }

@@ -353,6 +353,8 @@ struct RelayArgs {
     admission_url: Option<String>,
     #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     max_sessions: u32,
+    #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS_PER_NODE", default_value_t = 0)]
+    max_sessions_per_node: u32,
     #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
     max_mbps: u32,
     #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
@@ -3025,6 +3027,7 @@ struct RelayOtelMetrics {
     active_sessions: Gauge<u64>,
     max_sessions: Gauge<u64>,
     available_sessions: Gauge<u64>,
+    max_sessions_per_node: Gauge<u64>,
     max_mbps: Gauge<u64>,
     enabled_by_policy: Gauge<u64>,
     e2e_only: Gauge<u64>,
@@ -3093,6 +3096,12 @@ impl RelayOtelMetrics {
             available_sessions: meter
                 .u64_gauge("ipars.relay.sessions.available")
                 .with_description("Available relay session capacity.")
+                .build(),
+            max_sessions_per_node: meter
+                .u64_gauge("ipars.relay.sessions.max_per_node")
+                .with_description(
+                    "Configured active relay session cap per participating node. Zero means disabled.",
+                )
                 .build(),
             max_mbps: meter
                 .u64_gauge("ipars.relay.max_mbps")
@@ -3184,6 +3193,10 @@ impl RelayOtelMetrics {
             .record(status.capability.max_sessions as u64, &relay_attrs);
         self.available_sessions
             .record(status.capability.available_capacity() as u64, &relay_attrs);
+        self.max_sessions_per_node.record(
+            status.max_sessions_per_node.unwrap_or_default() as u64,
+            &relay_attrs,
+        );
         self.max_mbps
             .record(status.capability.max_mbps as u64, &relay_attrs);
         self.enabled_by_policy
@@ -3849,7 +3862,9 @@ async fn run_relay(
         max_attempts: args.admission_rate_limit,
         window: chrono::Duration::seconds(args.admission_rate_limit_window_seconds as i64),
     });
-    let service = Arc::new(RelayService::with_session_ttl_and_admission_rate_limit(
+    let max_sessions_per_node =
+        (args.max_sessions_per_node > 0).then_some(args.max_sessions_per_node);
+    let service = Arc::new(RelayService::with_session_ttl_admission_controls(
         NodeId::from_string(args.relay_node_id),
         RelayCapability {
             enabled_by_policy: true,
@@ -3862,6 +3877,7 @@ async fn run_relay(
         },
         chrono::Duration::seconds(args.session_ttl_seconds as i64),
         admission_rate_limit,
+        max_sessions_per_node,
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
@@ -3893,6 +3909,9 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
     }
     if args.max_mbps == 0 {
         anyhow::bail!("--max-mbps must be greater than zero");
+    }
+    if args.max_sessions_per_node > args.max_sessions {
+        anyhow::bail!("--max-sessions-per-node must be less than or equal to --max-sessions");
     }
     validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
     if args.admission_rate_limit > 0 {
@@ -10474,6 +10493,7 @@ mod tests {
             admission_success_count: 0,
             admission_failure_count: 0,
             admission_failures_by_reason: BTreeMap::new(),
+            max_sessions_per_node: Some(20),
             dataplane: RelayDataplaneMetrics::default(),
         };
 
@@ -14006,6 +14026,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "http://relay-a:9580",
             "--session-ttl-seconds",
             "60",
+            "--max-sessions-per-node",
+            "25",
             "--admission-rate-limit",
             "120",
             "--admission-rate-limit-window-seconds",
@@ -14016,6 +14038,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
+            assert_eq!(args.max_sessions_per_node, 25);
             assert_eq!(args.admission_rate_limit, 120);
             assert_eq!(args.admission_rate_limit_window_seconds, 30);
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
@@ -14087,6 +14110,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--max-mbps must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let node_limit_above_capacity = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--max-sessions",
+            "10",
+            "--max-sessions-per-node",
+            "11",
+        ])?;
+        if let Command::Relay(args) = node_limit_above_capacity.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--max-sessions-per-node must be less than or equal to --max-sessions"));
         } else {
             anyhow::bail!("expected relay command");
         }

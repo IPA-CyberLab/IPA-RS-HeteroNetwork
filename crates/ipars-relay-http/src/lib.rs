@@ -125,6 +125,16 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_relay_max_sessions_per_node Configured active relay session cap per participating node. Zero means disabled."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_max_sessions_per_node gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_max_sessions_per_node{{relay_node=\"{relay_node}\"}} {}",
+        status.max_sessions_per_node.unwrap_or_default()
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_relay_available_sessions Remaining relay session capacity."
     );
     prometheus_line!(&mut body, "# TYPE ipars_relay_available_sessions gauge");
@@ -407,6 +417,7 @@ impl IntoResponse for ApiError {
         };
         let status = match error {
             RelayError::AdmissionDenied => StatusCode::FORBIDDEN,
+            RelayError::NodeSessionLimitExceeded => StatusCode::FORBIDDEN,
             RelayError::UnknownSession => StatusCode::NOT_FOUND,
             RelayError::SessionExpired => StatusCode::GONE,
             RelayError::InvalidSessionCredential => StatusCode::FORBIDDEN,
@@ -529,6 +540,7 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_relay_active_sessions"));
         assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_max_sessions_per_node{relay_node=\"relay-a\"} 0"));
         assert!(body.contains("ipars_relay_e2e_only{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_admission_attempts_total"));
         assert!(body.contains("ipars_relay_admission_attempts_total{relay_node=\"relay-a\"} 1"));
