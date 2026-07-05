@@ -66,7 +66,7 @@ use ipars_types::ebpf::{
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TransportProtocol,
+    SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -2121,6 +2121,7 @@ where
     let otel_metrics_task = otel_metrics_enabled.then(|| {
         start_control_plane_otel_metrics_export(
             plane.clone(),
+            join_service.clone(),
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
@@ -2212,6 +2213,9 @@ struct ControlPlaneOtelMetrics {
     vpn_pool_total: Gauge<u64>,
     vpn_pool_allocated: Gauge<u64>,
     vpn_pool_available: Gauge<u64>,
+    join_tokens: Gauge<u64>,
+    join_tokens_issued: Gauge<u64>,
+    join_token_uses: Gauge<u64>,
     node_health: Gauge<u64>,
     paths: Gauge<u64>,
     paths_by_state: Gauge<u64>,
@@ -2251,6 +2255,18 @@ impl ControlPlaneOtelMetrics {
                 .u64_gauge("ipars.control_plane.vpn_pool.available")
                 .with_description("Unallocated usable VPN IP addresses in the configured pool.")
                 .build(),
+            join_tokens: meter
+                .u64_gauge("ipars.control_plane.join_tokens")
+                .with_description("Join tokens by current token-ledger status.")
+                .build(),
+            join_tokens_issued: meter
+                .u64_gauge("ipars.control_plane.join_tokens.issued")
+                .with_description("Total join-token ledger records.")
+                .build(),
+            join_token_uses: meter
+                .u64_gauge("ipars.control_plane.join_token_uses")
+                .with_description("Total accepted join-token uses recorded by the ledger.")
+                .build(),
             node_health: meter
                 .u64_gauge("ipars.control_plane.node_health")
                 .with_description("Registered nodes by last reported health state.")
@@ -2286,7 +2302,24 @@ impl ControlPlaneOtelMetrics {
             .record(metrics.vpn_pool_allocated_count, &cluster_attrs);
         self.vpn_pool_available
             .record(metrics.vpn_pool_available_count, &cluster_attrs);
+        self.join_tokens_issued
+            .record(metrics.token_ledger_issued_count, &cluster_attrs);
+        self.join_token_uses
+            .record(metrics.token_ledger_use_count, &cluster_attrs);
         self.paths.record(metrics.path_count as u64, &cluster_attrs);
+
+        for (status, count) in [
+            ("active", metrics.token_ledger_active_count),
+            ("revoked", metrics.token_ledger_revoked_count),
+            ("expired", metrics.token_ledger_expired_count),
+            ("exhausted", metrics.token_ledger_exhausted_count),
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("status", status),
+            ];
+            self.join_tokens.record(count, &attrs);
+        }
 
         for (state, count) in [
             (HealthState::Healthy, metrics.healthy_node_count),
@@ -2331,18 +2364,33 @@ fn control_plane_path_state_count(
         .unwrap_or(0)
 }
 
-fn start_control_plane_otel_metrics_export<S>(
+fn start_control_plane_otel_metrics_export<S, L>(
     plane: Arc<ControlPlane<S>>,
+    join_service: Arc<ControlPlaneJoinService<S, L>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()>
 where
     S: ControlPlaneStore + 'static,
+    L: TokenLedger + 'static,
 {
     tokio::spawn(async move {
         let metrics = ControlPlaneOtelMetrics::new();
         loop {
             match plane.metrics().await {
-                Ok(status) => metrics.record_status(&status),
+                Ok(mut status) => {
+                    match join_service
+                        .token_metrics(&status.cluster_id, chrono::Utc::now())
+                        .await
+                    {
+                        Ok(token_metrics) => {
+                            apply_token_ledger_metrics(&mut status, token_metrics);
+                            metrics.record_status(&status);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to collect control-plane token-ledger OTLP metrics")
+                        }
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(%error, "failed to collect control-plane OTLP metrics")
                 }
@@ -2350,6 +2398,18 @@ where
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+fn apply_token_ledger_metrics(
+    metrics: &mut ControlPlaneMetricsResponse,
+    token_metrics: TokenLedgerMetrics,
+) {
+    metrics.token_ledger_issued_count = token_metrics.issued_count;
+    metrics.token_ledger_active_count = token_metrics.active_count;
+    metrics.token_ledger_revoked_count = token_metrics.revoked_count;
+    metrics.token_ledger_expired_count = token_metrics.expired_count;
+    metrics.token_ledger_exhausted_count = token_metrics.exhausted_count;
+    metrics.token_ledger_use_count = token_metrics.use_count;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -8129,6 +8189,12 @@ mod tests {
             vpn_pool_total_count: 6,
             vpn_pool_allocated_count: 2,
             vpn_pool_available_count: 4,
+            token_ledger_issued_count: 3,
+            token_ledger_active_count: 1,
+            token_ledger_revoked_count: 1,
+            token_ledger_expired_count: 0,
+            token_ledger_exhausted_count: 1,
+            token_ledger_use_count: 7,
             path_count: 3,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,

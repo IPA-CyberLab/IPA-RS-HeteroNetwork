@@ -18,7 +18,7 @@ use ipars_types::api::{
 use ipars_types::{
     AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -139,6 +139,11 @@ pub trait TokenLedger: Send + Sync {
         nonce: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError>;
+    async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError>;
 }
 
 #[derive(Debug, Default)]
@@ -310,6 +315,24 @@ impl TokenLedger for InMemoryTokenLedger {
         record.uses = record.uses.saturating_add(1);
         Ok(record.clone())
     }
+
+    async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        let mut metrics = TokenLedgerMetrics::default();
+        for record in self
+            .tokens
+            .read()
+            .await
+            .values()
+            .filter(|record| &record.cluster_id == cluster_id)
+        {
+            metrics.observe_record(record, now);
+        }
+        Ok(metrics)
+    }
 }
 
 #[derive(Debug)]
@@ -369,6 +392,14 @@ where
         self.ledger
             .revoke_token(cluster_id, nonce, revoked_at)
             .await
+    }
+
+    pub async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        self.ledger.token_metrics(cluster_id, now).await
     }
 }
 
@@ -449,6 +480,14 @@ where
         self.admission
             .revoke_token(cluster_id, nonce, revoked_at)
             .await
+    }
+
+    pub async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        self.admission.token_metrics(cluster_id, now).await
     }
 }
 
@@ -838,6 +877,12 @@ where
             vpn_pool_total_count,
             vpn_pool_allocated_count,
             vpn_pool_available_count,
+            token_ledger_issued_count: 0,
+            token_ledger_active_count: 0,
+            token_ledger_revoked_count: 0,
+            token_ledger_expired_count: 0,
+            token_ledger_exhausted_count: 0,
+            token_ledger_use_count: 0,
             path_count: paths.len(),
             path_state_counts: path_state_counts
                 .into_iter()

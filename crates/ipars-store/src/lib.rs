@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    TokenLedgerRecord, TokenStatus, VpnIp,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -357,6 +357,23 @@ impl TokenLedger for SqliteControlPlaneStore {
             }
         }
     }
+
+    async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        let records = sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = ?1")
+            .bind(cluster_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        let mut metrics = TokenLedgerMetrics::default();
+        for record in records.into_iter().map(row_to_token) {
+            metrics.observe_record(&record?, now);
+        }
+        Ok(metrics)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -710,6 +727,23 @@ impl TokenLedger for PostgresControlPlaneStore {
             }
         }
     }
+
+    async fn token_metrics(
+        &self,
+        cluster_id: &ClusterId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        let records = sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = $1")
+            .bind(cluster_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        let mut metrics = TokenLedgerMetrics::default();
+        for record in records.into_iter().map(pg_row_to_token) {
+            metrics.observe_record(&record?, now);
+        }
+        Ok(metrics)
+    }
 }
 
 fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord, ControlPlaneError> {
@@ -966,6 +1000,11 @@ mod tests {
                 ..
             })
         ));
+        let token_metrics = store.token_metrics(&local.cluster_id, Utc::now()).await?;
+        assert_eq!(token_metrics.issued_count, 1);
+        assert_eq!(token_metrics.active_count, 0);
+        assert_eq!(token_metrics.exhausted_count, 1);
+        assert_eq!(token_metrics.use_count, 1);
         Ok(())
     }
 
@@ -1022,6 +1061,11 @@ mod tests {
             .ok_or_else(|| ControlPlaneError::TokenNotFound(token_claims.nonce.clone()))?;
         assert_eq!(final_record.uses, 1);
         assert_eq!(final_record.status(Utc::now()), TokenStatus::Exhausted);
+        let token_metrics = store.token_metrics(&cluster_id, Utc::now()).await?;
+        assert_eq!(token_metrics.issued_count, 1);
+        assert_eq!(token_metrics.active_count, 0);
+        assert_eq!(token_metrics.exhausted_count, 1);
+        assert_eq!(token_metrics.use_count, 1);
 
         let _ = std::fs::remove_file(database_path);
         Ok(())

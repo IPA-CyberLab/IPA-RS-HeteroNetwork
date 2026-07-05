@@ -831,6 +831,31 @@ impl TokenLedgerRecord {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLedgerMetrics {
+    pub issued_count: u64,
+    pub active_count: u64,
+    pub revoked_count: u64,
+    pub expired_count: u64,
+    pub exhausted_count: u64,
+    pub use_count: u64,
+}
+
+impl TokenLedgerMetrics {
+    pub fn observe_record(&mut self, record: &TokenLedgerRecord, now: DateTime<Utc>) {
+        self.issued_count = self.issued_count.saturating_add(1);
+        self.use_count = self.use_count.saturating_add(record.uses as u64);
+        match record.status(now) {
+            TokenStatus::Active => self.active_count = self.active_count.saturating_add(1),
+            TokenStatus::Revoked => self.revoked_count = self.revoked_count.saturating_add(1),
+            TokenStatus::Expired => self.expired_count = self.expired_count.saturating_add(1),
+            TokenStatus::Exhausted => {
+                self.exhausted_count = self.exhausted_count.saturating_add(1);
+            }
+        }
+    }
+}
+
 pub mod api {
     use super::*;
 
@@ -995,6 +1020,18 @@ pub mod api {
         pub vpn_pool_allocated_count: u64,
         #[serde(default)]
         pub vpn_pool_available_count: u64,
+        #[serde(default)]
+        pub token_ledger_issued_count: u64,
+        #[serde(default)]
+        pub token_ledger_active_count: u64,
+        #[serde(default)]
+        pub token_ledger_revoked_count: u64,
+        #[serde(default)]
+        pub token_ledger_expired_count: u64,
+        #[serde(default)]
+        pub token_ledger_exhausted_count: u64,
+        #[serde(default)]
+        pub token_ledger_use_count: u64,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]

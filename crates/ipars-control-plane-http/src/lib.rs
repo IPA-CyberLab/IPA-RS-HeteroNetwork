@@ -15,7 +15,7 @@ use ipars_types::api::{
     JoinNodeRequest, PeerMap, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{NodeId, PathState};
+use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
 
 macro_rules! prometheus_line {
@@ -83,7 +83,7 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    Ok(Json(state.plane.metrics().await?))
+    Ok(Json(control_plane_metrics(&state).await?))
 }
 
 async fn policy<S, L>(
@@ -109,7 +109,7 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let metrics = state.plane.metrics().await?;
+    let metrics = control_plane_metrics(&state).await?;
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -117,6 +117,34 @@ where
         )],
         render_prometheus_metrics(&metrics),
     ))
+}
+
+async fn control_plane_metrics<S, L>(
+    state: &ControlPlaneHttpState<S, L>,
+) -> Result<ControlPlaneMetricsResponse, ControlPlaneError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let mut metrics = state.plane.metrics().await?;
+    let token_metrics = state
+        .join_service
+        .token_metrics(&metrics.cluster_id, Utc::now())
+        .await?;
+    apply_token_ledger_metrics(&mut metrics, token_metrics);
+    Ok(metrics)
+}
+
+fn apply_token_ledger_metrics(
+    metrics: &mut ControlPlaneMetricsResponse,
+    token_metrics: TokenLedgerMetrics,
+) {
+    metrics.token_ledger_issued_count = token_metrics.issued_count;
+    metrics.token_ledger_active_count = token_metrics.active_count;
+    metrics.token_ledger_revoked_count = token_metrics.revoked_count;
+    metrics.token_ledger_expired_count = token_metrics.expired_count;
+    metrics.token_ledger_exhausted_count = token_metrics.exhausted_count;
+    metrics.token_ledger_use_count = token_metrics.use_count;
 }
 
 async fn join<S, L>(
@@ -289,6 +317,48 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         &mut body,
         "ipars_control_plane_vpn_pool_available{{cluster_id=\"{cluster_id}\"}} {}",
         metrics.vpn_pool_available_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_join_tokens Issued join tokens by current status."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_join_tokens gauge");
+    for (status, count) in [
+        ("active", metrics.token_ledger_active_count),
+        ("revoked", metrics.token_ledger_revoked_count),
+        ("expired", metrics.token_ledger_expired_count),
+        ("exhausted", metrics.token_ledger_exhausted_count),
+    ] {
+        prometheus_line!(
+            &mut body,
+            "ipars_control_plane_join_tokens{{cluster_id=\"{cluster_id}\",status=\"{status}\"}} {count}"
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_join_tokens_issued Total join-token ledger records."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_join_tokens_issued gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_join_tokens_issued{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.token_ledger_issued_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_join_token_uses Total accepted join-token uses recorded by the ledger."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_join_token_uses gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_join_token_uses{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.token_ledger_use_count
     );
     prometheus_line!(
         &mut body,
@@ -698,6 +768,12 @@ mod tests {
         assert_eq!(metrics.vpn_pool_total_count, 6);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
         assert_eq!(metrics.vpn_pool_available_count, 5);
+        assert_eq!(metrics.token_ledger_issued_count, 1);
+        assert_eq!(metrics.token_ledger_active_count, 0);
+        assert_eq!(metrics.token_ledger_revoked_count, 1);
+        assert_eq!(metrics.token_ledger_expired_count, 0);
+        assert_eq!(metrics.token_ledger_exhausted_count, 0);
+        assert_eq!(metrics.token_ledger_use_count, 1);
 
         let response = app
             .oneshot(
@@ -722,6 +798,9 @@ mod tests {
         assert!(body.contains("ipars_control_plane_vpn_pool_total"));
         assert!(body.contains("ipars_control_plane_vpn_pool_allocated"));
         assert!(body.contains("ipars_control_plane_vpn_pool_available"));
+        assert!(body.contains("ipars_control_plane_join_tokens"));
+        assert!(body.contains("ipars_control_plane_join_tokens_issued"));
+        assert!(body.contains("ipars_control_plane_join_token_uses"));
         assert!(body.contains("ipars_control_plane_node_health"));
         Ok(())
     }
