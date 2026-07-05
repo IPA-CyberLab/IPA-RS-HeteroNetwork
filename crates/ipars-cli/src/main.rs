@@ -5687,6 +5687,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn bundled_chart_rejects_inconsistent_service_exposure_values() -> anyhow::Result<()> {
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(service_template.contains(
+            "agent.apiService exposure-specific values require agent.apiService.enabled=true"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.loadBalancerSourceRanges requires agent.apiService.type LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.loadBalancerSourceRanges requires agent.relayService.type LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.apiService.loadBalancerSourceRanges"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.relayService.loadBalancerSourceRanges"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.exposureAcknowledged=true requires external Service type or externalIPs"
+        ));
+        Ok(())
+    }
+
     fn base_k8s_install_args() -> K8sInstallArgs {
         K8sInstallArgs {
             release: "edge".to_string(),
