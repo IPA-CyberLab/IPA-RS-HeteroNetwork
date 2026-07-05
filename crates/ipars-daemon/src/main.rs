@@ -104,6 +104,10 @@ const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+const TRACEFS_EVENT_ROOTS: [&str; 2] = [
+    "/sys/kernel/tracing/events",
+    "/sys/kernel/debug/tracing/events",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -879,6 +883,8 @@ struct RuntimePreflightChecks {
     cap_sys_admin: fn() -> anyhow::Result<()>,
     cap_perfmon: fn() -> anyhow::Result<()>,
     cap_bpf: fn() -> anyhow::Result<()>,
+    ebpf_object: fn(&Path) -> anyhow::Result<()>,
+    ebpf_tracepoint: fn(&EbpfTracepointAttachSpec) -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
     ipv4_forwarding: fn() -> anyhow::Result<()>,
@@ -893,6 +899,8 @@ impl RuntimePreflightChecks {
             cap_sys_admin: ensure_cap_sys_admin_if_known,
             cap_perfmon: ensure_cap_perfmon_if_known,
             cap_bpf: ensure_cap_bpf_if_known,
+            ebpf_object: ensure_ebpf_object_file_ready,
+            ebpf_tracepoint: ensure_ebpf_tracepoint_ready,
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
             ipv4_forwarding: ensure_ipv4_forwarding_if_known,
@@ -1074,6 +1082,13 @@ fn preflight_agent_runtime_with_path_and_checks(
     }
     if needs.cap_bpf {
         (checks.cap_bpf)()?;
+    }
+    if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
+        let config = EbpfRingbufConfig::from_args(args)?;
+        (checks.ebpf_object)(&config.object_path)?;
+        for attachment in &config.attachments {
+            (checks.ebpf_tracepoint)(attachment)?;
+        }
     }
     if needs.linux_netns {
         let namespace_name = args
@@ -1631,6 +1646,77 @@ fn ensure_cap_bpf_if_known() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_ebpf_object_file_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("eBPF packet-flow object {} is not readable", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "eBPF packet-flow object {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "eBPF packet-flow object {} must be a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() > 0,
+        "eBPF packet-flow object {} is empty",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_ebpf_tracepoint_ready(attachment: &EbpfTracepointAttachSpec) -> anyhow::Result<()> {
+    let roots = TRACEFS_EVENT_ROOTS.iter().map(|root| Path::new(*root));
+    ensure_ebpf_tracepoint_ready_in_roots(attachment, roots)
+}
+
+fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
+    attachment: &EbpfTracepointAttachSpec,
+    roots: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<()> {
+    let mut checked = Vec::new();
+    for root in roots {
+        let tracepoint_id = root
+            .join(&attachment.category)
+            .join(&attachment.name)
+            .join("id");
+        checked.push(tracepoint_id.display().to_string());
+        match std::fs::metadata(&tracepoint_id) {
+            Ok(metadata) if metadata.is_file() => return Ok(()),
+            Ok(_) => {
+                anyhow::bail!(
+                    "eBPF tracepoint `{}/{}` for program `{}` has non-file id path {}",
+                    attachment.category,
+                    attachment.name,
+                    attachment.program,
+                    tracepoint_id.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect eBPF tracepoint `{}/{}` for program `{}` at {}",
+                        attachment.category,
+                        attachment.name,
+                        attachment.program,
+                        tracepoint_id.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "eBPF tracepoint `{}/{}` for program `{}` was not found; checked {}",
+        attachment.category,
+        attachment.name,
+        attachment.program,
+        checked.join(", ")
+    )
 }
 
 fn ensure_ipv4_forwarding_if_known() -> anyhow::Result<()> {
@@ -10058,6 +10144,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Ok(())
     }
 
+    fn preflight_noop_ebpf_object(_path: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn preflight_noop_ebpf_tracepoint(
+        _attachment: &EbpfTracepointAttachSpec,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn preflight_fail_ebpf_object(path: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("blocked test eBPF object {}", path.display())
+    }
+
+    fn preflight_fail_ebpf_tracepoint(attachment: &EbpfTracepointAttachSpec) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "blocked test eBPF tracepoint {}/{}",
+            attachment.category,
+            attachment.name
+        )
+    }
+
     fn preflight_fail_ipv4_forwarding() -> anyhow::Result<()> {
         anyhow::bail!("blocked test net.ipv4.ip_forward")
     }
@@ -10089,6 +10197,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             cap_sys_admin: preflight_noop,
             cap_perfmon: preflight_noop,
             cap_bpf: preflight_noop,
+            ebpf_object: preflight_noop_ebpf_object,
+            ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
             netlink,
             ipv4_forwarding: preflight_noop,
@@ -10106,6 +10216,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             cap_sys_admin: preflight_noop,
             cap_perfmon: preflight_noop,
             cap_bpf: preflight_noop,
+            ebpf_object: preflight_noop_ebpf_object,
+            ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
             ipv4_forwarding,
@@ -10284,6 +10396,112 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_ebpf_object_and_tracepoints() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_sys_enter_connect:syscalls:sys_enter_connect",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let mut object_checks = test_preflight_checks(preflight_noop_netlink);
+            object_checks.ebpf_object = preflight_fail_ebpf_object;
+            let object_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                object_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful eBPF object preflight"),
+                Err(error) => error,
+            };
+            assert!(object_error
+                .to_string()
+                .contains("blocked test eBPF object /run/ipars/ipars-packet-flow.bpf.o"));
+
+            let mut tracepoint_checks = test_preflight_checks(preflight_noop_netlink);
+            tracepoint_checks.ebpf_tracepoint = preflight_fail_ebpf_tracepoint;
+            let tracepoint_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                tracepoint_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful eBPF tracepoint preflight"),
+                Err(error) => error,
+            };
+            assert!(tracepoint_error
+                .to_string()
+                .contains("blocked test eBPF tracepoint syscalls/sys_enter_connect"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn ebpf_object_preflight_requires_nonempty_regular_file() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-object-preflight")?;
+        let object = base.join("ipars-packet-flow.bpf.o");
+        std::fs::write(&object, b"elf bytes")?;
+        ensure_ebpf_object_file_ready(&object)?;
+
+        let empty = base.join("empty.bpf.o");
+        std::fs::write(&empty, b"")?;
+        let empty_error = match ensure_ebpf_object_file_ready(&empty) {
+            Ok(()) => anyhow::bail!("unexpected successful empty object preflight"),
+            Err(error) => error,
+        };
+        assert!(empty_error.to_string().contains("is empty"));
+
+        let directory = base.join("object-dir");
+        std::fs::create_dir_all(&directory)?;
+        let directory_error = match ensure_ebpf_object_file_ready(&directory) {
+            Ok(()) => anyhow::bail!("unexpected successful directory object preflight"),
+            Err(error) => error,
+        };
+        assert!(directory_error
+            .to_string()
+            .contains("must be a regular file"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_tracepoint_preflight_searches_tracefs_roots() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-tracepoint-preflight")?;
+        let first_root = base.join("first/events");
+        let second_root = base.join("second/events");
+        std::fs::create_dir_all(&first_root)?;
+        std::fs::create_dir_all(&second_root)?;
+        let roots = [first_root.as_path(), second_root.as_path()];
+        let attachment =
+            EbpfTracepointAttachSpec::parse("ipars_sys_enter_connect:syscalls:sys_enter_connect")?;
+
+        let missing_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful missing tracepoint preflight"),
+            Err(error) => error,
+        };
+        assert!(missing_error
+            .to_string()
+            .contains("syscalls/sys_enter_connect"));
+
+        let tracepoint_dir = second_root.join("syscalls/sys_enter_connect");
+        std::fs::create_dir_all(&tracepoint_dir)?;
+        std::fs::write(tracepoint_dir.join("id"), b"123\n")?;
+        ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots)?;
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 
     #[test]
