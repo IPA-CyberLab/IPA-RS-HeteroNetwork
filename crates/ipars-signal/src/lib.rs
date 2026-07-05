@@ -209,6 +209,9 @@ impl SignalRegistry {
         if !nat_classifications_allow_hole_punch(
             source_nat_classification.as_ref(),
             target_nat_classification.as_ref(),
+            self.coordinator
+                .policy
+                .nat_classification_min_confidence_percent,
         ) {
             self.hole_punch_nat_suppressions
                 .fetch_add(1, Ordering::Relaxed);
@@ -255,6 +258,10 @@ impl SignalRegistry {
         let relay_health_ttl_seconds = self.coordinator.policy.relay_health_ttl_seconds;
         let endpoint_candidate_ttl_seconds = self.coordinator.policy.endpoint_candidate_ttl_seconds;
         let nat_classification_ttl_seconds = self.coordinator.policy.nat_classification_ttl_seconds;
+        let nat_classification_min_confidence_percent = self
+            .coordinator
+            .policy
+            .nat_classification_min_confidence_percent;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
@@ -323,6 +330,7 @@ impl SignalRegistry {
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
             nat_classification_ttl_seconds,
+            nat_classification_min_confidence_percent,
             generated_at: now,
         }
     }
@@ -480,6 +488,7 @@ impl SignalCoordinator {
         if !nat_classifications_allow_hole_punch(
             source_nat_classification,
             target_nat_classification,
+            self.policy.nat_classification_min_confidence_percent,
         ) {
             return HolePunchPlan {
                 source_reflexive: None,
@@ -545,6 +554,7 @@ impl SignalCoordinator {
             && nat_classifications_allow_hole_punch(
                 source_nat_classification,
                 target_nat_classification,
+                self.policy.nat_classification_min_confidence_percent,
             )
         {
             return PathState::DirectNatTraversal;
@@ -626,18 +636,36 @@ fn endpoint_candidate_is_fresh(
 fn nat_classifications_allow_hole_punch(
     source: Option<&NatClassification>,
     target: Option<&NatClassification>,
+    min_confidence_percent: u8,
 ) -> bool {
-    nat_classification_allows_hole_punch(source) && nat_classification_allows_hole_punch(target)
+    nat_classification_allows_hole_punch(source, min_confidence_percent)
+        && nat_classification_allows_hole_punch(target, min_confidence_percent)
 }
 
-fn nat_classification_allows_hole_punch(classification: Option<&NatClassification>) -> bool {
-    match classification.map(|classification| classification.strategy) {
+fn nat_classification_allows_hole_punch(
+    classification: Option<&NatClassification>,
+    min_confidence_percent: u8,
+) -> bool {
+    match classification {
         None => true,
-        Some(NatTraversalStrategy::DirectCandidate)
-        | Some(NatTraversalStrategy::CoordinatedHolePunch) => true,
-        Some(NatTraversalStrategy::RelayPreferred)
-        | Some(NatTraversalStrategy::InsufficientData) => false,
+        Some(classification)
+            if !nat_classification_meets_confidence(classification, min_confidence_percent) =>
+        {
+            false
+        }
+        Some(classification) => matches!(
+            classification.strategy,
+            NatTraversalStrategy::DirectCandidate | NatTraversalStrategy::CoordinatedHolePunch
+        ),
     }
+}
+
+fn nat_classification_meets_confidence(
+    classification: &NatClassification,
+    min_confidence_percent: u8,
+) -> bool {
+    classification.confidence.is_finite()
+        && classification.confidence * 100.0 >= min_confidence_percent as f32
 }
 
 fn relay_candidate_allowed(
@@ -936,6 +964,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_blocks_low_confidence_nat_classification_for_negotiation(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            nat_classification_min_confidence_percent: 80,
+            ..ClusterPolicy::default()
+        });
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(source.clone(), Some(coordinated_hole_punch_nat(0.7)))
+            .await?;
+        registry.upsert_node(target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.nat_classification_min_confidence_percent, 80);
+        assert_eq!(
+            signal_path_state_count(&metrics, PathState::DirectNatTraversal),
+            0
+        );
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_uses_stored_source_nat_classification_for_negotiation(
     ) -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
@@ -1112,6 +1175,7 @@ mod tests {
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
         assert_eq!(stale_metrics.nat_classification_ttl_seconds, 300);
+        assert_eq!(stale_metrics.nat_classification_min_confidence_percent, 50);
         assert_eq!(stale_metrics.stale_endpoint_candidate_count, 1);
 
         registry
@@ -1194,6 +1258,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_blocks_hole_punch_plan_when_nat_confidence_is_too_low(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            nat_classification_min_confidence_percent: 80,
+            ..ClusterPolicy::default()
+        });
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(source, Some(coordinated_hole_punch_nat(0.7)))
+            .await?;
+        registry.upsert_node(target).await?;
+
+        let plan = registry
+            .hole_punch_plan(NodeId::from_string("node-a"), NodeId::from_string("node-b"))
+            .await?;
+
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 1);
+        assert_eq!(metrics.nat_classification_min_confidence_percent, 80);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_ignores_stale_nat_classification_for_hole_punch_plan(
     ) -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy {
@@ -1252,6 +1343,20 @@ mod tests {
             Err(SignalError::CandidateOwnerMismatch { .. })
         ));
         Ok(())
+    }
+
+    fn coordinated_hole_punch_nat(confidence: f32) -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::EndpointIndependent,
+            filtering_behavior: ipars_types::NatFilteringBehavior::EndpointIndependent,
+            observed_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 50_000))),
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::CoordinatedHolePunch,
+            confidence,
+            assessed_at: Utc::now(),
+        }
     }
 
     fn relay_preferred_nat() -> NatClassification {

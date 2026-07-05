@@ -311,6 +311,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         "ipars_signal_nat_classification_ttl_seconds {}",
         metrics.nat_classification_ttl_seconds
     );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_nat_classification_min_confidence_percent Minimum NAT classification confidence percentage required by signal."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_nat_classification_min_confidence_percent gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_nat_classification_min_confidence_percent {}",
+        metrics.nat_classification_min_confidence_percent
+    );
     body
 }
 
@@ -512,6 +525,7 @@ mod tests {
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
         assert_eq!(metrics.nat_classification_ttl_seconds, 300);
+        assert_eq!(metrics.nat_classification_min_confidence_percent, 50);
         assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
@@ -536,6 +550,7 @@ mod tests {
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_nat_classification_ttl_seconds 300"));
+        assert!(body.contains("ipars_signal_nat_classification_min_confidence_percent 50"));
         assert!(body.contains(
             "ipars_signal_fresh_nat_classifications_by_strategy{strategy=\"direct_candidate\"} 0"
         ));

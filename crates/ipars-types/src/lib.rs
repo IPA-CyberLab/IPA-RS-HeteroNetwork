@@ -645,6 +645,8 @@ pub struct ClusterPolicy {
     pub endpoint_candidate_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_ttl_seconds")]
     pub nat_classification_ttl_seconds: u64,
+    #[serde(default = "default_nat_classification_min_confidence_percent")]
+    pub nat_classification_min_confidence_percent: u8,
     pub pinned_roles: BTreeSet<Role>,
     pub pinned_tags: BTreeSet<Tag>,
     #[serde(default)]
@@ -663,6 +665,8 @@ impl Default for ClusterPolicy {
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
             nat_classification_ttl_seconds: default_nat_classification_ttl_seconds(),
+            nat_classification_min_confidence_percent:
+                default_nat_classification_min_confidence_percent(),
             pinned_roles,
             pinned_tags: BTreeSet::new(),
             acl_rules: Vec::new(),
@@ -680,6 +684,10 @@ fn default_endpoint_candidate_ttl_seconds() -> u64 {
 
 fn default_nat_classification_ttl_seconds() -> u64 {
     300
+}
+
+fn default_nat_classification_min_confidence_percent() -> u8 {
+    50
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1105,6 +1113,8 @@ pub mod api {
         pub endpoint_candidate_ttl_seconds: u64,
         #[serde(default = "super::default_nat_classification_ttl_seconds")]
         pub nat_classification_ttl_seconds: u64,
+        #[serde(default = "super::default_nat_classification_min_confidence_percent")]
+        pub nat_classification_min_confidence_percent: u8,
         pub generated_at: DateTime<Utc>,
     }
 

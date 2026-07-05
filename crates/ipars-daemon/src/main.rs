@@ -307,6 +307,12 @@ struct SignalArgs {
     nat_classification_ttl_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_SIGNAL_NAT_CLASSIFICATION_MIN_CONFIDENCE_PERCENT",
+        default_value_t = 50
+    )]
+    nat_classification_min_confidence_percent: u8,
+    #[arg(
+        long,
         env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
         default_value_t = false
     )]
@@ -1289,6 +1295,13 @@ fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_percent(value: u8, name: &str) -> anyhow::Result<()> {
+    if value > 100 {
+        anyhow::bail!("{name} must be between 0 and 100");
+    }
+    Ok(())
+}
+
 fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
@@ -2171,6 +2184,7 @@ async fn run_signal(
         relay_health_ttl_seconds: args.relay_health_ttl_seconds,
         endpoint_candidate_ttl_seconds: args.endpoint_candidate_ttl_seconds,
         nat_classification_ttl_seconds: args.nat_classification_ttl_seconds,
+        nat_classification_min_confidence_percent: args.nat_classification_min_confidence_percent,
         ..ClusterPolicy::default()
     };
     let registry = Arc::new(SignalRegistry::new(policy));
@@ -2197,6 +2211,10 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     validate_positive_seconds(
         args.nat_classification_ttl_seconds,
         "--nat-classification-ttl-seconds",
+    )?;
+    validate_percent(
+        args.nat_classification_min_confidence_percent,
+        "--nat-classification-min-confidence-percent",
     )
 }
 
@@ -2506,6 +2524,7 @@ struct SignalOtelMetrics {
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
     nat_classification_ttl_seconds: Gauge<u64>,
+    nat_classification_min_confidence_percent: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
@@ -2567,6 +2586,12 @@ impl SignalOtelMetrics {
                 .u64_gauge("ipars.signal.nat_classification_ttl_seconds")
                 .with_description("NAT classification freshness window used by signal.")
                 .build(),
+            nat_classification_min_confidence_percent: meter
+                .u64_gauge("ipars.signal.nat_classification_min_confidence_percent")
+                .with_description(
+                    "Minimum NAT classification confidence percentage required by signal.",
+                )
+                .build(),
             node_upserts: meter
                 .u64_counter("ipars.signal.node_upserts")
                 .with_description("Signal node upsert requests handled.")
@@ -2619,6 +2644,10 @@ impl SignalOtelMetrics {
             .record(metrics.endpoint_candidate_ttl_seconds, &[]);
         self.nat_classification_ttl_seconds
             .record(metrics.nat_classification_ttl_seconds, &[]);
+        self.nat_classification_min_confidence_percent.record(
+            metrics.nat_classification_min_confidence_percent as u64,
+            &[],
+        );
 
         for (state, count) in [
             (HealthState::Healthy, metrics.healthy_node_count),
@@ -8493,6 +8522,8 @@ mod tests {
             "75",
             "--nat-classification-ttl-seconds",
             "180",
+            "--nat-classification-min-confidence-percent",
+            "75",
             "--disable-relay-fallback",
         ])?;
 
@@ -8502,6 +8533,7 @@ mod tests {
         assert_eq!(args.relay_health_ttl_seconds, 45);
         assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
         assert_eq!(args.nat_classification_ttl_seconds, 180);
+        assert_eq!(args.nat_classification_min_confidence_percent, 75);
         assert!(args.disable_relay_fallback);
         validate_signal_runtime_config(&args)?;
         Ok(())
@@ -8570,6 +8602,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--nat-classification-ttl-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_nat_classification_min_confidence_must_be_percent() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "signal",
+            "--nat-classification-min-confidence-percent",
+            "101",
+        ])?;
+
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        let error = match validate_signal_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("unexpected valid signal runtime config"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--nat-classification-min-confidence-percent must be between 0 and 100"));
         Ok(())
     }
 
