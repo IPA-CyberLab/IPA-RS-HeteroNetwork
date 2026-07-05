@@ -277,6 +277,10 @@ struct DockerInstallArgs {
     docker_host_interface: String,
     #[arg(long = "docker-container-cidr")]
     docker_container_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long)]
+    userspace_wireguard_command: Option<String>,
+    #[arg(long = "userspace-wireguard-arg")]
+    userspace_wireguard_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2062,7 +2066,11 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.rootless {
-        notes.push("Rootless Docker network discovery uses the user socket and selects the userspace-command WireGuard backend; the userspace WireGuard process must create the configured interface before peer-map sync starts".to_string());
+        if args.userspace_wireguard_command.is_some() {
+            notes.push("Rootless Docker network discovery uses the user socket, selects the userspace-command WireGuard backend, and starts the configured userspace WireGuard process before peer-map sync".to_string());
+        } else {
+            notes.push("Rootless Docker network discovery uses the user socket and selects the userspace-command WireGuard backend; set --userspace-wireguard-command or pre-create the configured userspace WireGuard interface before peer-map sync starts".to_string());
+        }
     } else {
         notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
     }
@@ -2090,6 +2098,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     if let Some(namespace) = args.docker_container_namespace.as_deref() {
         validate_linux_namespace_name(namespace)?;
     }
+    validate_docker_userspace_wireguard_args(args)?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
@@ -2100,6 +2109,29 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     }
     for filter in &args.docker_networks {
         validate_docker_network_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    if !args.userspace_wireguard_args.is_empty() && args.userspace_wireguard_command.is_none() {
+        anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
+    }
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        if command.is_empty() {
+            anyhow::bail!("--userspace-wireguard-command cannot be empty");
+        }
+        if command.chars().any(char::is_control) {
+            anyhow::bail!("--userspace-wireguard-command must not contain control characters");
+        }
+    }
+    for argument in &args.userspace_wireguard_args {
+        if argument.is_empty() {
+            anyhow::bail!("--userspace-wireguard-arg cannot be empty");
+        }
+        if argument.chars().any(|character| character == '\0') {
+            anyhow::bail!("--userspace-wireguard-arg must not contain NUL bytes");
+        }
     }
     Ok(())
 }
@@ -2208,10 +2240,22 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
         });
     }
-    if args.rootless {
+    if args.rootless || args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
             name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
             value: "userspace-command".to_string(),
+        });
+    }
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+            value: command.to_string(),
+        });
+    }
+    if !args.userspace_wireguard_args.is_empty() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+            value: args.userspace_wireguard_args.join(","),
         });
     }
     let container_namespace = args
@@ -4070,6 +4114,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         })?;
 
         assert_eq!(plan.platform, "docker-compose");
@@ -4127,6 +4173,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         })?;
 
         assert_eq!(
@@ -4148,6 +4196,8 @@ mod tests {
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_host_interface: "br-edge".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["ipars0".to_string()],
         })?;
 
         assert!(plan
@@ -4173,6 +4223,14 @@ mod tests {
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
             Some("userspace-command")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"),
+            Some("wireguard-go")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"),
+            Some("ipars0")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
@@ -4208,6 +4266,8 @@ mod tests {
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
         assert!(compose
             .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
         assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
@@ -4233,6 +4293,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         }) {
             Ok(_) => anyhow::bail!("ambiguous Docker install settings should be rejected"),
             Err(error) => error,
@@ -4251,6 +4313,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         }) {
             Ok(_) => anyhow::bail!("unused Docker network filter should be rejected"),
             Err(error) => error,
@@ -4269,6 +4333,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         }) {
             Ok(_) => anyhow::bail!("invalid Docker network filter should be rejected"),
             Err(error) => error,
@@ -4287,6 +4353,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker/0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         }) {
             Ok(_) => anyhow::bail!("invalid Docker host interface should be rejected"),
             Err(error) => error,
@@ -4305,6 +4373,8 @@ mod tests {
             docker_container_namespace: Some("../compose".to_string()),
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
         }) {
             Ok(_) => anyhow::bail!("invalid Docker container namespace should be rejected"),
             Err(error) => error,
@@ -5126,6 +5196,10 @@ mod tests {
             "compose-edge",
             "--docker-host-interface",
             "br-edge",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg",
+            "ipars0",
         ])?;
         if let Command::Docker {
             command: DockerCommand::Install(args),
@@ -5146,6 +5220,11 @@ mod tests {
             );
             assert_eq!(args.docker_host_interface, "br-edge");
             assert!(args.docker_container_cidrs.is_empty());
+            assert_eq!(
+                args.userspace_wireguard_command.as_deref(),
+                Some("wireguard-go")
+            );
+            assert_eq!(args.userspace_wireguard_args, vec!["ipars0".to_string()]);
         } else {
             anyhow::bail!("expected docker install command");
         }

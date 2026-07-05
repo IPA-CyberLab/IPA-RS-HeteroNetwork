@@ -17,11 +17,12 @@ use aya::programs::TracePoint;
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
-    AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommandRunner,
-    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
-    PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats,
-    RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher,
-    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
+    AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommand,
+    LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
+    NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier, PeerMapSink, PeerMapSource,
+    PeerMapSync, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
+    TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder, UserspaceWireGuardBackend,
+    WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -589,6 +590,26 @@ struct AgentArgs {
         default_value_t = WireGuardApplyBackend::Command
     )]
     wireguard_backend: WireGuardApplyBackend,
+    #[arg(long, env = "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND")]
+    userspace_wireguard_command: Option<String>,
+    #[arg(
+        long = "userspace-wireguard-arg",
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS",
+        value_delimiter = ','
+    )]
+    userspace_wireguard_args: Vec<String>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+        default_value_t = 10
+    )]
+    userspace_wireguard_ready_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+        default_value_t = 5
+    )]
+    userspace_wireguard_shutdown_timeout_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_ROUTE_BACKEND",
@@ -823,6 +844,7 @@ impl PacketFlowDetector {
 struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
+    userspace_wireguard_command: bool,
     route_netlink: bool,
     generic_netlink: bool,
     netfilter_netlink: bool,
@@ -842,6 +864,7 @@ impl RuntimePreflightNeeds {
         Self {
             ip_command: false,
             wg_command: false,
+            userspace_wireguard_command: false,
             route_netlink: false,
             generic_netlink: false,
             netfilter_netlink: false,
@@ -860,6 +883,7 @@ impl RuntimePreflightNeeds {
     fn is_empty(self) -> bool {
         !self.ip_command
             && !self.wg_command
+            && !self.userspace_wireguard_command
             && !self.route_netlink
             && !self.generic_netlink
             && !self.netfilter_netlink
@@ -1079,6 +1103,13 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.wg_command {
         ensure_program_in_path("wg", path)?;
     }
+    if needs.userspace_wireguard_command {
+        let command = args
+            .userspace_wireguard_command
+            .as_deref()
+            .context("userspace WireGuard command preflight requested without command")?;
+        ensure_runtime_program_ready(command, path)?;
+    }
     if needs.route_netlink {
         (checks.netlink)(RuntimeNetlinkProtocol::Route)?;
     }
@@ -1135,6 +1166,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         route_backend = args.route_backend.as_str(),
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
+        needs_userspace_wireguard_command = needs.userspace_wireguard_command,
         needs_route_netlink = needs.route_netlink,
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
@@ -1186,6 +1218,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.runtime_command_timeout_seconds,
         "--runtime-command-timeout-seconds",
     )?;
+    validate_userspace_wireguard_config(args)?;
     validate_positive_usize(
         args.runtime_command_output_max_bytes,
         "--runtime-command-output-max-bytes",
@@ -1287,6 +1320,55 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     }
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
+    validate_positive_seconds(
+        args.userspace_wireguard_ready_timeout_seconds,
+        "--userspace-wireguard-ready-timeout-seconds",
+    )?;
+    validate_positive_seconds(
+        args.userspace_wireguard_shutdown_timeout_seconds,
+        "--userspace-wireguard-shutdown-timeout-seconds",
+    )?;
+
+    let has_userspace_process_config =
+        args.userspace_wireguard_command.is_some() || !args.userspace_wireguard_args.is_empty();
+    if !has_userspace_process_config {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.runtime_backend == AgentRuntimeBackend::LinuxCommand,
+        "--userspace-wireguard-command and --userspace-wireguard-arg require --runtime-backend linux-command"
+    );
+    anyhow::ensure!(
+        args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand,
+        "--userspace-wireguard-command and --userspace-wireguard-arg require --wireguard-backend userspace-command"
+    );
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        validate_runtime_program_token(command, "--userspace-wireguard-command")?;
+    } else {
+        anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
+    }
+    for argument in &args.userspace_wireguard_args {
+        if argument.is_empty() {
+            anyhow::bail!("--userspace-wireguard-arg cannot be empty");
+        }
+        if argument.chars().any(|character| character == '\0') {
+            anyhow::bail!("--userspace-wireguard-arg must not contain NUL bytes");
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
     }
     Ok(())
 }
@@ -1427,11 +1509,15 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
     let applies_wireguard_with_netlink =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::KernelNetlink;
+    let starts_userspace_wireguard = args.userspace_wireguard_command.is_some();
     let ipv4_forwarding = agent_routes_may_forward_ipv4(args);
     let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
-        wg_command: applies_wireguard_with_command || applies_wireguard_with_userspace_command,
+        wg_command: applies_wireguard_with_command
+            || applies_wireguard_with_userspace_command
+            || starts_userspace_wireguard,
+        userspace_wireguard_command: starts_userspace_wireguard,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
@@ -1647,6 +1733,19 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
     } else {
         anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
     }
+}
+
+fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    if program.contains('/') {
+        let program_path = Path::new(program);
+        if is_executable_file(program_path) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "configured userspace WireGuard command `{program}` is not an executable file"
+        );
+    }
+    ensure_program_in_path(program, path)
 }
 
 fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
@@ -3617,6 +3716,7 @@ async fn run_agent(
     let signal_bases =
         signal_base_urls(join_token.as_ref(), args.signal_url.as_deref()).unwrap_or_default();
     preflight_agent_runtime(&args)?;
+    let userspace_wireguard_process = start_userspace_wireguard_process(&args).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
     if otel_metrics_enabled {
@@ -3813,7 +3913,178 @@ async fn run_agent(
     if let Some(supervisor) = relay_forwarder_supervisor {
         supervisor.shutdown_all(runtime.as_ref()).await;
     }
+    if let Some(process) = userspace_wireguard_process {
+        process.shutdown().await;
+    }
     result
+}
+
+struct ManagedUserspaceWireGuardProcess {
+    child: tokio::process::Child,
+    label: String,
+    shutdown_timeout: Duration,
+}
+
+impl ManagedUserspaceWireGuardProcess {
+    async fn shutdown(mut self) {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::info!(
+                    command = %self.label,
+                    %status,
+                    "userspace WireGuard process already exited"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    command = %self.label,
+                    %error,
+                    "failed to inspect userspace WireGuard process before shutdown"
+                );
+            }
+        }
+
+        if let Err(error) = self.child.start_kill() {
+            tracing::warn!(
+                command = %self.label,
+                %error,
+                "failed to signal userspace WireGuard process shutdown"
+            );
+            return;
+        }
+        match tokio::time::timeout(self.shutdown_timeout, self.child.wait()).await {
+            Ok(Ok(status)) => tracing::info!(
+                command = %self.label,
+                %status,
+                "userspace WireGuard process stopped"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                command = %self.label,
+                %error,
+                "failed waiting for userspace WireGuard process shutdown"
+            ),
+            Err(_) => tracing::warn!(
+                command = %self.label,
+                timeout_seconds = self.shutdown_timeout.as_secs(),
+                "timed out waiting for userspace WireGuard process shutdown"
+            ),
+        }
+    }
+}
+
+async fn start_userspace_wireguard_process(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<ManagedUserspaceWireGuardProcess>> {
+    let Some(command) = userspace_wireguard_launch_command(args)? else {
+        return Ok(None);
+    };
+    let label = runtime_command_label(&command.program, &command.args);
+    let mut child = tokio::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
+    tracing::info!(
+        command = %label,
+        interface = %args.wireguard_interface,
+        "started userspace WireGuard process"
+    );
+    wait_for_userspace_wireguard_ready(args, &mut child, &label).await?;
+    Ok(Some(ManagedUserspaceWireGuardProcess {
+        child,
+        label,
+        shutdown_timeout: Duration::from_secs(args.userspace_wireguard_shutdown_timeout_seconds),
+    }))
+}
+
+async fn wait_for_userspace_wireguard_ready(
+    args: &AgentArgs,
+    child: &mut tokio::process::Child,
+    label: &str,
+) -> anyhow::Result<()> {
+    let ready_command = userspace_wireguard_ready_command(args)?;
+    let runner = TimedSystemCommandRunner::with_output_max_bytes(
+        runtime_command_timeout(args),
+        runtime_command_output_max_bytes(args),
+    );
+    let timeout = Duration::from_secs(args.userspace_wireguard_ready_timeout_seconds);
+    let started = Instant::now();
+    loop {
+        if runner.run(ready_command.clone()).await.is_ok() {
+            tracing::info!(
+                command = %label,
+                interface = %args.wireguard_interface,
+                "userspace WireGuard interface is ready"
+            );
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect userspace WireGuard process readiness")?
+        {
+            anyhow::bail!(
+                "userspace WireGuard process `{label}` exited before interface {} became ready: {status}",
+                args.wireguard_interface
+            );
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "userspace WireGuard process `{label}` did not expose interface {} within {} seconds",
+                args.wireguard_interface,
+                args.userspace_wireguard_ready_timeout_seconds
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn userspace_wireguard_launch_command(args: &AgentArgs) -> anyhow::Result<Option<LinuxCommand>> {
+    let Some(program) = args.userspace_wireguard_command.as_deref() else {
+        return Ok(None);
+    };
+    let command_args = if args.userspace_wireguard_args.is_empty() {
+        vec![args.wireguard_interface.clone()]
+    } else {
+        args.userspace_wireguard_args.clone()
+    };
+    let command = LinuxCommand::new(program, command_args);
+    userspace_wireguard_maybe_namespaced_command(args, command)
+}
+
+fn userspace_wireguard_ready_command(args: &AgentArgs) -> anyhow::Result<LinuxCommand> {
+    match userspace_wireguard_maybe_namespaced_command(
+        args,
+        LinuxCommand::new("wg", ["show", args.wireguard_interface.as_str()]),
+    )? {
+        Some(command) => Ok(command),
+        None => anyhow::bail!("userspace WireGuard ready command was unexpectedly absent"),
+    }
+}
+
+fn userspace_wireguard_maybe_namespaced_command(
+    args: &AgentArgs,
+    command: LinuxCommand,
+) -> anyhow::Result<Option<LinuxCommand>> {
+    if let Some(namespace) = args.linux_netns.as_deref() {
+        Ok(Some(command.in_namespace(
+            &LinuxNetworkNamespace::from_name(namespace)?,
+        )))
+    } else {
+        Ok(Some(command))
+    }
+}
+
+fn runtime_command_label(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, args.join(" "))
+    }
 }
 
 async fn start_peer_map_sync(
@@ -10840,6 +11111,124 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_launch_command_defaults_interface_and_wraps_namespace(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let command = match userspace_wireguard_launch_command(&args)? {
+                Some(command) => command,
+                None => anyhow::bail!("expected userspace WireGuard launch command"),
+            };
+            assert_eq!(command.program, "ip");
+            assert_eq!(
+                command.args,
+                vec![
+                    "netns".to_string(),
+                    "exec".to_string(),
+                    "node-a".to_string(),
+                    "wireguard-go".to_string(),
+                    "ipars0".to_string(),
+                ]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_launch_command_accepts_explicit_args() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg=--foreground",
+            "--userspace-wireguard-arg=ipars42",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let command = match userspace_wireguard_launch_command(&args)? {
+                Some(command) => command,
+                None => anyhow::bail!("expected userspace WireGuard launch command"),
+            };
+            assert_eq!(command.program, "wireguard-go");
+            assert_eq!(
+                command.args,
+                vec!["--foreground".to_string(), "ipars42".to_string()]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_process_config_requires_userspace_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--wireguard-backend userspace-command"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_userspace_wireguard_command() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.userspace_wireguard_command);
+            let error = match ensure_runtime_program_ready("wireguard-go", Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful command preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("missing required Linux runtime command `wireguard-go`"));
             return Ok(());
         }
 
