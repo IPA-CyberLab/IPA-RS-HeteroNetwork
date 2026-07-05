@@ -337,6 +337,10 @@ struct K8sInstallArgs {
     agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "agent-api-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_agent_api")]
     agent_api_internal_traffic_policy: Option<String>,
+    #[arg(long = "agent-api-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_agent_api")]
+    agent_api_session_affinity: Option<String>,
+    #[arg(long = "agent-api-session-affinity-timeout-seconds", value_parser = parse_kubernetes_session_affinity_timeout_seconds, requires = "expose_agent_api")]
+    agent_api_session_affinity_timeout_seconds: Option<u32>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
     agent_api_external_traffic_policy: String,
     #[arg(long = "agent-api-service-annotation", value_parser = parse_key_value, requires = "expose_agent_api")]
@@ -371,6 +375,10 @@ struct K8sInstallArgs {
     relay_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "relay-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_relay")]
     relay_internal_traffic_policy: Option<String>,
+    #[arg(long = "relay-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_relay")]
+    relay_session_affinity: Option<String>,
+    #[arg(long = "relay-session-affinity-timeout-seconds", value_parser = parse_kubernetes_session_affinity_timeout_seconds, requires = "expose_relay")]
+    relay_session_affinity_timeout_seconds: Option<u32>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
     relay_external_traffic_policy: String,
     #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
@@ -1142,6 +1150,36 @@ fn parse_kubernetes_internal_traffic_policy(value: &str) -> Result<String, Strin
     }
 }
 
+fn parse_kubernetes_session_affinity(value: &str) -> Result<String, String> {
+    match value {
+        "None" | "ClientIP" => Ok(value.to_string()),
+        _ => Err(format!(
+            "session affinity must be None or ClientIP; got {value}"
+        )),
+    }
+}
+
+const KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN: u32 = 1;
+const KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX: u32 = 86_400;
+
+fn parse_kubernetes_session_affinity_timeout_seconds(value: &str) -> Result<u32, String> {
+    let timeout = value.parse::<u32>().map_err(|_| {
+        format!(
+            "session affinity timeout must be an integer between {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN} and {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX}; got {value}"
+        )
+    })?;
+    if (KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN
+        ..=KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX)
+        .contains(&timeout)
+    {
+        Ok(timeout)
+    } else {
+        Err(format!(
+            "session affinity timeout must be between {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN} and {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX}; got {value}"
+        ))
+    }
+}
+
 fn parse_kubernetes_ip_family_policy(value: &str) -> Result<String, String> {
     match value {
         "SingleStack" | "PreferDualStack" | "RequireDualStack" => Ok(value.to_string()),
@@ -1818,6 +1856,16 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.apiService.internalTrafficPolicy={internal_traffic_policy}"
             ));
         }
+        if let Some(session_affinity) = args.agent_api_session_affinity.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.sessionAffinity={session_affinity}"
+            ));
+        }
+        if let Some(timeout_seconds) = args.agent_api_session_affinity_timeout_seconds {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.sessionAffinityTimeoutSeconds={timeout_seconds}"
+            ));
+        }
         if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -1905,6 +1953,16 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if let Some(internal_traffic_policy) = args.relay_internal_traffic_policy.as_deref() {
             helm_command.push_str(&format!(
                 " --set agent.relayService.internalTrafficPolicy={internal_traffic_policy}"
+            ));
+        }
+        if let Some(session_affinity) = args.relay_session_affinity.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.sessionAffinity={session_affinity}"
+            ));
+        }
+        if let Some(timeout_seconds) = args.relay_session_affinity_timeout_seconds {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.sessionAffinityTimeoutSeconds={timeout_seconds}"
             ));
         }
         if is_external_kubernetes_service_type(&args.relay_service_type) {
@@ -2190,6 +2248,32 @@ fn validate_kubernetes_service_ip_families(
     Ok(())
 }
 
+fn validate_kubernetes_session_affinity_options(
+    flag_prefix: &str,
+    affinity: Option<&str>,
+    timeout_seconds: Option<u32>,
+) -> anyhow::Result<()> {
+    if let Some(affinity) = affinity {
+        parse_kubernetes_session_affinity(affinity).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(timeout_seconds) = timeout_seconds {
+        if !(KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN
+            ..=KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX)
+            .contains(&timeout_seconds)
+        {
+            anyhow::bail!(
+                "{flag_prefix} session affinity timeout must be between {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MIN} and {KUBERNETES_SESSION_AFFINITY_TIMEOUT_SECONDS_MAX}"
+            );
+        }
+        if affinity != Some("ClientIP") {
+            anyhow::bail!(
+                "--{flag_prefix}-session-affinity-timeout-seconds requires --{flag_prefix}-session-affinity ClientIP"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
@@ -2211,6 +2295,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.agent_api_internal_traffic_policy.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-internal-traffic-policy requires --expose-agent-api");
+    }
+    if args.agent_api_session_affinity.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-session-affinity requires --expose-agent-api");
+    }
+    if args.agent_api_session_affinity_timeout_seconds.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-session-affinity-timeout-seconds requires --expose-agent-api");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -2236,6 +2326,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_internal_traffic_policy.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-internal-traffic-policy requires --expose-relay");
     }
+    if args.relay_session_affinity.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-session-affinity requires --expose-relay");
+    }
+    if args.relay_session_affinity_timeout_seconds.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-session-affinity-timeout-seconds requires --expose-relay");
+    }
     validate_kubernetes_service_ip_families(
         "agent-api",
         args.agent_api_ip_family_policy.as_deref(),
@@ -2245,6 +2341,16 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         "relay",
         args.relay_ip_family_policy.as_deref(),
         &args.relay_ip_families,
+    )?;
+    validate_kubernetes_session_affinity_options(
+        "agent-api",
+        args.agent_api_session_affinity.as_deref(),
+        args.agent_api_session_affinity_timeout_seconds,
+    )?;
+    validate_kubernetes_session_affinity_options(
+        "relay",
+        args.relay_session_affinity.as_deref(),
+        args.relay_session_affinity_timeout_seconds,
     )?;
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
@@ -3267,6 +3373,8 @@ mod tests {
             agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_internal_traffic_policy: Some("Local".to_string()),
+            agent_api_session_affinity: Some("ClientIP".to_string()),
+            agent_api_session_affinity_timeout_seconds: Some(600),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
                 key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
@@ -3283,6 +3391,8 @@ mod tests {
             relay_ip_families: vec!["IPv6".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: Some("Cluster".to_string()),
+            relay_session_affinity: Some("ClientIP".to_string()),
+            relay_session_affinity_timeout_seconds: Some(900),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
                 key: "metallb.universe.tf/address-pool".to_string(),
@@ -3312,6 +3422,10 @@ mod tests {
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
         assert!(plan.commands[2].contains("--set agent.apiService.internalTrafficPolicy=Local"));
+        assert!(plan.commands[2].contains("--set agent.apiService.sessionAffinity=ClientIP"));
+        assert!(
+            plan.commands[2].contains("--set agent.apiService.sessionAffinityTimeoutSeconds=600")
+        );
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2]
@@ -3332,6 +3446,10 @@ mod tests {
         );
         assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
         assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
+        assert!(plan.commands[2].contains("--set agent.relayService.sessionAffinity=ClientIP"));
+        assert!(
+            plan.commands[2].contains("--set agent.relayService.sessionAffinityTimeoutSeconds=900")
+        );
         assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains(
@@ -3395,6 +3513,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -3408,6 +3528,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -3632,6 +3754,10 @@ mod tests {
             "198.51.100.0/24",
             "--agent-api-internal-traffic-policy",
             "Local",
+            "--agent-api-session-affinity",
+            "ClientIP",
+            "--agent-api-session-affinity-timeout-seconds",
+            "600",
             "--agent-api-external-traffic-policy",
             "Cluster",
             "--agent-api-service-annotation",
@@ -3655,6 +3781,10 @@ mod tests {
             "203.0.113.0/24",
             "--relay-internal-traffic-policy",
             "Cluster",
+            "--relay-session-affinity",
+            "ClientIP",
+            "--relay-session-affinity-timeout-seconds",
+            "900",
             "--relay-external-traffic-policy",
             "Local",
             "--relay-service-annotation",
@@ -3716,6 +3846,8 @@ mod tests {
                 args.agent_api_internal_traffic_policy.as_deref(),
                 Some("Local")
             );
+            assert_eq!(args.agent_api_session_affinity.as_deref(), Some("ClientIP"));
+            assert_eq!(args.agent_api_session_affinity_timeout_seconds, Some(600));
             assert_eq!(args.agent_api_external_traffic_policy, "Cluster");
             assert_eq!(
                 args.agent_api_service_annotations,
@@ -3746,6 +3878,8 @@ mod tests {
                 args.relay_internal_traffic_policy.as_deref(),
                 Some("Cluster")
             );
+            assert_eq!(args.relay_session_affinity.as_deref(), Some("ClientIP"));
+            assert_eq!(args.relay_session_affinity_timeout_seconds, Some(900));
             assert_eq!(args.relay_external_traffic_policy, "Local");
             assert_eq!(
                 args.relay_service_annotations,
@@ -3800,6 +3934,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -3813,6 +3949,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -3861,6 +3999,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -3874,6 +4014,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4178,6 +4320,93 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_session_affinity() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_session_affinity = Some("ClientIP".to_string());
+        valid.agent_api_session_affinity_timeout_seconds = Some(600);
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_session_affinity = Some("ClientIP".to_string());
+        valid.relay_session_affinity_timeout_seconds = Some(900);
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.sessionAffinity=ClientIP"));
+        assert!(
+            plan.commands[2].contains("--set agent.apiService.sessionAffinityTimeoutSeconds=600")
+        );
+        assert!(plan.commands[2].contains("--set agent.relayService.sessionAffinity=ClientIP"));
+        assert!(
+            plan.commands[2].contains("--set agent.relayService.sessionAffinityTimeoutSeconds=900")
+        );
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-session-affinity",
+            "Cookie",
+        ]);
+        assert!(parsed.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-session-affinity-timeout-seconds",
+            "0",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_agent_affinity = base_k8s_install_args();
+        missing_agent_affinity.expose_agent_api = true;
+        missing_agent_affinity.agent_api_session_affinity_timeout_seconds = Some(600);
+        let error = match k8s_install_plan(missing_agent_affinity) {
+            Ok(_) => panic!("agent session affinity timeout should require ClientIP affinity"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-session-affinity-timeout-seconds requires"));
+
+        let mut none_relay_affinity = base_k8s_install_args();
+        none_relay_affinity.expose_relay = true;
+        none_relay_affinity.relay_service_type = "ClusterIP".to_string();
+        none_relay_affinity.relay_session_affinity = Some("None".to_string());
+        none_relay_affinity.relay_session_affinity_timeout_seconds = Some(900);
+        none_relay_affinity.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        none_relay_affinity.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(none_relay_affinity) {
+            Ok(_) => panic!("relay session affinity timeout should reject None affinity"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-session-affinity-timeout-seconds requires"));
+
+        let mut invalid_timeout = base_k8s_install_args();
+        invalid_timeout.expose_agent_api = true;
+        invalid_timeout.agent_api_session_affinity = Some("ClientIP".to_string());
+        invalid_timeout.agent_api_session_affinity_timeout_seconds = Some(86_401);
+        let error = match k8s_install_plan(invalid_timeout) {
+            Ok(_) => panic!("agent session affinity timeout over 86400 should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("session affinity timeout must be between"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_session_affinity = Some("ClientIP".to_string());
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay session affinity requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-session-affinity requires"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_wires_and_validates_ip_families() -> anyhow::Result<()> {
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
@@ -4272,6 +4501,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4285,6 +4516,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4320,6 +4553,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4333,6 +4568,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4375,6 +4612,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -4388,6 +4627,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4428,6 +4669,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -4441,6 +4684,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4476,6 +4721,8 @@ mod tests {
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_session_affinity: None,
+            agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4489,6 +4736,8 @@ mod tests {
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_session_affinity: None,
+            relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4519,6 +4768,25 @@ mod tests {
             Ok("Cluster".to_string())
         );
         assert!(parse_kubernetes_internal_traffic_policy("Public").is_err());
+        assert_eq!(
+            parse_kubernetes_session_affinity("ClientIP"),
+            Ok("ClientIP".to_string())
+        );
+        assert_eq!(
+            parse_kubernetes_session_affinity("None"),
+            Ok("None".to_string())
+        );
+        assert!(parse_kubernetes_session_affinity("Cookie").is_err());
+        assert_eq!(
+            parse_kubernetes_session_affinity_timeout_seconds("1"),
+            Ok(1)
+        );
+        assert_eq!(
+            parse_kubernetes_session_affinity_timeout_seconds("86400"),
+            Ok(86_400)
+        );
+        assert!(parse_kubernetes_session_affinity_timeout_seconds("0").is_err());
+        assert!(parse_kubernetes_session_affinity_timeout_seconds("86401").is_err());
         assert_eq!(parse_kubernetes_node_port("30000"), Ok(30000));
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());

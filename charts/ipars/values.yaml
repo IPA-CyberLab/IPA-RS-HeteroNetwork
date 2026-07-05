@@ -31,6 +31,8 @@ agent:
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    sessionAffinity: ""
+    sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
     port: 9780
     nodePort: 0
@@ -59,6 +61,8 @@ agent:
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    sessionAffinity: ""
+    sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580

@@ -4,6 +4,8 @@
 {{- $relayServiceTypeValid := or (eq .Values.agent.relayService.type "ClusterIP") (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
 {{- $agentApiInternalTrafficPolicyValid := or (eq .Values.agent.apiService.internalTrafficPolicy "") (eq .Values.agent.apiService.internalTrafficPolicy "Local") (eq .Values.agent.apiService.internalTrafficPolicy "Cluster") -}}
 {{- $relayInternalTrafficPolicyValid := or (eq .Values.agent.relayService.internalTrafficPolicy "") (eq .Values.agent.relayService.internalTrafficPolicy "Local") (eq .Values.agent.relayService.internalTrafficPolicy "Cluster") -}}
+{{- $agentApiSessionAffinityValid := or (eq .Values.agent.apiService.sessionAffinity "") (eq .Values.agent.apiService.sessionAffinity "None") (eq .Values.agent.apiService.sessionAffinity "ClientIP") -}}
+{{- $relaySessionAffinityValid := or (eq .Values.agent.relayService.sessionAffinity "") (eq .Values.agent.relayService.sessionAffinity "None") (eq .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
@@ -15,6 +17,7 @@
 {{- $agentApiIpFamilyPolicy := .Values.agent.apiService.ipFamilyPolicy -}}
 {{- $agentApiIpFamilies := .Values.agent.apiService.ipFamilies -}}
 {{- $agentApiIpFamilyPolicyDual := or (eq $agentApiIpFamilyPolicy "PreferDualStack") (eq $agentApiIpFamilyPolicy "RequireDualStack") -}}
+{{- $agentApiSessionAffinityTimeoutSeconds := int .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
 {{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
@@ -25,6 +28,7 @@
 {{- $relayIpFamilyPolicy := .Values.agent.relayService.ipFamilyPolicy -}}
 {{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
 {{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
+{{- $relaySessionAffinityTimeoutSeconds := int .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
@@ -162,6 +166,24 @@
 {{- if and $relayServiceActive (not $relayInternalTrafficPolicyValid) -}}
 {{- fail "agent.relayService.internalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiSessionAffinityValid) -}}
+{{- fail "agent.apiService.sessionAffinity must be None or ClientIP" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relaySessionAffinityValid) -}}
+{{- fail "agent.relayService.sessionAffinity must be None or ClientIP" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiSessionAffinityTimeoutSeconds 0) (or (lt $agentApiSessionAffinityTimeoutSeconds 1) (gt $agentApiSessionAffinityTimeoutSeconds 86400)) -}}
+{{- fail "agent.apiService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relaySessionAffinityTimeoutSeconds 0) (or (lt $relaySessionAffinityTimeoutSeconds 1) (gt $relaySessionAffinityTimeoutSeconds 86400)) -}}
+{{- fail "agent.relayService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiSessionAffinityTimeoutSeconds 0) (ne .Values.agent.apiService.sessionAffinity "ClientIP") -}}
+{{- fail "agent.apiService.sessionAffinityTimeoutSeconds requires agent.apiService.sessionAffinity ClientIP" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.sessionAffinity "ClientIP") -}}
+{{- fail "agent.relayService.sessionAffinityTimeoutSeconds requires agent.relayService.sessionAffinity ClientIP" -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
@@ -236,6 +258,14 @@ spec:
   {{- if .Values.agent.apiService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.apiService.internalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.apiService.sessionAffinity }}
+  sessionAffinity: {{ .Values.agent.apiService.sessionAffinity }}
+  {{- end }}
+  {{- if and (eq .Values.agent.apiService.sessionAffinity "ClientIP") (ne $agentApiSessionAffinityTimeoutSeconds 0) }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ $agentApiSessionAffinityTimeoutSeconds }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
   ports:
@@ -287,6 +317,14 @@ spec:
   {{- end }}
   {{- if .Values.agent.relayService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.relayService.internalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.agent.relayService.sessionAffinity }}
+  sessionAffinity: {{ .Values.agent.relayService.sessionAffinity }}
+  {{- end }}
+  {{- if and (eq .Values.agent.relayService.sessionAffinity "ClientIP") (ne $relaySessionAffinityTimeoutSeconds 0) }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ $relaySessionAffinityTimeoutSeconds }}
   {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
