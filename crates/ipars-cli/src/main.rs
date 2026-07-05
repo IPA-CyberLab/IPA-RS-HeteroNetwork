@@ -331,6 +331,8 @@ struct K8sInstallArgs {
     agent_priority_class: Option<String>,
     #[arg(long = "agent-node-selector", value_parser = parse_kubernetes_label_pair)]
     agent_node_selectors: Vec<KeyValueArg>,
+    #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
+    agent_tolerations: Vec<KubernetesTolerationArg>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
     agent_resource_request_cpu: Option<String>,
     #[arg(long = "agent-resource-request-memory", value_parser = parse_kubernetes_resource_quantity)]
@@ -439,6 +441,15 @@ struct K8sInstallArgs {
 struct KeyValueArg {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesTolerationArg {
+    key: Option<String>,
+    operator: Option<String>,
+    value: Option<String>,
+    effect: Option<String>,
+    toleration_seconds: Option<u64>,
 }
 
 #[tokio::main]
@@ -1289,6 +1300,62 @@ fn parse_kubernetes_label_pair(value: &str) -> Result<KeyValueArg, String> {
     })
 }
 
+fn parse_kubernetes_toleration_arg(value: &str) -> Result<KubernetesTolerationArg, String> {
+    if value.is_empty() {
+        return Err("toleration must not be empty".to_string());
+    }
+    let mut toleration = KubernetesTolerationArg {
+        key: None,
+        operator: None,
+        value: None,
+        effect: None,
+        toleration_seconds: None,
+    };
+    for part in value.split(',') {
+        let (field, field_value) = part
+            .split_once('=')
+            .ok_or_else(|| "toleration fields must use name=value syntax".to_string())?;
+        if field_value.is_empty() {
+            return Err(format!("toleration field {field} must not be empty"));
+        }
+        match field {
+            "key" => set_toleration_string_field(&mut toleration.key, field, field_value)?,
+            "operator" => {
+                set_toleration_string_field(&mut toleration.operator, field, field_value)?
+            }
+            "value" => set_toleration_string_field(&mut toleration.value, field, field_value)?,
+            "effect" => set_toleration_string_field(&mut toleration.effect, field, field_value)?,
+            "tolerationSeconds" | "toleration-seconds" => {
+                let seconds = field_value.parse::<u64>().map_err(|_| {
+                    format!("toleration field {field} must be a non-negative integer")
+                })?;
+                if toleration.toleration_seconds.replace(seconds).is_some() {
+                    return Err(format!("duplicate toleration field {field}"));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "unknown toleration field {field}; expected key, operator, value, effect, or tolerationSeconds"
+                ));
+            }
+        }
+    }
+    validate_kubernetes_toleration_arg(&toleration)?;
+    Ok(toleration)
+}
+
+fn set_toleration_string_field(
+    slot: &mut Option<String>,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if slot.replace(value.to_string()).is_some() {
+        Err(format!("duplicate toleration field {field}"))
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
     validate_kubernetes_dns_subdomain(value, "priorityClassName")?;
     Ok(value.to_string())
@@ -1422,6 +1489,46 @@ fn validate_kubernetes_label_value(value: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
+    Ok(())
+}
+
+fn validate_kubernetes_toleration_arg(toleration: &KubernetesTolerationArg) -> Result<(), String> {
+    let operator = toleration.operator.as_deref().unwrap_or("Equal");
+    match operator {
+        "Exists" | "Equal" => {}
+        _ => return Err("toleration operator must be Exists or Equal".to_string()),
+    }
+
+    if let Some(key) = toleration.key.as_deref() {
+        validate_kubernetes_label_key(key)?;
+    } else if operator != "Exists" {
+        return Err("toleration with no key requires operator Exists".to_string());
+    }
+
+    if toleration.value.is_some() && operator == "Exists" {
+        return Err("toleration value must be omitted when operator is Exists".to_string());
+    }
+    if let Some(value) = toleration.value.as_deref() {
+        validate_kubernetes_label_value(value)?;
+    }
+
+    if let Some(effect) = toleration.effect.as_deref() {
+        match effect {
+            "NoSchedule" | "PreferNoSchedule" | "NoExecute" => {}
+            _ => {
+                return Err(
+                    "toleration effect must be NoSchedule, PreferNoSchedule, or NoExecute"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if toleration.toleration_seconds.is_some() && toleration.effect.as_deref() != Some("NoExecute")
+    {
+        return Err("tolerationSeconds requires effect NoExecute".to_string());
+    }
+
     Ok(())
 }
 
@@ -2277,7 +2384,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Agent pod labels, annotations, priority class, node selectors, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "Agent pod labels, annotations, priority class, node selectors, tolerations, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2350,6 +2457,35 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
             &format!("agent.nodeSelector.{}", helm_set_key(&selector.key)),
             &selector.value,
         );
+    }
+    for (index, toleration) in args.agent_tolerations.iter().enumerate() {
+        if let Some(key) = toleration.key.as_deref() {
+            append_helm_set_string(command, &format!("agent.tolerations[{index}].key"), key);
+        }
+        if let Some(operator) = toleration.operator.as_deref() {
+            append_helm_set_string(
+                command,
+                &format!("agent.tolerations[{index}].operator"),
+                operator,
+            );
+        }
+        if let Some(value) = toleration.value.as_deref() {
+            append_helm_set_string(command, &format!("agent.tolerations[{index}].value"), value);
+        }
+        if let Some(effect) = toleration.effect.as_deref() {
+            append_helm_set_string(
+                command,
+                &format!("agent.tolerations[{index}].effect"),
+                effect,
+            );
+        }
+        if let Some(seconds) = toleration.toleration_seconds {
+            append_helm_set_string(
+                command,
+                &format!("agent.tolerations[{index}].tolerationSeconds"),
+                &seconds.to_string(),
+            );
+        }
     }
     if let Some(cpu) = args.agent_resource_request_cpu.as_deref() {
         append_helm_set_string(command, "agent.resources.requests.cpu", cpu);
@@ -2587,6 +2723,9 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     for selector in &args.agent_node_selectors {
         validate_kubernetes_label_key(&selector.key).map_err(anyhow::Error::msg)?;
         validate_kubernetes_label_value(&selector.value).map_err(anyhow::Error::msg)?;
+    }
+    for toleration in &args.agent_tolerations {
+        validate_kubernetes_toleration_arg(toleration).map_err(anyhow::Error::msg)?;
     }
     for (label, quantity) in [
         (
@@ -3776,6 +3915,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -3942,6 +4082,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -4032,6 +4173,22 @@ mod tests {
             key: "kubernetes.io/os".to_string(),
             value: "linux".to_string(),
         }];
+        args.agent_tolerations = vec![
+            KubernetesTolerationArg {
+                key: Some("node-role.kubernetes.io/control-plane".to_string()),
+                operator: Some("Exists".to_string()),
+                value: None,
+                effect: Some("NoSchedule".to_string()),
+                toleration_seconds: None,
+            },
+            KubernetesTolerationArg {
+                key: Some("node.kubernetes.io/unreachable".to_string()),
+                operator: Some("Exists".to_string()),
+                value: None,
+                effect: Some("NoExecute".to_string()),
+                toleration_seconds: Some(600),
+            },
+        ];
         args.agent_resource_request_cpu = Some("100m".to_string());
         args.agent_resource_request_memory = Some("128Mi".to_string());
         args.agent_resource_limit_cpu = Some("500m".to_string());
@@ -4044,6 +4201,16 @@ mod tests {
         assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
         assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
         assert!(helm.contains("--set-string 'agent.nodeSelector.kubernetes\\.io/os=linux'"));
+        assert!(helm.contains(
+            "--set-string 'agent.tolerations[0].key=node-role.kubernetes.io/control-plane'"
+        ));
+        assert!(helm.contains("--set-string 'agent.tolerations[0].operator=Exists'"));
+        assert!(helm.contains("--set-string 'agent.tolerations[0].effect=NoSchedule'"));
+        assert!(
+            helm.contains("--set-string 'agent.tolerations[1].key=node.kubernetes.io/unreachable'")
+        );
+        assert!(helm.contains("--set-string 'agent.tolerations[1].effect=NoExecute'"));
+        assert!(helm.contains("--set-string 'agent.tolerations[1].tolerationSeconds=600'"));
         assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
         assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
         assert!(helm.contains("--set-string agent.resources.limits.cpu=500m"));
@@ -4077,6 +4244,20 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("agent priority class"));
+
+        let mut invalid_toleration = base_k8s_install_args();
+        invalid_toleration.agent_tolerations = vec![KubernetesTolerationArg {
+            key: None,
+            operator: None,
+            value: None,
+            effect: Some("NoSchedule".to_string()),
+            toleration_seconds: None,
+        }];
+        let error = match k8s_install_plan(invalid_toleration) {
+            Ok(_) => panic!("keyless toleration without Exists should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no key requires operator Exists"));
 
         Ok(())
     }
@@ -4333,6 +4514,8 @@ mod tests {
             "ipars-agent-critical",
             "--agent-node-selector",
             "kubernetes.io/os=linux",
+            "--agent-toleration",
+            "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
             "--agent-resource-request-cpu",
             "100m",
             "--agent-resource-request-memory",
@@ -4472,6 +4655,16 @@ mod tests {
                     value: "linux".to_string(),
                 }]
             );
+            assert_eq!(
+                args.agent_tolerations,
+                vec![KubernetesTolerationArg {
+                    key: Some("node-role.kubernetes.io/control-plane".to_string()),
+                    operator: Some("Exists".to_string()),
+                    value: None,
+                    effect: Some("NoSchedule".to_string()),
+                    toleration_seconds: None,
+                }]
+            );
             assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
             assert_eq!(args.agent_resource_limit_cpu.as_deref(), Some("500m"));
@@ -4595,6 +4788,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -4677,6 +4871,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5274,6 +5469,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5343,6 +5539,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5419,6 +5616,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5493,6 +5691,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5562,6 +5761,7 @@ mod tests {
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
+            agent_tolerations: Vec::new(),
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
@@ -5657,6 +5857,40 @@ mod tests {
         );
         assert!(parse_kubernetes_label_pair("Example.com/role=agent").is_err());
         assert!(parse_kubernetes_label_pair("ipars.io/role=-agent").is_err());
+        assert_eq!(
+            parse_kubernetes_toleration_arg(
+                "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule"
+            ),
+            Ok(KubernetesTolerationArg {
+                key: Some("node-role.kubernetes.io/control-plane".to_string()),
+                operator: Some("Exists".to_string()),
+                value: None,
+                effect: Some("NoSchedule".to_string()),
+                toleration_seconds: None,
+            })
+        );
+        assert_eq!(
+            parse_kubernetes_toleration_arg(
+                "key=node.kubernetes.io/unreachable,operator=Exists,effect=NoExecute,tolerationSeconds=600"
+            ),
+            Ok(KubernetesTolerationArg {
+                key: Some("node.kubernetes.io/unreachable".to_string()),
+                operator: Some("Exists".to_string()),
+                value: None,
+                effect: Some("NoExecute".to_string()),
+                toleration_seconds: Some(600),
+            })
+        );
+        assert!(parse_kubernetes_toleration_arg("operator=Equal").is_err());
+        assert!(parse_kubernetes_toleration_arg(
+            "key=node-role.kubernetes.io/control-plane,operator=Exists,value=true"
+        )
+        .is_err());
+        assert!(parse_kubernetes_toleration_arg(
+            "key=node-role.kubernetes.io/control-plane,effect=NoSchedule,tolerationSeconds=600"
+        )
+        .is_err());
+        assert!(parse_kubernetes_toleration_arg("key=Example.com/role").is_err());
         assert_eq!(
             parse_kubernetes_priority_class_name("ipars-agent-critical"),
             Ok("ipars-agent-critical".to_string())

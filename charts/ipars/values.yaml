@@ -21,6 +21,7 @@ agent:
   podAnnotations: {}
   priorityClassName: ""
   nodeSelector: {}
+  tolerations: []
   resources:
     requests:
       cpu: ""

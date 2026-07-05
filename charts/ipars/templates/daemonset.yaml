@@ -25,6 +25,38 @@
 {{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
 {{- include "ipars.validateLabelValue" (dict "path" "agent.nodeSelector" "value" (printf "%v" $value)) -}}
 {{- end -}}
+{{- range $index, $toleration := .Values.agent.tolerations -}}
+{{- $path := printf "agent.tolerations[%d]" $index -}}
+{{- $tolerationKey := default "" $toleration.key -}}
+{{- $tolerationOperator := default "Equal" $toleration.operator -}}
+{{- $tolerationValue := default "" $toleration.value -}}
+{{- $tolerationEffect := default "" $toleration.effect -}}
+{{- if ne $tolerationKey "" -}}
+{{- include "ipars.validateLabelKey" (dict "path" $path "key" $tolerationKey) -}}
+{{- end -}}
+{{- if and (ne $tolerationOperator "Exists") (ne $tolerationOperator "Equal") -}}
+{{- fail (printf "%s.operator must be Exists or Equal" $path) -}}
+{{- end -}}
+{{- if and (eq $tolerationKey "") (ne $tolerationOperator "Exists") -}}
+{{- fail (printf "%s with an empty key requires operator Exists" $path) -}}
+{{- end -}}
+{{- if and (eq $tolerationOperator "Exists") (ne $tolerationValue "") -}}
+{{- fail (printf "%s.value must be empty when operator is Exists" $path) -}}
+{{- end -}}
+{{- if ne $tolerationValue "" -}}
+{{- include "ipars.validateLabelValue" (dict "path" $path "value" (printf "%v" $tolerationValue)) -}}
+{{- end -}}
+{{- if and (ne $tolerationEffect "") (not (or (eq $tolerationEffect "NoSchedule") (eq $tolerationEffect "PreferNoSchedule") (eq $tolerationEffect "NoExecute"))) -}}
+{{- fail (printf "%s.effect must be NoSchedule, PreferNoSchedule, or NoExecute" $path) -}}
+{{- end -}}
+{{- if hasKey $toleration "tolerationSeconds" -}}
+{{- $tolerationSeconds := printf "%v" $toleration.tolerationSeconds -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
+{{- if ne $tolerationEffect "NoExecute" -}}
+{{- fail (printf "%s.tolerationSeconds requires effect NoExecute" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.cpu" "value" (printf "%v" .Values.agent.resources.requests.cpu)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
@@ -166,6 +198,27 @@ spec:
       nodeSelector:
         {{- range $key, $value := . }}
         {{ $key }}: {{ $value | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- range . }}
+        -
+          {{- if .key }}
+          key: {{ .key | quote }}
+          {{- end }}
+          {{- if .operator }}
+          operator: {{ .operator | quote }}
+          {{- end }}
+          {{- if .value }}
+          value: {{ .value | quote }}
+          {{- end }}
+          {{- if .effect }}
+          effect: {{ .effect | quote }}
+          {{- end }}
+          {{- if hasKey . "tolerationSeconds" }}
+          tolerationSeconds: {{ int .tolerationSeconds }}
+          {{- end }}
         {{- end }}
       {{- end }}
       containers:
