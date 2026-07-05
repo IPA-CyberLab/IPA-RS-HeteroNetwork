@@ -1329,6 +1329,12 @@ pub mod api {
         pub capability: RelayCapability,
         pub health: HealthState,
         #[serde(default)]
+        pub admission_attempt_count: u64,
+        #[serde(default)]
+        pub admission_success_count: u64,
+        #[serde(default)]
+        pub admission_failure_count: u64,
+        #[serde(default)]
         pub dataplane: RelayDataplaneMetrics,
     }
 

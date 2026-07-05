@@ -2904,12 +2904,18 @@ fn signal_snapshot_path_state_count(snapshot: &SignalOtelSnapshot, state: PathSt
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RelayOtelSnapshot {
+    admission_attempt_count: u64,
+    admission_success_count: u64,
+    admission_failure_count: u64,
     dataplane: RelayDataplaneMetrics,
 }
 
 impl From<&RelayStatusResponse> for RelayOtelSnapshot {
     fn from(status: &RelayStatusResponse) -> Self {
         Self {
+            admission_attempt_count: status.admission_attempt_count,
+            admission_success_count: status.admission_success_count,
+            admission_failure_count: status.admission_failure_count,
             dataplane: status.dataplane.clone(),
         }
     }
@@ -2917,6 +2923,9 @@ impl From<&RelayStatusResponse> for RelayOtelSnapshot {
 
 #[derive(Debug)]
 struct RelayOtelMetrics {
+    admission_attempts: Counter<u64>,
+    admission_success: Counter<u64>,
+    admission_failures: Counter<u64>,
     datagrams_received: Counter<u64>,
     datagram_bytes_received: Counter<u64>,
     datagrams_forwarded: Counter<u64>,
@@ -2937,6 +2946,18 @@ impl RelayOtelMetrics {
     fn new() -> Self {
         let meter = global::meter("iparsd.relay");
         Self {
+            admission_attempts: meter
+                .u64_counter("ipars.relay.admission.attempts")
+                .with_description("Relay session admission attempts.")
+                .build(),
+            admission_success: meter
+                .u64_counter("ipars.relay.admission.success")
+                .with_description("Relay session admissions accepted.")
+                .build(),
+            admission_failures: meter
+                .u64_counter("ipars.relay.admission.failures")
+                .with_description("Relay session admission failures.")
+                .build(),
             datagrams_received: meter
                 .u64_counter("ipars.relay.datagrams.received")
                 .with_description("UDP relay datagrams received.")
@@ -3009,6 +3030,30 @@ impl RelayOtelMetrics {
         );
         let relay_node = status.relay_node.as_str().to_string();
         let relay_attrs = [KeyValue::new("relay_node", relay_node.clone())];
+        let admission_attempt_delta = counter_delta(
+            status.admission_attempt_count,
+            previous.map(|snapshot| snapshot.admission_attempt_count),
+        );
+        if admission_attempt_delta > 0 {
+            self.admission_attempts
+                .add(admission_attempt_delta, &relay_attrs);
+        }
+        let admission_success_delta = counter_delta(
+            status.admission_success_count,
+            previous.map(|snapshot| snapshot.admission_success_count),
+        );
+        if admission_success_delta > 0 {
+            self.admission_success
+                .add(admission_success_delta, &relay_attrs);
+        }
+        let admission_failure_delta = counter_delta(
+            status.admission_failure_count,
+            previous.map(|snapshot| snapshot.admission_failure_count),
+        );
+        if admission_failure_delta > 0 {
+            self.admission_failures
+                .add(admission_failure_delta, &relay_attrs);
+        }
         self.datagrams_received
             .add(delta.datagrams_received, &relay_attrs);
         self.datagram_bytes_received
@@ -10117,6 +10162,9 @@ mod tests {
                 e2e_only: true,
             },
             health: HealthState::Healthy,
+            admission_attempt_count: 0,
+            admission_success_count: 0,
+            admission_failure_count: 0,
             dataplane: RelayDataplaneMetrics::default(),
         };
 

@@ -88,7 +88,10 @@ async fn admit(
     headers: HeaderMap,
     Json(request): Json<RelayAdmissionRequest>,
 ) -> Result<(StatusCode, Json<RelayAdmissionResponse>), ApiError> {
-    state.authorize_admission(&headers)?;
+    if let Err(error) = state.authorize_admission(&headers) {
+        state.relay.record_unauthorized_admission_attempt();
+        return Err(error);
+    }
     Ok((StatusCode::CREATED, Json(state.relay.admit(request).await?)))
 }
 
@@ -159,6 +162,45 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
         &mut body,
         "ipars_relay_e2e_only{{relay_node=\"{relay_node}\"}} {}",
         u8::from(status.capability.e2e_only)
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_admission_attempts_total Total relay session admission attempts."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_admission_attempts_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_admission_attempts_total{{relay_node=\"{relay_node}\"}} {}",
+        status.admission_attempt_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_admission_success_total Total relay session admissions accepted."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_admission_success_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_admission_success_total{{relay_node=\"{relay_node}\"}} {}",
+        status.admission_success_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_relay_admission_failures_total Total relay session admission failures."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_admission_failures_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_admission_failures_total{{relay_node=\"{relay_node}\"}} {}",
+        status.admission_failure_count
     );
     prometheus_line!(
         &mut body,
@@ -437,6 +479,9 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RelayStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.capability.active_sessions, 1);
+        assert_eq!(response.admission_attempt_count, 1);
+        assert_eq!(response.admission_success_count, 1);
+        assert_eq!(response.admission_failure_count, 0);
         assert_eq!(response.dataplane.datagrams_received, 0);
 
         let table = relay.table();
@@ -466,6 +511,10 @@ mod tests {
         assert!(body.contains("ipars_relay_active_sessions"));
         assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_e2e_only{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_admission_attempts_total"));
+        assert!(body.contains("ipars_relay_admission_attempts_total{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_admission_success_total{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_admission_failures_total{relay_node=\"relay-a\"} 0"));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
         assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains(
@@ -490,7 +539,7 @@ mod tests {
             },
         ));
         let app = router(
-            RelayHttpState::new(relay)
+            RelayHttpState::new(relay.clone())
                 .require_admission_bearer_token("cluster-relay-secret".to_string()),
         );
 
@@ -541,6 +590,10 @@ mod tests {
             .await?;
 
         assert_eq!(accepted.status(), StatusCode::CREATED);
+        let status = relay.status().await;
+        assert_eq!(status.admission_attempt_count, 3);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 2);
         Ok(())
     }
 }

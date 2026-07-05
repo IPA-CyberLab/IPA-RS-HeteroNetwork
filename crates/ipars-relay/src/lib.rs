@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use ipars_types::api::{
@@ -518,6 +519,9 @@ pub struct RelayService {
     capability: RwLock<RelayCapability>,
     table: std::sync::Arc<RwLock<RelayTable>>,
     session_ttl: chrono::Duration,
+    admission_attempts: AtomicU64,
+    admission_successes: AtomicU64,
+    admission_failures: AtomicU64,
 }
 
 impl RelayService {
@@ -535,6 +539,9 @@ impl RelayService {
             capability: RwLock::new(capability),
             table: std::sync::Arc::new(RwLock::new(RelayTable::default())),
             session_ttl: session_ttl.max(chrono::Duration::milliseconds(1)),
+            admission_attempts: AtomicU64::new(0),
+            admission_successes: AtomicU64::new(0),
+            admission_failures: AtomicU64::new(0),
         }
     }
 
@@ -543,6 +550,28 @@ impl RelayService {
     }
 
     pub async fn admit(
+        &self,
+        request: RelayAdmissionRequest,
+    ) -> Result<RelayAdmissionResponse, RelayError> {
+        self.admission_attempts.fetch_add(1, Ordering::Relaxed);
+        let result = self.admit_inner(request).await;
+        match &result {
+            Ok(_) => {
+                self.admission_successes.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.admission_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    pub fn record_unauthorized_admission_attempt(&self) {
+        self.admission_attempts.fetch_add(1, Ordering::Relaxed);
+        self.admission_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn admit_inner(
         &self,
         request: RelayAdmissionRequest,
     ) -> Result<RelayAdmissionResponse, RelayError> {
@@ -584,6 +613,9 @@ impl RelayService {
             relay_node: self.relay_node.clone(),
             capability: capability.clone(),
             health: HealthState::Healthy,
+            admission_attempt_count: self.admission_attempts.load(Ordering::Relaxed),
+            admission_success_count: self.admission_successes.load(Ordering::Relaxed),
+            admission_failure_count: self.admission_failures.load(Ordering::Relaxed),
             dataplane: table.dataplane_metrics(),
         }
     }
@@ -969,6 +1001,39 @@ mod tests {
         let status = service.status().await;
 
         assert_eq!(status.capability.active_sessions, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_status_reports_admission_counters(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        capability.max_sessions = 1;
+        let service = RelayService::new(NodeId::from_string("relay"), capability);
+
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-a"),
+                right: NodeId::from_string("right-a"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-b"),
+                right: NodeId::from_string("right-b"),
+                left_addr: SocketAddr::from(([10, 0, 0, 3], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 4], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
         Ok(())
     }
 
