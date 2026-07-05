@@ -408,6 +408,9 @@ pub struct AgentRuntime {
     packet_flow_application_http_count: AtomicU64,
     packet_flow_application_https_count: AtomicU64,
     packet_flow_application_ssh_count: AtomicU64,
+    packet_flow_application_ldap_count: AtomicU64,
+    packet_flow_application_smb_count: AtomicU64,
+    packet_flow_application_rdp_count: AtomicU64,
     packet_flow_application_kubernetes_api_count: AtomicU64,
     packet_flow_application_etcd_count: AtomicU64,
     packet_flow_application_postgres_count: AtomicU64,
@@ -661,6 +664,9 @@ impl AgentRuntime {
             packet_flow_application_http_count: AtomicU64::new(0),
             packet_flow_application_https_count: AtomicU64::new(0),
             packet_flow_application_ssh_count: AtomicU64::new(0),
+            packet_flow_application_ldap_count: AtomicU64::new(0),
+            packet_flow_application_smb_count: AtomicU64::new(0),
+            packet_flow_application_rdp_count: AtomicU64::new(0),
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
             packet_flow_application_etcd_count: AtomicU64::new(0),
             packet_flow_application_postgres_count: AtomicU64::new(0),
@@ -1262,6 +1268,9 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Http => &self.packet_flow_application_http_count,
             AgentPacketFlowApplication::Https => &self.packet_flow_application_https_count,
             AgentPacketFlowApplication::Ssh => &self.packet_flow_application_ssh_count,
+            AgentPacketFlowApplication::Ldap => &self.packet_flow_application_ldap_count,
+            AgentPacketFlowApplication::Smb => &self.packet_flow_application_smb_count,
+            AgentPacketFlowApplication::Rdp => &self.packet_flow_application_rdp_count,
             AgentPacketFlowApplication::KubernetesApi => {
                 &self.packet_flow_application_kubernetes_api_count
             }
@@ -4355,6 +4364,48 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(grpc_match.peer, peer_b_id);
+        let ldap_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 32)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(389),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(ldap_match.peer, peer_b_id);
+        let smb_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 33)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(445),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(smb_match.peer, peer_b_id);
+        let rdp_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 34)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(3389),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(rdp_match.peer, peer_b_id);
         let hinted_postgres_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 29)),
@@ -4379,8 +4430,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 10);
-        assert_eq!(metrics.packet_flow_match_count, 8);
+        assert_eq!(metrics.packet_flow_observation_count, 13);
+        assert_eq!(metrics.packet_flow_match_count, 11);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -4392,7 +4443,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            8
+            11
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -4421,6 +4472,9 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Kafka), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Grpc), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Rdp), 1);
         assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics

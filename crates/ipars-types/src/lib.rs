@@ -1614,6 +1614,9 @@ pub mod api {
         Http,
         Https,
         Ssh,
+        Ldap,
+        Smb,
+        Rdp,
         KubernetesApi,
         Etcd,
         Postgres,
@@ -1635,12 +1638,15 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 23] = [
+        pub const ALL: [Self; 26] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
             Self::Https,
             Self::Ssh,
+            Self::Ldap,
+            Self::Smb,
+            Self::Rdp,
             Self::KubernetesApi,
             Self::Etcd,
             Self::Postgres,
@@ -1668,6 +1674,9 @@ pub mod api {
                 Self::Http => "http",
                 Self::Https => "https",
                 Self::Ssh => "ssh",
+                Self::Ldap => "ldap",
+                Self::Smb => "smb",
+                Self::Rdp => "rdp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::Postgres => "postgres",
@@ -1794,6 +1803,17 @@ pub mod api {
             if self.involves_port(22) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Ssh;
             }
+            if (self.involves_port(389) || self.involves_port(636))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Ldap;
+            }
+            if self.involves_port(445) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Smb;
+            }
+            if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Rdp;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -1883,6 +1903,9 @@ pub mod api {
                     tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
                 })
                 .or_else(|| ssh_payload(payload).then_some(AgentPacketFlowApplication::Ssh))
+                .or_else(|| ldap_payload(payload).then_some(AgentPacketFlowApplication::Ldap))
+                .or_else(|| smb_payload(payload).then_some(AgentPacketFlowApplication::Smb))
+                .or_else(|| rdp_payload(payload).then_some(AgentPacketFlowApplication::Rdp))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -2167,6 +2190,68 @@ pub mod api {
 
     fn ssh_payload(payload: &[u8]) -> bool {
         payload.starts_with(b"SSH-")
+    }
+
+    fn ldap_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0x30 {
+            return false;
+        }
+        let Some((sequence_len, mut offset)) = ber_length(payload, 1) else {
+            return false;
+        };
+        if !(1..=16_777_216).contains(&sequence_len) || payload.get(offset) != Some(&0x02) {
+            return false;
+        }
+        let Some((message_id_len, message_id_offset)) = ber_length(payload, offset + 1) else {
+            return false;
+        };
+        if !(1..=4).contains(&message_id_len) {
+            return false;
+        }
+        let Some(protocol_op_offset) = message_id_offset.checked_add(message_id_len) else {
+            return false;
+        };
+        offset = protocol_op_offset;
+        matches!(payload.get(offset), Some(0x42 | 0x4a | 0x50 | 0x60..=0x79))
+    }
+
+    fn ber_length(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        let first = *payload.get(offset)?;
+        if first & 0x80 == 0 {
+            return Some((first as usize, offset + 1));
+        }
+        let length_bytes = (first & 0x7f) as usize;
+        if length_bytes == 0 || length_bytes > 4 {
+            return None;
+        }
+        let mut len = 0_usize;
+        for byte in payload.get(offset + 1..offset + 1 + length_bytes)? {
+            len = len.checked_shl(8)?.checked_add(*byte as usize)?;
+        }
+        Some((len, offset + 1 + length_bytes))
+    }
+
+    fn smb_payload(payload: &[u8]) -> bool {
+        smb_magic_at(payload, 0) || smb_magic_at(payload, 4)
+    }
+
+    fn smb_magic_at(payload: &[u8], offset: usize) -> bool {
+        matches!(
+            payload.get(offset..offset + 4),
+            Some([0xff, b'S', b'M', b'B']) | Some([0xfe, b'S', b'M', b'B'])
+        )
+    }
+
+    fn rdp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0x03 || payload[1] != 0x00 {
+            return false;
+        }
+        let length = u16::from_be_bytes([payload[2], payload[3]]);
+        let x224_len = payload[4] as u16;
+        (7..=4096).contains(&length)
+            && x224_len >= 2
+            && x224_len + 5 <= length
+            && matches!(payload[5], 0xd0 | 0xe0 | 0xf0)
     }
 
     fn postgres_payload(payload: &[u8]) -> bool {
@@ -2733,6 +2818,27 @@ mod tests {
         };
         assert_eq!(https.application(), api::AgentPacketFlowApplication::Https);
 
+        let ldap = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(389),
+            ..Default::default()
+        };
+        assert_eq!(ldap.application(), api::AgentPacketFlowApplication::Ldap);
+
+        let smb = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(445),
+            ..Default::default()
+        };
+        assert_eq!(smb.application(), api::AgentPacketFlowApplication::Smb);
+
+        let rdp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3389),
+            ..Default::default()
+        };
+        assert_eq!(rdp.application(), api::AgentPacketFlowApplication::Rdp);
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -2958,6 +3064,27 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"SSH-2.0-OpenSSH_9.0\r\n").application(),
             api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Rdp
         );
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
