@@ -942,6 +942,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.wireguard_interface)?;
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
+        if args.docker_route_interval_seconds == 0 {
+            anyhow::bail!("--docker-route-interval-seconds must be greater than zero");
+        }
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
         } else if !args.docker_networks.is_empty() {
@@ -1141,6 +1144,9 @@ fn validate_docker_network_token(value: &str, label: &str) -> anyhow::Result<()>
 }
 
 fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.kubernetes_route_interval_seconds == 0 {
+        anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
+    }
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
     }
@@ -3172,7 +3178,7 @@ fn docker_namespace_from_networks(network_names: &[String]) -> String {
 
 async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let source = docker_route_source(args)?;
-    let interval = Duration::from_secs(args.docker_route_interval_seconds.max(1));
+    let interval = Duration::from_secs(args.docker_route_interval_seconds);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3288,7 +3294,7 @@ async fn start_kubernetes_underlay_routes(
     local_node_id: NodeId,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let source = kubernetes_route_source(args, local_node_id)?;
-    let interval = Duration::from_secs(args.kubernetes_route_interval_seconds.max(1));
+    let interval = Duration::from_secs(args.kubernetes_route_interval_seconds);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -8861,6 +8867,54 @@ invalid no-destination-here
         ])?;
         if let Command::Agent(args) = missing_routes.command {
             assert!(docker_network_intent(&args).is_err());
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_route_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
+        let docker_zero = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-route-interval-seconds",
+            "0",
+        ])?;
+        if let Command::Agent(args) = docker_zero.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("zero Docker route interval should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--docker-route-interval-seconds must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let kubernetes_zero = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-route-interval-seconds",
+            "0",
+        ])?;
+        if let Command::Agent(args) = kubernetes_zero.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("zero Kubernetes route interval should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-route-interval-seconds must be greater than zero"));
             return Ok(());
         }
 
