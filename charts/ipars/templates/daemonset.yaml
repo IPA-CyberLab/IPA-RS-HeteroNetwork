@@ -13,6 +13,17 @@
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- $imagePullSecrets := dict -}}
+{{- range .Values.imagePullSecrets -}}
+{{- $secretName := printf "%v" . -}}
+{{- if or (eq $secretName "") (gt (len $secretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secretName)) -}}
+{{- fail (printf "imagePullSecrets entry %q must be a Kubernetes Secret name" $secretName) -}}
+{{- end -}}
+{{- if hasKey $imagePullSecrets $secretName -}}
+{{- fail (printf "imagePullSecrets entry %q must not be repeated" $secretName) -}}
+{{- end -}}
+{{- $_ := set $imagePullSecrets $secretName true -}}
+{{- end -}}
 {{- if not (or (eq $rbacCreate "true") (eq $rbacCreate "false")) -}}
 {{- fail "rbac.create must be true or false" -}}
 {{- end -}}
@@ -222,6 +233,12 @@ spec:
     spec:
       serviceAccountName: {{ include "ipars.serviceAccountName" . }}
       automountServiceAccountToken: {{ $agentAutomountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
       hostNetwork: {{ .Values.agent.hostNetwork }}
       {{- if ne $agentTerminationGracePeriodSeconds "" }}
       terminationGracePeriodSeconds: {{ int $agentTerminationGracePeriodSeconds }}

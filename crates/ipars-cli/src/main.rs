@@ -291,6 +291,8 @@ struct K8sInstallArgs {
     join_token_secret: String,
     #[arg(long, default_value = "token")]
     join_token_key: String,
+    #[arg(long = "image-pull-secret", value_parser = parse_kubernetes_image_pull_secret_name)]
+    image_pull_secrets: Vec<String>,
     #[arg(long, default_value_t = false)]
     kubernetes_discover_services: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1378,6 +1380,11 @@ fn parse_kubernetes_service_account_name(value: &str) -> Result<String, String> 
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_image_pull_secret_name(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_subdomain(value, "imagePullSecrets entry")?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     validate_kubernetes_resource_quantity(value, "resource quantity")?;
     Ok(value.to_string())
@@ -2139,6 +2146,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
+    validate_k8s_image_pull_secrets(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_rollout_options(&args)?;
@@ -2154,6 +2162,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_secret,
         args.join_token_key
     );
+    append_k8s_image_values(&mut helm_command, &args);
     append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
     append_k8s_agent_pod_values(&mut helm_command, &args);
@@ -2415,12 +2424,19 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn append_k8s_image_values(command: &mut String, args: &K8sInstallArgs) {
+    for (index, secret) in args.image_pull_secrets.iter().enumerate() {
+        append_helm_set_string(command, &format!("imagePullSecrets[{index}]"), secret);
+    }
 }
 
 fn append_k8s_service_account_values(command: &mut String, args: &K8sInstallArgs) {
@@ -2627,6 +2643,18 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
         .map_err(anyhow::Error::msg)?;
     validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn validate_k8s_image_pull_secrets(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let mut names = BTreeSet::new();
+    for secret in &args.image_pull_secrets {
+        validate_kubernetes_dns_subdomain(secret, "image pull Secret name")
+            .map_err(anyhow::Error::msg)?;
+        if !names.insert(secret) {
+            anyhow::bail!("--image-pull-secret `{secret}` must not be repeated");
+        }
+    }
     Ok(())
 }
 
@@ -3989,6 +4017,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4162,6 +4191,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4260,6 +4290,38 @@ mod tests {
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_image_pull_secrets() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.image_pull_secrets = vec!["registry-cred".to_string(), "mirror.cred".to_string()];
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set-string 'imagePullSecrets[0]=registry-cred'"));
+        assert!(helm.contains("--set-string 'imagePullSecrets[1]=mirror.cred'"));
+
+        let mut duplicate = base_k8s_install_args();
+        duplicate.image_pull_secrets =
+            vec!["registry-cred".to_string(), "registry-cred".to_string()];
+        let error = match k8s_install_plan(duplicate) {
+            Ok(_) => panic!("duplicate image pull Secret should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--image-pull-secret"));
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-pull-secret",
+            "bad secret",
+        ])
+        .is_err());
+
         Ok(())
     }
 
@@ -4686,6 +4748,8 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--image-pull-secret",
+            "registry-cred",
             "--kubernetes-discover-services",
             "--kubernetes-discover-api-server",
             "false",
@@ -4812,6 +4876,7 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert_eq!(args.image_pull_secrets, vec!["registry-cred"]);
             assert!(args.kubernetes_discover_services);
             assert!(!args.kubernetes_discover_api_server);
             assert_eq!(
@@ -4988,6 +5053,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5077,6 +5143,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5681,6 +5748,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5757,6 +5825,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5840,6 +5909,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5921,6 +5991,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5997,6 +6068,7 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_pull_secrets: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),

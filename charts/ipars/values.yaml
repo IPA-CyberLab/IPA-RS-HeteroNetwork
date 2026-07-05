@@ -3,6 +3,8 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+imagePullSecrets: []
+
 cluster:
   controlPlaneUrl: "http://ipars-control-plane:8443"
   signalUrl: "http://ipars-signal:9443"
