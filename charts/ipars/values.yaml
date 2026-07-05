@@ -30,6 +30,7 @@ agent:
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""
     ipFamilies: []
+    internalTrafficPolicy: ""
     externalTrafficPolicy: Local
     port: 9780
     nodePort: 0
@@ -57,6 +58,7 @@ agent:
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""
     ipFamilies: []
+    internalTrafficPolicy: ""
     externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580

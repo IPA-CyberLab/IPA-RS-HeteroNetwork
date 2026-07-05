@@ -335,6 +335,8 @@ struct K8sInstallArgs {
     agent_api_ip_families: Vec<String>,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
     agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "agent-api-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_agent_api")]
+    agent_api_internal_traffic_policy: Option<String>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
     agent_api_external_traffic_policy: String,
     #[arg(long = "agent-api-service-annotation", value_parser = parse_key_value, requires = "expose_agent_api")]
@@ -367,6 +369,8 @@ struct K8sInstallArgs {
     relay_ip_families: Vec<String>,
     #[arg(long = "relay-allow-source-cidr", requires = "expose_relay")]
     relay_allow_source_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "relay-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_relay")]
+    relay_internal_traffic_policy: Option<String>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
     relay_external_traffic_policy: String,
     #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
@@ -1129,6 +1133,15 @@ fn parse_kubernetes_external_traffic_policy(value: &str) -> Result<String, Strin
     }
 }
 
+fn parse_kubernetes_internal_traffic_policy(value: &str) -> Result<String, String> {
+    match value {
+        "Cluster" | "Local" => Ok(value.to_string()),
+        _ => Err(format!(
+            "internal traffic policy must be Cluster or Local; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_ip_family_policy(value: &str) -> Result<String, String> {
     match value {
         "SingleStack" | "PreferDualStack" | "RequireDualStack" => Ok(value.to_string()),
@@ -1800,6 +1813,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "agent.apiService.ipFamilies",
             &args.agent_api_ip_families,
         );
+        if let Some(internal_traffic_policy) = args.agent_api_internal_traffic_policy.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.internalTrafficPolicy={internal_traffic_policy}"
+            ));
+        }
         if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -1884,6 +1902,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "agent.relayService.ipFamilies",
             &args.relay_ip_families,
         );
+        if let Some(internal_traffic_policy) = args.relay_internal_traffic_policy.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.internalTrafficPolicy={internal_traffic_policy}"
+            ));
+        }
         if is_external_kubernetes_service_type(&args.relay_service_type) {
             helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -2186,6 +2209,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if !args.agent_api_ip_families.is_empty() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-ip-family requires --expose-agent-api");
     }
+    if args.agent_api_internal_traffic_policy.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-internal-traffic-policy requires --expose-agent-api");
+    }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
     }
@@ -2206,6 +2232,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if !args.relay_ip_families.is_empty() && !args.expose_relay {
         anyhow::bail!("--relay-ip-family requires --expose-relay");
+    }
+    if args.relay_internal_traffic_policy.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-internal-traffic-policy requires --expose-relay");
     }
     validate_kubernetes_service_ip_families(
         "agent-api",
@@ -3237,6 +3266,7 @@ mod tests {
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
             agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_internal_traffic_policy: Some("Local".to_string()),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
                 key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
@@ -3252,6 +3282,7 @@ mod tests {
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
             relay_ip_families: vec!["IPv6".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_internal_traffic_policy: Some("Cluster".to_string()),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
                 key: "metallb.universe.tf/address-pool".to_string(),
@@ -3280,6 +3311,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
+        assert!(plan.commands[2].contains("--set agent.apiService.internalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2]
@@ -3299,6 +3331,7 @@ mod tests {
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
         assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
+        assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
         assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains(
@@ -3361,6 +3394,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -3373,6 +3407,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -3595,6 +3630,8 @@ mod tests {
             "IPv6",
             "--agent-api-allow-source-cidr",
             "198.51.100.0/24",
+            "--agent-api-internal-traffic-policy",
+            "Local",
             "--agent-api-external-traffic-policy",
             "Cluster",
             "--agent-api-service-annotation",
@@ -3616,6 +3653,8 @@ mod tests {
             "IPv6",
             "--relay-allow-source-cidr",
             "203.0.113.0/24",
+            "--relay-internal-traffic-policy",
+            "Cluster",
             "--relay-external-traffic-policy",
             "Local",
             "--relay-service-annotation",
@@ -3673,6 +3712,10 @@ mod tests {
                 args.agent_api_allow_source_cidrs,
                 vec!["198.51.100.0/24".parse::<ipnet::IpNet>()?]
             );
+            assert_eq!(
+                args.agent_api_internal_traffic_policy.as_deref(),
+                Some("Local")
+            );
             assert_eq!(args.agent_api_external_traffic_policy, "Cluster");
             assert_eq!(
                 args.agent_api_service_annotations,
@@ -3698,6 +3741,10 @@ mod tests {
             assert_eq!(
                 args.relay_allow_source_cidrs,
                 vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.relay_internal_traffic_policy.as_deref(),
+                Some("Cluster")
             );
             assert_eq!(args.relay_external_traffic_policy, "Local");
             assert_eq!(
@@ -3752,6 +3799,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -3764,6 +3812,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -3811,6 +3860,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -3823,6 +3873,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4082,6 +4133,51 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_internal_traffic_policy() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_internal_traffic_policy = Some("Local".to_string());
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_internal_traffic_policy = Some("Cluster".to_string());
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.internalTrafficPolicy=Local"));
+        assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-internal-traffic-policy",
+            "Public",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_internal_traffic_policy = Some("Local".to_string());
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent internalTrafficPolicy requires exposed agent API Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-internal-traffic-policy requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_internal_traffic_policy = Some("Local".to_string());
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay internalTrafficPolicy requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-internal-traffic-policy requires"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_wires_and_validates_ip_families() -> anyhow::Result<()> {
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
@@ -4175,6 +4271,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4187,6 +4284,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4221,6 +4319,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4233,6 +4332,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4274,6 +4374,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -4286,6 +4387,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4325,6 +4427,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
@@ -4337,6 +4440,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: None,
@@ -4371,6 +4475,7 @@ mod tests {
             agent_api_ip_family_policy: None,
             agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_internal_traffic_policy: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
@@ -4383,6 +4488,7 @@ mod tests {
             relay_ip_family_policy: None,
             relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
+            relay_internal_traffic_policy: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
@@ -4408,6 +4514,11 @@ mod tests {
             Ok("Local".to_string())
         );
         assert!(parse_kubernetes_external_traffic_policy("Public").is_err());
+        assert_eq!(
+            parse_kubernetes_internal_traffic_policy("Cluster"),
+            Ok("Cluster".to_string())
+        );
+        assert!(parse_kubernetes_internal_traffic_policy("Public").is_err());
         assert_eq!(parse_kubernetes_node_port("30000"), Ok(30000));
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());

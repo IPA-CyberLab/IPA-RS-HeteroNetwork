@@ -2,6 +2,8 @@
 {{- $relayExternal := or (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
 {{- $agentApiServiceTypeValid := or (eq .Values.agent.apiService.type "ClusterIP") (eq .Values.agent.apiService.type "NodePort") (eq .Values.agent.apiService.type "LoadBalancer") -}}
 {{- $relayServiceTypeValid := or (eq .Values.agent.relayService.type "ClusterIP") (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
+{{- $agentApiInternalTrafficPolicyValid := or (eq .Values.agent.apiService.internalTrafficPolicy "") (eq .Values.agent.apiService.internalTrafficPolicy "Local") (eq .Values.agent.apiService.internalTrafficPolicy "Cluster") -}}
+{{- $relayInternalTrafficPolicyValid := or (eq .Values.agent.relayService.internalTrafficPolicy "") (eq .Values.agent.relayService.internalTrafficPolicy "Local") (eq .Values.agent.relayService.internalTrafficPolicy "Cluster") -}}
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
@@ -154,6 +156,12 @@
 {{- if and $relayServiceActive (eq (len $relayIpFamilies) 2) (not $relayIpFamilyPolicyDual) -}}
 {{- fail "agent.relayService ipFamilies with both IPv4 and IPv6 require ipFamilyPolicy=PreferDualStack or RequireDualStack" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiInternalTrafficPolicyValid) -}}
+{{- fail "agent.apiService.internalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayInternalTrafficPolicyValid) -}}
+{{- fail "agent.relayService.internalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
@@ -225,6 +233,9 @@ spec:
   ipFamilies:
 {{- toYaml .Values.agent.apiService.ipFamilies | nindent 4 }}
   {{- end }}
+  {{- if .Values.agent.apiService.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ .Values.agent.apiService.internalTrafficPolicy }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
   ports:
@@ -273,6 +284,9 @@ spec:
   {{- if .Values.agent.relayService.ipFamilies }}
   ipFamilies:
 {{- toYaml .Values.agent.relayService.ipFamilies | nindent 4 }}
+  {{- end }}
+  {{- if .Values.agent.relayService.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ .Values.agent.relayService.internalTrafficPolicy }}
   {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
