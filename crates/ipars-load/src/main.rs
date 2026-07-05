@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -22,9 +22,10 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
     AgentStatusResponse, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -181,6 +182,10 @@ struct LoadReport {
     relay_max_mbps_reported: u32,
     relay_enabled_by_policy_reported: bool,
     relay_e2e_only_reported: bool,
+    relay_admission_attempts_reported: u64,
+    relay_admission_successes_reported: u64,
+    relay_admission_failures_reported: u64,
+    relay_admission_failures_by_reason_reported: BTreeMap<RelayAdmissionFailureReason, u64>,
     relay_mbps: f64,
     daemon_processes: usize,
     daemon_agent_processes: usize,
@@ -332,6 +337,10 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_max_mbps_reported: 0,
         relay_enabled_by_policy_reported: false,
         relay_e2e_only_reported: false,
+        relay_admission_attempts_reported: 0,
+        relay_admission_successes_reported: 0,
+        relay_admission_failures_reported: 0,
+        relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
@@ -486,6 +495,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_max_mbps_reported: 0,
         relay_enabled_by_policy_reported: false,
         relay_e2e_only_reported: false,
+        relay_admission_attempts_reported: 0,
+        relay_admission_successes_reported: 0,
+        relay_admission_failures_reported: 0,
+        relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
@@ -614,6 +627,10 @@ async fn run_relay_udp_scenario(
         relay_max_mbps_reported: status.capability.max_mbps,
         relay_enabled_by_policy_reported: status.capability.enabled_by_policy,
         relay_e2e_only_reported: status.capability.e2e_only,
+        relay_admission_attempts_reported: status.admission_attempt_count,
+        relay_admission_successes_reported: status.admission_success_count,
+        relay_admission_failures_reported: status.admission_failure_count,
+        relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: 0,
         daemon_agent_processes: 0,
@@ -845,6 +862,10 @@ async fn run_daemon_scenario(
         relay_max_mbps_reported: status.capability.max_mbps,
         relay_enabled_by_policy_reported: status.capability.enabled_by_policy,
         relay_e2e_only_reported: status.capability.e2e_only,
+        relay_admission_attempts_reported: status.admission_attempt_count,
+        relay_admission_successes_reported: status.admission_success_count,
+        relay_admission_failures_reported: status.admission_failure_count,
+        relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: services.process_count(),
         daemon_agent_processes: agent_processes,
@@ -2149,6 +2170,12 @@ mod tests {
         assert_eq!(report.relay_max_mbps_reported, 10_000);
         assert!(report.relay_enabled_by_policy_reported);
         assert!(report.relay_e2e_only_reported);
+        assert_eq!(report.relay_admission_attempts_reported, 6);
+        assert_eq!(report.relay_admission_successes_reported, 6);
+        assert_eq!(report.relay_admission_failures_reported, 0);
+        assert!(report
+            .relay_admission_failures_by_reason_reported
+            .is_empty());
         assert_eq!(report.relay_http_requests, 8);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
@@ -2490,6 +2517,18 @@ mod tests {
         assert_eq!(report.relay_max_mbps_reported, 10_000);
         assert!(report.relay_enabled_by_policy_reported);
         assert!(report.relay_e2e_only_reported);
+        assert_eq!(
+            report.relay_admission_attempts_reported,
+            report.active_pair_count as u64
+        );
+        assert_eq!(
+            report.relay_admission_successes_reported,
+            report.active_pair_count as u64
+        );
+        assert_eq!(report.relay_admission_failures_reported, 0);
+        assert!(report
+            .relay_admission_failures_by_reason_reported
+            .is_empty());
         Ok(())
     }
 
