@@ -990,10 +990,11 @@ impl AgentRuntime {
     }
 
     pub async fn relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
-        self.relay_sessions.read().await.get(peer).cloned()
+        self.active_relay_session(peer, Utc::now()).await
     }
 
     pub async fn relay_sessions(&self) -> Vec<RelaySessionState> {
+        self.purge_expired_relay_sessions(Utc::now()).await;
         self.relay_sessions.read().await.values().cloned().collect()
     }
 
@@ -1084,12 +1085,10 @@ impl AgentRuntime {
     ) -> bool {
         let renew_before = chrono::Duration::from_std(renew_before)
             .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
-        self.relay_sessions
-            .read()
+        self.active_relay_session(peer, now)
             .await
-            .get(peer)
             .map(|session| {
-                &session.relay_node != relay_node || now + renew_before >= session.expires_at
+                session.relay_node != *relay_node || now + renew_before >= session.expires_at
             })
             .unwrap_or(true)
     }
@@ -3255,6 +3254,98 @@ mod tests {
             .await;
 
         assert!(runtime.active_relay_session(&peer, now).await.is_none());
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_relay_session_accessor_excludes_expired_sessions() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        let active_peer = NodeId::from_string("peer-active");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        let active_session = RelaySessionState {
+            peer: active_peer.clone(),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+            admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+            admitted_peer_addr: SocketAddr::from(([198, 51, 100, 21], 40000)),
+            session_id: "session-active".to_string(),
+            session_token: "secret-active".to_string(),
+            expires_at: now + ChronoDuration::seconds(60),
+        };
+        runtime.upsert_relay_session(active_session.clone()).await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+        assert_eq!(runtime.relay_sessions().await, vec![active_session.clone()]);
+        assert_eq!(
+            runtime.relay_session(&active_peer).await,
+            Some(active_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_renewal_check_purges_expired_relay_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(
+            runtime
+                .relay_session_needs_renewal(
+                    &peer,
+                    &NodeId::from_string("relay-a"),
+                    now,
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        );
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }

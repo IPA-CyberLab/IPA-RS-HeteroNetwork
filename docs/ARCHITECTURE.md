@@ -128,7 +128,7 @@ Agent heartbeats and signal registrations can refresh relay capability and capac
 
 The agent-side relay dataplane forwarder wraps outbound opaque WireGuard packets in the relay frame and sends them to the selected relay UDP endpoint. Its UDP loop forwards packets from the local WireGuard socket to the relay and sends stripped inbound relay payloads back toward the local WireGuard endpoint.
 
-Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. Expired relay sessions are purged from runtime session and forwarder state before active-session metrics are reported or active relay stability decisions are made. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
+Agents renew relay sessions before expiry and remove relay credentials when path negotiation selects a direct or unreachable non-relay state. Expired relay sessions are purged from runtime session and forwarder state before active-session metrics, active session lookups, renewal checks, or active relay stability decisions are made. This keeps relay bearer credentials short-lived without forcing admission churn on every negotiation tick.
 
 When the agent is started with relay forwarder binding enabled, the daemon supervises per-peer local UDP forwarders for active relay sessions. Peer-map application consults negotiated path state, transient relay sessions, and the runtime forwarder endpoint table before configuring kernel WireGuard peers. Relay-selected peers with active credentials use their local forwarder endpoint as the WireGuard endpoint, allowing the forwarder to wrap opaque WireGuard packets before they leave for the public relay.
 
