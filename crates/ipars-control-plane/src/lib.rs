@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -550,6 +551,17 @@ where
                 )
             })
             .count();
+        let stale_endpoint_candidate_count = nodes
+            .iter()
+            .flat_map(|node| &node.endpoint_candidates)
+            .filter(|candidate| {
+                !endpoint_candidate_is_fresh(
+                    candidate,
+                    now,
+                    self.config.cluster_policy.endpoint_candidate_ttl_seconds,
+                )
+            })
+            .count();
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
         for node in &nodes {
@@ -577,11 +589,16 @@ where
             healthy_node_count,
             degraded_node_count,
             unhealthy_node_count,
+            stale_endpoint_candidate_count,
             path_count: paths.len(),
             path_state_counts: path_state_counts
                 .into_iter()
                 .map(|(state, count)| PathStateCount { state, count })
                 .collect(),
+            endpoint_candidate_ttl_seconds: self
+                .config
+                .cluster_policy
+                .endpoint_candidate_ttl_seconds,
             generated_at: Utc::now(),
         })
     }
@@ -611,6 +628,13 @@ where
                 .iter()
                 .filter(|peer| peer.node_id != source.node_id)
                 .filter_map(|peer| acl_filter_peer(source, peer, &self.config.cluster_policy))
+                .map(|peer| {
+                    filter_stale_endpoint_candidates(
+                        peer,
+                        generated_at,
+                        &self.config.cluster_policy,
+                    )
+                })
                 .collect(),
             generated_at,
         }
@@ -642,9 +666,38 @@ where
                         acl_filter_peer(source, peer, &self.config.cluster_policy)
                     }
                 })
+                .map(|peer| {
+                    filter_stale_endpoint_candidates(
+                        peer,
+                        generated_at,
+                        &self.config.cluster_policy,
+                    )
+                })
                 .collect(),
             generated_at,
         }
+    }
+}
+
+fn filter_stale_endpoint_candidates(
+    mut node: NodeRecord,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> NodeRecord {
+    node.endpoint_candidates.retain(|candidate| {
+        endpoint_candidate_is_fresh(candidate, now, policy.endpoint_candidate_ttl_seconds)
+    });
+    node
+}
+
+fn endpoint_candidate_is_fresh(
+    candidate: &EndpointCandidate,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now.signed_duration_since(candidate.observed_at).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
     }
 }
 
@@ -672,7 +725,7 @@ fn relay_health_allows(
         return false;
     }
     match now.signed_duration_since(health.last_seen_at).to_std() {
-        Ok(age) => age <= std::time::Duration::from_secs(ttl_seconds),
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
 }
@@ -959,6 +1012,12 @@ mod tests {
             cost: 10,
             source: CandidateSource::StunProbe,
         }
+    }
+
+    fn stale_candidate(node_id: &str) -> EndpointCandidate {
+        let mut candidate = candidate(node_id);
+        candidate.observed_at = Utc::now() - Duration::seconds(60);
+        candidate
     }
 
     fn path(local: &str, remote: &str) -> PathRecord {
@@ -1292,6 +1351,71 @@ mod tests {
             .peers
             .iter()
             .all(|peer| peer.node_id != NodeId::from_string("denied")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_filters_stale_endpoint_candidates() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.endpoint_candidate_ttl_seconds = 30;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let source = node_record("source");
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![stale_candidate("peer-a"), candidate("peer-a")];
+        let mut relay = node_record("relay-a");
+        relay.endpoint_candidates = vec![stale_candidate("relay-a"), candidate("relay-a")];
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            ..relay_capability()
+        });
+
+        store.insert_node(source.clone()).await?;
+        store.insert_node(peer).await?;
+        store.insert_node(relay).await?;
+        store
+            .upsert_health(
+                NodeId::from_string("relay-a"),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.10),
+                    message: None,
+                },
+            )
+            .await?;
+
+        let peer_map = plane.peer_map_for(&source.node_id).await?;
+        let peer = peer_map
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == NodeId::from_string("peer-a"))
+            .ok_or("peer should remain visible with fresh candidate")?;
+        assert_eq!(peer.endpoint_candidates.len(), 1);
+        assert!(peer.endpoint_candidates[0].observed_at > Utc::now() - Duration::seconds(30));
+
+        let relay_registration = plane
+            .register_with_claims(
+                claims(ClusterId::from_string("cluster-a")),
+                registration_request("node-b"),
+            )
+            .await?;
+        let relay = relay_registration
+            .relay_map
+            .relays
+            .iter()
+            .find(|relay| relay.node_id == NodeId::from_string("relay-a"))
+            .ok_or("fresh healthy relay should remain visible")?;
+        assert_eq!(relay.endpoint_candidates.len(), 1);
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.stale_endpoint_candidate_count, 2);
+        assert_eq!(metrics.endpoint_candidate_ttl_seconds, 30);
         Ok(())
     }
 

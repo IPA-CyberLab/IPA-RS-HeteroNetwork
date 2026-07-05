@@ -202,6 +202,32 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_stale_endpoint_candidates Number of endpoint candidates older than the control-plane candidate TTL."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_stale_endpoint_candidates gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_stale_endpoint_candidates{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.stale_endpoint_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_endpoint_candidate_ttl_seconds Endpoint candidate freshness window used by control-plane peer maps."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_endpoint_candidate_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_endpoint_candidate_ttl_seconds{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.endpoint_candidate_ttl_seconds
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_node_health Registered nodes by last reported health."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_node_health gauge");
@@ -509,6 +535,8 @@ mod tests {
         let metrics: ControlPlaneMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_count, 1);
         assert_eq!(metrics.healthy_node_count, 1);
+        assert_eq!(metrics.stale_endpoint_candidate_count, 0);
+        assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
 
         let response = app
             .oneshot(
@@ -528,6 +556,8 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_control_plane_nodes"));
+        assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
+        assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
         assert!(body.contains("ipars_control_plane_node_health"));
         Ok(())
     }

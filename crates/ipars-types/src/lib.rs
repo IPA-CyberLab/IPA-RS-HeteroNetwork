@@ -915,8 +915,12 @@ pub mod api {
         pub healthy_node_count: usize,
         pub degraded_node_count: usize,
         pub unhealthy_node_count: usize,
+        #[serde(default)]
+        pub stale_endpoint_candidate_count: usize,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
+        #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
+        pub endpoint_candidate_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 

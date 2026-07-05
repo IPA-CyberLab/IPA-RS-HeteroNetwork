@@ -74,7 +74,7 @@ Direct paths are preferred when allowed and healthy. Relay paths remain encrypte
 
 ## ACL And Peer Visibility
 
-Control-plane peer maps and relay maps are filtered through cluster ACL rules when rules are configured. An empty ACL list preserves the default allow-all peer visibility. When ACL rules exist, deny matches take precedence over allow matches, and unmatched peers/routes are hidden. Rules match source role/tag, target role/tag, protocol, and advertised route CIDR containment; route-specific rules can expose only the allowed subset of a node's advertised routes.
+Control-plane peer maps and relay maps are filtered through cluster ACL rules when rules are configured. An empty ACL list preserves the default allow-all peer visibility. When ACL rules exist, deny matches take precedence over allow matches, and unmatched peers/routes are hidden. Rules match source role/tag, target role/tag, protocol, and advertised route CIDR containment; route-specific rules can expose only the allowed subset of a node's advertised routes. Endpoint candidates older than `endpoint_candidate_ttl_seconds` are removed from peer and relay maps before they are served, while the underlying node record remains available for the next heartbeat refresh.
 
 Operators can load these rules into `iparsd control-plane` with repeated `--acl-rule '<json>'` arguments, or a semicolon-separated `IPARS_ACL_RULES` value. The JSON is the typed `AclRule` schema, so daemon configuration, control-plane policy, and API behavior all share the same role/tag/route/protocol/action model. `GET /v1/policy` returns the active cluster policy, VPN pool, and loaded ACL rules for audit and status tooling.
 
@@ -105,7 +105,7 @@ Agents include their latest NAT classification when registering with signal and 
 
 ## Relay Design
 
-Public nodes are relay candidates only when policy, health, and capacity permit it. The control plane includes a node in relay maps and relay-candidate metrics only after it has a healthy heartbeat newer than `relay_health_ttl_seconds` in the active cluster policy, and the signal registry applies the same fresh-healthy gate before offering relay candidates during path negotiation. `iparsd control-plane --relay-health-ttl-seconds` controls the control-plane window, while `iparsd signal --relay-health-ttl-seconds` controls the signal negotiation window. Signal also reports stale endpoint candidate counts and its active `endpoint_candidate_ttl_seconds` window through JSON, Prometheus, and OTLP metrics. Relay admission checks include:
+Public nodes are relay candidates only when policy, health, and capacity permit it. The control plane includes a node in relay maps and relay-candidate metrics only after it has a healthy heartbeat newer than `relay_health_ttl_seconds` in the active cluster policy, and the signal registry applies the same fresh-healthy gate before offering relay candidates during path negotiation. `iparsd control-plane --relay-health-ttl-seconds` controls the control-plane window, while `iparsd signal --relay-health-ttl-seconds` controls the signal negotiation window. Control-plane and signal both report stale endpoint candidate counts and their active `endpoint_candidate_ttl_seconds` windows through JSON, Prometheus, and OTLP metrics. Relay admission checks include:
 
 - explicit relay permission in policy
 - public UDP endpoint availability

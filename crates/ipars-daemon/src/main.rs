@@ -214,6 +214,12 @@ struct ControlPlaneArgs {
     vpn_pool: ipnet::Ipv4Net,
     #[arg(long, env = "IPARS_RELAY_HEALTH_TTL_SECONDS", default_value_t = 90)]
     relay_health_ttl_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_ENDPOINT_CANDIDATE_TTL_SECONDS",
+        default_value_t = 120
+    )]
+    endpoint_candidate_ttl_seconds: u64,
     #[arg(long, env = "IPARS_DATABASE_URL")]
     database_url: Option<String>,
     #[arg(long, env = "IPARS_ISSUER_NODE_ID")]
@@ -1724,9 +1730,11 @@ where
     S: ControlPlaneStore + 'static,
     L: TokenLedger + 'static,
 {
+    validate_control_plane_runtime_config(&args)?;
     let mut config =
         ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
     config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
+    config.cluster_policy.endpoint_candidate_ttl_seconds = args.endpoint_candidate_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
     let mut key_ring = IssuerKeyRing::default();
@@ -1762,6 +1770,14 @@ where
         task.abort();
     }
     result
+}
+
+fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Result<()> {
+    validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
+    validate_positive_seconds(
+        args.endpoint_candidate_ttl_seconds,
+        "--endpoint-candidate-ttl-seconds",
+    )
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
@@ -1828,6 +1844,8 @@ async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
 struct ControlPlaneOtelMetrics {
     nodes: Gauge<u64>,
     relay_candidates: Gauge<u64>,
+    stale_endpoint_candidates: Gauge<u64>,
+    endpoint_candidate_ttl_seconds: Gauge<u64>,
     node_health: Gauge<u64>,
     paths: Gauge<u64>,
     paths_by_state: Gauge<u64>,
@@ -1844,6 +1862,16 @@ impl ControlPlaneOtelMetrics {
             relay_candidates: meter
                 .u64_gauge("ipars.control_plane.relay_candidates")
                 .with_description("Relay-capable nodes accepted into relay maps.")
+                .build(),
+            stale_endpoint_candidates: meter
+                .u64_gauge("ipars.control_plane.stale_endpoint_candidates")
+                .with_description("Control-plane endpoint candidates older than the candidate TTL.")
+                .build(),
+            endpoint_candidate_ttl_seconds: meter
+                .u64_gauge("ipars.control_plane.endpoint_candidate_ttl_seconds")
+                .with_description(
+                    "Endpoint candidate freshness window used by control-plane peer maps.",
+                )
                 .build(),
             node_health: meter
                 .u64_gauge("ipars.control_plane.node_health")
@@ -1868,6 +1896,12 @@ impl ControlPlaneOtelMetrics {
         self.nodes.record(metrics.node_count as u64, &cluster_attrs);
         self.relay_candidates
             .record(metrics.relay_candidate_count as u64, &cluster_attrs);
+        self.stale_endpoint_candidates.record(
+            metrics.stale_endpoint_candidate_count as u64,
+            &cluster_attrs,
+        );
+        self.endpoint_candidate_ttl_seconds
+            .record(metrics.endpoint_candidate_ttl_seconds, &cluster_attrs);
         self.paths.record(metrics.path_count as u64, &cluster_attrs);
 
         for (state, count) in [
@@ -7016,11 +7050,13 @@ mod tests {
             healthy_node_count: 1,
             degraded_node_count: 1,
             unhealthy_node_count: 0,
+            stale_endpoint_candidate_count: 0,
             path_count: 3,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,
                 count: 3,
             }],
+            endpoint_candidate_ttl_seconds: 120,
             generated_at: Utc::now(),
         };
 
@@ -7130,6 +7166,8 @@ mod tests {
             "pub-a",
             "--relay-health-ttl-seconds",
             "45",
+            "--endpoint-candidate-ttl-seconds",
+            "75",
             "--acl-rule",
             r#"{"id":"edge-to-db","from_roles":["edge"],"from_tags":["app"],"to_roles":["database"],"to_tags":["db"],"routes":["10.42.0.0/16"],"protocol":"any","action":"allow"}"#,
         ])?;
@@ -7138,6 +7176,8 @@ mod tests {
             anyhow::bail!("expected control-plane command");
         };
         assert_eq!(args.relay_health_ttl_seconds, 45);
+        assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
+        validate_control_plane_runtime_config(&args)?;
         assert_eq!(args.acl_rules.len(), 1);
         let rule = &args.acl_rules[0];
         assert_eq!(rule.id, "edge-to-db");
@@ -7170,6 +7210,36 @@ mod tests {
         assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
         assert!(args.disable_relay_fallback);
         validate_signal_runtime_config(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_candidate_ttl_must_be_positive() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--endpoint-candidate-ttl-seconds",
+            "0",
+        ])?;
+
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let error = match validate_control_plane_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("unexpected valid control-plane runtime config"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--endpoint-candidate-ttl-seconds must be greater than zero"));
         Ok(())
     }
 
