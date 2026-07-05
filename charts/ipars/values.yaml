@@ -27,6 +27,7 @@ agent:
     loadBalancerSourceRanges: []
     externalTrafficPolicy: Local
     port: 9780
+    nodePort: 0
   relayForwarder:
     maxSessions: 1024
     restartBackoffSeconds: 5
@@ -49,6 +50,8 @@ agent:
     externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580
+    udpNodePort: 0
+    httpNodePort: 0
 
 serviceExposure:
   enabled: true

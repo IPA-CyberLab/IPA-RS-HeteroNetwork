@@ -6,8 +6,11 @@
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
 {{- $agentApiPort := int .Values.agent.apiService.port -}}
+{{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
+{{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
+{{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
@@ -17,11 +20,29 @@
 {{- if and .Values.agent.apiService.enabled (or (lt $agentApiPort 1) (gt $agentApiPort 65535)) -}}
 {{- fail "agent.apiService.port must be between 1 and 65535" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (not $agentApiExternal) -}}
+{{- fail "agent.apiService.nodePort requires agent.apiService.type NodePort or LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (or (lt $agentApiNodePort 30000) (gt $agentApiNodePort 32767)) -}}
+{{- fail "agent.apiService.nodePort must be 0 or between 30000 and 32767" -}}
+{{- end -}}
 {{- if and $relayServiceActive (or (lt $relayUdpPort 1) (gt $relayUdpPort 65535)) -}}
 {{- fail "agent.relayService.udpPort must be between 1 and 65535" -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (lt $relayHttpPort 1) (gt $relayHttpPort 65535)) -}}
 {{- fail "agent.relayService.httpPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (or (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0)) (not $relayExternal) -}}
+{{- fail "agent.relayService udpNodePort/httpNodePort require agent.relayService.type NodePort or LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayUdpNodePort 0) (or (lt $relayUdpNodePort 30000) (gt $relayUdpNodePort 32767)) -}}
+{{- fail "agent.relayService.udpNodePort must be 0 or between 30000 and 32767" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayHttpNodePort 0) (or (lt $relayHttpNodePort 30000) (gt $relayHttpNodePort 32767)) -}}
+{{- fail "agent.relayService.httpNodePort must be 0 or between 30000 and 32767" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayUdpNodePort 0) (eq $relayUdpNodePort $relayHttpNodePort) -}}
+{{- fail "agent.relayService.udpNodePort and agent.relayService.httpNodePort must be different" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
@@ -85,6 +106,9 @@ spec:
       protocol: TCP
       port: {{ .Values.agent.apiService.port }}
       targetPort: 9780
+      {{- if and $agentApiExternal (ne $agentApiNodePort 0) }}
+      nodePort: {{ $agentApiNodePort }}
+      {{- end }}
 {{- end }}
 {{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
 ---
@@ -115,8 +139,14 @@ spec:
       protocol: UDP
       port: {{ .Values.agent.relayService.udpPort }}
       targetPort: {{ .Values.agent.relayService.udpPort }}
+      {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
+      nodePort: {{ $relayUdpNodePort }}
+      {{- end }}
     - name: relay-http
       protocol: TCP
       port: {{ .Values.agent.relayService.httpPort }}
       targetPort: {{ .Values.agent.relayService.httpPort }}
+      {{- if and $relayExternal (ne $relayHttpNodePort 0) }}
+      nodePort: {{ $relayHttpNodePort }}
+      {{- end }}
 {{- end }}
