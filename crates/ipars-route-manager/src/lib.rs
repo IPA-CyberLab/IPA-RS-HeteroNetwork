@@ -4,8 +4,9 @@ use std::fs::File;
 use std::io;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::Output;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -21,6 +22,9 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, RouteMessageBuilder};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
+use tokio::process::Command;
+
+const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -382,20 +386,86 @@ pub struct SystemRouteCommandRunner;
 #[async_trait]
 impl LinuxRouteCommandRunner for SystemRouteCommandRunner {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
-        let output = Command::new(&command.program)
-            .args(&command.args)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
+        run_system_route_command(command, DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT).await
+    }
+}
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(RouteManagerError::Backend(format!(
-            "{} {} failed: {}",
-            command.program,
-            command.args.join(" "),
-            stderr.trim()
-        )))
+#[derive(Debug, Clone)]
+pub struct TimedSystemRouteCommandRunner {
+    timeout: Duration,
+}
+
+impl TimedSystemRouteCommandRunner {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for TimedSystemRouteCommandRunner {
+    fn default() -> Self {
+        Self::new(DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT)
+    }
+}
+
+#[async_trait]
+impl LinuxRouteCommandRunner for TimedSystemRouteCommandRunner {
+    async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
+        run_system_route_command(command, self.timeout).await
+    }
+}
+
+async fn run_system_route_command(
+    command: LinuxRouteCommand,
+    timeout: Duration,
+) -> Result<(), RouteManagerError> {
+    let command_label = command_label(&command.program, &command.args);
+    let output = run_route_command_output(command, timeout, &command_label).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(RouteManagerError::Backend(format!(
+        "{command_label} failed: {}",
+        stderr.trim()
+    )))
+}
+
+async fn run_route_command_output(
+    command: LinuxRouteCommand,
+    timeout: Duration,
+    command_label: &str,
+) -> Result<Output, RouteManagerError> {
+    tokio::time::timeout(
+        timeout,
+        Command::new(&command.program)
+            .args(&command.args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        RouteManagerError::Backend(format!(
+            "{command_label} timed out after {}",
+            command_timeout_label(timeout)
+        ))
+    })?
+    .map_err(RouteManagerError::Io)
+}
+
+fn command_timeout_label(timeout: Duration) -> String {
+    if timeout.as_millis() < 1000 {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+fn command_label(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, args.join(" "))
     }
 }
 
@@ -884,6 +954,39 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_reports_failure_stderr() {
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+        let error = match runner
+            .run(LinuxRouteCommand::new(
+                "sh",
+                ["-c", "echo route-failed >&2; exit 7"],
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("route-failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_times_out() {
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(10));
+        let error = match runner
+            .run(LinuxRouteCommand::new("sh", ["-c", "sleep 1"]))
+            .await
+        {
+            Ok(()) => panic!("command should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("timed out after 10ms"));
     }
 
     fn route_plan() -> Result<RoutePlan, Box<dyn std::error::Error>> {

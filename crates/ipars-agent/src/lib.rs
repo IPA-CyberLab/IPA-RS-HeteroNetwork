@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Output;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,7 @@ use ipars_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::process::Command;
 
 #[cfg(target_os = "linux")]
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_REQUEST};
@@ -46,6 +47,7 @@ use netlink_packet_wireguard::{
 use rtnetlink::{LinkUnspec, LinkWireguard};
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
+const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -1257,20 +1259,83 @@ pub struct SystemCommandRunner;
 #[async_trait]
 impl LinuxCommandRunner for SystemCommandRunner {
     async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
-        let output = Command::new(&command.program)
-            .args(&command.args)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
+        run_system_command(command, DEFAULT_SYSTEM_COMMAND_TIMEOUT).await
+    }
+}
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(AgentError::WireGuard(format!(
-            "{} {} failed: {}",
-            command.program,
-            command.args.join(" "),
-            stderr.trim()
-        )))
+#[derive(Debug, Clone)]
+pub struct TimedSystemCommandRunner {
+    timeout: Duration,
+}
+
+impl TimedSystemCommandRunner {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for TimedSystemCommandRunner {
+    fn default() -> Self {
+        Self::new(DEFAULT_SYSTEM_COMMAND_TIMEOUT)
+    }
+}
+
+#[async_trait]
+impl LinuxCommandRunner for TimedSystemCommandRunner {
+    async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
+        run_system_command(command, self.timeout).await
+    }
+}
+
+async fn run_system_command(command: LinuxCommand, timeout: Duration) -> Result<(), AgentError> {
+    let command_label = command_label(&command.program, &command.args);
+    let output = run_command_output(command, timeout, &command_label).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(AgentError::WireGuard(format!(
+        "{command_label} failed: {}",
+        stderr.trim()
+    )))
+}
+
+async fn run_command_output(
+    command: LinuxCommand,
+    timeout: Duration,
+    command_label: &str,
+) -> Result<Output, AgentError> {
+    tokio::time::timeout(
+        timeout,
+        Command::new(&command.program)
+            .args(&command.args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        AgentError::WireGuard(format!(
+            "{command_label} timed out after {}",
+            command_timeout_label(timeout)
+        ))
+    })?
+    .map_err(AgentError::Io)
+}
+
+fn command_timeout_label(timeout: Duration) -> String {
+    if timeout.as_millis() < 1000 {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+fn command_label(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, args.join(" "))
     }
 }
 
@@ -2269,6 +2334,36 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_reports_failure_stderr() {
+        let runner = TimedSystemCommandRunner::new(Duration::from_secs(1));
+        let error = match runner
+            .run(LinuxCommand::new(
+                "sh",
+                ["-c", "echo wireguard-failed >&2; exit 7"],
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("wireguard-failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_times_out() {
+        let runner = TimedSystemCommandRunner::new(Duration::from_millis(10));
+        let error = match runner.run(LinuxCommand::new("sh", ["-c", "sleep 1"])).await {
+            Ok(()) => panic!("command should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("timed out after 10ms"));
     }
 
     #[derive(Debug, Default)]

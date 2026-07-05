@@ -17,7 +17,7 @@ use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommandRunner,
     LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PeerMapApplier,
     PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats, RelaySessionState,
-    RuntimePeerEndpointResolver, SystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
+    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
     WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
@@ -31,7 +31,7 @@ use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
     kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
     LinuxNetlinkRouteManager, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
-    NamespacedLinuxRouteCommandRunner, RouteManager, SystemRouteCommandRunner,
+    NamespacedLinuxRouteCommandRunner, RouteManager, TimedSystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
@@ -378,6 +378,12 @@ struct AgentArgs {
         default_value_t = false
     )]
     skip_runtime_preflight: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RUNTIME_COMMAND_TIMEOUT_SECONDS",
+        default_value_t = 30
+    )]
+    runtime_command_timeout_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
@@ -1036,6 +1042,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--relay-session-renew-before-seconds",
         )?;
     }
+    validate_positive_seconds(
+        args.runtime_command_timeout_seconds,
+        "--runtime-command-timeout-seconds",
+    )?;
     if args.packet_flow_detector != PacketFlowDetector::Disabled {
         validate_positive_seconds(
             args.packet_flow_poll_interval_seconds,
@@ -3091,6 +3101,7 @@ async fn start_peer_map_sync(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let command_timeout = runtime_command_timeout(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3104,8 +3115,14 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
-                        NamespacedLinuxRouteCommandRunner::new(namespace, SystemRouteCommandRunner),
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::new(command_timeout),
+                        ),
+                        NamespacedLinuxRouteCommandRunner::new(
+                            namespace,
+                            TimedSystemRouteCommandRunner::new(command_timeout),
+                        ),
                     )
                     .await
                 }
@@ -3114,8 +3131,8 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        SystemCommandRunner,
-                        SystemRouteCommandRunner,
+                        TimedSystemCommandRunner::new(command_timeout),
+                        TimedSystemRouteCommandRunner::new(command_timeout),
                     )
                     .await
                 }
@@ -3128,7 +3145,10 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        NamespacedLinuxCommandRunner::new(namespace.clone(), SystemCommandRunner),
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::new(command_timeout),
+                        ),
                         Some(namespace),
                     )
                     .await
@@ -3138,7 +3158,7 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        SystemCommandRunner,
+                        TimedSystemCommandRunner::new(command_timeout),
                         None,
                     )
                     .await
@@ -3154,7 +3174,7 @@ async fn start_peer_map_sync(
                         control_plane_urls,
                         NamespacedLinuxRouteCommandRunner::new(
                             namespace.clone(),
-                            SystemRouteCommandRunner,
+                            TimedSystemRouteCommandRunner::new(command_timeout),
                         ),
                         Some(namespace),
                     )
@@ -3165,7 +3185,7 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        SystemRouteCommandRunner,
+                        TimedSystemRouteCommandRunner::new(command_timeout),
                         None,
                     )
                     .await
@@ -3210,6 +3230,10 @@ async fn start_peer_map_sync(
             ))
         }
     }
+}
+
+fn runtime_command_timeout(args: &AgentArgs) -> Duration {
+    Duration::from_secs(args.runtime_command_timeout_seconds)
 }
 
 #[derive(Debug, Clone)]
@@ -3492,6 +3516,7 @@ fn docker_namespace_from_networks(network_names: &[String]) -> String {
 async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let source = docker_route_source(args)?;
     let interval = Duration::from_secs(args.docker_route_interval_seconds);
+    let command_timeout = runtime_command_timeout(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3505,7 +3530,7 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
                         let manager =
                             LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
                                 namespace,
-                                SystemRouteCommandRunner,
+                                TimedSystemRouteCommandRunner::new(command_timeout),
                             ));
                         Ok(tokio::spawn(async move {
                             run_docker_route_loop(manager, source, interval).await;
@@ -3521,7 +3546,9 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
-                        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+                        let manager = LinuxRouteManager::new(TimedSystemRouteCommandRunner::new(
+                            command_timeout,
+                        ));
                         Ok(tokio::spawn(async move {
                             run_docker_route_loop(manager, source, interval).await;
                         }))
@@ -3608,6 +3635,7 @@ async fn start_kubernetes_underlay_routes(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let source = kubernetes_route_source(args, local_node_id)?;
     let interval = Duration::from_secs(args.kubernetes_route_interval_seconds);
+    let command_timeout = runtime_command_timeout(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3621,7 +3649,7 @@ async fn start_kubernetes_underlay_routes(
                         let manager =
                             LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
                                 namespace,
-                                SystemRouteCommandRunner,
+                                TimedSystemRouteCommandRunner::new(command_timeout),
                             ));
                         Ok(tokio::spawn(async move {
                             run_kubernetes_underlay_route_loop(manager, source, interval).await;
@@ -3637,7 +3665,9 @@ async fn start_kubernetes_underlay_routes(
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
-                        let manager = LinuxRouteManager::new(SystemRouteCommandRunner);
+                        let manager = LinuxRouteManager::new(TimedSystemRouteCommandRunner::new(
+                            command_timeout,
+                        ));
                         Ok(tokio::spawn(async move {
                             run_kubernetes_underlay_route_loop(manager, source, interval).await;
                         }))
@@ -7938,6 +7968,7 @@ mod tests {
             assert_eq!(args.wireguard_backend.as_str(), "command");
             assert_eq!(args.route_backend, RouteApplyBackend::Command);
             assert_eq!(args.route_backend.as_str(), "command");
+            assert_eq!(args.runtime_command_timeout_seconds, 30);
             return Ok(());
         }
 
@@ -9723,6 +9754,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             (
                 vec!["iparsd", "agent", "--heartbeat-interval-seconds", "0"],
                 "--heartbeat-interval-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--runtime-command-timeout-seconds", "0"],
+                "--runtime-command-timeout-seconds must be greater than zero",
             ),
             (
                 vec![
