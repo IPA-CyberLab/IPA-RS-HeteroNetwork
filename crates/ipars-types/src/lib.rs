@@ -1804,6 +1804,54 @@ pub mod api {
         pub observed_route_count: usize,
     }
 
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentManagedProcessState {
+        #[default]
+        Disabled,
+        Starting,
+        Ready,
+        Exited,
+        Stopping,
+        Stopped,
+        Failed,
+    }
+
+    impl AgentManagedProcessState {
+        pub const ALL: [Self; 7] = [
+            Self::Disabled,
+            Self::Starting,
+            Self::Ready,
+            Self::Exited,
+            Self::Stopping,
+            Self::Stopped,
+            Self::Failed,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled",
+                Self::Starting => "starting",
+                Self::Ready => "ready",
+                Self::Exited => "exited",
+                Self::Stopping => "stopping",
+                Self::Stopped => "stopped",
+                Self::Failed => "failed",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentManagedProcessStatus {
+        pub state: AgentManagedProcessState,
+        pub pid: Option<u32>,
+        pub exit_status: Option<String>,
+        pub message: Option<String>,
+        pub updated_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowDropReasonCount {
         pub reason: AgentPacketFlowDropReason,
@@ -1847,6 +1895,8 @@ pub mod api {
         pub packet_flow_classification_counts: Vec<AgentPacketFlowClassificationCount>,
         #[serde(default)]
         pub packet_flow_application_counts: Vec<AgentPacketFlowApplicationCount>,
+        #[serde(default)]
+        pub userspace_wireguard_process: Option<AgentManagedProcessStatus>,
         pub generated_at: DateTime<Utc>,
     }
 

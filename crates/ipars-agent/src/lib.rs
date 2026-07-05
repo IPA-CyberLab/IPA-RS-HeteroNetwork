@@ -19,12 +19,12 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
-    AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
-    AgentPacketFlowDropReasonCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
-    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
-    SignalHolePunchPlanResponse,
+    AgentManagedProcessState, AgentManagedProcessStatus, AgentMetricsResponse,
+    AgentPacketFlowApplication, AgentPacketFlowApplicationCount, AgentPacketFlowClassification,
+    AgentPacketFlowClassificationCount, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
+    AgentPacketFlowMatch, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
+    AgentPathProbeRequest, AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics,
+    PathStateCount, PeerMap, RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -380,6 +380,7 @@ pub struct AgentRuntime {
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
+    userspace_wireguard_process: tokio::sync::RwLock<Option<AgentManagedProcessStatus>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
     relay_admission_attempt_count: AtomicU64,
     relay_admission_success_count: AtomicU64,
@@ -630,6 +631,7 @@ impl AgentRuntime {
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
+            userspace_wireguard_process: tokio::sync::RwLock::new(None),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
             relay_admission_attempt_count: AtomicU64::new(0),
             relay_admission_success_count: AtomicU64::new(0),
@@ -688,6 +690,26 @@ impl AgentRuntime {
             Ok(mut current) => *current = state,
             Err(poisoned) => *poisoned.into_inner() = state,
         }
+    }
+
+    pub async fn record_userspace_wireguard_process_status(
+        &self,
+        state: AgentManagedProcessState,
+        pid: Option<u32>,
+        exit_status: Option<String>,
+        message: Option<String>,
+    ) {
+        *self.userspace_wireguard_process.write().await = Some(AgentManagedProcessStatus {
+            state,
+            pid,
+            exit_status,
+            message,
+            updated_at: Utc::now(),
+        });
+    }
+
+    pub async fn userspace_wireguard_process_status(&self) -> Option<AgentManagedProcessStatus> {
+        self.userspace_wireguard_process.read().await.clone()
     }
 
     pub fn wireguard_key_rotation_request(
@@ -832,6 +854,7 @@ impl AgentRuntime {
         let relay_sessions = self.relay_sessions.read().await;
         let relay_forwarders = self.relay_forwarder_endpoints.read().await;
         let relay_forwarder_metrics = self.relay_forwarder_metrics.read().await;
+        let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         let path_change_events = self.path_change_events.read().await;
         let lazy_connect = self.lazy_connect.read().await;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
@@ -876,6 +899,7 @@ impl AgentRuntime {
             packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
             packet_flow_classification_counts: self.packet_flow_classification_counts(),
             packet_flow_application_counts: self.packet_flow_application_counts(),
+            userspace_wireguard_process,
             generated_at: Utc::now(),
         }
     }

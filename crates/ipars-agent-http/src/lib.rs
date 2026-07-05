@@ -8,12 +8,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
-    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
-    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
-    AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
-    AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    AgentManagedProcessState, AgentMetricsResponse, AgentNatClassifyRequest,
+    AgentNatClassifyResponse, AgentPacketFlowRequest, AgentPacketFlowResponse,
+    AgentPathEventsResponse, AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse,
+    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
+    AgentStunProbeRequest, AgentStunProbeResponse, AgentWireGuardKeyRotationRequest,
+    AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathMetricsValidationError, PathState};
 use serde::Serialize;
@@ -356,6 +356,28 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         "ipars_agent_relay_forwarders{{node_id=\"{node_id}\"}} {}",
         metrics.relay_forwarder_count
     );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_userspace_wireguard_process_state Managed userspace WireGuard process state, exported as one-hot gauges."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_userspace_wireguard_process_state gauge"
+    );
+    let userspace_wireguard_state = metrics
+        .userspace_wireguard_process
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or(AgentManagedProcessState::Disabled);
+    for state in AgentManagedProcessState::ALL {
+        let value = u8::from(state == userspace_wireguard_state);
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_userspace_wireguard_process_state{{node_id=\"{node_id}\",state=\"{}\"}} {}",
+            state.as_str(),
+            value
+        );
+    }
     prometheus_line!(
         &mut body,
         "# HELP ipars_agent_relay_forwarder_outbound_packets_total Relay forwarder packets sent from local WireGuard to relay."
@@ -961,6 +983,14 @@ mod tests {
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_success();
         runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Ready,
+                Some(4242),
+                None,
+                None,
+            )
+            .await;
+        runtime
             .record_peer_activity(NodeId::from_string("peer-a"), Utc::now(), true)
             .await;
         runtime
@@ -999,6 +1029,20 @@ mod tests {
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 0);
+        assert_eq!(
+            metrics
+                .userspace_wireguard_process
+                .as_ref()
+                .map(|status| status.state),
+            Some(AgentManagedProcessState::Ready)
+        );
+        assert_eq!(
+            metrics
+                .userspace_wireguard_process
+                .as_ref()
+                .and_then(|status| status.pid),
+            Some(4242)
+        );
         assert_eq!(metrics.lazy_connect.active_peer_count, 1);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 1);
         assert_eq!(metrics.path_probe_record_count, 0);
@@ -1050,6 +1094,9 @@ mod tests {
         assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
         assert!(body.contains("ipars_agent_relay_admission_success_total"));
         assert!(body.contains("ipars_agent_relay_admission_failures_total"));
+        assert!(body.contains("ipars_agent_userspace_wireguard_process_state"));
+        assert!(body.contains("state=\"ready\"} 1"));
+        assert!(body.contains("state=\"disabled\"} 0"));
         assert!(body.contains("peer=\"peer-a\""));
         assert!(body.contains("relay_node=\"relay-a\""));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));

@@ -43,13 +43,14 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowClassification,
-    AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowObservation,
-    AgentPacketFlowTcpState, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentManagedProcessState, AgentMetricsResponse, AgentPacketFlowApplication,
+    AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
+    AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayForwarderMetrics,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
+    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -3159,6 +3160,7 @@ struct AgentOtelMetrics {
     paths_by_state: Gauge<u64>,
     relay_sessions: Gauge<u64>,
     relay_forwarders: Gauge<u64>,
+    userspace_wireguard_process_state: Gauge<u64>,
     path_change_events: Gauge<u64>,
     lazy_active_peers: Gauge<u64>,
     lazy_pinned_peers: Gauge<u64>,
@@ -3207,6 +3209,12 @@ impl AgentOtelMetrics {
             relay_forwarders: meter
                 .u64_gauge("ipars.agent.relay.forwarders")
                 .with_description("Supervised relay forwarder endpoints.")
+                .build(),
+            userspace_wireguard_process_state: meter
+                .u64_gauge("ipars.agent.userspace_wireguard.process.state")
+                .with_description(
+                    "Managed userspace WireGuard process state, exported as one-hot gauges.",
+                )
                 .build(),
             path_change_events: meter
                 .u64_gauge("ipars.agent.path_change_events")
@@ -3330,6 +3338,23 @@ impl AgentOtelMetrics {
             .record(metrics.relay_session_count as u64, &node_attrs);
         self.relay_forwarders
             .record(metrics.relay_forwarder_count as u64, &node_attrs);
+        let userspace_wireguard_state = metrics
+            .userspace_wireguard_process
+            .as_ref()
+            .map(|status| status.state)
+            .unwrap_or(AgentManagedProcessState::Disabled);
+        for state in AgentManagedProcessState::ALL {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("state", state.as_str()),
+            ];
+            let value = if state == userspace_wireguard_state {
+                1
+            } else {
+                0
+            };
+            self.userspace_wireguard_process_state.record(value, &attrs);
+        }
         self.path_change_events
             .record(metrics.path_change_event_count as u64, &node_attrs);
         self.lazy_active_peers
@@ -3716,7 +3741,8 @@ async fn run_agent(
     let signal_bases =
         signal_base_urls(join_token.as_ref(), args.signal_url.as_deref()).unwrap_or_default();
     preflight_agent_runtime(&args)?;
-    let userspace_wireguard_process = start_userspace_wireguard_process(&args).await?;
+    let userspace_wireguard_process =
+        start_userspace_wireguard_process(&args, runtime.clone()).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
     if otel_metrics_enabled {
@@ -3921,6 +3947,8 @@ async fn run_agent(
 
 struct ManagedUserspaceWireGuardProcess {
     label: String,
+    pid: Option<u32>,
+    runtime: Arc<AgentRuntime>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -3931,6 +3959,7 @@ impl ManagedUserspaceWireGuardProcess {
             if shutdown.send(()).is_err() {
                 tracing::info!(
                     command = %self.label,
+                    pid = ?self.pid,
                     "userspace WireGuard process monitor already stopped"
                 );
             }
@@ -3939,17 +3968,35 @@ impl ManagedUserspaceWireGuardProcess {
         if let Err(error) = self.task.await {
             tracing::warn!(
                 command = %self.label,
+                pid = ?self.pid,
                 %error,
                 "userspace WireGuard process monitor task failed"
             );
+            self.runtime
+                .record_userspace_wireguard_process_status(
+                    AgentManagedProcessState::Failed,
+                    self.pid,
+                    None,
+                    Some(error.to_string()),
+                )
+                .await;
         }
     }
 }
 
 async fn start_userspace_wireguard_process(
     args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
 ) -> anyhow::Result<Option<ManagedUserspaceWireGuardProcess>> {
     let Some(command) = userspace_wireguard_launch_command(args)? else {
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Disabled,
+                None,
+                None,
+                None,
+            )
+            .await;
         return Ok(None);
     };
     let label = runtime_command_label(&command.program, &command.args);
@@ -3961,25 +4008,53 @@ async fn start_userspace_wireguard_process(
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
+    let pid = child.id();
+    runtime
+        .record_userspace_wireguard_process_status(
+            AgentManagedProcessState::Starting,
+            pid,
+            None,
+            None,
+        )
+        .await;
     tracing::info!(
         command = %label,
+        pid = ?pid,
         interface = %args.wireguard_interface,
         "started userspace WireGuard process"
     );
     let shutdown_timeout = Duration::from_secs(args.userspace_wireguard_shutdown_timeout_seconds);
     if let Err(error) = wait_for_userspace_wireguard_ready(args, &mut child, &label).await {
-        cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout).await;
+        let message = error.to_string();
+        let status =
+            cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout)
+                .await;
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Failed,
+                pid,
+                status.map(|status| status.to_string()),
+                Some(message),
+            )
+            .await;
         return Err(error);
     }
+    runtime
+        .record_userspace_wireguard_process_status(AgentManagedProcessState::Ready, pid, None, None)
+        .await;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(monitor_userspace_wireguard_process(
         child,
         label.clone(),
+        pid,
+        runtime.clone(),
         shutdown_rx,
         shutdown_timeout,
     ));
     Ok(Some(ManagedUserspaceWireGuardProcess {
         label,
+        pid,
+        runtime,
         shutdown: Some(shutdown),
         task,
     }))
@@ -3989,18 +4064,20 @@ async fn cleanup_unready_userspace_wireguard_process(
     child: tokio::process::Child,
     label: String,
     shutdown_timeout: Duration,
-) {
+) -> Option<std::process::ExitStatus> {
     tracing::warn!(
         command = %label,
         "stopping userspace WireGuard process after readiness failure"
     );
     let mut child = child;
-    stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+    stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await
 }
 
 async fn monitor_userspace_wireguard_process(
     mut child: tokio::process::Child,
     label: String,
+    pid: Option<u32>,
+    runtime: Arc<AgentRuntime>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     shutdown_timeout: Duration,
 ) {
@@ -4009,15 +4086,25 @@ async fn monitor_userspace_wireguard_process(
             Ok(Some(status)) => {
                 tracing::warn!(
                     command = %label,
+                    pid = ?pid,
                     %status,
                     "userspace WireGuard process exited unexpectedly"
                 );
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        AgentManagedProcessState::Exited,
+                        pid,
+                        Some(status.to_string()),
+                        None,
+                    )
+                    .await;
                 return;
             }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     command = %label,
+                    pid = ?pid,
                     %error,
                     "failed to inspect userspace WireGuard process"
                 );
@@ -4026,7 +4113,32 @@ async fn monitor_userspace_wireguard_process(
 
         tokio::select! {
             _ = &mut shutdown => {
-                stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        AgentManagedProcessState::Stopping,
+                        pid,
+                        None,
+                        None,
+                    )
+                    .await;
+                let status = stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+                let stopped = status.is_some();
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        if stopped {
+                            AgentManagedProcessState::Stopped
+                        } else {
+                            AgentManagedProcessState::Failed
+                        },
+                        pid,
+                        status.map(|status| status.to_string()),
+                        if stopped {
+                            None
+                        } else {
+                            Some("failed to stop userspace WireGuard process cleanly".to_string())
+                        },
+                    )
+                    .await;
                 return;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -4038,7 +4150,7 @@ async fn stop_userspace_wireguard_child(
     child: &mut tokio::process::Child,
     label: &str,
     shutdown_timeout: Duration,
-) {
+) -> Option<std::process::ExitStatus> {
     match child.try_wait() {
         Ok(Some(status)) => {
             tracing::info!(
@@ -4046,7 +4158,7 @@ async fn stop_userspace_wireguard_child(
                 %status,
                 "userspace WireGuard process already exited"
             );
-            return;
+            return Some(status);
         }
         Ok(None) => {}
         Err(error) => {
@@ -4064,24 +4176,33 @@ async fn stop_userspace_wireguard_child(
             %error,
             "failed to signal userspace WireGuard process shutdown"
         );
-        return;
+        return None;
     }
     match tokio::time::timeout(shutdown_timeout, child.wait()).await {
-        Ok(Ok(status)) => tracing::info!(
-            command = %label,
-            %status,
-            "userspace WireGuard process stopped"
-        ),
-        Ok(Err(error)) => tracing::warn!(
-            command = %label,
-            %error,
-            "failed waiting for userspace WireGuard process shutdown"
-        ),
-        Err(_) => tracing::warn!(
-            command = %label,
-            timeout_seconds = shutdown_timeout.as_secs(),
-            "timed out waiting for userspace WireGuard process shutdown"
-        ),
+        Ok(Ok(status)) => {
+            tracing::info!(
+                command = %label,
+                %status,
+                "userspace WireGuard process stopped"
+            );
+            Some(status)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed waiting for userspace WireGuard process shutdown"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                command = %label,
+                timeout_seconds = shutdown_timeout.as_secs(),
+                "timed out waiting for userspace WireGuard process shutdown"
+            );
+            None
+        }
     }
 }
 
@@ -9329,6 +9450,7 @@ mod tests {
                 application: AgentPacketFlowApplication::WireGuard,
                 count: 2,
             }],
+            userspace_wireguard_process: None,
             generated_at: Utc::now(),
         };
         let previous = AgentOtelSnapshot::from(&metrics);
@@ -11356,7 +11478,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         ])?;
 
         if let Command::Agent(args) = cli.command {
-            let error = match start_userspace_wireguard_process(&args).await {
+            let runtime = Arc::new(AgentRuntime::new(
+                AgentNodeState::generate(Utc::now()),
+                ClusterPolicy::default(),
+            ));
+            let error = match start_userspace_wireguard_process(&args, runtime.clone()).await {
                 Ok(Some(process)) => {
                     process.shutdown().await;
                     anyhow::bail!("unexpected ready userspace WireGuard process")
@@ -11378,6 +11504,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 wait_for_process_absent(pid, Duration::from_secs(2)).await,
                 "userspace WireGuard child process {pid} was left running after readiness failure"
             );
+            let status = runtime
+                .userspace_wireguard_process_status()
+                .await
+                .context("missing userspace WireGuard process status")?;
+            assert_eq!(status.state, AgentManagedProcessState::Failed);
+            assert_eq!(status.pid, Some(pid));
+            assert!(status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not expose interface ipars0 within 1 seconds"));
             let _ = std::fs::remove_dir_all(&temp_dir);
             return Ok(());
         }
@@ -11410,9 +11547,15 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .context("failed to start monitor test child")?;
         let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
         let task = tokio::spawn(monitor_userspace_wireguard_process(
             child,
             "monitor-test".to_string(),
+            Some(pid),
+            runtime.clone(),
             shutdown_rx,
             Duration::from_secs(1),
         ));
@@ -11423,7 +11566,55 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             wait_for_process_absent(pid, Duration::from_secs(2)).await,
             "userspace WireGuard monitor child process {pid} was left running after shutdown"
         );
+        let status = runtime
+            .userspace_wireguard_process_status()
+            .await
+            .context("missing userspace WireGuard process status")?;
+        assert_eq!(status.state, AgentManagedProcessState::Stopped);
+        assert_eq!(status.pid, Some(pid));
+        assert!(status.exit_status.is_some());
         let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_monitor_records_unexpected_exit() -> anyhow::Result<()> {
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start monitor exit test child")?;
+        let pid = child.id();
+        let (_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        monitor_userspace_wireguard_process(
+            child,
+            "monitor-exit-test".to_string(),
+            pid,
+            runtime.clone(),
+            shutdown_rx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let status = runtime
+            .userspace_wireguard_process_status()
+            .await
+            .context("missing userspace WireGuard process status")?;
+        assert_eq!(status.state, AgentManagedProcessState::Exited);
+        assert_eq!(status.pid, pid);
+        assert!(status
+            .exit_status
+            .as_deref()
+            .unwrap_or_default()
+            .contains('7'));
         Ok(())
     }
 
