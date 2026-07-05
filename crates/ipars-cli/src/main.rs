@@ -390,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Docker {
             command: DockerCommand::Install(args),
-        } => print_json(&docker_install_plan(args))?,
+        } => print_json(&docker_install_plan(args)?)?,
         Command::K8s {
             command: K8sCommand::Install(args),
         } => print_json(&k8s_install_plan(args)?)?,
@@ -1362,7 +1362,8 @@ struct InstallEnvironment {
     value: String,
 }
 
-fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
+fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
+    validate_docker_install_args(&args)?;
     let compose_file = args.compose_file.display().to_string();
     let compose_prefix = format!(
         "docker compose -p {} -f {}",
@@ -1395,7 +1396,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
         notes.push("Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
     }
 
-    InstallPlan {
+    Ok(InstallPlan {
         platform: "docker-compose".to_string(),
         manifest: compose_file,
         commands: vec![
@@ -1410,7 +1411,40 @@ fn docker_install_plan(args: DockerInstallArgs) -> InstallPlan {
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
         notes,
+    })
+}
+
+fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    if !args.docker_discover_networks && !args.docker_networks.is_empty() {
+        anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
+    if args.docker_discover_networks && !args.docker_container_cidrs.is_empty() {
+        anyhow::bail!(
+            "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
+        );
+    }
+    for filter in &args.docker_networks {
+        validate_docker_network_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
+    if filter.is_empty() {
+        anyhow::bail!("Docker network filter cannot be empty");
+    }
+    if filter.len() > 255 {
+        anyhow::bail!("Docker network filter `{filter}` exceeds 255 bytes");
+    }
+    if !filter
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "Docker network filter `{filter}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
 }
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
@@ -2316,7 +2350,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_install_plan_lists_compose_commands_and_requirements() {
+    fn docker_install_plan_lists_compose_commands_and_requirements() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
@@ -2327,7 +2361,7 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
-        });
+        })?;
 
         assert_eq!(plan.platform, "docker-compose");
         assert_eq!(plan.manifest, "ops/compose.yaml");
@@ -2349,6 +2383,7 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
+        Ok(())
     }
 
     #[test]
@@ -2362,8 +2397,8 @@ mod tests {
             docker_api_socket: None,
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_host_interface: "br-edge".to_string(),
-            docker_container_cidrs: vec!["172.20.0.0/16".parse()?, "172.21.0.0/16".parse()?],
-        });
+            docker_container_cidrs: Vec::new(),
+        })?;
 
         assert!(plan
             .prerequisites
@@ -2395,12 +2430,71 @@ mod tests {
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
-            Some("172.20.0.0/16,172.21.0.0/16")
+            None
         );
         assert!(plan
             .notes
             .iter()
             .any(|note| note.contains("userspace WireGuard backend")));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rejects_ambiguous_or_unused_docker_network_settings(
+    ) -> anyhow::Result<()> {
+        let ambiguous = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string()],
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+        }) {
+            Ok(_) => anyhow::bail!("ambiguous Docker install settings should be rejected"),
+            Err(error) => error,
+        };
+        assert!(ambiguous
+            .to_string()
+            .contains("cannot be combined with explicit --docker-container-cidr"));
+
+        let unused_filter = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: vec!["edge_default".to_string()],
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+        }) {
+            Ok(_) => anyhow::bail!("unused Docker network filter should be rejected"),
+            Err(error) => error,
+        };
+        assert!(unused_filter
+            .to_string()
+            .contains("--docker-network requires --docker-discover-networks"));
+
+        let invalid_filter = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: true,
+            docker_networks: vec!["edge/default".to_string()],
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+        }) {
+            Ok(_) => anyhow::bail!("invalid Docker network filter should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_filter
+            .to_string()
+            .contains("must contain only ASCII letters"));
         Ok(())
     }
 
@@ -2505,8 +2599,6 @@ mod tests {
             "compose-edge",
             "--docker-host-interface",
             "br-edge",
-            "--docker-container-cidr",
-            "172.20.0.0/16",
         ])?;
         if let Command::Docker {
             command: DockerCommand::Install(args),
@@ -2526,7 +2618,7 @@ mod tests {
                 Some("compose-edge")
             );
             assert_eq!(args.docker_host_interface, "br-edge");
-            assert_eq!(args.docker_container_cidrs, vec!["172.20.0.0/16".parse()?]);
+            assert!(args.docker_container_cidrs.is_empty());
         } else {
             anyhow::bail!("expected docker install command");
         }

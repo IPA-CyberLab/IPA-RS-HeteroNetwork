@@ -944,6 +944,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         validate_linux_interface_name(&args.docker_host_interface)?;
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
+        } else if !args.docker_networks.is_empty() {
+            anyhow::bail!("--docker-network requires --docker-discover-networks");
         }
     }
     if let Some(namespace) = args.linux_netns.as_deref() {
@@ -8593,6 +8595,37 @@ invalid no-destination-here
             assert!(error
                 .to_string()
                 .contains("cannot be combined with explicit --docker-container-cidr"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_network_filters_require_api_discovery() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-network",
+            "compose_default",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => {
+                    anyhow::bail!("Docker network filter without discovery should be rejected")
+                }
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--docker-network requires --docker-discover-networks"));
             return Ok(());
         }
 
