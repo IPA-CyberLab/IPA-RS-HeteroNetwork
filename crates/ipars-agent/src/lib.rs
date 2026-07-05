@@ -1104,10 +1104,7 @@ impl AgentRuntime {
             return None;
         }
 
-        let session = self.relay_session(peer).await?;
-        if now >= session.expires_at {
-            return None;
-        }
+        let session = self.active_relay_session(peer, now).await?;
         if path.relay_node.as_ref() != Some(&session.relay_node) {
             return None;
         }
@@ -3345,6 +3342,63 @@ mod tests {
                     std::time::Duration::from_secs(60),
                 )
                 .await
+        );
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_relay_forwarder_endpoint_uses_supplied_time_for_expiry() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let local_id = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        let relay_node = NodeId::from_string("relay-a");
+        let forwarder_endpoint = SocketAddr::from(([127, 0, 0, 1], 50000));
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(relay_node.clone()),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: now,
+                pinned: false,
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node,
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret-a".to_string(),
+                expires_at: now + ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(peer.clone(), forwarder_endpoint)
+            .await;
+
+        assert_eq!(
+            runtime
+                .relay_forwarder_endpoint_for_peer(&peer, now, None)
+                .await,
+            Some(forwarder_endpoint)
+        );
+        assert_eq!(
+            runtime
+                .relay_forwarder_endpoint_for_peer(&peer, now + ChronoDuration::seconds(2), None)
+                .await,
+            None
         );
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
