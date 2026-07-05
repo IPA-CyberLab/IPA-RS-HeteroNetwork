@@ -150,6 +150,22 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_fresh_nat_classifications_by_strategy Number of fresh signal NAT classifications by traversal strategy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_fresh_nat_classifications_by_strategy gauge"
+    );
+    for strategy_count in &metrics.fresh_nat_classification_strategy_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_signal_fresh_nat_classifications_by_strategy{{strategy=\"{}\"}} {}",
+            strategy_count.strategy.as_str(),
+            strategy_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_health_reports Number of signal health reports stored by state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_signal_health_reports gauge");
@@ -363,7 +379,7 @@ mod tests {
     };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
-        NodeRecord, Role, TokenPolicy, VpnIp,
+        NatTraversalStrategy, NodeRecord, Role, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -487,6 +503,12 @@ mod tests {
         assert_eq!(metrics.node_count, 2);
         assert_eq!(metrics.relay_candidate_count, 0);
         assert_eq!(metrics.stale_nat_classification_count, 0);
+        assert!(metrics
+            .fresh_nat_classification_strategy_counts
+            .iter()
+            .any(
+                |entry| entry.strategy == NatTraversalStrategy::DirectCandidate && entry.count == 0
+            ));
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
         assert_eq!(metrics.nat_classification_ttl_seconds, 300);
@@ -514,6 +536,9 @@ mod tests {
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_nat_classification_ttl_seconds 300"));
+        assert!(body.contains(
+            "ipars_signal_fresh_nat_classifications_by_strategy{strategy=\"direct_candidate\"} 0"
+        ));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
         assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
         assert!(

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use ipars_types::api::{
-    PathStateCount, SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    NatTraversalStrategyCount, PathStateCount, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
@@ -283,6 +283,11 @@ impl SignalRegistry {
                 !nat_classification_is_fresh(classification, now, nat_classification_ttl_seconds)
             })
             .count();
+        let fresh_nat_classification_strategy_counts = nat_classification_strategy_counts(
+            &nat_classifications,
+            now,
+            nat_classification_ttl_seconds,
+        );
 
         let relay_candidate_count = nodes
             .values()
@@ -301,6 +306,7 @@ impl SignalRegistry {
             relay_candidate_count,
             nat_classification_count: nat_classifications.len(),
             stale_nat_classification_count,
+            fresh_nat_classification_strategy_counts,
             health_report_count: health.len(),
             healthy_node_count,
             degraded_node_count,
@@ -363,6 +369,26 @@ impl SignalRegistry {
         })
         .collect()
     }
+}
+
+fn nat_classification_strategy_counts(
+    classifications: &BTreeMap<NodeId, NatClassification>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Vec<NatTraversalStrategyCount> {
+    NatTraversalStrategy::ALL
+        .into_iter()
+        .map(|strategy| NatTraversalStrategyCount {
+            strategy,
+            count: classifications
+                .values()
+                .filter(|classification| {
+                    classification.strategy == strategy
+                        && nat_classification_is_fresh(classification, now, ttl_seconds)
+                })
+                .count(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -968,6 +994,10 @@ mod tests {
         let metrics = registry.metrics().await;
         assert_eq!(metrics.nat_classification_count, 1);
         assert_eq!(metrics.stale_nat_classification_count, 1);
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::RelayPreferred),
+            0
+        );
         assert_eq!(metrics.nat_classification_ttl_seconds, 30);
         Ok(())
     }
@@ -1059,6 +1089,14 @@ mod tests {
         assert_eq!(stale_metrics.relay_candidate_count, 0);
         assert_eq!(stale_metrics.nat_classification_count, 1);
         assert_eq!(stale_metrics.stale_nat_classification_count, 0);
+        assert_eq!(
+            signal_nat_strategy_count(&stale_metrics, NatTraversalStrategy::RelayPreferred),
+            1
+        );
+        assert_eq!(
+            signal_nat_strategy_count(&stale_metrics, NatTraversalStrategy::CoordinatedHolePunch),
+            0
+        );
         assert_eq!(stale_metrics.health_report_count, 3);
         assert_eq!(stale_metrics.healthy_node_count, 3);
         assert_eq!(stale_metrics.stale_health_report_count, 1);
@@ -1235,6 +1273,18 @@ mod tests {
             .path_negotiation_state_counts
             .iter()
             .find(|entry| entry.state == state)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
+    fn signal_nat_strategy_count(
+        metrics: &SignalMetricsResponse,
+        strategy: NatTraversalStrategy,
+    ) -> usize {
+        metrics
+            .fresh_nat_classification_strategy_counts
+            .iter()
+            .find(|entry| entry.strategy == strategy)
             .map(|entry| entry.count)
             .unwrap_or(0)
     }

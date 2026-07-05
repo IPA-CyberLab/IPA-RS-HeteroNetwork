@@ -240,6 +240,24 @@ pub enum NatTraversalStrategy {
     InsufficientData,
 }
 
+impl NatTraversalStrategy {
+    pub const ALL: [Self; 4] = [
+        Self::DirectCandidate,
+        Self::CoordinatedHolePunch,
+        Self::RelayPreferred,
+        Self::InsufficientData,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectCandidate => "direct_candidate",
+            Self::CoordinatedHolePunch => "coordinated_hole_punch",
+            Self::RelayPreferred => "relay_preferred",
+            Self::InsufficientData => "insufficient_data",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NatClassification {
     pub local_addr: SocketAddr,
@@ -1066,6 +1084,8 @@ pub mod api {
         pub nat_classification_count: usize,
         #[serde(default)]
         pub stale_nat_classification_count: usize,
+        #[serde(default)]
+        pub fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
         pub health_report_count: usize,
         pub healthy_node_count: usize,
         pub degraded_node_count: usize,
@@ -1670,6 +1690,12 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PathStateCount {
         pub state: PathState,
+        pub count: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NatTraversalStrategyCount {
+        pub strategy: NatTraversalStrategy,
         pub count: usize,
     }
 
