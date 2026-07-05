@@ -2395,6 +2395,73 @@ mod tests {
     }
 
     #[test]
+    fn nat_classification_detects_address_dependent_mapping() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 0, 0, 10], 50_000));
+        let first_stun = std::net::SocketAddr::from(([198, 51, 100, 1], 3478));
+        let second_stun = std::net::SocketAddr::from(([198, 51, 100, 2], 3478));
+        let classification = NatClassification::from_observations_with_filtering(
+            local_addr,
+            vec![
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: second_stun,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_001)),
+                    observed_at: assessed_at,
+                },
+            ],
+            vec![
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::SameAddress,
+                    response_origin: Some(first_stun),
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::ChangePort,
+                    response_origin: Some(std::net::SocketAddr::from(([198, 51, 100, 1], 3479))),
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::ChangeAddressAndPort,
+                    response_origin: None,
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.mapping_behavior,
+            NatMappingBehavior::AddressDependent
+        );
+        assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::AddressDependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::CoordinatedHolePunch
+        );
+        assert_eq!(classification.observed_endpoint, None);
+        assert!(classification.confidence > 0.5);
+    }
+
+    #[test]
     fn nat_classification_detects_no_nat_when_reflexive_matches_local() {
         let assessed_at = Utc::now();
         let local_addr = std::net::SocketAddr::from(([192, 0, 2, 10], 50_000));

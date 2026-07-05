@@ -1404,6 +1404,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_uses_nat_traversal_for_address_dependent_nat() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let nat = address_dependent_hole_punch_nat();
+        registry.upsert_node(source.clone()).await?;
+        registry
+            .upsert_node_with_nat(target.clone(), Some(nat.clone()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: Some(nat),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        assert!(response.relay_candidates.is_empty());
+        let metrics = registry.metrics().await;
+        assert_eq!(
+            signal_path_state_count(&metrics, PathState::DirectNatTraversal),
+            1
+        );
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::CoordinatedHolePunch),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_blocks_low_confidence_nat_classification_for_negotiation(
     ) -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy {
@@ -1885,6 +1920,20 @@ mod tests {
             filtering_observations: Vec::new(),
             strategy: NatTraversalStrategy::CoordinatedHolePunch,
             confidence,
+            assessed_at: Utc::now(),
+        }
+    }
+
+    fn address_dependent_hole_punch_nat() -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::AddressDependent,
+            filtering_behavior: ipars_types::NatFilteringBehavior::AddressDependent,
+            observed_endpoint: None,
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::CoordinatedHolePunch,
+            confidence: 0.85,
             assessed_at: Utc::now(),
         }
     }
