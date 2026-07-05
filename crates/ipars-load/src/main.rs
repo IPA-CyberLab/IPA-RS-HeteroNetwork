@@ -43,6 +43,9 @@ const DAEMON_LOG_TAIL_LINES: usize = 40;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
+const MAX_DAEMON_READINESS_TIMEOUT_SECONDS: u64 = 3_600;
+const DEFAULT_DAEMON_HTTP_READINESS_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS: u64 = 15;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -71,6 +74,12 @@ struct Cli {
 
     #[arg(long)]
     daemon_keep_runtime_dir: bool,
+
+    #[arg(long, default_value_t = DEFAULT_DAEMON_HTTP_READINESS_TIMEOUT_SECONDS)]
+    daemon_http_readiness_timeout_seconds: u64,
+
+    #[arg(long, default_value_t = DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS)]
+    daemon_agent_readiness_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -118,6 +127,8 @@ struct DaemonLoadOptions {
     control_plane_processes: usize,
     agent_processes: usize,
     keep_runtime_dir: bool,
+    http_readiness_timeout: Duration,
+    agent_readiness_timeout: Duration,
     relay_options: RelayLoadOptions,
 }
 
@@ -248,12 +259,22 @@ async fn main() -> anyhow::Result<()> {
             run_daemon_scenario(
                 scenario,
                 &cli.iparsd_bin,
-                cli.daemon_control_plane_processes,
-                cli.daemon_agent_processes,
-                cli.daemon_keep_runtime_dir,
-                RelayLoadOptions {
-                    packets_per_session: cli.relay_packets_per_session,
-                    payload_bytes: cli.relay_payload_bytes,
+                DaemonLoadOptions {
+                    control_plane_processes: cli.daemon_control_plane_processes,
+                    agent_processes: cli.daemon_agent_processes,
+                    keep_runtime_dir: cli.daemon_keep_runtime_dir,
+                    http_readiness_timeout: daemon_timeout_from_seconds(
+                        cli.daemon_http_readiness_timeout_seconds,
+                        "--daemon-http-readiness-timeout-seconds",
+                    )?,
+                    agent_readiness_timeout: daemon_timeout_from_seconds(
+                        cli.daemon_agent_readiness_timeout_seconds,
+                        "--daemon-agent-readiness-timeout-seconds",
+                    )?,
+                    relay_options: RelayLoadOptions {
+                        packets_per_session: cli.relay_packets_per_session,
+                        payload_bytes: cli.relay_payload_bytes,
+                    },
                 },
             )
             .await?
@@ -710,15 +731,20 @@ async fn run_relay_udp_scenario(
 async fn run_daemon_scenario(
     scenario: Scenario,
     iparsd_bin: &Path,
-    requested_control_plane_processes: usize,
-    requested_agent_processes: usize,
-    keep_runtime_dir: bool,
-    relay_options: RelayLoadOptions,
+    options: DaemonLoadOptions,
 ) -> anyhow::Result<LoadReport> {
-    let relay_options = relay_options.validate()?;
+    let relay_options = options.relay_options.validate()?;
     let control_plane_processes =
-        validate_daemon_control_plane_processes(requested_control_plane_processes)?;
-    let agent_processes = validate_daemon_agent_processes(requested_agent_processes, scenario)?;
+        validate_daemon_control_plane_processes(options.control_plane_processes)?;
+    let agent_processes = validate_daemon_agent_processes(options.agent_processes, scenario)?;
+    let http_readiness_timeout = validate_daemon_timeout(
+        options.http_readiness_timeout,
+        "--daemon-http-readiness-timeout-seconds",
+    )?;
+    let agent_readiness_timeout = validate_daemon_timeout(
+        options.agent_readiness_timeout,
+        "--daemon-agent-readiness-timeout-seconds",
+    )?;
     let issuer = IdentityKeyPair::generate();
     let key_id = KeyId::from_string("load-key");
     let cluster_id = ClusterId::from_string(format!("load-daemon-{:?}", scenario.name));
@@ -731,7 +757,9 @@ async fn run_daemon_scenario(
         DaemonLoadOptions {
             control_plane_processes,
             agent_processes,
-            keep_runtime_dir,
+            keep_runtime_dir: options.keep_runtime_dir,
+            http_readiness_timeout,
+            agent_readiness_timeout,
             relay_options,
         },
     )
@@ -937,8 +965,10 @@ async fn run_daemon_scenario(
         relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: services.process_count(),
-        daemon_runtime_dir: keep_runtime_dir.then(|| services.runtime_dir.clone()),
-        daemon_runtime_manifest: keep_runtime_dir.then(|| services.manifest_path()),
+        daemon_runtime_dir: options
+            .keep_runtime_dir
+            .then(|| services.runtime_dir.clone()),
+        daemon_runtime_manifest: options.keep_runtime_dir.then(|| services.manifest_path()),
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
@@ -993,6 +1023,26 @@ fn validate_daemon_control_plane_processes(
         );
     }
     Ok(requested_control_plane_processes)
+}
+
+fn daemon_timeout_from_seconds(seconds: u64, flag: &str) -> anyhow::Result<Duration> {
+    if seconds == 0 {
+        bail!("{flag} must be greater than zero");
+    }
+    if seconds > MAX_DAEMON_READINESS_TIMEOUT_SECONDS {
+        bail!("{flag} must be at most {MAX_DAEMON_READINESS_TIMEOUT_SECONDS} seconds");
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn validate_daemon_timeout(timeout: Duration, flag: &str) -> anyhow::Result<Duration> {
+    if timeout.is_zero() {
+        bail!("{flag} must be greater than zero");
+    }
+    if timeout.as_secs() > MAX_DAEMON_READINESS_TIMEOUT_SECONDS {
+        bail!("{flag} must be at most {MAX_DAEMON_READINESS_TIMEOUT_SECONDS} seconds");
+    }
+    Ok(timeout)
 }
 
 #[derive(Debug, Default)]
@@ -1203,6 +1253,8 @@ struct DaemonRuntimeManifestWorkload {
     scenario_active_pair_count: usize,
     daemon_control_plane_processes: usize,
     daemon_agent_processes: usize,
+    daemon_http_readiness_timeout_seconds: u64,
+    daemon_agent_readiness_timeout_seconds: u64,
     relay_packets_per_session: usize,
     relay_payload_bytes: usize,
 }
@@ -1333,6 +1385,8 @@ impl DaemonProcessGroup {
                 scenario_active_pair_count: scenario.active_pair_count,
                 daemon_control_plane_processes: options.control_plane_processes,
                 daemon_agent_processes: options.agent_processes,
+                daemon_http_readiness_timeout_seconds: options.http_readiness_timeout.as_secs(),
+                daemon_agent_readiness_timeout_seconds: options.agent_readiness_timeout.as_secs(),
                 relay_packets_per_session: options.relay_options.packets_per_session,
                 relay_payload_bytes: options.relay_options.payload_bytes,
             },
@@ -1385,9 +1439,12 @@ impl DaemonProcessGroup {
                 format!("{}/healthz", control_plane_urls[index]),
                 &role,
                 &mut startup.children,
-                &manifest_seed,
-                DaemonRuntimePhase::ControlPlaneStartup,
-                &agent_urls,
+                DaemonHttpReadinessManifestContext {
+                    manifest_seed: &manifest_seed,
+                    phase: DaemonRuntimePhase::ControlPlaneStartup,
+                    agent_urls: &agent_urls,
+                    timeout: options.http_readiness_timeout,
+                },
             )
             .await?;
         }
@@ -1454,9 +1511,12 @@ impl DaemonProcessGroup {
             format!("{signal_url}/healthz"),
             "signal",
             &mut startup.children,
-            &manifest_seed,
-            DaemonRuntimePhase::ServiceStartup,
-            &agent_urls,
+            DaemonHttpReadinessManifestContext {
+                manifest_seed: &manifest_seed,
+                phase: DaemonRuntimePhase::ServiceStartup,
+                agent_urls: &agent_urls,
+                timeout: options.http_readiness_timeout,
+            },
         )
         .await?;
         wait_for_http_ok_or_manifest_failure(
@@ -1464,9 +1524,12 @@ impl DaemonProcessGroup {
             format!("{relay_http_url}/healthz"),
             "relay",
             &mut startup.children,
-            &manifest_seed,
-            DaemonRuntimePhase::ServiceStartup,
-            &agent_urls,
+            DaemonHttpReadinessManifestContext {
+                manifest_seed: &manifest_seed,
+                phase: DaemonRuntimePhase::ServiceStartup,
+                agent_urls: &agent_urls,
+                timeout: options.http_readiness_timeout,
+            },
         )
         .await?;
 
@@ -1527,9 +1590,12 @@ impl DaemonProcessGroup {
                 ),
                 "agent",
                 &mut startup.children,
-                &manifest_seed,
-                DaemonRuntimePhase::AgentStartup,
-                &agent_urls,
+                DaemonHttpReadinessManifestContext {
+                    manifest_seed: &manifest_seed,
+                    phase: DaemonRuntimePhase::AgentStartup,
+                    agent_urls: &agent_urls,
+                    timeout: options.http_readiness_timeout,
+                },
             )
             .await?;
         }
@@ -1545,6 +1611,7 @@ impl DaemonProcessGroup {
             &agent_urls,
             &mut startup.children,
             &manifest_seed,
+            options.agent_readiness_timeout,
         )
         .await?;
         manifest_seed.write(
@@ -1920,9 +1987,11 @@ async fn wait_for_http_ok(
     url: String,
     context: &str,
     children: &mut [DaemonChild],
+    timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut last_error = None;
-    for _ in 0..100 {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         ensure_daemon_children_running(children)?;
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
@@ -1936,7 +2005,11 @@ async fn wait_for_http_ok(
                 last_error = Some(error.into());
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
     }
     let error = last_error.unwrap_or_else(|| anyhow::anyhow!("{context} readiness timed out"));
     bail!(
@@ -1945,22 +2018,27 @@ async fn wait_for_http_ok(
     )
 }
 
+struct DaemonHttpReadinessManifestContext<'a> {
+    manifest_seed: &'a DaemonRuntimeManifestSeed,
+    phase: DaemonRuntimePhase,
+    agent_urls: &'a [String],
+    timeout: Duration,
+}
+
 async fn wait_for_http_ok_or_manifest_failure(
     client: &reqwest::Client,
     url: String,
     context: &str,
     children: &mut [DaemonChild],
-    manifest_seed: &DaemonRuntimeManifestSeed,
-    phase: DaemonRuntimePhase,
-    agent_urls: &[String],
+    manifest_context: DaemonHttpReadinessManifestContext<'_>,
 ) -> anyhow::Result<()> {
-    match wait_for_http_ok(client, url, context, children).await {
+    match wait_for_http_ok(client, url, context, children, manifest_context.timeout).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Err(manifest_error) = write_daemon_manifest_after_startup_failure(
-                manifest_seed,
-                phase,
-                agent_urls,
+                manifest_context.manifest_seed,
+                manifest_context.phase,
+                manifest_context.agent_urls,
                 children,
             ) {
                 bail!(
@@ -1978,9 +2056,11 @@ async fn wait_for_daemon_agents_ready(
     signal_url: &str,
     agent_urls: &[String],
     children: &mut [DaemonChild],
+    timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut last_error = None;
-    for _ in 0..150 {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         ensure_daemon_children_running(children)?;
         match daemon_agent_statuses(client, agent_urls).await {
             Ok(statuses) => match check_daemon_agent_control_and_signal_readiness(
@@ -1996,7 +2076,11 @@ async fn wait_for_daemon_agents_ready(
             },
             Err(error) => last_error = Some(error),
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
     }
     let error = last_error.unwrap_or_else(|| anyhow::anyhow!("daemon agent readiness timed out"));
     bail!(
@@ -2012,9 +2096,17 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
     agent_urls: &[String],
     children: &mut [DaemonChild],
     manifest_seed: &DaemonRuntimeManifestSeed,
+    timeout: Duration,
 ) -> anyhow::Result<()> {
-    match wait_for_daemon_agents_ready(client, control_plane_urls, signal_url, agent_urls, children)
-        .await
+    match wait_for_daemon_agents_ready(
+        client,
+        control_plane_urls,
+        signal_url,
+        agent_urls,
+        children,
+        timeout,
+    )
+    .await
     {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -2752,6 +2844,45 @@ mod tests {
     }
 
     #[test]
+    fn daemon_readiness_timeouts_reject_zero_seconds() -> anyhow::Result<()> {
+        let zero_http =
+            match daemon_timeout_from_seconds(0, "--daemon-http-readiness-timeout-seconds") {
+                Ok(_) => bail!("zero daemon HTTP readiness timeout should fail validation"),
+                Err(error) => error.to_string(),
+            };
+        assert!(zero_http.contains("--daemon-http-readiness-timeout-seconds"));
+
+        let zero_agent = match validate_daemon_timeout(
+            Duration::ZERO,
+            "--daemon-agent-readiness-timeout-seconds",
+        ) {
+            Ok(_) => bail!("zero daemon agent readiness timeout should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(zero_agent.contains("--daemon-agent-readiness-timeout-seconds"));
+
+        let oversized =
+            match daemon_timeout_from_seconds(3_601, "--daemon-http-readiness-timeout-seconds") {
+                Ok(_) => bail!("oversized daemon HTTP readiness timeout should fail validation"),
+                Err(error) => error.to_string(),
+            };
+        assert!(oversized.contains("at most 3600 seconds"));
+
+        assert_eq!(
+            daemon_timeout_from_seconds(7, "--daemon-http-readiness-timeout-seconds")?,
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            validate_daemon_timeout(
+                Duration::from_secs(11),
+                "--daemon-agent-readiness-timeout-seconds"
+            )?,
+            Duration::from_secs(11)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn daemon_control_plane_summary_reports_endpoint_ranges() -> anyhow::Result<()> {
         let consistent = ControlPlaneHealthSummary::from_metrics(&[
             control_plane_metrics(2, 3, 0, 0),
@@ -3224,12 +3355,16 @@ mod tests {
         let report = run_daemon_scenario(
             Scenario::from_name(ScenarioName::Three),
             &iparsd_bin,
-            2,
-            2,
-            false,
-            RelayLoadOptions {
-                packets_per_session: 1,
-                payload_bytes: 64,
+            DaemonLoadOptions {
+                control_plane_processes: 2,
+                agent_processes: 2,
+                keep_runtime_dir: false,
+                http_readiness_timeout: Duration::from_secs(5),
+                agent_readiness_timeout: Duration::from_secs(15),
+                relay_options: RelayLoadOptions {
+                    packets_per_session: 1,
+                    payload_bytes: 64,
+                },
             },
         )
         .await?;
@@ -3425,6 +3560,8 @@ mod tests {
             scenario_active_pair_count: 6,
             daemon_control_plane_processes: 2,
             daemon_agent_processes: 2,
+            daemon_http_readiness_timeout_seconds: 5,
+            daemon_agent_readiness_timeout_seconds: 15,
             relay_packets_per_session: 1,
             relay_payload_bytes: 64,
         }
