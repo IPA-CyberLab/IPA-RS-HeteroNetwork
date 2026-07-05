@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ipars_crypto::{verify_heartbeat_request_signature, verify_join_token, CryptoError};
+use ipars_crypto::{
+    validate_identity_public_key_b64, verify_heartbeat_request_signature, verify_join_token,
+    CryptoError,
+};
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
     RegisterNodeRequest, RegisterNodeResponse, RelayMap,
@@ -34,6 +37,8 @@ pub enum ControlPlaneError {
     NodeSignatureRejected { node_id: NodeId, reason: String },
     #[error("node {node_id} heartbeat update rejected: {reason}")]
     NodeUpdateRejected { node_id: NodeId, reason: String },
+    #[error("node {node_id} registration rejected: {reason}")]
+    NodeRegistrationRejected { node_id: NodeId, reason: String },
     #[error("node not found: {0}")]
     NodeNotFound(NodeId),
     #[error("no available VPN IP in pool")]
@@ -450,6 +455,7 @@ where
         if !claims.policy.allow_join {
             return Err(ControlPlaneError::JoinDenied);
         }
+        validate_registration_request(&request)?;
         for route in &request.requested_routes {
             if !route_allowed(route, &claims) {
                 return Err(ControlPlaneError::RouteDenied(route.id.clone()));
@@ -962,6 +968,42 @@ fn relay_capability_allowed(
         .transpose()
 }
 
+fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), ControlPlaneError> {
+    validate_identity_public_key_b64(&request.identity_public_key).map_err(|error| {
+        ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!("identity public key is invalid: {error}"),
+        }
+    })?;
+    if let Some(candidate) = request
+        .candidates
+        .iter()
+        .find(|candidate| candidate.node_id != request.node_id)
+    {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "candidate belongs to node {} instead of {}",
+                candidate.node_id, request.node_id
+            ),
+        });
+    }
+    if let Some(route) = request
+        .requested_routes
+        .iter()
+        .find(|route| route.advertised_by != request.node_id)
+    {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "route {} is advertised by node {} instead of {}",
+                route.id, route.advertised_by, request.node_id
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn token_key(cluster_id: &ClusterId, nonce: &str) -> String {
     format!("{cluster_id}:{nonce}")
 }
@@ -1274,9 +1316,10 @@ mod tests {
             Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
         );
         let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let identity = identity_for_node("node-a");
         let request = RegisterNodeRequest {
             node_id: NodeId::from_string("node-a"),
-            identity_public_key: "identity".to_string(),
+            identity_public_key: identity.public_key_b64(),
             wireguard_public_key: "wg".to_string(),
             candidates: Vec::new(),
             relay_capability: Some(relay_capability()),
@@ -1482,6 +1525,75 @@ mod tests {
         };
 
         assert!(matches!(error, ControlPlaneError::RouteDenied(route) if route == "route-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_unowned_candidates_and_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+
+        let mut candidate_request = registration_request("node-a");
+        candidate_request.candidates = vec![candidate("node-b")];
+        let error = match plane
+            .register_with_claims(claims(cluster_id.clone()), candidate_request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful candidate registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+
+        let mut route_request = registration_request("node-a");
+        route_request.requested_routes = vec![route("route-b", "10.42.1.0/24", "node-b")?];
+        let mut route_claims = claims(cluster_id);
+        route_claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        let error = match plane
+            .register_with_claims(route_claims, route_request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful route registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_identity_public_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.identity_public_key = "not-valid-base64".to_string();
+
+        let error = match plane
+            .register_with_claims(claims(cluster_id), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful identity registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
         Ok(())
     }
 

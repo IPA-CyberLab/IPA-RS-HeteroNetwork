@@ -316,7 +316,8 @@ impl IntoResponse for ApiError {
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)
             | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,
-            ControlPlaneError::NodeUpdateRejected { .. } => StatusCode::FORBIDDEN,
+            ControlPlaneError::NodeUpdateRejected { .. }
+            | ControlPlaneError::NodeRegistrationRejected { .. } => StatusCode::FORBIDDEN,
             ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
             ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
                 StatusCode::SERVICE_UNAVAILABLE

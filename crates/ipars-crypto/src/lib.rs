@@ -154,6 +154,13 @@ pub fn verify_heartbeat_request_signature(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> {
+    let key_bytes = decode_32(value)?;
+    VerifyingKey::from_bytes(&key_bytes)
+        .map(|_| ())
+        .map_err(|_| CryptoError::InvalidEd25519Key)
+}
+
 pub fn node_id_from_public_key(public_key: &[u8]) -> NodeId {
     let digest = Sha256::digest(public_key);
     NodeId::from_string(format!("node-{}", hex::encode(&digest[..16])))
@@ -227,6 +234,11 @@ mod tests {
 
         assert_eq!(key.node_id(), restored.node_id());
         assert_eq!(key.public_key_b64(), restored.public_key_b64());
+        validate_identity_public_key_b64(&key.public_key_b64())?;
+        assert!(matches!(
+            validate_identity_public_key_b64("not-valid-base64"),
+            Err(CryptoError::Base64(_))
+        ));
         Ok(())
     }
 
