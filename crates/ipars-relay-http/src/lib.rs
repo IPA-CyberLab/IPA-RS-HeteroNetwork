@@ -123,6 +123,16 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_relay_e2e_only Whether relay forwarding is restricted to end-to-end encrypted opaque payloads."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_relay_e2e_only gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_e2e_only{{relay_node=\"{relay_node}\"}} {}",
+        u8::from(status.capability.e2e_only)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_relay_datagrams_received_total Total UDP relay datagrams received."
     );
     prometheus_line!(
@@ -369,6 +379,7 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_relay_active_sessions"));
         assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_e2e_only{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
         assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains(

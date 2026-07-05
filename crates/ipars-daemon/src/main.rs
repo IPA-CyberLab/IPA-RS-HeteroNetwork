@@ -1919,6 +1919,7 @@ struct RelayOtelMetrics {
     available_sessions: Gauge<u64>,
     max_mbps: Gauge<u64>,
     enabled_by_policy: Gauge<u64>,
+    e2e_only: Gauge<u64>,
     health: Gauge<u64>,
 }
 
@@ -1978,6 +1979,12 @@ impl RelayOtelMetrics {
                 .u64_gauge("ipars.relay.enabled_by_policy")
                 .with_description("Whether relay admission is enabled by policy.")
                 .build(),
+            e2e_only: meter
+                .u64_gauge("ipars.relay.e2e_only")
+                .with_description(
+                    "Whether relay forwarding is restricted to end-to-end encrypted opaque payloads.",
+                )
+                .build(),
             health: meter
                 .u64_gauge("ipars.relay.health")
                 .with_description("Relay health state as a labeled gauge.")
@@ -2022,6 +2029,8 @@ impl RelayOtelMetrics {
             .record(status.capability.max_mbps as u64, &relay_attrs);
         self.enabled_by_policy
             .record(u64::from(status.capability.enabled_by_policy), &relay_attrs);
+        self.e2e_only
+            .record(u64::from(status.capability.e2e_only), &relay_attrs);
         for state in [
             HealthState::Healthy,
             HealthState::Degraded,
