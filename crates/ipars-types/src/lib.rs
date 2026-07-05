@@ -1287,6 +1287,28 @@ pub mod api {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RelayAdmissionFailureReason {
+        Unauthorized,
+        AdmissionDenied,
+        InvalidSessionCredential,
+        SocketError,
+        InternalError,
+    }
+
+    impl RelayAdmissionFailureReason {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Unauthorized => "unauthorized",
+                Self::AdmissionDenied => "admission_denied",
+                Self::InvalidSessionCredential => "invalid_session_credential",
+                Self::SocketError => "socket_error",
+                Self::InternalError => "internal_error",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RelayDataplaneMetrics {
         pub datagrams_received: u64,
@@ -1334,6 +1356,8 @@ pub mod api {
         pub admission_success_count: u64,
         #[serde(default)]
         pub admission_failure_count: u64,
+        #[serde(default)]
+        pub admission_failures_by_reason: BTreeMap<RelayAdmissionFailureReason, u64>,
         #[serde(default)]
         pub dataplane: RelayDataplaneMetrics,
     }

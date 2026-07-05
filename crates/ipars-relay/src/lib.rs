@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use ipars_types::api::{
-    RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
-    RelayStatusResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
 };
 use ipars_types::{HealthState, NodeId, RelayCapability};
 use thiserror::Error;
@@ -424,6 +425,21 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
     }
 }
 
+fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFailureReason {
+    match error {
+        RelayError::AdmissionDenied => RelayAdmissionFailureReason::AdmissionDenied,
+        RelayError::InvalidSessionCredential => {
+            RelayAdmissionFailureReason::InvalidSessionCredential
+        }
+        RelayError::Socket(_) => RelayAdmissionFailureReason::SocketError,
+        RelayError::UnknownSession
+        | RelayError::SessionExpired
+        | RelayError::RateLimited
+        | RelayError::MalformedFrame
+        | RelayError::FrameTooLarge => RelayAdmissionFailureReason::InternalError,
+    }
+}
+
 fn validate_relay_session_admission(
     session_id: &RelaySessionId,
     session_token: &str,
@@ -522,6 +538,7 @@ pub struct RelayService {
     admission_attempts: AtomicU64,
     admission_successes: AtomicU64,
     admission_failures: AtomicU64,
+    admission_failures_by_reason: Mutex<BTreeMap<RelayAdmissionFailureReason, u64>>,
 }
 
 impl RelayService {
@@ -542,6 +559,7 @@ impl RelayService {
             admission_attempts: AtomicU64::new(0),
             admission_successes: AtomicU64::new(0),
             admission_failures: AtomicU64::new(0),
+            admission_failures_by_reason: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -559,8 +577,8 @@ impl RelayService {
             Ok(_) => {
                 self.admission_successes.fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {
-                self.admission_failures.fetch_add(1, Ordering::Relaxed);
+            Err(error) => {
+                self.record_admission_failure(relay_error_admission_failure_reason(error));
             }
         }
         result
@@ -568,7 +586,24 @@ impl RelayService {
 
     pub fn record_unauthorized_admission_attempt(&self) {
         self.admission_attempts.fetch_add(1, Ordering::Relaxed);
+        self.record_admission_failure(RelayAdmissionFailureReason::Unauthorized);
+    }
+
+    fn record_admission_failure(&self, reason: RelayAdmissionFailureReason) {
         self.admission_failures.fetch_add(1, Ordering::Relaxed);
+        let mut failures_by_reason = self
+            .admission_failures_by_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = failures_by_reason.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn admission_failures_by_reason(&self) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+        self.admission_failures_by_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     async fn admit_inner(
@@ -616,6 +651,7 @@ impl RelayService {
             admission_attempt_count: self.admission_attempts.load(Ordering::Relaxed),
             admission_success_count: self.admission_successes.load(Ordering::Relaxed),
             admission_failure_count: self.admission_failures.load(Ordering::Relaxed),
+            admission_failures_by_reason: self.admission_failures_by_reason(),
             dataplane: table.dataplane_metrics(),
         }
     }
@@ -663,6 +699,7 @@ impl UdpRelay {
 
 #[cfg(test)]
 mod tests {
+    use ipars_types::api::RelayAdmissionFailureReason;
     use ipars_types::RelayCapability;
 
     use super::*;
@@ -1034,6 +1071,12 @@ mod tests {
         assert_eq!(status.admission_attempt_count, 2);
         assert_eq!(status.admission_success_count, 1);
         assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
         Ok(())
     }
 

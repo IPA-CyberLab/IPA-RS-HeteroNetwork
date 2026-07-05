@@ -204,6 +204,21 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_relay_admission_failures_by_reason_total Total relay session admission failures by reason."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_admission_failures_by_reason_total counter"
+    );
+    for (reason, count) in &status.admission_failures_by_reason {
+        prometheus_line!(
+            &mut body,
+            "ipars_relay_admission_failures_by_reason_total{{relay_node=\"{relay_node}\",reason=\"{}\"}} {count}",
+            reason.as_str()
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_relay_datagrams_received_total Total UDP relay datagrams received."
     );
     prometheus_line!(
@@ -421,7 +436,10 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{header, Request};
-    use ipars_types::api::{RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse};
+    use ipars_types::api::{
+        RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+        RelayStatusResponse,
+    };
     use ipars_types::{NodeId, RelayCapability};
     use tower::ServiceExt;
 
@@ -482,6 +500,7 @@ mod tests {
         assert_eq!(response.admission_attempt_count, 1);
         assert_eq!(response.admission_success_count, 1);
         assert_eq!(response.admission_failure_count, 0);
+        assert!(response.admission_failures_by_reason.is_empty());
         assert_eq!(response.dataplane.datagrams_received, 0);
 
         let table = relay.table();
@@ -515,6 +534,7 @@ mod tests {
         assert!(body.contains("ipars_relay_admission_attempts_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_admission_success_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_admission_failures_total{relay_node=\"relay-a\"} 0"));
+        assert!(body.contains("ipars_relay_admission_failures_by_reason_total"));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
         assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains(
@@ -579,6 +599,7 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
         let accepted = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -594,6 +615,27 @@ mod tests {
         assert_eq!(status.admission_attempt_count, 3);
         assert_eq!(status.admission_success_count, 1);
         assert_eq!(status.admission_failure_count, 2);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&2)
+        );
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(metrics.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains(
+            "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"unauthorized\"} 2"
+        ));
         Ok(())
     }
 }

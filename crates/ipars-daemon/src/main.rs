@@ -47,10 +47,10 @@ use ipars_types::api::{
     AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
     AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayForwarderMetrics,
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -2907,6 +2907,7 @@ struct RelayOtelSnapshot {
     admission_attempt_count: u64,
     admission_success_count: u64,
     admission_failure_count: u64,
+    admission_failures_by_reason: BTreeMap<RelayAdmissionFailureReason, u64>,
     dataplane: RelayDataplaneMetrics,
 }
 
@@ -2916,6 +2917,7 @@ impl From<&RelayStatusResponse> for RelayOtelSnapshot {
             admission_attempt_count: status.admission_attempt_count,
             admission_success_count: status.admission_success_count,
             admission_failure_count: status.admission_failure_count,
+            admission_failures_by_reason: status.admission_failures_by_reason.clone(),
             dataplane: status.dataplane.clone(),
         }
     }
@@ -2926,6 +2928,7 @@ struct RelayOtelMetrics {
     admission_attempts: Counter<u64>,
     admission_success: Counter<u64>,
     admission_failures: Counter<u64>,
+    admission_failures_by_reason: Counter<u64>,
     datagrams_received: Counter<u64>,
     datagram_bytes_received: Counter<u64>,
     datagrams_forwarded: Counter<u64>,
@@ -2957,6 +2960,10 @@ impl RelayOtelMetrics {
             admission_failures: meter
                 .u64_counter("ipars.relay.admission.failures")
                 .with_description("Relay session admission failures.")
+                .build(),
+            admission_failures_by_reason: meter
+                .u64_counter("ipars.relay.admission.failures_by_reason")
+                .with_description("Relay session admission failures, by reason.")
                 .build(),
             datagrams_received: meter
                 .u64_counter("ipars.relay.datagrams.received")
@@ -3054,6 +3061,17 @@ impl RelayOtelMetrics {
             self.admission_failures
                 .add(admission_failure_delta, &relay_attrs);
         }
+        let admission_failure_reason_delta = relay_admission_failure_reason_delta(
+            &status.admission_failures_by_reason,
+            previous.map(|snapshot| &snapshot.admission_failures_by_reason),
+        );
+        for (reason, count) in admission_failure_reason_delta {
+            let attrs = [
+                KeyValue::new("relay_node", relay_node.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.admission_failures_by_reason.add(count, &attrs);
+        }
         self.datagrams_received
             .add(delta.datagrams_received, &relay_attrs);
         self.datagram_bytes_received
@@ -3143,6 +3161,24 @@ fn relay_dataplane_delta(
         ),
         drops_by_reason,
     }
+}
+
+fn relay_admission_failure_reason_delta(
+    current: &BTreeMap<RelayAdmissionFailureReason, u64>,
+    previous: Option<&BTreeMap<RelayAdmissionFailureReason, u64>>,
+) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for (reason, current_count) in current {
+        let previous_count = previous
+            .and_then(|previous| previous.get(reason))
+            .copied()
+            .unwrap_or(0);
+        let delta = current_count.saturating_sub(previous_count);
+        if delta > 0 {
+            delta_by_reason.insert(*reason, delta);
+        }
+    }
+    delta_by_reason
 }
 
 fn counter_delta(current: u64, previous: Option<u64>) -> u64 {
@@ -9566,6 +9602,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relay_admission_failure_reason_delta_records_counter_increments() {
+        let mut previous = BTreeMap::new();
+        previous.insert(RelayAdmissionFailureReason::Unauthorized, 2);
+        previous.insert(RelayAdmissionFailureReason::AdmissionDenied, 1);
+        let mut current = previous.clone();
+        current.insert(RelayAdmissionFailureReason::Unauthorized, 5);
+        current.insert(RelayAdmissionFailureReason::InvalidSessionCredential, 1);
+
+        let delta = relay_admission_failure_reason_delta(&current, Some(&previous));
+
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&3)
+        );
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::InvalidSessionCredential),
+            Some(&1)
+        );
+        assert!(!delta.contains_key(&RelayAdmissionFailureReason::AdmissionDenied));
+    }
+
     fn agent_forwarder_metrics(
         peer: &str,
         relay_node: &str,
@@ -10165,6 +10223,7 @@ mod tests {
             admission_attempt_count: 0,
             admission_success_count: 0,
             admission_failure_count: 0,
+            admission_failures_by_reason: BTreeMap::new(),
             dataplane: RelayDataplaneMetrics::default(),
         };
 
