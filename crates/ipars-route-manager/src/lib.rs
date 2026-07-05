@@ -38,6 +38,8 @@ pub enum RouteManagerError {
     InvalidNamespace(String),
     #[error("invalid Docker network intent: {0}")]
     InvalidDockerNetworkIntent(String),
+    #[error("invalid Kubernetes underlay intent: {0}")]
+    InvalidKubernetesUnderlayIntent(String),
     #[error("invalid policy rule: {0}")]
     InvalidPolicyRule(String),
 }
@@ -342,7 +344,7 @@ fn validate_docker_container_cidrs(cidrs: &[IpNet]) -> Result<(), RouteManagerEr
     let mut seen = BTreeSet::new();
     let mut routes = Vec::new();
     for cidr in cidrs {
-        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
             return Err(invalid_docker_network_intent(format!(
                 "must not include {reason} Docker container CIDR {cidr}"
             )));
@@ -375,7 +377,7 @@ fn invalid_docker_network_intent(message: impl Into<String>) -> RouteManagerErro
     RouteManagerError::InvalidDockerNetworkIntent(message.into())
 }
 
-fn restricted_docker_container_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+fn restricted_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
     if cidr.prefix_len() == 0 {
         return Some("unrestricted");
     }
@@ -488,6 +490,55 @@ pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
             fwmark: None,
         }],
     }
+}
+
+pub fn checked_kubernetes_route_plan(
+    intent: KubernetesUnderlayIntent,
+) -> Result<RoutePlan, RouteManagerError> {
+    validate_kubernetes_underlay_intent(&intent)?;
+    Ok(kubernetes_route_plan(intent))
+}
+
+pub fn validate_kubernetes_underlay_intent(
+    intent: &KubernetesUnderlayIntent,
+) -> Result<(), RouteManagerError> {
+    let mut seen = BTreeSet::new();
+    validate_kubernetes_underlay_cidrs(
+        "Kubernetes API server CIDR",
+        &intent.api_server_cidrs,
+        &mut seen,
+    )?;
+    validate_kubernetes_underlay_cidrs("Kubernetes Service CIDR", &intent.service_cidrs, &mut seen)
+}
+
+fn validate_kubernetes_underlay_cidrs(
+    label: &str,
+    cidrs: &[IpNet],
+    seen: &mut BTreeSet<IpNet>,
+) -> Result<(), RouteManagerError> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must not include {reason} {label} {cidr}"
+            )));
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must use canonical {label} route {route}, not {cidr}"
+            )));
+        }
+        if !seen.insert(route) {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must not repeat Kubernetes underlay route CIDR {route}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_kubernetes_underlay_intent(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidKubernetesUnderlayIntent(message.into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,7 +925,7 @@ where
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = kubernetes_route_plan(intent);
+        let plan = checked_kubernetes_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -1043,7 +1094,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = kubernetes_route_plan(intent);
+        let plan = checked_kubernetes_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -1147,7 +1198,7 @@ impl RouteManager for DryRunLinuxRouteManager {
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        Ok(kubernetes_route_plan(intent))
+        checked_kubernetes_route_plan(intent)
     }
 }
 
@@ -1425,6 +1476,86 @@ mod tests {
         assert_eq!(plan.routes[1].id, "k8s-1");
         assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
         assert_eq!(plan.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kubernetes_intent_allows_specific_route_inside_service_cidr(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let plan = manager
+            .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                node_name: "worker-a".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                api_server_cidrs: vec!["10.96.0.1/32".parse()?],
+                service_cidrs: vec!["10.96.0.0/12".parse()?],
+                route_provider: NodeId::from_string("route-provider-a"),
+            })
+            .await?;
+
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].cidr, "10.96.0.1/32".parse::<IpNet>()?);
+        assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kubernetes_intent_rejects_invalid_route_cidrs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            (
+                vec!["0.0.0.0/0"],
+                Vec::new(),
+                "unrestricted Kubernetes API server CIDR",
+            ),
+            (
+                Vec::new(),
+                vec!["127.0.0.0/8"],
+                "loopback Kubernetes Service CIDR",
+            ),
+            (
+                Vec::new(),
+                vec!["10.96.0.1/12"],
+                "canonical Kubernetes Service CIDR route 10.96.0.0/12",
+            ),
+            (
+                vec!["10.96.0.1/32"],
+                vec!["10.96.0.1/32"],
+                "repeat Kubernetes underlay route CIDR 10.96.0.1/32",
+            ),
+        ];
+
+        for (api_server_cidrs, service_cidrs, expected) in cases {
+            let error = match manager
+                .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                    node_name: "worker-a".to_string(),
+                    overlay_interface: "ipars0".to_string(),
+                    api_server_cidrs: api_server_cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    service_cidrs: service_cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    route_provider: NodeId::from_string("route-provider-a"),
+                })
+                .await
+            {
+                Ok(plan) => {
+                    return Err(
+                        format!("invalid Kubernetes CIDR should be rejected: {plan:?}").into(),
+                    );
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, RouteManagerError::InvalidKubernetesUnderlayIntent(ref message) if message.contains(expected)),
+                "unexpected error: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -1731,6 +1862,43 @@ mod tests {
                 error,
                 RouteManagerError::InvalidDockerNetworkIntent(ref message)
                     if message.contains("canonical Docker container CIDR route 172.18.0.0/16")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(runner.commands().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_rejects_invalid_kubernetes_intent_before_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let error = match manager
+            .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                node_name: "worker-a".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                api_server_cidrs: Vec::new(),
+                service_cidrs: vec!["10.96.0.1/12".parse()?],
+                route_provider: NodeId::from_string("route-provider-a"),
+            })
+            .await
+        {
+            Ok(plan) => {
+                return Err(format!(
+                    "invalid Kubernetes intent should fail before route commands: {plan:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                RouteManagerError::InvalidKubernetesUnderlayIntent(ref message)
+                    if message.contains("canonical Kubernetes Service CIDR route 10.96.0.0/12")
             ),
             "unexpected error: {error}"
         );
