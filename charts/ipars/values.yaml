@@ -27,6 +27,8 @@ agent:
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
     allocateLoadBalancerNodePorts: true
+    ipFamilyPolicy: ""
+    ipFamilies: []
     externalTrafficPolicy: Local
     port: 9780
     nodePort: 0
@@ -51,6 +53,8 @@ agent:
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
     allocateLoadBalancerNodePorts: true
+    ipFamilyPolicy: ""
+    ipFamilies: []
     externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580

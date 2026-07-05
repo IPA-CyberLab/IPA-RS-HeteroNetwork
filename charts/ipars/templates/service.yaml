@@ -9,12 +9,18 @@
 {{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
 {{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
 {{- $agentApiAllocateLoadBalancerNodePorts := .Values.agent.apiService.allocateLoadBalancerNodePorts -}}
+{{- $agentApiIpFamilyPolicy := .Values.agent.apiService.ipFamilyPolicy -}}
+{{- $agentApiIpFamilies := .Values.agent.apiService.ipFamilies -}}
+{{- $agentApiIpFamilyPolicyDual := or (eq $agentApiIpFamilyPolicy "PreferDualStack") (eq $agentApiIpFamilyPolicy "RequireDualStack") -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
 {{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
 {{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
 {{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
 {{- $relayAllocateLoadBalancerNodePorts := .Values.agent.relayService.allocateLoadBalancerNodePorts -}}
+{{- $relayIpFamilyPolicy := .Values.agent.relayService.ipFamilyPolicy -}}
+{{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
+{{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
@@ -41,6 +47,31 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiAllocateLoadBalancerNodePorts) (ne $agentApiNodePort 0) -}}
 {{- fail "agent.apiService.allocateLoadBalancerNodePorts=false cannot be combined with agent.apiService.nodePort" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiIpFamilyPolicy "") (not (or (eq $agentApiIpFamilyPolicy "SingleStack") $agentApiIpFamilyPolicyDual)) -}}
+{{- fail "agent.apiService.ipFamilyPolicy must be SingleStack, PreferDualStack, or RequireDualStack" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (gt (len $agentApiIpFamilies) 2) -}}
+{{- fail "agent.apiService.ipFamilies accepts at most two values" -}}
+{{- end -}}
+{{- if .Values.agent.apiService.enabled -}}
+{{- range $family := $agentApiIpFamilies -}}
+{{- if not (or (eq $family "IPv4") (eq $family "IPv6")) -}}
+{{- fail "agent.apiService.ipFamilies values must be IPv4 or IPv6" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (eq (len $agentApiIpFamilies) 2) (eq (index $agentApiIpFamilies 0) (index $agentApiIpFamilies 1)) -}}
+{{- fail "agent.apiService.ipFamilies cannot repeat the same family" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (eq $agentApiIpFamilyPolicy "SingleStack") (gt (len $agentApiIpFamilies) 1) -}}
+{{- fail "agent.apiService.ipFamilyPolicy=SingleStack cannot use both IPv4 and IPv6" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (eq $agentApiIpFamilyPolicy "RequireDualStack") (ne (len $agentApiIpFamilies) 2) -}}
+{{- fail "agent.apiService.ipFamilyPolicy=RequireDualStack requires both IPv4 and IPv6 families" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (eq (len $agentApiIpFamilies) 2) (not $agentApiIpFamilyPolicyDual) -}}
+{{- fail "agent.apiService ipFamilies with both IPv4 and IPv6 require ipFamilyPolicy=PreferDualStack or RequireDualStack" -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (lt $relayUdpPort 1) (gt $relayUdpPort 65535)) -}}
 {{- fail "agent.relayService.udpPort must be between 1 and 65535" -}}
@@ -71,6 +102,31 @@
 {{- end -}}
 {{- if and $relayServiceActive (not $relayAllocateLoadBalancerNodePorts) (or (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0)) -}}
 {{- fail "agent.relayService.allocateLoadBalancerNodePorts=false cannot be combined with relay NodePorts" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayIpFamilyPolicy "") (not (or (eq $relayIpFamilyPolicy "SingleStack") $relayIpFamilyPolicyDual)) -}}
+{{- fail "agent.relayService.ipFamilyPolicy must be SingleStack, PreferDualStack, or RequireDualStack" -}}
+{{- end -}}
+{{- if and $relayServiceActive (gt (len $relayIpFamilies) 2) -}}
+{{- fail "agent.relayService.ipFamilies accepts at most two values" -}}
+{{- end -}}
+{{- if $relayServiceActive -}}
+{{- range $family := $relayIpFamilies -}}
+{{- if not (or (eq $family "IPv4") (eq $family "IPv6")) -}}
+{{- fail "agent.relayService.ipFamilies values must be IPv4 or IPv6" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq (len $relayIpFamilies) 2) (eq (index $relayIpFamilies 0) (index $relayIpFamilies 1)) -}}
+{{- fail "agent.relayService.ipFamilies cannot repeat the same family" -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq $relayIpFamilyPolicy "SingleStack") (gt (len $relayIpFamilies) 1) -}}
+{{- fail "agent.relayService.ipFamilyPolicy=SingleStack cannot use both IPv4 and IPv6" -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq $relayIpFamilyPolicy "RequireDualStack") (ne (len $relayIpFamilies) 2) -}}
+{{- fail "agent.relayService.ipFamilyPolicy=RequireDualStack requires both IPv4 and IPv6 families" -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq (len $relayIpFamilies) 2) (not $relayIpFamilyPolicyDual) -}}
+{{- fail "agent.relayService ipFamilies with both IPv4 and IPv6 require ipFamilyPolicy=PreferDualStack or RequireDualStack" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
@@ -133,6 +189,13 @@ spec:
   {{- if $agentApiExternal }}
   externalTrafficPolicy: {{ .Values.agent.apiService.externalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.apiService.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ .Values.agent.apiService.ipFamilyPolicy }}
+  {{- end }}
+  {{- if .Values.agent.apiService.ipFamilies }}
+  ipFamilies:
+{{- toYaml .Values.agent.apiService.ipFamilies | nindent 4 }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
   ports:
@@ -171,6 +234,13 @@ spec:
   {{- end }}
   {{- if $relayExternal }}
   externalTrafficPolicy: {{ .Values.agent.relayService.externalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.agent.relayService.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ .Values.agent.relayService.ipFamilyPolicy }}
+  {{- end }}
+  {{- if .Values.agent.relayService.ipFamilies }}
+  ipFamilies:
+{{- toYaml .Values.agent.relayService.ipFamilies | nindent 4 }}
   {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "ipars.name" . }}

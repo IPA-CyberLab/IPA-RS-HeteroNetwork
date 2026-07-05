@@ -327,6 +327,10 @@ struct K8sInstallArgs {
         requires = "expose_agent_api"
     )]
     agent_api_disable_load_balancer_node_ports: bool,
+    #[arg(long = "agent-api-ip-family-policy", value_parser = parse_kubernetes_ip_family_policy, requires = "expose_agent_api")]
+    agent_api_ip_family_policy: Option<String>,
+    #[arg(long = "agent-api-ip-family", value_parser = parse_kubernetes_ip_family, requires = "expose_agent_api")]
+    agent_api_ip_families: Vec<String>,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
     agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
@@ -353,6 +357,10 @@ struct K8sInstallArgs {
         requires = "expose_relay"
     )]
     relay_disable_load_balancer_node_ports: bool,
+    #[arg(long = "relay-ip-family-policy", value_parser = parse_kubernetes_ip_family_policy, requires = "expose_relay")]
+    relay_ip_family_policy: Option<String>,
+    #[arg(long = "relay-ip-family", value_parser = parse_kubernetes_ip_family, requires = "expose_relay")]
+    relay_ip_families: Vec<String>,
     #[arg(long = "relay-allow-source-cidr", requires = "expose_relay")]
     relay_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
@@ -1117,6 +1125,22 @@ fn parse_kubernetes_external_traffic_policy(value: &str) -> Result<String, Strin
     }
 }
 
+fn parse_kubernetes_ip_family_policy(value: &str) -> Result<String, String> {
+    match value {
+        "SingleStack" | "PreferDualStack" | "RequireDualStack" => Ok(value.to_string()),
+        _ => Err(format!(
+            "ipFamilyPolicy must be SingleStack, PreferDualStack, or RequireDualStack; got {value}"
+        )),
+    }
+}
+
+fn parse_kubernetes_ip_family(value: &str) -> Result<String, String> {
+    match value {
+        "IPv4" | "IPv6" => Ok(value.to_string()),
+        _ => Err(format!("ipFamily must be IPv4 or IPv6; got {value}")),
+    }
+}
+
 const KUBERNETES_NODE_PORT_MIN: u16 = 30000;
 const KUBERNETES_NODE_PORT_MAX: u16 = 32767;
 
@@ -1284,6 +1308,12 @@ fn append_helm_set_string(command: &mut String, key: &str, value: &str) {
 fn append_helm_ipnet_list(command: &mut String, key: &str, values: &[ipnet::IpNet]) {
     for (index, value) in values.iter().enumerate() {
         append_helm_set_string(command, &format!("{key}[{index}]"), &value.to_string());
+    }
+}
+
+fn append_helm_string_list(command: &mut String, key: &str, values: &[String]) {
+    for (index, value) in values.iter().enumerate() {
+        append_helm_set_string(command, &format!("{key}[{index}]"), value);
     }
 }
 
@@ -1751,6 +1781,16 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if args.agent_api_disable_load_balancer_node_ports {
             helm_command.push_str(" --set agent.apiService.allocateLoadBalancerNodePorts=false");
         }
+        if let Some(ip_family_policy) = args.agent_api_ip_family_policy.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.ipFamilyPolicy={ip_family_policy}"
+            ));
+        }
+        append_helm_string_list(
+            &mut helm_command,
+            "agent.apiService.ipFamilies",
+            &args.agent_api_ip_families,
+        );
         if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -1820,6 +1860,16 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if args.relay_disable_load_balancer_node_ports {
             helm_command.push_str(" --set agent.relayService.allocateLoadBalancerNodePorts=false");
         }
+        if let Some(ip_family_policy) = args.relay_ip_family_policy.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.ipFamilyPolicy={ip_family_policy}"
+            ));
+        }
+        append_helm_string_list(
+            &mut helm_command,
+            "agent.relayService.ipFamilies",
+            &args.relay_ip_families,
+        );
         if is_external_kubernetes_service_type(&args.relay_service_type) {
             helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -2067,6 +2117,42 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_kubernetes_service_ip_families(
+    flag_prefix: &str,
+    policy: Option<&str>,
+    families: &[String],
+) -> anyhow::Result<()> {
+    if let Some(policy) = policy {
+        parse_kubernetes_ip_family_policy(policy).map_err(anyhow::Error::msg)?;
+    }
+    if families.len() > 2 {
+        anyhow::bail!("{flag_prefix} accepts at most two --{flag_prefix}-ip-family values");
+    }
+    for family in families {
+        parse_kubernetes_ip_family(family).map_err(anyhow::Error::msg)?;
+    }
+
+    let has_ipv4 = families.iter().any(|family| family == "IPv4");
+    let has_ipv6 = families.iter().any(|family| family == "IPv6");
+    if families.len() == 2 && !(has_ipv4 && has_ipv6) {
+        anyhow::bail!("{flag_prefix} ipFamilies cannot repeat the same family");
+    }
+    if policy == Some("SingleStack") && families.len() > 1 {
+        anyhow::bail!("{flag_prefix} ipFamilyPolicy=SingleStack cannot use both IPv4 and IPv6");
+    }
+    if policy == Some("RequireDualStack") && families.len() != 2 {
+        anyhow::bail!(
+            "{flag_prefix} ipFamilyPolicy=RequireDualStack requires both IPv4 and IPv6 families"
+        );
+    }
+    if families.len() == 2 && !matches!(policy, Some("PreferDualStack" | "RequireDualStack")) {
+        anyhow::bail!(
+            "{flag_prefix} with both IPv4 and IPv6 requires ipFamilyPolicy=PreferDualStack or RequireDualStack"
+        );
+    }
+    Ok(())
+}
+
 fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
@@ -2076,6 +2162,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.agent_api_disable_load_balancer_node_ports && !args.expose_agent_api {
         anyhow::bail!("--agent-api-disable-load-balancer-node-ports requires --expose-agent-api");
+    }
+    if args.agent_api_ip_family_policy.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-ip-family-policy requires --expose-agent-api");
+    }
+    if !args.agent_api_ip_families.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-ip-family requires --expose-agent-api");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -2089,6 +2181,22 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_disable_load_balancer_node_ports && !args.expose_relay {
         anyhow::bail!("--relay-disable-load-balancer-node-ports requires --expose-relay");
     }
+    if args.relay_ip_family_policy.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-ip-family-policy requires --expose-relay");
+    }
+    if !args.relay_ip_families.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-ip-family requires --expose-relay");
+    }
+    validate_kubernetes_service_ip_families(
+        "agent-api",
+        args.agent_api_ip_family_policy.as_deref(),
+        &args.agent_api_ip_families,
+    )?;
+    validate_kubernetes_service_ip_families(
+        "relay",
+        args.relay_ip_family_policy.as_deref(),
+        &args.relay_ip_families,
+    )?;
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
         && !args.allow_public_service_exposure
@@ -3073,6 +3181,8 @@ mod tests {
             agent_api_node_port: Some(31080),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
+            agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
@@ -3085,6 +3195,8 @@ mod tests {
             relay_http_node_port: Some(31580),
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: Some("PreferDualStack".to_string()),
+            relay_ip_families: vec!["IPv6".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
@@ -3110,6 +3222,9 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
+        assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
+        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
+        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2]
@@ -3124,6 +3239,10 @@ mod tests {
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
+        assert!(
+            plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
+        );
+        assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
         assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains(
@@ -3182,6 +3301,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3191,6 +3312,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3404,6 +3527,12 @@ mod tests {
             "31080",
             "--agent-api-load-balancer-class",
             "example.com/internal-api",
+            "--agent-api-ip-family-policy",
+            "RequireDualStack",
+            "--agent-api-ip-family",
+            "IPv4",
+            "--agent-api-ip-family",
+            "IPv6",
             "--agent-api-allow-source-cidr",
             "198.51.100.0/24",
             "--agent-api-external-traffic-policy",
@@ -3419,6 +3548,10 @@ mod tests {
             "31580",
             "--relay-load-balancer-class",
             "example.com/internal-relay",
+            "--relay-ip-family-policy",
+            "PreferDualStack",
+            "--relay-ip-family",
+            "IPv6",
             "--relay-allow-source-cidr",
             "203.0.113.0/24",
             "--relay-external-traffic-policy",
@@ -3469,6 +3602,11 @@ mod tests {
                 Some("example.com/internal-api")
             );
             assert_eq!(
+                args.agent_api_ip_family_policy.as_deref(),
+                Some("RequireDualStack")
+            );
+            assert_eq!(args.agent_api_ip_families, vec!["IPv4", "IPv6"]);
+            assert_eq!(
                 args.agent_api_allow_source_cidrs,
                 vec!["198.51.100.0/24".parse::<ipnet::IpNet>()?]
             );
@@ -3488,6 +3626,11 @@ mod tests {
                 args.relay_load_balancer_class.as_deref(),
                 Some("example.com/internal-relay")
             );
+            assert_eq!(
+                args.relay_ip_family_policy.as_deref(),
+                Some("PreferDualStack")
+            );
+            assert_eq!(args.relay_ip_families, vec!["IPv6"]);
             assert_eq!(
                 args.relay_allow_source_cidrs,
                 vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
@@ -3541,6 +3684,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3550,6 +3695,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3594,6 +3741,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3603,6 +3752,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3778,6 +3929,71 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_ip_families() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_ip_family_policy = Some("RequireDualStack".to_string());
+        valid.agent_api_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_ip_family_policy = Some("PreferDualStack".to_string());
+        valid.relay_ip_families = vec!["IPv6".to_string()];
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
+        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
+        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
+        assert!(
+            plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
+        );
+        assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-ip-family",
+            "IPv5",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_dual_family = base_k8s_install_args();
+        missing_dual_family.expose_agent_api = true;
+        missing_dual_family.agent_api_ip_family_policy = Some("RequireDualStack".to_string());
+        missing_dual_family.agent_api_ip_families = vec!["IPv6".to_string()];
+        let error = match k8s_install_plan(missing_dual_family) {
+            Ok(_) => panic!("RequireDualStack without both families should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("RequireDualStack requires both IPv4 and IPv6 families"));
+
+        let mut duplicate_family = base_k8s_install_args();
+        duplicate_family.expose_agent_api = true;
+        duplicate_family.agent_api_ip_family_policy = Some("PreferDualStack".to_string());
+        duplicate_family.agent_api_ip_families = vec!["IPv6".to_string(), "IPv6".to_string()];
+        let error = match k8s_install_plan(duplicate_family) {
+            Ok(_) => panic!("duplicate ipFamilies should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ipFamilies cannot repeat"));
+
+        let mut missing_policy = base_k8s_install_args();
+        missing_policy.expose_agent_api = true;
+        missing_policy.agent_api_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
+        let error = match k8s_install_plan(missing_policy) {
+            Ok(_) => panic!("two ipFamilies without dual-stack policy should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("requires ipFamilyPolicy=PreferDualStack or RequireDualStack"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_requires_acknowledgement_for_cluster_external_traffic_policy(
     ) -> anyhow::Result<()> {
         let without_ack = k8s_install_plan(K8sInstallArgs {
@@ -3802,6 +4018,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3811,6 +4029,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3842,6 +4062,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3851,6 +4073,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3889,6 +4113,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3898,6 +4124,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3934,6 +4162,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3943,6 +4173,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3974,6 +4206,8 @@ mod tests {
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
             agent_api_disable_load_balancer_node_ports: false,
+            agent_api_ip_family_policy: None,
+            agent_api_ip_families: Vec::new(),
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3983,6 +4217,8 @@ mod tests {
             relay_http_node_port: None,
             relay_load_balancer_class: None,
             relay_disable_load_balancer_node_ports: false,
+            relay_ip_family_policy: None,
+            relay_ip_families: Vec::new(),
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -4013,6 +4249,13 @@ mod tests {
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());
         assert!(parse_kubernetes_node_port("32768").is_err());
+        assert_eq!(
+            parse_kubernetes_ip_family_policy("RequireDualStack"),
+            Ok("RequireDualStack".to_string())
+        );
+        assert!(parse_kubernetes_ip_family_policy("DualStack").is_err());
+        assert_eq!(parse_kubernetes_ip_family("IPv6"), Ok("IPv6".to_string()));
+        assert!(parse_kubernetes_ip_family("IPv5").is_err());
         assert_eq!(
             parse_kubernetes_load_balancer_class("example.com/internal-api"),
             Ok("example.com/internal-api".to_string())
