@@ -123,15 +123,14 @@ impl FileAgentStateStore {
     }
 
     pub fn load(&self) -> Result<AgentNodeState, AgentError> {
+        ensure_private_agent_state_parent(&self.path)?;
         ensure_private_agent_state_file(&self.path)?;
         let bytes = std::fs::read(&self.path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub fn save(&self, state: &AgentNodeState) -> Result<(), AgentError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        prepare_private_agent_state_parent(&self.path)?;
         let bytes = serde_json::to_vec_pretty(state)?;
         write_private_agent_state_file(&self.path, &bytes)?;
         Ok(())
@@ -153,6 +152,93 @@ impl FileAgentStateStore {
 fn ensure_private_agent_state_file(path: &Path) -> Result<(), AgentError> {
     let metadata = std::fs::symlink_metadata(path)?;
     validate_private_agent_state_metadata(path, &metadata)
+}
+
+fn agent_state_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+fn ensure_private_agent_state_parent(path: &Path) -> Result<(), AgentError> {
+    let Some(parent) = agent_state_parent(path) else {
+        return Ok(());
+    };
+    let metadata = std::fs::symlink_metadata(parent)?;
+    validate_private_agent_state_directory_metadata(parent, &metadata)
+}
+
+fn prepare_private_agent_state_parent(path: &Path) -> Result<(), AgentError> {
+    match ensure_private_agent_state_parent(path) {
+        Ok(()) => Ok(()),
+        Err(AgentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = agent_state_parent(path) else {
+                return Ok(());
+            };
+            create_private_agent_state_directory(parent)?;
+            ensure_private_agent_state_parent(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn create_private_agent_state_directory(path: &Path) -> Result<(), AgentError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_agent_state_directory(path: &Path) -> Result<(), AgentError> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_agent_state_directory_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), AgentError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must not be a symbolic link",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must be a directory",
+            path.display()
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must not be readable, writable, or executable by group/other users; current mode is {mode:o}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_agent_state_directory_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), AgentError> {
+    if !metadata.is_dir() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must be a directory",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -252,10 +338,7 @@ fn private_agent_state_temp_path(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn sync_agent_state_parent_dir(path: &Path) -> Result<(), AgentError> {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
+    let Some(parent) = agent_state_parent(path) else {
         return Ok(());
     };
     let directory = std::fs::File::open(parent)?;
@@ -2102,14 +2185,6 @@ mod tests {
 
     use super::*;
 
-    fn temp_state_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ipars-agent-{name}-{}-{}.json",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
-    }
-
     fn temp_state_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ipars-agent-{name}-{}-{}",
@@ -3422,7 +3497,8 @@ mod tests {
 
     #[test]
     fn file_state_store_creates_and_reloads_node_identity() -> Result<(), AgentError> {
-        let path = temp_state_path("state");
+        let dir = temp_state_dir("state");
+        let path = dir.join("state.json");
         let store = FileAgentStateStore::new(&path);
         let created = store.load_or_create(Utc::now())?;
         let loaded = store.load_or_create(Utc::now())?;
@@ -3436,10 +3512,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
 
+            let dir_mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
             let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
 
@@ -3449,7 +3527,11 @@ mod tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let state = AgentNodeState::generate(Utc::now());
-        let broad = temp_state_path("state-broad");
+        let dir = temp_state_dir("state-insecure-paths");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+
+        let broad = dir.join("state-broad.json");
         std::fs::write(&broad, serde_json::to_vec_pretty(&state)?)?;
         std::fs::set_permissions(&broad, std::fs::Permissions::from_mode(0o644))?;
 
@@ -3459,8 +3541,8 @@ mod tests {
         };
         assert!(error.to_string().contains("must not be readable"));
 
-        let target = temp_state_path("state-target");
-        let link = temp_state_path("state-link");
+        let target = dir.join("state-target.json");
+        let link = dir.join("state-link.json");
         FileAgentStateStore::new(&target).save(&state)?;
         symlink(&target, &link)?;
 
@@ -3475,9 +3557,56 @@ mod tests {
         };
         assert!(save_error.to_string().contains("symbolic link"));
 
-        let _ = std::fs::remove_file(broad);
-        let _ = std::fs::remove_file(link);
-        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_state_store_rejects_insecure_state_directories() -> Result<(), AgentError> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state = AgentNodeState::generate(Utc::now());
+        let broad_dir = temp_state_dir("state-broad-dir");
+        std::fs::create_dir_all(&broad_dir)?;
+        std::fs::set_permissions(&broad_dir, std::fs::Permissions::from_mode(0o777))?;
+        let broad_path = broad_dir.join("state.json");
+        std::fs::write(&broad_path, serde_json::to_vec_pretty(&state)?)?;
+        std::fs::set_permissions(&broad_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let load_error = match FileAgentStateStore::new(&broad_path).load() {
+            Ok(_) => panic!("state file in broadly accessible directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(load_error.to_string().contains("must not be readable"));
+        let save_error = match FileAgentStateStore::new(&broad_path).save(&state) {
+            Ok(_) => panic!("broadly accessible state directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(save_error.to_string().contains("must not be readable"));
+        std::fs::set_permissions(&broad_dir, std::fs::Permissions::from_mode(0o700))?;
+        let _ = std::fs::remove_dir_all(&broad_dir);
+
+        let target_dir = temp_state_dir("state-dir-target");
+        std::fs::create_dir_all(&target_dir)?;
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700))?;
+        let link_dir = temp_state_dir("state-dir-link");
+        symlink(&target_dir, &link_dir)?;
+        let link_path = link_dir.join("state.json");
+
+        let load_error = match FileAgentStateStore::new(&link_path).load() {
+            Ok(_) => panic!("state file in symlinked state directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(load_error.to_string().contains("symbolic link"));
+        let save_error = match FileAgentStateStore::new(&link_path).save(&state) {
+            Ok(_) => panic!("symlinked state directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(save_error.to_string().contains("symbolic link"));
+
+        let _ = std::fs::remove_file(link_dir);
+        let _ = std::fs::remove_dir_all(target_dir);
         Ok(())
     }
 
@@ -3487,7 +3616,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_state_dir("state-atomic");
-        std::fs::create_dir_all(&dir)?;
         let path = dir.join("state.json");
         let store = FileAgentStateStore::new(&path);
         let first = AgentNodeState::generate(Utc::now());
@@ -3499,6 +3627,8 @@ mod tests {
         let loaded = store.load()?;
         assert_eq!(loaded.node_id, second.node_id);
         assert_ne!(loaded.node_id, first.node_id);
+        let dir_mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let temp_file_left = std::fs::read_dir(&dir)?.any(|entry| {

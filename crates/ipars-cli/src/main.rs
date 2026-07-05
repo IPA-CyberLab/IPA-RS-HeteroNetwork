@@ -2487,7 +2487,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites: vec![
             "kubectl access with permission to create namespaces, Secrets, DaemonSets, and RBAC when Kubernetes Service discovery is enabled".to_string(),
             "Helm 3".to_string(),
-            "/dev/net/tun plus a writable agent state hostPath available on every scheduled node".to_string(),
+            "/dev/net/tun plus a writable agent state hostPath available on every scheduled node; the chart initContainer creates/chmods the mounted state directory to 0700".to_string(),
             "NET_ADMIN and NET_RAW capability allowance, or equivalent --agent-add-capability overrides, for the DaemonSet agent".to_string(),
             "net.ipv4.ip_forward=1 on Kubernetes route-provider nodes, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 Service/API CIDRs".to_string(),
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
@@ -2503,6 +2503,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "ServiceAccount creation can be disabled only when an equivalent ServiceAccount already exists in the target namespace".to_string(),
             "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
             "Agent securityContext capability add/drop, privilege escalation, and privileged mode flags should match the selected runtime backend and cluster Pod Security admission policy".to_string(),
+            "Agent state directories are owner-only; pre-existing hostPath directories must allow the chart initContainer to chmod them to 0700".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
