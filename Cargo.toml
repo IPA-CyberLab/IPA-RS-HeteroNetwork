@@ -28,6 +28,7 @@ rust-version = "1.80"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+aya = { version = "0.13.1", default-features = false }
 axum = "0.8"
 base64 = "0.22"
 bytes = "1.12"

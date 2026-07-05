@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use axum::Router;
+use aya::maps::{MapData, RingBuf};
+use aya::programs::TracePoint;
+use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
     AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommandRunner,
@@ -66,6 +69,7 @@ use opentelemetry_sdk::{
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -73,6 +77,8 @@ use tracing_subscriber::{EnvFilter, Layer};
 const CAP_NET_ADMIN_BIT: u8 = 12;
 const CAP_NET_RAW_BIT: u8 = 13;
 const CAP_SYS_ADMIN_BIT: u8 = 21;
+const CAP_PERFMON_BIT: u8 = 38;
+const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
@@ -81,6 +87,10 @@ const DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
+const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
+const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = "IPARS_PACKET_FLOWS";
+const IPARS_EBPF_PACKET_FLOW_EVENT_VERSION: u8 = 1;
+const IPARS_EBPF_PACKET_FLOW_EVENT_LEN: usize = 48;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
@@ -436,6 +446,20 @@ struct AgentArgs {
     packet_flow_conntrack_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_PATH")]
     packet_flow_ebpf_event_path: Option<PathBuf>,
+    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_OBJECT_PATH")]
+    packet_flow_ebpf_object_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAP",
+        default_value = DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP
+    )]
+    packet_flow_ebpf_ringbuf_map: String,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_ATTACH",
+        value_name = "PROGRAM:CATEGORY:NAME"
+    )]
+    packet_flow_ebpf_attach: Vec<String>,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
@@ -490,6 +514,12 @@ struct AgentArgs {
         default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS
     )]
     packet_flow_ebpf_event_max_flows: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS",
+        default_value_t = DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS
+    )]
+    packet_flow_ebpf_ringbuf_max_events: usize,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
     packet_flow_pin: bool,
     #[arg(
@@ -736,6 +766,8 @@ enum PacketFlowDetector {
     ConntrackNetlinkEvents,
     #[value(name = "ebpf-jsonl")]
     EbpfJsonl,
+    #[value(name = "ebpf-ringbuf")]
+    EbpfRingbuf,
 }
 
 impl PacketFlowDetector {
@@ -746,6 +778,7 @@ impl PacketFlowDetector {
             Self::ConntrackNetlink => "conntrack-netlink",
             Self::ConntrackNetlinkEvents => "conntrack-netlink-events",
             Self::EbpfJsonl => "ebpf-jsonl",
+            Self::EbpfRingbuf => "ebpf-ringbuf",
         }
     }
 }
@@ -762,6 +795,8 @@ struct RuntimePreflightNeeds {
     cap_net_admin: bool,
     cap_net_raw: bool,
     cap_sys_admin: bool,
+    cap_perfmon: bool,
+    cap_bpf: bool,
     linux_netns: bool,
 }
 
@@ -778,6 +813,8 @@ impl RuntimePreflightNeeds {
             cap_net_admin: false,
             cap_net_raw: false,
             cap_sys_admin: false,
+            cap_perfmon: false,
+            cap_bpf: false,
             linux_netns: false,
         }
     }
@@ -793,6 +830,8 @@ impl RuntimePreflightNeeds {
             && !self.cap_net_admin
             && !self.cap_net_raw
             && !self.cap_sys_admin
+            && !self.cap_perfmon
+            && !self.cap_bpf
             && !self.linux_netns
     }
 }
@@ -827,6 +866,8 @@ struct RuntimePreflightChecks {
     cap_net_admin: fn() -> anyhow::Result<()>,
     cap_net_raw: fn() -> anyhow::Result<()>,
     cap_sys_admin: fn() -> anyhow::Result<()>,
+    cap_perfmon: fn() -> anyhow::Result<()>,
+    cap_bpf: fn() -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
     ipv4_forwarding: fn() -> anyhow::Result<()>,
@@ -839,6 +880,8 @@ impl RuntimePreflightChecks {
             cap_net_admin: ensure_cap_net_admin_if_known,
             cap_net_raw: ensure_cap_net_raw_if_known,
             cap_sys_admin: ensure_cap_sys_admin_if_known,
+            cap_perfmon: ensure_cap_perfmon_if_known,
+            cap_bpf: ensure_cap_bpf_if_known,
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
             ipv4_forwarding: ensure_ipv4_forwarding_if_known,
@@ -1015,6 +1058,12 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.cap_sys_admin {
         (checks.cap_sys_admin)()?;
     }
+    if needs.cap_perfmon {
+        (checks.cap_perfmon)()?;
+    }
+    if needs.cap_bpf {
+        (checks.cap_bpf)()?;
+    }
     if needs.linux_netns {
         let namespace_name = args
             .linux_netns
@@ -1038,6 +1087,8 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_cap_net_admin = needs.cap_net_admin,
         needs_cap_net_raw = needs.cap_net_raw,
         needs_cap_sys_admin = needs.cap_sys_admin,
+        needs_cap_perfmon = needs.cap_perfmon,
+        needs_cap_bpf = needs.cap_bpf,
         linux_netns = ?args.linux_netns,
         "runtime backend preflight passed"
     );
@@ -1129,6 +1180,27 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--packet-flow-ebpf-event-max-flows must be greater than zero"
         );
     }
+    if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_object_path.is_some(),
+            "--packet-flow-ebpf-object-path is required when --packet-flow-detector ebpf-ringbuf is set"
+        );
+        validate_ebpf_identifier(
+            &args.packet_flow_ebpf_ringbuf_map,
+            "--packet-flow-ebpf-ringbuf-map",
+        )?;
+        anyhow::ensure!(
+            !args.packet_flow_ebpf_attach.is_empty(),
+            "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
+        );
+        for attach in &args.packet_flow_ebpf_attach {
+            EbpfTracepointAttachSpec::parse(attach)?;
+        }
+        anyhow::ensure!(
+            args.packet_flow_ebpf_ringbuf_max_events > 0,
+            "--packet-flow-ebpf-ringbuf-max-events must be greater than zero"
+        );
+    }
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
         validate_positive_seconds(
@@ -1169,6 +1241,22 @@ fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
 fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_ebpf_identifier(value: &str, name: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{name} cannot be empty");
+    }
+    if value.len() > 255 {
+        anyhow::bail!("{name} `{value}` exceeds 255 bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("{name} `{value}` must contain only ASCII letters, digits, '_', '.' or '-'");
     }
     Ok(())
 }
@@ -1221,14 +1309,17 @@ fn validate_http_url(value: &str, name: &str) -> anyhow::Result<()> {
 }
 
 fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
+    let netfilter_netlink = matches!(
+        args.packet_flow_detector,
+        PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
+    );
+    let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
     if args.runtime_backend == AgentRuntimeBackend::DryRun {
-        let netfilter_netlink = matches!(
-            args.packet_flow_detector,
-            PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
-        );
         return RuntimePreflightNeeds {
             netfilter_netlink,
             cap_net_admin: netfilter_netlink,
+            cap_perfmon: ebpf_ringbuf,
+            cap_bpf: ebpf_ringbuf,
             ..RuntimePreflightNeeds::none()
         };
     }
@@ -1246,10 +1337,6 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
     let applies_wireguard_with_netlink =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::KernelNetlink;
-    let netfilter_netlink = matches!(
-        args.packet_flow_detector,
-        PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
-    );
     let ipv4_forwarding = agent_routes_may_forward_ipv4(args);
     let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
@@ -1263,6 +1350,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
         cap_net_raw: applies_wireguard,
         cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        cap_perfmon: ebpf_ringbuf,
+        cap_bpf: ebpf_ringbuf,
         linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
     }
 }
@@ -1515,6 +1604,24 @@ fn ensure_cap_sys_admin_if_known() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_cap_perfmon_if_known() -> anyhow::Result<()> {
+    if let Some(false) = process_has_any_capability(&[CAP_PERFMON_BIT, CAP_SYS_ADMIN_BIT])? {
+        anyhow::bail!(
+            "eBPF packet-flow detector requires CAP_PERFMON or CAP_SYS_ADMIN for tracepoint attachment"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_cap_bpf_if_known() -> anyhow::Result<()> {
+    if let Some(false) = process_has_any_capability(&[CAP_BPF_BIT, CAP_SYS_ADMIN_BIT])? {
+        anyhow::bail!(
+            "eBPF packet-flow detector requires CAP_BPF or CAP_SYS_ADMIN for BPF object loading"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_ipv4_forwarding_if_known() -> anyhow::Result<()> {
     ensure_proc_sysctl_enabled_if_known(
         Path::new(PROC_SYS_IPV4_FORWARD),
@@ -1572,7 +1679,25 @@ fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
     process_status_has_capability(&status, bit)
 }
 
+fn process_has_any_capability(bits: &[u8]) -> anyhow::Result<Option<bool>> {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    process_status_has_any_capability(&status, bits)
+}
+
 fn process_status_has_capability(status: &str, bit: u8) -> anyhow::Result<Option<bool>> {
+    Ok(process_status_capability_mask(status)?.map(|mask| mask & (1_u64 << bit) != 0))
+}
+
+fn process_status_has_any_capability(status: &str, bits: &[u8]) -> anyhow::Result<Option<bool>> {
+    Ok(process_status_capability_mask(status)?
+        .map(|mask| bits.iter().any(|bit| mask & (1_u64 << *bit) != 0)))
+}
+
+fn process_status_capability_mask(status: &str) -> anyhow::Result<Option<u64>> {
     let cap_eff = status
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
@@ -1582,7 +1707,7 @@ fn process_status_has_capability(status: &str, bit: u8) -> anyhow::Result<Option
     };
     let mask = u64::from_str_radix(cap_eff, 16)
         .with_context(|| format!("failed to parse CapEff from /proc/self/status: {cap_eff}"))?;
-    Ok(Some(mask & (1_u64 << bit) != 0))
+    Ok(Some(mask))
 }
 
 fn ensure_netlink_protocol_ready(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
@@ -3168,6 +3293,29 @@ async fn run_agent(
                 Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 limits,
+                args.packet_flow_pin,
+            ));
+        }
+        PacketFlowDetector::EbpfRingbuf => {
+            let config = EbpfRingbufConfig::from_args(&args)?;
+            let limits = EbpfRingbufReadLimits::from_args(&args);
+            tracing::info!(
+                detector = args.packet_flow_detector.as_str(),
+                object_path = %config.object_path.display(),
+                ringbuf_map = %config.ringbuf_map,
+                attachments = config.attachments.len(),
+                retry_interval_seconds = args.packet_flow_poll_interval_seconds,
+                max_events_per_wake = limits.max_events_per_wake,
+                dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
+                pin = args.packet_flow_pin,
+                "starting packet-flow detector"
+            );
+            background_tasks.push(start_ebpf_ringbuf_packet_flow_detector(
+                runtime.clone(),
+                config,
+                limits,
+                Duration::from_secs(args.packet_flow_poll_interval_seconds),
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
         }
@@ -5986,6 +6134,139 @@ fn start_ebpf_jsonl_packet_flow_detector(
     })
 }
 
+fn start_ebpf_ringbuf_packet_flow_detector(
+    runtime: Arc<AgentRuntime>,
+    config: EbpfRingbufConfig,
+    limits: EbpfRingbufReadLimits,
+    retry_interval: Duration,
+    dedup_ttl: Option<Duration>,
+    pin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match run_ebpf_ringbuf_packet_flow_detector_once(
+                runtime.as_ref(),
+                &config,
+                limits,
+                dedup_ttl,
+                pin,
+            )
+            .await
+            {
+                Ok(()) => tracing::warn!("eBPF packet-flow ring buffer detector stopped"),
+                Err(error) => tracing::warn!(
+                    %error,
+                    object_path = %config.object_path.display(),
+                    ringbuf_map = %config.ringbuf_map,
+                    "eBPF packet-flow ring buffer detector failed; will retry"
+                ),
+            }
+            tokio::time::sleep(retry_interval).await;
+        }
+    })
+}
+
+async fn run_ebpf_ringbuf_packet_flow_detector_once(
+    runtime: &AgentRuntime,
+    config: &EbpfRingbufConfig,
+    limits: EbpfRingbufReadLimits,
+    dedup_ttl: Option<Duration>,
+    pin: bool,
+) -> anyhow::Result<()> {
+    let mut reader = load_ebpf_ringbuf_packet_flow_reader(config)?;
+    let mut deduper = PacketFlowDeduper::new(dedup_ttl);
+    loop {
+        let mut guard = reader.ringbuf.readable_mut().await.with_context(|| {
+            format!(
+                "failed to wait for eBPF packet-flow ring buffer `{}`",
+                config.ringbuf_map
+            )
+        })?;
+        let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
+        guard.clear_ready();
+        let (flows, duplicate_count) = deduper.retain_new(flows);
+        log_packet_flow_duplicates(duplicate_count, "ebpf-ringbuf");
+        let matched_count =
+            record_packet_flow_observations(runtime, flows, pin, "ebpf-ringbuf").await;
+        if matched_count > 0 {
+            tracing::info!(
+                matched = matched_count,
+                object_path = %config.object_path.display(),
+                ringbuf_map = %config.ringbuf_map,
+                "recorded packet-flow lazy-connect activity from eBPF ring buffer events"
+            );
+        }
+    }
+}
+
+struct EbpfRingbufPacketFlowReader {
+    _bpf: Ebpf,
+    ringbuf: AsyncFd<RingBuf<MapData>>,
+}
+
+fn load_ebpf_ringbuf_packet_flow_reader(
+    config: &EbpfRingbufConfig,
+) -> anyhow::Result<EbpfRingbufPacketFlowReader> {
+    let mut bpf = EbpfLoader::new()
+        .load_file(&config.object_path)
+        .with_context(|| {
+            format!(
+                "failed to load eBPF packet-flow object {}",
+                config.object_path.display()
+            )
+        })?;
+    for attachment in &config.attachments {
+        let program: &mut TracePoint = bpf
+            .program_mut(&attachment.program)
+            .with_context(|| {
+                format!(
+                    "eBPF packet-flow object {} does not contain tracepoint program `{}`",
+                    config.object_path.display(),
+                    attachment.program
+                )
+            })?
+            .try_into()
+            .with_context(|| {
+                format!(
+                    "eBPF program `{}` is not a tracepoint program",
+                    attachment.program
+                )
+            })?;
+        program.load().with_context(|| {
+            format!(
+                "failed to load eBPF tracepoint program `{}`",
+                attachment.program
+            )
+        })?;
+        program
+            .attach(&attachment.category, &attachment.name)
+            .with_context(|| {
+                format!(
+                    "failed to attach eBPF program `{}` to tracepoint `{}/{}`",
+                    attachment.program, attachment.category, attachment.name
+                )
+            })?;
+    }
+
+    let map = bpf.take_map(&config.ringbuf_map).with_context(|| {
+        format!(
+            "eBPF packet-flow object {} does not contain ring buffer map `{}`",
+            config.object_path.display(),
+            config.ringbuf_map
+        )
+    })?;
+    let ringbuf = RingBuf::try_from(map)
+        .with_context(|| format!("eBPF map `{}` is not a ring buffer", config.ringbuf_map))?;
+    let ringbuf = AsyncFd::new(ringbuf).with_context(|| {
+        format!(
+            "failed to register eBPF packet-flow ring buffer `{}` with tokio",
+            config.ringbuf_map
+        )
+    })?;
+
+    Ok(EbpfRingbufPacketFlowReader { _bpf: bpf, ringbuf })
+}
+
 fn packet_flow_dedup_ttl(seconds: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
@@ -6239,6 +6520,82 @@ impl Default for EbpfJsonlReadLimits {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EbpfRingbufConfig {
+    object_path: PathBuf,
+    ringbuf_map: String,
+    attachments: Vec<EbpfTracepointAttachSpec>,
+}
+
+impl EbpfRingbufConfig {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        let object_path = args
+            .packet_flow_ebpf_object_path
+            .clone()
+            .context("--packet-flow-ebpf-object-path is required")?;
+        let attachments = args
+            .packet_flow_ebpf_attach
+            .iter()
+            .map(|attach| EbpfTracepointAttachSpec::parse(attach))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            object_path,
+            ringbuf_map: args.packet_flow_ebpf_ringbuf_map.clone(),
+            attachments,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EbpfTracepointAttachSpec {
+    program: String,
+    category: String,
+    name: String,
+}
+
+impl EbpfTracepointAttachSpec {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        let mut parts = value.split(':');
+        let program = parts.next().unwrap_or_default();
+        let category = parts.next().unwrap_or_default();
+        let name = parts.next().unwrap_or_default();
+        if parts.next().is_some() || program.is_empty() || category.is_empty() || name.is_empty() {
+            anyhow::bail!(
+                "--packet-flow-ebpf-attach must use PROGRAM:CATEGORY:NAME format, got `{value}`"
+            );
+        }
+        validate_ebpf_identifier(program, "--packet-flow-ebpf-attach program")?;
+        validate_ebpf_identifier(category, "--packet-flow-ebpf-attach category")?;
+        validate_ebpf_identifier(name, "--packet-flow-ebpf-attach name")?;
+        Ok(Self {
+            program: program.to_string(),
+            category: category.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EbpfRingbufReadLimits {
+    max_events_per_wake: usize,
+}
+
+impl EbpfRingbufReadLimits {
+    fn from_args(args: &AgentArgs) -> Self {
+        Self {
+            max_events_per_wake: args.packet_flow_ebpf_ringbuf_max_events,
+        }
+    }
+}
+
+impl Default for EbpfRingbufReadLimits {
+    fn default() -> Self {
+        Self {
+            max_events_per_wake: DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct EbpfJsonlReadCursor {
     offset: u64,
@@ -6249,6 +6606,112 @@ struct EbpfJsonlReadCursor {
 struct PacketFlowRecord {
     destination: IpAddr,
     observation: AgentPacketFlowObservation,
+}
+
+fn drain_ebpf_ringbuf_packet_flows(
+    ringbuf: &mut RingBuf<MapData>,
+    limits: EbpfRingbufReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    let mut flows = Vec::new();
+    while flows.len() < limits.max_events_per_wake {
+        let Some(item) = ringbuf.next() else {
+            break;
+        };
+        flows.push(parse_ebpf_ringbuf_packet_flow_event(&item)?);
+    }
+    Ok(flows)
+}
+
+fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFlowRecord> {
+    anyhow::ensure!(
+        bytes.len() == IPARS_EBPF_PACKET_FLOW_EVENT_LEN,
+        "eBPF packet-flow ring buffer event has {} bytes, expected {}",
+        bytes.len(),
+        IPARS_EBPF_PACKET_FLOW_EVENT_LEN
+    );
+    let version = bytes[0];
+    anyhow::ensure!(
+        version == IPARS_EBPF_PACKET_FLOW_EVENT_VERSION,
+        "unsupported eBPF packet-flow event version {version}"
+    );
+    let ip_family = bytes[1];
+    let protocol = ebpf_packet_flow_protocol(bytes[2]);
+    let tcp_state = ebpf_packet_flow_tcp_state(bytes[3])?;
+    let conntrack_status = ebpf_packet_flow_conntrack_status(bytes[4]);
+    let source_port = optional_nonzero_port(u16::from_be_bytes([bytes[6], bytes[7]]));
+    let destination_port = optional_nonzero_port(u16::from_be_bytes([bytes[8], bytes[9]]));
+    let source = ebpf_packet_flow_ip(ip_family, &bytes[16..32])?;
+    let destination = ebpf_packet_flow_ip(ip_family, &bytes[32..48])?;
+    Ok(PacketFlowRecord {
+        destination,
+        observation: AgentPacketFlowObservation {
+            source: Some(source),
+            protocol,
+            source_port,
+            destination_port,
+            detector: Some("ebpf-ringbuf".to_string()),
+            conntrack_status,
+            tcp_state,
+        },
+    })
+}
+
+fn ebpf_packet_flow_protocol(value: u8) -> Option<TransportProtocol> {
+    match value {
+        0 => None,
+        1 => Some(TransportProtocol::Icmp),
+        6 => Some(TransportProtocol::Tcp),
+        17 => Some(TransportProtocol::Udp),
+        _ => Some(TransportProtocol::Any),
+    }
+}
+
+fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
+    let state = match value {
+        0 => None,
+        1 => Some(AgentPacketFlowTcpState::SynSent),
+        2 => Some(AgentPacketFlowTcpState::SynRecv),
+        3 => Some(AgentPacketFlowTcpState::Established),
+        4 => Some(AgentPacketFlowTcpState::FinWait),
+        5 => Some(AgentPacketFlowTcpState::TimeWait),
+        6 => Some(AgentPacketFlowTcpState::Close),
+        7 => Some(AgentPacketFlowTcpState::CloseWait),
+        8 => Some(AgentPacketFlowTcpState::LastAck),
+        9 => Some(AgentPacketFlowTcpState::Listen),
+        10 => Some(AgentPacketFlowTcpState::SynSent2),
+        _ => anyhow::bail!("unsupported eBPF packet-flow TCP state code {value}"),
+    };
+    Ok(state)
+}
+
+fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackStatus> {
+    let mut status = Vec::new();
+    if value & 0x01 != 0 {
+        status.push(AgentPacketFlowConntrackStatus::Unreplied);
+    }
+    if value & 0x02 != 0 {
+        status.push(AgentPacketFlowConntrackStatus::Assured);
+    }
+    status
+}
+
+fn optional_nonzero_port(value: u16) -> Option<u16> {
+    (value != 0).then_some(value)
+}
+
+fn ebpf_packet_flow_ip(ip_family: u8, bytes: &[u8]) -> anyhow::Result<IpAddr> {
+    match ip_family {
+        4 => Ok(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
+        6 => {
+            let octets: [u8; 16] = bytes
+                .try_into()
+                .context("eBPF packet-flow IPv6 field had invalid length")?;
+            Ok(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => anyhow::bail!("unsupported eBPF packet-flow IP family {ip_family}"),
+    }
 }
 
 fn packet_flow_destination_drop_reason(destination: IpAddr) -> Option<AgentPacketFlowDropReason> {
@@ -8588,6 +9051,120 @@ mod tests {
     }
 
     #[test]
+    fn agent_args_accept_ebpf_ringbuf_packet_flow_detector() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-ringbuf-map",
+            "IPARS_PACKET_FLOWS",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+            "--packet-flow-ebpf-attach",
+            "ipars_egress:net:net_dev_queue",
+            "--packet-flow-ebpf-ringbuf-max-events",
+            "128",
+            "--packet-flow-pin",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(args.packet_flow_detector, PacketFlowDetector::EbpfRingbuf);
+            assert_eq!(args.packet_flow_detector.as_str(), "ebpf-ringbuf");
+            assert_eq!(
+                args.packet_flow_ebpf_object_path.as_deref(),
+                Some(Path::new("/run/ipars/ipars-packet-flow.bpf.o"))
+            );
+            assert_eq!(args.packet_flow_ebpf_ringbuf_map, "IPARS_PACKET_FLOWS");
+            assert_eq!(args.packet_flow_ebpf_attach.len(), 2);
+            assert_eq!(args.packet_flow_ebpf_ringbuf_max_events, 128);
+            assert_eq!(
+                EbpfRingbufReadLimits::from_args(&args),
+                EbpfRingbufReadLimits {
+                    max_events_per_wake: 128,
+                }
+            );
+            let config = EbpfRingbufConfig::from_args(&args)?;
+            assert_eq!(config.attachments.len(), 2);
+            assert_eq!(config.attachments[0].program, "ipars_ingress");
+            assert_eq!(config.attachments[0].category, "net");
+            assert_eq!(config.attachments[0].name, "netif_receive_skb");
+            assert!(args.packet_flow_pin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_ebpf_ringbuf_packet_flow_config_must_be_complete() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec!["iparsd", "agent", "--packet-flow-detector", "ebpf-ringbuf"],
+                "--packet-flow-ebpf-object-path is required",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                ],
+                "--packet-flow-ebpf-attach must be set at least once",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "bad-format",
+                ],
+                "--packet-flow-ebpf-attach must use PROGRAM:CATEGORY:NAME format",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                    "--packet-flow-ebpf-ringbuf-max-events",
+                    "0",
+                ],
+                "--packet-flow-ebpf-ringbuf-max-events must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected `{expected}`, got `{error}`"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_netlink_packet_flow_limit_must_be_positive() -> anyhow::Result<()> {
         for detector in ["conntrack-netlink", "conntrack-netlink-events"] {
             let cli = Cli::try_parse_from([
@@ -8646,6 +9223,79 @@ mod tests {
             flows[1].observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_ringbuf_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
+        let mut event = [0_u8; IPARS_EBPF_PACKET_FLOW_EVENT_LEN];
+        event[0] = IPARS_EBPF_PACKET_FLOW_EVENT_VERSION;
+        event[1] = 4;
+        event[2] = 6;
+        event[3] = 3;
+        event[4] = 0x02;
+        event[6..8].copy_from_slice(&443_u16.to_be_bytes());
+        event[8..10].copy_from_slice(&6443_u16.to_be_bytes());
+        event[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        event[32..36].copy_from_slice(&[100, 64, 0, 11]);
+
+        let flow = parse_ebpf_ringbuf_packet_flow_event(&event)?;
+        assert_eq!(flow.destination, "100.64.0.11".parse::<IpAddr>()?);
+        assert_eq!(flow.observation.source, Some("192.0.2.10".parse()?));
+        assert_eq!(flow.observation.protocol, Some(TransportProtocol::Tcp));
+        assert_eq!(flow.observation.source_port, Some(443));
+        assert_eq!(flow.observation.destination_port, Some(6443));
+        assert_eq!(flow.observation.detector.as_deref(), Some("ebpf-ringbuf"));
+        assert_eq!(
+            flow.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            flow.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_ringbuf_parser_handles_ipv6_and_rejects_bad_events() -> anyhow::Result<()> {
+        let source = "2001:db8::1".parse::<Ipv6Addr>()?;
+        let destination = "fd00::42".parse::<Ipv6Addr>()?;
+        let mut event = [0_u8; IPARS_EBPF_PACKET_FLOW_EVENT_LEN];
+        event[0] = IPARS_EBPF_PACKET_FLOW_EVENT_VERSION;
+        event[1] = 6;
+        event[2] = 17;
+        event[4] = 0x01;
+        event[8..10].copy_from_slice(&51820_u16.to_be_bytes());
+        event[16..32].copy_from_slice(&source.octets());
+        event[32..48].copy_from_slice(&destination.octets());
+
+        let flow = parse_ebpf_ringbuf_packet_flow_event(&event)?;
+        assert_eq!(flow.destination, IpAddr::V6(destination));
+        assert_eq!(flow.observation.source, Some(IpAddr::V6(source)));
+        assert_eq!(flow.observation.protocol, Some(TransportProtocol::Udp));
+        assert_eq!(flow.observation.source_port, None);
+        assert_eq!(flow.observation.destination_port, Some(51820));
+        assert_eq!(
+            flow.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Unreplied]
+        );
+
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&event[..8]) {
+            Ok(_) => anyhow::bail!("short eBPF ringbuf event should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected 48"));
+
+        let mut bad_version = event;
+        bad_version[0] = 2;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_version) {
+            Ok(_) => anyhow::bail!("unsupported eBPF event version should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow event version"));
         Ok(())
     }
 
@@ -9432,6 +10082,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             cap_net_admin: preflight_noop,
             cap_net_raw: preflight_noop,
             cap_sys_admin: preflight_noop,
+            cap_perfmon: preflight_noop,
+            cap_bpf: preflight_noop,
             linux_netns: preflight_noop_netns,
             netlink,
             ipv4_forwarding: preflight_noop,
@@ -9447,6 +10099,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             cap_net_admin: preflight_noop,
             cap_net_raw: preflight_noop,
             cap_sys_admin: preflight_noop,
+            cap_perfmon: preflight_noop,
+            cap_bpf: preflight_noop,
             linux_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
             ipv4_forwarding,
@@ -9515,6 +10169,44 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 Err(error) => error,
             };
             assert!(error.to_string().contains("blocked test NETLINK_NETFILTER"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_requires_ebpf_caps_even_for_dry_run() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
+            assert!(!needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(!needs.cap_sys_admin);
+            assert!(needs.cap_perfmon);
+            assert!(needs.cap_bpf);
+            preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                test_preflight_checks(preflight_noop_netlink),
+            )?;
             return Ok(());
         }
 
@@ -9624,6 +10316,21 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         assert_eq!(
             process_status_has_capability(status, CAP_SYS_ADMIN_BIT)?,
+            Some(false)
+        );
+        let modern_ebpf_caps = format!(
+            "Name:\tiparsd\nCapEff:\t{:016x}\n",
+            (1_u64 << CAP_PERFMON_BIT) | (1_u64 << CAP_BPF_BIT)
+        );
+        assert_eq!(
+            process_status_has_any_capability(
+                &modern_ebpf_caps,
+                &[CAP_BPF_BIT, CAP_SYS_ADMIN_BIT]
+            )?,
+            Some(true)
+        );
+        assert_eq!(
+            process_status_has_any_capability(status, &[CAP_BPF_BIT, CAP_SYS_ADMIN_BIT])?,
             Some(false)
         );
         assert_eq!(
