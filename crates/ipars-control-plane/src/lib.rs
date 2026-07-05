@@ -621,7 +621,13 @@ where
         {
             let nodes = self.store.list_nodes().await?;
             let health_by_node = self.health_by_node(&nodes).await?;
-            self.validate_heartbeat_path_relay_eligibility(&request, &nodes, &health_by_node, now)?;
+            self.validate_heartbeat_path_relay_eligibility(
+                &request,
+                &node,
+                &nodes,
+                &health_by_node,
+                now,
+            )?;
         }
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
@@ -901,6 +907,7 @@ where
     fn validate_heartbeat_path_relay_eligibility(
         &self,
         request: &HeartbeatRequest,
+        reporter: &NodeRecord,
         nodes: &[NodeRecord],
         health_by_node: &BTreeMap<NodeId, NodeHealth>,
         now: chrono::DateTime<Utc>,
@@ -931,6 +938,12 @@ where
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!("relay node {relay_node} is not an eligible relay candidate"),
+                });
+            }
+            if acl_filter_peer(reporter, relay, &self.config.cluster_policy).is_none() {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!("relay node {relay_node} is not visible to reporting node"),
                 });
             }
         }
@@ -2842,6 +2855,178 @@ mod tests {
             ControlPlaneError::NodeUpdateRejected { .. }
         ));
         assert!(error.to_string().contains("uses endpoint"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_hidden_by_acl() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![
+            AclRule {
+                id: "deny-relay".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("relay-hidden")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Deny,
+            },
+            AclRule {
+                id: "allow-other-peers".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::new(),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+        ];
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        relay_claims.tags.insert(Tag::from_string("relay-hidden"));
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.1),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful ACL-hidden relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("is not visible"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_records_relay_path_visible_by_acl() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![AclRule {
+            id: "allow-relay".to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::from([Tag::from_string("relay-visible")]),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
+        }];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        relay_claims.tags.insert(Tag::from_string("relay-visible"));
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.1),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let response = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert!(response.accepted);
+        let paths = store.list_paths_for(&node_id("node-a")).await?;
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].relay_node, Some(node_id("relay-a")));
         Ok(())
     }
 
