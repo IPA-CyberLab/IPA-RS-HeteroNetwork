@@ -53,6 +53,8 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
     #[error("agent state serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("insecure agent state path: {0}")]
+    InsecureStatePath(String),
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
     #[error("stun probe error: {0}")]
@@ -121,6 +123,7 @@ impl FileAgentStateStore {
     }
 
     pub fn load(&self) -> Result<AgentNodeState, AgentError> {
+        ensure_private_agent_state_file(&self.path)?;
         let bytes = std::fs::read(&self.path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
@@ -130,12 +133,7 @@ impl FileAgentStateStore {
             std::fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(state)?;
-        std::fs::write(&self.path, bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        write_private_agent_state_file(&self.path, &bytes)?;
         Ok(())
     }
 
@@ -150,6 +148,92 @@ impl FileAgentStateStore {
             Err(error) => Err(error),
         }
     }
+}
+
+fn ensure_private_agent_state_file(path: &Path) -> Result<(), AgentError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate_private_agent_state_metadata(path, &metadata)
+}
+
+#[cfg(unix)]
+fn validate_private_agent_state_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), AgentError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must not be a symbolic link",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must not be readable, writable, or executable by group/other users; current mode is {mode:o}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_agent_state_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), AgentError> {
+    if !metadata.is_file() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_private_agent_state_metadata(path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    validate_private_agent_state_metadata(path, &metadata)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_private_agent_state_metadata(path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3302,7 +3386,52 @@ mod tests {
             created.identity_public_key_b64,
             loaded.identity_key_pair()?.public_key_b64()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_state_store_rejects_insecure_state_paths() -> Result<(), AgentError> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state = AgentNodeState::generate(Utc::now());
+        let broad = temp_state_path("state-broad");
+        std::fs::write(&broad, serde_json::to_vec_pretty(&state)?)?;
+        std::fs::set_permissions(&broad, std::fs::Permissions::from_mode(0o644))?;
+
+        let error = match FileAgentStateStore::new(&broad).load() {
+            Ok(_) => panic!("broadly readable state file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be readable"));
+
+        let target = temp_state_path("state-target");
+        let link = temp_state_path("state-link");
+        FileAgentStateStore::new(&target).save(&state)?;
+        symlink(&target, &link)?;
+
+        let load_error = match FileAgentStateStore::new(&link).load() {
+            Ok(_) => panic!("symlinked state file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(load_error.to_string().contains("symbolic link"));
+        let save_error = match FileAgentStateStore::new(&link).save(&state) {
+            Ok(_) => panic!("symlinked state file should not be overwritten"),
+            Err(error) => error,
+        };
+        assert!(save_error.to_string().contains("symbolic link"));
+
+        let _ = std::fs::remove_file(broad);
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
         Ok(())
     }
 

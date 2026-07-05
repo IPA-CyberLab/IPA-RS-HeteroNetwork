@@ -21,6 +21,7 @@ ipars-types = { path = "../ipars-types" }
 netlink-packet-core.workspace = true
 netlink-packet-generic.workspace = true
 netlink-packet-wireguard.workspace = true
+nix.workspace = true
 rtnetlink.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1030,6 +1030,7 @@ dependencies = [
  "netlink-packet-core",
  "netlink-packet-generic",
  "netlink-packet-wireguard",
+ "nix",
  "rtnetlink",
  "serde",
  "serde_json",
