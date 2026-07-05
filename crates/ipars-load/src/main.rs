@@ -216,6 +216,10 @@ struct LoadReport {
     daemon_agent_processes: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
+    daemon_control_plane_peer_map_endpoints: usize,
+    daemon_control_plane_peer_map_edges_min: usize,
+    daemon_control_plane_peer_map_edges_max: usize,
+    daemon_control_plane_peer_maps_consistent: bool,
     daemon_control_plane_relay_candidates_min: usize,
     daemon_control_plane_relay_candidates_max: usize,
     daemon_control_plane_healthy_nodes: usize,
@@ -289,7 +293,7 @@ impl LoadReport {
     fn validate_success(&self) -> anyhow::Result<()> {
         match self.transport {
             TransportMode::InMemory | TransportMode::Http => {
-                self.validate_registration_and_paths("load scenario", true)?;
+                self.validate_registration_and_paths("load scenario", true, self.node_count)?;
                 if self.relay_count > 0 && self.relay_candidates < self.relay_count {
                     bail!(
                         "load scenario reported {} relay candidates, expected at least {}",
@@ -302,7 +306,14 @@ impl LoadReport {
                 self.validate_relay_measurement("relay UDP scenario")?;
             }
             TransportMode::Daemon => {
-                self.validate_registration_and_paths("daemon load scenario", false)?;
+                let expected_peer_map_requests = self
+                    .node_count
+                    .saturating_mul(self.daemon_control_plane_processes);
+                self.validate_registration_and_paths(
+                    "daemon load scenario",
+                    false,
+                    expected_peer_map_requests,
+                )?;
                 self.validate_relay_measurement("daemon load scenario")?;
                 let expected_processes =
                     self.daemon_agent_processes + self.daemon_control_plane_processes + 3;
@@ -314,6 +325,30 @@ impl LoadReport {
                 }
                 if !self.daemon_control_plane_metrics_consistent {
                     bail!("daemon load scenario control-plane metrics are inconsistent");
+                }
+                if self.daemon_control_plane_peer_map_endpoints
+                    != self.daemon_control_plane_processes
+                {
+                    bail!(
+                        "daemon load scenario checked {} peer-map endpoints, expected {}",
+                        self.daemon_control_plane_peer_map_endpoints,
+                        self.daemon_control_plane_processes
+                    );
+                }
+                let expected_peer_edges = self
+                    .node_count
+                    .saturating_mul(self.node_count.saturating_sub(1));
+                if !self.daemon_control_plane_peer_maps_consistent {
+                    bail!("daemon load scenario control-plane peer maps are inconsistent");
+                }
+                if self.daemon_control_plane_peer_map_edges_min != expected_peer_edges
+                    || self.daemon_control_plane_peer_map_edges_max != expected_peer_edges
+                {
+                    bail!(
+                        "daemon load scenario peer-map edge mismatch: min/max={}/{}, expected {expected_peer_edges}",
+                        self.daemon_control_plane_peer_map_edges_min,
+                        self.daemon_control_plane_peer_map_edges_max
+                    );
                 }
                 if self.daemon_control_plane_healthy_nodes_min != self.node_count
                     || self.daemon_control_plane_healthy_nodes_max != self.node_count
@@ -352,6 +387,7 @@ impl LoadReport {
         &self,
         context: &str,
         allow_partial_unreachable: bool,
+        expected_peer_map_requests: usize,
     ) -> anyhow::Result<()> {
         if self.registrations != self.node_count {
             bail!(
@@ -360,11 +396,10 @@ impl LoadReport {
                 self.node_count
             );
         }
-        if self.peer_map_requests != self.node_count {
+        if self.peer_map_requests != expected_peer_map_requests {
             bail!(
-                "{context} made {} peer-map requests, expected {}",
-                self.peer_map_requests,
-                self.node_count
+                "{context} made {} peer-map requests, expected {expected_peer_map_requests}",
+                self.peer_map_requests
             );
         }
         let expected_peer_edges = self
@@ -562,6 +597,10 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_peer_map_endpoints: 0,
+        daemon_control_plane_peer_map_edges_min: 0,
+        daemon_control_plane_peer_map_edges_max: 0,
+        daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -731,6 +770,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_peer_map_endpoints: 0,
+        daemon_control_plane_peer_map_edges_min: 0,
+        daemon_control_plane_peer_map_edges_max: 0,
+        daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -874,6 +917,10 @@ async fn run_relay_udp_scenario(
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_peer_map_endpoints: 0,
+        daemon_control_plane_peer_map_edges_min: 0,
+        daemon_control_plane_peer_map_edges_max: 0,
+        daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -947,20 +994,12 @@ async fn run_daemon_scenario(
 
     services.write_manifest(DaemonRuntimePhase::PeerMapProbe)?;
     let peer_map_started = Instant::now();
-    let mut peer_map_edges_seen = 0;
-    let mut peer_records = Vec::new();
-    for (index, status) in agent_statuses.iter().enumerate() {
-        let control_plane_url =
-            &services.control_plane_urls[index % services.control_plane_urls.len()];
-        let peer_map: PeerMap = get_json(
-            &client,
-            format!("{control_plane_url}/v1/peers/{}", status.node_id),
-            "daemon control-plane peer map",
-        )
-        .await?;
-        peer_map_edges_seen += peer_map.peers.len();
-        peer_records.extend(peer_map.peers);
-    }
+    let peer_map_probe =
+        daemon_peer_map_probe(&client, &services.control_plane_urls, &agent_statuses).await?;
+    let peer_map_requests = agent_statuses.len() * services.control_plane_urls.len();
+    let peer_map_edges_seen = peer_map_probe.canonical_edge_count;
+    let peer_records = peer_map_probe.canonical_peer_records;
+    let peer_map_summary = peer_map_probe.summary;
     services.ensure_running(DaemonRuntimePhase::PeerMapProbe)?;
     let peer_map_millis = peer_map_started.elapsed().as_millis();
 
@@ -1102,7 +1141,7 @@ async fn run_daemon_scenario(
         advertised_routes,
         active_pair_count,
         registrations: agent_statuses.len(),
-        peer_map_requests: agent_statuses.len(),
+        peer_map_requests,
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
         relay_candidates: control_summary.relay_candidate_count_min,
@@ -1111,7 +1150,9 @@ async fn run_daemon_scenario(
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: (agent_statuses.len() * 2) + control_summary.endpoint_count,
+        control_plane_http_requests: agent_statuses.len()
+            + peer_map_requests
+            + control_summary.endpoint_count,
         signal_http_requests: peer_records.len() + active_pair_count + 1,
         relay_http_requests: active_pair_count + 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
@@ -1141,6 +1182,10 @@ async fn run_daemon_scenario(
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
+        daemon_control_plane_peer_map_endpoints: peer_map_summary.endpoint_count,
+        daemon_control_plane_peer_map_edges_min: peer_map_summary.edge_count_min,
+        daemon_control_plane_peer_map_edges_max: peer_map_summary.edge_count_max,
+        daemon_control_plane_peer_maps_consistent: peer_map_summary.maps_consistent,
         daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
         daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
         daemon_control_plane_healthy_nodes: control_summary.healthy_node_count_min,
@@ -2424,6 +2469,104 @@ async fn control_plane_health_summary(
     ControlPlaneHealthSummary::from_metrics(&metrics_samples)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DaemonPeerMapEndpointSummary {
+    edge_count: usize,
+    edges: BTreeMap<(String, String), usize>,
+}
+
+impl DaemonPeerMapEndpointSummary {
+    fn record_edge(&mut self, source_node_id: impl ToString, peer_node_id: impl ToString) {
+        self.edge_count += 1;
+        *self
+            .edges
+            .entry((source_node_id.to_string(), peer_node_id.to_string()))
+            .or_insert(0) += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonPeerMapSummary {
+    endpoint_count: usize,
+    edge_count_min: usize,
+    edge_count_max: usize,
+    maps_consistent: bool,
+}
+
+impl DaemonPeerMapSummary {
+    fn from_endpoint_summaries(
+        endpoint_summaries: &[DaemonPeerMapEndpointSummary],
+    ) -> anyhow::Result<Self> {
+        let first = endpoint_summaries
+            .first()
+            .context("daemon control-plane peer-map summary was empty")?;
+        let mut summary = Self {
+            endpoint_count: endpoint_summaries.len(),
+            edge_count_min: first.edge_count,
+            edge_count_max: first.edge_count,
+            maps_consistent: true,
+        };
+
+        for endpoint in &endpoint_summaries[1..] {
+            summary.edge_count_min = summary.edge_count_min.min(endpoint.edge_count);
+            summary.edge_count_max = summary.edge_count_max.max(endpoint.edge_count);
+            if endpoint != first {
+                summary.maps_consistent = false;
+            }
+        }
+
+        Ok(summary)
+    }
+}
+
+#[derive(Debug)]
+struct DaemonPeerMapProbe {
+    canonical_peer_records: Vec<NodeRecord>,
+    canonical_edge_count: usize,
+    summary: DaemonPeerMapSummary,
+}
+
+async fn daemon_peer_map_probe(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    agent_statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonPeerMapProbe> {
+    if control_plane_urls.is_empty() {
+        bail!("at least one daemon control-plane URL is required");
+    }
+
+    let mut endpoint_summaries = Vec::with_capacity(control_plane_urls.len());
+    let mut canonical_peer_records = Vec::new();
+    let mut canonical_edge_count = 0;
+    for (endpoint_index, control_plane_url) in control_plane_urls.iter().enumerate() {
+        let mut endpoint_summary = DaemonPeerMapEndpointSummary::default();
+        for status in agent_statuses {
+            let request_context =
+                format!("daemon control-plane peer map endpoint {endpoint_index}");
+            let peer_map: PeerMap = get_json(
+                client,
+                format!("{control_plane_url}/v1/peers/{}", status.node_id),
+                &request_context,
+            )
+            .await?;
+            for peer in &peer_map.peers {
+                endpoint_summary.record_edge(&status.node_id, &peer.node_id);
+            }
+            if endpoint_index == 0 {
+                canonical_edge_count += peer_map.peers.len();
+                canonical_peer_records.extend(peer_map.peers);
+            }
+        }
+        endpoint_summaries.push(endpoint_summary);
+    }
+
+    Ok(DaemonPeerMapProbe {
+        canonical_peer_records,
+        canonical_edge_count,
+        summary: DaemonPeerMapSummary::from_endpoint_summaries(&endpoint_summaries)?,
+    })
+}
+
 async fn check_daemon_agent_control_and_signal_readiness(
     client: &reqwest::Client,
     control_plane_urls: &[String],
@@ -3134,6 +3277,41 @@ mod tests {
     }
 
     #[test]
+    fn daemon_peer_map_summary_reports_endpoint_ranges_and_consistency() -> anyhow::Result<()> {
+        let first = daemon_peer_map_endpoint_summary(&[
+            ("load-node-0000", "load-node-0001"),
+            ("load-node-0001", "load-node-0000"),
+        ]);
+        let consistent =
+            DaemonPeerMapSummary::from_endpoint_summaries(&[first.clone(), first.clone()])?;
+        assert_eq!(consistent.endpoint_count, 2);
+        assert_eq!(consistent.edge_count_min, 2);
+        assert_eq!(consistent.edge_count_max, 2);
+        assert!(consistent.maps_consistent);
+
+        let different_edges = daemon_peer_map_endpoint_summary(&[
+            ("load-node-0000", "load-node-0002"),
+            ("load-node-0001", "load-node-0000"),
+        ]);
+        let skewed = DaemonPeerMapSummary::from_endpoint_summaries(&[
+            first.clone(),
+            different_edges,
+            daemon_peer_map_endpoint_summary(&[("load-node-0000", "load-node-0001")]),
+        ])?;
+        assert_eq!(skewed.endpoint_count, 3);
+        assert_eq!(skewed.edge_count_min, 1);
+        assert_eq!(skewed.edge_count_max, 2);
+        assert!(!skewed.maps_consistent);
+
+        let empty = match DaemonPeerMapSummary::from_endpoint_summaries(&[]) {
+            Ok(_) => bail!("empty control-plane peer-map summary should fail"),
+            Err(error) => error,
+        };
+        assert!(empty.to_string().contains("summary was empty"));
+        Ok(())
+    }
+
+    #[test]
     fn daemon_runtime_cleanup_policy_removes_or_retains_directory() -> anyhow::Result<()> {
         let cleanup_dir = synthetic_runtime_dir("cleanup");
         std::fs::create_dir_all(&cleanup_dir)?;
@@ -3609,9 +3787,15 @@ mod tests {
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
+        assert_eq!(report.peer_map_requests, 4);
+        assert_eq!(report.peer_map_edges_seen, 2);
         assert_eq!(report.daemon_processes, 7);
         assert!(report.daemon_runtime_dir.is_none());
         assert!(report.daemon_runtime_manifest.is_none());
+        assert_eq!(report.daemon_control_plane_peer_map_endpoints, 2);
+        assert_eq!(report.daemon_control_plane_peer_map_edges_min, 2);
+        assert_eq!(report.daemon_control_plane_peer_map_edges_max, 2);
+        assert!(report.daemon_control_plane_peer_maps_consistent);
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
@@ -3719,6 +3903,14 @@ mod tests {
             endpoint_candidate_ttl_seconds: 0,
             generated_at: Utc::now(),
         }
+    }
+
+    fn daemon_peer_map_endpoint_summary(edges: &[(&str, &str)]) -> DaemonPeerMapEndpointSummary {
+        let mut summary = DaemonPeerMapEndpointSummary::default();
+        for (source, peer) in edges {
+            summary.record_edge(source, peer);
+        }
+        summary
     }
 
     fn synthetic_runtime_dir(label: &str) -> PathBuf {

@@ -79,10 +79,12 @@ invalid inputs. Daemon transport can spawn
 multiple control-plane processes against the same SQLite store, writes signed agent join tokens into
 private runtime files using the selected scenario's relay/route-provider distribution and all
 runtime control-plane bootstrap URLs, and passes `--join-token-path` so token material is not exposed
-through child process argv. Load reports are validated before CLI success so missing registrations,
-peer-map edge loss, all-unreachable path negotiation, relay packet loss, relay admission failures,
-or daemon health inconsistencies fail the run instead of only appearing as degraded JSON fields. It
-captures each child process stdout/stderr log and reports log tails
+through child process argv. Daemon transport probes every control-plane endpoint for every agent
+peer map and reports per-endpoint edge-count min/max plus full source/target edge consistency.
+Load reports are validated before CLI success so missing registrations, peer-map edge loss or
+cross-control-plane skew, all-unreachable path negotiation, relay packet loss, relay admission
+failures, or daemon health inconsistencies fail the run instead of only appearing as degraded JSON
+fields. It captures each child process stdout/stderr log and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration
 visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
 negotiation readiness before measuring:
