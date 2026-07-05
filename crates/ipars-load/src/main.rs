@@ -743,7 +743,7 @@ async fn run_daemon_scenario(
         agent_statuses
             .push(get_json(&client, format!("{url}/v1/status"), "daemon agent status").await?);
     }
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::RegistrationProbe)?;
     let registration_millis = registration_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::PeerMapProbe)?;
@@ -762,7 +762,7 @@ async fn run_daemon_scenario(
         peer_map_edges_seen += peer_map.peers.len();
         peer_records.extend(peer_map.peers);
     }
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::PeerMapProbe)?;
     let peer_map_millis = peer_map_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::SignalUpsert)?;
@@ -779,7 +779,7 @@ async fn run_daemon_scenario(
         )
         .await?;
     }
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::SignalUpsert)?;
 
     services.write_manifest(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_started = Instant::now();
@@ -809,7 +809,7 @@ async fn run_daemon_scenario(
         .await?;
         path_counts.record(response.preferred_state);
     }
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_millis = signal_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::RelayMeasurement)?;
@@ -861,7 +861,7 @@ async fn run_daemon_scenario(
             relay_payload_bytes_received = relay_payload_bytes_received.saturating_add(len as u64);
         }
     }
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::RelayMeasurement)?;
     let relay_elapsed = relay_started.elapsed();
     let relay_millis = relay_elapsed.as_millis();
     services.write_manifest(DaemonRuntimePhase::FinalMetrics)?;
@@ -891,7 +891,7 @@ async fn run_daemon_scenario(
         "daemon signal metrics",
     )
     .await?;
-    services.ensure_running()?;
+    services.ensure_running(DaemonRuntimePhase::FinalMetrics)?;
     services.write_manifest(DaemonRuntimePhase::Completed)?;
 
     Ok(LoadReport {
@@ -1196,6 +1196,16 @@ struct DaemonRuntimeManifestChild {
     role: String,
     pid: Option<u32>,
     log_path: Option<PathBuf>,
+    state: DaemonRuntimeManifestChildState,
+    exit_status: Option<String>,
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonRuntimeManifestChildState {
+    Running,
+    Exited,
 }
 
 #[derive(Debug, Clone)]
@@ -1246,10 +1256,22 @@ impl DaemonRuntimeManifestSeed {
 
 impl DaemonRuntimeManifestChild {
     fn from_child(child: &DaemonChild) -> Self {
+        let (state, exit_status, exit_code) = if let Some(exit) = &child.last_exit {
+            (
+                DaemonRuntimeManifestChildState::Exited,
+                Some(exit.status.clone()),
+                exit.code,
+            )
+        } else {
+            (DaemonRuntimeManifestChildState::Running, None, None)
+        };
         Self {
             role: child.role.clone(),
             pid: Some(child.child.id()),
             log_path: child.log_path.clone(),
+            state,
+            exit_status,
+            exit_code,
         }
     }
 }
@@ -1503,8 +1525,18 @@ impl DaemonProcessGroup {
         self.children.len()
     }
 
-    fn ensure_running(&mut self) -> anyhow::Result<()> {
-        ensure_daemon_children_running(&mut self.children)
+    fn ensure_running(&mut self, phase: DaemonRuntimePhase) -> anyhow::Result<()> {
+        match ensure_daemon_children_running(&mut self.children) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(manifest_error) = self.write_manifest(phase) {
+                    bail!(
+                        "{error}; additionally failed to update daemon runtime manifest after liveness failure: {manifest_error}"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -1564,6 +1596,13 @@ struct DaemonChild {
     role: String,
     child: Child,
     log_path: Option<PathBuf>,
+    last_exit: Option<DaemonChildExit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonChildExit {
+    status: String,
+    code: Option<i32>,
 }
 
 fn spawn_iparsd(
@@ -1602,6 +1641,7 @@ fn spawn_iparsd(
         role: role.to_string(),
         child,
         log_path: Some(log_path),
+        last_exit: None,
     })
 }
 
@@ -1620,6 +1660,11 @@ fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Resul
                 daemon_child.role
             )
         })? {
+            let exit = DaemonChildExit {
+                status: status.to_string(),
+                code: status.code(),
+            };
+            daemon_child.last_exit = Some(exit.clone());
             let log_tail = daemon_child
                 .log_tail()
                 .map(|tail| format!("\n{tail}"))
@@ -1627,7 +1672,7 @@ fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Resul
             bail!(
                 "iparsd {} process exited before daemon load scenario completed: {}{}",
                 daemon_child.role,
-                status,
+                exit.status,
                 log_tail
             );
         }
@@ -2699,6 +2744,12 @@ mod tests {
         assert_eq!(decoded.children[0].role, "control-plane-0");
         assert_eq!(decoded.children[0].pid, Some(4242));
         assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
+        assert_eq!(
+            decoded.children[0].state,
+            DaemonRuntimeManifestChildState::Running
+        );
+        assert_eq!(decoded.children[0].exit_status, None);
+        assert_eq!(decoded.children[0].exit_code, None);
 
         std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
@@ -2734,6 +2785,7 @@ mod tests {
             role: "signal".to_string(),
             child,
             log_path: Some(log_path.clone()),
+            last_exit: None,
         }];
 
         let agent_urls = vec!["http://127.0.0.1:31006".to_string()];
@@ -2753,6 +2805,12 @@ mod tests {
         assert_eq!(updated.children[0].role, "signal");
         assert_eq!(updated.children[0].pid, Some(pid));
         assert_eq!(updated.children[0].log_path.as_ref(), Some(&log_path));
+        assert_eq!(
+            updated.children[0].state,
+            DaemonRuntimeManifestChildState::Running
+        );
+        assert_eq!(updated.children[0].exit_status, None);
+        assert_eq!(updated.children[0].exit_code, None);
 
         let _ = children[0].child.kill();
         let _ = children[0].child.wait();
@@ -2911,6 +2969,7 @@ mod tests {
             role: "synthetic".to_string(),
             child,
             log_path: Some(log_path.clone()),
+            last_exit: None,
         }];
 
         for _ in 0..50 {
@@ -2921,6 +2980,23 @@ mod tests {
                     assert!(message.contains("iparsd synthetic process exited"));
                     assert!(message.contains("7"));
                     assert!(message.contains("child diagnostic line"));
+                    assert_eq!(
+                        children[0].last_exit,
+                        Some(DaemonChildExit {
+                            status: "exit status: 7".to_string(),
+                            code: Some(7),
+                        })
+                    );
+                    let manifest_child = DaemonRuntimeManifestChild::from_child(&children[0]);
+                    assert_eq!(
+                        manifest_child.state,
+                        DaemonRuntimeManifestChildState::Exited
+                    );
+                    assert_eq!(
+                        manifest_child.exit_status.as_deref(),
+                        Some("exit status: 7")
+                    );
+                    assert_eq!(manifest_child.exit_code, Some(7));
                     let _ = std::fs::remove_file(&log_path);
                     return Ok(());
                 }
@@ -3160,6 +3236,9 @@ mod tests {
                 role: "control-plane-0".to_string(),
                 pid: Some(4242),
                 log_path: Some(log_path),
+                state: DaemonRuntimeManifestChildState::Running,
+                exit_status: None,
+                exit_code: None,
             }],
         }
     }
