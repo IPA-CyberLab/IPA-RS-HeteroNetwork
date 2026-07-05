@@ -2600,8 +2600,11 @@ fn apply_token_ledger_metrics(
 struct SignalOtelSnapshot {
     node_upsert_count: u64,
     path_negotiation_count: u64,
+    path_acl_denied_count: u64,
+    relay_candidate_acl_denied_count: u64,
     path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
+    hole_punch_acl_denied_count: u64,
     hole_punch_nat_suppressed_count: u64,
 }
 
@@ -2610,8 +2613,11 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
         Self {
             node_upsert_count: metrics.node_upsert_count,
             path_negotiation_count: metrics.path_negotiation_count,
+            path_acl_denied_count: metrics.path_acl_denied_count,
+            relay_candidate_acl_denied_count: metrics.relay_candidate_acl_denied_count,
             path_negotiation_state_counts: metrics.path_negotiation_state_counts.clone(),
             hole_punch_plan_count: metrics.hole_punch_plan_count,
+            hole_punch_acl_denied_count: metrics.hole_punch_acl_denied_count,
             hole_punch_nat_suppressed_count: metrics.hole_punch_nat_suppressed_count,
         }
     }
@@ -2635,8 +2641,11 @@ struct SignalOtelMetrics {
     nat_classification_min_confidence_percent: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
+    path_acl_denials: Counter<u64>,
+    relay_candidate_acl_denials: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
     hole_punch_plans: Counter<u64>,
+    hole_punch_acl_denials: Counter<u64>,
     hole_punch_nat_suppressions: Counter<u64>,
 }
 
@@ -2714,6 +2723,16 @@ impl SignalOtelMetrics {
                 .u64_counter("ipars.signal.path_negotiations")
                 .with_description("Signal path negotiation requests handled.")
                 .build(),
+            path_acl_denials: meter
+                .u64_counter("ipars.signal.path_acl_denials")
+                .with_description("Signal path negotiations hidden by cluster ACL policy.")
+                .build(),
+            relay_candidate_acl_denials: meter
+                .u64_counter("ipars.signal.relay_candidate_acl_denials")
+                .with_description(
+                    "Eligible relay candidates removed from signal negotiation by cluster ACL policy.",
+                )
+                .build(),
             path_negotiations_by_state: meter
                 .u64_counter("ipars.signal.path_negotiations.by_state")
                 .with_description("Successful signal path negotiations by selected state.")
@@ -2721,6 +2740,10 @@ impl SignalOtelMetrics {
             hole_punch_plans: meter
                 .u64_counter("ipars.signal.hole_punch_plans")
                 .with_description("Signal hole-punch plan requests handled.")
+                .build(),
+            hole_punch_acl_denials: meter
+                .u64_counter("ipars.signal.hole_punch_acl_denials")
+                .with_description("Signal hole-punch plans hidden by cluster ACL policy.")
                 .build(),
             hole_punch_nat_suppressions: meter
                 .u64_counter("ipars.signal.hole_punch_nat_suppressions")
@@ -2790,6 +2813,20 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        self.path_acl_denials.add(
+            counter_delta(
+                metrics.path_acl_denied_count,
+                previous.map(|previous| previous.path_acl_denied_count),
+            ),
+            &[],
+        );
+        self.relay_candidate_acl_denials.add(
+            counter_delta(
+                metrics.relay_candidate_acl_denied_count,
+                previous.map(|previous| previous.relay_candidate_acl_denied_count),
+            ),
+            &[],
+        );
         for state in [
             PathState::DirectPublic,
             PathState::DirectIpv6,
@@ -2811,6 +2848,13 @@ impl SignalOtelMetrics {
             counter_delta(
                 metrics.hole_punch_plan_count,
                 previous.map(|previous| previous.hole_punch_plan_count),
+            ),
+            &[],
+        );
+        self.hole_punch_acl_denials.add(
+            counter_delta(
+                metrics.hole_punch_acl_denied_count,
+                previous.map(|previous| previous.hole_punch_acl_denied_count),
             ),
             &[],
         );

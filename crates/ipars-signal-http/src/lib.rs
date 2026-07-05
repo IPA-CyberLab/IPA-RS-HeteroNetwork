@@ -245,6 +245,32 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_path_acl_denials_total Total signal path negotiations hidden by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_path_acl_denials_total {}",
+        metrics.path_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_relay_candidate_acl_denials_total Total eligible relay candidates removed from signal negotiation by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_relay_candidate_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_relay_candidate_acl_denials_total {}",
+        metrics.relay_candidate_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_path_negotiation_state_total Successful signal path negotiations by selected state."
     );
     prometheus_line!(
@@ -271,6 +297,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         &mut body,
         "ipars_signal_hole_punch_plans_total {}",
         metrics.hole_punch_plan_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_hole_punch_acl_denials_total Total signal hole-punch plans hidden by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_hole_punch_acl_denials_total {}",
+        metrics.hole_punch_acl_denied_count
     );
     prometheus_line!(
         &mut body,
@@ -551,6 +590,9 @@ mod tests {
         assert_eq!(metrics.nat_classification_min_confidence_percent, 50);
         assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
+        assert_eq!(metrics.path_acl_denied_count, 0);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         assert_eq!(
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
@@ -579,6 +621,9 @@ mod tests {
             "ipars_signal_fresh_nat_classifications_by_strategy{strategy=\"direct_candidate\"} 0"
         ));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
+        assert!(body.contains("ipars_signal_path_acl_denials_total 0"));
+        assert!(body.contains("ipars_signal_relay_candidate_acl_denials_total 0"));
+        assert!(body.contains("ipars_signal_hole_punch_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")

@@ -41,12 +41,15 @@ pub struct SignalRegistry {
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     node_upserts: AtomicU64,
     path_negotiations: AtomicU64,
+    path_acl_denials: AtomicU64,
+    relay_candidate_acl_denials: AtomicU64,
     direct_public_negotiations: AtomicU64,
     direct_ipv6_negotiations: AtomicU64,
     direct_nat_traversal_negotiations: AtomicU64,
     relay_negotiations: AtomicU64,
     unreachable_negotiations: AtomicU64,
     hole_punch_plans: AtomicU64,
+    hole_punch_acl_denials: AtomicU64,
     hole_punch_nat_suppressions: AtomicU64,
 }
 
@@ -59,12 +62,15 @@ impl SignalRegistry {
             health: RwLock::new(BTreeMap::new()),
             node_upserts: AtomicU64::new(0),
             path_negotiations: AtomicU64::new(0),
+            path_acl_denials: AtomicU64::new(0),
+            relay_candidate_acl_denials: AtomicU64::new(0),
             direct_public_negotiations: AtomicU64::new(0),
             direct_ipv6_negotiations: AtomicU64::new(0),
             direct_nat_traversal_negotiations: AtomicU64::new(0),
             relay_negotiations: AtomicU64::new(0),
             unreachable_negotiations: AtomicU64::new(0),
             hole_punch_plans: AtomicU64::new(0),
+            hole_punch_acl_denials: AtomicU64::new(0),
             hole_punch_nat_suppressions: AtomicU64::new(0),
         }
     }
@@ -146,6 +152,7 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
         if !acl_allows_peer(&source_node, &target, &self.coordinator.policy) {
+            self.path_acl_denials.fetch_add(1, Ordering::Relaxed);
             let response = acl_denied_signal_path_response(request);
             self.record_path_negotiation_state(response.preferred_state);
             return Ok(response);
@@ -171,12 +178,23 @@ impl SignalRegistry {
         if let Some(source_nat_classification) = source_nat_classification {
             request.source_nat_classification = Some(source_nat_classification);
         }
+        let mut relay_acl_denials = 0;
         let relays = self
             .relay_candidates()
             .await
             .into_iter()
-            .filter(|relay| acl_allows_peer(&source_node, relay, &self.coordinator.policy))
+            .filter(|relay| {
+                let allowed = acl_allows_peer(&source_node, relay, &self.coordinator.policy);
+                if !allowed {
+                    relay_acl_denials += 1;
+                }
+                allowed
+            })
             .collect::<Vec<_>>();
+        if relay_acl_denials > 0 {
+            self.relay_candidate_acl_denials
+                .fetch_add(relay_acl_denials, Ordering::Relaxed);
+        }
         let response = self.coordinator.negotiate(
             request,
             &target,
@@ -203,6 +221,7 @@ impl SignalRegistry {
             .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
         let now = Utc::now();
         if !acl_allows_peer(&source_node, &target_node, &self.coordinator.policy) {
+            self.hole_punch_acl_denials.fetch_add(1, Ordering::Relaxed);
             return Ok(SignalHolePunchPlanResponse {
                 key: PeerPathKey::new(source, target),
                 source_reflexive: None,
@@ -360,8 +379,13 @@ impl SignalRegistry {
             stale_endpoint_candidate_count,
             node_upsert_count: self.node_upserts.load(Ordering::Relaxed),
             path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
+            path_acl_denied_count: self.path_acl_denials.load(Ordering::Relaxed),
+            relay_candidate_acl_denied_count: self
+                .relay_candidate_acl_denials
+                .load(Ordering::Relaxed),
             path_negotiation_state_counts: self.path_negotiation_state_counts(),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
+            hole_punch_acl_denied_count: self.hole_punch_acl_denials.load(Ordering::Relaxed),
             hole_punch_nat_suppressed_count: self
                 .hole_punch_nat_suppressions
                 .load(Ordering::Relaxed),
@@ -1176,6 +1200,9 @@ mod tests {
         assert!(response.relay_candidates.is_empty());
         assert_eq!(response.score.reasons, vec!["policy_denied".to_string()]);
         let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 1);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
         Ok(())
     }
@@ -1212,6 +1239,9 @@ mod tests {
 
         assert_eq!(response.preferred_state, PathState::Unreachable);
         assert!(response.relay_candidates.is_empty());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 0);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 1);
 
         registry
             .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
@@ -1235,6 +1265,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![NodeId::from_string("relay-a")]
         );
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 1);
         Ok(())
     }
 
@@ -1601,6 +1633,7 @@ mod tests {
         assert_eq!(plan.start_after_millis, 0);
         let metrics = registry.metrics().await;
         assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         Ok(())
     }
