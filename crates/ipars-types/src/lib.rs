@@ -2034,6 +2034,9 @@ pub mod api {
     ];
 
     fn http_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if let Some(application) = http_payload_hint_application(payload) {
+            return Some(application);
+        }
         if let Some(path) = http_request_path(payload) {
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
@@ -2083,10 +2086,15 @@ pub mod api {
             return None;
         }
         let frames = payload.get(HTTP2_PREFACE.len()..).unwrap_or_default();
-        if contains_ascii_case_insensitive(frames, b"/opentelemetry.proto.collector.") {
+        http_payload_hint_application(frames)
+    }
+
+    fn http_payload_hint_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if contains_ascii_case_insensitive(payload, b"/opentelemetry.proto.collector.") {
             return Some(AgentPacketFlowApplication::OpenTelemetry);
         }
-        if grpc_http_payload(frames) || contains_ascii_case_insensitive(frames, b"application/grpc")
+        if grpc_http_payload(payload)
+            || contains_ascii_case_insensitive(payload, b"application/grpc")
         {
             return Some(AgentPacketFlowApplication::Grpc);
         }
@@ -3128,6 +3136,17 @@ mod tests {
         assert_eq!(
             observation_for_payload(
                 b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"\x00\x00*application/grpc\x00\x00\x00").application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"\x00/opentelemetry.proto.collector.logs.v1.LogsService/Export"
             )
             .application(),
             api::AgentPacketFlowApplication::OpenTelemetry
