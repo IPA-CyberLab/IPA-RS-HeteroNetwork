@@ -1360,6 +1360,7 @@ impl DaemonProcessGroup {
         }
         let runtime_dir = daemon_runtime_dir()?;
         std::fs::create_dir_all(&runtime_dir)?;
+        secure_daemon_runtime_dir(&runtime_dir)?;
         let mut startup = DaemonStartupGuard::new(runtime_dir.clone(), options.keep_runtime_dir);
         let control_addrs = reserve_tcp_addrs(options.control_plane_processes).await?;
         let signal_addr = reserve_tcp_addr().await?;
@@ -1952,6 +1953,16 @@ fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
     Ok(std::env::temp_dir().join(unique))
+}
+
+fn secure_daemon_runtime_dir(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure daemon runtime dir {}", path.display()))?;
+    }
+    Ok(())
 }
 
 async fn reserve_tcp_addr() -> anyhow::Result<SocketAddr> {
@@ -2933,6 +2944,23 @@ mod tests {
         }
         assert!(retained_dir.join("marker.log").exists());
         std::fs::remove_dir_all(&retained_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_runtime_dir_is_owner_only() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("secure-runtime");
+        std::fs::create_dir_all(&runtime_dir)?;
+        secure_daemon_runtime_dir(&runtime_dir)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&runtime_dir)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+
+        std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
     }
 
