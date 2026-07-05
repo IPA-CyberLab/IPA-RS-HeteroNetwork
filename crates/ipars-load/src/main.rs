@@ -1036,6 +1036,7 @@ impl DaemonProcessGroup {
                 index,
                 Scenario::from_name(ScenarioName::Three),
             )?)?;
+            let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
             startup.children.push(spawn_iparsd(
                 iparsd_bin,
                 &[
@@ -1044,8 +1045,8 @@ impl DaemonProcessGroup {
                     agent_addr.to_string(),
                     "--state-path".to_string(),
                     state_path.display().to_string(),
-                    "--join-token".to_string(),
-                    serde_json::to_string(&token)?,
+                    "--join-token-path".to_string(),
+                    token_path.display().to_string(),
                     "--control-plane-url".to_string(),
                     control_plane_url.clone(),
                     "--signal-url".to_string(),
@@ -1282,6 +1283,50 @@ fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
         })
         .collect::<String>();
     runtime_dir.join(format!("{serial:04}-{sanitized_role}.log"))
+}
+
+fn write_daemon_join_token<Token: Serialize>(
+    runtime_dir: &Path,
+    agent_index: usize,
+    token: &Token,
+) -> anyhow::Result<PathBuf> {
+    let token_path = runtime_dir.join(format!("agent-{agent_index:04}.join-token.json"));
+    let token_json = serde_json::to_vec(token).context("failed to serialize daemon join token")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&token_path).with_context(|| {
+        format!(
+            "failed to create daemon join token {}",
+            token_path.display()
+        )
+    })?;
+    file.write_all(&token_json)
+        .with_context(|| format!("failed to write daemon join token {}", token_path.display()))?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "failed to finalize daemon join token {}",
+            token_path.display()
+        )
+    })?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync daemon join token {}", token_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set daemon join token permissions on {}",
+                    token_path.display()
+                )
+            })?;
+    }
+    Ok(token_path)
 }
 
 fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
@@ -1851,6 +1896,39 @@ mod tests {
         let _ = children[0].child.wait();
         let _ = std::fs::remove_file(&log_path);
         bail!("synthetic daemon child did not exit before liveness timeout")
+    }
+
+    #[test]
+    fn daemon_join_token_writer_uses_private_runtime_file() -> anyhow::Result<()> {
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "ipars-load-token-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&runtime_dir)?;
+        let token = serde_json::json!({
+            "token": "sensitive",
+            "signature": "test-signature",
+        });
+
+        let token_path = write_daemon_join_token(&runtime_dir, 7, &token)?;
+
+        assert_eq!(
+            token_path.file_name().and_then(|name| name.to_str()),
+            Some("agent-0007.join-token.json")
+        );
+        let contents = std::fs::read_to_string(&token_path)?;
+        assert!(contents.contains("\"sensitive\""));
+        assert!(contents.ends_with('\n'));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&token_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
     }
 
     #[tokio::test]
