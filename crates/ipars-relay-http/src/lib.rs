@@ -89,7 +89,7 @@ async fn admit(
     Json(request): Json<RelayAdmissionRequest>,
 ) -> Result<(StatusCode, Json<RelayAdmissionResponse>), ApiError> {
     if let Err(error) = state.authorize_admission(&headers) {
-        state.relay.record_unauthorized_admission_attempt();
+        state.relay.record_unauthorized_admission_attempt()?;
         return Err(error);
     }
     Ok((StatusCode::CREATED, Json(state.relay.admit(request).await?)))
@@ -648,6 +648,81 @@ mod tests {
         assert!(body.contains(
             "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"unauthorized\"} 2"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_relay_admission_rate_limits_unauthorized_attempts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let relay = Arc::new(RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay-a"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                admission_url: Some("http://203.0.113.10:9580".to_string()),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+            chrono::Duration::seconds(300),
+            Some(ipars_relay::RelayAdmissionRateLimit {
+                max_attempts: 1,
+                window: chrono::Duration::seconds(60),
+            }),
+        ));
+        let app = router(
+            RelayHttpState::new(relay.clone())
+                .require_admission_bearer_token("cluster-relay-secret".to_string()),
+        );
+
+        let request_body = serde_json::to_vec(&RelayAdmissionRequest {
+            left: NodeId::from_string("left"),
+            right: NodeId::from_string("right"),
+            left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+            right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+        })?;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let status = relay.status().await;
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 2);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&1)
+        );
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::RateLimited),
+            Some(&1)
+        );
         Ok(())
     }
 }

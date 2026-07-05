@@ -662,9 +662,18 @@ impl RelayService {
         result
     }
 
-    pub fn record_unauthorized_admission_attempt(&self) {
+    pub fn record_unauthorized_admission_attempt(&self) -> Result<(), RelayError> {
         self.admission_attempts.fetch_add(1, Ordering::Relaxed);
-        self.record_admission_failure(RelayAdmissionFailureReason::Unauthorized);
+        match self.record_admission_attempt_for_limit(Utc::now()) {
+            Ok(()) => {
+                self.record_admission_failure(RelayAdmissionFailureReason::Unauthorized);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_admission_failure(relay_error_admission_failure_reason(&error));
+                Err(error)
+            }
+        }
     }
 
     fn record_admission_attempt_for_limit(&self, now: DateTime<Utc>) -> Result<(), RelayError> {
@@ -1471,6 +1480,43 @@ mod tests {
         assert_eq!(
             RelayAdmissionFailureReason::RateLimited.as_str(),
             "rate_limited"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_rate_limits_unauthorized_admission_attempts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 1,
+                window: chrono::Duration::seconds(60),
+            }),
+        );
+
+        service.record_unauthorized_admission_attempt()?;
+        let rejected = service.record_unauthorized_admission_attempt();
+
+        assert!(matches!(rejected, Err(RelayError::RateLimited)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 2);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&1)
+        );
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::RateLimited),
+            Some(&1)
         );
         Ok(())
     }
