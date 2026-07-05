@@ -811,6 +811,7 @@ struct RuntimePreflightNeeds {
     route_netlink: bool,
     generic_netlink: bool,
     netfilter_netlink: bool,
+    docker_api_socket: bool,
     ipv4_forwarding: bool,
     ipv6_forwarding: bool,
     cap_net_admin: bool,
@@ -829,6 +830,7 @@ impl RuntimePreflightNeeds {
             route_netlink: false,
             generic_netlink: false,
             netfilter_netlink: false,
+            docker_api_socket: false,
             ipv4_forwarding: false,
             ipv6_forwarding: false,
             cap_net_admin: false,
@@ -846,6 +848,7 @@ impl RuntimePreflightNeeds {
             && !self.route_netlink
             && !self.generic_netlink
             && !self.netfilter_netlink
+            && !self.docker_api_socket
             && !self.ipv4_forwarding
             && !self.ipv6_forwarding
             && !self.cap_net_admin
@@ -893,6 +896,7 @@ struct RuntimePreflightChecks {
     ebpf_tracepoint: fn(&EbpfTracepointAttachSpec) -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
+    docker_api_socket: fn(&Path) -> anyhow::Result<()>,
     ipv4_forwarding: fn() -> anyhow::Result<()>,
     ipv6_forwarding: fn() -> anyhow::Result<()>,
 }
@@ -909,6 +913,7 @@ impl RuntimePreflightChecks {
             ebpf_tracepoint: ensure_ebpf_tracepoint_ready,
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
+            docker_api_socket: ensure_docker_api_socket_ready,
             ipv4_forwarding: ensure_ipv4_forwarding_if_known,
             ipv6_forwarding: ensure_ipv6_forwarding_if_known,
         }
@@ -1068,6 +1073,10 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.netfilter_netlink {
         (checks.netlink)(RuntimeNetlinkProtocol::Netfilter)?;
     }
+    if needs.docker_api_socket {
+        let socket = docker_api_socket_path(args)?;
+        (checks.docker_api_socket)(&socket)?;
+    }
     if needs.ipv4_forwarding {
         (checks.ipv4_forwarding)()?;
     }
@@ -1114,6 +1123,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_route_netlink = needs.route_netlink,
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
+        needs_docker_api_socket = needs.docker_api_socket,
         needs_ipv4_forwarding = needs.ipv4_forwarding,
         needs_ipv6_forwarding = needs.ipv6_forwarding,
         needs_cap_net_admin = needs.cap_net_admin,
@@ -1365,9 +1375,11 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
+    let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
     if args.runtime_backend == AgentRuntimeBackend::DryRun {
         return RuntimePreflightNeeds {
             netfilter_netlink,
+            docker_api_socket,
             cap_net_admin: netfilter_netlink,
             cap_perfmon: ebpf_ringbuf,
             cap_bpf: ebpf_ringbuf,
@@ -1375,7 +1387,10 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         };
     }
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
-        return RuntimePreflightNeeds::none();
+        return RuntimePreflightNeeds {
+            docker_api_socket,
+            ..RuntimePreflightNeeds::none()
+        };
     }
     let applies_routes =
         args.apply_peer_map || args.apply_docker_routes || args.apply_kubernetes_underlay;
@@ -1396,6 +1411,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
+        docker_api_socket,
         ipv4_forwarding,
         ipv6_forwarding,
         cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
@@ -1691,6 +1707,35 @@ fn ensure_ebpf_object_file_ready(path: &Path) -> anyhow::Result<()> {
         "eBPF packet-flow object {} is empty",
         path.display()
     );
+    Ok(())
+}
+
+fn ensure_docker_api_socket_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Docker API socket {} is not readable", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "Docker API socket {} must not be a symlink",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        anyhow::ensure!(
+            metadata.file_type().is_socket(),
+            "Docker API socket {} must be a Unix domain socket",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Docker API socket {} must be a regular file on this platform",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -10172,6 +10217,69 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_checks_docker_api_socket_for_discovery() -> anyhow::Result<()> {
+        let base = unique_test_dir("docker-api-preflight")?;
+        let missing_socket = base.join("missing.sock");
+        let missing_socket_arg = missing_socket.display().to_string();
+        let missing_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            missing_socket_arg.as_str(),
+        ])?;
+
+        if let Command::Agent(args) = missing_cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.docker_api_socket);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("missing Docker socket should fail preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("Docker API socket"));
+            assert!(error.to_string().contains("not readable"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let socket = base.join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let socket_arg = socket.display().to_string();
+        let valid_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            socket_arg.as_str(),
+        ])?;
+        if let Command::Agent(args) = valid_cli.command {
+            preflight_agent_runtime_with_path(&args, Some(OsStr::new("")))?;
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let link = base.join("docker-link.sock");
+        std::os::unix::fs::symlink(&socket, &link)?;
+        let error = match ensure_docker_api_socket_ready(&link) {
+            Ok(()) => anyhow::bail!("symlinked Docker socket should fail preflight"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
     #[test]
     fn runtime_preflight_requires_linux_tools_for_command_backend() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-peer-map"])?;
@@ -10339,6 +10447,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Ok(())
     }
 
+    fn preflight_noop_path(_path: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn preflight_fail_ebpf_object(path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("blocked test eBPF object {}", path.display())
     }
@@ -10386,6 +10498,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
             netlink,
+            docker_api_socket: preflight_noop_path,
             ipv4_forwarding: preflight_noop,
             ipv6_forwarding: preflight_noop,
         }
@@ -10405,6 +10518,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
+            docker_api_socket: preflight_noop_path,
             ipv4_forwarding,
             ipv6_forwarding,
         }
