@@ -38,13 +38,13 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
-    AgentPacketFlowDropReason, AgentPacketFlowObservation, AgentPacketFlowTcpState,
-    AgentRelayForwarderMetrics, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowClassification,
+    AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowObservation,
+    AgentPacketFlowTcpState, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneMetrics,
+    RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
@@ -2447,6 +2447,7 @@ struct AgentOtelSnapshot {
     packet_flow_filtered_count: u64,
     packet_flow_filtered_reason_counts: BTreeMap<AgentPacketFlowDropReason, u64>,
     packet_flow_classification_counts: BTreeMap<AgentPacketFlowClassification, u64>,
+    packet_flow_application_counts: BTreeMap<AgentPacketFlowApplication, u64>,
 }
 
 impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
@@ -2482,6 +2483,11 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                 .iter()
                 .map(|entry| (entry.classification, entry.count))
                 .collect(),
+            packet_flow_application_counts: metrics
+                .packet_flow_application_counts
+                .iter()
+                .map(|entry| (entry.application, entry.count))
+                .collect(),
         }
     }
 }
@@ -2510,6 +2516,7 @@ struct AgentOtelMetrics {
     packet_flow_filtered: Counter<u64>,
     packet_flow_filtered_by_reason: Counter<u64>,
     packet_flow_classified_by_lifecycle: Counter<u64>,
+    packet_flow_classified_by_application: Counter<u64>,
     forwarder_outbound_packets: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
@@ -2615,6 +2622,12 @@ impl AgentOtelMetrics {
                 .u64_counter("ipars.agent.packet_flow.classified.by_lifecycle")
                 .with_description(
                     "Packet-flow observations classified by inferred conntrack lifecycle.",
+                )
+                .build(),
+            packet_flow_classified_by_application: meter
+                .u64_counter("ipars.agent.packet_flow.classified.by_application")
+                .with_description(
+                    "Packet-flow observations classified by inferred application protocol.",
                 )
                 .build(),
             forwarder_outbound_packets: meter
@@ -2781,6 +2794,23 @@ impl AgentOtelMetrics {
                     ),
                 ];
                 self.packet_flow_classified_by_lifecycle.add(delta, &attrs);
+            }
+        }
+        for application_count in &metrics.packet_flow_application_counts {
+            let previous_count = previous.and_then(|previous| {
+                previous
+                    .packet_flow_application_counts
+                    .get(&application_count.application)
+                    .copied()
+            });
+            let delta = counter_delta(application_count.count, previous_count);
+            if delta > 0 {
+                let attrs = [
+                    KeyValue::new("node_id", node_id.clone()),
+                    KeyValue::new("application", application_count.application.as_str()),
+                ];
+                self.packet_flow_classified_by_application
+                    .add(delta, &attrs);
             }
         }
 
@@ -7246,9 +7276,9 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
-        AgentMetricsResponse, AgentPacketFlowClassificationCount, AgentPacketFlowDropReasonCount,
-        AgentRelayForwarderMetrics, LazyConnectMetrics, PathStateCount, RelayAdmissionResponse,
-        RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
+        AgentPacketFlowDropReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
+        PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -7793,6 +7823,10 @@ mod tests {
             }],
             packet_flow_classification_counts: vec![AgentPacketFlowClassificationCount {
                 classification: AgentPacketFlowClassification::Established,
+                count: 2,
+            }],
+            packet_flow_application_counts: vec![AgentPacketFlowApplicationCount {
+                application: AgentPacketFlowApplication::WireGuard,
                 count: 2,
             }],
             generated_at: Utc::now(),

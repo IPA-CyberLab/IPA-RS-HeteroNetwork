@@ -19,11 +19,11 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowClassification, AgentPacketFlowClassificationCount,
-    AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount, AgentPacketFlowMatch,
-    AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPathProbeRequest,
-    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
-    SignalHolePunchPlanResponse,
+    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
+    AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
+    AgentPacketFlowDropReasonCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
+    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
+    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -393,6 +393,14 @@ pub struct AgentRuntime {
     packet_flow_classification_established_count: AtomicU64,
     packet_flow_classification_closing_count: AtomicU64,
     packet_flow_classification_closed_count: AtomicU64,
+    packet_flow_application_unknown_count: AtomicU64,
+    packet_flow_application_dns_count: AtomicU64,
+    packet_flow_application_http_count: AtomicU64,
+    packet_flow_application_https_count: AtomicU64,
+    packet_flow_application_ssh_count: AtomicU64,
+    packet_flow_application_kubernetes_api_count: AtomicU64,
+    packet_flow_application_wireguard_count: AtomicU64,
+    packet_flow_application_icmp_count: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +630,14 @@ impl AgentRuntime {
             packet_flow_classification_established_count: AtomicU64::new(0),
             packet_flow_classification_closing_count: AtomicU64::new(0),
             packet_flow_classification_closed_count: AtomicU64::new(0),
+            packet_flow_application_unknown_count: AtomicU64::new(0),
+            packet_flow_application_dns_count: AtomicU64::new(0),
+            packet_flow_application_http_count: AtomicU64::new(0),
+            packet_flow_application_https_count: AtomicU64::new(0),
+            packet_flow_application_ssh_count: AtomicU64::new(0),
+            packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
+            packet_flow_application_wireguard_count: AtomicU64::new(0),
+            packet_flow_application_icmp_count: AtomicU64::new(0),
         }
     }
 
@@ -774,6 +790,7 @@ impl AgentRuntime {
             packet_flow_filtered_count: self.packet_flow_filtered_count.load(Ordering::Relaxed),
             packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
             packet_flow_classification_counts: self.packet_flow_classification_counts(),
+            packet_flow_application_counts: self.packet_flow_application_counts(),
             generated_at: Utc::now(),
         }
     }
@@ -979,6 +996,8 @@ impl AgentRuntime {
             .fetch_add(1, Ordering::Relaxed);
         self.packet_flow_classification_counter(observation.classification())
             .fetch_add(1, Ordering::Relaxed);
+        self.packet_flow_application_counter(observation.application())
+            .fetch_add(1, Ordering::Relaxed);
         let mut lazy_connect = self.lazy_connect.write().await;
         let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
             self.packet_flow_unmatched_count
@@ -1059,6 +1078,36 @@ impl AgentRuntime {
                 &self.packet_flow_classification_closing_count
             }
             AgentPacketFlowClassification::Closed => &self.packet_flow_classification_closed_count,
+        }
+    }
+
+    fn packet_flow_application_counts(&self) -> Vec<AgentPacketFlowApplicationCount> {
+        AgentPacketFlowApplication::ALL
+            .into_iter()
+            .map(|application| AgentPacketFlowApplicationCount {
+                application,
+                count: self
+                    .packet_flow_application_counter(application)
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn packet_flow_application_counter(
+        &self,
+        application: AgentPacketFlowApplication,
+    ) -> &AtomicU64 {
+        match application {
+            AgentPacketFlowApplication::Unknown => &self.packet_flow_application_unknown_count,
+            AgentPacketFlowApplication::Dns => &self.packet_flow_application_dns_count,
+            AgentPacketFlowApplication::Http => &self.packet_flow_application_http_count,
+            AgentPacketFlowApplication::Https => &self.packet_flow_application_https_count,
+            AgentPacketFlowApplication::Ssh => &self.packet_flow_application_ssh_count,
+            AgentPacketFlowApplication::KubernetesApi => {
+                &self.packet_flow_application_kubernetes_api_count
+            }
+            AgentPacketFlowApplication::WireGuard => &self.packet_flow_application_wireguard_count,
+            AgentPacketFlowApplication::Icmp => &self.packet_flow_application_icmp_count,
         }
     }
 
@@ -2353,7 +2402,7 @@ mod tests {
     };
     use ipars_types::{
         CandidateSource, ClusterId, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy,
-        PathMetrics, PeerPathKey, RelayCapability, TokenPolicy,
+        PathMetrics, PeerPathKey, RelayCapability, TokenPolicy, TransportProtocol,
     };
 
     use super::*;
@@ -3617,6 +3666,8 @@ mod tests {
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 25)),
                 AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(443),
                     conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
                     tcp_state: Some(AgentPacketFlowTcpState::Established),
                     ..Default::default()
@@ -3646,6 +3697,8 @@ mod tests {
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
                 AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(6443),
                     conntrack_status: vec![AgentPacketFlowConntrackStatus::Unreplied],
                     tcp_state: Some(AgentPacketFlowTcpState::SynSent),
                     ..Default::default()
@@ -3685,6 +3738,20 @@ mod tests {
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unreplied),
+            1
+        );
+        let application_count = |application| {
+            metrics
+                .packet_flow_application_counts
+                .iter()
+                .find(|entry| entry.application == application)
+                .map(|entry| entry.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
+        assert_eq!(
+            application_count(AgentPacketFlowApplication::KubernetesApi),
             1
         );
         assert_eq!(metrics.packet_flow_filtered_count, 3);

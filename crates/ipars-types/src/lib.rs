@@ -1251,6 +1251,45 @@ pub mod api {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentPacketFlowApplication {
+        Unknown,
+        Dns,
+        Http,
+        Https,
+        Ssh,
+        KubernetesApi,
+        WireGuard,
+        Icmp,
+    }
+
+    impl AgentPacketFlowApplication {
+        pub const ALL: [Self; 8] = [
+            Self::Unknown,
+            Self::Dns,
+            Self::Http,
+            Self::Https,
+            Self::Ssh,
+            Self::KubernetesApi,
+            Self::WireGuard,
+            Self::Icmp,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Unknown => "unknown",
+                Self::Dns => "dns",
+                Self::Http => "http",
+                Self::Https => "https",
+                Self::Ssh => "ssh",
+                Self::KubernetesApi => "kubernetes_api",
+                Self::WireGuard => "wireguard",
+                Self::Icmp => "icmp",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowRequest {
         pub destination: IpAddr,
@@ -1309,6 +1348,44 @@ pub mod api {
                 None => AgentPacketFlowClassification::Unknown,
             }
         }
+
+        pub fn application(&self) -> AgentPacketFlowApplication {
+            if self.protocol == Some(TransportProtocol::Icmp) {
+                return AgentPacketFlowApplication::Icmp;
+            }
+            if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::WireGuard;
+            }
+            if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::KubernetesApi;
+            }
+            if self.involves_port(53)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Dns;
+            }
+            if self.involves_port(80) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Http;
+            }
+            if self.involves_port(443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Https;
+            }
+            if self.involves_port(22) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Ssh;
+            }
+            AgentPacketFlowApplication::Unknown
+        }
+
+        fn involves_port(&self, port: u16) -> bool {
+            self.source_port == Some(port) || self.destination_port == Some(port)
+        }
+    }
+
+    fn protocol_is(protocol: Option<TransportProtocol>, expected: TransportProtocol) -> bool {
+        protocol.is_none() || protocol == Some(expected)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1369,6 +1446,12 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowApplicationCount {
+        pub application: AgentPacketFlowApplication,
+        pub count: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentMetricsResponse {
         pub node_id: NodeId,
         pub candidate_count: usize,
@@ -1391,6 +1474,8 @@ pub mod api {
         pub packet_flow_filtered_reason_counts: Vec<AgentPacketFlowDropReasonCount>,
         #[serde(default)]
         pub packet_flow_classification_counts: Vec<AgentPacketFlowClassificationCount>,
+        #[serde(default)]
+        pub packet_flow_application_counts: Vec<AgentPacketFlowApplicationCount>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1490,6 +1575,43 @@ mod tests {
             udp_assured.classification(),
             api::AgentPacketFlowClassification::Assured
         );
+    }
+
+    #[test]
+    fn packet_flow_observation_classifies_application_protocol() {
+        let dns = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(53),
+            ..Default::default()
+        };
+        assert_eq!(dns.application(), api::AgentPacketFlowApplication::Dns);
+
+        let kubernetes_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6443),
+            ..Default::default()
+        };
+        assert_eq!(
+            kubernetes_api.application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+
+        let wireguard = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(51820),
+            ..Default::default()
+        };
+        assert_eq!(
+            wireguard.application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+
+        let https = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            ..Default::default()
+        };
+        assert_eq!(https.application(), api::AgentPacketFlowApplication::Https);
     }
 
     #[test]
