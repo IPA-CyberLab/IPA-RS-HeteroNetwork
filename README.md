@@ -80,11 +80,13 @@ multiple control-plane processes against the same SQLite store, writes signed ag
 private runtime files using the selected scenario's relay/route-provider distribution and all
 runtime control-plane bootstrap URLs, and passes `--join-token-path` so token material is not exposed
 through child process argv. Daemon transport probes every control-plane endpoint for every agent
-peer map and reports per-endpoint edge-count min/max plus full source/target edge consistency.
-Load reports are validated before CLI success so missing registrations, peer-map edge loss or
-cross-control-plane skew, all-unreachable path negotiation, relay packet loss, relay admission
-failures, or daemon health inconsistencies fail the run instead of only appearing as degraded JSON
-fields. It captures each child process stdout/stderr log and reports log tails
+peer map, reports per-endpoint edge-count min/max plus full source/target edge consistency, then
+stops one control-plane process when redundant endpoints exist and verifies the remaining endpoints
+can still serve complete peer maps. Load reports are validated before CLI success so missing
+registrations, peer-map edge loss, cross-control-plane skew, failed control-plane failover,
+all-unreachable path negotiation, relay packet loss, relay admission failures, or daemon health
+inconsistencies fail the run instead of only appearing as degraded JSON fields. It captures each
+child process stdout/stderr log and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration
 visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
 negotiation readiness before measuring:

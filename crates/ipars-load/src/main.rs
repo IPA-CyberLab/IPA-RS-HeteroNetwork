@@ -220,6 +220,11 @@ struct LoadReport {
     daemon_control_plane_peer_map_edges_min: usize,
     daemon_control_plane_peer_map_edges_max: usize,
     daemon_control_plane_peer_maps_consistent: bool,
+    daemon_control_plane_failover_checked: bool,
+    daemon_control_plane_failover_survivor_endpoints: usize,
+    daemon_control_plane_failover_peer_map_edges_min: usize,
+    daemon_control_plane_failover_peer_map_edges_max: usize,
+    daemon_control_plane_failover_peer_maps_consistent: bool,
     daemon_control_plane_relay_candidates_min: usize,
     daemon_control_plane_relay_candidates_max: usize,
     daemon_control_plane_healthy_nodes: usize,
@@ -308,7 +313,11 @@ impl LoadReport {
             TransportMode::Daemon => {
                 let expected_peer_map_requests = self
                     .node_count
-                    .saturating_mul(self.daemon_control_plane_processes);
+                    .saturating_mul(self.daemon_control_plane_processes)
+                    .saturating_add(
+                        self.node_count
+                            .saturating_mul(self.daemon_control_plane_processes.saturating_sub(1)),
+                    );
                 self.validate_registration_and_paths(
                     "daemon load scenario",
                     false,
@@ -349,6 +358,36 @@ impl LoadReport {
                         self.daemon_control_plane_peer_map_edges_min,
                         self.daemon_control_plane_peer_map_edges_max
                     );
+                }
+                if self.daemon_control_plane_processes > 1 {
+                    if !self.daemon_control_plane_failover_checked {
+                        bail!("daemon load scenario did not check control-plane failover");
+                    }
+                    let expected_survivor_endpoints =
+                        self.daemon_control_plane_processes.saturating_sub(1);
+                    if self.daemon_control_plane_failover_survivor_endpoints
+                        != expected_survivor_endpoints
+                    {
+                        bail!(
+                            "daemon load scenario failover checked {} survivor endpoints, expected {expected_survivor_endpoints}",
+                            self.daemon_control_plane_failover_survivor_endpoints
+                        );
+                    }
+                    if !self.daemon_control_plane_failover_peer_maps_consistent {
+                        bail!(
+                            "daemon load scenario failover control-plane peer maps are inconsistent"
+                        );
+                    }
+                    if self.daemon_control_plane_failover_peer_map_edges_min != expected_peer_edges
+                        || self.daemon_control_plane_failover_peer_map_edges_max
+                            != expected_peer_edges
+                    {
+                        bail!(
+                            "daemon load scenario failover peer-map edge mismatch: min/max={}/{}, expected {expected_peer_edges}",
+                            self.daemon_control_plane_failover_peer_map_edges_min,
+                            self.daemon_control_plane_failover_peer_map_edges_max
+                        );
+                    }
                 }
                 if self.daemon_control_plane_healthy_nodes_min != self.node_count
                     || self.daemon_control_plane_healthy_nodes_max != self.node_count
@@ -601,6 +640,11 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_peer_map_edges_min: 0,
         daemon_control_plane_peer_map_edges_max: 0,
         daemon_control_plane_peer_maps_consistent: false,
+        daemon_control_plane_failover_checked: false,
+        daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_peer_map_edges_min: 0,
+        daemon_control_plane_failover_peer_map_edges_max: 0,
+        daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -774,6 +818,11 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_peer_map_edges_min: 0,
         daemon_control_plane_peer_map_edges_max: 0,
         daemon_control_plane_peer_maps_consistent: false,
+        daemon_control_plane_failover_checked: false,
+        daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_peer_map_edges_min: 0,
+        daemon_control_plane_failover_peer_map_edges_max: 0,
+        daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -921,6 +970,11 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_peer_map_edges_min: 0,
         daemon_control_plane_peer_map_edges_max: 0,
         daemon_control_plane_peer_maps_consistent: false,
+        daemon_control_plane_failover_checked: false,
+        daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_peer_map_edges_min: 0,
+        daemon_control_plane_failover_peer_map_edges_max: 0,
+        daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
@@ -1130,6 +1184,36 @@ async fn run_daemon_scenario(
     )
     .await?;
     services.ensure_running(DaemonRuntimePhase::FinalMetrics)?;
+    let mut total_peer_map_requests = peer_map_requests;
+    let mut control_plane_http_requests =
+        agent_statuses.len() + peer_map_requests + control_summary.endpoint_count;
+    let mut failover_checked = false;
+    let mut failover_survivor_endpoints = 0;
+    let mut failover_peer_map_edges_min = 0;
+    let mut failover_peer_map_edges_max = 0;
+    let mut failover_peer_maps_consistent = false;
+    if services.control_plane_urls.len() > 1 {
+        services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
+        let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
+        failover_survivor_endpoints = survivor_urls.len();
+        let failover_probe = daemon_peer_map_probe(&client, &survivor_urls, &agent_statuses)
+            .await
+            .with_context(|| {
+                format!("daemon control-plane failover probe failed after stopping {stopped_role}")
+            })?;
+        let failover_peer_map_requests = agent_statuses.len() * survivor_urls.len();
+        total_peer_map_requests += failover_peer_map_requests;
+        control_plane_http_requests += failover_peer_map_requests;
+        failover_checked = true;
+        failover_peer_map_edges_min = failover_probe.summary.edge_count_min;
+        failover_peer_map_edges_max = failover_probe.summary.edge_count_max;
+        failover_peer_maps_consistent = failover_probe.summary.maps_consistent;
+        services.ensure_running_allowing_roles(
+            DaemonRuntimePhase::ControlPlaneFailover,
+            &[stopped_role.as_str()],
+        )?;
+        services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
+    }
     services.write_manifest(DaemonRuntimePhase::Completed)?;
 
     Ok(LoadReport {
@@ -1141,7 +1225,7 @@ async fn run_daemon_scenario(
         advertised_routes,
         active_pair_count,
         registrations: agent_statuses.len(),
-        peer_map_requests,
+        peer_map_requests: total_peer_map_requests,
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
         relay_candidates: control_summary.relay_candidate_count_min,
@@ -1150,9 +1234,7 @@ async fn run_daemon_scenario(
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: agent_statuses.len()
-            + peer_map_requests
-            + control_summary.endpoint_count,
+        control_plane_http_requests,
         signal_http_requests: peer_records.len() + active_pair_count + 1,
         relay_http_requests: active_pair_count + 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
@@ -1186,6 +1268,11 @@ async fn run_daemon_scenario(
         daemon_control_plane_peer_map_edges_min: peer_map_summary.edge_count_min,
         daemon_control_plane_peer_map_edges_max: peer_map_summary.edge_count_max,
         daemon_control_plane_peer_maps_consistent: peer_map_summary.maps_consistent,
+        daemon_control_plane_failover_checked: failover_checked,
+        daemon_control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
+        daemon_control_plane_failover_peer_map_edges_min: failover_peer_map_edges_min,
+        daemon_control_plane_failover_peer_map_edges_max: failover_peer_map_edges_max,
+        daemon_control_plane_failover_peer_maps_consistent: failover_peer_maps_consistent,
         daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
         daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
         daemon_control_plane_healthy_nodes: control_summary.healthy_node_count_min,
@@ -1437,6 +1524,7 @@ enum DaemonRuntimePhase {
     SignalNegotiation,
     RelayMeasurement,
     FinalMetrics,
+    ControlPlaneFailover,
     Completed,
 }
 
@@ -1867,6 +1955,73 @@ impl DaemonProcessGroup {
         }
     }
 
+    fn ensure_running_allowing_roles(
+        &mut self,
+        phase: DaemonRuntimePhase,
+        allowed_exited_roles: &[&str],
+    ) -> anyhow::Result<()> {
+        match ensure_daemon_children_running_allowing_roles(
+            &mut self.children,
+            allowed_exited_roles,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(manifest_error) = self.write_manifest(phase) {
+                    bail!(
+                        "{error}; additionally failed to update daemon runtime manifest after liveness failure: {manifest_error}"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn stop_control_plane_for_failover(
+        &mut self,
+        control_plane_index: usize,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        let stopped_url = self
+            .control_plane_urls
+            .get(control_plane_index)
+            .with_context(|| {
+                format!("daemon control-plane index {control_plane_index} is not available")
+            })?
+            .clone();
+        let stopped_role = format!("control-plane-{control_plane_index}");
+        let child = self
+            .children
+            .iter_mut()
+            .find(|child| child.role == stopped_role)
+            .with_context(|| {
+                format!("daemon control-plane failover child {stopped_role} was not found")
+            })?;
+        if child.last_exit.is_some() {
+            bail!("daemon control-plane failover child {stopped_role} already exited");
+        }
+        child
+            .child
+            .kill()
+            .with_context(|| format!("failed to stop iparsd {stopped_role} for failover probe"))?;
+        let status = child.child.wait().with_context(|| {
+            format!("failed to wait for iparsd {stopped_role} during failover probe")
+        })?;
+        child.last_exit = Some(DaemonChildExit {
+            status: status.to_string(),
+            code: status.code(),
+        });
+        let survivor_urls = self
+            .control_plane_urls
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != control_plane_index)
+            .map(|(_, url)| url.clone())
+            .collect::<Vec<_>>();
+        if survivor_urls.is_empty() {
+            bail!("daemon control-plane failover stopped {stopped_url} without survivors");
+        }
+        Ok((stopped_role, survivor_urls))
+    }
+
     fn manifest_path(&self) -> PathBuf {
         daemon_runtime_manifest_path(&self.runtime_dir)
     }
@@ -1981,7 +2136,31 @@ fn kill_daemon_children(children: &mut [DaemonChild]) {
 }
 
 fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Result<()> {
+    ensure_daemon_children_running_allowing_roles(children, &[])
+}
+
+fn ensure_daemon_children_running_allowing_roles(
+    children: &mut [DaemonChild],
+    allowed_exited_roles: &[&str],
+) -> anyhow::Result<()> {
     for daemon_child in children {
+        if daemon_child.last_exit.is_some()
+            && allowed_exited_roles.contains(&daemon_child.role.as_str())
+        {
+            continue;
+        }
+        if let Some(exit) = &daemon_child.last_exit {
+            let log_tail = daemon_child
+                .log_tail()
+                .map(|tail| format!("\n{tail}"))
+                .unwrap_or_default();
+            bail!(
+                "iparsd {} process exited before daemon load scenario completed: {}{}",
+                daemon_child.role,
+                exit.status,
+                log_tail
+            );
+        }
         if let Some(status) = daemon_child.child.try_wait().with_context(|| {
             format!(
                 "failed to inspect iparsd {} process status",
@@ -3115,6 +3294,25 @@ mod tests {
         };
         assert!(error.contains("received"));
 
+        let daemon_report = valid_daemon_report_for_validation().await?;
+        daemon_report.validate_success()?;
+
+        let mut missing_failover = daemon_report.clone();
+        missing_failover.daemon_control_plane_failover_checked = false;
+        let error = match missing_failover.validate_success() {
+            Ok(_) => bail!("daemon report without control-plane failover should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failover"));
+
+        let mut skewed_failover = daemon_report.clone();
+        skewed_failover.daemon_control_plane_failover_peer_map_edges_min -= 1;
+        let error = match skewed_failover.validate_success() {
+            Ok(_) => bail!("daemon report with failover peer-map edge loss should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failover peer-map"));
+
         Ok(())
     }
 
@@ -3329,6 +3527,41 @@ mod tests {
         }
         assert!(retained_dir.join("marker.log").exists());
         std::fs::remove_dir_all(&retained_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_control_plane_failover_stop_records_exit_and_survivors() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("failover-stop");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut group = synthetic_daemon_group(runtime_dir.clone(), false);
+        group.control_plane_urls = vec![
+            "http://127.0.0.1:31001".to_string(),
+            "http://127.0.0.1:31002".to_string(),
+        ];
+        group.children.push(synthetic_sleep_child(
+            "control-plane-0",
+            runtime_dir.join("0000-control-plane-0.log"),
+        )?);
+        group.children.push(synthetic_sleep_child(
+            "control-plane-1",
+            runtime_dir.join("0001-control-plane-1.log"),
+        )?);
+
+        let (stopped_role, survivor_urls) = group.stop_control_plane_for_failover(0)?;
+
+        assert_eq!(stopped_role, "control-plane-0");
+        assert_eq!(survivor_urls, vec!["http://127.0.0.1:31002"]);
+        assert!(group.children[0].last_exit.is_some());
+        group.ensure_running_allowing_roles(
+            DaemonRuntimePhase::ControlPlaneFailover,
+            &[stopped_role.as_str()],
+        )?;
+        let error = match group.ensure_running(DaemonRuntimePhase::ControlPlaneFailover) {
+            Ok(_) => bail!("normal daemon liveness should reject the stopped control-plane"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("control-plane-0"));
         Ok(())
     }
 
@@ -3787,7 +4020,7 @@ mod tests {
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
-        assert_eq!(report.peer_map_requests, 4);
+        assert_eq!(report.peer_map_requests, 6);
         assert_eq!(report.peer_map_edges_seen, 2);
         assert_eq!(report.daemon_processes, 7);
         assert!(report.daemon_runtime_dir.is_none());
@@ -3796,6 +4029,11 @@ mod tests {
         assert_eq!(report.daemon_control_plane_peer_map_edges_min, 2);
         assert_eq!(report.daemon_control_plane_peer_map_edges_max, 2);
         assert!(report.daemon_control_plane_peer_maps_consistent);
+        assert!(report.daemon_control_plane_failover_checked);
+        assert_eq!(report.daemon_control_plane_failover_survivor_endpoints, 1);
+        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_min, 2);
+        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_max, 2);
+        assert!(report.daemon_control_plane_failover_peer_maps_consistent);
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
@@ -3869,6 +4107,53 @@ mod tests {
         Ok(())
     }
 
+    async fn valid_daemon_report_for_validation() -> anyhow::Result<LoadReport> {
+        let mut report = run_in_memory_scenario(Scenario::from_name(ScenarioName::Three)).await?;
+        let expected_peer_edges = report.node_count * report.node_count.saturating_sub(1);
+        report.transport = TransportMode::Daemon;
+        report.peer_map_requests = report.node_count * 3;
+        report.direct_public_paths = 0;
+        report.direct_ipv6_paths = 0;
+        report.direct_nat_paths = report.active_pair_count;
+        report.relay_paths = 0;
+        report.unreachable_paths = 0;
+        report.relay_packets_per_session = 1;
+        report.relay_udp_packets_sent = report.active_pair_count;
+        report.relay_udp_packets_received = report.active_pair_count;
+        report.relay_udp_payload_bytes_sent = report.active_pair_count as u64 * 64;
+        report.relay_udp_payload_bytes_received = report.relay_udp_payload_bytes_sent;
+        report.relay_forwarded_bytes_reported = report.relay_udp_payload_bytes_received;
+        report.relay_admission_successes_reported = report.active_pair_count as u64;
+        report.daemon_processes = 8;
+        report.daemon_agent_processes = report.node_count;
+        report.daemon_control_plane_processes = 2;
+        report.daemon_control_plane_metrics_endpoints = 2;
+        report.daemon_control_plane_peer_map_endpoints = 2;
+        report.daemon_control_plane_peer_map_edges_min = expected_peer_edges;
+        report.daemon_control_plane_peer_map_edges_max = expected_peer_edges;
+        report.daemon_control_plane_peer_maps_consistent = true;
+        report.daemon_control_plane_failover_checked = true;
+        report.daemon_control_plane_failover_survivor_endpoints = 1;
+        report.daemon_control_plane_failover_peer_map_edges_min = expected_peer_edges;
+        report.daemon_control_plane_failover_peer_map_edges_max = expected_peer_edges;
+        report.daemon_control_plane_failover_peer_maps_consistent = true;
+        report.daemon_control_plane_healthy_nodes = report.node_count;
+        report.daemon_control_plane_healthy_nodes_min = report.node_count;
+        report.daemon_control_plane_healthy_nodes_max = report.node_count;
+        report.daemon_control_plane_degraded_nodes = 0;
+        report.daemon_control_plane_degraded_nodes_min = 0;
+        report.daemon_control_plane_degraded_nodes_max = 0;
+        report.daemon_control_plane_unhealthy_nodes = 0;
+        report.daemon_control_plane_unhealthy_nodes_min = 0;
+        report.daemon_control_plane_unhealthy_nodes_max = 0;
+        report.daemon_control_plane_metrics_consistent = true;
+        report.daemon_signal_health_reports = report.node_count;
+        report.daemon_signal_healthy_nodes = report.node_count;
+        report.daemon_signal_degraded_nodes = 0;
+        report.daemon_signal_unhealthy_nodes = 0;
+        Ok(report)
+    }
+
     fn control_plane_metrics(
         relay_candidate_count: usize,
         healthy_node_count: usize,
@@ -3911,6 +4196,23 @@ mod tests {
             summary.record_edge(source, peer);
         }
         summary
+    }
+
+    fn synthetic_sleep_child(role: &str, log_path: PathBuf) -> anyhow::Result<DaemonChild> {
+        std::fs::write(&log_path, format!("{role} synthetic log\n"))?;
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to spawn synthetic daemon child {role}"))?;
+        Ok(DaemonChild {
+            role: role.to_string(),
+            child,
+            log_path: Some(log_path),
+            last_exit: None,
+        })
     }
 
     fn synthetic_runtime_dir(label: &str) -> PathBuf {
