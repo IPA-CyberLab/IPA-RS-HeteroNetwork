@@ -103,6 +103,11 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         relay_capability: Option<RelayCapability>,
     ) -> Result<(), ControlPlaneError>;
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError>;
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -195,6 +200,19 @@ impl ControlPlaneStore for InMemoryStore {
             .get_mut(node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.relay_capability = relay_capability;
+        Ok(())
+    }
+
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
         Ok(())
     }
 
@@ -648,6 +666,11 @@ where
         self.store
             .update_node_relay_capability(&request.node_id, relay_capability)
             .await?;
+        if let Some(routes) = request.routes {
+            self.store
+                .update_node_routes(&request.node_id, routes)
+                .await?;
+        }
         self.store
             .upsert_health(request.node_id.clone(), request.health)
             .await?;
@@ -787,6 +810,22 @@ where
                     candidate.kind, candidate.addr
                 ),
             });
+        }
+        if let Some(routes) = request.routes.as_ref() {
+            for route in routes {
+                if route.advertised_by != request.node_id {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "route {} is advertised by node {} instead of {}",
+                            route.id, route.advertised_by, request.node_id
+                        ),
+                    });
+                }
+                if !route_allowed_by_policy(route, &node.token_policy) {
+                    return Err(ControlPlaneError::RouteDenied(route.id.clone()));
+                }
+            }
         }
         for path in &request.path_state {
             let peer = if path.key.local == request.node_id {
@@ -1338,8 +1377,11 @@ fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
-    claims
-        .policy
+    route_allowed_by_policy(route, &claims.policy)
+}
+
+fn route_allowed_by_policy(route: &Route, policy: &ipars_types::TokenPolicy) -> bool {
+    policy
         .allowed_routes
         .iter()
         .any(|allowed_route| allowed_route.contains(&route.cidr))
@@ -1688,6 +1730,14 @@ mod tests {
                 .await
         }
 
+        async fn update_node_routes(
+            &self,
+            node_id: &NodeId,
+            routes: Vec<Route>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.update_node_routes(node_id, routes).await
+        }
+
         async fn rotate_node_wireguard_public_key(
             &self,
             node_id: &NodeId,
@@ -1894,6 +1944,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2453,6 +2504,7 @@ mod tests {
                     health: health.clone(),
                     candidates: vec![candidate("node-a")],
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![path("node-a", "node-b")],
                     node_signature: None,
                 },
@@ -2472,6 +2524,174 @@ mod tests {
         );
         assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
         assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_routes_when_policy_allows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+        let route = route("route-a", "10.42.1.0/24", "node-a")?;
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("routes refreshed".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route.clone()]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert_eq!(
+            store
+                .get_node(&node_id("node-a"))
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+                .routes,
+            vec![route.clone()]
+        );
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(13.0),
+                        relay_load: None,
+                        message: Some("no route update".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert_eq!(
+            store
+                .get_node(&node_id("node-a"))
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+                .routes,
+            vec![route]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_routes_outside_token_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store);
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("bad route".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route("route-denied", "10.43.1.0/24", "node-a")?]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::RouteDenied(route)) if route == "route-denied"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store);
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("unowned route".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route("route-unowned", "10.42.1.0/24", "node-b")?]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("route route-unowned is advertised by node")
+        ));
         Ok(())
     }
 
@@ -2501,6 +2721,7 @@ mod tests {
                 },
                 candidates: vec![candidate("node-a")],
                 relay_capability: None,
+                routes: None,
                 path_state: Vec::new(),
                 node_signature: None,
             },
@@ -2544,6 +2765,7 @@ mod tests {
             },
             candidates: Vec::new(),
             relay_capability: None,
+            routes: None,
             path_state: Vec::new(),
             node_signature: None,
         };
@@ -2591,6 +2813,7 @@ mod tests {
                     health: health.clone(),
                     candidates: vec![candidate("node-b")],
                     relay_capability: None,
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2609,6 +2832,7 @@ mod tests {
                     health,
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![path("node-b", "node-c")],
                     node_signature: None,
                 },
@@ -2650,6 +2874,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![reported_path],
                     node_signature: None,
                 },
@@ -2700,6 +2925,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![reported_path],
                     node_signature: None,
                 },
@@ -2745,6 +2971,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", None)],
                     node_signature: None,
                 },
@@ -2797,6 +3024,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     node_signature: None,
                 },
@@ -2844,6 +3072,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("node-a"))],
                     node_signature: None,
                 },
@@ -2915,6 +3144,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2938,6 +3168,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     node_signature: None,
                 },
@@ -2998,6 +3229,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3021,6 +3253,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     node_signature: None,
                 },
@@ -3065,6 +3298,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3088,6 +3322,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     node_signature: None,
                 },
@@ -3131,6 +3366,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![reported_path],
                     node_signature: None,
                 },
@@ -3175,6 +3411,7 @@ mod tests {
                     },
                     candidates: vec![invalid_ipv6_candidate("node-a")],
                     relay_capability: None,
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3226,6 +3463,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(heartbeat_relay),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3277,6 +3515,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3298,6 +3537,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -3345,6 +3585,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },

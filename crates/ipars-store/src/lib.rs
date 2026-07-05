@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
+    Route, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -149,6 +149,25 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.relay_capability = relay_capability;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
         sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
             .bind(node_id.as_str())
             .bind(serde_json::to_string(&node).map_err(json_error)?)
@@ -519,6 +538,25 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.relay_capability = relay_capability;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
         sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
             .bind(node_id.as_str())
             .bind(serde_json::to_value(&node).map_err(json_error)?)
@@ -964,6 +1002,25 @@ mod tests {
                 .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
                 .relay_capability,
             None
+        );
+        let advertised_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        };
+        store
+            .update_node_routes(&local.node_id, vec![advertised_route.clone()])
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .routes,
+            vec![advertised_route]
         );
         let rotated = store
             .rotate_node_wireguard_public_key(

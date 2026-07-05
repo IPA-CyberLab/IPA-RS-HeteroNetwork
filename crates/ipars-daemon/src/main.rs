@@ -4215,6 +4215,8 @@ async fn run_agent(
         ));
     }
     if !args.disable_heartbeat && !control_plane_bases.is_empty() {
+        let heartbeat_route_reporter =
+            heartbeat_route_reporter(&args, runtime.state().node_id.clone());
         background_tasks.push(start_heartbeat_reporting(
             runtime.clone(),
             runtime
@@ -4224,6 +4226,7 @@ async fn run_agent(
             control_plane_bases.clone(),
             Duration::from_secs(args.heartbeat_interval_seconds),
             relay_capability_reporter.clone(),
+            heartbeat_route_reporter,
         ));
     }
     let peer_map_task = if args.apply_peer_map {
@@ -5151,6 +5154,35 @@ fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<R
             tags: Default::default(),
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct HeartbeatRouteReporter {
+    args: AgentArgs,
+    node_id: NodeId,
+}
+
+fn heartbeat_route_reporter(args: &AgentArgs, node_id: NodeId) -> Option<HeartbeatRouteReporter> {
+    let reports_routes = (args.apply_docker_routes && args.docker_expose_host_routes)
+        || args.apply_kubernetes_underlay;
+    reports_routes.then(|| HeartbeatRouteReporter {
+        args: args.clone(),
+        node_id,
+    })
+}
+
+async fn heartbeat_routes(reporter: Option<&HeartbeatRouteReporter>) -> Option<Vec<Route>> {
+    let reporter = reporter?;
+    match agent_requested_routes(&reporter.args, reporter.node_id.clone()).await {
+        Ok(routes) => Some(routes),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to refresh advertised routes for heartbeat; preserving control-plane route state"
+            );
+            None
+        }
+    }
 }
 
 fn docker_api_networks_url(api_version: &str) -> String {
@@ -6641,6 +6673,7 @@ fn start_heartbeat_reporting(
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
+    route_reporter: Option<HeartbeatRouteReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_heartbeat_loop(
@@ -6649,6 +6682,7 @@ fn start_heartbeat_reporting(
             control_plane_urls,
             interval,
             relay_capability_reporter,
+            route_reporter,
         )
         .await;
     })
@@ -6660,20 +6694,28 @@ async fn run_heartbeat_loop(
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
+    route_reporter: Option<HeartbeatRouteReporter>,
 ) {
     let client = reqwest::Client::new();
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
-        let request =
-            match heartbeat_request(runtime.as_ref(), &identity, relay_capability.clone()).await {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
-                    tokio::time::sleep(interval).await;
-                    continue;
-                }
-            };
+        let routes = heartbeat_routes(route_reporter.as_ref()).await;
+        let request = match heartbeat_request(
+            runtime.as_ref(),
+            &identity,
+            relay_capability.clone(),
+            routes,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
         match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
             Ok(response) => tracing::info!(
                 accepted = response.accepted,
@@ -6734,6 +6776,7 @@ async fn heartbeat_request(
     runtime: &AgentRuntime,
     identity: &IdentityKeyPair,
     relay_capability: Option<RelayCapability>,
+    routes: Option<Vec<Route>>,
 ) -> anyhow::Result<HeartbeatRequest> {
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
@@ -6743,6 +6786,7 @@ async fn heartbeat_request(
         health,
         candidates: status.candidates,
         relay_capability,
+        routes,
         path_state,
         node_signature: None,
     };
@@ -15422,13 +15466,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         runtime.upsert_path_state(path.clone()).await;
 
         let identity = runtime.state().identity_key_pair()?;
-        let request = heartbeat_request(&runtime, &identity, None).await?;
+        let advertised_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: node_id.clone(),
+            via: Some(node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        };
+        let request = heartbeat_request(
+            &runtime,
+            &identity,
+            None,
+            Some(vec![advertised_route.clone()]),
+        )
+        .await?;
 
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.node_signature.is_some());
         assert!(request.candidates.is_empty());
         assert!(request.relay_capability.is_none());
+        assert_eq!(request.routes, Some(vec![advertised_route]));
         assert_eq!(request.path_state, vec![path]);
         Ok(())
     }
@@ -15449,7 +15508,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .await;
         let identity = runtime.state().identity_key_pair()?;
 
-        let request = heartbeat_request(&runtime, &identity, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None).await?;
 
         assert_eq!(request.health.state, HealthState::Unhealthy);
         let message = request.health.message.as_deref().unwrap_or_default();

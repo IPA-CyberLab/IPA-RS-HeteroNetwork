@@ -1033,6 +1033,8 @@ pub mod api {
         pub health: NodeHealth,
         pub candidates: Vec<EndpointCandidate>,
         pub relay_capability: Option<RelayCapability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routes: Option<Vec<Route>>,
         pub path_state: Vec<PathRecord>,
         pub signed_at: DateTime<Utc>,
     }
@@ -1052,6 +1054,8 @@ pub mod api {
         pub candidates: Vec<EndpointCandidate>,
         #[serde(default)]
         pub relay_capability: Option<RelayCapability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routes: Option<Vec<Route>>,
         pub path_state: Vec<PathRecord>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node_signature: Option<NodeRequestSignature>,
@@ -1064,6 +1068,7 @@ pub mod api {
                 health: self.health.clone(),
                 candidates: self.candidates.clone(),
                 relay_capability: self.relay_capability.clone(),
+                routes: self.routes.clone(),
                 path_state: self.path_state.clone(),
                 signed_at,
             }

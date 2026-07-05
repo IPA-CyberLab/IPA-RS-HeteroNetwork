@@ -3061,6 +3061,7 @@ fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<Heartbea
         health: healthy_node_health(),
         candidates: node.endpoint_candidates.clone(),
         relay_capability: node.relay_capability.clone(),
+        routes: Some(node.routes.clone()),
         path_state: Vec::new(),
         node_signature: None,
     };
