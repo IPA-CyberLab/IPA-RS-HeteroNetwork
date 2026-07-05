@@ -4362,6 +4362,7 @@ async fn run_agent(
                 node,
                 signal_bases.clone(),
                 Duration::from_secs(args.signal_registration_interval_seconds),
+                relay_capability_reporter.clone(),
             ));
         }
     }
@@ -6758,9 +6759,17 @@ fn start_signal_registration(
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_signal_registration_loop(runtime, node, signal_urls, interval).await;
+        run_signal_registration_loop(
+            runtime,
+            node,
+            signal_urls,
+            interval,
+            relay_capability_reporter,
+        )
+        .await;
     })
 }
 
@@ -6769,10 +6778,14 @@ async fn run_signal_registration_loop(
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
     let client = reqwest::Client::new();
     loop {
-        let request = signal_node_upsert_request(runtime.as_ref(), node.clone()).await;
+        let relay_capability =
+            heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
+        let request =
+            signal_node_upsert_request(runtime.as_ref(), node.clone(), relay_capability).await;
         match send_signal_node_upsert_to_signal_services(&client, &signal_urls, request).await {
             Ok(successes) => tracing::info!(
                 node_id = %node.node_id,
@@ -6847,15 +6860,31 @@ async fn send_signal_node_upsert(
 async fn signal_node_upsert_request(
     runtime: &AgentRuntime,
     mut node: NodeRecord,
+    relay_capability: Option<RelayCapability>,
 ) -> SignalNodeUpsertRequest {
     let status = runtime.status().await;
     let health = agent_health_from_status(&status, "agent signal registration");
     node.endpoint_candidates = status.candidates;
+    node.relay_capability =
+        signal_relay_capability(node.relay_capability.as_ref(), relay_capability);
     SignalNodeUpsertRequest {
         node,
         nat_classification: status.nat_classification,
         health: Some(health),
     }
+}
+
+fn signal_relay_capability(
+    registered_capability: Option<&RelayCapability>,
+    refreshed_capability: Option<RelayCapability>,
+) -> Option<RelayCapability> {
+    let registered_capability = registered_capability?;
+    if !registered_capability.enabled_by_policy {
+        return None;
+    }
+    let mut refreshed_capability = refreshed_capability?;
+    refreshed_capability.enabled_by_policy = true;
+    Some(refreshed_capability)
 }
 
 fn agent_health_from_status(
@@ -7308,14 +7337,24 @@ async fn heartbeat_relay_capability(
         return Some(reporter.advertised.clone());
     };
     match fetch_relay_status(client, status_url).await {
-        Ok(status) => Some(relay_capability_from_status(&reporter.advertised, &status)),
+        Ok(status) if status.health == HealthState::Healthy => {
+            Some(relay_capability_from_status(&reporter.advertised, &status))
+        }
+        Ok(status) => {
+            tracing::warn!(
+                status_url,
+                health = ?status.health,
+                "relay status is not healthy; omitting relay capability from reports"
+            );
+            None
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
                 status_url,
-                "failed to refresh relay status for heartbeat; using configured relay capability"
+                "failed to refresh relay status; omitting relay capability from reports"
             );
-            Some(reporter.advertised.clone())
+            None
         }
     }
 }
@@ -9575,6 +9614,36 @@ mod tests {
         }
     }
 
+    fn test_relay_capability(max_sessions: u32, active_sessions: u32) -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51_820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
+            max_sessions,
+            active_sessions,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
+    fn test_relay_status_response(
+        health: HealthState,
+        max_sessions: u32,
+        active_sessions: u32,
+    ) -> RelayStatusResponse {
+        RelayStatusResponse {
+            relay_node: NodeId::from_string("relay-a"),
+            capability: test_relay_capability(max_sessions, active_sessions),
+            health,
+            admission_attempt_count: 0,
+            admission_success_count: 0,
+            admission_failure_count: 0,
+            admission_failures_by_reason: BTreeMap::new(),
+            max_sessions_per_node: Some(20),
+            dataplane: RelayDataplaneMetrics::default(),
+        }
+    }
+
     fn test_crash_policy() -> RelayForwarderCrashPolicy {
         RelayForwarderCrashPolicy {
             window: Duration::from_secs(60),
@@ -10756,6 +10825,41 @@ mod tests {
         assert_eq!(refreshed.max_sessions, 250);
         assert_eq!(refreshed.active_sessions, 12);
         assert_eq!(refreshed.max_mbps, 500);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_relay_capability_omits_unhealthy_status() -> anyhow::Result<()> {
+        async fn degraded_status() -> axum::Json<RelayStatusResponse> {
+            axum::Json(test_relay_status_response(HealthState::Degraded, 250, 12))
+        }
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/status", axum::routing::get(degraded_status)),
+        )
+        .await?;
+        let reporter = RelayCapabilityReporter {
+            advertised: test_relay_capability(100, 0),
+            status_url: Some(relay_base),
+        };
+
+        let capability = heartbeat_relay_capability(&reqwest::Client::new(), Some(&reporter)).await;
+
+        assert!(capability.is_none());
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_relay_capability_omits_unreachable_status_url() -> anyhow::Result<()> {
+        let reporter = RelayCapabilityReporter {
+            advertised: test_relay_capability(100, 0),
+            status_url: Some(unused_http_base_url().await?),
+        };
+
+        let capability = heartbeat_relay_capability(&reqwest::Client::new(), Some(&reporter)).await;
+
+        assert!(capability.is_none());
+        Ok(())
     }
 
     #[test]
@@ -15364,7 +15468,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         let node = node_record("node-a");
 
-        let request = signal_node_upsert_request(&runtime, node).await;
+        let request = signal_node_upsert_request(&runtime, node, None).await;
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
@@ -15372,6 +15476,50 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             request.health.as_ref().map(|health| health.state),
             Some(HealthState::Healthy)
         );
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_refreshes_policy_enabled_relay_capability() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let mut node = node_record("node-a");
+        node.relay_capability = Some(test_relay_capability(100, 1));
+        let refreshed = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51_820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
+            max_sessions: 250,
+            active_sessions: 12,
+            max_mbps: 750,
+            e2e_only: true,
+        };
+
+        let request = signal_node_upsert_request(&runtime, node, Some(refreshed)).await;
+        let relay_capability = match request.node.relay_capability {
+            Some(relay_capability) => relay_capability,
+            None => panic!("policy enabled relay should remain advertised"),
+        };
+
+        assert!(relay_capability.enabled_by_policy);
+        assert_eq!(relay_capability.max_sessions, 250);
+        assert_eq!(relay_capability.active_sessions, 12);
+        assert_eq!(relay_capability.max_mbps, 750);
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_clears_relay_capability_without_status_refresh() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let mut node = node_record("node-a");
+        node.relay_capability = Some(test_relay_capability(100, 1));
+
+        let request = signal_node_upsert_request(&runtime, node, None).await;
+
+        assert!(request.node.relay_capability.is_none());
     }
 
     #[tokio::test]
@@ -15390,7 +15538,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .await;
         let node = node_record("node-a");
 
-        let request = signal_node_upsert_request(&runtime, node).await;
+        let request = signal_node_upsert_request(&runtime, node, None).await;
 
         let health = match request.health {
             Some(health) => health,
