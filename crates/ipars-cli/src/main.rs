@@ -1103,13 +1103,101 @@ fn parse_key_value(value: &str) -> Result<KeyValueArg, String> {
     let (key, annotation_value) = value
         .split_once('=')
         .ok_or_else(|| "annotation must use key=value syntax".to_string())?;
-    if key.trim().is_empty() {
-        return Err("annotation key must not be empty".to_string());
-    }
+    validate_kubernetes_annotation_key(key)?;
+    validate_kubernetes_annotation_value(annotation_value)?;
     Ok(KeyValueArg {
         key: key.to_string(),
         value: annotation_value.to_string(),
     })
+}
+
+fn validate_kubernetes_annotation_key(key: &str) -> Result<(), String> {
+    let (prefix, name) = match key.split_once('/') {
+        Some((prefix, name)) => {
+            if name.contains('/') {
+                return Err("annotation key must contain at most one '/' separator".to_string());
+            }
+            (Some(prefix), name)
+        }
+        None => (None, key),
+    };
+    if let Some(prefix) = prefix {
+        validate_kubernetes_dns_subdomain(prefix, "annotation prefix")?;
+    }
+    validate_kubernetes_qualified_name(name, "annotation name")
+}
+
+fn validate_kubernetes_dns_subdomain(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 253 {
+        return Err(format!("{label} exceeds 253 bytes"));
+    }
+    for part in value.split('.') {
+        if part.is_empty() {
+            return Err(format!("{label} must not contain empty DNS labels"));
+        }
+        if part.len() > 63 {
+            return Err(format!("{label} DNS label `{part}` exceeds 63 bytes"));
+        }
+        let valid_body = part
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        let valid_edges = part
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && part
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+        if !valid_body || !valid_edges {
+            return Err(format!(
+                "{label} `{value}` must be a DNS subdomain using lowercase ASCII letters, digits, and '-' with alphanumeric label edges"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_qualified_name(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 63 {
+        return Err(format!("{label} exceeds 63 bytes"));
+    }
+    let valid_body = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    let valid_edges = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !valid_body || !valid_edges {
+        return Err(format!(
+            "{label} `{value}` must use ASCII letters, digits, '-', '_', or '.', with alphanumeric edges"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err("annotation value cannot contain control characters".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(
+            "annotation value cannot contain whitespace in generated Helm --set-string commands"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn helm_set_key(key: &str) -> String {
@@ -3365,7 +3453,19 @@ mod tests {
                 value: "nlb".to_string(),
             })
         );
+        assert_eq!(
+            parse_key_value("example.com/team.alpha_1=blue"),
+            Ok(KeyValueArg {
+                key: "example.com/team.alpha_1".to_string(),
+                value: "blue".to_string(),
+            })
+        );
         assert!(parse_key_value("missing-equals").is_err());
+        assert!(parse_key_value("Upper.example.com/key=value").is_err());
+        assert!(parse_key_value("example.com/-bad=value").is_err());
+        assert!(parse_key_value("example.com/bad?=value").is_err());
+        assert!(parse_key_value("example.com/key=two words").is_err());
+        assert!(parse_key_value("example.com/key=line\nbreak").is_err());
         assert_eq!(
             helm_set_key("service.beta.kubernetes.io/aws-load-balancer-type"),
             "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
