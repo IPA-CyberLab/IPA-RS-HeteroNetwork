@@ -39,6 +39,27 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateExternalServiceIPAddress" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- include "ipars.validateIPAddress" (dict "path" $path "value" $value) -}}
+{{- if or (eq $value "0.0.0.0") (eq $value "::") (eq $value "0:0:0:0:0:0:0:0") -}}
+{{- fail (printf "%s value %q must not be an unspecified address" $path $value) -}}
+{{- end -}}
+{{- if or (regexMatch "^127\\." $value) (eq $value "::1") (eq $value "0:0:0:0:0:0:0:1") -}}
+{{- fail (printf "%s value %q must not be a loopback address" $path $value) -}}
+{{- end -}}
+{{- if or (regexMatch "^169\\.254\\." $value) (regexMatch "^[Ff][Ee][89AaBb][0-9A-Fa-f]:" $value) -}}
+{{- fail (printf "%s value %q must not be a link-local address" $path $value) -}}
+{{- end -}}
+{{- if or (regexMatch "^(22[4-9]|23[0-9])\\." $value) (regexMatch "^[Ff][Ff]" $value) -}}
+{{- fail (printf "%s value %q must not be a multicast address" $path $value) -}}
+{{- end -}}
+{{- if eq $value "255.255.255.255" -}}
+{{- fail (printf "%s value %q must not be a broadcast address" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateLabelKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}

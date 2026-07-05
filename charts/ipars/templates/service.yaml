@@ -111,11 +111,17 @@
 {{- fail "agent.apiService.loadBalancerIP requires agent.apiService.type LoadBalancer" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerIP "") -}}
-{{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.loadBalancerIP" "value" $agentApiLoadBalancerIP) -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.loadBalancerIP" "value" $agentApiLoadBalancerIP) -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
+{{- $agentApiExternalIPSet := dict -}}
 {{- range $ip := $agentApiExternalIPs -}}
-{{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ip) -}}
+{{- $ipValue := printf "%v" $ip -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $agentApiExternalIPSet $ipValue -}}
+{{- fail (printf "agent.apiService.externalIPs entry %q must not be repeated" $ipValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiExternalIPSet $ipValue true -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
@@ -247,11 +253,17 @@
 {{- fail "agent.relayService.loadBalancerIP requires agent.relayService.type LoadBalancer" -}}
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayLoadBalancerIP "") -}}
-{{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.loadBalancerIP" "value" $relayLoadBalancerIP) -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.loadBalancerIP" "value" $relayLoadBalancerIP) -}}
 {{- end -}}
 {{- if $relayServiceActive -}}
+{{- $relayExternalIPSet := dict -}}
 {{- range $ip := $relayExternalIPs -}}
-{{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ip) -}}
+{{- $ipValue := printf "%v" $ip -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $relayExternalIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q must not be repeated" $ipValue) -}}
+{{- end -}}
+{{- $_ := set $relayExternalIPSet $ipValue true -}}
 {{- end -}}
 {{- end -}}
 {{- if $relayServiceActive -}}

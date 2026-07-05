@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -2778,8 +2778,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.apiService.sessionAffinityTimeoutSeconds={timeout_seconds}"
             ));
         }
-        if is_external_kubernetes_service_type(&args.agent_api_service_type) {
+        if is_external_kubernetes_service_type(&args.agent_api_service_type)
+            || !args.agent_api_external_ips.is_empty()
+        {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
+        }
+        if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(&format!(
                 " --set agent.apiService.externalTrafficPolicy={}",
                 args.agent_api_external_traffic_policy
@@ -2930,8 +2934,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.sessionAffinityTimeoutSeconds={timeout_seconds}"
             ));
         }
-        if is_external_kubernetes_service_type(&args.relay_service_type) {
+        if is_external_kubernetes_service_type(&args.relay_service_type)
+            || !args.relay_external_ips.is_empty()
+        {
             helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
+        }
+        if is_external_kubernetes_service_type(&args.relay_service_type) {
             helm_command.push_str(&format!(
                 " --set agent.relayService.externalTrafficPolicy={}",
                 args.relay_external_traffic_policy
@@ -3009,6 +3017,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
+            "LoadBalancer IP and externalIPs reject unspecified, loopback, link-local, multicast, and broadcast addresses".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
             "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement when host networking remains enabled because enforcement is CNI-dependent for host-networked pods".to_string(),
@@ -3604,6 +3613,39 @@ fn kubernetes_ip_family(ip: IpAddr) -> &'static str {
     }
 }
 
+fn kubernetes_external_service_ip_rejection_reason(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(ip) if ip.is_unspecified() => Some("unspecified"),
+        IpAddr::V4(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V4(ip) if ip.is_link_local() => Some("link-local"),
+        IpAddr::V4(ip) if ip.is_multicast() => Some("multicast"),
+        IpAddr::V4(ip) if ip == Ipv4Addr::BROADCAST => Some("broadcast"),
+        IpAddr::V6(ip) if ip.is_unspecified() => Some("unspecified"),
+        IpAddr::V6(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V6(ip) if ip.is_unicast_link_local() => Some("link-local"),
+        IpAddr::V6(ip) if ip.is_multicast() => Some("multicast"),
+        _ => None,
+    }
+}
+
+fn validate_kubernetes_external_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
+    if let Some(reason) = kubernetes_external_service_ip_rejection_reason(ip) {
+        anyhow::bail!("{flag} must not use {reason} address {ip}");
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for &ip in ips {
+        validate_kubernetes_external_service_ip(flag, ip)?;
+        if !seen.insert(ip) {
+            anyhow::bail!("{flag} must not repeat external Service IP address {ip}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_service_cluster_ips(
     flag_prefix: &str,
     cluster_ip: Option<IpAddr>,
@@ -4136,6 +4178,17 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--relay-external-ip requires --allow-public-service-exposure because externalIPs can expose the Service outside the cluster"
         );
     }
+    if let Some(ip) = args.agent_api_load_balancer_ip {
+        validate_kubernetes_external_service_ip("--agent-api-load-balancer-ip", ip)?;
+    }
+    if let Some(ip) = args.relay_load_balancer_ip {
+        validate_kubernetes_external_service_ip("--relay-load-balancer-ip", ip)?;
+    }
+    validate_kubernetes_external_service_ips(
+        "--agent-api-external-ip",
+        &args.agent_api_external_ips,
+    )?;
+    validate_kubernetes_external_service_ips("--relay-external-ip", &args.relay_external_ips)?;
     if args.agent_api_health_check_node_port.is_some()
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -5781,6 +5834,37 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_rejects_unsafe_external_service_ips() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(helpers.contains("ipars.validateExternalServiceIPAddress"));
+        assert!(helpers.contains("must not be an unspecified address"));
+        assert!(helpers.contains("must not be a loopback address"));
+        assert!(helpers.contains("must not be a link-local address"));
+        assert!(helpers.contains("must not be a multicast address"));
+        assert!(helpers.contains("must not be a broadcast address"));
+        assert!(service_template.contains(
+            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.apiService.loadBalancerIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.relayService.loadBalancerIP\""
+        ));
+        assert!(
+            service_template.contains("agent.apiService.externalIPs entry %q must not be repeated")
+        );
+        assert!(service_template
+            .contains("agent.relayService.externalIPs entry %q must not be repeated"));
         Ok(())
     }
 
@@ -7597,6 +7681,17 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string 'agent.relayService.externalIPs[0]=203.0.113.11'"));
 
+        let mut cluster_ip_external = base_k8s_install_args();
+        cluster_ip_external.expose_agent_api = true;
+        cluster_ip_external.allow_public_service_exposure = true;
+        cluster_ip_external.agent_api_service_type = "ClusterIP".to_string();
+        cluster_ip_external.agent_api_external_ips = vec!["198.51.100.12".parse()?];
+        let cluster_ip_external_plan = k8s_install_plan(cluster_ip_external)?;
+        assert!(cluster_ip_external_plan.commands[2]
+            .contains("--set agent.apiService.exposureAcknowledged=true"));
+        assert!(cluster_ip_external_plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.12'"));
+
         let mut cluster_ip_agent = base_k8s_install_args();
         cluster_ip_agent.expose_agent_api = true;
         cluster_ip_agent.agent_api_service_type = "ClusterIP".to_string();
@@ -7635,6 +7730,46 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-external-ip requires --expose-relay"));
+
+        let mut unspecified_agent_lb = base_k8s_install_args();
+        unspecified_agent_lb.expose_agent_api = true;
+        unspecified_agent_lb.allow_public_service_exposure = true;
+        unspecified_agent_lb.allow_unrestricted_load_balancer = true;
+        unspecified_agent_lb.agent_api_service_type = "LoadBalancer".to_string();
+        unspecified_agent_lb.agent_api_load_balancer_ip = Some("0.0.0.0".parse()?);
+        let error = match k8s_install_plan(unspecified_agent_lb) {
+            Ok(_) => panic!("agent LoadBalancerIP should reject unspecified addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-load-balancer-ip must not use unspecified address"));
+
+        let mut link_local_relay_external_ip = base_k8s_install_args();
+        link_local_relay_external_ip.expose_relay = true;
+        link_local_relay_external_ip.allow_public_service_exposure = true;
+        link_local_relay_external_ip.allow_unrestricted_load_balancer = true;
+        link_local_relay_external_ip.relay_service_type = "LoadBalancer".to_string();
+        link_local_relay_external_ip.relay_external_ips = vec!["fe80::1".parse()?];
+        link_local_relay_external_ip.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        link_local_relay_external_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(link_local_relay_external_ip) {
+            Ok(_) => panic!("relay externalIPs should reject link-local addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-external-ip must not use link-local address"));
+
+        let mut duplicate_agent_external_ip = base_k8s_install_args();
+        duplicate_agent_external_ip.expose_agent_api = true;
+        duplicate_agent_external_ip.allow_public_service_exposure = true;
+        duplicate_agent_external_ip.agent_api_external_ips =
+            vec!["198.51.100.11".parse()?, "198.51.100.11".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_external_ip) {
+            Ok(_) => panic!("agent externalIPs should reject duplicate addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-external-ip must not repeat external Service IP address 198.51.100.11"
+        ));
 
         let parsed = Cli::try_parse_from([
             "ipars",
