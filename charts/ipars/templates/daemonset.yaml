@@ -10,6 +10,8 @@
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
+{{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
+{{- $agentAllowPrivilegeEscalation := printf "%v" .Values.agent.securityContext.allowPrivilegeEscalation -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
@@ -41,6 +43,15 @@
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
+{{- end -}}
+{{- if not (or (eq $agentPrivileged "true") (eq $agentPrivileged "false")) -}}
+{{- fail "agent.privileged must be true or false" -}}
+{{- end -}}
+{{- if not (or (eq $agentAllowPrivilegeEscalation "") (eq $agentAllowPrivilegeEscalation "true") (eq $agentAllowPrivilegeEscalation "false")) -}}
+{{- fail "agent.securityContext.allowPrivilegeEscalation must be true, false, or empty" -}}
+{{- end -}}
+{{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
+{{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
 {{- end -}}
 {{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
@@ -95,6 +106,34 @@
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.memory" "value" (printf "%v" .Values.agent.resources.limits.memory)) -}}
+{{- $agentCapabilityAdds := dict -}}
+{{- range .Values.agent.securityContext.capabilities.add -}}
+{{- $capability := printf "%v" . -}}
+{{- if or (eq $capability "") (gt (len $capability) 64) (not (regexMatch "^(ALL|[A-Z][A-Z0-9_]{0,63})$" $capability)) -}}
+{{- fail (printf "agent.securityContext.capabilities.add entry %q must be a Linux capability name" $capability) -}}
+{{- end -}}
+{{- if hasKey $agentCapabilityAdds $capability -}}
+{{- fail (printf "agent.securityContext.capabilities.add entry %q must not be repeated" $capability) -}}
+{{- end -}}
+{{- $_ := set $agentCapabilityAdds $capability true -}}
+{{- end -}}
+{{- $agentCapabilityDrops := dict -}}
+{{- range .Values.agent.securityContext.capabilities.drop -}}
+{{- $capability := printf "%v" . -}}
+{{- if or (eq $capability "") (gt (len $capability) 64) (not (regexMatch "^(ALL|[A-Z][A-Z0-9_]{0,63})$" $capability)) -}}
+{{- fail (printf "agent.securityContext.capabilities.drop entry %q must be a Linux capability name" $capability) -}}
+{{- end -}}
+{{- if hasKey $agentCapabilityDrops $capability -}}
+{{- fail (printf "agent.securityContext.capabilities.drop entry %q must not be repeated" $capability) -}}
+{{- end -}}
+{{- if hasKey $agentCapabilityAdds $capability -}}
+{{- fail (printf "agent securityContext capability %q cannot be both added and dropped" $capability) -}}
+{{- end -}}
+{{- $_ := set $agentCapabilityDrops $capability true -}}
+{{- end -}}
+{{- if and (eq $agentAllowPrivilegeEscalation "false") (or (hasKey $agentCapabilityAdds "SYS_ADMIN") (hasKey $agentCapabilityAdds "CAP_SYS_ADMIN")) -}}
+{{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used when SYS_ADMIN is added" -}}
+{{- end -}}
 {{- $agentRolloutUpdateStrategy := .Values.agent.rollout.updateStrategy -}}
 {{- $agentRolloutMaxUnavailable := printf "%v" .Values.agent.rollout.maxUnavailable -}}
 {{- $agentRolloutMaxSurge := printf "%v" .Values.agent.rollout.maxSurge -}}
@@ -361,11 +400,25 @@ spec:
             - name: IPARS_ROUTE_PROVIDER
               value: {{ .Values.agent.routeProvider | quote }}
           securityContext:
-            privileged: {{ .Values.agent.privileged }}
+            privileged: {{ $agentPrivileged }}
+            {{- if ne $agentAllowPrivilegeEscalation "" }}
+            allowPrivilegeEscalation: {{ $agentAllowPrivilegeEscalation }}
+            {{- end }}
+            {{- if or .Values.agent.securityContext.capabilities.add .Values.agent.securityContext.capabilities.drop }}
             capabilities:
+              {{- with .Values.agent.securityContext.capabilities.add }}
               add:
-                - NET_ADMIN
-                - NET_RAW
+                {{- range . }}
+                - {{ . | quote }}
+                {{- end }}
+              {{- end }}
+              {{- with .Values.agent.securityContext.capabilities.drop }}
+              drop:
+                {{- range . }}
+                - {{ . | quote }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
           {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory .Values.agent.resources.limits.cpu .Values.agent.resources.limits.memory }}
           resources:
             {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory }}

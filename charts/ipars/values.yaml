@@ -29,6 +29,13 @@ agent:
   automountServiceAccountToken: true
   terminationGracePeriodSeconds: ""
   privileged: false
+  securityContext:
+    allowPrivilegeEscalation: ""
+    capabilities:
+      add:
+        - NET_ADMIN
+        - NET_RAW
+      drop: []
   podLabels: {}
   podAnnotations: {}
   priorityClassName: ""

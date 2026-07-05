@@ -293,6 +293,14 @@ struct K8sInstallArgs {
     join_token_key: String,
     #[arg(long = "image-pull-secret", value_parser = parse_kubernetes_image_pull_secret_name)]
     image_pull_secrets: Vec<String>,
+    #[arg(long = "agent-privileged", default_value_t = false)]
+    agent_privileged: bool,
+    #[arg(long = "agent-add-capability", value_parser = parse_linux_capability)]
+    agent_add_capabilities: Vec<String>,
+    #[arg(long = "agent-drop-capability", value_parser = parse_linux_capability)]
+    agent_drop_capabilities: Vec<String>,
+    #[arg(long = "disable-agent-privilege-escalation", default_value_t = false)]
+    disable_agent_privilege_escalation: bool,
     #[arg(long, default_value_t = false)]
     kubernetes_discover_services: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1385,6 +1393,11 @@ fn parse_kubernetes_image_pull_secret_name(value: &str) -> Result<String, String
     Ok(value.to_string())
 }
 
+fn parse_linux_capability(value: &str) -> Result<String, String> {
+    validate_linux_capability_name(value, "Linux capability")?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     validate_kubernetes_resource_quantity(value, "resource quantity")?;
     Ok(value.to_string())
@@ -1711,6 +1724,14 @@ fn append_helm_string_list(command: &mut String, key: &str, values: &[String]) {
     for (index, value) in values.iter().enumerate() {
         append_helm_set_string(command, &format!("{key}[{index}]"), value);
     }
+}
+
+fn append_helm_literal_list(command: &mut String, key: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    let assignment = format!("{key}={{{}}}", values.join(","));
+    command.push_str(&format!(" --set {}", shell_word(&assignment)));
 }
 
 fn shell_word(value: &str) -> String {
@@ -2074,6 +2095,28 @@ fn validate_linux_namespace_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_linux_capability_name(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 64 {
+        return Err(format!("{label} `{value}` exceeds 64 bytes"));
+    }
+    let valid = value
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase());
+    if !valid {
+        return Err(format!(
+            "{label} `{value}` must contain only uppercase ASCII letters, digits, and '_' and start with a letter"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
     if filter.is_empty() {
         anyhow::bail!("Docker network filter cannot be empty");
@@ -2149,6 +2192,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_image_pull_secrets(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
+    validate_k8s_agent_security_context(&args)?;
     validate_k8s_agent_rollout_options(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
@@ -2406,7 +2450,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "kubectl access with permission to create namespaces, Secrets, DaemonSets, and RBAC when Kubernetes Service discovery is enabled".to_string(),
             "Helm 3".to_string(),
             "/dev/net/tun available on every scheduled node".to_string(),
-            "NET_ADMIN and NET_RAW capability allowance for the DaemonSet agent".to_string(),
+            "NET_ADMIN and NET_RAW capability allowance, or equivalent --agent-add-capability overrides, for the DaemonSet agent".to_string(),
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
         ],
         security: vec![
@@ -2419,13 +2463,14 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Use --disable-agent-service-account-token only when Kubernetes Service API discovery is not required".to_string(),
             "ServiceAccount creation can be disabled only when an equivalent ServiceAccount already exists in the target namespace".to_string(),
             "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
+            "Agent securityContext capability add/drop, privilege escalation, and privileged mode flags should match the selected runtime backend and cluster Pod Security admission policy".to_string(),
             "Relay advertisement remains ineffective unless the join token allows relay".to_string(),
         ],
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
             "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2506,6 +2551,22 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_agent_service_account_token {
         command.push_str(" --set agent.automountServiceAccountToken=false");
     }
+    if args.agent_privileged {
+        command.push_str(" --set agent.privileged=true");
+    }
+    if args.disable_agent_privilege_escalation {
+        command.push_str(" --set agent.securityContext.allowPrivilegeEscalation=false");
+    }
+    append_helm_literal_list(
+        command,
+        "agent.securityContext.capabilities.add",
+        &args.agent_add_capabilities,
+    );
+    append_helm_literal_list(
+        command,
+        "agent.securityContext.capabilities.drop",
+        &args.agent_drop_capabilities,
+    );
     for label in &args.agent_pod_labels {
         append_helm_set_string(
             command,
@@ -2819,6 +2880,56 @@ fn validate_kubernetes_session_affinity_options(
             );
         }
     }
+    Ok(())
+}
+
+const DEFAULT_AGENT_CAPABILITIES: [&str; 2] = ["NET_ADMIN", "NET_RAW"];
+
+fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let mut added = BTreeSet::new();
+    for capability in &args.agent_add_capabilities {
+        validate_linux_capability_name(capability, "agent add capability")
+            .map_err(anyhow::Error::msg)?;
+        if !added.insert(capability.as_str()) {
+            anyhow::bail!("--agent-add-capability `{capability}` must not be repeated");
+        }
+    }
+
+    let effective_added: BTreeSet<&str> = if args.agent_add_capabilities.is_empty() {
+        DEFAULT_AGENT_CAPABILITIES.into_iter().collect()
+    } else {
+        added.iter().copied().collect()
+    };
+
+    let mut dropped = BTreeSet::new();
+    for capability in &args.agent_drop_capabilities {
+        validate_linux_capability_name(capability, "agent drop capability")
+            .map_err(anyhow::Error::msg)?;
+        if !dropped.insert(capability.as_str()) {
+            anyhow::bail!("--agent-drop-capability `{capability}` must not be repeated");
+        }
+        if (capability == "ALL" && effective_added.contains("ALL"))
+            || (capability != "ALL" && effective_added.contains(capability.as_str()))
+        {
+            anyhow::bail!(
+                "--agent-drop-capability `{capability}` conflicts with the agent capability add list"
+            );
+        }
+    }
+
+    if args.disable_agent_privilege_escalation {
+        if args.agent_privileged {
+            anyhow::bail!(
+                "--disable-agent-privilege-escalation cannot be used with --agent-privileged"
+            );
+        }
+        if effective_added.contains("SYS_ADMIN") || effective_added.contains("CAP_SYS_ADMIN") {
+            anyhow::bail!(
+                "--disable-agent-privilege-escalation cannot be used when SYS_ADMIN is added"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -4018,6 +4129,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4192,6 +4307,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4319,6 +4438,68 @@ mod tests {
             "install",
             "--image-pull-secret",
             "bad secret",
+        ])
+        .is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_security_context() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_add_capabilities = vec![
+            "NET_ADMIN".to_string(),
+            "NET_RAW".to_string(),
+            "SYS_TIME".to_string(),
+        ];
+        args.agent_drop_capabilities = vec!["MKNOD".to_string()];
+        args.disable_agent_privilege_escalation = true;
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.securityContext.allowPrivilegeEscalation=false"));
+        assert!(helm.contains(
+            "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_TIME}'"
+        ));
+        assert!(helm.contains("--set 'agent.securityContext.capabilities.drop={MKNOD}'"));
+
+        let mut privileged = base_k8s_install_args();
+        privileged.agent_privileged = true;
+        let plan = k8s_install_plan(privileged)?;
+        assert!(plan.commands[2].contains("--set agent.privileged=true"));
+
+        let mut duplicate = base_k8s_install_args();
+        duplicate.agent_add_capabilities = vec!["NET_ADMIN".to_string(), "NET_ADMIN".to_string()];
+        let error = match k8s_install_plan(duplicate) {
+            Ok(_) => panic!("duplicate agent capability should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-add-capability"));
+
+        let mut drop_default = base_k8s_install_args();
+        drop_default.agent_drop_capabilities = vec!["NET_RAW".to_string()];
+        let error = match k8s_install_plan(drop_default) {
+            Ok(_) => panic!("dropping a default added capability should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-drop-capability"));
+
+        let mut privilege_escalation_conflict = base_k8s_install_args();
+        privilege_escalation_conflict.agent_privileged = true;
+        privilege_escalation_conflict.disable_agent_privilege_escalation = true;
+        let error = match k8s_install_plan(privilege_escalation_conflict) {
+            Ok(_) => panic!("privileged pod should not disable privilege escalation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--disable-agent-privilege-escalation"));
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-add-capability",
+            "net_admin",
         ])
         .is_err());
 
@@ -4750,6 +4931,15 @@ mod tests {
             "signed-token",
             "--image-pull-secret",
             "registry-cred",
+            "--agent-privileged",
+            "--agent-add-capability",
+            "NET_ADMIN",
+            "--agent-add-capability",
+            "NET_RAW",
+            "--agent-add-capability",
+            "SYS_TIME",
+            "--agent-drop-capability",
+            "MKNOD",
             "--kubernetes-discover-services",
             "--kubernetes-discover-api-server",
             "false",
@@ -4877,6 +5067,13 @@ mod tests {
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
             assert_eq!(args.image_pull_secrets, vec!["registry-cred"]);
+            assert!(args.agent_privileged);
+            assert_eq!(
+                args.agent_add_capabilities,
+                vec!["NET_ADMIN", "NET_RAW", "SYS_TIME"]
+            );
+            assert_eq!(args.agent_drop_capabilities, vec!["MKNOD"]);
+            assert!(!args.disable_agent_privilege_escalation);
             assert!(args.kubernetes_discover_services);
             assert!(!args.kubernetes_discover_api_server);
             assert_eq!(
@@ -5054,6 +5251,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5144,6 +5345,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5749,6 +5954,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5826,6 +6035,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5910,6 +6123,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5992,6 +6209,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6069,6 +6290,10 @@ mod tests {
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             image_pull_secrets: Vec::new(),
+            agent_privileged: false,
+            agent_add_capabilities: Vec::new(),
+            agent_drop_capabilities: Vec::new(),
+            disable_agent_privilege_escalation: false,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
