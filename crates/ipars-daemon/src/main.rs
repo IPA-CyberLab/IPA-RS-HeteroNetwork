@@ -11538,6 +11538,91 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Ok(())
     }
 
+    #[tokio::test]
+    async fn docker_api_discovery_reads_networks_over_unix_socket() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let base = unique_test_dir("docker-api-socket")?;
+        let socket_path = base.join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request).into_owned();
+            anyhow::ensure!(
+                request_text.starts_with("GET /v1.43/networks "),
+                "unexpected Docker API request line: {request_text}"
+            );
+            let body = r#"[
+  {"Id":"default-id","Name":"compose_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.18.0.0/16"}]}},
+  {"Id":"extra-id","Name":"compose_extra","Driver":"bridge","IPAM":{"Config":[{"Subnet":"fd00:18::/64"}]}},
+  {"Id":"host-id","Name":"host","Driver":"host","IPAM":{"Config":[{"Subnet":"192.0.2.0/24"}]}}
+]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<String, anyhow::Error>(request_text)
+        });
+
+        let client = reqwest::Client::builder()
+            .unix_socket(socket_path.clone())
+            .build()
+            .context("failed to build test Docker API client")?;
+        let discovery = DockerApiNetworkDiscovery {
+            client,
+            api_version: "v1.43".to_string(),
+            network_filters: vec!["default-id".to_string(), "compose_extra".to_string()],
+            container_namespace: None,
+            host_interface: "br-edge".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            expose_host_routes: true,
+        };
+
+        let intent_result = discovery.discover_intent().await;
+        let request_text = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for mock Docker API request")???;
+        assert!(request_text.to_ascii_lowercase().contains("host: docker"));
+        let intent = intent_result?;
+        assert_eq!(
+            intent.container_namespace,
+            "docker:compose_default+compose_extra"
+        );
+        assert_eq!(intent.host_interface, "br-edge");
+        assert_eq!(intent.overlay_interface, "ipars0");
+        assert!(intent.expose_host_routes);
+        assert_eq!(
+            intent.container_cidrs,
+            vec![
+                "172.18.0.0/16".parse::<ipnet::IpNet>()?,
+                "fd00:18::/64".parse::<ipnet::IpNet>()?,
+            ]
+        );
+
+        let routes =
+            docker_advertised_routes(&NodeId::from_string("node-a"), intent.container_cidrs);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].id, "docker-0");
+        assert_eq!(routes[0].via, Some(NodeId::from_string("node-a")));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
     #[test]
     fn docker_api_discovery_rejects_invalid_discovered_network_names() -> anyhow::Result<()> {
         let networks = vec![docker_api_network(
