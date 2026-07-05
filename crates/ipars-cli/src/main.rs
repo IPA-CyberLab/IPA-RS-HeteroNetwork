@@ -531,6 +531,10 @@ struct K8sInstallArgs {
     relay_external_traffic_policy: String,
     #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
     relay_service_annotations: Vec<KeyValueArg>,
+    #[arg(long = "relay-admission-bearer-token-secret")]
+    relay_admission_bearer_token_secret: Option<String>,
+    #[arg(long = "relay-admission-bearer-token-key")]
+    relay_admission_bearer_token_key: Option<String>,
     #[arg(long)]
     relay_public_endpoint: Option<String>,
     #[arg(long)]
@@ -2583,6 +2587,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
     validate_k8s_image_pull_secrets(&args)?;
+    validate_k8s_relay_admission_bearer_token_secret(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_security_context(&args)?;
@@ -2604,6 +2609,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
     append_k8s_agent_pod_values(&mut helm_command, &args);
+    append_k8s_relay_admission_bearer_token_values(&mut helm_command, &args);
     if args.enable_network_policy {
         helm_command.push_str(" --set networkPolicy.enabled=true");
         if args.network_policy_acknowledge_host_network {
@@ -3009,6 +3015,19 @@ fn append_k8s_service_account_values(command: &mut String, args: &K8sInstallArgs
     }
 }
 
+fn append_k8s_relay_admission_bearer_token_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(secret) = args.relay_admission_bearer_token_secret.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.relayAdmissionBearerTokenSecret.name",
+            secret,
+        );
+    }
+    if let Some(key) = args.relay_admission_bearer_token_key.as_deref() {
+        append_helm_set_string(command, "agent.relayAdmissionBearerTokenSecret.key", key);
+    }
+}
+
 fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_rbac {
         command.push_str(" --set rbac.create=false");
@@ -3292,6 +3311,30 @@ fn validate_k8s_image_pull_secrets(args: &K8sInstallArgs) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn validate_k8s_relay_admission_bearer_token_secret(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    match (
+        args.relay_admission_bearer_token_secret.as_deref(),
+        args.relay_admission_bearer_token_key.as_deref(),
+    ) {
+        (Some(secret), Some(key)) => {
+            validate_kubernetes_dns_subdomain(secret, "relay admission bearer token Secret name")
+                .map_err(anyhow::Error::msg)?;
+            validate_kubernetes_secret_key_for_label(
+                key,
+                "relay admission bearer token Secret key",
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "--relay-admission-bearer-token-secret and --relay-admission-bearer-token-key must be provided together"
+            );
+        }
+    }
+}
+
 fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if let Some(name) = args.service_account_name.as_deref() {
         validate_kubernetes_dns_subdomain(name, "ServiceAccount name")
@@ -3337,20 +3380,23 @@ fn validate_helm_release_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_kubernetes_secret_key(key: &str) -> Result<(), String> {
+    validate_kubernetes_secret_key_for_label(key, "join token Secret key")
+}
+
+fn validate_kubernetes_secret_key_for_label(key: &str, label: &str) -> Result<(), String> {
     if key.is_empty() {
-        return Err("join token Secret key must not be empty".to_string());
+        return Err(format!("{label} must not be empty"));
     }
     if key.len() > 253 {
-        return Err("join token Secret key exceeds 253 bytes".to_string());
+        return Err(format!("{label} exceeds 253 bytes"));
     }
     let valid = key
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
     if !valid {
-        return Err(
-            "join token Secret key must contain only ASCII letters, digits, '-', '_' or '.'"
-                .to_string(),
-        );
+        return Err(format!(
+            "{label} must contain only ASCII letters, digits, '-', '_' or '.'"
+        ));
     }
     Ok(())
 }
@@ -5327,6 +5373,8 @@ mod tests {
                 key: "metallb.universe.tf/address-pool".to_string(),
                 value: "public".to_string(),
             }],
+            relay_admission_bearer_token_secret: Some("relay-admission-token".to_string()),
+            relay_admission_bearer_token_key: Some("token".to_string()),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: Some("http://203.0.113.10:9580".to_string()),
@@ -5441,6 +5489,11 @@ mod tests {
         ));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayAdmissionBearerTokenSecret.name=relay-admission-token"
+        ));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayAdmissionBearerTokenSecret.key=token"));
         assert!(plan.commands[2].contains(
             "--set-string 'agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public'"
         ));
@@ -5570,6 +5623,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -6156,6 +6211,34 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("join token Secret key"));
+
+        let mut missing_bearer_key = base_k8s_install_args();
+        missing_bearer_key.relay_admission_bearer_token_secret =
+            Some("relay-admission-token".to_string());
+        let error = match k8s_install_plan(missing_bearer_key) {
+            Ok(_) => panic!("relay admission bearer token Secret key should be required"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-admission-bearer-token-secret"));
+
+        let mut invalid_bearer_secret = base_k8s_install_args();
+        invalid_bearer_secret.relay_admission_bearer_token_secret = Some("bad secret".to_string());
+        invalid_bearer_secret.relay_admission_bearer_token_key = Some("token".to_string());
+        let error = match k8s_install_plan(invalid_bearer_secret) {
+            Ok(_) => panic!("invalid relay admission bearer token Secret name should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay admission bearer token Secret name"));
+
+        let mut invalid_bearer_key = base_k8s_install_args();
+        invalid_bearer_key.relay_admission_bearer_token_secret =
+            Some("relay-admission-token".to_string());
+        invalid_bearer_key.relay_admission_bearer_token_key = Some("../token".to_string());
+        let error = match k8s_install_plan(invalid_bearer_key) {
+            Ok(_) => panic!("invalid relay admission bearer token Secret key should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay admission bearer token Secret key"));
     }
 
     #[test]
@@ -6441,6 +6524,10 @@ mod tests {
             "Local",
             "--relay-service-annotation",
             "metallb.universe.tf/address-pool=public",
+            "--relay-admission-bearer-token-secret",
+            "relay-admission-token",
+            "--relay-admission-bearer-token-key",
+            "token",
             "--relay-public-endpoint",
             "203.0.113.10:51820",
             "--relay-admission-url",
@@ -6654,6 +6741,14 @@ mod tests {
                 }]
             );
             assert_eq!(
+                args.relay_admission_bearer_token_secret.as_deref(),
+                Some("relay-admission-token")
+            );
+            assert_eq!(
+                args.relay_admission_bearer_token_key.as_deref(),
+                Some("token")
+            );
+            assert_eq!(
                 args.relay_public_endpoint.as_deref(),
                 Some("203.0.113.10:51820")
             );
@@ -6777,6 +6872,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -6901,6 +6998,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -7891,6 +7990,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
@@ -8002,6 +8103,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
@@ -8120,6 +8223,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -8236,6 +8341,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -8347,6 +8454,8 @@ mod tests {
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,

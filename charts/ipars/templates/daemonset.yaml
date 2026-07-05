@@ -4,6 +4,20 @@
 {{- if or (eq .Values.agent.joinTokenSecretKey "") (gt (len .Values.agent.joinTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.joinTokenSecretKey)) -}}
 {{- fail "agent.joinTokenSecretKey must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- $relayAdmissionBearerTokenSecretName := .Values.agent.relayAdmissionBearerTokenSecret.name -}}
+{{- $relayAdmissionBearerTokenSecretKey := .Values.agent.relayAdmissionBearerTokenSecret.key -}}
+{{- if and (eq $relayAdmissionBearerTokenSecretName "") (ne $relayAdmissionBearerTokenSecretKey "") -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.key requires agent.relayAdmissionBearerTokenSecret.name" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretName "") (eq $relayAdmissionBearerTokenSecretKey "") -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.name requires agent.relayAdmissionBearerTokenSecret.key" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretName "") (or (gt (len $relayAdmissionBearerTokenSecretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $relayAdmissionBearerTokenSecretName))) -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.name must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretKey "") (or (gt (len $relayAdmissionBearerTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" $relayAdmissionBearerTokenSecretKey))) -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.key must contain only ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
 {{- $imageRepository := printf "%v" .Values.image.repository -}}
@@ -508,6 +522,13 @@ spec:
               value: {{ .Values.cluster.stunEndpoint | quote }}
             - name: IPARS_RELAY_ENDPOINT
               value: {{ .Values.cluster.relayEndpoint | quote }}
+            {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
+            - name: IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $relayAdmissionBearerTokenSecretName | quote }}
+                  key: {{ $relayAdmissionBearerTokenSecretKey | quote }}
+            {{- end }}
             - name: IPARS_AGENT_WIREGUARD_INTERFACE
               value: {{ .Values.agent.interfaceName | quote }}
             - name: IPARS_ROUTE_PROVIDER

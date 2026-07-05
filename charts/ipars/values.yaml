@@ -112,6 +112,9 @@ agent:
     maxSessions: 1024
     restartBackoffSeconds: 5
     netns: ""
+  relayAdmissionBearerTokenSecret:
+    name: ""
+    key: ""
   relayAdvertisement:
     enabled: false
     publicEndpoint: ""
