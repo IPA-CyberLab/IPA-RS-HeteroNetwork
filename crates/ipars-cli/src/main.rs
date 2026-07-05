@@ -2438,7 +2438,7 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
     let mut seen = BTreeSet::new();
     let mut routes = Vec::new();
     for cidr in cidrs {
-        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
             anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
         }
         let route = cidr.trunc();
@@ -2463,7 +2463,7 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
     Ok(())
 }
 
-fn restricted_docker_container_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+fn restricted_route_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
     if cidr.prefix_len() == 0 {
         return Some("unrestricted");
     }
@@ -3452,6 +3452,19 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.kubernetes_route_interval_seconds == 0 {
         anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
     }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
     Ok(())
 }
 
@@ -3769,6 +3782,27 @@ fn validate_kubernetes_restricted_cidrs(
     for cidr in cidrs {
         if cidr.prefix_len() == 0 {
             anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_underlay_route_cidrs(
+    flag: &str,
+    label: &str,
+    cidrs: &[ipnet::IpNet],
+    seen: &mut BTreeSet<ipnet::IpNet>,
+) -> anyhow::Result<()> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} {label} {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical {label} route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Kubernetes underlay route CIDR {route}");
         }
     }
     Ok(())
@@ -6834,7 +6868,7 @@ mod tests {
     }
 
     #[test]
-    fn k8s_install_plan_rejects_invalid_route_discovery_settings() {
+    fn k8s_install_plan_rejects_invalid_route_discovery_settings() -> anyhow::Result<()> {
         let mut namespace_without_discovery = base_k8s_install_args();
         namespace_without_discovery.kubernetes_namespaces = vec!["default".to_string()];
         let error = match k8s_install_plan(namespace_without_discovery) {
@@ -6898,6 +6932,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--kubernetes-route-interval-seconds must be greater than zero"));
+
+        let mut unrestricted_api_cidr = base_k8s_install_args();
+        unrestricted_api_cidr.kubernetes_api_server_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_api_cidr) {
+            Ok(_) => panic!("unrestricted API server CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-api-server-cidr must not include unrestricted Kubernetes API server CIDR 0.0.0.0/0"
+        ));
+
+        let mut loopback_service_cidr = base_k8s_install_args();
+        loopback_service_cidr.kubernetes_service_cidrs = vec!["127.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(loopback_service_cidr) {
+            Ok(_) => panic!("loopback Service CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must not include loopback Kubernetes Service CIDR 127.0.0.0/8"
+        ));
+
+        let mut non_canonical_service_cidr = base_k8s_install_args();
+        non_canonical_service_cidr.kubernetes_service_cidrs = vec!["10.96.0.1/12".parse()?];
+        let error = match k8s_install_plan(non_canonical_service_cidr) {
+            Ok(_) => panic!("non-canonical Service CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12"
+        ));
+
+        let mut duplicate_route_cidr = base_k8s_install_args();
+        duplicate_route_cidr.kubernetes_api_server_cidrs = vec!["10.96.0.1/32".parse()?];
+        duplicate_route_cidr.kubernetes_service_cidrs = vec!["10.96.0.1/32".parse()?];
+        let error = match k8s_install_plan(duplicate_route_cidr) {
+            Ok(_) => panic!("duplicate Kubernetes route CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must not repeat Kubernetes underlay route CIDR 10.96.0.1/32"
+        ));
+
+        Ok(())
     }
 
     #[test]

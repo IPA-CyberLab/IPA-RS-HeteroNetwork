@@ -1668,7 +1668,7 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
     let mut seen = BTreeSet::new();
     let mut routes = Vec::new();
     for cidr in cidrs {
-        if let Some(reason) = restricted_docker_container_cidr_reason(cidr) {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
             anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
         }
         let route = cidr.trunc();
@@ -1693,7 +1693,7 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
     Ok(())
 }
 
-fn restricted_docker_container_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+fn restricted_route_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
     if cidr.prefix_len() == 0 {
         return Some("unrestricted");
     }
@@ -1849,6 +1849,40 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
             anyhow::bail!(
                 "--kubernetes-service-label-selector requires --kubernetes-discover-services"
             );
+        }
+    }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
+    Ok(())
+}
+
+fn validate_kubernetes_underlay_route_cidrs(
+    flag: &str,
+    label: &str,
+    cidrs: &[ipnet::IpNet],
+    seen: &mut BTreeSet<ipnet::IpNet>,
+) -> anyhow::Result<()> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} {label} {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical {label} route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Kubernetes underlay route CIDR {route}");
         }
     }
     Ok(())
@@ -5654,6 +5688,19 @@ impl KubernetesApiRouteDiscovery {
         if api_server_cidrs.is_empty() && service_cidrs.is_empty() {
             anyhow::bail!("Kubernetes API discovery found no service or API server routes");
         }
+        let mut route_cidrs = BTreeSet::new();
+        validate_kubernetes_underlay_route_cidrs(
+            "Kubernetes API discovery",
+            "Kubernetes API server CIDR",
+            &api_server_cidrs,
+            &mut route_cidrs,
+        )?;
+        validate_kubernetes_underlay_route_cidrs(
+            "Kubernetes API discovery",
+            "Kubernetes Service CIDR",
+            &service_cidrs,
+            &mut route_cidrs,
+        )?;
         Ok(KubernetesUnderlayIntent {
             node_name: self.node_name.clone(),
             overlay_interface: self.overlay_interface.clone(),
@@ -5812,6 +5859,19 @@ fn kubernetes_underlay_intent(
             "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
         );
     }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
     let route_provider = args
         .kubernetes_route_provider
         .clone()
@@ -13891,6 +13951,32 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[test]
+    fn kubernetes_underlay_intent_rejects_invalid_route_cidrs() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.1/12",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match kubernetes_underlay_intent(&args, NodeId::from_string("local")) {
+                Ok(intent) => {
+                    anyhow::bail!("invalid Kubernetes intent should be rejected: {intent:?}");
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(
+                "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12"
+            ));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
     fn agent_runtime_config_error(argv: Vec<&str>) -> anyhow::Result<String> {
         let cli = Cli::try_parse_from(argv)?;
         if let Command::Agent(args) = cli.command {
@@ -13967,6 +14053,56 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         ])?;
         assert!(overlapping.contains(
             "--docker-container-cidr must not include overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_explicit_route_cidrs_reject_invalid_ranges() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--kubernetes-api-server-cidr",
+                "0.0.0.0/0",
+                "--kubernetes-api-server-cidr must not include unrestricted Kubernetes API server CIDR 0.0.0.0/0",
+            ),
+            (
+                "--kubernetes-service-cidr",
+                "127.0.0.0/8",
+                "--kubernetes-service-cidr must not include loopback Kubernetes Service CIDR 127.0.0.0/8",
+            ),
+            (
+                "--kubernetes-service-cidr",
+                "10.96.0.1/12",
+                "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12",
+            ),
+        ];
+
+        for (flag, cidr, expected) in cases {
+            let error = agent_runtime_config_error(vec![
+                "iparsd",
+                "agent",
+                "--apply-kubernetes-underlay",
+                flag,
+                cidr,
+            ])?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+
+        let duplicate = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-api-server-cidr",
+            "10.96.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.1/32",
+        ])?;
+        assert!(duplicate.contains(
+            "--kubernetes-service-cidr must not repeat Kubernetes underlay route CIDR 10.96.0.1/32"
         ));
 
         Ok(())
