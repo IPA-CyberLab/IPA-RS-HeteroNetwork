@@ -4361,9 +4361,11 @@ mod tests {
             peer_map_route_candidate_count: 0,
             peer_map_route_visible_count: 0,
             peer_map_route_acl_denied_count: 0,
+            stale_path_count: 0,
             path_count: 0,
             path_state_counts: Vec::new(),
             endpoint_candidate_ttl_seconds: 0,
+            path_state_ttl_seconds: 0,
             generated_at: Utc::now(),
         }
     }

@@ -298,6 +298,19 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_path_state_ttl_seconds Path-state freshness window used by control-plane status and metrics."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_path_state_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_path_state_ttl_seconds{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.path_state_ttl_seconds
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_vpn_pool_total Usable VPN IP addresses in the configured pool."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_vpn_pool_total gauge");
@@ -481,6 +494,16 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         &mut body,
         "ipars_control_plane_paths{{cluster_id=\"{cluster_id}\"}} {}",
         metrics.path_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_stale_paths Number of pair-scoped paths older than the control-plane path-state TTL."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_stale_paths gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_stale_paths{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.stale_path_count
     );
     prometheus_line!(
         &mut body,
@@ -881,6 +904,8 @@ mod tests {
         assert_eq!(metrics.healthy_node_count, 1);
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
+        assert_eq!(metrics.stale_path_count, 0);
+        assert_eq!(metrics.path_state_ttl_seconds, 600);
         assert_eq!(metrics.vpn_pool_total_count, 6);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
         assert_eq!(metrics.vpn_pool_available_count, 5);
@@ -947,6 +972,8 @@ mod tests {
         assert_eq!(paths.node_id, node_id("node-http"));
         assert_eq!(paths.paths.len(), 1);
         assert_eq!(paths.paths[0].key.remote, node_id("node-peer"));
+        assert_eq!(paths.stale_path_count, 0);
+        assert_eq!(paths.path_state_ttl_seconds, 600);
 
         let response = app
             .oneshot(
@@ -968,6 +995,8 @@ mod tests {
         assert!(body.contains("ipars_control_plane_nodes"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
+        assert!(body.contains("ipars_control_plane_stale_paths"));
+        assert!(body.contains("ipars_control_plane_path_state_ttl_seconds"));
         assert!(body.contains("ipars_control_plane_vpn_pool_total"));
         assert!(body.contains("ipars_control_plane_vpn_pool_allocated"));
         assert!(body.contains("ipars_control_plane_vpn_pool_available"));

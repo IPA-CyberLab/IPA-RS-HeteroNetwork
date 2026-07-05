@@ -649,22 +649,37 @@ where
             .iter()
             .map(|peer| (peer.node_id.clone(), peer))
             .collect::<BTreeMap<_, _>>();
+        let now = Utc::now();
+        let mut stale_path_count = 0;
         let paths = self
             .store
             .list_paths_for(node_id)
             .await?
             .into_iter()
-            .filter(|path| {
+            .filter_map(|path| {
                 let peer_id = if path.key.local == source.node_id {
                     &path.key.remote
                 } else if path.key.remote == source.node_id {
                     &path.key.local
                 } else {
-                    return false;
+                    return None;
                 };
-                peers_by_id.get(peer_id).is_some_and(|peer| {
+                let visible = peers_by_id.get(peer_id).is_some_and(|peer| {
                     acl_filter_peer(&source, peer, &self.config.cluster_policy).is_some()
-                })
+                });
+                if !visible {
+                    return None;
+                }
+                if path_is_fresh(
+                    &path,
+                    now,
+                    self.config.cluster_policy.path_state_ttl_seconds,
+                ) {
+                    Some(path)
+                } else {
+                    stale_path_count += 1;
+                    None
+                }
             })
             .collect::<Vec<_>>();
 
@@ -672,7 +687,9 @@ where
             cluster_id: self.config.cluster_id.clone(),
             node_id: node_id.clone(),
             paths,
-            generated_at: Utc::now(),
+            stale_path_count,
+            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            generated_at: now,
         })
     }
 
@@ -1108,10 +1125,16 @@ where
             }
         }
 
+        let mut stale_path_count = 0;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in paths.values() {
+            if !path_is_fresh(path, now, self.config.cluster_policy.path_state_ttl_seconds) {
+                stale_path_count += 1;
+                continue;
+            }
             *path_state_counts.entry(path.selected_state).or_default() += 1;
         }
+        let path_count = paths.len().saturating_sub(stale_path_count);
 
         Ok(ControlPlaneMetricsResponse {
             cluster_id: self.config.cluster_id.clone(),
@@ -1136,7 +1159,8 @@ where
             peer_map_route_candidate_count: peer_map_metrics.route_candidates,
             peer_map_route_visible_count: peer_map_metrics.visible_routes,
             peer_map_route_acl_denied_count: peer_map_metrics.acl_denied_routes,
-            path_count: paths.len(),
+            stale_path_count,
+            path_count,
             path_state_counts: path_state_counts
                 .into_iter()
                 .map(|(state, count)| PathStateCount { state, count })
@@ -1145,7 +1169,8 @@ where
                 .config
                 .cluster_policy
                 .endpoint_candidate_ttl_seconds,
-            generated_at: Utc::now(),
+            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            generated_at: now,
         })
     }
 
@@ -1291,6 +1316,13 @@ fn endpoint_candidate_is_fresh(
     ttl_seconds: u64,
 ) -> bool {
     match now.signed_duration_since(candidate.observed_at).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
+}
+
+fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64) -> bool {
+    match now.signed_duration_since(path.updated_at).to_std() {
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
@@ -2560,6 +2592,47 @@ mod tests {
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.stale_endpoint_candidate_count, 2);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 30);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_status_and_metrics_filter_stale_path_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.path_state_ttl_seconds = 30;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let source = node_record("source");
+        store.insert_node(source.clone()).await?;
+        store.insert_node(node_record("fresh-peer")).await?;
+        store.insert_node(node_record("stale-peer")).await?;
+        store.upsert_path(path("source", "fresh-peer")).await?;
+        let mut stale_path = path("source", "stale-peer");
+        stale_path.updated_at = Utc::now() - Duration::seconds(31);
+        store.upsert_path(stale_path).await?;
+
+        let paths = plane.paths_for(&source.node_id).await?;
+
+        assert_eq!(paths.paths.len(), 1);
+        assert_eq!(paths.paths[0].key.remote, node_id("fresh-peer"));
+        assert_eq!(paths.stale_path_count, 1);
+        assert_eq!(paths.path_state_ttl_seconds, 30);
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.stale_path_count, 1);
+        assert_eq!(metrics.path_state_ttl_seconds, 30);
+        assert_eq!(
+            metrics
+                .path_state_counts
+                .iter()
+                .find(|count| count.state == PathState::DirectNatTraversal)
+                .map(|count| count.count),
+            Some(1)
+        );
         Ok(())
     }
 

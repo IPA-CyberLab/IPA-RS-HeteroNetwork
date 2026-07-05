@@ -733,6 +733,8 @@ pub struct ClusterPolicy {
     pub relay_health_ttl_seconds: u64,
     #[serde(default = "default_endpoint_candidate_ttl_seconds")]
     pub endpoint_candidate_ttl_seconds: u64,
+    #[serde(default = "default_path_state_ttl_seconds")]
+    pub path_state_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_ttl_seconds")]
     pub nat_classification_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_min_confidence_percent")]
@@ -754,6 +756,7 @@ impl Default for ClusterPolicy {
             idle_timeout_seconds: 300,
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
+            path_state_ttl_seconds: default_path_state_ttl_seconds(),
             nat_classification_ttl_seconds: default_nat_classification_ttl_seconds(),
             nat_classification_min_confidence_percent:
                 default_nat_classification_min_confidence_percent(),
@@ -770,6 +773,10 @@ fn default_relay_health_ttl_seconds() -> u64 {
 
 fn default_endpoint_candidate_ttl_seconds() -> u64 {
     120
+}
+
+fn default_path_state_ttl_seconds() -> u64 {
+    600
 }
 
 fn default_nat_classification_ttl_seconds() -> u64 {
@@ -1026,6 +1033,10 @@ pub mod api {
         pub cluster_id: ClusterId,
         pub node_id: NodeId,
         pub paths: Vec<PathRecord>,
+        #[serde(default)]
+        pub stale_path_count: usize,
+        #[serde(default = "super::default_path_state_ttl_seconds")]
+        pub path_state_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1181,10 +1192,14 @@ pub mod api {
         pub peer_map_route_visible_count: usize,
         #[serde(default)]
         pub peer_map_route_acl_denied_count: usize,
+        #[serde(default)]
+        pub stale_path_count: usize,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,
+        #[serde(default = "super::default_path_state_ttl_seconds")]
+        pub path_state_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 
