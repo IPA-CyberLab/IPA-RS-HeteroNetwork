@@ -4938,7 +4938,26 @@ fn docker_discovered_routes(
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
     let mut network_names = BTreeSet::new();
     let mut cidrs = BTreeMap::<ipnet::IpNet, String>::new();
+    let requested_filters = filters.iter().cloned().collect::<BTreeSet<_>>();
+    let mut matched_filters = BTreeSet::new();
+    let mut bridge_matched_filters = BTreeSet::new();
+    let mut subnet_matched_filters = BTreeSet::new();
     for network in networks {
+        let matching_filters = docker_network_matching_filters(network, filters);
+        if filters.is_empty() {
+            if network.driver != "bridge" {
+                continue;
+            }
+        } else {
+            if matching_filters.is_empty() {
+                continue;
+            }
+            matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
+            if network.driver != "bridge" {
+                continue;
+            }
+            bridge_matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
+        }
         if !docker_network_matches(network, filters) {
             continue;
         }
@@ -4958,7 +4977,42 @@ fn docker_discovered_routes(
             found_subnet = true;
         }
         if found_subnet {
+            subnet_matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
             network_names.insert(network.name.clone());
+        }
+    }
+    if !requested_filters.is_empty() {
+        let missing_filters = requested_filters
+            .difference(&matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery did not find requested network filters: {}",
+                missing_filters.join(",")
+            );
+        }
+
+        let non_bridge_filters = requested_filters
+            .difference(&bridge_matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !non_bridge_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery requested non-bridge networks: {}",
+                non_bridge_filters.join(",")
+            );
+        }
+
+        let subnetless_filters = requested_filters
+            .difference(&subnet_matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !subnetless_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery requested networks without IPAM subnets: {}",
+                subnetless_filters.join(",")
+            );
         }
     }
     if cidrs.is_empty() {
@@ -4978,6 +5032,16 @@ fn docker_network_matches(network: &DockerApiNetwork, filters: &[String]) -> boo
         || filters
             .iter()
             .any(|filter| filter == &network.name || filter == &network.id)
+}
+
+fn docker_network_matching_filters<'a>(
+    network: &DockerApiNetwork,
+    filters: &'a [String],
+) -> Vec<&'a String> {
+    filters
+        .iter()
+        .filter(|filter| *filter == &network.name || *filter == &network.id)
+        .collect()
 }
 
 fn docker_namespace_from_networks(network_names: &[String]) -> String {
@@ -13465,6 +13529,78 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
         assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_unmatched_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["172.18.0.0/16"],
+        )];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "missing".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("missing Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("did not find requested network filters"));
+        assert!(error.contains("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_non_bridge_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
+        ];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "host".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("non-bridge Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("requested non-bridge networks"));
+        assert!(error.contains("host"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_subnetless_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("empty-id", "compose_empty", "bridge", &[]),
+        ];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "empty-id".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("subnetless Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("without IPAM subnets"));
+        assert!(error.contains("empty-id"));
         Ok(())
     }
 
