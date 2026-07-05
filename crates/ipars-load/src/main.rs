@@ -1684,7 +1684,7 @@ fn join_claims(
 fn endpoint_candidates(index: usize, scenario: Scenario) -> Vec<EndpointCandidate> {
     let kind = if index < scenario.relay_count {
         EndpointCandidateKind::PublicUdp
-    } else if index % 11 == 0 {
+    } else if index.is_multiple_of(11) {
         EndpointCandidateKind::Ipv6
     } else {
         EndpointCandidateKind::StunReflexive

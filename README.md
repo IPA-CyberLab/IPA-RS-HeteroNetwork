@@ -40,7 +40,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - agent peer-map applier that converts active or pinned control-plane peers into WireGuard peer configs and route plans, and prunes idle unpinned peers from WireGuard state after the cluster idle timeout
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed agent/control-plane status, peer, route, relay, and path queries/probes when URLs are provided
-- Docker Compose manifest with service healthchecks, file-backed agent join-token secret, host-network agent loopback wiring, env-driven Docker route settings, Docker API socket binding, and Helm chart starting points
+- Docker Compose manifest with service healthchecks, file-backed agent join-token secret, host-network agent loopback wiring, env-driven Docker route settings, Docker API socket binding, gated Compose smoke coverage, and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete target design and implementation roadmap.
@@ -61,6 +61,12 @@ IPARS_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallb
 ```
 
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include fixed-port one-sided public-peer SNAT, IP-only, fixed-port, and mixed port-preserving/fixed-port endpoint-independent two-sided SNAT topologies, plus an address/port-dependent SNAT non-traversal case where advertised STUN reflexive ports differ from peer-destination mappings. They require `iptables` plus `sysctl` when the gated tests are enabled.
+
+Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit and builds the repository image. The smoke generates a signed join token, verifies the bundled Compose Docker API socket render, starts PostgreSQL/control-plane/signal/STUN/relay/agent with `docker compose up --wait`, and uses an agent `dry-run` runtime override so the test does not mutate host routes:
+
+```bash
+IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
+```
 
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay

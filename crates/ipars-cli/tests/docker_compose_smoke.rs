@@ -1,0 +1,453 @@
+use std::fs;
+use std::net::{TcpListener, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+
+#[test]
+fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
+    if std::env::var("IPARS_RUN_DOCKER_COMPOSE_SMOKE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping Docker Compose smoke test; set IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 to run it"
+        );
+        return Ok(());
+    }
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .context("failed to resolve repository root")?;
+    let temp_dir = create_temp_dir_in(&repo_root.join("target"), "ipars-compose-smoke")?;
+    let _temp_guard = TempDirGuard {
+        path: temp_dir.clone(),
+    };
+
+    let control_plane_port = free_tcp_port()?;
+    let signal_port = free_tcp_port()?;
+    let relay_http_port = free_tcp_port()?;
+    let agent_port = free_tcp_port()?;
+    let stun_port = free_udp_port()?;
+    let relay_udp_port = free_udp_port()?;
+
+    let init = generated_init_output(relay_udp_port)?;
+    let cluster_id = json_string(&init, "cluster_id")?;
+    let issuer_node_id = json_string(&init, "issuer_node_id")?;
+    let issuer_public_key = json_string(&init, "issuer_public_key")?;
+    let join_token = init
+        .get("join_token")
+        .context("init output missing join_token")?
+        .to_string();
+
+    let override_path = temp_dir.join("compose.override.yaml");
+    let override_config = ComposeOverrideConfig {
+        cluster_id: &cluster_id,
+        issuer_node_id: &issuer_node_id,
+        issuer_public_key: &issuer_public_key,
+        join_token: &join_token,
+        ports: ComposeOverridePorts {
+            control_plane: control_plane_port,
+            signal: signal_port,
+            stun: stun_port,
+            relay_udp: relay_udp_port,
+            relay_http: relay_http_port,
+            agent: agent_port,
+        },
+    };
+    fs::write(&override_path, compose_override(&override_config))
+        .with_context(|| format!("failed to write {}", override_path.display()))?;
+
+    let docker_socket = temp_dir.join("docker.sock");
+    let base_compose = ComposeProject {
+        repo_root: repo_root.clone(),
+        project_name: format!("ipars-config-{}", unique_suffix()?),
+        compose_files: vec![PathBuf::from("docker/compose.yaml")],
+        docker_socket: docker_socket.clone(),
+    };
+    let rendered = run_compose(&base_compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
+    anyhow::ensure!(
+        rendered.contains(&format!("source: {}", docker_socket.display())),
+        "rendered base Compose config did not include the Docker API socket bind"
+    );
+    anyhow::ensure!(
+        rendered.contains("target: /run/ipars/docker.sock"),
+        "rendered base Compose config did not mount the Docker API socket in the agent container"
+    );
+
+    let compose = ComposeProject {
+        repo_root,
+        project_name: format!("ipars-smoke-{}", unique_suffix()?),
+        compose_files: vec![PathBuf::from("docker/compose.yaml"), override_path],
+        docker_socket: temp_dir.join("unused-docker.sock"),
+    };
+    let _compose_guard = ComposeCleanup {
+        repo_root: compose.repo_root.clone(),
+        project_name: compose.project_name.clone(),
+        compose_files: compose.compose_files.clone(),
+        docker_socket: compose.docker_socket.clone(),
+    };
+
+    let rendered = run_compose(&compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
+    anyhow::ensure!(
+        rendered.contains(&format!(
+            "IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}"
+        )),
+        "rendered Compose config did not include the control-plane host port override"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_AGENT_JOIN_TOKEN:"),
+        "rendered smoke Compose config did not include the inline join token override"
+    );
+
+    run_compose(
+        &compose,
+        ["up", "-d", "--build", "--wait", "--wait-timeout", "180"],
+    )?;
+    assert_compose_services_running(
+        &compose,
+        &[
+            "postgres",
+            "control-plane",
+            "signal",
+            "stun",
+            "relay",
+            "agent",
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ipars"))
+        .args([
+            "init",
+            "--public-endpoint",
+            &format!("127.0.0.1:{relay_udp_port}"),
+            "--bootstrap-scheme",
+            "http",
+            "--emit-issuer-private-key",
+            "--allow-relay",
+            "--unlimited-uses",
+            "--token-ttl-seconds",
+            "3600",
+            "--allowed-route",
+            "100.64.0.0/10",
+            "--allowed-route",
+            "172.18.0.0/16",
+        ])
+        .output()
+        .context("failed to run ipars init")?;
+    ensure_success("ipars init", &output)?;
+    serde_json::from_slice(&output.stdout).context("failed to parse ipars init output")
+}
+
+struct ComposeOverrideConfig<'a> {
+    cluster_id: &'a str,
+    issuer_node_id: &'a str,
+    issuer_public_key: &'a str,
+    join_token: &'a str,
+    ports: ComposeOverridePorts,
+}
+
+struct ComposeOverridePorts {
+    control_plane: u16,
+    signal: u16,
+    stun: u16,
+    relay_udp: u16,
+    relay_http: u16,
+    agent: u16,
+}
+
+fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
+    format!(
+        r#"services:
+  postgres:
+    ports: !reset []
+
+  control-plane:
+    command:
+      - control-plane
+      - --listen
+      - 0.0.0.0:8443
+      - --cluster-id
+      - {cluster_id}
+      - --issuer-node-id
+      - {issuer_node_id}
+      - --issuer-key-id
+      - root
+      - --issuer-public-key
+      - {issuer_public_key}
+    ports:
+      - "{control_plane_port}:8443"
+
+  signal:
+    ports:
+      - "{signal_port}:9443"
+
+  stun:
+    ports:
+      - "{stun_port}:3478/udp"
+
+  relay:
+    cap_add: !reset []
+    devices: !reset []
+    ports:
+      - "{relay_udp_port}:51820/udp"
+      - "{relay_http_port}:9580"
+
+  agent:
+    cap_add: !reset []
+    devices: !reset []
+    secrets: !reset []
+    volumes: !reset
+      - agent-data:/var/lib/ipars
+    command:
+      - agent
+      - --listen
+      - 0.0.0.0:{agent_port}
+      - --state-path
+      - /var/lib/ipars/agent.json
+      - --runtime-backend
+      - dry-run
+      - --stun-server
+      - 127.0.0.1:{stun_port}
+    environment:
+      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_JOIN_TOKEN_PATH:
+      IPARS_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
+      IPARS_AGENT_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
+      IPARS_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{agent_port}/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+"#,
+        cluster_id = config.cluster_id,
+        issuer_node_id = config.issuer_node_id,
+        issuer_public_key = config.issuer_public_key,
+        join_token = yaml_single_quoted(config.join_token),
+        control_plane_port = config.ports.control_plane,
+        signal_port = config.ports.signal,
+        stun_port = config.ports.stun,
+        relay_udp_port = config.ports.relay_udp,
+        relay_http_port = config.ports.relay_http,
+        agent_port = config.ports.agent,
+    )
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[derive(Debug)]
+struct ComposeProject {
+    repo_root: PathBuf,
+    project_name: String,
+    compose_files: Vec<PathBuf>,
+    docker_socket: PathBuf,
+}
+
+#[derive(Debug)]
+struct ComposeCleanup {
+    repo_root: PathBuf,
+    project_name: String,
+    compose_files: Vec<PathBuf>,
+    docker_socket: PathBuf,
+}
+
+impl Drop for ComposeCleanup {
+    fn drop(&mut self) {
+        let project = ComposeProject {
+            repo_root: self.repo_root.clone(),
+            project_name: self.project_name.clone(),
+            compose_files: self.compose_files.clone(),
+            docker_socket: self.docker_socket.clone(),
+        };
+        let mut command = compose_command(&project);
+        command.args(["down", "--volumes", "--remove-orphans", "--timeout", "1"]);
+        let _ = command.output();
+    }
+}
+
+#[derive(Debug)]
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn run_compose<const N: usize>(compose: &ComposeProject, args: [&str; N]) -> Result<Output> {
+    let mut command = compose_command(compose);
+    command.args(args);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose {args:?}"))?;
+    ensure_success(&format!("docker compose {args:?}"), &output)?;
+    Ok(output)
+}
+
+fn assert_compose_services_running(compose: &ComposeProject, expected: &[&str]) -> Result<()> {
+    let output = run_compose(compose, ["ps", "--format", "json"])?;
+    let containers = parse_compose_ps(&output.stdout)?;
+    for service in expected {
+        let container = containers
+            .iter()
+            .find(|container| {
+                json_string_field(container, &["Service", "service"]) == Some(*service)
+            })
+            .with_context(|| {
+                format!(
+                    "service {service} was missing from docker compose ps\n{}",
+                    compose_diagnostics(compose)
+                )
+            })?;
+        let state = json_string_field(container, &["State", "state"]).unwrap_or_default();
+        anyhow::ensure!(
+            state == "running",
+            "service {service} state was {state:?}\n{}",
+            compose_diagnostics(compose)
+        );
+        if let Some(health) = json_string_field(container, &["Health", "health"]) {
+            anyhow::ensure!(
+                health.is_empty() || health == "healthy",
+                "service {service} health was {health:?}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_compose_ps(stdout: &[u8]) -> Result<Vec<Value>> {
+    let text = std::str::from_utf8(stdout).context("docker compose ps output was not UTF-8")?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => {
+            if let Some(array) = value.as_array() {
+                return Ok(array.clone());
+            }
+            Ok(vec![value])
+        }
+        Err(array_error) => text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str::<Value>(line).with_context(|| {
+                    format!("failed to parse docker compose ps JSON line after array parse failed: {array_error}")
+                })
+            })
+            .collect(),
+    }
+}
+
+fn json_string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| value.get(*name)?.as_str())
+}
+
+fn compose_diagnostics(compose: &ComposeProject) -> String {
+    let mut ps = compose_command(compose);
+    ps.args(["ps", "--all"]);
+    let ps_output = ps.output();
+
+    let mut logs = compose_command(compose);
+    logs.args(["logs", "--no-color", "--tail", "120"]);
+    let logs_output = logs.output();
+
+    format!(
+        "docker compose ps:\n{}\n\ndocker compose logs:\n{}",
+        command_output_text(ps_output),
+        command_output_text(logs_output)
+    )
+}
+
+fn command_output_text(output: std::io::Result<Output>) -> String {
+    match output {
+        Ok(output) => format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("failed to collect diagnostics: {error}"),
+    }
+}
+
+fn compose_command(compose: &ComposeProject) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .current_dir(&compose.repo_root)
+        .env("IPARS_DOCKER_API_SOCKET_HOST", &compose.docker_socket)
+        .args(["compose", "-p", &compose.project_name]);
+    for file in &compose.compose_files {
+        command.arg("-f").arg(file);
+    }
+    command
+}
+
+fn ensure_success(label: &str, output: &Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{label} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn json_string(value: &Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .with_context(|| format!("init output missing string field {key}"))
+}
+
+fn create_temp_dir_in(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create temp parent {}", parent.display()))?;
+    let path = parent.join(format!("{prefix}-{}", unique_suffix()?));
+    fs::create_dir(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(path)
+}
+
+fn unique_suffix() -> Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_millis();
+    Ok(format!("{}-{millis}", std::process::id()))
+}
+
+fn free_tcp_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral TCP port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn free_udp_port() -> Result<u16> {
+    let socket = UdpSocket::bind("127.0.0.1:0").context("failed to bind ephemeral UDP port")?;
+    Ok(socket.local_addr()?.port())
+}

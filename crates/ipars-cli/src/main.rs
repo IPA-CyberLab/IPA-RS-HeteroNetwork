@@ -3121,7 +3121,7 @@ fn validate_k8s_agent_rollout_options(args: &K8sInstallArgs) -> anyhow::Result<(
         && args
             .agent_rollout_max_surge
             .as_deref()
-            .map_or(true, kubernetes_int_or_percent_is_zero)
+            .is_none_or(kubernetes_int_or_percent_is_zero)
     {
         anyhow::bail!(
             "--agent-rollout-max-unavailable cannot be zero when --agent-rollout-max-surge is zero or unset"

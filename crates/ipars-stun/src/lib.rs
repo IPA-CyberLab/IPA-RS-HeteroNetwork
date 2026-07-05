@@ -570,7 +570,7 @@ fn read_header(message: &[u8]) -> Result<(u16, u16, TransactionId), StunError> {
             "message length exceeds received datagram".to_string(),
         ));
     }
-    if message_len % 4 != 0 {
+    if !message_len.is_multiple_of(4) {
         return Err(StunError::InvalidResponse(
             "message length is not 32-bit aligned".to_string(),
         ));

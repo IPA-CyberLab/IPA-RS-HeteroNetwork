@@ -1,0 +1,11 @@
+/.git/
+/target/
+/ebpf/*/target/
+
+.env
+.env.*
+!.env.example
+**/*.rs.bk
+**/*.log
+
+docker/join.token
