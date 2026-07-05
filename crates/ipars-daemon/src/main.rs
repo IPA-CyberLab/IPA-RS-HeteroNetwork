@@ -9390,6 +9390,93 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ebpf_ringbuf_privileged_attach_reads_sendto_event() -> anyhow::Result<()> {
+        if !env_flag_enabled("IPARS_RUN_EBPF_ATTACH_TESTS") {
+            eprintln!(
+                "skipping eBPF attach integration test; set IPARS_RUN_EBPF_ATTACH_TESTS=1 to run it"
+            );
+            return Ok(());
+        }
+
+        let object_path = std::env::var_os("IPARS_EBPF_OBJECT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/ebpf/ipars-packet-flow.bpf.o"));
+        let config = EbpfRingbufConfig {
+            object_path,
+            ringbuf_map: DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP.to_string(),
+            attachments: vec![
+                EbpfTracepointAttachSpec::parse(
+                    "ipars_sys_enter_connect:syscalls:sys_enter_connect",
+                )?,
+                EbpfTracepointAttachSpec::parse(
+                    "ipars_sys_enter_sendto:syscalls:sys_enter_sendto",
+                )?,
+            ],
+        };
+        ensure_ebpf_object_file_ready(&config.object_path)?;
+        for attachment in &config.attachments {
+            ensure_ebpf_tracepoint_ready(attachment)?;
+        }
+
+        let mut reader = load_ebpf_ringbuf_packet_flow_reader(&config)?;
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let destination = receiver.local_addr()?;
+        let limits = EbpfRingbufReadLimits {
+            max_events_per_wake: 512,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            sender.send_to(b"ipars-ebpf-sendto-smoke", destination)?;
+            let Ok(guard_result) =
+                tokio::time::timeout(Duration::from_millis(250), reader.ringbuf.readable_mut())
+                    .await
+            else {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out waiting for eBPF sendto event for {}",
+                        destination
+                    );
+                }
+                continue;
+            };
+            let mut guard = guard_result.with_context(|| {
+                format!(
+                    "failed to wait for eBPF packet-flow ring buffer `{}`",
+                    config.ringbuf_map
+                )
+            })?;
+            let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
+            guard.clear_ready();
+            if flows.iter().any(|flow| {
+                flow.destination == destination.ip()
+                    && flow.observation.destination_port == Some(destination.port())
+                    && flow.observation.detector.as_deref() == Some("ebpf-ringbuf")
+            }) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let observed = flows
+                    .iter()
+                    .map(|flow| {
+                        format!(
+                            "{}:{:?}",
+                            flow.destination, flow.observation.destination_port
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "timed out waiting for eBPF sendto event for {}; last observed [{}]",
+                    destination,
+                    observed
+                );
+            }
+        }
+    }
+
     #[test]
     fn ebpf_jsonl_parser_retains_partial_lines_and_enforces_limits() -> anyhow::Result<()> {
         let limits = EbpfJsonlReadLimits {
@@ -10754,6 +10841,15 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         ));
         std::fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn env_flag_enabled(name: &str) -> bool {
+        std::env::var(name).is_ok_and(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
     }
 
     #[tokio::test]

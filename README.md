@@ -93,6 +93,12 @@ scripts/build-ebpf.sh
 iparsd agent --packet-flow-detector ebpf-ringbuf --packet-flow-ebpf-object-path target/ebpf/ipars-packet-flow.bpf.o --packet-flow-ebpf-attach ipars_sys_enter_connect:syscalls:sys_enter_connect --packet-flow-ebpf-attach ipars_sys_enter_sendto:syscalls:sys_enter_sendto
 ```
 
+Hosts with BPF and tracepoint privileges can run the gated attach/event smoke test after building the object:
+
+```bash
+IPARS_RUN_EBPF_ATTACH_TESTS=1 IPARS_EBPF_OBJECT_PATH=target/ebpf/ipars-packet-flow.bpf.o cargo test -p ipars-daemon ebpf_ringbuf_privileged_attach_reads_sendto_event
+```
+
 ## CLI Surface
 
 ```bash
