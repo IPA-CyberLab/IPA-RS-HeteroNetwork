@@ -144,7 +144,7 @@ struct RoutesArgs {
 
 #[derive(Debug, Subcommand)]
 enum TokenCommand {
-    Create(TokenCreateArgs),
+    Create(Box<TokenCreateArgs>),
     Revoke(TokenRevokeArgs),
 }
 
@@ -168,6 +168,14 @@ struct TokenCreateArgs {
     ttl_seconds: i64,
     #[arg(long = "bootstrap")]
     bootstrap_endpoints: Vec<String>,
+    #[arg(long = "control-plane-bootstrap")]
+    control_plane_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "signal-bootstrap")]
+    signal_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "stun-bootstrap")]
+    stun_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "relay-bootstrap")]
+    relay_bootstrap_endpoints: Vec<String>,
     #[arg(long, default_value_t = false)]
     allow_relay: bool,
     #[arg(long, conflicts_with = "unlimited_uses")]
@@ -521,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
             None => print_json(&StaticStatus::routes())?,
         },
         Command::Token { command } => match command {
-            TokenCommand::Create(args) => print_json(&create_token(args)?)?,
+            TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
         },
         Command::Relay {
@@ -882,18 +890,11 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.issuer_private_key_path.as_deref(),
         MissingIssuerPath::GenerateEphemeral,
     )?;
+    let bootstrap_endpoints = token_create_bootstrap_endpoints(&args);
     let cluster_id = args
         .cluster_id
         .map(ClusterId::from_string)
         .unwrap_or_default();
-    let bootstrap_endpoints = args
-        .bootstrap_endpoints
-        .into_iter()
-        .map(|url| BootstrapEndpoint {
-            url,
-            kind: BootstrapEndpointKind::ControlPlane,
-        })
-        .collect();
     let token = issuer.sign_join_token(claims(
         cluster_id,
         TokenIssuer {
@@ -911,6 +912,41 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         },
     ))?;
     Ok(token)
+}
+
+fn token_create_bootstrap_endpoints(args: &TokenCreateArgs) -> Vec<BootstrapEndpoint> {
+    args.bootstrap_endpoints
+        .iter()
+        .chain(args.control_plane_bootstrap_endpoints.iter())
+        .map(|url| BootstrapEndpoint {
+            url: url.clone(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        })
+        .chain(
+            args.signal_bootstrap_endpoints
+                .iter()
+                .map(|url| BootstrapEndpoint {
+                    url: url.clone(),
+                    kind: BootstrapEndpointKind::Signal,
+                }),
+        )
+        .chain(
+            args.stun_bootstrap_endpoints
+                .iter()
+                .map(|url| BootstrapEndpoint {
+                    url: url.clone(),
+                    kind: BootstrapEndpointKind::Stun,
+                }),
+        )
+        .chain(
+            args.relay_bootstrap_endpoints
+                .iter()
+                .map(|url| BootstrapEndpoint {
+                    url: url.clone(),
+                    kind: BootstrapEndpointKind::Relay,
+                }),
+        )
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3606,6 +3642,10 @@ mod tests {
             allowed_routes: vec!["10.42.0.0/16".parse()?],
             ttl_seconds: 300,
             bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+            control_plane_bootstrap_endpoints: Vec::new(),
+            signal_bootstrap_endpoints: Vec::new(),
+            stun_bootstrap_endpoints: Vec::new(),
+            relay_bootstrap_endpoints: Vec::new(),
             allow_relay: true,
             max_uses: Some(7),
             unlimited_uses: false,
@@ -3625,6 +3665,56 @@ mod tests {
             Utc::now(),
             &ClusterId::from_string("cluster-a"),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_accepts_typed_bootstrap_endpoints() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let token = create_token(TokenCreateArgs {
+            cluster_id: Some("cluster-a".to_string()),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: Some(issuer.signing_key_b64()),
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            ttl_seconds: 300,
+            bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+            control_plane_bootstrap_endpoints: vec!["https://203.0.113.11:8443".to_string()],
+            signal_bootstrap_endpoints: vec!["https://203.0.113.10:9443".to_string()],
+            stun_bootstrap_endpoints: vec!["udp://203.0.113.10:3478".to_string()],
+            relay_bootstrap_endpoints: vec!["udp://203.0.113.10:51820".to_string()],
+            allow_relay: false,
+            max_uses: Some(1),
+            unlimited_uses: false,
+        })?;
+
+        assert_eq!(
+            token.claims.bootstrap_endpoints,
+            vec![
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.11:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:9443".to_string(),
+                    kind: BootstrapEndpointKind::Signal,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.10:3478".to_string(),
+                    kind: BootstrapEndpointKind::Stun,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.10:51820".to_string(),
+                    kind: BootstrapEndpointKind::Relay,
+                },
+            ]
+        );
         Ok(())
     }
 
@@ -3656,6 +3746,16 @@ mod tests {
             "10.42.0.0/16",
             "--max-uses",
             "7",
+            "--bootstrap",
+            "https://203.0.113.10:8443",
+            "--control-plane-bootstrap",
+            "https://203.0.113.11:8443",
+            "--signal-bootstrap",
+            "https://203.0.113.10:9443",
+            "--stun-bootstrap",
+            "udp://203.0.113.10:3478",
+            "--relay-bootstrap",
+            "udp://203.0.113.10:51820",
         ])?;
         if let Command::Token {
             command: TokenCommand::Create(args),
@@ -3664,6 +3764,31 @@ mod tests {
             assert_eq!(args.allowed_routes, vec!["10.42.0.0/16".parse()?]);
             assert_eq!(args.max_uses, Some(7));
             assert!(!args.unlimited_uses);
+            assert_eq!(
+                token_create_bootstrap_endpoints(&args),
+                vec![
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.10:8443".to_string(),
+                        kind: BootstrapEndpointKind::ControlPlane,
+                    },
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.11:8443".to_string(),
+                        kind: BootstrapEndpointKind::ControlPlane,
+                    },
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.10:9443".to_string(),
+                        kind: BootstrapEndpointKind::Signal,
+                    },
+                    BootstrapEndpoint {
+                        url: "udp://203.0.113.10:3478".to_string(),
+                        kind: BootstrapEndpointKind::Stun,
+                    },
+                    BootstrapEndpoint {
+                        url: "udp://203.0.113.10:51820".to_string(),
+                        kind: BootstrapEndpointKind::Relay,
+                    },
+                ]
+            );
             return Ok(());
         }
 
