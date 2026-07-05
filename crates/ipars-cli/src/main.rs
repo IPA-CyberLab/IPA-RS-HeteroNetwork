@@ -2362,6 +2362,9 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
+    if args.docker_discover_networks {
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST or /var/run/docker.sock before Compose bind-mounts it into the agent".to_string());
+    }
     if args.rootless {
         if args.userspace_wireguard_command.is_some() {
             notes.push("Rootless Docker network discovery uses the user socket, selects the userspace-command WireGuard backend, and starts the configured userspace WireGuard process before peer-map sync".to_string());
@@ -2372,13 +2375,17 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
     }
 
+    let mut commands = Vec::new();
+    if args.docker_discover_networks {
+        commands.push(docker_api_socket_preflight_command());
+    }
+    commands.push(format!("{compose_prefix} config"));
+    commands.push(format!("{compose_prefix} up -d --build"));
+
     Ok(InstallPlan {
         platform: "docker-compose".to_string(),
         manifest: compose_file,
-        commands: vec![
-            format!("{compose_prefix} config"),
-            format!("{compose_prefix} up -d --build"),
-        ],
+        commands,
         environment,
         prerequisites,
         security: vec![
@@ -2389,6 +2396,10 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         ],
         notes,
     })
+}
+
+fn docker_api_socket_preflight_command() -> String {
+    "test -S \"${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}\" && docker --host \"unix://${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}\" version >/dev/null".to_string()
 }
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
@@ -5122,6 +5133,13 @@ mod tests {
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
             None
         );
+        assert!(plan.commands[0].contains("test -S"));
+        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("docker --host"));
+        assert_eq!(
+            plan.commands[1],
+            "docker compose -p edge -f ops/compose.yaml config"
+        );
         assert!(plan
             .notes
             .iter()
@@ -5130,6 +5148,10 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("IPARS_DOCKER_API_SOCKET_HOST")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("socket preflight command")));
         Ok(())
     }
 
