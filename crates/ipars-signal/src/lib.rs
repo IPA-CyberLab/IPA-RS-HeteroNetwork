@@ -8,9 +8,9 @@ use ipars_types::api::{
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
-    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathScore, PathState,
-    PeerPathKey,
+    AclAction, AclRule, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState,
+    NatClassification, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
+    PathScore, PathState, PeerPathKey, TransportProtocol,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -135,7 +135,8 @@ impl SignalRegistry {
         mut request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
-        self.get_node(&request.source)
+        let source_node = self
+            .get_node(&request.source)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
         validate_endpoint_candidates(&request.source, &request.source_candidates)?;
@@ -144,6 +145,11 @@ impl SignalRegistry {
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
+        if !acl_allows_peer(&source_node, &target, &self.coordinator.policy) {
+            let response = acl_denied_signal_path_response(request);
+            self.record_path_negotiation_state(response.preferred_state);
+            return Ok(response);
+        }
         let nat_classifications = self.nat_classifications.read().await;
         let source_nat_classification = fresh_stored_nat_classification(
             nat_classifications.get(&request.source),
@@ -165,7 +171,12 @@ impl SignalRegistry {
         if let Some(source_nat_classification) = source_nat_classification {
             request.source_nat_classification = Some(source_nat_classification);
         }
-        let relays = self.relay_candidates().await;
+        let relays = self
+            .relay_candidates()
+            .await
+            .into_iter()
+            .filter(|relay| acl_allows_peer(&source_node, relay, &self.coordinator.policy))
+            .collect::<Vec<_>>();
         let response = self.coordinator.negotiate(
             request,
             &target,
@@ -191,6 +202,15 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
         let now = Utc::now();
+        if !acl_allows_peer(&source_node, &target_node, &self.coordinator.policy) {
+            return Ok(SignalHolePunchPlanResponse {
+                key: PeerPathKey::new(source, target),
+                source_reflexive: None,
+                target_reflexive: None,
+                start_after_millis: 0,
+                expires_at: now,
+            });
+        }
         let nat_classifications = self.nat_classifications.read().await;
         let source_nat_classification = nat_classifications
             .get(&source)
@@ -665,6 +685,53 @@ fn endpoint_candidate_is_fresh(
     }
 }
 
+fn acl_denied_signal_path_response(request: SignalPathRequest) -> SignalPathResponse {
+    SignalPathResponse {
+        key: PeerPathKey::new(request.source, request.target),
+        target_candidates: Vec::new(),
+        relay_candidates: Vec::new(),
+        preferred_state: PathState::Unreachable,
+        score: PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), false, 0),
+    }
+}
+
+fn acl_allows_peer(source: &NodeRecord, target: &NodeRecord, policy: &ClusterPolicy) -> bool {
+    if policy.acl_rules.is_empty() {
+        return true;
+    }
+
+    let mut allowed = None;
+    for rule in &policy.acl_rules {
+        if !acl_rule_matches_peer(rule, source, target) {
+            continue;
+        }
+        match rule.action {
+            AclAction::Deny => return false,
+            AclAction::Allow => allowed = Some(true),
+        }
+    }
+    allowed.unwrap_or(false)
+}
+
+fn acl_rule_matches_peer(rule: &AclRule, source: &NodeRecord, target: &NodeRecord) -> bool {
+    if rule.protocol != TransportProtocol::Any {
+        return false;
+    }
+    if !rule.from_roles.is_empty() && !rule.from_roles.contains(&source.role) {
+        return false;
+    }
+    if !rule.to_roles.is_empty() && !rule.to_roles.contains(&target.role) {
+        return false;
+    }
+    if !rule.from_tags.is_empty() && rule.from_tags.is_disjoint(&source.tags) {
+        return false;
+    }
+    if !rule.to_tags.is_empty() && rule.to_tags.is_disjoint(&target.tags) {
+        return false;
+    }
+    rule.routes.is_empty()
+}
+
 fn nat_classifications_allow_hole_punch(
     source: Option<&NatClassification>,
     target: Option<&NatClassification>,
@@ -752,7 +819,7 @@ mod tests {
 
     use ipars_types::{
         CandidateSource, ClusterId, HealthState, NatMappingBehavior, NodeHealth, NodeId,
-        RelayCapability, Role, TokenPolicy, VpnIp,
+        RelayCapability, Role, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -846,6 +913,32 @@ mod tests {
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
+        }
+    }
+
+    fn deny_to_tag_acl(id: &str, tag: &str) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::from([Tag::from_string(tag)]),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Deny,
+        }
+    }
+
+    fn allow_peer_acl(id: &str) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
         }
     }
 
@@ -1034,6 +1127,99 @@ mod tests {
             .negotiate(SignalPathRequest {
                 source: NodeId::from_string("node-a"),
                 target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![NodeId::from_string("relay-a")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_applies_acl_to_path_negotiation() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-blocked", "blocked"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut blocked_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        blocked_target.tags.insert(Tag::from_string("blocked"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(blocked_target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: blocked_target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+        assert!(response.relay_candidates.is_empty());
+        assert_eq!(response.score.reasons, vec!["policy_denied".to_string()]);
+        let metrics = registry.metrics().await;
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_filters_relay_candidates_by_acl() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-hidden-relay", "relay-hidden"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        let mut hidden_relay = relay();
+        hidden_relay.tags.insert(Tag::from_string("relay-hidden"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        registry
+            .upsert_node_with_nat_and_health(hidden_relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
                 source_candidates: Vec::new(),
                 source_nat_classification: None,
                 desired_routes: Vec::new(),
@@ -1380,6 +1566,39 @@ mod tests {
         assert!(plan.source_reflexive.is_some());
         assert!(plan.target_reflexive.is_some());
         assert_eq!(plan.start_after_millis, 50);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_applies_acl_to_hole_punch_plans() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-blocked", "blocked"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut blocked_target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        blocked_target.tags.insert(Tag::from_string("blocked"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(blocked_target.clone()).await?;
+
+        let plan = registry
+            .hole_punch_plan(source.node_id.clone(), blocked_target.node_id.clone())
+            .await?;
+
+        assert_eq!(
+            plan.key,
+            PeerPathKey::new(source.node_id, blocked_target.node_id)
+        );
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
+        assert_eq!(plan.start_after_millis, 0);
         let metrics = registry.metrics().await;
         assert_eq!(metrics.hole_punch_plan_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
