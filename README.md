@@ -86,7 +86,8 @@ can still serve complete peer maps. Load reports are validated before CLI succes
 registrations, peer-map edge loss, cross-control-plane skew, failed control-plane failover,
 all-unreachable path negotiation, relay packet loss, relay admission failures, or daemon health
 inconsistencies fail the run instead of only appearing as degraded JSON fields. It captures each
-child process stdout/stderr log and reports log tails
+child process stdout/stderr log, records per-child log byte counts plus redacted log-tail hashes in
+the runtime manifest, and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration
 visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
 negotiation readiness before measuring:

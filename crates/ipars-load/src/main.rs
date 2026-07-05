@@ -33,6 +33,7 @@ use ipars_types::{
     NodeId, NodeRecord, PathState, RelayCapability, Role, Route, Tag, TokenPolicy,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -1566,6 +1567,8 @@ struct DaemonRuntimeManifestChild {
     role: String,
     pid: Option<u32>,
     log_path: Option<PathBuf>,
+    log_bytes: Option<u64>,
+    log_tail_sha256: Option<String>,
     state: DaemonRuntimeManifestChildState,
     exit_status: Option<String>,
     exit_code: Option<i32>,
@@ -1637,10 +1640,13 @@ impl DaemonRuntimeManifestChild {
         } else {
             (DaemonRuntimeManifestChildState::Running, None, None)
         };
+        let diagnostics = child.log_path.as_deref().and_then(daemon_log_diagnostics);
         Self {
             role: child.role.clone(),
             pid: Some(child.child.id()),
             log_path: child.log_path.clone(),
+            log_bytes: diagnostics.as_ref().map(|diagnostics| diagnostics.bytes),
+            log_tail_sha256: diagnostics.map(|diagnostics| diagnostics.tail_sha256),
             state,
             exit_status,
             exit_code,
@@ -2235,6 +2241,23 @@ fn daemon_log_tail(path: &Path) -> anyhow::Result<String> {
         .collect::<Vec<_>>();
     lines.reverse();
     Ok(lines.join("\n"))
+}
+
+struct DaemonLogDiagnostics {
+    bytes: u64,
+    tail_sha256: String,
+}
+
+fn daemon_log_diagnostics(path: &Path) -> Option<DaemonLogDiagnostics> {
+    let bytes = std::fs::read(path).ok()?;
+    let start = bytes.len().saturating_sub(DAEMON_LOG_TAIL_BYTES);
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[start..]);
+    let tail_sha256 = format!("{:x}", hasher.finalize());
+    Some(DaemonLogDiagnostics {
+        bytes: bytes.len() as u64,
+        tail_sha256,
+    })
 }
 
 fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
@@ -3608,6 +3631,7 @@ mod tests {
         let runtime_dir = synthetic_runtime_dir("manifest");
         std::fs::create_dir_all(&runtime_dir)?;
         let log_path = runtime_dir.join("0000-control-plane-0.log");
+        std::fs::write(&log_path, "control-plane diagnostic\n")?;
         let manifest = synthetic_manifest(runtime_dir.clone(), log_path.clone());
 
         let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest.clone())?;
@@ -3632,6 +3656,16 @@ mod tests {
         assert_eq!(decoded.children[0].role, "control-plane-0");
         assert_eq!(decoded.children[0].pid, Some(4242));
         assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
+        assert_eq!(
+            decoded.children[0].log_bytes,
+            Some("control-plane diagnostic\n".len() as u64)
+        );
+        assert_eq!(
+            decoded.children[0].log_tail_sha256.as_deref(),
+            daemon_log_diagnostics(&log_path)
+                .as_ref()
+                .map(|diagnostics| diagnostics.tail_sha256.as_str())
+        );
         assert_eq!(
             decoded.children[0].state,
             DaemonRuntimeManifestChildState::Running
@@ -3696,6 +3730,16 @@ mod tests {
         assert_eq!(updated.children[0].pid, Some(pid));
         assert_eq!(updated.children[0].log_path.as_ref(), Some(&log_path));
         assert_eq!(
+            updated.children[0].log_bytes,
+            Some("signal log\n".len() as u64)
+        );
+        assert_eq!(
+            updated.children[0].log_tail_sha256.as_deref(),
+            daemon_log_diagnostics(&log_path)
+                .as_ref()
+                .map(|diagnostics| diagnostics.tail_sha256.as_str())
+        );
+        assert_eq!(
             updated.children[0].state,
             DaemonRuntimeManifestChildState::Running
         );
@@ -3751,6 +3795,16 @@ mod tests {
         assert_eq!(decoded.children[0].role, "agent");
         assert_eq!(decoded.children[0].pid, Some(pid));
         assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
+        assert_eq!(
+            decoded.children[0].log_bytes,
+            Some("agent exited during readiness\n".len() as u64)
+        );
+        assert_eq!(
+            decoded.children[0].log_tail_sha256.as_deref(),
+            daemon_log_diagnostics(&log_path)
+                .as_ref()
+                .map(|diagnostics| diagnostics.tail_sha256.as_str())
+        );
         assert_eq!(
             decoded.children[0].state,
             DaemonRuntimeManifestChildState::Exited
@@ -3946,6 +4000,16 @@ mod tests {
                         Some("exit status: 7")
                     );
                     assert_eq!(manifest_child.exit_code, Some(7));
+                    assert_eq!(
+                        manifest_child.log_bytes,
+                        Some("first line\nchild diagnostic line\n".len() as u64)
+                    );
+                    assert_eq!(
+                        manifest_child.log_tail_sha256.as_deref(),
+                        daemon_log_diagnostics(&log_path)
+                            .as_ref()
+                            .map(|diagnostics| diagnostics.tail_sha256.as_str())
+                    );
                     let _ = std::fs::remove_file(&log_path);
                     return Ok(());
                 }
@@ -4255,6 +4319,7 @@ mod tests {
 
     fn synthetic_manifest(runtime_dir: PathBuf, log_path: PathBuf) -> DaemonRuntimeManifest {
         let now = Utc::now();
+        let log_diagnostics = daemon_log_diagnostics(&log_path);
         DaemonRuntimeManifest {
             scenario: ScenarioName::Three,
             phase: DaemonRuntimePhase::StartupReady,
@@ -4274,6 +4339,10 @@ mod tests {
                 role: "control-plane-0".to_string(),
                 pid: Some(4242),
                 log_path: Some(log_path),
+                log_bytes: log_diagnostics
+                    .as_ref()
+                    .map(|diagnostics| diagnostics.bytes),
+                log_tail_sha256: log_diagnostics.map(|diagnostics| diagnostics.tail_sha256),
                 state: DaemonRuntimeManifestChildState::Running,
                 exit_status: None,
                 exit_code: None,
