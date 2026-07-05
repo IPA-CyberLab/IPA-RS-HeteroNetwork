@@ -942,6 +942,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.wireguard_interface)?;
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
+        if args.docker_discover_networks {
+            validate_docker_discovery_config(args)?;
+        }
     }
     if let Some(namespace) = args.linux_netns.as_deref() {
         LinuxNetworkNamespace::from_name(namespace)?;
@@ -1013,6 +1016,66 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
+}
+
+fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
+    validate_docker_api_version(&args.docker_api_version)?;
+    for filter in &args.docker_networks {
+        validate_docker_network_filter(filter)?;
+    }
+    if !args.docker_container_cidrs.is_empty() {
+        anyhow::bail!(
+            "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
+        );
+    }
+    Ok(())
+}
+
+fn validate_docker_api_version(version: &str) -> anyhow::Result<()> {
+    let version = version.trim_matches('/');
+    if version.is_empty() {
+        return Ok(());
+    }
+    if version.len() > 16 {
+        anyhow::bail!("Docker API version `{version}` is too long");
+    }
+    let Some(rest) = version.strip_prefix('v') else {
+        anyhow::bail!(
+            "Docker API version `{version}` must be empty or use v<major>.<minor> format"
+        );
+    };
+    let mut parts = rest.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        anyhow::bail!(
+            "Docker API version `{version}` must be empty or use v<major>.<minor> format"
+        );
+    }
+    Ok(())
+}
+
+fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
+    if filter.is_empty() {
+        anyhow::bail!("Docker network filter cannot be empty");
+    }
+    if filter.len() > 255 {
+        anyhow::bail!("Docker network filter `{filter}` exceeds 255 bytes");
+    }
+    if !filter
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "Docker network filter `{filter}` must contain only ASCII letters, digits, '.', '_' or '-'"
         );
     }
     Ok(())
@@ -8477,6 +8540,63 @@ invalid no-destination-here
         assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
         assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
         Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_validates_version_and_network_filters() {
+        for version in ["", "v1.43", "/v1.43/"] {
+            assert!(
+                validate_docker_api_version(version).is_ok(),
+                "{version} should be valid"
+            );
+        }
+        for version in ["1.43", "v1", "v1.43/containers", "../v1.43"] {
+            assert!(
+                validate_docker_api_version(version).is_err(),
+                "{version} should be invalid"
+            );
+        }
+
+        for filter in ["compose_default", "network.extra-1", "abcdef012345"] {
+            assert!(
+                validate_docker_network_filter(filter).is_ok(),
+                "{filter} should be valid"
+            );
+        }
+        for filter in ["", "compose/default", "compose default", "compose:default"] {
+            assert!(
+                validate_docker_network_filter(filter).is_err(),
+                "{filter} should be invalid"
+            );
+        }
+        let too_long = "n".repeat(256);
+        assert!(validate_docker_network_filter(&too_long).is_err());
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_ambiguous_explicit_cidrs() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("ambiguous Docker discovery config should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("cannot be combined with explicit --docker-container-cidr"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]
