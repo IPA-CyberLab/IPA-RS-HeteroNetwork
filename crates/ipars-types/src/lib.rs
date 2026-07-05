@@ -1778,6 +1778,12 @@ pub mod api {
             if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
                 return AgentPacketFlowApplication::WireGuard;
             }
+            let payload_application = self.payload_prefix_application();
+            if let Some(application) = payload_application {
+                if self.payload_prefix_application_overrides_port(application) {
+                    return application;
+                }
+            }
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
             }
@@ -1871,7 +1877,7 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Elasticsearch;
             }
-            if let Some(application) = self.payload_prefix_application() {
+            if let Some(application) = payload_application {
                 return application;
             }
             AgentPacketFlowApplication::Unknown
@@ -1879,6 +1885,17 @@ pub mod api {
 
         fn involves_port(&self, port: u16) -> bool {
             self.source_port == Some(port) || self.destination_port == Some(port)
+        }
+
+        fn payload_prefix_application_overrides_port(
+            &self,
+            application: AgentPacketFlowApplication,
+        ) -> bool {
+            !matches!(
+                application,
+                AgentPacketFlowApplication::Http | AgentPacketFlowApplication::Https
+            ) || self.involves_port(80)
+                || self.involves_port(443)
         }
 
         fn payload_prefix_application(&self) -> Option<AgentPacketFlowApplication> {
@@ -3004,6 +3021,39 @@ mod tests {
         assert_eq!(
             detector_hint_overrides_port_guess.application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+
+        let specific_payload_overrides_generic_https_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            payload_prefix: b"POST /opentelemetry.proto.collector.trace.v1.TraceService/Export HTTP/1.1\r\ncontent-type: application/grpc\r\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            specific_payload_overrides_generic_https_port.application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+
+        let tls_payload_overrides_generic_http_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(80),
+            payload_prefix: vec![0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00],
+            ..Default::default()
+        };
+        assert_eq!(
+            tls_payload_overrides_generic_http_port.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+
+        let generic_tls_keeps_kubernetes_api_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6443),
+            payload_prefix: vec![0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00],
+            ..Default::default()
+        };
+        assert_eq!(
+            generic_tls_keeps_kubernetes_api_port.application(),
+            api::AgentPacketFlowApplication::KubernetesApi
         );
     }
 
