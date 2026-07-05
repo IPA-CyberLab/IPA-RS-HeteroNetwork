@@ -1,4 +1,5 @@
 /target/
+ebpf/*/target/
 **/*.rs.bk
 .env
 .env.*

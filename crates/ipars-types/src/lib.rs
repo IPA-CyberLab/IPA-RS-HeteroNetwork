@@ -7,6 +7,8 @@ use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod ebpf;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClusterId(String);
 

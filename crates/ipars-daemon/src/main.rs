@@ -49,6 +49,19 @@ use ipars_types::api::{
     RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
     SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
+#[cfg(test)]
+use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
+use ipars_types::ebpf::{
+    PacketFlowEvent, PACKET_FLOW_CONNTRACK_ASSURED, PACKET_FLOW_CONNTRACK_UNREPLIED,
+    PACKET_FLOW_EVENT_VERSION, PACKET_FLOW_IP_FAMILY_IPV4, PACKET_FLOW_IP_FAMILY_IPV6,
+    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_TCP, PACKET_FLOW_PROTOCOL_UDP,
+    PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_RINGBUF_MAP, PACKET_FLOW_TCP_STATE_CLOSE,
+    PACKET_FLOW_TCP_STATE_CLOSE_WAIT, PACKET_FLOW_TCP_STATE_ESTABLISHED,
+    PACKET_FLOW_TCP_STATE_FIN_WAIT, PACKET_FLOW_TCP_STATE_LAST_ACK, PACKET_FLOW_TCP_STATE_LISTEN,
+    PACKET_FLOW_TCP_STATE_SYN_RECV, PACKET_FLOW_TCP_STATE_SYN_SENT,
+    PACKET_FLOW_TCP_STATE_SYN_SENT2, PACKET_FLOW_TCP_STATE_TIME_WAIT,
+    PACKET_FLOW_TCP_STATE_UNKNOWN,
+};
 use ipars_types::{
     AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
     KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
@@ -88,9 +101,7 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
-const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = "IPARS_PACKET_FLOWS";
-const IPARS_EBPF_PACKET_FLOW_EVENT_VERSION: u8 = 1;
-const IPARS_EBPF_PACKET_FLOW_EVENT_LEN: usize = 48;
+const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
@@ -6623,25 +6634,19 @@ fn drain_ebpf_ringbuf_packet_flows(
 }
 
 fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFlowRecord> {
+    let event = PacketFlowEvent::from_bytes(bytes).map_err(|error| anyhow::anyhow!(error))?;
     anyhow::ensure!(
-        bytes.len() == IPARS_EBPF_PACKET_FLOW_EVENT_LEN,
-        "eBPF packet-flow ring buffer event has {} bytes, expected {}",
-        bytes.len(),
-        IPARS_EBPF_PACKET_FLOW_EVENT_LEN
+        event.version == PACKET_FLOW_EVENT_VERSION,
+        "unsupported eBPF packet-flow event version {}",
+        event.version
     );
-    let version = bytes[0];
-    anyhow::ensure!(
-        version == IPARS_EBPF_PACKET_FLOW_EVENT_VERSION,
-        "unsupported eBPF packet-flow event version {version}"
-    );
-    let ip_family = bytes[1];
-    let protocol = ebpf_packet_flow_protocol(bytes[2]);
-    let tcp_state = ebpf_packet_flow_tcp_state(bytes[3])?;
-    let conntrack_status = ebpf_packet_flow_conntrack_status(bytes[4]);
-    let source_port = optional_nonzero_port(u16::from_be_bytes([bytes[6], bytes[7]]));
-    let destination_port = optional_nonzero_port(u16::from_be_bytes([bytes[8], bytes[9]]));
-    let source = ebpf_packet_flow_ip(ip_family, &bytes[16..32])?;
-    let destination = ebpf_packet_flow_ip(ip_family, &bytes[32..48])?;
+    let protocol = ebpf_packet_flow_protocol(event.protocol);
+    let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
+    let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status);
+    let source_port = optional_nonzero_port(event.source_port());
+    let destination_port = optional_nonzero_port(event.destination_port());
+    let source = ebpf_packet_flow_ip(event.ip_family, &event.source)?;
+    let destination = ebpf_packet_flow_ip(event.ip_family, &event.destination)?;
     Ok(PacketFlowRecord {
         destination,
         observation: AgentPacketFlowObservation {
@@ -6658,27 +6663,27 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
 
 fn ebpf_packet_flow_protocol(value: u8) -> Option<TransportProtocol> {
     match value {
-        0 => None,
-        1 => Some(TransportProtocol::Icmp),
-        6 => Some(TransportProtocol::Tcp),
-        17 => Some(TransportProtocol::Udp),
+        PACKET_FLOW_PROTOCOL_UNKNOWN => None,
+        PACKET_FLOW_PROTOCOL_ICMP => Some(TransportProtocol::Icmp),
+        PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
+        PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
         _ => Some(TransportProtocol::Any),
     }
 }
 
 fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
     let state = match value {
-        0 => None,
-        1 => Some(AgentPacketFlowTcpState::SynSent),
-        2 => Some(AgentPacketFlowTcpState::SynRecv),
-        3 => Some(AgentPacketFlowTcpState::Established),
-        4 => Some(AgentPacketFlowTcpState::FinWait),
-        5 => Some(AgentPacketFlowTcpState::TimeWait),
-        6 => Some(AgentPacketFlowTcpState::Close),
-        7 => Some(AgentPacketFlowTcpState::CloseWait),
-        8 => Some(AgentPacketFlowTcpState::LastAck),
-        9 => Some(AgentPacketFlowTcpState::Listen),
-        10 => Some(AgentPacketFlowTcpState::SynSent2),
+        PACKET_FLOW_TCP_STATE_UNKNOWN => None,
+        PACKET_FLOW_TCP_STATE_SYN_SENT => Some(AgentPacketFlowTcpState::SynSent),
+        PACKET_FLOW_TCP_STATE_SYN_RECV => Some(AgentPacketFlowTcpState::SynRecv),
+        PACKET_FLOW_TCP_STATE_ESTABLISHED => Some(AgentPacketFlowTcpState::Established),
+        PACKET_FLOW_TCP_STATE_FIN_WAIT => Some(AgentPacketFlowTcpState::FinWait),
+        PACKET_FLOW_TCP_STATE_TIME_WAIT => Some(AgentPacketFlowTcpState::TimeWait),
+        PACKET_FLOW_TCP_STATE_CLOSE => Some(AgentPacketFlowTcpState::Close),
+        PACKET_FLOW_TCP_STATE_CLOSE_WAIT => Some(AgentPacketFlowTcpState::CloseWait),
+        PACKET_FLOW_TCP_STATE_LAST_ACK => Some(AgentPacketFlowTcpState::LastAck),
+        PACKET_FLOW_TCP_STATE_LISTEN => Some(AgentPacketFlowTcpState::Listen),
+        PACKET_FLOW_TCP_STATE_SYN_SENT2 => Some(AgentPacketFlowTcpState::SynSent2),
         _ => anyhow::bail!("unsupported eBPF packet-flow TCP state code {value}"),
     };
     Ok(state)
@@ -6686,10 +6691,10 @@ fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlo
 
 fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackStatus> {
     let mut status = Vec::new();
-    if value & 0x01 != 0 {
+    if value & PACKET_FLOW_CONNTRACK_UNREPLIED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Unreplied);
     }
-    if value & 0x02 != 0 {
+    if value & PACKET_FLOW_CONNTRACK_ASSURED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Assured);
     }
     status
@@ -6701,10 +6706,10 @@ fn optional_nonzero_port(value: u16) -> Option<u16> {
 
 fn ebpf_packet_flow_ip(ip_family: u8, bytes: &[u8]) -> anyhow::Result<IpAddr> {
     match ip_family {
-        4 => Ok(IpAddr::V4(Ipv4Addr::new(
+        PACKET_FLOW_IP_FAMILY_IPV4 => Ok(IpAddr::V4(Ipv4Addr::new(
             bytes[0], bytes[1], bytes[2], bytes[3],
         ))),
-        6 => {
+        PACKET_FLOW_IP_FAMILY_IPV6 => {
             let octets: [u8; 16] = bytes
                 .try_into()
                 .context("eBPF packet-flow IPv6 field had invalid length")?;
@@ -9228,12 +9233,12 @@ mod tests {
 
     #[test]
     fn ebpf_ringbuf_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
-        let mut event = [0_u8; IPARS_EBPF_PACKET_FLOW_EVENT_LEN];
-        event[0] = IPARS_EBPF_PACKET_FLOW_EVENT_VERSION;
-        event[1] = 4;
-        event[2] = 6;
-        event[3] = 3;
-        event[4] = 0x02;
+        let mut event = [0_u8; PACKET_FLOW_EVENT_LEN];
+        event[0] = PACKET_FLOW_EVENT_VERSION;
+        event[1] = PACKET_FLOW_IP_FAMILY_IPV4;
+        event[2] = PACKET_FLOW_PROTOCOL_TCP;
+        event[3] = PACKET_FLOW_TCP_STATE_ESTABLISHED;
+        event[4] = PACKET_FLOW_CONNTRACK_ASSURED;
         event[6..8].copy_from_slice(&443_u16.to_be_bytes());
         event[8..10].copy_from_slice(&6443_u16.to_be_bytes());
         event[16..20].copy_from_slice(&[192, 0, 2, 10]);
@@ -9261,11 +9266,11 @@ mod tests {
     fn ebpf_ringbuf_parser_handles_ipv6_and_rejects_bad_events() -> anyhow::Result<()> {
         let source = "2001:db8::1".parse::<Ipv6Addr>()?;
         let destination = "fd00::42".parse::<Ipv6Addr>()?;
-        let mut event = [0_u8; IPARS_EBPF_PACKET_FLOW_EVENT_LEN];
-        event[0] = IPARS_EBPF_PACKET_FLOW_EVENT_VERSION;
-        event[1] = 6;
-        event[2] = 17;
-        event[4] = 0x01;
+        let mut event = [0_u8; PACKET_FLOW_EVENT_LEN];
+        event[0] = PACKET_FLOW_EVENT_VERSION;
+        event[1] = PACKET_FLOW_IP_FAMILY_IPV6;
+        event[2] = PACKET_FLOW_PROTOCOL_UDP;
+        event[4] = PACKET_FLOW_CONNTRACK_UNREPLIED;
         event[8..10].copy_from_slice(&51820_u16.to_be_bytes());
         event[16..32].copy_from_slice(&source.octets());
         event[32..48].copy_from_slice(&destination.octets());
