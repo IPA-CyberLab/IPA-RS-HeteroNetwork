@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{Read, SeekFrom};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -66,7 +66,7 @@ use opentelemetry_sdk::{
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -78,6 +78,9 @@ const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS: usize = 131_072;
+const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES: u64 = 1024 * 1024;
+const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
+const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 
@@ -431,6 +434,8 @@ struct AgentArgs {
     packet_flow_detector: PacketFlowDetector,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_CONNTRACK_PATH")]
     packet_flow_conntrack_path: Option<PathBuf>,
+    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_PATH")]
+    packet_flow_ebpf_event_path: Option<PathBuf>,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
@@ -467,6 +472,24 @@ struct AgentArgs {
         default_value_t = DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS
     )]
     packet_flow_netlink_max_flows: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES",
+        default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES
+    )]
+    packet_flow_ebpf_event_max_bytes: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES",
+        default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES
+    )]
+    packet_flow_ebpf_event_max_line_bytes: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS",
+        default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS
+    )]
+    packet_flow_ebpf_event_max_flows: usize,
     #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
     packet_flow_pin: bool,
     #[arg(
@@ -711,6 +734,8 @@ enum PacketFlowDetector {
     ConntrackNetlink,
     #[value(name = "conntrack-netlink-events")]
     ConntrackNetlinkEvents,
+    #[value(name = "ebpf-jsonl")]
+    EbpfJsonl,
 }
 
 impl PacketFlowDetector {
@@ -720,6 +745,7 @@ impl PacketFlowDetector {
             Self::ProcNetConntrack => "proc-net-conntrack",
             Self::ConntrackNetlink => "conntrack-netlink",
             Self::ConntrackNetlinkEvents => "conntrack-netlink-events",
+            Self::EbpfJsonl => "ebpf-jsonl",
         }
     }
 }
@@ -1083,6 +1109,24 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
             args.packet_flow_netlink_max_flows > 0,
             "--packet-flow-netlink-max-flows must be greater than zero"
+        );
+    }
+    if args.packet_flow_detector == PacketFlowDetector::EbpfJsonl {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_path.is_some(),
+            "--packet-flow-ebpf-event-path is required when --packet-flow-detector ebpf-jsonl is set"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_max_bytes > 0,
+            "--packet-flow-ebpf-event-max-bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_max_line_bytes > 0,
+            "--packet-flow-ebpf-event-max-line-bytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_max_flows > 0,
+            "--packet-flow-ebpf-event-max-flows must be greater than zero"
         );
     }
     if args.apply_docker_routes {
@@ -3065,6 +3109,32 @@ async fn run_agent(
             );
             background_tasks.push(start_conntrack_netlink_event_packet_flow_detector(
                 runtime.clone(),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds),
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                limits,
+                args.packet_flow_pin,
+            ));
+        }
+        PacketFlowDetector::EbpfJsonl => {
+            let limits = EbpfJsonlReadLimits::from_args(&args);
+            let event_path = args
+                .packet_flow_ebpf_event_path
+                .clone()
+                .context("--packet-flow-ebpf-event-path is required")?;
+            tracing::info!(
+                detector = args.packet_flow_detector.as_str(),
+                event_path = %event_path.display(),
+                interval_seconds = args.packet_flow_poll_interval_seconds,
+                dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
+                max_bytes = limits.max_bytes,
+                max_line_bytes = limits.max_line_bytes,
+                max_flows = limits.max_flows,
+                pin = args.packet_flow_pin,
+                "starting packet-flow detector"
+            );
+            background_tasks.push(start_ebpf_jsonl_packet_flow_detector(
+                runtime.clone(),
+                event_path,
                 Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 limits,
@@ -5848,6 +5918,44 @@ fn start_conntrack_netlink_event_packet_flow_detector(
     })
 }
 
+fn start_ebpf_jsonl_packet_flow_detector(
+    runtime: Arc<AgentRuntime>,
+    event_path: PathBuf,
+    interval: Duration,
+    dedup_ttl: Option<Duration>,
+    limits: EbpfJsonlReadLimits,
+    pin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cursor = EbpfJsonlReadCursor::default();
+        let mut deduper = PacketFlowDeduper::new(dedup_ttl);
+        loop {
+            match read_ebpf_jsonl_packet_flows(&event_path, &mut cursor, limits).await {
+                Ok(flows) => {
+                    let (flows, duplicate_count) = deduper.retain_new(flows);
+                    log_packet_flow_duplicates(duplicate_count, "ebpf-jsonl");
+                    let matched_count =
+                        record_packet_flow_observations(runtime.as_ref(), flows, pin, "ebpf-jsonl")
+                            .await;
+                    if matched_count > 0 {
+                        tracing::info!(
+                            matched = matched_count,
+                            event_path = %event_path.display(),
+                            "recorded packet-flow lazy-connect activity from eBPF JSONL events"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    event_path = %event_path.display(),
+                    "failed to read eBPF packet-flow event file; will retry"
+                ),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
 fn packet_flow_dedup_ttl(seconds: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
@@ -6072,6 +6180,39 @@ impl Default for ConntrackNetlinkReadLimits {
             max_flows: DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EbpfJsonlReadLimits {
+    max_bytes: u64,
+    max_line_bytes: usize,
+    max_flows: usize,
+}
+
+impl EbpfJsonlReadLimits {
+    fn from_args(args: &AgentArgs) -> Self {
+        Self {
+            max_bytes: args.packet_flow_ebpf_event_max_bytes,
+            max_line_bytes: args.packet_flow_ebpf_event_max_line_bytes,
+            max_flows: args.packet_flow_ebpf_event_max_flows,
+        }
+    }
+}
+
+impl Default for EbpfJsonlReadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES,
+            max_line_bytes: DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES,
+            max_flows: DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct EbpfJsonlReadCursor {
+    offset: u64,
+    partial_line: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6629,6 +6770,129 @@ async fn read_conntrack_packet_flows(
         );
     }
     anyhow::bail!("no conntrack flow table found at {}", attempted.join(", "))
+}
+
+async fn read_ebpf_jsonl_packet_flows(
+    path: &Path,
+    cursor: &mut EbpfJsonlReadCursor,
+    limits: EbpfJsonlReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    let mut file = tokio::fs::File::open(path).await.with_context(|| {
+        format!(
+            "failed to open eBPF packet-flow event file {}",
+            path.display()
+        )
+    })?;
+    let file_len = file
+        .metadata()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to stat eBPF packet-flow event file {}",
+                path.display()
+            )
+        })?
+        .len();
+    if cursor.offset > file_len {
+        cursor.offset = 0;
+        cursor.partial_line.clear();
+    }
+
+    file.seek(SeekFrom::Start(cursor.offset))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to seek eBPF packet-flow event file {}",
+                path.display()
+            )
+        })?;
+    let mut bytes = Vec::new();
+    let read = file
+        .take(limits.max_bytes)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read eBPF packet-flow event file {}",
+                path.display()
+            )
+        })?;
+    cursor.offset = cursor
+        .offset
+        .checked_add(read as u64)
+        .context("eBPF packet-flow event file offset overflow")?;
+    parse_ebpf_jsonl_packet_flow_bytes(&bytes, cursor, limits)
+}
+
+fn parse_ebpf_jsonl_packet_flow_bytes(
+    bytes: &[u8],
+    cursor: &mut EbpfJsonlReadCursor,
+    limits: EbpfJsonlReadLimits,
+) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    let mut input = std::mem::take(&mut cursor.partial_line);
+    input.extend_from_slice(bytes);
+
+    let mut flows = Vec::new();
+    let mut line_start = 0_usize;
+    for (index, byte) in input.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if flows.len() >= limits.max_flows {
+            return Ok(flows);
+        }
+        let line = trim_jsonl_line(&input[line_start..index]);
+        if !line.is_empty() {
+            flows.push(parse_ebpf_jsonl_packet_flow_line(line, limits)?);
+        }
+        line_start = index + 1;
+    }
+
+    if line_start < input.len() {
+        let remaining = &input[line_start..];
+        anyhow::ensure!(
+            remaining.len() <= limits.max_line_bytes,
+            "eBPF packet-flow event line exceeds configured --packet-flow-ebpf-event-max-line-bytes ({})",
+            limits.max_line_bytes
+        );
+        cursor.partial_line.extend_from_slice(remaining);
+    }
+
+    Ok(flows)
+}
+
+fn parse_ebpf_jsonl_packet_flow_line(
+    line: &[u8],
+    limits: EbpfJsonlReadLimits,
+) -> anyhow::Result<PacketFlowRecord> {
+    anyhow::ensure!(
+        line.len() <= limits.max_line_bytes,
+        "eBPF packet-flow event line exceeds configured --packet-flow-ebpf-event-max-line-bytes ({})",
+        limits.max_line_bytes
+    );
+    let event: EbpfJsonlPacketFlowEvent =
+        serde_json::from_slice(line).context("failed to parse eBPF packet-flow JSON event")?;
+    Ok(PacketFlowRecord {
+        destination: event.destination,
+        observation: event.observation,
+    })
+}
+
+fn trim_jsonl_line(mut line: &[u8]) -> &[u8] {
+    while matches!(line.first(), Some(b' ' | b'\t' | b'\r')) {
+        line = &line[1..];
+    }
+    while matches!(line.last(), Some(b' ' | b'\t' | b'\r')) {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+#[derive(Debug, Deserialize)]
+struct EbpfJsonlPacketFlowEvent {
+    destination: IpAddr,
+    #[serde(default, flatten)]
+    observation: AgentPacketFlowObservation,
 }
 
 fn parse_conntrack_packet_flows(
@@ -8191,6 +8455,105 @@ mod tests {
     }
 
     #[test]
+    fn agent_args_accept_ebpf_jsonl_packet_flow_detector() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-jsonl",
+            "--packet-flow-ebpf-event-path",
+            "/run/ipars/ebpf-flows.jsonl",
+            "--packet-flow-ebpf-event-max-bytes",
+            "1048576",
+            "--packet-flow-ebpf-event-max-line-bytes",
+            "1024",
+            "--packet-flow-ebpf-event-max-flows",
+            "2048",
+            "--packet-flow-pin",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(args.packet_flow_detector, PacketFlowDetector::EbpfJsonl);
+            assert_eq!(args.packet_flow_detector.as_str(), "ebpf-jsonl");
+            assert_eq!(
+                args.packet_flow_ebpf_event_path.as_deref(),
+                Some(Path::new("/run/ipars/ebpf-flows.jsonl"))
+            );
+            assert_eq!(args.packet_flow_ebpf_event_max_bytes, 1_048_576);
+            assert_eq!(args.packet_flow_ebpf_event_max_line_bytes, 1024);
+            assert_eq!(args.packet_flow_ebpf_event_max_flows, 2048);
+            assert_eq!(
+                EbpfJsonlReadLimits::from_args(&args),
+                EbpfJsonlReadLimits {
+                    max_bytes: 1_048_576,
+                    max_line_bytes: 1024,
+                    max_flows: 2048,
+                }
+            );
+            assert!(args.packet_flow_pin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_ebpf_jsonl_packet_flow_config_must_be_complete() -> anyhow::Result<()> {
+        let missing_path =
+            Cli::try_parse_from(["iparsd", "agent", "--packet-flow-detector", "ebpf-jsonl"])?;
+        if let Command::Agent(args) = missing_path.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-event-path is required"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        for (flag, expected) in [
+            (
+                "--packet-flow-ebpf-event-max-bytes",
+                "--packet-flow-ebpf-event-max-bytes must be greater than zero",
+            ),
+            (
+                "--packet-flow-ebpf-event-max-line-bytes",
+                "--packet-flow-ebpf-event-max-line-bytes must be greater than zero",
+            ),
+            (
+                "--packet-flow-ebpf-event-max-flows",
+                "--packet-flow-ebpf-event-max-flows must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "ebpf-jsonl",
+                "--packet-flow-ebpf-event-path",
+                "/run/ipars/ebpf-flows.jsonl",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_netlink_packet_flow_limit_must_be_positive() -> anyhow::Result<()> {
         for detector in ["conntrack-netlink", "conntrack-netlink-events"] {
             let cli = Cli::try_parse_from([
@@ -8213,6 +8576,127 @@ mod tests {
                 anyhow::bail!("expected agent command");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_jsonl_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
+        let mut cursor = EbpfJsonlReadCursor::default();
+        let flows = parse_ebpf_jsonl_packet_flow_bytes(
+            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","conntrack_status":["assured"]}
+{"destination":"fd00::42","source":"2001:db8::1","protocol":"tcp","source_port":443,"destination_port":51820,"tcp_state":"established"}
+"#,
+            &mut cursor,
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        )?;
+
+        assert!(cursor.partial_line.is_empty());
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
+        assert_eq!(flows[0].observation.source, Some("192.0.2.10".parse()?));
+        assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Udp));
+        assert_eq!(flows[0].observation.source_port, Some(50000));
+        assert_eq!(flows[0].observation.destination_port, Some(51820));
+        assert_eq!(flows[0].observation.detector.as_deref(), Some("xdp-flow"));
+        assert_eq!(
+            flows[0].observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(flows[1].destination, "fd00::42".parse::<IpAddr>()?);
+        assert_eq!(flows[1].observation.protocol, Some(TransportProtocol::Tcp));
+        assert_eq!(
+            flows[1].observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_jsonl_parser_retains_partial_lines_and_enforces_limits() -> anyhow::Result<()> {
+        let limits = EbpfJsonlReadLimits {
+            max_bytes: 4096,
+            max_line_bytes: 128,
+            max_flows: 1,
+        };
+        let mut cursor = EbpfJsonlReadCursor::default();
+        let flows = parse_ebpf_jsonl_packet_flow_bytes(
+            br#"{"destination":"100.64.0."#,
+            &mut cursor,
+            limits,
+        )?;
+        assert!(flows.is_empty());
+        assert_eq!(
+            cursor.partial_line,
+            br#"{"destination":"100.64.0."#.to_vec()
+        );
+
+        let flows =
+            parse_ebpf_jsonl_packet_flow_bytes(br#"11","protocol":"udp"}"#, &mut cursor, limits)?;
+        assert!(flows.is_empty());
+        assert!(!cursor.partial_line.is_empty());
+
+        let flows = parse_ebpf_jsonl_packet_flow_bytes(
+            b"\n{\"destination\":\"100.64.0.12\"}\n",
+            &mut cursor,
+            limits,
+        )?;
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            br#"{"destination":"100.64.0.13","detector":"this-line-is-too-long-for-the-test-limit"}
+"#,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 32,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized eBPF JSONL line should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--packet-flow-ebpf-event-max-line-bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ebpf_jsonl_reader_tails_appended_events() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "ipars-ebpf-jsonl-reader-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, "{\"destination\":\"100.64.0.11\"}\n")?;
+
+        let mut cursor = EbpfJsonlReadCursor::default();
+        let limits = EbpfJsonlReadLimits {
+            max_bytes: 4096,
+            max_line_bytes: 512,
+            max_flows: 16,
+        };
+        let flows = read_ebpf_jsonl_packet_flows(&path, &mut cursor, limits).await?;
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
+
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            file.write_all(b"{\"destination\":\"100.64.0.12\",\"protocol\":\"tcp\"}\n")?;
+        }
+
+        let flows = read_ebpf_jsonl_packet_flows(&path, &mut cursor, limits).await?;
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].destination, "100.64.0.12".parse::<IpAddr>()?);
+        assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Tcp));
+
+        let _ = std::fs::remove_file(path);
         Ok(())
     }
 
