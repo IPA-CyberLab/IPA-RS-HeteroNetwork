@@ -191,9 +191,18 @@ struct LoadReport {
     daemon_agent_processes: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
+    daemon_control_plane_relay_candidates_min: usize,
+    daemon_control_plane_relay_candidates_max: usize,
     daemon_control_plane_healthy_nodes: usize,
+    daemon_control_plane_healthy_nodes_min: usize,
+    daemon_control_plane_healthy_nodes_max: usize,
     daemon_control_plane_degraded_nodes: usize,
+    daemon_control_plane_degraded_nodes_min: usize,
+    daemon_control_plane_degraded_nodes_max: usize,
     daemon_control_plane_unhealthy_nodes: usize,
+    daemon_control_plane_unhealthy_nodes_min: usize,
+    daemon_control_plane_unhealthy_nodes_max: usize,
+    daemon_control_plane_metrics_consistent: bool,
     daemon_signal_health_reports: usize,
     daemon_signal_healthy_nodes: usize,
     daemon_signal_degraded_nodes: usize,
@@ -346,9 +355,18 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_relay_candidates_min: 0,
+        daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_healthy_nodes_min: 0,
+        daemon_control_plane_healthy_nodes_max: 0,
         daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_degraded_nodes_min: 0,
+        daemon_control_plane_degraded_nodes_max: 0,
         daemon_control_plane_unhealthy_nodes: 0,
+        daemon_control_plane_unhealthy_nodes_min: 0,
+        daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
@@ -504,9 +522,18 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_relay_candidates_min: 0,
+        daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_healthy_nodes_min: 0,
+        daemon_control_plane_healthy_nodes_max: 0,
         daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_degraded_nodes_min: 0,
+        daemon_control_plane_degraded_nodes_max: 0,
         daemon_control_plane_unhealthy_nodes: 0,
+        daemon_control_plane_unhealthy_nodes_min: 0,
+        daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
@@ -636,9 +663,18 @@ async fn run_relay_udp_scenario(
         daemon_agent_processes: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
+        daemon_control_plane_relay_candidates_min: 0,
+        daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_healthy_nodes_min: 0,
+        daemon_control_plane_healthy_nodes_max: 0,
         daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_degraded_nodes_min: 0,
+        daemon_control_plane_degraded_nodes_max: 0,
         daemon_control_plane_unhealthy_nodes: 0,
+        daemon_control_plane_unhealthy_nodes_min: 0,
+        daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
@@ -839,7 +875,7 @@ async fn run_daemon_scenario(
         peer_map_requests: agent_statuses.len(),
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
-        relay_candidates: control_summary.relay_candidate_count,
+        relay_candidates: control_summary.relay_candidate_count_min,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
         direct_nat_paths: path_counts.direct_nat,
@@ -871,9 +907,18 @@ async fn run_daemon_scenario(
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
-        daemon_control_plane_healthy_nodes: control_summary.healthy_node_count,
-        daemon_control_plane_degraded_nodes: control_summary.degraded_node_count,
-        daemon_control_plane_unhealthy_nodes: control_summary.unhealthy_node_count,
+        daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
+        daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
+        daemon_control_plane_healthy_nodes: control_summary.healthy_node_count_min,
+        daemon_control_plane_healthy_nodes_min: control_summary.healthy_node_count_min,
+        daemon_control_plane_healthy_nodes_max: control_summary.healthy_node_count_max,
+        daemon_control_plane_degraded_nodes: control_summary.degraded_node_count_max,
+        daemon_control_plane_degraded_nodes_min: control_summary.degraded_node_count_min,
+        daemon_control_plane_degraded_nodes_max: control_summary.degraded_node_count_max,
+        daemon_control_plane_unhealthy_nodes: control_summary.unhealthy_node_count_max,
+        daemon_control_plane_unhealthy_nodes_min: control_summary.unhealthy_node_count_min,
+        daemon_control_plane_unhealthy_nodes_max: control_summary.unhealthy_node_count_max,
+        daemon_control_plane_metrics_consistent: control_summary.metrics_consistent(),
         daemon_signal_health_reports: signal_metrics.health_report_count,
         daemon_signal_healthy_nodes: signal_metrics.healthy_node_count,
         daemon_signal_degraded_nodes: signal_metrics.degraded_node_count,
@@ -1622,10 +1667,69 @@ async fn daemon_agent_statuses(
 #[derive(Debug, Clone, Copy)]
 struct ControlPlaneHealthSummary {
     endpoint_count: usize,
-    relay_candidate_count: usize,
-    healthy_node_count: usize,
-    degraded_node_count: usize,
-    unhealthy_node_count: usize,
+    relay_candidate_count_min: usize,
+    relay_candidate_count_max: usize,
+    healthy_node_count_min: usize,
+    healthy_node_count_max: usize,
+    degraded_node_count_min: usize,
+    degraded_node_count_max: usize,
+    unhealthy_node_count_min: usize,
+    unhealthy_node_count_max: usize,
+}
+
+impl ControlPlaneHealthSummary {
+    fn from_metrics(metrics: &[ControlPlaneMetricsResponse]) -> anyhow::Result<Self> {
+        let first = metrics
+            .first()
+            .context("daemon control-plane metrics summary was empty")?;
+        let mut summary = Self {
+            endpoint_count: metrics.len(),
+            relay_candidate_count_min: first.relay_candidate_count,
+            relay_candidate_count_max: first.relay_candidate_count,
+            healthy_node_count_min: first.healthy_node_count,
+            healthy_node_count_max: first.healthy_node_count,
+            degraded_node_count_min: first.degraded_node_count,
+            degraded_node_count_max: first.degraded_node_count,
+            unhealthy_node_count_min: first.unhealthy_node_count,
+            unhealthy_node_count_max: first.unhealthy_node_count,
+        };
+
+        for metrics in &metrics[1..] {
+            summary.relay_candidate_count_min = summary
+                .relay_candidate_count_min
+                .min(metrics.relay_candidate_count);
+            summary.relay_candidate_count_max = summary
+                .relay_candidate_count_max
+                .max(metrics.relay_candidate_count);
+            summary.healthy_node_count_min = summary
+                .healthy_node_count_min
+                .min(metrics.healthy_node_count);
+            summary.healthy_node_count_max = summary
+                .healthy_node_count_max
+                .max(metrics.healthy_node_count);
+            summary.degraded_node_count_min = summary
+                .degraded_node_count_min
+                .min(metrics.degraded_node_count);
+            summary.degraded_node_count_max = summary
+                .degraded_node_count_max
+                .max(metrics.degraded_node_count);
+            summary.unhealthy_node_count_min = summary
+                .unhealthy_node_count_min
+                .min(metrics.unhealthy_node_count);
+            summary.unhealthy_node_count_max = summary
+                .unhealthy_node_count_max
+                .max(metrics.unhealthy_node_count);
+        }
+
+        Ok(summary)
+    }
+
+    fn metrics_consistent(&self) -> bool {
+        self.relay_candidate_count_min == self.relay_candidate_count_max
+            && self.healthy_node_count_min == self.healthy_node_count_max
+            && self.degraded_node_count_min == self.degraded_node_count_max
+            && self.unhealthy_node_count_min == self.unhealthy_node_count_max
+    }
 }
 
 async fn control_plane_health_summary(
@@ -1637,7 +1741,7 @@ async fn control_plane_health_summary(
         bail!("at least one daemon control-plane URL is required");
     }
 
-    let mut summary: Option<ControlPlaneHealthSummary> = None;
+    let mut metrics_samples = Vec::with_capacity(control_plane_urls.len());
     for control_plane_url in control_plane_urls {
         let request_context = format!("{context} control-plane metrics");
         let metrics: ControlPlaneMetricsResponse = get_json(
@@ -1646,29 +1750,10 @@ async fn control_plane_health_summary(
             &request_context,
         )
         .await?;
-        summary = Some(match summary {
-            Some(summary) => ControlPlaneHealthSummary {
-                endpoint_count: summary.endpoint_count + 1,
-                relay_candidate_count: summary
-                    .relay_candidate_count
-                    .min(metrics.relay_candidate_count),
-                healthy_node_count: summary.healthy_node_count.min(metrics.healthy_node_count),
-                degraded_node_count: summary.degraded_node_count.max(metrics.degraded_node_count),
-                unhealthy_node_count: summary
-                    .unhealthy_node_count
-                    .max(metrics.unhealthy_node_count),
-            },
-            None => ControlPlaneHealthSummary {
-                endpoint_count: 1,
-                relay_candidate_count: metrics.relay_candidate_count,
-                healthy_node_count: metrics.healthy_node_count,
-                degraded_node_count: metrics.degraded_node_count,
-                unhealthy_node_count: metrics.unhealthy_node_count,
-            },
-        });
+        metrics_samples.push(metrics);
     }
 
-    summary.context("daemon control-plane metrics summary was empty")
+    ControlPlaneHealthSummary::from_metrics(&metrics_samples)
 }
 
 async fn check_daemon_agent_control_and_signal_readiness(
@@ -1681,18 +1766,20 @@ async fn check_daemon_agent_control_and_signal_readiness(
     if expected_agent_count > 0 {
         let control_summary =
             control_plane_health_summary(client, control_plane_urls, "daemon readiness").await?;
-        if control_summary.healthy_node_count < expected_agent_count {
+        if control_summary.healthy_node_count_min < expected_agent_count {
             bail!(
                 "daemon control-plane endpoints report at least {} healthy nodes; expected at least {}",
-                control_summary.healthy_node_count,
+                control_summary.healthy_node_count_min,
                 expected_agent_count
             );
         }
-        if control_summary.degraded_node_count > 0 || control_summary.unhealthy_node_count > 0 {
+        if control_summary.degraded_node_count_max > 0
+            || control_summary.unhealthy_node_count_max > 0
+        {
             bail!(
                 "daemon control-plane endpoints report degraded={} unhealthy={} nodes during readiness",
-                control_summary.degraded_node_count,
-                control_summary.unhealthy_node_count
+                control_summary.degraded_node_count_max,
+                control_summary.unhealthy_node_count_max
             );
         }
     }
@@ -2269,6 +2356,39 @@ mod tests {
     }
 
     #[test]
+    fn daemon_control_plane_summary_reports_endpoint_ranges() -> anyhow::Result<()> {
+        let consistent = ControlPlaneHealthSummary::from_metrics(&[
+            control_plane_metrics(2, 3, 0, 0),
+            control_plane_metrics(2, 3, 0, 0),
+        ])?;
+        assert_eq!(consistent.endpoint_count, 2);
+        assert_eq!(consistent.relay_candidate_count_min, 2);
+        assert_eq!(consistent.relay_candidate_count_max, 2);
+        assert_eq!(consistent.healthy_node_count_min, 3);
+        assert_eq!(consistent.healthy_node_count_max, 3);
+        assert!(consistent.metrics_consistent());
+
+        let skewed = ControlPlaneHealthSummary::from_metrics(&[
+            control_plane_metrics(1, 2, 0, 0),
+            control_plane_metrics(2, 3, 1, 0),
+        ])?;
+        assert_eq!(skewed.relay_candidate_count_min, 1);
+        assert_eq!(skewed.relay_candidate_count_max, 2);
+        assert_eq!(skewed.healthy_node_count_min, 2);
+        assert_eq!(skewed.healthy_node_count_max, 3);
+        assert_eq!(skewed.degraded_node_count_min, 0);
+        assert_eq!(skewed.degraded_node_count_max, 1);
+        assert!(!skewed.metrics_consistent());
+
+        let empty = match ControlPlaneHealthSummary::from_metrics(&[]) {
+            Ok(_) => bail!("empty control-plane metrics summary should fail"),
+            Err(error) => error,
+        };
+        assert!(empty.to_string().contains("summary was empty"));
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_claims_follow_requested_scenario_distribution() -> anyhow::Result<()> {
         let issuer = IdentityKeyPair::generate();
         let key_id = KeyId::from_string("load-key");
@@ -2499,9 +2619,24 @@ mod tests {
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
         assert_eq!(report.daemon_processes, 7);
+        assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
+        assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
+        assert_eq!(
+            report.daemon_control_plane_healthy_nodes_min,
+            report.daemon_control_plane_healthy_nodes
+        );
+        assert_eq!(
+            report.daemon_control_plane_healthy_nodes_max,
+            report.daemon_control_plane_healthy_nodes
+        );
         assert_eq!(report.daemon_control_plane_degraded_nodes, 0);
+        assert_eq!(report.daemon_control_plane_degraded_nodes_min, 0);
+        assert_eq!(report.daemon_control_plane_degraded_nodes_max, 0);
         assert_eq!(report.daemon_control_plane_unhealthy_nodes, 0);
+        assert_eq!(report.daemon_control_plane_unhealthy_nodes_min, 0);
+        assert_eq!(report.daemon_control_plane_unhealthy_nodes_max, 0);
+        assert!(report.daemon_control_plane_metrics_consistent);
         assert!(report.daemon_signal_health_reports >= 2);
         assert!(report.daemon_signal_healthy_nodes >= 2);
         assert_eq!(report.daemon_signal_degraded_nodes, 0);
@@ -2555,5 +2690,41 @@ mod tests {
         assert_eq!(report.signal_negotiations, 2_000);
         assert!(report.signal_negotiations < report.peer_map_edges_seen);
         Ok(())
+    }
+
+    fn control_plane_metrics(
+        relay_candidate_count: usize,
+        healthy_node_count: usize,
+        degraded_node_count: usize,
+        unhealthy_node_count: usize,
+    ) -> ControlPlaneMetricsResponse {
+        ControlPlaneMetricsResponse {
+            cluster_id: ClusterId::from_string("load-summary-test"),
+            node_count: healthy_node_count + degraded_node_count + unhealthy_node_count,
+            relay_candidate_count,
+            healthy_node_count,
+            degraded_node_count,
+            unhealthy_node_count,
+            stale_endpoint_candidate_count: 0,
+            vpn_pool_total_count: 0,
+            vpn_pool_allocated_count: 0,
+            vpn_pool_available_count: 0,
+            token_ledger_issued_count: 0,
+            token_ledger_active_count: 0,
+            token_ledger_revoked_count: 0,
+            token_ledger_expired_count: 0,
+            token_ledger_exhausted_count: 0,
+            token_ledger_use_count: 0,
+            peer_map_candidate_count: 0,
+            peer_map_visible_count: 0,
+            peer_map_acl_denied_count: 0,
+            peer_map_route_candidate_count: 0,
+            peer_map_route_visible_count: 0,
+            peer_map_route_acl_denied_count: 0,
+            path_count: 0,
+            path_state_counts: Vec::new(),
+            endpoint_candidate_ttl_seconds: 0,
+            generated_at: Utc::now(),
+        }
     }
 }
