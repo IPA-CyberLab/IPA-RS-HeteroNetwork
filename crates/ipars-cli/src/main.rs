@@ -5667,6 +5667,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn bundled_chart_validates_load_balancer_source_ranges() -> anyhow::Result<()> {
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(service_template.contains(
+            "ipars.validateCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
+        ));
+        assert!(service_template
+            .contains("agent.apiService.loadBalancerSourceRanges entry %q must not be repeated"));
+        assert!(service_template.contains(
+            "ipars.validateCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
+        ));
+        assert!(service_template
+            .contains("agent.relayService.loadBalancerSourceRanges entry %q must not be repeated"));
+        Ok(())
+    }
+
     fn base_k8s_install_args() -> K8sInstallArgs {
         K8sInstallArgs {
             release: "edge".to_string(),

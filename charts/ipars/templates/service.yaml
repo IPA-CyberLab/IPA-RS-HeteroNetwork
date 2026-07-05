@@ -106,6 +106,17 @@
 {{- include "ipars.validateIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ip) -}}
 {{- end -}}
 {{- end -}}
+{{- if .Values.agent.apiService.enabled -}}
+{{- $agentApiLoadBalancerSourceRanges := dict -}}
+{{- range $range := .Values.agent.apiService.loadBalancerSourceRanges -}}
+{{- $rangeValue := printf "%v" $range -}}
+{{- include "ipars.validateCidr" (dict "path" "agent.apiService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- if hasKey $agentApiLoadBalancerSourceRanges $rangeValue -}}
+{{- fail (printf "agent.apiService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiLoadBalancerSourceRanges $rangeValue true -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne .Values.agent.apiService.appProtocol "") -}}
 {{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.appProtocol" "value" .Values.agent.apiService.appProtocol) -}}
 {{- end -}}
@@ -220,6 +231,17 @@
 {{- if $relayServiceActive -}}
 {{- range $ip := $relayExternalIPs -}}
 {{- include "ipars.validateIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ip) -}}
+{{- end -}}
+{{- end -}}
+{{- if $relayServiceActive -}}
+{{- $relayLoadBalancerSourceRanges := dict -}}
+{{- range $range := .Values.agent.relayService.loadBalancerSourceRanges -}}
+{{- $rangeValue := printf "%v" $range -}}
+{{- include "ipars.validateCidr" (dict "path" "agent.relayService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- if hasKey $relayLoadBalancerSourceRanges $rangeValue -}}
+{{- fail (printf "agent.relayService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
+{{- end -}}
+{{- $_ := set $relayLoadBalancerSourceRanges $rangeValue true -}}
 {{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive (ne .Values.agent.relayService.udpAppProtocol "") -}}
