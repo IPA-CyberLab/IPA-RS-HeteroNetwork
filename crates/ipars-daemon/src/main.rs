@@ -190,6 +190,13 @@ impl Drop for ObservabilityGuard {
     }
 }
 
+fn validate_observability_config(args: &ObservabilityArgs) -> anyhow::Result<()> {
+    validate_positive_seconds(
+        args.otel_metrics_poll_interval_seconds,
+        "--otel-metrics-poll-interval-seconds",
+    )
+}
+
 #[derive(Debug, Args, Clone)]
 struct ControlPlaneArgs {
     #[arg(long, env = "IPARS_LISTEN", default_value = "0.0.0.0:8443")]
@@ -940,11 +947,46 @@ fn preflight_agent_runtime_with_path_and_checks(
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.wireguard_interface)?;
+    if !args.disable_heartbeat {
+        validate_positive_seconds(
+            args.heartbeat_interval_seconds,
+            "--heartbeat-interval-seconds",
+        )?;
+    }
+    if args.apply_peer_map {
+        validate_positive_seconds(
+            args.peer_map_poll_interval_seconds,
+            "--peer-map-poll-interval-seconds",
+        )?;
+    }
+    if !args.disable_signal_registration {
+        validate_positive_seconds(
+            args.signal_registration_interval_seconds,
+            "--signal-registration-interval-seconds",
+        )?;
+    }
+    if !args.disable_signal_paths {
+        validate_positive_seconds(
+            args.signal_path_interval_seconds,
+            "--signal-path-interval-seconds",
+        )?;
+        validate_positive_seconds(
+            args.relay_session_renew_before_seconds,
+            "--relay-session-renew-before-seconds",
+        )?;
+    }
+    if args.packet_flow_detector != PacketFlowDetector::Disabled {
+        validate_positive_seconds(
+            args.packet_flow_poll_interval_seconds,
+            "--packet-flow-poll-interval-seconds",
+        )?;
+    }
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
-        if args.docker_route_interval_seconds == 0 {
-            anyhow::bail!("--docker-route-interval-seconds must be greater than zero");
-        }
+        validate_positive_seconds(
+            args.docker_route_interval_seconds,
+            "--docker-route-interval-seconds",
+        )?;
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
         } else if !args.docker_networks.is_empty() {
@@ -965,6 +1007,13 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         anyhow::bail!(
             "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
         );
+    }
+    Ok(())
+}
+
+fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
     }
     Ok(())
 }
@@ -1144,9 +1193,10 @@ fn validate_docker_network_token(value: &str, label: &str) -> anyhow::Result<()>
 }
 
 fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
-    if args.kubernetes_route_interval_seconds == 0 {
-        anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
-    }
+    validate_positive_seconds(
+        args.kubernetes_route_interval_seconds,
+        "--kubernetes-route-interval-seconds",
+    )?;
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
     }
@@ -1414,10 +1464,11 @@ fn same_file_identity(_left: &Path, _right: &Path) -> anyhow::Result<bool> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let component = cli.command.component();
+    validate_observability_config(&cli.observability)?;
     let _observability = init_observability(&cli.observability, component)?;
     let otel_metrics_enabled = cli.observability.otel_active();
     let otel_metrics_interval =
-        Duration::from_secs(cli.observability.otel_metrics_poll_interval_seconds.max(1));
+        Duration::from_secs(cli.observability.otel_metrics_poll_interval_seconds);
     tracing::info!(
         component,
         otel_enabled = cli.observability.otel_active(),
@@ -2558,7 +2609,7 @@ async fn run_relay(
             max_mbps: args.max_mbps,
             e2e_only: true,
         },
-        chrono::Duration::seconds(args.session_ttl_seconds.max(1) as i64),
+        chrono::Duration::seconds(args.session_ttl_seconds as i64),
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
@@ -2588,6 +2639,7 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
     if args.max_mbps == 0 {
         anyhow::bail!("--max-mbps must be greater than zero");
     }
+    validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
     Ok(())
 }
 
@@ -2659,7 +2711,7 @@ async fn run_agent(
         background_tasks.push(start_heartbeat_reporting(
             runtime.clone(),
             control_plane_bases.clone(),
-            Duration::from_secs(args.heartbeat_interval_seconds.max(1)),
+            Duration::from_secs(args.heartbeat_interval_seconds),
             relay_capability_reporter.clone(),
         ));
     }
@@ -2688,7 +2740,7 @@ async fn run_agent(
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
-                interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
@@ -2696,7 +2748,7 @@ async fn run_agent(
             background_tasks.push(start_proc_net_conntrack_packet_flow_detector(
                 runtime.clone(),
                 conntrack_paths(args.packet_flow_conntrack_path.clone()),
-                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
@@ -2704,14 +2756,14 @@ async fn run_agent(
         PacketFlowDetector::ConntrackNetlink => {
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
-                interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
             background_tasks.push(start_conntrack_netlink_packet_flow_detector(
                 runtime.clone(),
-                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
@@ -2719,14 +2771,14 @@ async fn run_agent(
         PacketFlowDetector::ConntrackNetlinkEvents => {
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
-                idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds.max(1),
+                idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 pin = args.packet_flow_pin,
                 "starting packet-flow detector"
             );
             background_tasks.push(start_conntrack_netlink_event_packet_flow_detector(
                 runtime.clone(),
-                Duration::from_secs(args.packet_flow_poll_interval_seconds.max(1)),
+                Duration::from_secs(args.packet_flow_poll_interval_seconds),
                 packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
                 args.packet_flow_pin,
             ));
@@ -2738,7 +2790,7 @@ async fn run_agent(
                 runtime.clone(),
                 node,
                 signal_bases.clone(),
-                Duration::from_secs(args.signal_registration_interval_seconds.max(1)),
+                Duration::from_secs(args.signal_registration_interval_seconds),
             ));
         }
     }
@@ -2753,8 +2805,8 @@ async fn run_agent(
                 signal_bases,
                 hole_puncher,
                 relay_forwarder_supervisor.clone(),
-                Duration::from_secs(args.relay_session_renew_before_seconds.max(1)),
-                Duration::from_secs(args.signal_path_interval_seconds.max(1)),
+                Duration::from_secs(args.relay_session_renew_before_seconds),
+                Duration::from_secs(args.signal_path_interval_seconds),
             ));
         }
     }
@@ -3885,7 +3937,7 @@ where
         HttpPeerMapSource::new(control_plane_urls),
         sink,
     );
-    let interval = Duration::from_secs(args.peer_map_poll_interval_seconds.max(1));
+    let interval = Duration::from_secs(args.peer_map_poll_interval_seconds);
     let interface = args.wireguard_interface.clone();
     tokio::spawn(async move {
         run_peer_map_sync_loop(sync, interval, interface).await;
@@ -6563,6 +6615,26 @@ mod tests {
     }
 
     #[test]
+    fn observability_rejects_zero_metrics_poll_interval() -> anyhow::Result<()> {
+        let args = ObservabilityArgs {
+            otel_enabled: true,
+            otel_endpoint: None,
+            otel_service_name: None,
+            otel_metrics_poll_interval_seconds: 0,
+            log_filter: "info".to_string(),
+        };
+
+        let error = match validate_observability_config(&args) {
+            Ok(()) => anyhow::bail!("zero OTEL metrics poll interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--otel-metrics-poll-interval-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
     fn observability_endpoint_implies_otel_and_uses_signal_paths() {
         let args = ObservabilityArgs {
             otel_enabled: false,
@@ -8873,52 +8945,103 @@ invalid no-destination-here
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    fn agent_runtime_config_error(argv: Vec<&str>) -> anyhow::Result<String> {
+        let cli = Cli::try_parse_from(argv)?;
+        if let Command::Agent(args) = cli.command {
+            return match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("agent runtime config should be rejected"),
+                Err(error) => Ok(error.to_string()),
+            };
+        }
+        anyhow::bail!("expected agent command")
+    }
+
     #[test]
-    fn agent_route_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
-        let docker_zero = Cli::try_parse_from([
-            "iparsd",
-            "agent",
-            "--apply-docker-routes",
-            "--docker-container-namespace",
-            "compose-default",
-            "--docker-container-cidr",
-            "172.18.0.0/16",
-            "--docker-route-interval-seconds",
-            "0",
-        ])?;
-        if let Command::Agent(args) = docker_zero.command {
-            let error = match validate_agent_runtime_config(&args) {
-                Ok(()) => anyhow::bail!("zero Docker route interval should be rejected"),
-                Err(error) => error,
-            };
-            assert!(error
-                .to_string()
-                .contains("--docker-route-interval-seconds must be greater than zero"));
-        } else {
-            anyhow::bail!("expected agent command");
-        }
+    fn agent_runtime_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                vec!["iparsd", "agent", "--heartbeat-interval-seconds", "0"],
+                "--heartbeat-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-map-poll-interval-seconds",
+                    "0",
+                ],
+                "--peer-map-poll-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--signal-registration-interval-seconds",
+                    "0",
+                ],
+                "--signal-registration-interval-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--signal-path-interval-seconds", "0"],
+                "--signal-path-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--relay-session-renew-before-seconds",
+                    "0",
+                ],
+                "--relay-session-renew-before-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "proc-net-conntrack",
+                    "--packet-flow-poll-interval-seconds",
+                    "0",
+                ],
+                "--packet-flow-poll-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-docker-routes",
+                    "--docker-container-namespace",
+                    "compose-default",
+                    "--docker-container-cidr",
+                    "172.18.0.0/16",
+                    "--docker-route-interval-seconds",
+                    "0",
+                ],
+                "--docker-route-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-kubernetes-underlay",
+                    "--kubernetes-service-cidr",
+                    "10.96.0.0/12",
+                    "--kubernetes-route-interval-seconds",
+                    "0",
+                ],
+                "--kubernetes-route-interval-seconds must be greater than zero",
+            ),
+        ];
 
-        let kubernetes_zero = Cli::try_parse_from([
-            "iparsd",
-            "agent",
-            "--apply-kubernetes-underlay",
-            "--kubernetes-service-cidr",
-            "10.96.0.0/12",
-            "--kubernetes-route-interval-seconds",
-            "0",
-        ])?;
-        if let Command::Agent(args) = kubernetes_zero.command {
-            let error = match validate_agent_runtime_config(&args) {
-                Ok(()) => anyhow::bail!("zero Kubernetes route interval should be rejected"),
-                Err(error) => error,
-            };
-            assert!(error
-                .to_string()
-                .contains("--kubernetes-route-interval-seconds must be greater than zero"));
-            return Ok(());
+        for (argv, expected) in cases {
+            let error = agent_runtime_config_error(argv)?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
         }
-
-        Err(anyhow::anyhow!("expected agent command"))
+        Ok(())
     }
 
     #[test]
@@ -9314,6 +9437,26 @@ invalid no-destination-here
             assert!(error
                 .to_string()
                 .contains("--max-mbps must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let zero_ttl = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--session-ttl-seconds",
+            "0",
+        ])?;
+        if let Command::Relay(args) = zero_ttl.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--session-ttl-seconds must be greater than zero"));
             return Ok(());
         }
 
