@@ -2442,6 +2442,11 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
             anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
         }
         let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!(
+                "{flag} must use canonical Docker container CIDR route {route}, not {cidr}"
+            );
+        }
         if !seen.insert(route) {
             anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
         }
@@ -5690,6 +5695,17 @@ mod tests {
         };
         assert!(loopback.to_string().contains(
             "--docker-container-cidr must not include loopback Docker container CIDR 127.0.0.0/8"
+        ));
+
+        let non_canonical = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["172.20.10.1/24".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("non-canonical Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(non_canonical.to_string().contains(
+            "--docker-container-cidr must use canonical Docker container CIDR route 172.20.10.0/24, not 172.20.10.1/24"
         ));
 
         let duplicate = match docker_install_plan(DockerInstallArgs {

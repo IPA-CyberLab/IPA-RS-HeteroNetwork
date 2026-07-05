@@ -1672,6 +1672,11 @@ fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow
             anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
         }
         let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!(
+                "{flag} must use canonical Docker container CIDR route {route}, not {cidr}"
+            );
+        }
         if !seen.insert(route) {
             anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
         }
@@ -13912,6 +13917,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "fe80::/64",
                 "--docker-container-cidr must not include link-local Docker container CIDR fe80::/64",
             ),
+            (
+                "172.18.10.1/24",
+                "--docker-container-cidr must use canonical Docker container CIDR route 172.18.10.0/24, not 172.18.10.1/24",
+            ),
         ];
 
         for (cidr, expected) in cases {
@@ -14159,6 +14168,20 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert!(error.contains(
             "Docker network discovery must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
+
+        let non_canonical_networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["172.18.10.1/24"],
+        )];
+        let non_canonical = match docker_discovered_routes(&non_canonical_networks, &[]) {
+            Ok(_) => anyhow::bail!("non-canonical Docker API subnet should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(non_canonical.contains(
+            "Docker network discovery must use canonical Docker container CIDR route 172.18.10.0/24, not 172.18.10.1/24"
         ));
         Ok(())
     }
