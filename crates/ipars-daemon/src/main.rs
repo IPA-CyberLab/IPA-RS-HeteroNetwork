@@ -2759,7 +2759,7 @@ struct DockerDiscoveredRoutes {
 
 impl DockerApiNetworkDiscovery {
     fn new(args: &AgentArgs) -> anyhow::Result<Self> {
-        let socket = docker_api_socket_path(args);
+        let socket = docker_api_socket_path(args)?;
         let client = reqwest::Client::builder()
             .unix_socket(socket)
             .build()
@@ -2821,7 +2821,7 @@ fn docker_api_networks_url(api_version: &str) -> String {
     }
 }
 
-fn docker_api_socket_path(args: &AgentArgs) -> PathBuf {
+fn docker_api_socket_path(args: &AgentArgs) -> anyhow::Result<PathBuf> {
     resolve_docker_api_socket(
         args.docker_api_socket.as_deref(),
         std::env::var_os("DOCKER_HOST").as_deref(),
@@ -2835,35 +2835,49 @@ fn resolve_docker_api_socket(
     docker_host: Option<&OsStr>,
     xdg_runtime_dir: Option<&OsStr>,
     exists: impl Fn(&Path) -> bool,
-) -> PathBuf {
+) -> anyhow::Result<PathBuf> {
     if let Some(configured) = configured {
-        return configured.to_path_buf();
+        return Ok(configured.to_path_buf());
     }
-    if let Some(path) = docker_host.and_then(docker_host_unix_socket_path) {
-        return path;
+    if let Some(path) = docker_host
+        .map(docker_host_unix_socket_path)
+        .transpose()?
+        .flatten()
+    {
+        return Ok(path);
     }
 
     let rootful = PathBuf::from("/var/run/docker.sock");
     if exists(&rootful) {
-        return rootful;
+        return Ok(rootful);
     }
 
     if let Some(runtime_dir) = xdg_runtime_dir {
         let rootless = PathBuf::from(runtime_dir).join("docker.sock");
         if exists(&rootless) {
-            return rootless;
+            return Ok(rootless);
         }
     }
 
-    rootful
+    Ok(rootful)
 }
 
-fn docker_host_unix_socket_path(docker_host: &OsStr) -> Option<PathBuf> {
-    let docker_host = docker_host.to_str()?;
-    docker_host
-        .strip_prefix("unix://")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+fn docker_host_unix_socket_path(docker_host: &OsStr) -> anyhow::Result<Option<PathBuf>> {
+    let docker_host = docker_host
+        .to_str()
+        .context("DOCKER_HOST must be valid UTF-8 for Docker API discovery")?;
+    if docker_host.trim().is_empty() {
+        return Ok(None);
+    }
+    if let Some(path) = docker_host.strip_prefix("unix://") {
+        if path.is_empty() {
+            anyhow::bail!("DOCKER_HOST unix:// value must include a socket path");
+        }
+        return Ok(Some(PathBuf::from(path)));
+    }
+    anyhow::bail!(
+        "Docker API discovery only supports unix:// DOCKER_HOST values; set --docker-api-socket for a local Unix socket"
+    )
 }
 
 fn docker_discovered_routes(
@@ -8466,10 +8480,11 @@ invalid no-destination-here
     }
 
     #[test]
-    fn docker_api_socket_resolution_prefers_explicit_then_docker_host_then_rootless() {
+    fn docker_api_socket_resolution_prefers_explicit_then_docker_host_then_rootless(
+    ) -> anyhow::Result<()> {
         let explicit = Path::new("/custom/docker.sock");
         assert_eq!(
-            resolve_docker_api_socket(Some(explicit), None, None, |_| false),
+            resolve_docker_api_socket(Some(explicit), None, None, |_| false)?,
             PathBuf::from("/custom/docker.sock")
         );
         assert_eq!(
@@ -8478,15 +8493,34 @@ invalid no-destination-here
                 Some(OsStr::new("unix:///tmp/docker.sock")),
                 None,
                 |_| false,
-            ),
+            )?,
             PathBuf::from("/tmp/docker.sock")
         );
         assert_eq!(
             resolve_docker_api_socket(None, None, Some(OsStr::new("/run/user/1000")), |path| {
                 path == Path::new("/run/user/1000/docker.sock")
-            }),
+            })?,
             PathBuf::from("/run/user/1000/docker.sock")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_resolution_rejects_unsupported_docker_host() -> anyhow::Result<()> {
+        let error = match resolve_docker_api_socket(
+            None,
+            Some(OsStr::new("tcp://127.0.0.1:2375")),
+            None,
+            |_| false,
+        ) {
+            Ok(_) => anyhow::bail!("unsupported DOCKER_HOST should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("only supports unix:// DOCKER_HOST"));
+        Ok(())
     }
 
     fn docker_api_network(
