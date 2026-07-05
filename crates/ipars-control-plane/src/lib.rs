@@ -121,6 +121,11 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
 }
 
@@ -256,6 +261,17 @@ impl ControlPlaneStore for InMemoryStore {
         } else {
             paths.push(path);
         }
+        Ok(())
+    }
+
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        replacement_paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut paths = self.paths.write().await;
+        paths.retain(|path| &path.key.local != node_id);
+        paths.extend(replacement_paths);
         Ok(())
     }
 
@@ -674,9 +690,9 @@ where
         self.store
             .upsert_health(request.node_id.clone(), request.health)
             .await?;
-        for path in request.path_state {
-            self.store.upsert_path(path).await?;
-        }
+        self.store
+            .replace_node_paths(&request.node_id, request.path_state)
+            .await?;
 
         Ok(HeartbeatResponse {
             accepted: true,
@@ -828,19 +844,25 @@ where
             }
         }
         for path in &request.path_state {
-            let peer = if path.key.local == request.node_id {
-                &path.key.remote
-            } else if path.key.remote == request.node_id {
-                &path.key.local
-            } else {
+            if path.key.local != request.node_id {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!(
-                        "path {} -> {} does not include reporting node",
+                        "path {} -> {} is not owned by reporting node {}",
+                        path.key.local, path.key.remote, request.node_id
+                    ),
+                });
+            }
+            if path.key.remote == request.node_id {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} points back to the reporting node",
                         path.key.local, path.key.remote
                     ),
                 });
-            };
+            }
+            let peer = &path.key.remote;
             if let Some(candidate) = &path.selected_candidate {
                 if &candidate.node_id != peer {
                     return Err(ControlPlaneError::NodeUpdateRejected {
@@ -1772,6 +1794,14 @@ mod tests {
             self.inner.upsert_path(path).await
         }
 
+        async fn replace_node_paths(
+            &self,
+            node_id: &NodeId,
+            paths: Vec<PathRecord>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.replace_node_paths(node_id, paths).await
+        }
+
         async fn list_paths_for(
             &self,
             node_id: &NodeId,
@@ -2524,6 +2554,37 @@ mod tests {
         );
         assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
         assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
+
+        let second_reported_at = reported_at + Duration::seconds(1);
+        let second_health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: second_reported_at,
+            latency_ms: Some(9.0),
+            relay_load: None,
+            message: Some("idle".to_string()),
+        };
+        let second_response = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: second_health.clone(),
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                second_reported_at,
+            ))
+            .await?;
+
+        assert!(second_response.accepted);
+        assert_eq!(
+            store.get_health(&node_id("node-a")).await?,
+            Some(second_health)
+        );
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
     }
 

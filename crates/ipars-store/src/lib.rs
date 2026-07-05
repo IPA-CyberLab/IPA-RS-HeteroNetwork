@@ -265,6 +265,37 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(())
     }
 
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_string(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError> {
         sqlx::query(
             r#"
@@ -654,6 +685,37 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         Ok(())
     }
 
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES ($1, $2, $3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_value(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError> {
         sqlx::query(
             r#"
@@ -963,11 +1025,20 @@ mod tests {
             updated_at: Utc::now(),
             pinned: false,
         };
+        let remote_reported_path = PathRecord {
+            key: PeerPathKey::new(remote.node_id.clone(), local.node_id.clone()),
+            ..path.clone()
+        };
         store.upsert_path(path).await?;
+        store.upsert_path(remote_reported_path).await?;
 
         assert_eq!(store.get_node(&local.node_id).await?, Some(local.clone()));
         assert_eq!(store.list_nodes().await?.len(), 2);
-        assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 1);
+        assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 2);
+        store.replace_node_paths(&local.node_id, Vec::new()).await?;
+        let remaining_paths = store.list_paths_for(&local.node_id).await?;
+        assert_eq!(remaining_paths.len(), 1);
+        assert_eq!(remaining_paths[0].key.local, remote.node_id);
         store
             .update_node_candidates(&local.node_id, vec![candidate(local.node_id.as_str())])
             .await?;
