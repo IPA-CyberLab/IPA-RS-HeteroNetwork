@@ -3743,13 +3743,13 @@ impl AgentOtelMetrics {
             packet_flow_filtered: meter
                 .u64_counter("ipars.agent.packet_flow.filtered")
                 .with_description(
-                    "Packet-flow observations filtered before lazy-connect resolution.",
+                    "Packet-flow observations filtered before or after lazy-connect resolution.",
                 )
                 .build(),
             packet_flow_filtered_by_reason: meter
                 .u64_counter("ipars.agent.packet_flow.filtered.by_reason")
                 .with_description(
-                    "Packet-flow observations filtered before lazy-connect resolution, by reason.",
+                    "Packet-flow observations filtered before or after lazy-connect resolution, by reason.",
                 )
                 .build(),
             packet_flow_classified_by_lifecycle: meter
@@ -12091,6 +12091,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Some(AgentPacketFlowDropReason::LinkLocal)
         );
         assert_eq!(AgentPacketFlowDropReason::LinkLocal.as_str(), "link_local");
+        assert_eq!(
+            AgentPacketFlowDropReason::NoOverlayMatch.as_str(),
+            "no_overlay_match"
+        );
         Ok(())
     }
 

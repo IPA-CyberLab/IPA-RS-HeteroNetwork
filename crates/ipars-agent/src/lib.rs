@@ -396,6 +396,7 @@ pub struct AgentRuntime {
     packet_flow_filtered_multicast_count: AtomicU64,
     packet_flow_filtered_broadcast_count: AtomicU64,
     packet_flow_filtered_link_local_count: AtomicU64,
+    packet_flow_filtered_no_overlay_match_count: AtomicU64,
     packet_flow_classification_unknown_count: AtomicU64,
     packet_flow_classification_opening_count: AtomicU64,
     packet_flow_classification_unreplied_count: AtomicU64,
@@ -652,6 +653,7 @@ impl AgentRuntime {
             packet_flow_filtered_multicast_count: AtomicU64::new(0),
             packet_flow_filtered_broadcast_count: AtomicU64::new(0),
             packet_flow_filtered_link_local_count: AtomicU64::new(0),
+            packet_flow_filtered_no_overlay_match_count: AtomicU64::new(0),
             packet_flow_classification_unknown_count: AtomicU64::new(0),
             packet_flow_classification_opening_count: AtomicU64::new(0),
             packet_flow_classification_unreplied_count: AtomicU64::new(0),
@@ -1167,6 +1169,7 @@ impl AgentRuntime {
         let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
             self.packet_flow_unmatched_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.record_packet_flow_filtered(AgentPacketFlowDropReason::NoOverlayMatch);
             return None;
         };
         lazy_connect.record_activity(matched.peer.clone(), at);
@@ -1204,6 +1207,9 @@ impl AgentRuntime {
             AgentPacketFlowDropReason::Multicast => &self.packet_flow_filtered_multicast_count,
             AgentPacketFlowDropReason::Broadcast => &self.packet_flow_filtered_broadcast_count,
             AgentPacketFlowDropReason::LinkLocal => &self.packet_flow_filtered_link_local_count,
+            AgentPacketFlowDropReason::NoOverlayMatch => {
+                &self.packet_flow_filtered_no_overlay_match_count
+            }
         }
     }
 
@@ -4475,7 +4481,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Rdp), 1);
-        assert_eq!(metrics.packet_flow_filtered_count, 3);
+        assert_eq!(metrics.packet_flow_filtered_count, 5);
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -4491,6 +4497,14 @@ mod tests {
                 .find(|entry| entry.reason == AgentPacketFlowDropReason::Broadcast)
                 .map(|entry| entry.count),
             Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(2)
         );
         assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);

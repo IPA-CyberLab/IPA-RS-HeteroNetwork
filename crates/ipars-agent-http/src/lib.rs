@@ -574,7 +574,7 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_agent_packet_flow_filtered_total Packet-flow observations filtered before lazy-connect resolution."
+        "# HELP ipars_agent_packet_flow_filtered_total Packet-flow observations filtered before or after lazy-connect resolution."
     );
     prometheus_line!(
         &mut body,
@@ -587,7 +587,7 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before lazy-connect resolution, by reason."
+        "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before or after lazy-connect resolution, by reason."
     );
     prometheus_line!(
         &mut body,
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
-        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert!(metrics
             .packet_flow_classification_counts
             .iter()
@@ -1091,6 +1091,13 @@ mod tests {
             .packet_flow_filtered_reason_counts
             .iter()
             .any(|entry| entry.reason == AgentPacketFlowDropReason::Multicast && entry.count == 1));
+        assert!(metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .any(
+                |entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch
+                    && entry.count == 1
+            ));
 
         let prometheus_response = app
             .clone()
@@ -1135,6 +1142,9 @@ mod tests {
         let prometheus_node_id = prometheus_label(node_id.as_str());
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"no_overlay_match\"}} 1")
         ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{prometheus_node_id}\",classification=\"unknown\"}} 1")

@@ -1526,15 +1526,17 @@ pub mod api {
         Multicast,
         Broadcast,
         LinkLocal,
+        NoOverlayMatch,
     }
 
     impl AgentPacketFlowDropReason {
-        pub const ALL: [Self; 5] = [
+        pub const ALL: [Self; 6] = [
             Self::Unspecified,
             Self::Loopback,
             Self::Multicast,
             Self::Broadcast,
             Self::LinkLocal,
+            Self::NoOverlayMatch,
         ];
 
         pub const fn as_str(self) -> &'static str {
@@ -1544,6 +1546,7 @@ pub mod api {
                 Self::Multicast => "multicast",
                 Self::Broadcast => "broadcast",
                 Self::LinkLocal => "link_local",
+                Self::NoOverlayMatch => "no_overlay_match",
             }
         }
     }
