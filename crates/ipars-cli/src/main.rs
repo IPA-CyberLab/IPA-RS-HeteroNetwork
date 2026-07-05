@@ -890,7 +890,7 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.issuer_private_key_path.as_deref(),
         MissingIssuerPath::GenerateEphemeral,
     )?;
-    let bootstrap_endpoints = token_create_bootstrap_endpoints(&args);
+    let bootstrap_endpoints = token_create_bootstrap_endpoints(&args)?;
     let cluster_id = args
         .cluster_id
         .map(ClusterId::from_string)
@@ -914,39 +914,89 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
     Ok(token)
 }
 
-fn token_create_bootstrap_endpoints(args: &TokenCreateArgs) -> Vec<BootstrapEndpoint> {
-    args.bootstrap_endpoints
+fn token_create_bootstrap_endpoints(
+    args: &TokenCreateArgs,
+) -> anyhow::Result<Vec<BootstrapEndpoint>> {
+    let mut endpoints = Vec::new();
+    for url in args
+        .bootstrap_endpoints
         .iter()
         .chain(args.control_plane_bootstrap_endpoints.iter())
-        .map(|url| BootstrapEndpoint {
-            url: url.clone(),
-            kind: BootstrapEndpointKind::ControlPlane,
-        })
-        .chain(
-            args.signal_bootstrap_endpoints
-                .iter()
-                .map(|url| BootstrapEndpoint {
-                    url: url.clone(),
-                    kind: BootstrapEndpointKind::Signal,
-                }),
-        )
-        .chain(
-            args.stun_bootstrap_endpoints
-                .iter()
-                .map(|url| BootstrapEndpoint {
-                    url: url.clone(),
-                    kind: BootstrapEndpointKind::Stun,
-                }),
-        )
-        .chain(
-            args.relay_bootstrap_endpoints
-                .iter()
-                .map(|url| BootstrapEndpoint {
-                    url: url.clone(),
-                    kind: BootstrapEndpointKind::Relay,
-                }),
-        )
-        .collect()
+    {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::ControlPlane,
+            "--bootstrap/--control-plane-bootstrap",
+        )?);
+    }
+    for url in &args.signal_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Signal,
+            "--signal-bootstrap",
+        )?);
+    }
+    for url in &args.stun_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Stun,
+            "--stun-bootstrap",
+        )?);
+    }
+    for url in &args.relay_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Relay,
+            "--relay-bootstrap",
+        )?);
+    }
+    Ok(endpoints)
+}
+
+fn validated_bootstrap_endpoint(
+    url: &str,
+    kind: BootstrapEndpointKind,
+    flag: &str,
+) -> anyhow::Result<BootstrapEndpoint> {
+    match kind {
+        BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::Signal => {
+            validate_http_bootstrap_url(url, flag)?;
+        }
+        BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
+            validate_udp_bootstrap_url(url, flag)?;
+        }
+    }
+    Ok(BootstrapEndpoint {
+        url: url.to_string(),
+        kind,
+    })
+}
+
+fn validate_http_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{flag} must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    Ok(())
+}
+
+fn validate_udp_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if parsed.scheme() != "udp" {
+        anyhow::bail!("{flag} must use udp");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    if parsed.port().is_none() {
+        anyhow::bail!("{flag} must include a port");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3765,7 +3815,7 @@ mod tests {
             assert_eq!(args.max_uses, Some(7));
             assert!(!args.unlimited_uses);
             assert_eq!(
-                token_create_bootstrap_endpoints(&args),
+                token_create_bootstrap_endpoints(&args)?,
                 vec![
                     BootstrapEndpoint {
                         url: "https://203.0.113.10:8443".to_string(),
@@ -3793,6 +3843,47 @@ mod tests {
         }
 
         anyhow::bail!("expected token create command")
+    }
+
+    #[test]
+    fn token_create_rejects_bootstrap_endpoint_scheme_mismatches() -> anyhow::Result<()> {
+        let http_for_stun = TokenCreateArgs {
+            cluster_id: None,
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            ttl_seconds: 300,
+            bootstrap_endpoints: Vec::new(),
+            control_plane_bootstrap_endpoints: Vec::new(),
+            signal_bootstrap_endpoints: Vec::new(),
+            stun_bootstrap_endpoints: vec!["https://203.0.113.10:3478".to_string()],
+            relay_bootstrap_endpoints: Vec::new(),
+            allow_relay: false,
+            max_uses: Some(1),
+            unlimited_uses: false,
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_for_stun) else {
+            anyhow::bail!("http STUN bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--stun-bootstrap"));
+        assert!(error.contains("must use udp"));
+
+        let udp_for_signal = TokenCreateArgs {
+            signal_bootstrap_endpoints: vec!["udp://203.0.113.10:9443".to_string()],
+            stun_bootstrap_endpoints: Vec::new(),
+            ..http_for_stun
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_for_signal) else {
+            anyhow::bail!("udp signal bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--signal-bootstrap"));
+        assert!(error.contains("must use http or https"));
+        Ok(())
     }
 
     #[test]
