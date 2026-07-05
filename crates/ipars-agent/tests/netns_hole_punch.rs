@@ -19,6 +19,8 @@ const MIXED_PORT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_mixed_port_snat_network_namespaces";
 const ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
+const ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -165,8 +167,9 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
             right_bind_port: 40102,
             left_reflexive_port: 40101,
             right_reflexive_port: 40102,
-            left_fixed_snat_port: false,
-            right_fixed_snat_port: false,
+            left_snat_port: None,
+            right_snat_port: None,
+            expect_hole_punch_success: true,
         },
     )
 }
@@ -203,8 +206,9 @@ async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
             right_bind_port: 40102,
             left_reflexive_port: 50101,
             right_reflexive_port: 50102,
-            left_fixed_snat_port: true,
-            right_fixed_snat_port: true,
+            left_snat_port: Some(50101),
+            right_snat_port: Some(50102),
+            expect_hole_punch_success: true,
         },
     )
 }
@@ -241,8 +245,48 @@ async fn udp_hole_puncher_traverses_mixed_port_snat_network_namespaces(
             right_bind_port: 40102,
             left_reflexive_port: 40101,
             right_reflexive_port: 50102,
-            left_fixed_snat_port: false,
-            right_fixed_snat_port: true,
+            left_snat_port: None,
+            right_snat_port: Some(50102),
+            expect_hole_punch_success: true,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_two_sided_snat_hole_punch_topology(
+        ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME,
+        "apdnat",
+        TwoSidedSnatTopology {
+            private_second_octet: 246,
+            public_third_octet: 4,
+            left_bind_port: 40101,
+            right_bind_port: 40102,
+            left_reflexive_port: 50101,
+            right_reflexive_port: 50102,
+            left_snat_port: Some(51101),
+            right_snat_port: Some(51102),
+            expect_hole_punch_success: false,
         },
     )
 }
@@ -280,8 +324,9 @@ struct TwoSidedSnatTopology {
     right_bind_port: u16,
     left_reflexive_port: u16,
     right_reflexive_port: u16,
-    left_fixed_snat_port: bool,
-    right_fixed_snat_port: bool,
+    left_snat_port: Option<u16>,
+    right_snat_port: Option<u16>,
+    expect_hole_punch_success: bool,
 }
 
 fn run_two_sided_snat_hole_punch_topology(
@@ -370,25 +415,19 @@ fn run_two_sided_snat_hole_punch_topology(
         ],
     )?;
 
-    let left_snat_port = topology
-        .left_fixed_snat_port
-        .then_some(topology.left_reflexive_port);
-    let right_snat_port = topology
-        .right_fixed_snat_port
-        .then_some(topology.right_reflexive_port);
     enable_snat_namespace(
         &left_nat_namespace,
         &left_nat_public_if,
         &format!("{left_ip}/32"),
         &left_public_ip,
-        left_snat_port,
+        topology.left_snat_port,
     )?;
     enable_snat_namespace(
         &right_nat_namespace,
         &right_nat_public_if,
         &format!("{right_ip}/32"),
         &right_public_ip,
-        right_snat_port,
+        topology.right_snat_port,
     )?;
 
     let left_ready = temp_file(format!("ipars-hp-{label}-ready-left-{suffix}"));
@@ -401,12 +440,17 @@ fn run_two_sided_snat_hole_punch_topology(
     let right_bind = format!("{}:{}", right_ip, topology.right_bind_port);
     let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
     let target_reflexive = format!("{}:{}", right_public_ip, topology.right_reflexive_port);
+    let child_role = if topology.expect_hole_punch_success {
+        "nat-duplex"
+    } else {
+        "nat-duplex-timeout"
+    };
 
     let left = spawn_child(
         test_name,
         &left_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
             ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
             (
@@ -426,7 +470,7 @@ fn run_two_sided_snat_hole_punch_topology(
         test_name,
         &right_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
             ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
             (
@@ -591,7 +635,8 @@ async fn run_child(role: &str) -> Result<(), Box<dyn std::error::Error>> {
     match role {
         "receiver" => run_receiver().await,
         "puncher" => run_puncher().await,
-        "nat-duplex" => run_nat_duplex().await,
+        "nat-duplex" => run_nat_duplex(true).await,
+        "nat-duplex-timeout" => run_nat_duplex(false).await,
         other => Err(format!("unknown hole-punch child role `{other}`").into()),
     }
 }
@@ -634,7 +679,7 @@ async fn run_puncher() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_nat_duplex() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::Error>> {
     let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
     let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
     let source_reflexive =
@@ -664,8 +709,20 @@ async fn run_nat_duplex() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(sent, 20);
 
     let mut buffer = [0_u8; 512];
-    let (len, _) =
-        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await??;
+    let received =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await;
+    if !expect_packet {
+        match received {
+            Err(_) => return Ok(()),
+            Ok(Err(error)) => return Err(error.into()),
+            Ok(Ok((len, from))) => {
+                let payload = String::from_utf8_lossy(&buffer[..len]);
+                return Err(format!("unexpected hole-punch payload from {from}: {payload}").into());
+            }
+        }
+    }
+
+    let (len, _) = received??;
     let payload = std::str::from_utf8(&buffer[..len])?;
 
     assert!(payload.contains("ipars-hole-punch-v1"));
