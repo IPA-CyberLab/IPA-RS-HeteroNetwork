@@ -323,6 +323,22 @@ struct K8sInstallArgs {
         requires = "enable_network_policy"
     )]
     network_policy_acknowledge_host_network: bool,
+    #[arg(long = "agent-pod-label", value_parser = parse_kubernetes_label_pair)]
+    agent_pod_labels: Vec<KeyValueArg>,
+    #[arg(long = "agent-pod-annotation", value_parser = parse_key_value)]
+    agent_pod_annotations: Vec<KeyValueArg>,
+    #[arg(long = "agent-priority-class", value_parser = parse_kubernetes_priority_class_name)]
+    agent_priority_class: Option<String>,
+    #[arg(long = "agent-node-selector", value_parser = parse_kubernetes_label_pair)]
+    agent_node_selectors: Vec<KeyValueArg>,
+    #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
+    agent_resource_request_cpu: Option<String>,
+    #[arg(long = "agent-resource-request-memory", value_parser = parse_kubernetes_resource_quantity)]
+    agent_resource_request_memory: Option<String>,
+    #[arg(long = "agent-resource-limit-cpu", value_parser = parse_kubernetes_resource_quantity)]
+    agent_resource_limit_cpu: Option<String>,
+    #[arg(long = "agent-resource-limit-memory", value_parser = parse_kubernetes_resource_quantity)]
+    agent_resource_limit_memory: Option<String>,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
@@ -1251,6 +1267,28 @@ fn parse_key_value(value: &str) -> Result<KeyValueArg, String> {
     })
 }
 
+fn parse_kubernetes_label_pair(value: &str) -> Result<KeyValueArg, String> {
+    let (key, label_value) = value
+        .split_once('=')
+        .ok_or_else(|| "label must use key=value syntax".to_string())?;
+    validate_kubernetes_label_key(key)?;
+    validate_kubernetes_label_value(label_value)?;
+    Ok(KeyValueArg {
+        key: key.to_string(),
+        value: label_value.to_string(),
+    })
+}
+
+fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_subdomain(value, "priorityClassName")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
+    validate_kubernetes_resource_quantity(value, "resource quantity")?;
+    Ok(value.to_string())
+}
+
 fn validate_kubernetes_annotation_key(key: &str) -> Result<(), String> {
     let (prefix, name) = match key.split_once('/') {
         Some((prefix, name)) => {
@@ -1265,6 +1303,49 @@ fn validate_kubernetes_annotation_key(key: &str) -> Result<(), String> {
         validate_kubernetes_dns_subdomain(prefix, "annotation prefix")?;
     }
     validate_kubernetes_qualified_name(name, "annotation name")
+}
+
+fn validate_kubernetes_label_key(key: &str) -> Result<(), String> {
+    let (prefix, name) = match key.split_once('/') {
+        Some((prefix, name)) => {
+            if name.contains('/') {
+                return Err("label key must contain at most one '/' separator".to_string());
+            }
+            (Some(prefix), name)
+        }
+        None => (None, key),
+    };
+    if let Some(prefix) = prefix {
+        validate_kubernetes_dns_subdomain(prefix, "label prefix")?;
+    }
+    validate_kubernetes_qualified_name(name, "label name")
+}
+
+fn validate_kubernetes_label_value(value: &str) -> Result<(), String> {
+    if value.len() > 63 {
+        return Err("label value exceeds 63 bytes".to_string());
+    }
+    if value.is_empty() {
+        return Ok(());
+    }
+    let valid_body = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    let valid_edges = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !valid_body || !valid_edges {
+        return Err(
+            "label value must be empty or use ASCII letters, digits, '-', '_' or '.', with alphanumeric edges"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_kubernetes_load_balancer_class(value: &str) -> Result<(), String> {
@@ -1356,6 +1437,33 @@ fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 64 {
+        return Err(format!("{label} exceeds 64 bytes"));
+    }
+    let mut bytes = value.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label} must start with a digit"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+    {
+        return Err(format!("{label} must not contain whitespace or separators"));
+    }
+    if !value
+        .bytes()
+        .last()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(format!("{label} must end with a digit or suffix letter"));
+    }
+    Ok(())
+}
+
 fn helm_set_key(key: &str) -> String {
     let mut escaped = String::with_capacity(key.len());
     for value in key.chars() {
@@ -1372,10 +1480,8 @@ fn helm_set_string_value(value: &str) -> String {
 }
 
 fn append_helm_set_string(command: &mut String, key: &str, value: &str) {
-    command.push_str(&format!(
-        " --set-string {key}={}",
-        helm_set_string_value(value)
-    ));
+    let assignment = format!("{key}={}", helm_set_string_value(value));
+    command.push_str(&format!(" --set-string {}", shell_word(&assignment)));
 }
 
 fn append_helm_ipnet_list(command: &mut String, key: &str, values: &[ipnet::IpNet]) {
@@ -1823,6 +1929,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
+    validate_k8s_agent_pod_options(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
@@ -1836,6 +1943,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_key
     );
     append_k8s_route_discovery_values(&mut helm_command, &args);
+    append_k8s_agent_pod_values(&mut helm_command, &args);
     if args.enable_network_policy {
         helm_command.push_str(" --set networkPolicy.enabled=true");
         if args.network_policy_acknowledge_host_network {
@@ -2091,6 +2199,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Agent pod labels, annotations, priority class, node selectors, and resource requests/limits map directly to DaemonSet chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2136,6 +2245,45 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
             "serviceExposure.routeProviderNodeId",
             route_provider,
         );
+    }
+}
+
+fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
+    for label in &args.agent_pod_labels {
+        append_helm_set_string(
+            command,
+            &format!("agent.podLabels.{}", helm_set_key(&label.key)),
+            &label.value,
+        );
+    }
+    for annotation in &args.agent_pod_annotations {
+        append_helm_set_string(
+            command,
+            &format!("agent.podAnnotations.{}", helm_set_key(&annotation.key)),
+            &annotation.value,
+        );
+    }
+    if let Some(priority_class) = args.agent_priority_class.as_deref() {
+        append_helm_set_string(command, "agent.priorityClassName", priority_class);
+    }
+    for selector in &args.agent_node_selectors {
+        append_helm_set_string(
+            command,
+            &format!("agent.nodeSelector.{}", helm_set_key(&selector.key)),
+            &selector.value,
+        );
+    }
+    if let Some(cpu) = args.agent_resource_request_cpu.as_deref() {
+        append_helm_set_string(command, "agent.resources.requests.cpu", cpu);
+    }
+    if let Some(memory) = args.agent_resource_request_memory.as_deref() {
+        append_helm_set_string(command, "agent.resources.requests.memory", memory);
+    }
+    if let Some(cpu) = args.agent_resource_limit_cpu.as_deref() {
+        append_helm_set_string(command, "agent.resources.limits.cpu", cpu);
+    }
+    if let Some(memory) = args.agent_resource_limit_memory.as_deref() {
+        append_helm_set_string(command, "agent.resources.limits.memory", memory);
     }
 }
 
@@ -2313,6 +2461,48 @@ fn validate_kubernetes_session_affinity_options(
             anyhow::bail!(
                 "--{flag_prefix}-session-affinity-timeout-seconds requires --{flag_prefix}-session-affinity ClientIP"
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    for label in &args.agent_pod_labels {
+        validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
+        validate_kubernetes_label_value(&label.value).map_err(anyhow::Error::msg)?;
+    }
+    for annotation in &args.agent_pod_annotations {
+        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
+        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(priority_class) = args.agent_priority_class.as_deref() {
+        validate_kubernetes_dns_subdomain(priority_class, "agent priority class")
+            .map_err(anyhow::Error::msg)?;
+    }
+    for selector in &args.agent_node_selectors {
+        validate_kubernetes_label_key(&selector.key).map_err(anyhow::Error::msg)?;
+        validate_kubernetes_label_value(&selector.value).map_err(anyhow::Error::msg)?;
+    }
+    for (label, quantity) in [
+        (
+            "agent resource request cpu",
+            args.agent_resource_request_cpu.as_deref(),
+        ),
+        (
+            "agent resource request memory",
+            args.agent_resource_request_memory.as_deref(),
+        ),
+        (
+            "agent resource limit cpu",
+            args.agent_resource_limit_cpu.as_deref(),
+        ),
+        (
+            "agent resource limit memory",
+            args.agent_resource_limit_memory.as_deref(),
+        ),
+    ] {
+        if let Some(quantity) = quantity {
+            validate_kubernetes_resource_quantity(quantity, label).map_err(anyhow::Error::msg)?;
         }
     }
     Ok(())
@@ -3442,6 +3632,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: true,
             network_policy_acknowledge_host_network: true,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
@@ -3496,7 +3694,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
         assert!(plan.commands[2]
-            .contains("--set-string networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8"));
+            .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
@@ -3504,8 +3702,8 @@ mod tests {
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
         assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
-        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
-        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
+        assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[0]=IPv4'"));
+        assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[1]=IPv6'"));
         assert!(plan.commands[2].contains("--set agent.apiService.internalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains("--set agent.apiService.sessionAffinity=ClientIP"));
         assert!(
@@ -3513,15 +3711,16 @@ mod tests {
         );
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
-        assert!(plan.commands[2]
-            .contains("--set-string agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24"));
         assert!(plan.commands[2].contains(
-            "--set-string agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip"
+            "--set-string 'agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24'"
+        ));
+        assert!(plan.commands[2].contains(
+            "--set-string 'agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip'"
         ));
         assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
         assert!(plan.commands[2]
-            .contains("--set-string networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24"));
+            .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
@@ -3532,7 +3731,7 @@ mod tests {
         assert!(
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
-        assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
+        assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[0]=IPv6'"));
         assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
         assert!(plan.commands[2].contains("--set agent.relayService.sessionAffinity=ClientIP"));
         assert!(
@@ -3541,7 +3740,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains(
-            "--set-string agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24"
+            "--set-string 'agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24'"
         ));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820"));
@@ -3551,7 +3750,7 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
         assert!(plan.commands[2].contains(
-            "--set-string agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public"
+            "--set-string 'agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public'"
         ));
         assert!(plan
             .security
@@ -3594,6 +3793,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -3648,14 +3855,79 @@ mod tests {
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
         assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
         assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
-        assert!(helm.contains("--set-string serviceExposure.apiServerCidrs[0]=10.0.0.1/32"));
-        assert!(helm.contains("--set-string serviceExposure.serviceCidrs[0]=10.96.0.0/12"));
-        assert!(helm.contains("--set-string serviceExposure.namespaces[0]=default"));
-        assert!(helm.contains("--set-string serviceExposure.namespaces[1]=platform"));
+        assert!(helm.contains("--set-string 'serviceExposure.apiServerCidrs[0]=10.0.0.1/32'"));
+        assert!(helm.contains("--set-string 'serviceExposure.serviceCidrs[0]=10.96.0.0/12'"));
+        assert!(helm.contains("--set-string 'serviceExposure.namespaces[0]=default'"));
+        assert!(helm.contains("--set-string 'serviceExposure.namespaces[1]=platform'"));
         assert!(
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_pod_scheduling_options() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_pod_labels = vec![KeyValueArg {
+            key: "ipars.io/role".to_string(),
+            value: "agent".to_string(),
+        }];
+        args.agent_pod_annotations = vec![KeyValueArg {
+            key: "prometheus.io/scrape".to_string(),
+            value: "true".to_string(),
+        }];
+        args.agent_priority_class = Some("ipars-agent-critical".to_string());
+        args.agent_node_selectors = vec![KeyValueArg {
+            key: "kubernetes.io/os".to_string(),
+            value: "linux".to_string(),
+        }];
+        args.agent_resource_request_cpu = Some("100m".to_string());
+        args.agent_resource_request_memory = Some("128Mi".to_string());
+        args.agent_resource_limit_cpu = Some("500m".to_string());
+        args.agent_resource_limit_memory = Some("512Mi".to_string());
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set-string 'agent.podLabels.ipars\\.io/role=agent'"));
+        assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
+        assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
+        assert!(helm.contains("--set-string 'agent.nodeSelector.kubernetes\\.io/os=linux'"));
+        assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
+        assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
+        assert!(helm.contains("--set-string agent.resources.limits.cpu=500m"));
+        assert!(helm.contains("--set-string agent.resources.limits.memory=512Mi"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-pod-label",
+            "Example.com/role=agent",
+        ]);
+        assert!(parsed.is_err());
+        assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+
+        let mut invalid_selector = base_k8s_install_args();
+        invalid_selector.agent_node_selectors = vec![KeyValueArg {
+            key: "kubernetes.io/os".to_string(),
+            value: "-linux".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_selector) {
+            Ok(_) => panic!("invalid node selector label value should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("label value"));
+
+        let mut invalid_priority = base_k8s_install_args();
+        invalid_priority.agent_priority_class = Some("system/node-critical".to_string());
+        let error = match k8s_install_plan(invalid_priority) {
+            Ok(_) => panic!("invalid priority class should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent priority class"));
+
         Ok(())
     }
 
@@ -3829,6 +4101,22 @@ mod tests {
             "--allow-cluster-external-traffic-policy",
             "--enable-network-policy",
             "--network-policy-acknowledge-host-network",
+            "--agent-pod-label",
+            "ipars.io/role=agent",
+            "--agent-pod-annotation",
+            "prometheus.io/scrape=true",
+            "--agent-priority-class",
+            "ipars-agent-critical",
+            "--agent-node-selector",
+            "kubernetes.io/os=linux",
+            "--agent-resource-request-cpu",
+            "100m",
+            "--agent-resource-request-memory",
+            "128Mi",
+            "--agent-resource-limit-cpu",
+            "500m",
+            "--agent-resource-limit-memory",
+            "512Mi",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -3925,6 +4213,35 @@ mod tests {
             assert!(args.allow_cluster_external_traffic_policy);
             assert!(args.enable_network_policy);
             assert!(args.network_policy_acknowledge_host_network);
+            assert_eq!(
+                args.agent_pod_labels,
+                vec![KeyValueArg {
+                    key: "ipars.io/role".to_string(),
+                    value: "agent".to_string(),
+                }]
+            );
+            assert_eq!(
+                args.agent_pod_annotations,
+                vec![KeyValueArg {
+                    key: "prometheus.io/scrape".to_string(),
+                    value: "true".to_string(),
+                }]
+            );
+            assert_eq!(
+                args.agent_priority_class.as_deref(),
+                Some("ipars-agent-critical")
+            );
+            assert_eq!(
+                args.agent_node_selectors,
+                vec![KeyValueArg {
+                    key: "kubernetes.io/os".to_string(),
+                    value: "linux".to_string(),
+                }]
+            );
+            assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
+            assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
+            assert_eq!(args.agent_resource_limit_cpu.as_deref(), Some("500m"));
+            assert_eq!(args.agent_resource_limit_memory.as_deref(), Some("512Mi"));
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_node_port, Some(31080));
@@ -4035,6 +4352,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4104,6 +4429,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4541,10 +4874,10 @@ mod tests {
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
         assert!(plan.commands[2]
-            .contains("--set-string networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8"));
+            .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
         assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
         assert!(plan.commands[2]
-            .contains("--set-string networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24"));
+            .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
 
         let parsed = Cli::try_parse_from([
             "ipars",
@@ -4616,12 +4949,12 @@ mod tests {
 
         let plan = k8s_install_plan(valid)?;
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
-        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[0]=IPv4"));
-        assert!(plan.commands[2].contains("--set-string agent.apiService.ipFamilies[1]=IPv6"));
+        assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[0]=IPv4'"));
+        assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[1]=IPv6'"));
         assert!(
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
-        assert!(plan.commands[2].contains("--set-string agent.relayService.ipFamilies[0]=IPv6"));
+        assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[0]=IPv6'"));
 
         let parsed = Cli::try_parse_from([
             "ipars",
@@ -4688,6 +5021,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4744,6 +5085,14 @@ mod tests {
             allow_cluster_external_traffic_policy: true,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4807,6 +5156,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4868,6 +5225,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4924,6 +5289,14 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             enable_network_policy: false,
             network_policy_acknowledge_host_network: false,
+            agent_pod_labels: Vec::new(),
+            agent_pod_annotations: Vec::new(),
+            agent_priority_class: None,
+            agent_node_selectors: Vec::new(),
+            agent_resource_request_cpu: None,
+            agent_resource_request_memory: None,
+            agent_resource_limit_cpu: None,
+            agent_resource_limit_memory: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5001,6 +5374,25 @@ mod tests {
         );
         assert!(parse_kubernetes_session_affinity_timeout_seconds("0").is_err());
         assert!(parse_kubernetes_session_affinity_timeout_seconds("86401").is_err());
+        assert_eq!(
+            parse_kubernetes_label_pair("ipars.io/role=agent"),
+            Ok(KeyValueArg {
+                key: "ipars.io/role".to_string(),
+                value: "agent".to_string(),
+            })
+        );
+        assert!(parse_kubernetes_label_pair("Example.com/role=agent").is_err());
+        assert!(parse_kubernetes_label_pair("ipars.io/role=-agent").is_err());
+        assert_eq!(
+            parse_kubernetes_priority_class_name("ipars-agent-critical"),
+            Ok("ipars-agent-critical".to_string())
+        );
+        assert!(parse_kubernetes_priority_class_name("system/node-critical").is_err());
+        assert_eq!(
+            parse_kubernetes_resource_quantity("128Mi"),
+            Ok("128Mi".to_string())
+        );
+        assert!(parse_kubernetes_resource_quantity("128 Mi").is_err());
         assert_eq!(parse_kubernetes_node_port("30000"), Ok(30000));
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());

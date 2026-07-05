@@ -17,6 +17,17 @@ agent:
   routeProvider: false
   hostNetwork: true
   privileged: false
+  podLabels: {}
+  podAnnotations: {}
+  priorityClassName: ""
+  nodeSelector: {}
+  resources:
+    requests:
+      cpu: ""
+      memory: ""
+    limits:
+      cpu: ""
+      memory: ""
   apiService:
     enabled: false
     exposureAcknowledged: false

@@ -9,6 +9,26 @@
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- if .Values.agent.priorityClassName -}}
+{{- if or (gt (len .Values.agent.priorityClassName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.priorityClassName)) -}}
+{{- fail "agent.priorityClassName must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := .Values.agent.podLabels -}}
+{{- include "ipars.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
+{{- include "ipars.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
+{{- end -}}
+{{- range $key, $_ := .Values.agent.podAnnotations -}}
+{{- include "ipars.validateAnnotationKey" (dict "path" "agent.podAnnotations" "key" $key) -}}
+{{- end -}}
+{{- range $key, $value := .Values.agent.nodeSelector -}}
+{{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
+{{- include "ipars.validateLabelValue" (dict "path" "agent.nodeSelector" "value" (printf "%v" $value)) -}}
+{{- end -}}
+{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.cpu" "value" (printf "%v" .Values.agent.resources.requests.cpu)) -}}
+{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
+{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
+{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.memory" "value" (printf "%v" .Values.agent.resources.limits.memory)) -}}
 {{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
 {{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
 {{- end -}}
@@ -89,9 +109,27 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: {{ include "ipars.name" . }}
+        {{- range $key, $value := .Values.agent.podLabels }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+      {{- with .Values.agent.podAnnotations }}
+      annotations:
+        {{- range $key, $value := . }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "ipars.fullname" . }}
       hostNetwork: {{ .Values.agent.hostNetwork }}
+      {{- if .Values.agent.priorityClassName }}
+      priorityClassName: {{ .Values.agent.priorityClassName | quote }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- range $key, $value := . }}
+        {{ $key }}: {{ $value | quote }}
+        {{- end }}
+      {{- end }}
       containers:
         - name: agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -185,6 +223,27 @@ spec:
               add:
                 - NET_ADMIN
                 - NET_RAW
+          {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory .Values.agent.resources.limits.cpu .Values.agent.resources.limits.memory }}
+          resources:
+            {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory }}
+            requests:
+              {{- if .Values.agent.resources.requests.cpu }}
+              cpu: {{ .Values.agent.resources.requests.cpu | quote }}
+              {{- end }}
+              {{- if .Values.agent.resources.requests.memory }}
+              memory: {{ .Values.agent.resources.requests.memory | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if or .Values.agent.resources.limits.cpu .Values.agent.resources.limits.memory }}
+            limits:
+              {{- if .Values.agent.resources.limits.cpu }}
+              cpu: {{ .Values.agent.resources.limits.cpu | quote }}
+              {{- end }}
+              {{- if .Values.agent.resources.limits.memory }}
+              memory: {{ .Values.agent.resources.limits.memory | quote }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
           volumeMounts:
             - name: dev-net-tun
               mountPath: /dev/net/tun

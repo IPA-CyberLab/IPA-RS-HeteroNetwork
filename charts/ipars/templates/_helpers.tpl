@@ -20,6 +20,45 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateLabelKey" -}}
+{{- $key := .key -}}
+{{- $path := .path -}}
+{{- $parts := splitList "/" $key -}}
+{{- if gt (len $parts) 2 -}}
+{{- fail (printf "%s label key %q must contain at most one '/' separator" $path $key) -}}
+{{- else if eq (len $parts) 2 -}}
+{{- $prefix := index $parts 0 -}}
+{{- $name := index $parts 1 -}}
+{{- if or (eq $prefix "") (gt (len $prefix) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $prefix)) -}}
+{{- fail (printf "%s label prefix %q must be a Kubernetes DNS subdomain" $path $prefix) -}}
+{{- end -}}
+{{- if or (eq $name "") (gt (len $name) 63) (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$" $name)) -}}
+{{- fail (printf "%s label name %q must be a Kubernetes qualified name" $path $name) -}}
+{{- end -}}
+{{- else -}}
+{{- $name := index $parts 0 -}}
+{{- if or (eq $name "") (gt (len $name) 63) (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$" $name)) -}}
+{{- fail (printf "%s label name %q must be a Kubernetes qualified name" $path $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateLabelValue" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- if or (gt (len $value) 63) (and (ne $value "") (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$" $value))) -}}
+{{- fail (printf "%s label value %q must be empty or a Kubernetes label value of at most 63 bytes" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateResourceQuantity" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- if and (ne $value "") (or (gt (len $value) 64) (not (regexMatch "^[0-9]([0-9A-Za-z.+-]*[0-9A-Za-z])?$" $value))) -}}
+{{- fail (printf "%s resource quantity %q must be a non-negative Kubernetes quantity without whitespace" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateAnnotationKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}
