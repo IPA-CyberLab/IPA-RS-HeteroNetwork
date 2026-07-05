@@ -11,8 +11,9 @@ use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
-    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest,
+    RevokeTokenResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
@@ -214,8 +215,12 @@ enum PathCommand {
 
 #[derive(Debug, Args)]
 struct PathStatusArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
     agent_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_NODE_ID")]
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -622,6 +627,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
                 Some(agent_url) => print_json(&path_status(agent_url).await?)?,
+                None if args.control_plane_url.is_some() => {
+                    print_json(&control_plane_path_status(&args).await?)?
+                }
+                None if args.node_id.is_some() => {
+                    anyhow::bail!("ipars path status requires --control-plane-url with --node-id")
+                }
                 None => print_json(&StaticStatus::path())?,
             },
             PathCommand::Activity(args) => {
@@ -1228,6 +1239,25 @@ async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
 
 async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
     get_json(agent_url, "/v1/paths", "agent path status").await
+}
+
+async fn control_plane_path_status(
+    args: &PathStatusArgs,
+) -> anyhow::Result<ControlPlanePathsResponse> {
+    let control_plane_url = args
+        .control_plane_url
+        .as_deref()
+        .context("ipars path status requires --control-plane-url")?;
+    let node_id = args
+        .node_id
+        .as_deref()
+        .context("ipars path status requires --node-id with --control-plane-url")?;
+    get_json(
+        control_plane_url,
+        &format!("/v1/paths/{node_id}"),
+        "control-plane path status",
+    )
+    .await
 }
 
 async fn path_activity(
@@ -5110,9 +5140,46 @@ mod tests {
         } = path.command
         {
             assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            assert_eq!(args.control_plane_url, None);
         } else {
             anyhow::bail!("expected path status command");
         }
+
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "status",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Status(args),
+        } = path.command
+        {
+            assert_eq!(args.agent_url, None);
+            assert_eq!(
+                args.control_plane_url.as_deref(),
+                Some("http://127.0.0.1:8443")
+            );
+            assert_eq!(args.node_id.as_deref(), Some("node-a"));
+        } else {
+            anyhow::bail!("expected path status command");
+        }
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "path",
+            "status",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])
+        .is_err());
 
         let activity = Cli::try_parse_from([
             "ipars",

@@ -1022,6 +1022,14 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlanePathsResponse {
+        pub cluster_id: ClusterId,
+        pub node_id: NodeId,
+        pub paths: Vec<PathRecord>,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct NodeRequestSignature {
         pub signed_at: DateTime<Utc>,
         pub signature: String,

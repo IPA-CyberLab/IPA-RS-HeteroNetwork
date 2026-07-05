@@ -130,6 +130,7 @@ ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root -
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars path status --agent-url http://127.0.0.1:9780
+ipars path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path activity --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --pin
 ipars path probe --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --state DIRECT_NAT_TRAVERSAL --latency-ms 23.5 --loss-ppm 100 --jitter-ms 3.25 --candidate-addr 198.51.100.10:51820 --candidate-kind stun-reflexive --pin
 ipars docker install --project-name ipars --compose-file docker/compose.yaml --docker-discover-networks --docker-network ipars_default

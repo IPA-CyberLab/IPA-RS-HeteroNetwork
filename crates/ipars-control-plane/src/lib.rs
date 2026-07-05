@@ -11,9 +11,9 @@ use ipars_crypto::{
     CryptoError,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
+    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
     AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
@@ -633,6 +633,47 @@ where
             .collect::<Vec<_>>();
 
         Ok(self.filtered_peer_map_for_node(&source, &peers, Utc::now()))
+    }
+
+    pub async fn paths_for(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ControlPlanePathsResponse, ControlPlaneError> {
+        let source = self
+            .store
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let peers = self.store.list_nodes().await?;
+        let peers_by_id = peers
+            .iter()
+            .map(|peer| (peer.node_id.clone(), peer))
+            .collect::<BTreeMap<_, _>>();
+        let paths = self
+            .store
+            .list_paths_for(node_id)
+            .await?
+            .into_iter()
+            .filter(|path| {
+                let peer_id = if path.key.local == source.node_id {
+                    &path.key.remote
+                } else if path.key.remote == source.node_id {
+                    &path.key.local
+                } else {
+                    return false;
+                };
+                peers_by_id.get(peer_id).is_some_and(|peer| {
+                    acl_filter_peer(&source, peer, &self.config.cluster_policy).is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ControlPlanePathsResponse {
+            cluster_id: self.config.cluster_id.clone(),
+            node_id: node_id.clone(),
+            paths,
+            generated_at: Utc::now(),
+        })
     }
 
     pub async fn heartbeat(
@@ -2429,6 +2470,24 @@ mod tests {
             .peers
             .iter()
             .all(|peer| peer.node_id != node_id("denied")));
+        store.upsert_path(path("source", "allowed")).await?;
+        store.upsert_path(path("source", "denied")).await?;
+        store.upsert_path(path("route-provider", "source")).await?;
+
+        let paths = plane.paths_for(&source.node_id).await?;
+
+        assert_eq!(paths.node_id, source.node_id);
+        assert_eq!(paths.paths.len(), 2);
+        assert!(paths.paths.iter().any(|path| {
+            path.key.local == node_id("source") && path.key.remote == node_id("allowed")
+        }));
+        assert!(paths.paths.iter().any(|path| {
+            path.key.local == node_id("route-provider") && path.key.remote == node_id("source")
+        }));
+        assert!(paths
+            .paths
+            .iter()
+            .all(|path| path.key.remote != node_id("denied")));
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.peer_map_candidate_count, 12);
         assert_eq!(metrics.peer_map_visible_count, 6);

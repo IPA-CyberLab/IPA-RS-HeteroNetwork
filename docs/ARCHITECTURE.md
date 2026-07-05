@@ -191,6 +191,7 @@ Initial control-plane HTTP routes:
 - `POST /v1/heartbeat`
 - `GET /v1/metrics`
 - `GET /v1/peers/{node_id}`
+- `GET /v1/paths/{node_id}`
 - `POST /v1/tokens/revoke`
 
 Initial signal HTTP routes:
