@@ -292,6 +292,22 @@ struct K8sInstallArgs {
     #[arg(long, default_value = "token")]
     join_token_key: String,
     #[arg(long, default_value_t = false)]
+    kubernetes_discover_services: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    kubernetes_discover_api_server: bool,
+    #[arg(long = "kubernetes-api-server-cidr")]
+    kubernetes_api_server_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "kubernetes-service-cidr")]
+    kubernetes_service_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "kubernetes-namespace")]
+    kubernetes_namespaces: Vec<String>,
+    #[arg(long)]
+    kubernetes_service_label_selector: Option<String>,
+    #[arg(long)]
+    kubernetes_route_provider: Option<String>,
+    #[arg(long, default_value_t = 60)]
+    kubernetes_route_interval_seconds: u64,
+    #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
     allow_public_service_exposure: bool,
@@ -1501,11 +1517,13 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_service_exposure(&args)?;
+    validate_k8s_route_discovery(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
         "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
         args.release, chart, args.namespace, args.join_token_secret, args.join_token_key
     );
+    append_k8s_route_discovery_values(&mut helm_command, &args);
     if args.expose_agent_api {
         helm_command.push_str(" --set agent.apiService.enabled=true");
         helm_command.push_str(&format!(
@@ -1648,6 +1666,109 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs) {
+    command.push_str(&format!(
+        " --set serviceExposure.discoverApiServer={}",
+        args.kubernetes_discover_api_server
+    ));
+    command.push_str(&format!(
+        " --set serviceExposure.routeIntervalSeconds={}",
+        args.kubernetes_route_interval_seconds
+    ));
+    if args.kubernetes_discover_services {
+        command.push_str(" --set serviceExposure.discoverServices=true");
+    }
+    append_helm_ipnet_list(
+        command,
+        "serviceExposure.apiServerCidrs",
+        &args.kubernetes_api_server_cidrs,
+    );
+    append_helm_ipnet_list(
+        command,
+        "serviceExposure.serviceCidrs",
+        &args.kubernetes_service_cidrs,
+    );
+    for (index, namespace) in args.kubernetes_namespaces.iter().enumerate() {
+        append_helm_set_string(
+            command,
+            &format!("serviceExposure.namespaces[{index}]"),
+            namespace,
+        );
+    }
+    if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
+        append_helm_set_string(command, "serviceExposure.serviceLabelSelector", selector);
+    }
+    if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        append_helm_set_string(
+            command,
+            "serviceExposure.routeProviderNodeId",
+            route_provider,
+        );
+    }
+}
+
+fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    for namespace in &args.kubernetes_namespaces {
+        validate_kubernetes_namespace(namespace)?;
+    }
+    if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
+        validate_kubernetes_label_selector(selector)?;
+    }
+    if !args.kubernetes_discover_services {
+        if !args.kubernetes_namespaces.is_empty() {
+            anyhow::bail!("--kubernetes-namespace requires --kubernetes-discover-services");
+        }
+        if args.kubernetes_service_label_selector.is_some() {
+            anyhow::bail!(
+                "--kubernetes-service-label-selector requires --kubernetes-discover-services"
+            );
+        }
+    }
+    if args.kubernetes_route_interval_seconds == 0 {
+        anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_namespace(namespace: &str) -> anyhow::Result<()> {
+    if namespace.is_empty() {
+        anyhow::bail!("Kubernetes namespace cannot be empty");
+    }
+    if namespace.len() > 63 {
+        anyhow::bail!("Kubernetes namespace `{namespace}` exceeds 63 bytes");
+    }
+    let valid_body = namespace
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let valid_edges = namespace
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && namespace
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !valid_body || !valid_edges {
+        anyhow::bail!(
+            "Kubernetes namespace `{namespace}` must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges"
+        );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
+    if selector.is_empty() {
+        anyhow::bail!("Kubernetes service label selector cannot be empty");
+    }
+    if selector.len() > 1024 {
+        anyhow::bail!("Kubernetes service label selector exceeds 1024 bytes");
+    }
+    if selector.chars().any(char::is_control) {
+        anyhow::bail!("Kubernetes service label selector cannot contain control characters");
+    }
+    Ok(())
 }
 
 fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
@@ -2513,6 +2634,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -2544,6 +2673,8 @@ mod tests {
             "kubectl -n edge-system create secret generic edge-token --from-file=signed-token=./join.token --dry-run=client -o yaml | kubectl apply -f -"
         );
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
+        assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
+        assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
@@ -2575,6 +2706,126 @@ mod tests {
             .iter()
             .any(|requirement| requirement.contains("disabled by default")));
         Ok(())
+    }
+
+    fn base_k8s_install_args() -> K8sInstallArgs {
+        K8sInstallArgs {
+            release: "edge".to_string(),
+            namespace: "edge-system".to_string(),
+            chart: PathBuf::from("charts/ipars"),
+            join_token_secret: "edge-token".to_string(),
+            join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
+            expose_agent_api: false,
+            allow_public_service_exposure: false,
+            allow_unrestricted_load_balancer: false,
+            allow_cluster_external_traffic_policy: false,
+            agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_allow_source_cidrs: Vec::new(),
+            agent_api_external_traffic_policy: "Local".to_string(),
+            agent_api_service_annotations: Vec::new(),
+            expose_relay: false,
+            relay_service_type: "LoadBalancer".to_string(),
+            relay_allow_source_cidrs: Vec::new(),
+            relay_external_traffic_policy: "Local".to_string(),
+            relay_service_annotations: Vec::new(),
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
+        }
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_route_discovery_settings() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.kubernetes_discover_services = true;
+        args.kubernetes_discover_api_server = false;
+        args.kubernetes_api_server_cidrs = vec!["10.0.0.1/32".parse()?];
+        args.kubernetes_service_cidrs = vec!["10.96.0.0/12".parse()?];
+        args.kubernetes_namespaces = vec!["default".to_string(), "platform".to_string()];
+        args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
+        args.kubernetes_route_provider = Some("route-provider-a".to_string());
+        args.kubernetes_route_interval_seconds = 15;
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set serviceExposure.discoverServices=true"));
+        assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
+        assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
+        assert!(helm.contains("--set-string serviceExposure.apiServerCidrs[0]=10.0.0.1/32"));
+        assert!(helm.contains("--set-string serviceExposure.serviceCidrs[0]=10.96.0.0/12"));
+        assert!(helm.contains("--set-string serviceExposure.namespaces[0]=default"));
+        assert!(helm.contains("--set-string serviceExposure.namespaces[1]=platform"));
+        assert!(
+            helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
+        );
+        assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_invalid_route_discovery_settings() {
+        let mut namespace_without_discovery = base_k8s_install_args();
+        namespace_without_discovery.kubernetes_namespaces = vec!["default".to_string()];
+        let error = match k8s_install_plan(namespace_without_discovery) {
+            Ok(_) => panic!("namespace without discovery should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--kubernetes-namespace requires --kubernetes-discover-services"));
+
+        let mut selector_without_discovery = base_k8s_install_args();
+        selector_without_discovery.kubernetes_service_label_selector =
+            Some("ipars.io/expose=true".to_string());
+        let error = match k8s_install_plan(selector_without_discovery) {
+            Ok(_) => panic!("selector without discovery should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-label-selector requires --kubernetes-discover-services"
+        ));
+
+        let mut invalid_namespace = base_k8s_install_args();
+        invalid_namespace.kubernetes_discover_services = true;
+        invalid_namespace.kubernetes_namespaces = vec!["Platform".to_string()];
+        let error = match k8s_install_plan(invalid_namespace) {
+            Ok(_) => panic!("invalid namespace should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must be a DNS label using lowercase ASCII letters"));
+
+        let mut invalid_selector = base_k8s_install_args();
+        invalid_selector.kubernetes_discover_services = true;
+        invalid_selector.kubernetes_service_label_selector =
+            Some("ipars.io/expose=true\n".to_string());
+        let error = match k8s_install_plan(invalid_selector) {
+            Ok(_) => panic!("invalid selector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("cannot contain control characters"));
+
+        let mut invalid_interval = base_k8s_install_args();
+        invalid_interval.kubernetes_route_interval_seconds = 0;
+        let error = match k8s_install_plan(invalid_interval) {
+            Ok(_) => panic!("zero route interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--kubernetes-route-interval-seconds must be greater than zero"));
     }
 
     #[test]
@@ -2635,6 +2886,21 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--kubernetes-discover-services",
+            "--kubernetes-discover-api-server",
+            "false",
+            "--kubernetes-api-server-cidr",
+            "10.0.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-namespace",
+            "default",
+            "--kubernetes-service-label-selector",
+            "ipars.io/expose=true",
+            "--kubernetes-route-provider",
+            "route-provider-a",
+            "--kubernetes-route-interval-seconds",
+            "15",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
@@ -2669,6 +2935,26 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert!(args.kubernetes_discover_services);
+            assert!(!args.kubernetes_discover_api_server);
+            assert_eq!(
+                args.kubernetes_api_server_cidrs,
+                vec!["10.0.0.1/32".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(
+                args.kubernetes_service_cidrs,
+                vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
+            );
+            assert_eq!(args.kubernetes_namespaces, vec!["default"]);
+            assert_eq!(
+                args.kubernetes_service_label_selector.as_deref(),
+                Some("ipars.io/expose=true")
+            );
+            assert_eq!(
+                args.kubernetes_route_provider.as_deref(),
+                Some("route-provider-a")
+            );
+            assert_eq!(args.kubernetes_route_interval_seconds, 15);
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -2725,6 +3011,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -2763,6 +3057,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -2792,6 +3094,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -2817,6 +3127,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -2849,6 +3167,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -2879,6 +3205,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -2904,6 +3238,14 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            kubernetes_discover_services: false,
+            kubernetes_discover_api_server: true,
+            kubernetes_api_server_cidrs: Vec::new(),
+            kubernetes_service_cidrs: Vec::new(),
+            kubernetes_namespaces: Vec::new(),
+            kubernetes_service_label_selector: None,
+            kubernetes_route_provider: None,
+            kubernetes_route_interval_seconds: 60,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
