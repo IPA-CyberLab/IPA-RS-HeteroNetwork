@@ -1348,18 +1348,30 @@ pub mod api {
         Https,
         Ssh,
         KubernetesApi,
+        Etcd,
+        Postgres,
+        Mysql,
+        Redis,
+        Prometheus,
+        OpenTelemetry,
         WireGuard,
         Icmp,
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 8] = [
+        pub const ALL: [Self; 14] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
             Self::Https,
             Self::Ssh,
             Self::KubernetesApi,
+            Self::Etcd,
+            Self::Postgres,
+            Self::Mysql,
+            Self::Redis,
+            Self::Prometheus,
+            Self::OpenTelemetry,
             Self::WireGuard,
             Self::Icmp,
         ];
@@ -1372,6 +1384,12 @@ pub mod api {
                 Self::Https => "https",
                 Self::Ssh => "ssh",
                 Self::KubernetesApi => "kubernetes_api",
+                Self::Etcd => "etcd",
+                Self::Postgres => "postgres",
+                Self::Mysql => "mysql",
+                Self::Redis => "redis",
+                Self::Prometheus => "prometheus",
+                Self::OpenTelemetry => "opentelemetry",
                 Self::WireGuard => "wireguard",
                 Self::Icmp => "icmp",
             }
@@ -1447,6 +1465,11 @@ pub mod api {
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
             }
+            if (self.involves_port(2379) || self.involves_port(2380))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Etcd;
+            }
             if self.involves_port(53)
                 && matches!(
                     self.protocol,
@@ -1463,6 +1486,23 @@ pub mod api {
             }
             if self.involves_port(22) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Ssh;
+            }
+            if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Postgres;
+            }
+            if self.involves_port(3306) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Mysql;
+            }
+            if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Redis;
+            }
+            if self.involves_port(9090) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Prometheus;
+            }
+            if (self.involves_port(4317) || self.involves_port(4318))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::OpenTelemetry;
             }
             AgentPacketFlowApplication::Unknown
         }
@@ -1700,6 +1740,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(https.application(), api::AgentPacketFlowApplication::Https);
+
+        let etcd = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2379),
+            ..Default::default()
+        };
+        assert_eq!(etcd.application(), api::AgentPacketFlowApplication::Etcd);
+
+        let postgres = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(5432),
+            ..Default::default()
+        };
+        assert_eq!(
+            postgres.application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+
+        let mysql = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3306),
+            ..Default::default()
+        };
+        assert_eq!(mysql.application(), api::AgentPacketFlowApplication::Mysql);
+
+        let redis = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6379),
+            ..Default::default()
+        };
+        assert_eq!(redis.application(), api::AgentPacketFlowApplication::Redis);
+
+        let prometheus = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9090),
+            ..Default::default()
+        };
+        assert_eq!(
+            prometheus.application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+
+        let opentelemetry = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(4317),
+            ..Default::default()
+        };
+        assert_eq!(
+            opentelemetry.application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
     }
 
     #[test]

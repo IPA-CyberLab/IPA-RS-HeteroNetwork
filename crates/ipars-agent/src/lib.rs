@@ -408,6 +408,12 @@ pub struct AgentRuntime {
     packet_flow_application_https_count: AtomicU64,
     packet_flow_application_ssh_count: AtomicU64,
     packet_flow_application_kubernetes_api_count: AtomicU64,
+    packet_flow_application_etcd_count: AtomicU64,
+    packet_flow_application_postgres_count: AtomicU64,
+    packet_flow_application_mysql_count: AtomicU64,
+    packet_flow_application_redis_count: AtomicU64,
+    packet_flow_application_prometheus_count: AtomicU64,
+    packet_flow_application_opentelemetry_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
     packet_flow_application_icmp_count: AtomicU64,
 }
@@ -645,6 +651,12 @@ impl AgentRuntime {
             packet_flow_application_https_count: AtomicU64::new(0),
             packet_flow_application_ssh_count: AtomicU64::new(0),
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
+            packet_flow_application_etcd_count: AtomicU64::new(0),
+            packet_flow_application_postgres_count: AtomicU64::new(0),
+            packet_flow_application_mysql_count: AtomicU64::new(0),
+            packet_flow_application_redis_count: AtomicU64::new(0),
+            packet_flow_application_prometheus_count: AtomicU64::new(0),
+            packet_flow_application_opentelemetry_count: AtomicU64::new(0),
             packet_flow_application_wireguard_count: AtomicU64::new(0),
             packet_flow_application_icmp_count: AtomicU64::new(0),
         }
@@ -1164,6 +1176,16 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Ssh => &self.packet_flow_application_ssh_count,
             AgentPacketFlowApplication::KubernetesApi => {
                 &self.packet_flow_application_kubernetes_api_count
+            }
+            AgentPacketFlowApplication::Etcd => &self.packet_flow_application_etcd_count,
+            AgentPacketFlowApplication::Postgres => &self.packet_flow_application_postgres_count,
+            AgentPacketFlowApplication::Mysql => &self.packet_flow_application_mysql_count,
+            AgentPacketFlowApplication::Redis => &self.packet_flow_application_redis_count,
+            AgentPacketFlowApplication::Prometheus => {
+                &self.packet_flow_application_prometheus_count
+            }
+            AgentPacketFlowApplication::OpenTelemetry => {
+                &self.packet_flow_application_opentelemetry_count
             }
             AgentPacketFlowApplication::WireGuard => &self.packet_flow_application_wireguard_count,
             AgentPacketFlowApplication::Icmp => &self.packet_flow_application_icmp_count,
@@ -3767,6 +3789,34 @@ mod tests {
             )
             .await
             .is_none());
+        let postgres_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 26)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(5432),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(postgres_match.peer, peer_b_id);
+        let prometheus_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 27)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(9090),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(prometheus_match.peer, peer_b_id);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
@@ -3776,8 +3826,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 4);
-        assert_eq!(metrics.packet_flow_match_count, 2);
+        assert_eq!(metrics.packet_flow_observation_count, 6);
+        assert_eq!(metrics.packet_flow_match_count, 4);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -3789,7 +3839,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            2
+            4
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -3813,6 +3863,8 @@ mod tests {
             application_count(AgentPacketFlowApplication::KubernetesApi),
             1
         );
+        assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Prometheus), 1);
         assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics
