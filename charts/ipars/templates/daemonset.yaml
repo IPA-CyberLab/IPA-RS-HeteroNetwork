@@ -6,6 +6,9 @@
 {{- end -}}
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
+{{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
+{{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
 {{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
 {{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
 {{- end -}}
@@ -27,6 +30,12 @@
 {{- if .Values.agent.relayAdvertisement.enabled -}}
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
+{{- end -}}
+{{- if not (regexMatch $hostPortPattern .Values.agent.relayAdvertisement.publicEndpoint) -}}
+{{- fail "agent.relayAdvertisement.publicEndpoint must be host:port or [ipv6]:port" -}}
+{{- end -}}
+{{- if or (lt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 65535) -}}
+{{- fail "agent.relayAdvertisement.publicEndpoint port must be between 1 and 65535" -}}
 {{- end -}}
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
