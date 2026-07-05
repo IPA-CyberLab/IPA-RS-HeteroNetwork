@@ -21,7 +21,7 @@ use ipars_agent::{
     LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
     PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats,
     RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher,
-    UdpRelayFrameForwarder, WireGuardBackend,
+    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -749,6 +749,8 @@ enum WireGuardApplyBackend {
     Command,
     #[value(name = "kernel-netlink")]
     KernelNetlink,
+    #[value(name = "userspace-command")]
+    UserspaceCommand,
 }
 
 impl WireGuardApplyBackend {
@@ -756,6 +758,7 @@ impl WireGuardApplyBackend {
         match self {
             Self::Command => "command",
             Self::KernelNetlink => "kernel-netlink",
+            Self::UserspaceCommand => "userspace-command",
         }
     }
 }
@@ -1418,6 +1421,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_routes && args.route_backend == RouteApplyBackend::Command;
     let applies_wireguard_with_command =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::Command;
+    let applies_wireguard_with_userspace_command =
+        applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand;
     let applies_routes_with_netlink =
         applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
     let applies_wireguard_with_netlink =
@@ -1426,15 +1431,17 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
         ip_command: applies_routes_with_command || applies_wireguard_with_command,
-        wg_command: applies_wireguard_with_command,
+        wg_command: applies_wireguard_with_command || applies_wireguard_with_userspace_command,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
         docker_api_socket,
         ipv4_forwarding,
         ipv6_forwarding,
-        cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
-        cap_net_raw: applies_wireguard,
+        cap_net_admin: applies_routes
+            || (applies_wireguard && !applies_wireguard_with_userspace_command)
+            || netfilter_netlink,
+        cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
         cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
         cap_perfmon: ebpf_ringbuf,
         cap_bpf: ebpf_ringbuf,
@@ -3896,6 +3903,87 @@ async fn start_peer_map_sync(
                     .await
                 }
                 (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::Command,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                            namespace,
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        )),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::UserspaceCommand, RouteApplyBackend::Command, None) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxRouteManager::new(
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::KernelNetlink,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxNetlinkRouteManager::new_in_namespace(namespace),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::KernelNetlink,
+                    None,
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxNetlinkRouteManager::new(),
+                    )
+                    .await
+                }
+                (
                     WireGuardApplyBackend::KernelNetlink,
                     RouteApplyBackend::Command,
                     Some(namespace),
@@ -4892,6 +4980,37 @@ where
         route_backend = args.route_backend.as_str(),
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with command WireGuard and kernel route netlink backends"
+    );
+    Ok(start_peer_map_sync_with_sink(
+        args,
+        runtime,
+        control_plane_urls,
+        applier,
+    ))
+}
+
+async fn start_peer_map_sync_with_userspace_wireguard<W, R>(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+    control_plane_urls: Vec<String>,
+    wireguard_runner: W,
+    route_manager: R,
+) -> anyhow::Result<tokio::task::JoinHandle<()>>
+where
+    W: LinuxCommandRunner + 'static,
+    R: RouteManager + 'static,
+{
+    let wireguard =
+        UserspaceWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
+    wireguard.ensure_interface().await?;
+    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    tracing::info!(
+        backend = args.runtime_backend.as_str(),
+        wireguard_backend = args.wireguard_backend.as_str(),
+        route_backend = args.route_backend.as_str(),
+        linux_netns = ?args.linux_netns,
+        "starting peer-map sync with userspace WireGuard command backend"
     );
     Ok(start_peer_map_sync_with_sink(
         args,
@@ -10686,6 +10805,40 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(!needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
+            assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_accepts_userspace_wireguard_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-command",
+            "--route-backend",
+            "kernel-netlink",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.wireguard_backend,
+                WireGuardApplyBackend::UserspaceCommand
+            );
+            assert_eq!(args.wireguard_backend.as_str(), "userspace-command");
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
             return Ok(());
         }

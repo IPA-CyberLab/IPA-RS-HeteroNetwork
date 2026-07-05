@@ -2045,6 +2045,10 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "Rootless Docker Engine with a reachable user Docker socket for network discovery"
                 .to_string(),
         );
+        prerequisites.push(
+            "A userspace WireGuard implementation started before the agent and exposing the configured interface through wg(8)"
+                .to_string(),
+        );
     }
     if args.docker_discover_networks {
         prerequisites
@@ -2058,9 +2062,9 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.rootless {
-        notes.push("Rootless Docker network discovery can use the user socket, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
+        notes.push("Rootless Docker network discovery uses the user socket and selects the userspace-command WireGuard backend; the userspace WireGuard process must create the configured interface before peer-map sync starts".to_string());
     } else {
-        notes.push("Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
+        notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
     }
 
     Ok(InstallPlan {
@@ -2202,6 +2206,12 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
+        });
+    }
+    if args.rootless {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+            value: "userspace-command".to_string(),
         });
     }
     let container_namespace = args
@@ -4161,6 +4171,10 @@ mod tests {
             Some("${XDG_RUNTIME_DIR}/docker.sock")
         );
         assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("userspace-command")
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
             Some("compose-edge")
         );
@@ -4175,7 +4189,7 @@ mod tests {
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("userspace WireGuard backend")));
+            .any(|note| note.contains("userspace-command WireGuard backend")));
         assert!(plan
             .notes
             .iter()
@@ -4192,6 +4206,8 @@ mod tests {
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
+        assert!(compose
+            .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
         assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
