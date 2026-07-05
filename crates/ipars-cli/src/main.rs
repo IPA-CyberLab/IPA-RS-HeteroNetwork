@@ -319,6 +319,8 @@ struct K8sInstallArgs {
     agent_api_service_type: String,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
+    #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
+    agent_api_load_balancer_class: Option<String>,
     #[arg(long = "agent-api-allow-source-cidr", requires = "expose_agent_api")]
     agent_api_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
@@ -337,6 +339,8 @@ struct K8sInstallArgs {
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_http_node_port: Option<u16>,
+    #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
+    relay_load_balancer_class: Option<String>,
     #[arg(long = "relay-allow-source-cidr", requires = "expose_relay")]
     relay_allow_source_cidrs: Vec<ipnet::IpNet>,
     #[arg(long, default_value = "Local", value_parser = parse_kubernetes_external_traffic_policy)]
@@ -1117,6 +1121,11 @@ fn parse_kubernetes_node_port(value: &str) -> Result<u16, String> {
     }
 }
 
+fn parse_kubernetes_load_balancer_class(value: &str) -> Result<String, String> {
+    validate_kubernetes_load_balancer_class(value)?;
+    Ok(value.to_string())
+}
+
 fn is_external_kubernetes_service_type(service_type: &str) -> bool {
     matches!(service_type, "NodePort" | "LoadBalancer")
 }
@@ -1147,6 +1156,22 @@ fn validate_kubernetes_annotation_key(key: &str) -> Result<(), String> {
         validate_kubernetes_dns_subdomain(prefix, "annotation prefix")?;
     }
     validate_kubernetes_qualified_name(name, "annotation name")
+}
+
+fn validate_kubernetes_load_balancer_class(value: &str) -> Result<(), String> {
+    let (prefix, name) = match value.split_once('/') {
+        Some((prefix, name)) => {
+            if name.contains('/') {
+                return Err("loadBalancerClass must contain at most one '/' separator".to_string());
+            }
+            (Some(prefix), name)
+        }
+        None => (None, value),
+    };
+    if let Some(prefix) = prefix {
+        validate_kubernetes_dns_subdomain(prefix, "loadBalancerClass prefix")?;
+    }
+    validate_kubernetes_qualified_name(name, "loadBalancerClass name")
 }
 
 fn validate_kubernetes_dns_subdomain(value: &str, label: &str) -> Result<(), String> {
@@ -1704,6 +1729,13 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if let Some(node_port) = args.agent_api_node_port {
             helm_command.push_str(&format!(" --set agent.apiService.nodePort={node_port}"));
         }
+        if let Some(load_balancer_class) = args.agent_api_load_balancer_class.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.loadBalancerClass",
+                load_balancer_class,
+            );
+        }
         if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
             helm_command.push_str(&format!(
@@ -1762,6 +1794,13 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             helm_command.push_str(&format!(
                 " --set agent.relayService.httpNodePort={node_port}"
             ));
+        }
+        if let Some(load_balancer_class) = args.relay_load_balancer_class.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.loadBalancerClass",
+                load_balancer_class,
+            );
         }
         if is_external_kubernetes_service_type(&args.relay_service_type) {
             helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
@@ -1846,7 +1885,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Service type, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "Service type, NodePort, LoadBalancer class, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
@@ -2014,11 +2053,17 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
     }
+    if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
+    }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
     }
     if args.relay_http_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-http-node-port requires --expose-relay");
+    }
+    if args.relay_load_balancer_class.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
     }
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
@@ -2063,6 +2108,13 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         && args.relay_udp_node_port == args.relay_http_node_port
     {
         anyhow::bail!("--relay-udp-node-port and --relay-http-node-port must be different");
+    }
+    if args.agent_api_load_balancer_class.is_some() && args.agent_api_service_type != "LoadBalancer"
+    {
+        anyhow::bail!("--agent-api-load-balancer-class only applies to LoadBalancer services");
+    }
+    if args.relay_load_balancer_class.is_some() && args.relay_service_type != "LoadBalancer" {
+        anyhow::bail!("--relay-load-balancer-class only applies to LoadBalancer services");
     }
     if args.expose_agent_api
         && args.agent_api_service_type == "LoadBalancer"
@@ -2971,6 +3023,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
+            agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
@@ -2981,6 +3034,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
+            relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
@@ -3004,6 +3058,8 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
         assert!(plan.commands[2].contains("--set agent.apiService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2]
@@ -3015,6 +3071,9 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
+        ));
         assert!(plan.commands[2].contains("--set agent.relayService.exposureAcknowledged=true"));
         assert!(plan.commands[2].contains("--set agent.relayService.externalTrafficPolicy=Local"));
         assert!(plan.commands[2].contains(
@@ -3071,6 +3130,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3078,6 +3138,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3289,6 +3350,8 @@ mod tests {
             "LoadBalancer",
             "--agent-api-node-port",
             "31080",
+            "--agent-api-load-balancer-class",
+            "example.com/internal-api",
             "--agent-api-allow-source-cidr",
             "198.51.100.0/24",
             "--agent-api-external-traffic-policy",
@@ -3302,6 +3365,8 @@ mod tests {
             "31820",
             "--relay-http-node-port",
             "31580",
+            "--relay-load-balancer-class",
+            "example.com/internal-relay",
             "--relay-allow-source-cidr",
             "203.0.113.0/24",
             "--relay-external-traffic-policy",
@@ -3348,6 +3413,10 @@ mod tests {
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_node_port, Some(31080));
             assert_eq!(
+                args.agent_api_load_balancer_class.as_deref(),
+                Some("example.com/internal-api")
+            );
+            assert_eq!(
                 args.agent_api_allow_source_cidrs,
                 vec!["198.51.100.0/24".parse::<ipnet::IpNet>()?]
             );
@@ -3363,6 +3432,10 @@ mod tests {
             assert_eq!(args.relay_service_type, "LoadBalancer");
             assert_eq!(args.relay_udp_node_port, Some(31820));
             assert_eq!(args.relay_http_node_port, Some(31580));
+            assert_eq!(
+                args.relay_load_balancer_class.as_deref(),
+                Some("example.com/internal-relay")
+            );
             assert_eq!(
                 args.relay_allow_source_cidrs,
                 vec!["203.0.113.0/24".parse::<ipnet::IpNet>()?]
@@ -3414,6 +3487,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3421,6 +3495,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3463,6 +3538,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3470,6 +3546,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3551,6 +3628,65 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_load_balancer_classes() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.allow_public_service_exposure = true;
+        valid.allow_unrestricted_load_balancer = true;
+        valid.agent_api_service_type = "LoadBalancer".to_string();
+        valid.agent_api_load_balancer_class = Some("example.com/internal-api".to_string());
+        valid.expose_relay = true;
+        valid.relay_service_type = "LoadBalancer".to_string();
+        valid.relay_load_balancer_class = Some("example.com/internal-relay".to_string());
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
+        assert!(plan.commands[2].contains(
+            "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
+        ));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-load-balancer-class",
+            "Example.com/internal-api",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut node_port_agent = base_k8s_install_args();
+        node_port_agent.expose_agent_api = true;
+        node_port_agent.allow_public_service_exposure = true;
+        node_port_agent.agent_api_service_type = "NodePort".to_string();
+        node_port_agent.agent_api_load_balancer_class =
+            Some("example.com/internal-api".to_string());
+        let error = match k8s_install_plan(node_port_agent) {
+            Ok(_) => panic!("NodePort agent loadBalancerClass should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-load-balancer-class only applies"));
+
+        let mut node_port_relay = base_k8s_install_args();
+        node_port_relay.expose_relay = true;
+        node_port_relay.allow_public_service_exposure = true;
+        node_port_relay.relay_service_type = "NodePort".to_string();
+        node_port_relay.relay_load_balancer_class = Some("example.com/internal-relay".to_string());
+        node_port_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        node_port_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(node_port_relay) {
+            Ok(_) => panic!("NodePort relay loadBalancerClass should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-load-balancer-class only applies"));
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_requires_acknowledgement_for_cluster_external_traffic_policy(
     ) -> anyhow::Result<()> {
         let without_ack = k8s_install_plan(K8sInstallArgs {
@@ -3573,6 +3709,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3580,6 +3717,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3609,6 +3747,7 @@ mod tests {
             allow_cluster_external_traffic_policy: true,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3616,6 +3755,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3652,6 +3792,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3659,6 +3800,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3693,6 +3835,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3700,6 +3843,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3729,6 +3873,7 @@ mod tests {
             allow_cluster_external_traffic_policy: false,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
+            agent_api_load_balancer_class: None,
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
@@ -3736,6 +3881,7 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_load_balancer_class: None,
             relay_allow_source_cidrs: Vec::new(),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
@@ -3766,6 +3912,16 @@ mod tests {
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());
         assert!(parse_kubernetes_node_port("32768").is_err());
+        assert_eq!(
+            parse_kubernetes_load_balancer_class("example.com/internal-api"),
+            Ok("example.com/internal-api".to_string())
+        );
+        assert_eq!(
+            parse_kubernetes_load_balancer_class("internal_api"),
+            Ok("internal_api".to_string())
+        );
+        assert!(parse_kubernetes_load_balancer_class("Example.com/internal-api").is_err());
+        assert!(parse_kubernetes_load_balancer_class("example.com/internal/api").is_err());
         assert_eq!(
             parse_key_value("service.beta.kubernetes.io/aws-load-balancer-type=nlb"),
             Ok(KeyValueArg {

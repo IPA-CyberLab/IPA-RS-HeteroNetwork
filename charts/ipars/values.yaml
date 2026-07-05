@@ -25,6 +25,7 @@ agent:
     type: ClusterIP
     annotations: {}
     loadBalancerSourceRanges: []
+    loadBalancerClass: ""
     externalTrafficPolicy: Local
     port: 9780
     nodePort: 0
@@ -47,6 +48,7 @@ agent:
     type: LoadBalancer
     annotations: {}
     loadBalancerSourceRanges: []
+    loadBalancerClass: ""
     externalTrafficPolicy: Local
     udpPort: 51820
     httpPort: 9580

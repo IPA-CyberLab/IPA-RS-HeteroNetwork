@@ -7,10 +7,12 @@
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
 {{- $agentApiPort := int .Values.agent.apiService.port -}}
 {{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
+{{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
 {{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
 {{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
+{{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
@@ -25,6 +27,12 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (or (lt $agentApiNodePort 30000) (gt $agentApiNodePort 32767)) -}}
 {{- fail "agent.apiService.nodePort must be 0 or between 30000 and 32767" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerClass "") (ne .Values.agent.apiService.type "LoadBalancer") -}}
+{{- fail "agent.apiService.loadBalancerClass requires agent.apiService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerClass "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.loadBalancerClass" "value" $agentApiLoadBalancerClass) -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (lt $relayUdpPort 1) (gt $relayUdpPort 65535)) -}}
 {{- fail "agent.relayService.udpPort must be between 1 and 65535" -}}
@@ -43,6 +51,12 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayUdpNodePort 0) (eq $relayUdpNodePort $relayHttpNodePort) -}}
 {{- fail "agent.relayService.udpNodePort and agent.relayService.httpNodePort must be different" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayLoadBalancerClass "") (ne .Values.agent.relayService.type "LoadBalancer") -}}
+{{- fail "agent.relayService.loadBalancerClass requires agent.relayService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayLoadBalancerClass "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.loadBalancerClass" "value" $relayLoadBalancerClass) -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
@@ -96,6 +110,9 @@ spec:
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.apiService.loadBalancerSourceRanges | nindent 4 }}
   {{- end }}
+  {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.agent.apiService.loadBalancerClass | quote }}
+  {{- end }}
   {{- if $agentApiExternal }}
   externalTrafficPolicy: {{ .Values.agent.apiService.externalTrafficPolicy }}
   {{- end }}
@@ -128,6 +145,9 @@ spec:
   {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.relayService.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.agent.relayService.loadBalancerClass | quote }}
   {{- end }}
   {{- if $relayExternal }}
   externalTrafficPolicy: {{ .Values.agent.relayService.externalTrafficPolicy }}
