@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -71,6 +72,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 const CAP_NET_ADMIN_BIT: u8 = 12;
 const CAP_NET_RAW_BIT: u8 = 13;
 const CAP_SYS_ADMIN_BIT: u8 = 21;
+const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -4614,18 +4616,57 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.join_token.as_deref() {
+        ensure_agent_join_token_size(token.len() as u64, "inline agent join token")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.join_token_path.as_deref() else {
         return Ok(None);
     };
-    let token = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read agent join token from {}", path.display()))?;
+    let token = read_agent_join_token_file(path)?;
     let token = token.trim();
     if token.is_empty() {
         anyhow::bail!("agent join token file {} is empty", path.display());
     }
     Ok(Some(token.to_string()))
+}
+
+fn read_agent_join_token_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open agent join token file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect agent join token file {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "agent join token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    ensure_agent_join_token_size(
+        metadata.len(),
+        &format!("agent join token file {}", path.display()),
+    )?;
+
+    let mut token = String::new();
+    let mut reader = file.by_ref().take(MAX_AGENT_JOIN_TOKEN_BYTES + 1);
+    reader
+        .read_to_string(&mut token)
+        .with_context(|| format!("failed to read agent join token from {}", path.display()))?;
+    ensure_agent_join_token_size(
+        token.len() as u64,
+        &format!("agent join token file {}", path.display()),
+    )?;
+    Ok(token)
+}
+
+fn ensure_agent_join_token_size(size: u64, context: &str) -> anyhow::Result<()> {
+    if size > MAX_AGENT_JOIN_TOKEN_BYTES {
+        anyhow::bail!(
+            "{context} exceeds maximum size of {} bytes",
+            MAX_AGENT_JOIN_TOKEN_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn agent_relay_capability(args: &AgentArgs) -> Option<RelayCapability> {
@@ -6859,6 +6900,52 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn agent_join_token_path_rejects_directory_and_oversized_file() -> anyhow::Result<()> {
+        let base = unique_test_dir("agent-token-path-validation")?;
+        let directory_token = base.join("token-dir");
+        std::fs::create_dir(&directory_token)?;
+        let directory_error = match read_agent_join_token_file(&directory_token) {
+            Ok(_) => anyhow::bail!("directory token path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(directory_error
+            .to_string()
+            .contains("must resolve to a regular file"));
+
+        let oversized_token = base.join("oversized-token.json");
+        std::fs::write(
+            &oversized_token,
+            "x".repeat(MAX_AGENT_JOIN_TOKEN_BYTES as usize + 1),
+        )?;
+        let oversized_error = match read_agent_join_token_file(&oversized_token) {
+            Ok(_) => anyhow::bail!("oversized token file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(oversized_error.to_string().contains("exceeds maximum size"));
+
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn agent_join_token_rejects_oversized_inline_token() -> anyhow::Result<()> {
+        let oversized_token = "x".repeat(MAX_AGENT_JOIN_TOKEN_BYTES as usize + 1);
+        let cli =
+            Cli::try_parse_from(["iparsd", "agent", "--join-token", oversized_token.as_str()])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match raw_agent_join_token(&args) {
+                Ok(_) => anyhow::bail!("oversized inline token should fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("exceeds maximum size"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]
