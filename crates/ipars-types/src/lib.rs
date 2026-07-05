@@ -1032,6 +1032,18 @@ pub mod api {
         pub token_ledger_exhausted_count: u64,
         #[serde(default)]
         pub token_ledger_use_count: u64,
+        #[serde(default)]
+        pub peer_map_candidate_count: usize,
+        #[serde(default)]
+        pub peer_map_visible_count: usize,
+        #[serde(default)]
+        pub peer_map_acl_denied_count: usize,
+        #[serde(default)]
+        pub peer_map_route_candidate_count: usize,
+        #[serde(default)]
+        pub peer_map_route_visible_count: usize,
+        #[serde(default)]
+        pub peer_map_route_acl_denied_count: usize,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]

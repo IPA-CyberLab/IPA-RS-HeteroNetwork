@@ -362,6 +362,84 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_peer_map_candidates Source-target peer-map candidates before ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_candidates gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_candidates{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_peer_map_visible Source-target peer-map entries visible after ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_visible gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_visible{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_visible_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_peer_map_acl_denied Source-target peer-map entries hidden by ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_acl_denied gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_acl_denied{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_peer_map_route_candidates Advertised route candidates considered for peer maps before ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_route_candidates gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_route_candidates{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_route_candidate_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_peer_map_routes_visible Advertised routes visible in peer maps after ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_routes_visible gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_routes_visible{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_route_visible_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_peer_map_routes_acl_denied Advertised routes hidden by peer-map ACL filtering."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_peer_map_routes_acl_denied gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_peer_map_routes_acl_denied{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.peer_map_route_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_node_health Registered nodes by last reported health."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_node_health gauge");
@@ -801,6 +879,12 @@ mod tests {
         assert!(body.contains("ipars_control_plane_join_tokens"));
         assert!(body.contains("ipars_control_plane_join_tokens_issued"));
         assert!(body.contains("ipars_control_plane_join_token_uses"));
+        assert!(body.contains("ipars_control_plane_peer_map_candidates"));
+        assert!(body.contains("ipars_control_plane_peer_map_visible"));
+        assert!(body.contains("ipars_control_plane_peer_map_acl_denied"));
+        assert!(body.contains("ipars_control_plane_peer_map_route_candidates"));
+        assert!(body.contains("ipars_control_plane_peer_map_routes_visible"));
+        assert!(body.contains("ipars_control_plane_peer_map_routes_acl_denied"));
         assert!(body.contains("ipars_control_plane_node_health"));
         Ok(())
     }

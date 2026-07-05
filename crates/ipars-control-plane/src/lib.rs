@@ -846,6 +846,7 @@ where
             .count() as u64;
         let vpn_pool_available_count =
             vpn_pool_total_count.saturating_sub(vpn_pool_allocated_count);
+        let peer_map_metrics = peer_map_visibility_metrics(&nodes, &self.config.cluster_policy);
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
         for node in &nodes {
@@ -883,6 +884,12 @@ where
             token_ledger_expired_count: 0,
             token_ledger_exhausted_count: 0,
             token_ledger_use_count: 0,
+            peer_map_candidate_count: peer_map_metrics.peer_candidates,
+            peer_map_visible_count: peer_map_metrics.visible_peers,
+            peer_map_acl_denied_count: peer_map_metrics.acl_denied_peers,
+            peer_map_route_candidate_count: peer_map_metrics.route_candidates,
+            peer_map_route_visible_count: peer_map_metrics.visible_routes,
+            peer_map_route_acl_denied_count: peer_map_metrics.acl_denied_routes,
             path_count: paths.len(),
             path_state_counts: path_state_counts
                 .into_iter()
@@ -970,6 +977,55 @@ where
             generated_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerMapVisibilityMetrics {
+    peer_candidates: usize,
+    visible_peers: usize,
+    acl_denied_peers: usize,
+    route_candidates: usize,
+    visible_routes: usize,
+    acl_denied_routes: usize,
+}
+
+fn peer_map_visibility_metrics(
+    nodes: &[NodeRecord],
+    policy: &ClusterPolicy,
+) -> PeerMapVisibilityMetrics {
+    let mut metrics = PeerMapVisibilityMetrics::default();
+    for source in nodes {
+        for target in nodes {
+            if source.node_id == target.node_id {
+                continue;
+            }
+            metrics.peer_candidates += 1;
+            metrics.route_candidates += target.routes.len();
+
+            if policy.acl_rules.is_empty() {
+                metrics.visible_peers += 1;
+                metrics.visible_routes += target.routes.len();
+                continue;
+            }
+
+            let peer_allowed = acl_allows_peer(source, target, policy);
+            let visible_routes = target
+                .routes
+                .iter()
+                .filter(|route| acl_allows_route(source, target, route, policy))
+                .count();
+            let route_denials = target.routes.len().saturating_sub(visible_routes);
+            metrics.visible_routes += visible_routes;
+            metrics.acl_denied_routes += route_denials;
+
+            if peer_allowed || visible_routes > 0 {
+                metrics.visible_peers += 1;
+            } else {
+                metrics.acl_denied_peers += 1;
+            }
+        }
+    }
+    metrics
 }
 
 fn filter_stale_endpoint_candidates(
@@ -2089,6 +2145,13 @@ mod tests {
             .peers
             .iter()
             .all(|peer| peer.node_id != node_id("denied")));
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.peer_map_candidate_count, 12);
+        assert_eq!(metrics.peer_map_visible_count, 6);
+        assert_eq!(metrics.peer_map_acl_denied_count, 6);
+        assert_eq!(metrics.peer_map_route_candidate_count, 6);
+        assert_eq!(metrics.peer_map_route_visible_count, 3);
+        assert_eq!(metrics.peer_map_route_acl_denied_count, 3);
         Ok(())
     }
 

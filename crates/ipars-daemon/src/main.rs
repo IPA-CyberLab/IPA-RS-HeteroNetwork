@@ -2216,6 +2216,12 @@ struct ControlPlaneOtelMetrics {
     join_tokens: Gauge<u64>,
     join_tokens_issued: Gauge<u64>,
     join_token_uses: Gauge<u64>,
+    peer_map_candidates: Gauge<u64>,
+    peer_map_visible: Gauge<u64>,
+    peer_map_acl_denied: Gauge<u64>,
+    peer_map_route_candidates: Gauge<u64>,
+    peer_map_routes_visible: Gauge<u64>,
+    peer_map_routes_acl_denied: Gauge<u64>,
     node_health: Gauge<u64>,
     paths: Gauge<u64>,
     paths_by_state: Gauge<u64>,
@@ -2267,6 +2273,32 @@ impl ControlPlaneOtelMetrics {
                 .u64_gauge("ipars.control_plane.join_token_uses")
                 .with_description("Total accepted join-token uses recorded by the ledger.")
                 .build(),
+            peer_map_candidates: meter
+                .u64_gauge("ipars.control_plane.peer_map.candidates")
+                .with_description("Source-target peer-map candidates before ACL filtering.")
+                .build(),
+            peer_map_visible: meter
+                .u64_gauge("ipars.control_plane.peer_map.visible")
+                .with_description("Source-target peer-map entries visible after ACL filtering.")
+                .build(),
+            peer_map_acl_denied: meter
+                .u64_gauge("ipars.control_plane.peer_map.acl_denied")
+                .with_description("Source-target peer-map entries hidden by ACL filtering.")
+                .build(),
+            peer_map_route_candidates: meter
+                .u64_gauge("ipars.control_plane.peer_map.routes.candidates")
+                .with_description(
+                    "Advertised route candidates considered for peer maps before ACL filtering.",
+                )
+                .build(),
+            peer_map_routes_visible: meter
+                .u64_gauge("ipars.control_plane.peer_map.routes.visible")
+                .with_description("Advertised routes visible in peer maps after ACL filtering.")
+                .build(),
+            peer_map_routes_acl_denied: meter
+                .u64_gauge("ipars.control_plane.peer_map.routes.acl_denied")
+                .with_description("Advertised routes hidden by peer-map ACL filtering.")
+                .build(),
             node_health: meter
                 .u64_gauge("ipars.control_plane.node_health")
                 .with_description("Registered nodes by last reported health state.")
@@ -2306,6 +2338,22 @@ impl ControlPlaneOtelMetrics {
             .record(metrics.token_ledger_issued_count, &cluster_attrs);
         self.join_token_uses
             .record(metrics.token_ledger_use_count, &cluster_attrs);
+        self.peer_map_candidates
+            .record(metrics.peer_map_candidate_count as u64, &cluster_attrs);
+        self.peer_map_visible
+            .record(metrics.peer_map_visible_count as u64, &cluster_attrs);
+        self.peer_map_acl_denied
+            .record(metrics.peer_map_acl_denied_count as u64, &cluster_attrs);
+        self.peer_map_route_candidates.record(
+            metrics.peer_map_route_candidate_count as u64,
+            &cluster_attrs,
+        );
+        self.peer_map_routes_visible
+            .record(metrics.peer_map_route_visible_count as u64, &cluster_attrs);
+        self.peer_map_routes_acl_denied.record(
+            metrics.peer_map_route_acl_denied_count as u64,
+            &cluster_attrs,
+        );
         self.paths.record(metrics.path_count as u64, &cluster_attrs);
 
         for (status, count) in [
@@ -8195,6 +8243,12 @@ mod tests {
             token_ledger_expired_count: 0,
             token_ledger_exhausted_count: 1,
             token_ledger_use_count: 7,
+            peer_map_candidate_count: 2,
+            peer_map_visible_count: 1,
+            peer_map_acl_denied_count: 1,
+            peer_map_route_candidate_count: 3,
+            peer_map_route_visible_count: 2,
+            peer_map_route_acl_denied_count: 1,
             path_count: 3,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,
