@@ -79,7 +79,7 @@ runtime files using the selected scenario's relay/route-provider distribution an
 `--join-token-path` so token material is not exposed through child process argv, captures each
 child process stdout/stderr log, and reports log tails when liveness or
 readiness checks fail while waiting for service health, agent registration visibility in the control
-plane, and signal negotiation readiness before measuring:
+plane, control-plane/signal health metrics, and signal negotiation readiness before measuring:
 
 ```bash
 cargo run -p ipars-load -- --scenario three

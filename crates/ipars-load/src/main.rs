@@ -174,6 +174,13 @@ struct LoadReport {
     relay_mbps: f64,
     daemon_processes: usize,
     daemon_agent_processes: usize,
+    daemon_control_plane_healthy_nodes: usize,
+    daemon_control_plane_degraded_nodes: usize,
+    daemon_control_plane_unhealthy_nodes: usize,
+    daemon_signal_health_reports: usize,
+    daemon_signal_healthy_nodes: usize,
+    daemon_signal_degraded_nodes: usize,
+    daemon_signal_unhealthy_nodes: usize,
     registration_millis: u128,
     peer_map_millis: u128,
     signal_millis: u128,
@@ -309,6 +316,13 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_unhealthy_nodes: 0,
+        daemon_signal_health_reports: 0,
+        daemon_signal_healthy_nodes: 0,
+        daemon_signal_degraded_nodes: 0,
+        daemon_signal_unhealthy_nodes: 0,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -448,6 +462,13 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_mbps: 0.0,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_unhealthy_nodes: 0,
+        daemon_signal_health_reports: 0,
+        daemon_signal_healthy_nodes: 0,
+        daemon_signal_degraded_nodes: 0,
+        daemon_signal_unhealthy_nodes: 0,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -561,6 +582,13 @@ async fn run_relay_udp_scenario(
         relay_mbps,
         daemon_processes: 0,
         daemon_agent_processes: 0,
+        daemon_control_plane_healthy_nodes: 0,
+        daemon_control_plane_degraded_nodes: 0,
+        daemon_control_plane_unhealthy_nodes: 0,
+        daemon_signal_health_reports: 0,
+        daemon_signal_healthy_nodes: 0,
+        daemon_signal_degraded_nodes: 0,
+        daemon_signal_unhealthy_nodes: 0,
         registration_millis: 0,
         peer_map_millis: 0,
         signal_millis: 0,
@@ -729,6 +757,19 @@ async fn run_daemon_scenario(
     } else {
         relay_payload_bytes_received as f64 * 8.0 / relay_elapsed.as_secs_f64() / 1_000_000.0
     };
+    let control_metrics: ControlPlaneMetricsResponse = get_json(
+        &client,
+        format!("{}/v1/metrics", services.control_plane_url),
+        "daemon control-plane metrics",
+    )
+    .await?;
+    let signal_metrics: SignalMetricsResponse = get_json(
+        &client,
+        format!("{}/v1/metrics", services.signal_url),
+        "daemon signal metrics",
+    )
+    .await?;
+    services.ensure_running()?;
 
     Ok(LoadReport {
         transport: TransportMode::Daemon,
@@ -742,14 +783,14 @@ async fn run_daemon_scenario(
         peer_map_requests: agent_statuses.len(),
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
-        relay_candidates: 1,
+        relay_candidates: control_metrics.relay_candidate_count,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: agent_statuses.len() + agent_statuses.len(),
-        signal_http_requests: peer_records.len() + active_pair_count,
+        control_plane_http_requests: agent_statuses.len() + agent_statuses.len() + 1,
+        signal_http_requests: peer_records.len() + active_pair_count + 1,
         relay_http_requests: active_pair_count + 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
         relay_packets_per_session: relay_options.packets_per_session,
@@ -762,6 +803,13 @@ async fn run_daemon_scenario(
         relay_mbps,
         daemon_processes: services.process_count(),
         daemon_agent_processes: agent_processes,
+        daemon_control_plane_healthy_nodes: control_metrics.healthy_node_count,
+        daemon_control_plane_degraded_nodes: control_metrics.degraded_node_count,
+        daemon_control_plane_unhealthy_nodes: control_metrics.unhealthy_node_count,
+        daemon_signal_health_reports: signal_metrics.health_report_count,
+        daemon_signal_healthy_nodes: signal_metrics.healthy_node_count,
+        daemon_signal_degraded_nodes: signal_metrics.degraded_node_count,
+        daemon_signal_unhealthy_nodes: signal_metrics.unhealthy_node_count,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -1867,6 +1915,8 @@ mod tests {
         assert_eq!(report.signal_negotiations, 6);
         assert_eq!(report.control_plane_http_requests, 0);
         assert_eq!(report.signal_http_requests, 0);
+        assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
+        assert_eq!(report.daemon_signal_health_reports, 0);
         Ok(())
     }
 
@@ -1883,6 +1933,8 @@ mod tests {
         assert_eq!(report.signal_negotiations, 6);
         assert_eq!(report.control_plane_http_requests, 8);
         assert_eq!(report.signal_http_requests, 9);
+        assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
+        assert_eq!(report.daemon_signal_health_reports, 0);
         Ok(())
     }
 
@@ -1907,6 +1959,8 @@ mod tests {
         assert_eq!(report.relay_udp_payload_bytes_received, 768);
         assert_eq!(report.relay_forwarded_bytes_reported, 768);
         assert_eq!(report.relay_http_requests, 8);
+        assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
+        assert_eq!(report.daemon_signal_health_reports, 0);
         Ok(())
     }
 
@@ -2171,6 +2225,13 @@ mod tests {
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.registrations, 2);
         assert_eq!(report.daemon_processes, 6);
+        assert!(report.daemon_control_plane_healthy_nodes >= 2);
+        assert_eq!(report.daemon_control_plane_degraded_nodes, 0);
+        assert_eq!(report.daemon_control_plane_unhealthy_nodes, 0);
+        assert!(report.daemon_signal_health_reports >= 2);
+        assert!(report.daemon_signal_healthy_nodes >= 2);
+        assert_eq!(report.daemon_signal_degraded_nodes, 0);
+        assert_eq!(report.daemon_signal_unhealthy_nodes, 0);
         assert_eq!(report.relay_udp_packets_sent, report.active_pair_count);
         assert_eq!(report.relay_udp_packets_received, report.active_pair_count);
         Ok(())
