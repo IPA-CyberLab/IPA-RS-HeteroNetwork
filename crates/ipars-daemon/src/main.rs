@@ -386,6 +386,12 @@ struct AgentArgs {
     runtime_command_timeout_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_AGENT_RUNTIME_COMMAND_OUTPUT_MAX_BYTES",
+        default_value_t = 65_536
+    )]
+    runtime_command_output_max_bytes: usize,
+    #[arg(
+        long,
         env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
         default_value_t = 30
     )]
@@ -1046,6 +1052,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.runtime_command_timeout_seconds,
         "--runtime-command-timeout-seconds",
     )?;
+    validate_positive_usize(
+        args.runtime_command_output_max_bytes,
+        "--runtime-command-output-max-bytes",
+    )?;
     if args.packet_flow_detector != PacketFlowDetector::Disabled {
         validate_positive_seconds(
             args.packet_flow_poll_interval_seconds,
@@ -1106,6 +1116,13 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
 }
 
 fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
     }
@@ -3102,6 +3119,7 @@ async fn start_peer_map_sync(
     control_plane_urls: Vec<String>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let command_timeout = runtime_command_timeout(args);
+    let command_output_max_bytes = runtime_command_output_max_bytes(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3117,11 +3135,17 @@ async fn start_peer_map_sync(
                         control_plane_urls,
                         NamespacedLinuxCommandRunner::new(
                             namespace.clone(),
-                            TimedSystemCommandRunner::new(command_timeout),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
                         ),
                         NamespacedLinuxRouteCommandRunner::new(
                             namespace,
-                            TimedSystemRouteCommandRunner::new(command_timeout),
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
                         ),
                     )
                     .await
@@ -3131,8 +3155,14 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        TimedSystemCommandRunner::new(command_timeout),
-                        TimedSystemRouteCommandRunner::new(command_timeout),
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        TimedSystemRouteCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
                     )
                     .await
                 }
@@ -3147,7 +3177,10 @@ async fn start_peer_map_sync(
                         control_plane_urls,
                         NamespacedLinuxCommandRunner::new(
                             namespace.clone(),
-                            TimedSystemCommandRunner::new(command_timeout),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
                         ),
                         Some(namespace),
                     )
@@ -3158,7 +3191,10 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        TimedSystemCommandRunner::new(command_timeout),
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
                         None,
                     )
                     .await
@@ -3174,7 +3210,10 @@ async fn start_peer_map_sync(
                         control_plane_urls,
                         NamespacedLinuxRouteCommandRunner::new(
                             namespace.clone(),
-                            TimedSystemRouteCommandRunner::new(command_timeout),
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
                         ),
                         Some(namespace),
                     )
@@ -3185,7 +3224,10 @@ async fn start_peer_map_sync(
                         args,
                         runtime,
                         control_plane_urls,
-                        TimedSystemRouteCommandRunner::new(command_timeout),
+                        TimedSystemRouteCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
                         None,
                     )
                     .await
@@ -3234,6 +3276,10 @@ async fn start_peer_map_sync(
 
 fn runtime_command_timeout(args: &AgentArgs) -> Duration {
     Duration::from_secs(args.runtime_command_timeout_seconds)
+}
+
+fn runtime_command_output_max_bytes(args: &AgentArgs) -> usize {
+    args.runtime_command_output_max_bytes
 }
 
 #[derive(Debug, Clone)]
@@ -3517,6 +3563,7 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
     let source = docker_route_source(args)?;
     let interval = Duration::from_secs(args.docker_route_interval_seconds);
     let command_timeout = runtime_command_timeout(args);
+    let command_output_max_bytes = runtime_command_output_max_bytes(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3530,7 +3577,10 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
                         let manager =
                             LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
                                 namespace,
-                                TimedSystemRouteCommandRunner::new(command_timeout),
+                                TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                    command_timeout,
+                                    command_output_max_bytes,
+                                ),
                             ));
                         Ok(tokio::spawn(async move {
                             run_docker_route_loop(manager, source, interval).await;
@@ -3546,9 +3596,12 @@ async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::Jo
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
-                        let manager = LinuxRouteManager::new(TimedSystemRouteCommandRunner::new(
-                            command_timeout,
-                        ));
+                        let manager = LinuxRouteManager::new(
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        );
                         Ok(tokio::spawn(async move {
                             run_docker_route_loop(manager, source, interval).await;
                         }))
@@ -3636,6 +3689,7 @@ async fn start_kubernetes_underlay_routes(
     let source = kubernetes_route_source(args, local_node_id)?;
     let interval = Duration::from_secs(args.kubernetes_route_interval_seconds);
     let command_timeout = runtime_command_timeout(args);
+    let command_output_max_bytes = runtime_command_output_max_bytes(args);
     match args.runtime_backend {
         AgentRuntimeBackend::LinuxCommand => {
             let namespace = args
@@ -3649,7 +3703,10 @@ async fn start_kubernetes_underlay_routes(
                         let manager =
                             LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
                                 namespace,
-                                TimedSystemRouteCommandRunner::new(command_timeout),
+                                TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                    command_timeout,
+                                    command_output_max_bytes,
+                                ),
                             ));
                         Ok(tokio::spawn(async move {
                             run_kubernetes_underlay_route_loop(manager, source, interval).await;
@@ -3665,9 +3722,12 @@ async fn start_kubernetes_underlay_routes(
             } else {
                 match args.route_backend {
                     RouteApplyBackend::Command => {
-                        let manager = LinuxRouteManager::new(TimedSystemRouteCommandRunner::new(
-                            command_timeout,
-                        ));
+                        let manager = LinuxRouteManager::new(
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        );
                         Ok(tokio::spawn(async move {
                             run_kubernetes_underlay_route_loop(manager, source, interval).await;
                         }))
@@ -7969,6 +8029,7 @@ mod tests {
             assert_eq!(args.route_backend, RouteApplyBackend::Command);
             assert_eq!(args.route_backend.as_str(), "command");
             assert_eq!(args.runtime_command_timeout_seconds, 30);
+            assert_eq!(args.runtime_command_output_max_bytes, 65_536);
             return Ok(());
         }
 
@@ -9758,6 +9819,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             (
                 vec!["iparsd", "agent", "--runtime-command-timeout-seconds", "0"],
                 "--runtime-command-timeout-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--runtime-command-output-max-bytes", "0"],
+                "--runtime-command-output-max-bytes must be greater than zero",
             ),
             (
                 vec![

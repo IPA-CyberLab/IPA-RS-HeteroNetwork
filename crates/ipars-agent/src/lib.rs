@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,7 @@ use ipars_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -48,6 +49,7 @@ use rtnetlink::{LinkUnspec, LinkWireguard};
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -1259,18 +1261,31 @@ pub struct SystemCommandRunner;
 #[async_trait]
 impl LinuxCommandRunner for SystemCommandRunner {
     async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
-        run_system_command(command, DEFAULT_SYSTEM_COMMAND_TIMEOUT).await
+        run_system_command(
+            command,
+            DEFAULT_SYSTEM_COMMAND_TIMEOUT,
+            DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .await
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TimedSystemCommandRunner {
     timeout: Duration,
+    output_max_bytes: usize,
 }
 
 impl TimedSystemCommandRunner {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self::with_output_max_bytes(timeout, DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES)
+    }
+
+    pub fn with_output_max_bytes(timeout: Duration, output_max_bytes: usize) -> Self {
+        Self {
+            timeout,
+            output_max_bytes,
+        }
     }
 }
 
@@ -1283,35 +1298,36 @@ impl Default for TimedSystemCommandRunner {
 #[async_trait]
 impl LinuxCommandRunner for TimedSystemCommandRunner {
     async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
-        run_system_command(command, self.timeout).await
+        run_system_command(command, self.timeout, self.output_max_bytes).await
     }
 }
 
-async fn run_system_command(command: LinuxCommand, timeout: Duration) -> Result<(), AgentError> {
+async fn run_system_command(
+    command: LinuxCommand,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<(), AgentError> {
     let command_label = command_label(&command.program, &command.args);
-    let output = run_command_output(command, timeout, &command_label).await?;
+    let output = run_command_output(command, timeout, output_max_bytes, &command_label).await?;
     if output.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
     Err(AgentError::WireGuard(format!(
         "{command_label} failed: {}",
-        stderr.trim()
+        command_stderr_message(&output.stderr)
     )))
 }
 
 async fn run_command_output(
     command: LinuxCommand,
     timeout: Duration,
+    output_max_bytes: usize,
     command_label: &str,
-) -> Result<Output, AgentError> {
+) -> Result<BoundedCommandOutput, AgentError> {
     tokio::time::timeout(
         timeout,
-        Command::new(&command.program)
-            .args(&command.args)
-            .kill_on_drop(true)
-            .output(),
+        collect_bounded_command_output(command, output_max_bytes),
     )
     .await
     .map_err(|_| {
@@ -1321,6 +1337,98 @@ async fn run_command_output(
         ))
     })?
     .map_err(AgentError::Io)
+}
+
+async fn collect_bounded_command_output(
+    command: LinuxCommand,
+    output_max_bytes: usize,
+) -> std::io::Result<BoundedCommandOutput> {
+    let mut child = Command::new(&command.program)
+        .args(&command.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+
+    let (status, _stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        read_limited_command_output(stdout, output_max_bytes),
+        read_limited_command_output(stderr, output_max_bytes)
+    )?;
+
+    Ok(BoundedCommandOutput { status, stderr })
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stderr: LimitedCommandOutput,
+}
+
+#[derive(Debug)]
+struct LimitedCommandOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    limit: usize,
+}
+
+async fn read_limited_command_output<R>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<LimitedCommandOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(4096));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = read.min(remaining);
+            bytes.extend_from_slice(&chunk[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    Ok(LimitedCommandOutput {
+        bytes,
+        truncated,
+        limit,
+    })
+}
+
+fn command_stderr_message(stderr: &LimitedCommandOutput) -> String {
+    let text = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+    if !stderr.truncated {
+        return text;
+    }
+
+    let suffix = format!("stderr truncated after {} bytes", stderr.limit);
+    if text.is_empty() {
+        suffix
+    } else {
+        format!("{text} ({suffix})")
+    }
 }
 
 fn command_timeout_label(timeout: Duration) -> String {
@@ -2364,6 +2472,48 @@ mod tests {
         };
 
         assert!(error.to_string().contains("timed out after 10ms"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_truncates_failure_stderr() {
+        let runner = TimedSystemCommandRunner::with_output_max_bytes(Duration::from_secs(1), 16);
+        let error = match runner
+            .run(LinuxCommand::new(
+                "sh",
+                ["-c", "printf '0123456789abcdefEXTRA' >&2; exit 7"],
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let stderr = match message.rsplit_once("failed: ") {
+            Some((_, stderr)) => stderr,
+            None => panic!("failure should include stderr"),
+        };
+
+        assert!(stderr.contains("0123456789abcdef"));
+        assert!(!stderr.contains("EXTRA"));
+        assert!(stderr.contains("stderr truncated after 16 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_drains_large_stdout_with_bound() -> Result<(), AgentError>
+    {
+        let runner = TimedSystemCommandRunner::with_output_max_bytes(Duration::from_secs(1), 16);
+
+        runner
+            .run(LinuxCommand::new(
+                "sh",
+                [
+                    "-c",
+                    "i=0; while [ $i -lt 5000 ]; do printf 0123456789abcdef; i=$((i + 1)); done",
+                ],
+            ))
+            .await
     }
 
     #[derive(Debug, Default)]

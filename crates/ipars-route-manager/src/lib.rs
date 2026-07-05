@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{ExitStatus, Stdio};
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
@@ -22,9 +22,11 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, RouteMessageBuilder};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -386,18 +388,31 @@ pub struct SystemRouteCommandRunner;
 #[async_trait]
 impl LinuxRouteCommandRunner for SystemRouteCommandRunner {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
-        run_system_route_command(command, DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT).await
+        run_system_route_command(
+            command,
+            DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT,
+            DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .await
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TimedSystemRouteCommandRunner {
     timeout: Duration,
+    output_max_bytes: usize,
 }
 
 impl TimedSystemRouteCommandRunner {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self::with_output_max_bytes(timeout, DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES)
+    }
+
+    pub fn with_output_max_bytes(timeout: Duration, output_max_bytes: usize) -> Self {
+        Self {
+            timeout,
+            output_max_bytes,
+        }
     }
 }
 
@@ -410,38 +425,37 @@ impl Default for TimedSystemRouteCommandRunner {
 #[async_trait]
 impl LinuxRouteCommandRunner for TimedSystemRouteCommandRunner {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
-        run_system_route_command(command, self.timeout).await
+        run_system_route_command(command, self.timeout, self.output_max_bytes).await
     }
 }
 
 async fn run_system_route_command(
     command: LinuxRouteCommand,
     timeout: Duration,
+    output_max_bytes: usize,
 ) -> Result<(), RouteManagerError> {
     let command_label = command_label(&command.program, &command.args);
-    let output = run_route_command_output(command, timeout, &command_label).await?;
+    let output =
+        run_route_command_output(command, timeout, output_max_bytes, &command_label).await?;
     if output.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
     Err(RouteManagerError::Backend(format!(
         "{command_label} failed: {}",
-        stderr.trim()
+        command_stderr_message(&output.stderr)
     )))
 }
 
 async fn run_route_command_output(
     command: LinuxRouteCommand,
     timeout: Duration,
+    output_max_bytes: usize,
     command_label: &str,
-) -> Result<Output, RouteManagerError> {
+) -> Result<BoundedRouteCommandOutput, RouteManagerError> {
     tokio::time::timeout(
         timeout,
-        Command::new(&command.program)
-            .args(&command.args)
-            .kill_on_drop(true)
-            .output(),
+        collect_bounded_route_command_output(command, output_max_bytes),
     )
     .await
     .map_err(|_| {
@@ -451,6 +465,98 @@ async fn run_route_command_output(
         ))
     })?
     .map_err(RouteManagerError::Io)
+}
+
+async fn collect_bounded_route_command_output(
+    command: LinuxRouteCommand,
+    output_max_bytes: usize,
+) -> io::Result<BoundedRouteCommandOutput> {
+    let mut child = Command::new(&command.program)
+        .args(&command.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+
+    let (status, _stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        read_limited_route_command_output(stdout, output_max_bytes),
+        read_limited_route_command_output(stderr, output_max_bytes)
+    )?;
+
+    Ok(BoundedRouteCommandOutput { status, stderr })
+}
+
+#[derive(Debug)]
+struct BoundedRouteCommandOutput {
+    status: ExitStatus,
+    stderr: LimitedRouteCommandOutput,
+}
+
+#[derive(Debug)]
+struct LimitedRouteCommandOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    limit: usize,
+}
+
+async fn read_limited_route_command_output<R>(
+    mut reader: R,
+    limit: usize,
+) -> io::Result<LimitedRouteCommandOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(4096));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = read.min(remaining);
+            bytes.extend_from_slice(&chunk[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    Ok(LimitedRouteCommandOutput {
+        bytes,
+        truncated,
+        limit,
+    })
+}
+
+fn command_stderr_message(stderr: &LimitedRouteCommandOutput) -> String {
+    let text = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+    if !stderr.truncated {
+        return text;
+    }
+
+    let suffix = format!("stderr truncated after {} bytes", stderr.limit);
+    if text.is_empty() {
+        suffix
+    } else {
+        format!("{text} ({suffix})")
+    }
 }
 
 fn command_timeout_label(timeout: Duration) -> String {
@@ -987,6 +1093,32 @@ mod tests {
         };
 
         assert!(error.to_string().contains("timed out after 10ms"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_truncates_failure_stderr() {
+        let runner =
+            TimedSystemRouteCommandRunner::with_output_max_bytes(Duration::from_secs(1), 16);
+        let error = match runner
+            .run(LinuxRouteCommand::new(
+                "sh",
+                ["-c", "printf '0123456789abcdefEXTRA' >&2; exit 7"],
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let stderr = match message.rsplit_once("failed: ") {
+            Some((_, stderr)) => stderr,
+            None => panic!("failure should include stderr"),
+        };
+
+        assert!(stderr.contains("0123456789abcdef"));
+        assert!(!stderr.contains("EXTRA"));
+        assert!(stderr.contains("stderr truncated after 16 bytes"));
     }
 
     fn route_plan() -> Result<RoutePlan, Box<dyn std::error::Error>> {
