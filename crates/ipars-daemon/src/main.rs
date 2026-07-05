@@ -1739,10 +1739,12 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
 }
 
 fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
-    if program_exists_in_path(program, path) {
+    if program_ready_in_path(program, path) {
         Ok(())
     } else {
-        anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
+        anyhow::bail!(
+            "missing required Linux runtime command `{program}` in PATH; expected an executable regular file"
+        );
     }
 }
 
@@ -1759,7 +1761,7 @@ fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::
     ensure_program_in_path(program, path)
 }
 
-fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
+fn program_ready_in_path(program: &str, path: Option<&OsStr>) -> bool {
     let Some(path) = path else {
         return false;
     };
@@ -1770,14 +1772,18 @@ fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    path.symlink_metadata()
+        .map(|metadata| {
+            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
+    path.symlink_metadata()
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
@@ -11815,6 +11821,74 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_rejects_unsafe_path_program_entries() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_test_dir("runtime-command-preflight")?;
+
+        let executable_bin = base.join("executable-bin");
+        std::fs::create_dir(&executable_bin)?;
+        let executable = executable_bin.join("ip");
+        std::fs::write(&executable, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        ensure_program_in_path("ip", Some(executable_bin.as_os_str()))?;
+
+        let non_executable_bin = base.join("non-executable-bin");
+        std::fs::create_dir(&non_executable_bin)?;
+        let non_executable = non_executable_bin.join("ip");
+        std::fs::write(&non_executable, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644))?;
+        let non_executable_error =
+            match ensure_program_in_path("ip", Some(non_executable_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful non-executable command preflight"),
+                Err(error) => error,
+            };
+        assert!(non_executable_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let directory_bin = base.join("directory-bin");
+        std::fs::create_dir(&directory_bin)?;
+        std::fs::create_dir(directory_bin.join("ip"))?;
+        let directory_error = match ensure_program_in_path("ip", Some(directory_bin.as_os_str())) {
+            Ok(()) => anyhow::bail!("unexpected successful directory command preflight"),
+            Err(error) => error,
+        };
+        assert!(directory_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let symlink_bin = base.join("symlink-bin");
+        std::fs::create_dir(&symlink_bin)?;
+        std::os::unix::fs::symlink(&executable, symlink_bin.join("ip"))?;
+        let symlink_error = match ensure_program_in_path("ip", Some(symlink_bin.as_os_str())) {
+            Ok(()) => anyhow::bail!("unexpected successful symlink command preflight"),
+            Err(error) => error,
+        };
+        assert!(symlink_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let userspace_link = base.join("wireguard-go-link");
+        std::os::unix::fs::symlink(&executable, &userspace_link)?;
+        let userspace_link = userspace_link.display().to_string();
+        let userspace_error =
+            match ensure_runtime_program_ready(userspace_link.as_str(), Some(OsStr::new(""))) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful symlink userspace command preflight")
+                }
+                Err(error) => error,
+            };
+        assert!(userspace_error
+            .to_string()
+            .contains("is not an executable file"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 
     #[test]
