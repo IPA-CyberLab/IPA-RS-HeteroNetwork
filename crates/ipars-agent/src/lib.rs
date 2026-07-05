@@ -210,18 +210,56 @@ fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), Agent
         Err(error) => return Err(error.into()),
     }
 
+    let temp_path = private_agent_state_temp_path(path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(&temp_path)?;
     let metadata = file.metadata()?;
-    validate_private_agent_state_metadata(path, &metadata)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    validate_private_agent_state_metadata(&temp_path, &metadata)?;
+    let result = (|| -> Result<(), AgentError> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temp_path, path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        validate_private_agent_state_metadata(path, &metadata)?;
+        sync_agent_state_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn private_agent_state_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent-state");
+    let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    parent.join(format!(
+        ".{file_name}.tmp-{}-{timestamp}",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+fn sync_agent_state_parent_dir(path: &Path) -> Result<(), AgentError> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let directory = std::fs::File::open(parent)?;
+    directory.sync_all()?;
     Ok(())
 }
 
@@ -2072,6 +2110,14 @@ mod tests {
         ))
     }
 
+    fn temp_state_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ipars-agent-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
     fn path(peer: &str, state: PathState, score: f32) -> PathRecord {
         PathRecord {
             key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string(peer)),
@@ -3432,6 +3478,38 @@ mod tests {
         let _ = std::fs::remove_file(broad);
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_file(target);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_state_store_replaces_state_atomically() -> Result<(), AgentError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_state_dir("state-atomic");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("state.json");
+        let store = FileAgentStateStore::new(&path);
+        let first = AgentNodeState::generate(Utc::now());
+        let second = AgentNodeState::generate(Utc::now());
+
+        store.save(&first)?;
+        store.save(&second)?;
+
+        let loaded = store.load()?;
+        assert_eq!(loaded.node_id, second.node_id);
+        assert_ne!(loaded.node_id, first.node_id);
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let temp_file_left = std::fs::read_dir(&dir)?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".state.json.tmp-"))
+        });
+        assert!(!temp_file_left);
+
+        let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
 

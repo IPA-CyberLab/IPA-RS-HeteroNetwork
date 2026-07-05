@@ -252,7 +252,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 - Signal down: existing paths remain active; agents retry registration and path negotiation against the remaining configured signal endpoints, and new NAT traversal waits for signal recovery only when all configured signal endpoints are unavailable.
 - Relay down: affected pairs demote to probing/direct candidates or another relay if available; otherwise `UNREACHABLE`.
 - STUN down: known candidates remain usable; new NAT classification is degraded.
-- Agent restart: identity and WireGuard keys are read from disk only when the state path resolves to an owner-only regular file, with symlinked or group/world-accessible state paths rejected; the agent can re-register with a join token, refresh signal-service node state, negotiate pair paths, execute UDP hole-punch plans, report heartbeat/path state, then pinned routes and current peer map are rehydrated through explicit backend application and refreshed by continuous peer-map polling.
+- Agent restart: identity and WireGuard keys are read from disk only when the state path resolves to an owner-only regular file, with symlinked or group/world-accessible state paths rejected; state updates are written through owner-only temporary files and atomically renamed into place. The agent can re-register with a join token, refresh signal-service node state, negotiate pair paths, execute UDP hole-punch plans, report heartbeat/path state, then pinned routes and current peer map are rehydrated through explicit backend application and refreshed by continuous peer-map polling.
 
 ## Integration Tests
 
