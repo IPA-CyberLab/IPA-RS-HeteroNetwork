@@ -28,6 +28,12 @@ agent:
     limits:
       cpu: ""
       memory: ""
+  rollout:
+    updateStrategy: ""
+    maxUnavailable: ""
+    maxSurge: ""
+    minReadySeconds: ""
+    revisionHistoryLimit: ""
   apiService:
     enabled: false
     exposureAcknowledged: false

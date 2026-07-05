@@ -339,6 +339,16 @@ struct K8sInstallArgs {
     agent_resource_limit_cpu: Option<String>,
     #[arg(long = "agent-resource-limit-memory", value_parser = parse_kubernetes_resource_quantity)]
     agent_resource_limit_memory: Option<String>,
+    #[arg(long = "agent-update-strategy", value_parser = parse_kubernetes_daemonset_update_strategy)]
+    agent_update_strategy: Option<String>,
+    #[arg(long = "agent-rollout-max-unavailable", value_parser = parse_kubernetes_int_or_percent)]
+    agent_rollout_max_unavailable: Option<String>,
+    #[arg(long = "agent-rollout-max-surge", value_parser = parse_kubernetes_int_or_percent)]
+    agent_rollout_max_surge: Option<String>,
+    #[arg(long = "agent-min-ready-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    agent_min_ready_seconds: Option<u32>,
+    #[arg(long = "agent-revision-history-limit", value_parser = parse_kubernetes_non_negative_i32)]
+    agent_revision_history_limit: Option<u32>,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
@@ -1289,6 +1299,73 @@ fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_daemonset_update_strategy(value: &str) -> Result<String, String> {
+    match value {
+        "RollingUpdate" | "OnDelete" => Ok(value.to_string()),
+        _ => Err(format!(
+            "DaemonSet update strategy must be RollingUpdate or OnDelete; got {value}"
+        )),
+    }
+}
+
+const KUBERNETES_INT32_MAX: u32 = 2_147_483_647;
+
+fn parse_kubernetes_non_negative_i32(value: &str) -> Result<u32, String> {
+    let parsed = value.parse::<u32>().map_err(|_| {
+        format!("value must be a non-negative integer up to {KUBERNETES_INT32_MAX}; got {value}")
+    })?;
+    if parsed <= KUBERNETES_INT32_MAX {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "value must be a non-negative integer up to {KUBERNETES_INT32_MAX}; got {value}"
+        ))
+    }
+}
+
+fn parse_kubernetes_int_or_percent(value: &str) -> Result<String, String> {
+    validate_kubernetes_int_or_percent(value, "rollout value")?;
+    Ok(value.to_string())
+}
+
+fn validate_kubernetes_int_or_percent(value: &str, label: &str) -> Result<(), String> {
+    if let Some(percent) = value.strip_suffix('%') {
+        validate_kubernetes_non_negative_integer_text(percent, label, Some(100)).map(|_| ())
+    } else {
+        validate_kubernetes_non_negative_integer_text(value, label, Some(KUBERNETES_INT32_MAX))
+            .map(|_| ())
+    }
+}
+
+fn kubernetes_int_or_percent_is_zero(value: &str) -> bool {
+    matches!(value, "0" | "0%")
+}
+
+fn validate_kubernetes_non_negative_integer_text(
+    value: &str,
+    label: &str,
+    max: Option<u32>,
+) -> Result<u32, String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return Err(format!("{label} must not use leading zeroes"));
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label} must be a non-negative integer"));
+    }
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{label} must be a non-negative integer"))?;
+    if let Some(max) = max {
+        if parsed > max {
+            return Err(format!("{label} must be between 0 and {max}"));
+        }
+    }
+    Ok(parsed)
+}
+
 fn validate_kubernetes_annotation_key(key: &str) -> Result<(), String> {
     let (prefix, name) = match key.split_once('/') {
         Some((prefix, name)) => {
@@ -1930,6 +2007,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
     validate_k8s_agent_pod_options(&args)?;
+    validate_k8s_agent_rollout_options(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
@@ -2199,7 +2277,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Agent pod labels, annotations, priority class, node selectors, and resource requests/limits map directly to DaemonSet chart values".to_string(),
+            "Agent pod labels, annotations, priority class, node selectors, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
@@ -2284,6 +2362,33 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     }
     if let Some(memory) = args.agent_resource_limit_memory.as_deref() {
         append_helm_set_string(command, "agent.resources.limits.memory", memory);
+    }
+    let rolling_update_configured =
+        args.agent_rollout_max_unavailable.is_some() || args.agent_rollout_max_surge.is_some();
+    if let Some(update_strategy) = args
+        .agent_update_strategy
+        .as_deref()
+        .or_else(|| rolling_update_configured.then_some("RollingUpdate"))
+    {
+        command.push_str(&format!(
+            " --set agent.rollout.updateStrategy={update_strategy}"
+        ));
+    }
+    if let Some(max_unavailable) = args.agent_rollout_max_unavailable.as_deref() {
+        append_helm_set_string(command, "agent.rollout.maxUnavailable", max_unavailable);
+    }
+    if let Some(max_surge) = args.agent_rollout_max_surge.as_deref() {
+        append_helm_set_string(command, "agent.rollout.maxSurge", max_surge);
+    }
+    if let Some(min_ready_seconds) = args.agent_min_ready_seconds {
+        command.push_str(&format!(
+            " --set agent.rollout.minReadySeconds={min_ready_seconds}"
+        ));
+    }
+    if let Some(revision_history_limit) = args.agent_revision_history_limit {
+        command.push_str(&format!(
+            " --set agent.rollout.revisionHistoryLimit={revision_history_limit}"
+        ));
     }
 }
 
@@ -2504,6 +2609,41 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
         if let Some(quantity) = quantity {
             validate_kubernetes_resource_quantity(quantity, label).map_err(anyhow::Error::msg)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_k8s_agent_rollout_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(update_strategy) = args.agent_update_strategy.as_deref() {
+        parse_kubernetes_daemonset_update_strategy(update_strategy).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(max_unavailable) = args.agent_rollout_max_unavailable.as_deref() {
+        validate_kubernetes_int_or_percent(max_unavailable, "agent rollout maxUnavailable")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(max_surge) = args.agent_rollout_max_surge.as_deref() {
+        validate_kubernetes_int_or_percent(max_surge, "agent rollout maxSurge")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if args.agent_update_strategy.as_deref() == Some("OnDelete")
+        && (args.agent_rollout_max_unavailable.is_some() || args.agent_rollout_max_surge.is_some())
+    {
+        anyhow::bail!(
+            "--agent-rollout-max-unavailable and --agent-rollout-max-surge require --agent-update-strategy RollingUpdate or no explicit strategy"
+        );
+    }
+    if args
+        .agent_rollout_max_unavailable
+        .as_deref()
+        .is_some_and(kubernetes_int_or_percent_is_zero)
+        && args
+            .agent_rollout_max_surge
+            .as_deref()
+            .map_or(true, kubernetes_int_or_percent_is_zero)
+    {
+        anyhow::bail!(
+            "--agent-rollout-max-unavailable cannot be zero when --agent-rollout-max-surge is zero or unset"
+        );
     }
     Ok(())
 }
@@ -3640,6 +3780,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: Some(31080),
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
@@ -3801,6 +3946,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -3927,6 +4077,80 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("agent priority class"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_and_validates_agent_rollout_options() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_update_strategy = Some("RollingUpdate".to_string());
+        args.agent_rollout_max_unavailable = Some("10%".to_string());
+        args.agent_rollout_max_surge = Some("1".to_string());
+        args.agent_min_ready_seconds = Some(15);
+        args.agent_revision_history_limit = Some(5);
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.rollout.updateStrategy=RollingUpdate"));
+        assert!(helm.contains("--set-string agent.rollout.maxUnavailable=10%"));
+        assert!(helm.contains("--set-string agent.rollout.maxSurge=1"));
+        assert!(helm.contains("--set agent.rollout.minReadySeconds=15"));
+        assert!(helm.contains("--set agent.rollout.revisionHistoryLimit=5"));
+
+        let mut inferred_strategy = base_k8s_install_args();
+        inferred_strategy.agent_rollout_max_unavailable = Some("25%".to_string());
+        let plan = k8s_install_plan(inferred_strategy)?;
+        assert!(plan.commands[2].contains("--set agent.rollout.updateStrategy=RollingUpdate"));
+        assert!(plan.commands[2].contains("--set-string agent.rollout.maxUnavailable=25%"));
+
+        let invalid_strategy = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-update-strategy",
+            "Recreate",
+        ]);
+        assert!(invalid_strategy.is_err());
+        let invalid_percent = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-rollout-max-unavailable",
+            "101%",
+        ]);
+        assert!(invalid_percent.is_err());
+        let invalid_i32 = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-min-ready-seconds",
+            "2147483648",
+        ]);
+        assert!(invalid_i32.is_err());
+
+        let mut on_delete_with_rolling_update = base_k8s_install_args();
+        on_delete_with_rolling_update.agent_update_strategy = Some("OnDelete".to_string());
+        on_delete_with_rolling_update.agent_rollout_max_surge = Some("1".to_string());
+        let error = match k8s_install_plan(on_delete_with_rolling_update) {
+            Ok(_) => panic!("OnDelete with rollingUpdate fields should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("require --agent-update-strategy RollingUpdate"));
+
+        let mut zero_without_surge = base_k8s_install_args();
+        zero_without_surge.agent_rollout_max_unavailable = Some("0".to_string());
+        let error = match k8s_install_plan(zero_without_surge) {
+            Ok(_) => panic!("zero maxUnavailable without maxSurge should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cannot be zero"));
+
+        let mut zero_with_surge = base_k8s_install_args();
+        zero_with_surge.agent_rollout_max_unavailable = Some("0".to_string());
+        zero_with_surge.agent_rollout_max_surge = Some("1".to_string());
+        k8s_install_plan(zero_with_surge)?;
 
         Ok(())
     }
@@ -4117,6 +4341,16 @@ mod tests {
             "500m",
             "--agent-resource-limit-memory",
             "512Mi",
+            "--agent-update-strategy",
+            "RollingUpdate",
+            "--agent-rollout-max-unavailable",
+            "10%",
+            "--agent-rollout-max-surge",
+            "1",
+            "--agent-min-ready-seconds",
+            "15",
+            "--agent-revision-history-limit",
+            "5",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
@@ -4242,6 +4476,11 @@ mod tests {
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
             assert_eq!(args.agent_resource_limit_cpu.as_deref(), Some("500m"));
             assert_eq!(args.agent_resource_limit_memory.as_deref(), Some("512Mi"));
+            assert_eq!(args.agent_update_strategy.as_deref(), Some("RollingUpdate"));
+            assert_eq!(args.agent_rollout_max_unavailable.as_deref(), Some("10%"));
+            assert_eq!(args.agent_rollout_max_surge.as_deref(), Some("1"));
+            assert_eq!(args.agent_min_ready_seconds, Some(15));
+            assert_eq!(args.agent_revision_history_limit, Some(5));
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_node_port, Some(31080));
@@ -4360,6 +4599,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -4437,6 +4681,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5029,6 +5278,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5093,6 +5347,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5164,6 +5423,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5233,6 +5497,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5297,6 +5566,11 @@ mod tests {
             agent_resource_request_memory: None,
             agent_resource_limit_cpu: None,
             agent_resource_limit_memory: None,
+            agent_update_strategy: None,
+            agent_rollout_max_unavailable: None,
+            agent_rollout_max_surge: None,
+            agent_min_ready_seconds: None,
+            agent_revision_history_limit: None,
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_node_port: None,
             agent_api_load_balancer_class: None,
@@ -5393,6 +5667,28 @@ mod tests {
             Ok("128Mi".to_string())
         );
         assert!(parse_kubernetes_resource_quantity("128 Mi").is_err());
+        assert_eq!(
+            parse_kubernetes_daemonset_update_strategy("RollingUpdate"),
+            Ok("RollingUpdate".to_string())
+        );
+        assert_eq!(
+            parse_kubernetes_daemonset_update_strategy("OnDelete"),
+            Ok("OnDelete".to_string())
+        );
+        assert!(parse_kubernetes_daemonset_update_strategy("Recreate").is_err());
+        assert_eq!(parse_kubernetes_int_or_percent("0"), Ok("0".to_string()));
+        assert_eq!(
+            parse_kubernetes_int_or_percent("100%"),
+            Ok("100%".to_string())
+        );
+        assert!(parse_kubernetes_int_or_percent("101%").is_err());
+        assert!(parse_kubernetes_int_or_percent("01%").is_err());
+        assert!(parse_kubernetes_int_or_percent("1.5").is_err());
+        assert_eq!(
+            parse_kubernetes_non_negative_i32("2147483647"),
+            Ok(2_147_483_647)
+        );
+        assert!(parse_kubernetes_non_negative_i32("2147483648").is_err());
         assert_eq!(parse_kubernetes_node_port("30000"), Ok(30000));
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());

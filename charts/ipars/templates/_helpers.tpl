@@ -59,6 +59,22 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateNonNegativeInteger" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- if and (ne $value "") (not (regexMatch "^([0-9]|[1-9][0-9]*)$" $value)) -}}
+{{- fail (printf "%s %q must be a non-negative integer" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateIntOrPercent" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- if and (ne $value "") (not (regexMatch "^([0-9]|[1-9][0-9]*|[0-9]%|[1-9][0-9]%|100%)$" $value)) -}}
+{{- fail (printf "%s %q must be a non-negative integer or percentage from 0%% to 100%%" $path $value) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateAnnotationKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}

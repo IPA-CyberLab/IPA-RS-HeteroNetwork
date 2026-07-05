@@ -29,6 +29,25 @@
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.memory" "value" (printf "%v" .Values.agent.resources.limits.memory)) -}}
+{{- $agentRolloutUpdateStrategy := .Values.agent.rollout.updateStrategy -}}
+{{- $agentRolloutMaxUnavailable := printf "%v" .Values.agent.rollout.maxUnavailable -}}
+{{- $agentRolloutMaxSurge := printf "%v" .Values.agent.rollout.maxSurge -}}
+{{- $agentMinReadySeconds := printf "%v" .Values.agent.rollout.minReadySeconds -}}
+{{- $agentRevisionHistoryLimit := printf "%v" .Values.agent.rollout.revisionHistoryLimit -}}
+{{- $agentRollingUpdateConfigured := or (ne $agentRolloutMaxUnavailable "") (ne $agentRolloutMaxSurge "") -}}
+{{- if and (ne $agentRolloutUpdateStrategy "") (not (or (eq $agentRolloutUpdateStrategy "RollingUpdate") (eq $agentRolloutUpdateStrategy "OnDelete"))) -}}
+{{- fail "agent.rollout.updateStrategy must be RollingUpdate or OnDelete" -}}
+{{- end -}}
+{{- if and (eq $agentRolloutUpdateStrategy "OnDelete") $agentRollingUpdateConfigured -}}
+{{- fail "agent.rollout.maxUnavailable and agent.rollout.maxSurge require agent.rollout.updateStrategy RollingUpdate or empty" -}}
+{{- end -}}
+{{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxUnavailable" "value" $agentRolloutMaxUnavailable) -}}
+{{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxSurge" "value" $agentRolloutMaxSurge) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit) -}}
+{{- if and (or (eq $agentRolloutMaxUnavailable "0") (eq $agentRolloutMaxUnavailable "0%")) (or (eq $agentRolloutMaxSurge "") (eq $agentRolloutMaxSurge "0") (eq $agentRolloutMaxSurge "0%")) -}}
+{{- fail "agent.rollout.maxUnavailable cannot be zero when agent.rollout.maxSurge is zero or unset" -}}
+{{- end -}}
 {{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
 {{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
 {{- end -}}
@@ -102,6 +121,25 @@ metadata:
   labels:
     app.kubernetes.io/name: {{ include "ipars.name" . }}
 spec:
+  {{- if ne $agentMinReadySeconds "" }}
+  minReadySeconds: {{ int $agentMinReadySeconds }}
+  {{- end }}
+  {{- if ne $agentRevisionHistoryLimit "" }}
+  revisionHistoryLimit: {{ int $agentRevisionHistoryLimit }}
+  {{- end }}
+  {{- if or (ne $agentRolloutUpdateStrategy "") $agentRollingUpdateConfigured }}
+  updateStrategy:
+    type: {{ default "RollingUpdate" $agentRolloutUpdateStrategy }}
+    {{- if $agentRollingUpdateConfigured }}
+    rollingUpdate:
+      {{- if ne $agentRolloutMaxUnavailable "" }}
+      maxUnavailable: {{- if regexMatch "%$" $agentRolloutMaxUnavailable }} {{ $agentRolloutMaxUnavailable | quote }}{{- else }} {{ int $agentRolloutMaxUnavailable }}{{- end }}
+      {{- end }}
+      {{- if ne $agentRolloutMaxSurge "" }}
+      maxSurge: {{- if regexMatch "%$" $agentRolloutMaxSurge }} {{ $agentRolloutMaxSurge | quote }}{{- else }} {{ int $agentRolloutMaxSurge }}{{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "ipars.name" . }}
