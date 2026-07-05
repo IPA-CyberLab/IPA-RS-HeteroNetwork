@@ -1163,6 +1163,7 @@ enum DaemonRuntimePhase {
     ControlPlaneStartup,
     ServiceStartup,
     AgentStartup,
+    StartupReadiness,
     StartupReady,
     RegistrationProbe,
     PeerMapProbe,
@@ -1352,11 +1353,14 @@ impl DaemonProcessGroup {
                 &agent_urls,
                 &startup.children,
             )?;
-            wait_for_http_ok(
+            wait_for_http_ok_or_manifest_failure(
                 &client,
                 format!("{}/healthz", control_plane_urls[index]),
                 &role,
                 &mut startup.children,
+                &manifest_seed,
+                DaemonRuntimePhase::ControlPlaneStartup,
+                &agent_urls,
             )
             .await?;
         }
@@ -1418,18 +1422,24 @@ impl DaemonProcessGroup {
             &startup.children,
         )?;
 
-        wait_for_http_ok(
+        wait_for_http_ok_or_manifest_failure(
             &client,
             format!("{signal_url}/healthz"),
             "signal",
             &mut startup.children,
+            &manifest_seed,
+            DaemonRuntimePhase::ServiceStartup,
+            &agent_urls,
         )
         .await?;
-        wait_for_http_ok(
+        wait_for_http_ok_or_manifest_failure(
             &client,
             format!("{relay_http_url}/healthz"),
             "relay",
             &mut startup.children,
+            &manifest_seed,
+            DaemonRuntimePhase::ServiceStartup,
+            &agent_urls,
         )
         .await?;
 
@@ -1482,7 +1492,7 @@ impl DaemonProcessGroup {
                 &agent_urls,
                 &startup.children,
             )?;
-            wait_for_http_ok(
+            wait_for_http_ok_or_manifest_failure(
                 &client,
                 format!(
                     "{}/healthz",
@@ -1490,15 +1500,24 @@ impl DaemonProcessGroup {
                 ),
                 "agent",
                 &mut startup.children,
+                &manifest_seed,
+                DaemonRuntimePhase::AgentStartup,
+                &agent_urls,
             )
             .await?;
         }
-        wait_for_daemon_agents_ready(
+        manifest_seed.write(
+            DaemonRuntimePhase::StartupReadiness,
+            &agent_urls,
+            &startup.children,
+        )?;
+        wait_for_daemon_agents_ready_or_manifest_failure(
             &client,
             &control_plane_urls,
             &signal_url,
             &agent_urls,
             &mut startup.children,
+            &manifest_seed,
         )
         .await?;
         manifest_seed.write(
@@ -1899,6 +1918,33 @@ async fn wait_for_http_ok(
     )
 }
 
+async fn wait_for_http_ok_or_manifest_failure(
+    client: &reqwest::Client,
+    url: String,
+    context: &str,
+    children: &mut [DaemonChild],
+    manifest_seed: &DaemonRuntimeManifestSeed,
+    phase: DaemonRuntimePhase,
+    agent_urls: &[String],
+) -> anyhow::Result<()> {
+    match wait_for_http_ok(client, url, context, children).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(manifest_error) = write_daemon_manifest_after_startup_failure(
+                manifest_seed,
+                phase,
+                agent_urls,
+                children,
+            ) {
+                bail!(
+                    "{error}; additionally failed to update daemon runtime manifest after {context} failure: {manifest_error}"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn wait_for_daemon_agents_ready(
     client: &reqwest::Client,
     control_plane_urls: &[String],
@@ -1930,6 +1976,43 @@ async fn wait_for_daemon_agents_ready(
         "daemon agent readiness failed: {error}\n{}",
         daemon_children_log_summary(children)
     )
+}
+
+async fn wait_for_daemon_agents_ready_or_manifest_failure(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    signal_url: &str,
+    agent_urls: &[String],
+    children: &mut [DaemonChild],
+    manifest_seed: &DaemonRuntimeManifestSeed,
+) -> anyhow::Result<()> {
+    match wait_for_daemon_agents_ready(client, control_plane_urls, signal_url, agent_urls, children)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(manifest_error) = write_daemon_manifest_after_startup_failure(
+                manifest_seed,
+                DaemonRuntimePhase::StartupReadiness,
+                agent_urls,
+                children,
+            ) {
+                bail!(
+                    "{error}; additionally failed to update daemon runtime manifest after daemon readiness failure: {manifest_error}"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn write_daemon_manifest_after_startup_failure(
+    manifest_seed: &DaemonRuntimeManifestSeed,
+    phase: DaemonRuntimePhase,
+    agent_urls: &[String],
+    children: &[DaemonChild],
+) -> anyhow::Result<PathBuf> {
+    manifest_seed.write(phase, agent_urls, children)
 }
 
 async fn daemon_agent_statuses(
@@ -2811,6 +2894,64 @@ mod tests {
         );
         assert_eq!(updated.children[0].exit_status, None);
         assert_eq!(updated.children[0].exit_code, None);
+
+        let _ = children[0].child.kill();
+        let _ = children[0].child.wait();
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_startup_failure_manifest_records_phase_and_exited_child() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("manifest-startup-failure");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let seed = synthetic_manifest_seed(runtime_dir.clone());
+        let log_path = runtime_dir.join("0002-agent.log");
+        std::fs::write(&log_path, "agent exited during readiness\n")?;
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn synthetic daemon child for startup failure manifest test")?;
+        let pid = child.id();
+        let mut children = vec![DaemonChild {
+            role: "agent".to_string(),
+            child,
+            log_path: Some(log_path.clone()),
+            last_exit: Some(DaemonChildExit {
+                status: "exit status: 11".to_string(),
+                code: Some(11),
+            }),
+        }];
+        let agent_urls = vec!["http://127.0.0.1:31006".to_string()];
+
+        let manifest_path = write_daemon_manifest_after_startup_failure(
+            &seed,
+            DaemonRuntimePhase::StartupReadiness,
+            &agent_urls,
+            &children,
+        )?;
+        let decoded: DaemonRuntimeManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReadiness);
+        assert_eq!(decoded.started_at, seed.started_at);
+        assert!(decoded.updated_at >= decoded.started_at);
+        assert_eq!(decoded.agent_urls, agent_urls);
+        assert_eq!(decoded.children.len(), 1);
+        assert_eq!(decoded.children[0].role, "agent");
+        assert_eq!(decoded.children[0].pid, Some(pid));
+        assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
+        assert_eq!(
+            decoded.children[0].state,
+            DaemonRuntimeManifestChildState::Exited
+        );
+        assert_eq!(
+            decoded.children[0].exit_status.as_deref(),
+            Some("exit status: 11")
+        );
+        assert_eq!(decoded.children[0].exit_code, Some(11));
 
         let _ = children[0].child.kill();
         let _ = children[0].child.wait();
