@@ -2359,6 +2359,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
+        "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.rootless {
@@ -2383,6 +2384,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
+            "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
         notes,
@@ -5018,6 +5020,10 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
+        assert!(plan.security.iter().any(|requirement| {
+            requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN")
+                && requirement.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
+        }));
         assert!(plan
             .notes
             .iter()
@@ -5026,6 +5032,10 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("join token") && note.contains("Compose secret")));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
+                && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
+        }));
         Ok(())
     }
 
@@ -5142,6 +5152,10 @@ mod tests {
         assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
         assert!(compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
