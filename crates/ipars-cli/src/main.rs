@@ -9,10 +9,10 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
-    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentStatusResponse,
-    ControlPlaneMetricsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest,
-    RevokeTokenResponse,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
+    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
@@ -208,6 +208,7 @@ struct RelayStatusArgs {
 #[derive(Debug, Subcommand)]
 enum PathCommand {
     Status(PathStatusArgs),
+    Activity(PathActivityArgs),
     Probe(PathProbeArgs),
 }
 
@@ -215,6 +216,16 @@ enum PathCommand {
 struct PathStatusArgs {
     #[arg(long, env = "IPARS_AGENT_URL")]
     agent_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PathActivityArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, default_value_t = false)]
+    pin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -613,6 +624,13 @@ async fn main() -> anyhow::Result<()> {
                 Some(agent_url) => print_json(&path_status(agent_url).await?)?,
                 None => print_json(&StaticStatus::path())?,
             },
+            PathCommand::Activity(args) => {
+                let agent_url = args
+                    .agent_url
+                    .as_deref()
+                    .context("ipars path activity requires --agent-url or IPARS_AGENT_URL")?;
+                print_json(&path_activity(agent_url, &args).await?)?
+            }
             PathCommand::Probe(args) => {
                 let agent_url = args
                     .agent_url
@@ -1210,6 +1228,27 @@ async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
 
 async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
     get_json(agent_url, "/v1/paths", "agent path status").await
+}
+
+async fn path_activity(
+    agent_url: &str,
+    args: &PathActivityArgs,
+) -> anyhow::Result<AgentPeerActivityResponse> {
+    let request = path_activity_request(args);
+    post_json(
+        agent_url,
+        "/v1/peer-activity",
+        "agent peer activity",
+        &request,
+    )
+    .await
+}
+
+fn path_activity_request(args: &PathActivityArgs) -> AgentPeerActivityRequest {
+    AgentPeerActivityRequest {
+        peer: NodeId::from_string(args.peer.clone()),
+        pin: args.pin,
+    }
 }
 
 async fn path_probe(
@@ -5071,10 +5110,54 @@ mod tests {
         } = path.command
         {
             assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+        } else {
+            anyhow::bail!("expected path status command");
+        }
+
+        let activity = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer-a",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Activity(args),
+        } = activity.command
+        {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
             return Ok(());
         }
 
-        anyhow::bail!("expected path status command")
+        anyhow::bail!("expected path activity command")
+    }
+
+    #[test]
+    fn path_activity_args_build_typed_request() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer-a",
+            "--pin",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Activity(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path activity command");
+        };
+
+        assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+        let request = path_activity_request(&args);
+        assert_eq!(request.peer, NodeId::from_string("peer-a"));
+        assert!(request.pin);
+        Ok(())
     }
 
     #[test]

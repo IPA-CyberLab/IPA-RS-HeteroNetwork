@@ -40,7 +40,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
 - agent peer-map applier that converts active or pinned control-plane peers into WireGuard peer configs and route plans, and prunes idle unpinned peers from WireGuard state after the cluster idle timeout
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed agent/control-plane status, peer, route, relay, and path queries/probes when URLs are provided
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `path status`, `path activity`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, and HTTP API-backed agent/control-plane status, peer, route, relay, path query, activation, and probe operations when URLs are provided
 - Docker Compose manifest with service healthchecks, file-backed agent join-token secret, host-network agent loopback wiring, env-driven Docker route, WireGuard backend/userspace lifecycle, relay admission auth/abuse-control settings, Docker API socket binding, gated Compose smoke coverage, and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
@@ -130,6 +130,7 @@ ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root -
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars path status --agent-url http://127.0.0.1:9780
+ipars path activity --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --pin
 ipars path probe --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --state DIRECT_NAT_TRAVERSAL --latency-ms 23.5 --loss-ppm 100 --jitter-ms 3.25 --candidate-addr 198.51.100.10:51820 --candidate-kind stun-reflexive --pin
 ipars docker install --project-name ipars --compose-file docker/compose.yaml --docker-discover-networks --docker-network ipars_default
 ipars k8s install --release ipars --namespace ipars-system --join-token-secret ipars-join-token --join-token-key token
