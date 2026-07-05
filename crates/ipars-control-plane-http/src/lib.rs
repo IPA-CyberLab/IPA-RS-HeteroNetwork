@@ -385,7 +385,7 @@ mod tests {
     fn registration(node_id: &str) -> RegisterNodeRequest {
         let identity = identity_for_node(node_id);
         RegisterNodeRequest {
-            node_id: NodeId::from_string(node_id),
+            node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             candidates: Vec::new(),
@@ -405,8 +405,12 @@ mod tests {
         IdentityKeyPair::from_signing_bytes(seed)
     }
 
-    fn signed_heartbeat(mut request: HeartbeatRequest) -> HeartbeatRequest {
-        let identity = identity_for_node(request.node_id.as_str());
+    fn node_id(label: &str) -> NodeId {
+        identity_for_node(label).node_id()
+    }
+
+    fn signed_heartbeat(label: &str, mut request: HeartbeatRequest) -> HeartbeatRequest {
+        let identity = identity_for_node(label);
         request.node_signature = Some(
             match identity.sign_heartbeat_request(&request, Utc::now()) {
                 Ok(signature) => signature,
@@ -485,7 +489,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RegisterNodeResponse = serde_json::from_slice(&body)?;
-        assert_eq!(response.node.node_id, NodeId::from_string("node-http"));
+        assert_eq!(response.node.node_id, node_id("node-http"));
 
         let response = app
             .clone()
@@ -521,20 +525,23 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let heartbeat = signed_heartbeat(HeartbeatRequest {
-            node_id: NodeId::from_string("node-http"),
-            health: NodeHealth {
-                state: HealthState::Healthy,
-                last_seen_at: Utc::now(),
-                latency_ms: Some(1.0),
-                relay_load: None,
-                message: None,
+        let heartbeat = signed_heartbeat(
+            "node-http",
+            HeartbeatRequest {
+                node_id: node_id("node-http"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                path_state: Vec::new(),
+                node_signature: None,
             },
-            candidates: Vec::new(),
-            relay_capability: None,
-            path_state: Vec::new(),
-            node_signature: None,
-        });
+        );
         let response = app
             .clone()
             .oneshot(

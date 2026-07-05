@@ -344,7 +344,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         .await
         .with_context(|| format!("failed to join synthetic node {index} over HTTP"))?;
         if index < scenario.relay_count {
-            let heartbeat = heartbeat_request(&response.node)?;
+            let heartbeat = heartbeat_request(index, &response.node)?;
             let _: HeartbeatResponse = post_json(
                 &client,
                 format!("{}/v1/heartbeat", services.control_plane_url),
@@ -1607,8 +1607,8 @@ where
 }
 
 fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<RegisterNodeRequest> {
-    let node_id = node_id(index);
-    let identity = identity_for_node(&node_id);
+    let identity = identity_for_index(index);
+    let node_id = identity.node_id();
     Ok(RegisterNodeRequest {
         node_id,
         identity_public_key: identity.public_key_b64(),
@@ -1619,7 +1619,7 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
     })
 }
 
-fn heartbeat_request(node: &NodeRecord) -> anyhow::Result<HeartbeatRequest> {
+fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<HeartbeatRequest> {
     let mut request = HeartbeatRequest {
         node_id: node.node_id.clone(),
         health: healthy_node_health(),
@@ -1629,7 +1629,7 @@ fn heartbeat_request(node: &NodeRecord) -> anyhow::Result<HeartbeatRequest> {
         node_signature: None,
     };
     request.node_signature = Some(
-        identity_for_node(&request.node_id)
+        identity_for_index(index)
             .sign_heartbeat_request(&request, Utc::now())
             .context("failed to sign synthetic load heartbeat")?,
     );
@@ -1770,12 +1770,13 @@ fn relay_capability(index: usize, scenario: Scenario) -> Option<RelayCapability>
 }
 
 fn node_id(index: usize) -> NodeId {
-    NodeId::from_string(format!("load-node-{index:04}"))
+    identity_for_index(index).node_id()
 }
 
-fn identity_for_node(node_id: &NodeId) -> IdentityKeyPair {
+fn identity_for_index(index: usize) -> IdentityKeyPair {
+    let label = format!("load-node-{index:04}");
     let mut seed = [0_u8; 32];
-    for (index, byte) in node_id.as_str().as_bytes().iter().enumerate() {
+    for (index, byte) in label.as_bytes().iter().enumerate() {
         seed[index % seed.len()] = seed[index % seed.len()].wrapping_add(*byte);
     }
     if seed.iter().all(|byte| *byte == 0) {

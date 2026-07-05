@@ -6,8 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
-    validate_identity_public_key_b64, verify_heartbeat_request_signature, verify_join_token,
-    CryptoError,
+    node_id_from_public_key_b64, verify_heartbeat_request_signature, verify_join_token, CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
@@ -969,12 +968,19 @@ fn relay_capability_allowed(
 }
 
 fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), ControlPlaneError> {
-    validate_identity_public_key_b64(&request.identity_public_key).map_err(|error| {
-        ControlPlaneError::NodeRegistrationRejected {
+    let derived_node_id =
+        node_id_from_public_key_b64(&request.identity_public_key).map_err(|error| {
+            ControlPlaneError::NodeRegistrationRejected {
+                node_id: request.node_id.clone(),
+                reason: format!("identity public key is invalid: {error}"),
+            }
+        })?;
+    if derived_node_id != request.node_id {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
             node_id: request.node_id.clone(),
-            reason: format!("identity public key is invalid: {error}"),
-        }
-    })?;
+            reason: format!("identity public key derives node ID {derived_node_id}"),
+        });
+    }
     if let Some(candidate) = request
         .candidates
         .iter()
@@ -1103,7 +1109,7 @@ mod tests {
     fn registration_request(node_id: &str) -> RegisterNodeRequest {
         let identity = identity_for_node(node_id);
         RegisterNodeRequest {
-            node_id: NodeId::from_string(node_id),
+            node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             candidates: Vec::new(),
@@ -1115,7 +1121,7 @@ mod tests {
     fn node_record(node_id: &str) -> NodeRecord {
         let identity = identity_for_node(node_id);
         NodeRecord {
-            node_id: NodeId::from_string(node_id),
+            node_id: identity.node_id(),
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: identity.public_key_b64(),
@@ -1141,8 +1147,12 @@ mod tests {
         IdentityKeyPair::from_signing_bytes(seed)
     }
 
-    fn signed_heartbeat(mut request: HeartbeatRequest) -> HeartbeatRequest {
-        let identity = identity_for_node(request.node_id.as_str());
+    fn node_id(label: &str) -> NodeId {
+        identity_for_node(label).node_id()
+    }
+
+    fn signed_heartbeat(label: &str, mut request: HeartbeatRequest) -> HeartbeatRequest {
+        let identity = identity_for_node(label);
         request.node_signature = Some(
             match identity.sign_heartbeat_request(&request, Utc::now()) {
                 Ok(signature) => signature,
@@ -1245,7 +1255,7 @@ mod tests {
         Ok(Route {
             id: id.to_string(),
             cidr: cidr.parse()?,
-            advertised_by: NodeId::from_string(advertised_by),
+            advertised_by: node_id(advertised_by),
             via: None,
             metric: 100,
             tags: BTreeSet::new(),
@@ -1254,7 +1264,7 @@ mod tests {
 
     fn candidate(node_id: &str) -> EndpointCandidate {
         EndpointCandidate {
-            node_id: NodeId::from_string(node_id),
+            node_id: self::node_id(node_id),
             kind: EndpointCandidateKind::StunReflexive,
             addr: std::net::SocketAddr::from(([203, 0, 113, 10], 51820)),
             observed_at: Utc::now(),
@@ -1272,7 +1282,7 @@ mod tests {
 
     fn path(local: &str, remote: &str) -> PathRecord {
         PathRecord {
-            key: PeerPathKey::new(NodeId::from_string(local), NodeId::from_string(remote)),
+            key: PeerPathKey::new(node_id(local), node_id(remote)),
             selected_state: PathState::DirectNatTraversal,
             selected_candidate: None,
             relay_node: None,
@@ -1318,7 +1328,7 @@ mod tests {
         let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
         let identity = identity_for_node("node-a");
         let request = RegisterNodeRequest {
-            node_id: NodeId::from_string("node-a"),
+            node_id: identity.node_id(),
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: "wg".to_string(),
             candidates: Vec::new(),
@@ -1371,20 +1381,23 @@ mod tests {
         assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
 
         plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("relay-a"),
-                health: NodeHealth {
-                    state: HealthState::Healthy,
-                    last_seen_at: Utc::now(),
-                    latency_ms: Some(1.0),
-                    relay_load: Some(0.10),
-                    message: None,
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.10),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
                 },
-                candidates: Vec::new(),
-                relay_capability: None,
-                path_state: Vec::new(),
-                node_signature: None,
-            }))
+            ))
             .await?;
         assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
 
@@ -1394,12 +1407,12 @@ mod tests {
         assert_eq!(source_registration.relay_map.relays.len(), 1);
         assert_eq!(
             source_registration.relay_map.relays[0].node_id,
-            NodeId::from_string("relay-a")
+            node_id("relay-a")
         );
 
         store
             .upsert_health(
-                NodeId::from_string("relay-a"),
+                node_id("relay-a"),
                 NodeHealth {
                     state: HealthState::Healthy,
                     last_seen_at: Utc::now() - Duration::seconds(120),
@@ -1413,7 +1426,7 @@ mod tests {
 
         store
             .upsert_health(
-                NodeId::from_string("relay-a"),
+                node_id("relay-a"),
                 NodeHealth {
                     state: HealthState::Unhealthy,
                     last_seen_at: Utc::now(),
@@ -1478,7 +1491,7 @@ mod tests {
         let nodes = store.list_nodes().await?;
         assert_eq!(nodes.len(), 2);
         assert!(nodes.iter().any(|node| {
-            node.node_id == NodeId::from_string("node-racing-peer")
+            node.node_id == node_id("node-racing-peer")
                 && node.vpn_ip.0 == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         }));
         Ok(())
@@ -1583,10 +1596,25 @@ mod tests {
         request.identity_public_key = "not-valid-base64".to_string();
 
         let error = match plane
-            .register_with_claims(claims(cluster_id), request)
+            .register_with_claims(claims(cluster_id.clone()), request)
             .await
         {
             Ok(_) => return Err("unexpected successful identity registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+
+        let mut mismatched = registration_request("node-a");
+        mismatched.node_id = node_id("node-b");
+        let error = match plane
+            .register_with_claims(claims(cluster_id), mismatched)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful mismatched identity registration".into()),
             Err(error) => error,
         };
 
@@ -1686,20 +1714,20 @@ mod tests {
         let allowed_peer = peer_map
             .peers
             .iter()
-            .find(|peer| peer.node_id == NodeId::from_string("allowed"))
+            .find(|peer| peer.node_id == node_id("allowed"))
             .ok_or("allowed peer should be visible")?;
         assert!(allowed_peer.routes.is_empty());
         let route_peer = peer_map
             .peers
             .iter()
-            .find(|peer| peer.node_id == NodeId::from_string("route-provider"))
+            .find(|peer| peer.node_id == node_id("route-provider"))
             .ok_or("route provider should be visible")?;
         assert_eq!(route_peer.routes.len(), 1);
         assert_eq!(route_peer.routes[0].id, "allowed-route");
         assert!(peer_map
             .peers
             .iter()
-            .all(|peer| peer.node_id != NodeId::from_string("denied")));
+            .all(|peer| peer.node_id != node_id("denied")));
         Ok(())
     }
 
@@ -1728,7 +1756,7 @@ mod tests {
         store.insert_node(relay).await?;
         store
             .upsert_health(
-                NodeId::from_string("relay-a"),
+                node_id("relay-a"),
                 NodeHealth {
                     state: HealthState::Healthy,
                     last_seen_at: Utc::now(),
@@ -1743,7 +1771,7 @@ mod tests {
         let peer = peer_map
             .peers
             .iter()
-            .find(|peer| peer.node_id == NodeId::from_string("peer-a"))
+            .find(|peer| peer.node_id == node_id("peer-a"))
             .ok_or("peer should remain visible with fresh candidate")?;
         assert_eq!(peer.endpoint_candidates.len(), 1);
         assert!(peer.endpoint_candidates[0].observed_at > Utc::now() - Duration::seconds(30));
@@ -1758,7 +1786,7 @@ mod tests {
             .relay_map
             .relays
             .iter()
-            .find(|relay| relay.node_id == NodeId::from_string("relay-a"))
+            .find(|relay| relay.node_id == node_id("relay-a"))
             .ok_or("fresh healthy relay should remain visible")?;
         assert_eq!(relay.endpoint_candidates.len(), 1);
 
@@ -1790,39 +1818,31 @@ mod tests {
         };
 
         let response = plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("node-a"),
-                health: health.clone(),
-                candidates: vec![candidate("node-a")],
-                relay_capability: None,
-                path_state: vec![path("node-a", "node-b")],
-                node_signature: None,
-            }))
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: health.clone(),
+                    candidates: vec![candidate("node-a")],
+                    relay_capability: None,
+                    path_state: vec![path("node-a", "node-b")],
+                    node_signature: None,
+                },
+            ))
             .await?;
 
         assert!(response.accepted);
         assert_eq!(
             store
-                .get_node(&NodeId::from_string("node-a"))
+                .get_node(&node_id("node-a"))
                 .await?
-                .ok_or(ControlPlaneError::NodeNotFound(NodeId::from_string(
-                    "node-a"
-                )))?
+                .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
                 .endpoint_candidates
                 .len(),
             1
         );
-        assert_eq!(
-            store.get_health(&NodeId::from_string("node-a")).await?,
-            Some(health)
-        );
-        assert_eq!(
-            store
-                .list_paths_for(&NodeId::from_string("node-a"))
-                .await?
-                .len(),
-            1
-        );
+        assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
+        assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
         Ok(())
     }
 
@@ -1838,7 +1858,7 @@ mod tests {
             .register_with_claims(claims(cluster_id), registration_request("node-a"))
             .await?;
         let unsigned = HeartbeatRequest {
-            node_id: NodeId::from_string("node-a"),
+            node_id: node_id("node-a"),
             health: NodeHealth {
                 state: HealthState::Healthy,
                 last_seen_at: Utc::now(),
@@ -1858,7 +1878,7 @@ mod tests {
             Err(ControlPlaneError::NodeSignatureRequired(_))
         ));
 
-        let mut tampered = signed_heartbeat(unsigned);
+        let mut tampered = signed_heartbeat("node-a", unsigned);
         tampered.health.message = Some("changed after signing".to_string());
         let result = plane.heartbeat(tampered).await;
         assert!(matches!(
@@ -1888,14 +1908,17 @@ mod tests {
         };
 
         let result = plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("node-a"),
-                health: health.clone(),
-                candidates: vec![candidate("node-b")],
-                relay_capability: None,
-                path_state: Vec::new(),
-                node_signature: None,
-            }))
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: health.clone(),
+                    candidates: vec![candidate("node-b")],
+                    relay_capability: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
             .await;
         assert!(matches!(
             result,
@@ -1903,14 +1926,17 @@ mod tests {
         ));
 
         let result = plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("node-a"),
-                health,
-                candidates: Vec::new(),
-                relay_capability: None,
-                path_state: vec![path("node-b", "node-c")],
-                node_signature: None,
-            }))
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health,
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    path_state: vec![path("node-b", "node-c")],
+                    node_signature: None,
+                },
+            ))
             .await;
         assert!(matches!(
             result,
@@ -1939,27 +1965,30 @@ mod tests {
         heartbeat_relay.active_sessions = 7;
 
         let response = plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("node-a"),
-                health: NodeHealth {
-                    state: HealthState::Healthy,
-                    last_seen_at: Utc::now(),
-                    latency_ms: None,
-                    relay_load: Some(0.25),
-                    message: None,
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: Some(0.25),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(heartbeat_relay),
+                    path_state: Vec::new(),
+                    node_signature: None,
                 },
-                candidates: Vec::new(),
-                relay_capability: Some(heartbeat_relay),
-                path_state: Vec::new(),
-                node_signature: None,
-            }))
+            ))
             .await?;
 
         assert!(response.accepted);
         let node = store
-            .get_node(&NodeId::from_string("node-a"))
+            .get_node(&node_id("node-a"))
             .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(NodeId::from_string("node-a")))?;
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
         let Some(relay) = node.relay_capability else {
             return Err("expected heartbeat relay capability".into());
         };
@@ -1982,20 +2011,23 @@ mod tests {
             .await?;
 
         let result = plane
-            .heartbeat(signed_heartbeat(HeartbeatRequest {
-                node_id: NodeId::from_string("node-a"),
-                health: NodeHealth {
-                    state: HealthState::Healthy,
-                    last_seen_at: Utc::now(),
-                    latency_ms: None,
-                    relay_load: None,
-                    message: None,
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    path_state: Vec::new(),
+                    node_signature: None,
                 },
-                candidates: Vec::new(),
-                relay_capability: Some(relay_capability()),
-                path_state: Vec::new(),
-                node_signature: None,
-            }))
+            ))
             .await;
 
         assert!(matches!(result, Err(ControlPlaneError::RelayDenied)));
@@ -2066,7 +2098,7 @@ mod tests {
             .join(token, registration_request("node-a"), Utc::now())
             .await?;
 
-        assert_eq!(response.node.node_id, NodeId::from_string("node-a"));
+        assert_eq!(response.node.node_id, node_id("node-a"));
         assert_eq!(
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
@@ -2123,8 +2155,8 @@ mod tests {
             .join(next_token, registration_request("node-next"), Utc::now())
             .await?;
 
-        assert_eq!(old_response.node.node_id, NodeId::from_string("node-old"));
-        assert_eq!(next_response.node.node_id, NodeId::from_string("node-next"));
+        assert_eq!(old_response.node.node_id, node_id("node-old"));
+        assert_eq!(next_response.node.node_id, node_id("node-next"));
         Ok(())
     }
 
