@@ -1477,6 +1477,8 @@ async fn run_daemon_scenario(
     )
     .await?;
     services.ensure_running(DaemonRuntimePhase::FinalMetrics)?;
+    let daemon_relay_count = daemon_relay_agent_count(scenario, agent_processes);
+    let daemon_route_provider_count = daemon_route_provider_agent_count(scenario, agent_processes);
     let mut total_peer_map_requests = peer_map_requests;
     let mut control_plane_http_requests =
         agent_statuses.len() + peer_map_requests + control_summary.endpoint_count;
@@ -1513,8 +1515,8 @@ async fn run_daemon_scenario(
         transport: TransportMode::Daemon,
         scenario: scenario.name,
         node_count: agent_statuses.len(),
-        relay_count: 1,
-        route_provider_count: 0,
+        relay_count: daemon_relay_count,
+        route_provider_count: daemon_route_provider_count,
         advertised_routes,
         active_pair_count,
         registrations: agent_statuses.len(),
@@ -1603,6 +1605,16 @@ fn validate_daemon_agent_processes(
         );
     }
     Ok(requested_agent_processes)
+}
+
+fn daemon_relay_agent_count(scenario: Scenario, agent_processes: usize) -> usize {
+    agent_processes.min(scenario.relay_count)
+}
+
+fn daemon_route_provider_agent_count(scenario: Scenario, agent_processes: usize) -> usize {
+    agent_processes
+        .saturating_sub(scenario.relay_count)
+        .min(scenario.route_provider_count)
 }
 
 fn validate_daemon_control_plane_processes(
@@ -3940,6 +3952,22 @@ mod tests {
     }
 
     #[test]
+    fn daemon_role_counts_follow_launched_agent_prefix() {
+        let ten = Scenario::from_name(ScenarioName::Ten);
+        assert_eq!(daemon_relay_agent_count(ten, 1), 1);
+        assert_eq!(daemon_relay_agent_count(ten, 2), 2);
+        assert_eq!(daemon_relay_agent_count(ten, 4), 2);
+        assert_eq!(daemon_route_provider_agent_count(ten, 1), 0);
+        assert_eq!(daemon_route_provider_agent_count(ten, 2), 0);
+        assert_eq!(daemon_route_provider_agent_count(ten, 3), 1);
+        assert_eq!(daemon_route_provider_agent_count(ten, 4), 2);
+
+        let thousand = Scenario::from_name(ScenarioName::Thousand);
+        assert_eq!(daemon_relay_agent_count(thousand, 4), 4);
+        assert_eq!(daemon_route_provider_agent_count(thousand, 4), 0);
+    }
+
+    #[test]
     fn daemon_control_plane_processes_reject_invalid_bounds() -> anyhow::Result<()> {
         let zero = match validate_daemon_control_plane_processes(0) {
             Ok(_) => bail!("zero daemon control-plane process count should fail validation"),
@@ -4709,6 +4737,8 @@ mod tests {
         assert_eq!(report.daemon_control_plane_processes, 2);
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 2);
+        assert_eq!(report.relay_count, 1);
+        assert_eq!(report.route_provider_count, 1);
         assert_eq!(report.registrations, 2);
         assert_eq!(report.peer_map_requests, 6);
         assert_eq!(report.peer_map_edges_seen, 2);

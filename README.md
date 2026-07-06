@@ -77,18 +77,21 @@ relay payload size, daemon agent process count, daemon control-plane process cou
 HTTP/agent readiness timeouts are validated before a run starts so load plans do not silently clamp
 invalid inputs. Daemon transport can spawn
 multiple control-plane processes against the same SQLite store, writes signed agent join tokens into
-private runtime files using the selected scenario's relay/route-provider distribution and all
-runtime control-plane bootstrap URLs, and passes `--join-token-path` so token material is not exposed
-through child process argv. Daemon transport probes every control-plane endpoint for every agent
-peer map, reports per-endpoint edge-count min/max plus full source/target edge consistency, then
-stops one control-plane process when redundant endpoints exist and verifies the remaining endpoints
-can still serve complete peer maps. Load reports are validated before CLI success so missing
-registrations, peer-map edge loss, cross-control-plane skew, failed control-plane failover,
-all-unreachable path negotiation, relay packet loss, relay capacity/policy/E2E/admission counter
-skew, relay admission failure reasons, retained runtime manifest incompleteness or file-backed log
-diagnostic mismatch after final child shutdown, or daemon health inconsistencies fail the run instead of only appearing as degraded JSON fields. It captures each
-child process stdout/stderr log, records per-child log byte counts plus redacted log-tail hashes in
-an owner-only atomically replaced runtime manifest, and reports log tails
+private runtime files using the selected scenario's relay/route-provider distribution for the
+launched agent prefix and all runtime control-plane bootstrap URLs, and passes
+`--join-token-path` so token material is not exposed through child process argv. Daemon transport
+probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
+min/max plus full source/target edge consistency, then stops one control-plane process when
+redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps.
+Load reports are validated before CLI success so missing
+registrations, peer-map edge loss, missing control-plane metrics endpoint coverage,
+cross-control-plane skew, failed control-plane failover, all-unreachable path negotiation,
+relay-candidate loss, relay packet loss, relay capacity/policy/E2E/admission counter skew,
+relay admission failure reasons, retained runtime manifest incompleteness or file-backed log
+diagnostic mismatch after final child shutdown, or daemon health inconsistencies fail the run
+instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
+records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced
+runtime manifest, and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration
 visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
 negotiation readiness before measuring:
