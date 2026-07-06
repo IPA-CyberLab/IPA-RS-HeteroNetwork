@@ -844,6 +844,7 @@ impl LoadReport {
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         let mut seen_log_paths = BTreeSet::new();
+        let mut seen_log_serials = BTreeSet::new();
         for child in &manifest.children {
             let Some(log_path) = &child.log_path else {
                 bail!(
@@ -919,7 +920,15 @@ impl LoadReport {
                         log_path.display()
                     )
                 })?;
-            validate_daemon_child_log_file_name(&child.role, log_file_name)?;
+            let log_serial = validate_daemon_child_log_file_name(&child.role, log_file_name)?;
+            if !seen_log_serials.insert(log_serial.clone()) {
+                bail!(
+                    "daemon load scenario retained manifest child {} log file name {} reuses serial prefix {}",
+                    child.role,
+                    log_file_name,
+                    log_serial
+                );
+            }
             expected_runtime_entries.insert(log_file_name.to_string());
             let log_diagnostics = daemon_log_diagnostics(log_path).with_context(|| {
                 format!(
@@ -3168,7 +3177,7 @@ fn sanitized_daemon_child_role(role: &str) -> String {
 fn validate_daemon_child_log_file_name(
     child_role: &str,
     log_file_name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let sanitized_role = sanitized_daemon_child_role(child_role);
     let expected_suffix = format!("-{sanitized_role}.log");
     let Some(serial_prefix) = log_file_name.strip_suffix(&expected_suffix) else {
@@ -3176,12 +3185,12 @@ fn validate_daemon_child_log_file_name(
             "daemon load scenario retained manifest child {child_role} log file name {log_file_name} does not match child role"
         );
     };
-    if serial_prefix.is_empty() || !serial_prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+    if serial_prefix.len() < 4 || !serial_prefix.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!(
             "daemon load scenario retained manifest child {child_role} log file name {log_file_name} has invalid serial prefix"
         );
     }
-    Ok(())
+    Ok(serial_prefix.to_string())
 }
 
 fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
@@ -4576,6 +4585,70 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("duplicated"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut duplicate_child_log_serial = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &duplicate_child_log_serial,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        duplicate_child_log_serial.daemon_runtime_dir = Some(runtime_dir.clone());
+        duplicate_child_log_serial.daemon_runtime_manifest = Some(manifest_path.clone());
+        let duplicate_serial_log_path = runtime_dir.join("0000-signal.log");
+        std::fs::rename(
+            runtime_dir.join("0002-signal.log"),
+            &duplicate_serial_log_path,
+        )?;
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[2].log_path = Some(duplicate_serial_log_path);
+        })?;
+        let error = match duplicate_child_log_serial.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with duplicate child log serial should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reuses serial prefix"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut invalid_child_log_serial = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &invalid_child_log_serial,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        invalid_child_log_serial.daemon_runtime_dir = Some(runtime_dir.clone());
+        invalid_child_log_serial.daemon_runtime_manifest = Some(manifest_path.clone());
+        let invalid_serial_log_path = runtime_dir.join("2-signal.log");
+        std::fs::rename(
+            runtime_dir.join("0002-signal.log"),
+            &invalid_serial_log_path,
+        )?;
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[2].log_path = Some(invalid_serial_log_path);
+        })?;
+        let error = match invalid_child_log_serial.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with invalid child log serial should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid serial prefix"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut role_mismatched_child_log_path = daemon_report.clone();
