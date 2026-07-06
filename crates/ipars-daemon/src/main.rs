@@ -8579,6 +8579,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
     validate_ebpf_packet_flow_unused_fields(&event)?;
     let protocol = ebpf_packet_flow_protocol(event.protocol)?;
     let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
+    validate_ebpf_packet_flow_transport_metadata(&event)?;
     let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status)?;
     let source_port = optional_nonzero_port(event.source_port());
     let destination_port = optional_nonzero_port(event.destination_port());
@@ -8640,6 +8641,17 @@ fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlo
         _ => anyhow::bail!("unsupported eBPF packet-flow TCP state code {value}"),
     };
     Ok(state)
+}
+
+fn validate_ebpf_packet_flow_transport_metadata(event: &PacketFlowEvent) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        event.protocol == PACKET_FLOW_PROTOCOL_TCP
+            || event.tcp_state == PACKET_FLOW_TCP_STATE_UNKNOWN,
+        "unsupported eBPF packet-flow TCP state {} for non-TCP protocol code {}",
+        event.tcp_state,
+        event.protocol
+    );
+    Ok(())
 }
 
 fn ebpf_packet_flow_conntrack_status(
@@ -11897,6 +11909,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported eBPF packet-flow conntrack status bits"));
+
+        let mut inconsistent_transport_metadata = event;
+        inconsistent_transport_metadata[3] = PACKET_FLOW_TCP_STATE_ESTABLISHED;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&inconsistent_transport_metadata) {
+            Ok(_) => anyhow::bail!("TCP state on non-TCP eBPF event should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow TCP state"));
 
         let mut unknown_protocol = event;
         unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
