@@ -1256,6 +1256,11 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.relay_session_renew_before_seconds,
             "--relay-session-renew-before-seconds",
         )?;
+        validate_positive_usize(args.hole_punch_attempts, "--hole-punch-attempts")?;
+        validate_positive_millis(
+            args.hole_punch_interval_millis,
+            "--hole-punch-interval-millis",
+        )?;
     }
     validate_positive_seconds(
         args.runtime_command_timeout_seconds,
@@ -1458,6 +1463,13 @@ fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()
 }
 
 fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_positive_millis(value: u64, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
     }
@@ -15183,6 +15195,62 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("must contain only ASCII letters"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_hole_punch_config_must_be_positive_when_signal_paths_are_enabled() -> anyhow::Result<()>
+    {
+        for (flag, expected) in [
+            (
+                "--hole-punch-attempts",
+                "--hole-punch-attempts must be greater than zero",
+            ),
+            (
+                "--hole-punch-interval-millis",
+                "--hole-punch-interval-millis must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--skip-runtime-preflight",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let disabled = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--disable-signal-paths",
+            "--hole-punch-attempts",
+            "0",
+            "--hole-punch-interval-millis",
+            "0",
+        ])?;
+        if let Command::Agent(args) = disabled.command {
+            validate_agent_runtime_config(&args)?;
             return Ok(());
         }
 
