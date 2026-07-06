@@ -8895,6 +8895,19 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
         ));
+        assert!(service_template.contains("(ne .Values.agent.apiService.type \"ClusterIP\")"));
+        assert!(service_template.contains("(ne $agentApiPort 9780)"));
+        assert!(service_template.contains("(ne .Values.agent.apiService.appProtocol \"http\")"));
+        assert!(service_template.contains("(ne .Values.agent.relayService.type \"LoadBalancer\")"));
+        assert!(service_template.contains("(ne $relayUdpPort 51820)"));
+        assert!(service_template.contains("(ne $relayUdpTargetPort 51820)"));
+        assert!(service_template.contains("(ne $relayHttpPort 9580)"));
+        assert!(service_template.contains("(ne $relayHttpTargetPort 9580)"));
+        assert!(service_template
+            .contains("(ne .Values.agent.relayService.udpAppProtocol \"ipars.io/relay-udp\")"));
+        assert!(
+            service_template.contains("(ne .Values.agent.relayService.httpAppProtocol \"http\")")
+        );
         assert!(service_template.contains(
             ".Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged"
         ));
