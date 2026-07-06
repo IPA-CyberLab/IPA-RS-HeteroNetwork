@@ -14672,6 +14672,27 @@ mod tests {
         assert!(error.chain().any(|cause| cause
             .to_string()
             .contains("port metadata requires TCP or UDP protocol")));
+
+        let inconsistent_application_line =
+            br#"{"destination":"100.64.0.13","protocol":"icmp","application":"postgres"}
+"#;
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            inconsistent_application_line,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!(
+                "protocol-incompatible eBPF JSONL application hint should be rejected"
+            ),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("application hint postgres requires TCP or UDP protocol")));
         Ok(())
     }
 
