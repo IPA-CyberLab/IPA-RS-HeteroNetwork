@@ -86,9 +86,9 @@ probes every control-plane endpoint for every agent peer map, reports per-endpoi
 min/max plus full source/target edge consistency, then stops one control-plane process when
 redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps.
 Load reports are validated before CLI success so missing
-registrations, agent status endpoint coverage, agent endpoint candidates, peer-map edge loss,
+registrations, agent status endpoint coverage, agent endpoint candidates, agent path-state endpoint coverage,
 advertised route loss, missing control-plane metrics endpoint coverage, cross-control-plane skew,
-failed control-plane failover, all-unreachable path negotiation, relay-candidate loss, relay packet
+failed control-plane failover, all-unreachable path negotiation, missing agent runtime reachable paths, relay-candidate loss, relay packet
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
 readiness-timeout, endpoint, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic

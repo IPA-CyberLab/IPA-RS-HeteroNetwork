@@ -21,11 +21,11 @@ use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
-    AgentStatusResponse, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    AgentPathsResponse, AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -224,6 +224,11 @@ struct LoadReport {
     daemon_agent_status_endpoints: usize,
     daemon_agent_candidate_count_min: usize,
     daemon_agent_candidate_count_max: usize,
+    daemon_agent_path_status_endpoints: usize,
+    daemon_agent_paths_total: usize,
+    daemon_agent_reachable_paths_total: usize,
+    daemon_agent_path_count_min: usize,
+    daemon_agent_path_count_max: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
     daemon_control_plane_peer_map_endpoints: usize,
@@ -359,6 +364,31 @@ impl LoadReport {
                         "daemon load scenario agent endpoint candidate mismatch: min/max={}/{}, expected every agent to advertise at least one candidate",
                         self.daemon_agent_candidate_count_min,
                         self.daemon_agent_candidate_count_max
+                    );
+                }
+                let expected_agent_path_count =
+                    expected_daemon_agent_path_count(self.active_pair_count, self.node_count);
+                if self.daemon_agent_path_status_endpoints != self.daemon_agent_processes {
+                    bail!(
+                        "daemon load scenario checked {} agent path endpoints, expected {}",
+                        self.daemon_agent_path_status_endpoints,
+                        self.daemon_agent_processes
+                    );
+                }
+                if self.daemon_agent_paths_total < expected_agent_path_count
+                    || self.daemon_agent_reachable_paths_total < expected_agent_path_count
+                {
+                    bail!(
+                        "daemon load scenario agent path state mismatch: total={}, reachable={}, expected at least {expected_agent_path_count}",
+                        self.daemon_agent_paths_total,
+                        self.daemon_agent_reachable_paths_total
+                    );
+                }
+                if self.daemon_agent_path_count_max < self.daemon_agent_path_count_min {
+                    bail!(
+                        "daemon load scenario agent path min/max is invalid: min={}, max={}",
+                        self.daemon_agent_path_count_min,
+                        self.daemon_agent_path_count_max
                     );
                 }
                 if !self.daemon_control_plane_metrics_consistent {
@@ -1386,6 +1416,11 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
         daemon_agent_candidate_count_max: 0,
+        daemon_agent_path_status_endpoints: 0,
+        daemon_agent_paths_total: 0,
+        daemon_agent_reachable_paths_total: 0,
+        daemon_agent_path_count_min: 0,
+        daemon_agent_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1569,6 +1604,11 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
         daemon_agent_candidate_count_max: 0,
+        daemon_agent_path_status_endpoints: 0,
+        daemon_agent_paths_total: 0,
+        daemon_agent_reachable_paths_total: 0,
+        daemon_agent_path_count_min: 0,
+        daemon_agent_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1726,6 +1766,11 @@ async fn run_relay_udp_scenario(
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
         daemon_agent_candidate_count_max: 0,
+        daemon_agent_path_status_endpoints: 0,
+        daemon_agent_paths_total: 0,
+        daemon_agent_reachable_paths_total: 0,
+        daemon_agent_path_count_min: 0,
+        daemon_agent_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1866,6 +1911,26 @@ async fn run_daemon_scenario(
     }
     services.ensure_running(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_millis = signal_started.elapsed().as_millis();
+
+    services.write_manifest(DaemonRuntimePhase::AgentPathValidation)?;
+    let expected_agent_path_count =
+        expected_daemon_agent_path_count(active_pair_count, agent_statuses.len());
+    drive_daemon_agent_peer_activity(
+        &client,
+        &services.agent_urls,
+        &agent_statuses,
+        active_pair_count,
+    )
+    .await?;
+    let agent_path_summary = wait_for_daemon_agent_path_summary(
+        &client,
+        &services.agent_urls,
+        &agent_statuses,
+        expected_agent_path_count,
+        agent_readiness_timeout,
+    )
+    .await?;
+    services.ensure_running(DaemonRuntimePhase::AgentPathValidation)?;
 
     services.write_manifest(DaemonRuntimePhase::RelayMeasurement)?;
     let relay_started = Instant::now();
@@ -2032,6 +2097,11 @@ async fn run_daemon_scenario(
         daemon_agent_status_endpoints: agent_status_summary.endpoint_count,
         daemon_agent_candidate_count_min: agent_status_summary.candidate_count_min,
         daemon_agent_candidate_count_max: agent_status_summary.candidate_count_max,
+        daemon_agent_path_status_endpoints: agent_path_summary.endpoint_count,
+        daemon_agent_paths_total: agent_path_summary.path_count_total,
+        daemon_agent_reachable_paths_total: agent_path_summary.reachable_path_count_total,
+        daemon_agent_path_count_min: agent_path_summary.path_count_min,
+        daemon_agent_path_count_max: agent_path_summary.path_count_max,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
         daemon_control_plane_peer_map_endpoints: peer_map_summary.endpoint_count,
@@ -2131,6 +2201,150 @@ fn daemon_agent_status_candidate_count(status: &AgentStatusResponse) -> anyhow::
         );
     }
     Ok(status.candidate_count)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonAgentPathSummary {
+    endpoint_count: usize,
+    path_count_total: usize,
+    reachable_path_count_total: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+}
+
+fn expected_daemon_agent_path_count(active_pair_count: usize, node_count: usize) -> usize {
+    if node_count < 2 {
+        return 0;
+    }
+    active_pair_count.min(node_count.saturating_mul(node_count.saturating_sub(1)))
+}
+
+fn daemon_agent_activity_pairs(
+    statuses: &[AgentStatusResponse],
+    active_pair_count: usize,
+) -> Vec<(usize, NodeId)> {
+    let mut seen = BTreeSet::new();
+    let mut pairs = Vec::new();
+    if statuses.len() < 2 {
+        return pairs;
+    }
+    for pair_index in 0..active_pair_count {
+        let (source_index, target_index) = active_pair_indices(pair_index, statuses.len());
+        let target = statuses[target_index].node_id.clone();
+        if seen.insert((source_index, target.clone())) {
+            pairs.push((source_index, target));
+        }
+    }
+    pairs
+}
+
+async fn drive_daemon_agent_peer_activity(
+    client: &reqwest::Client,
+    agent_urls: &[String],
+    statuses: &[AgentStatusResponse],
+    active_pair_count: usize,
+) -> anyhow::Result<usize> {
+    if agent_urls.len() != statuses.len() {
+        bail!(
+            "daemon agent activity probe has {} URLs for {} statuses",
+            agent_urls.len(),
+            statuses.len()
+        );
+    }
+    let pairs = daemon_agent_activity_pairs(statuses, active_pair_count);
+    for (source_index, peer) in &pairs {
+        let _: AgentPeerActivityResponse = post_json(
+            client,
+            format!("{}/v1/peer-activity", agent_urls[*source_index]),
+            &AgentPeerActivityRequest {
+                peer: peer.clone(),
+                pin: false,
+            },
+            "daemon agent peer activity",
+        )
+        .await?;
+    }
+    Ok(pairs.len())
+}
+
+async fn wait_for_daemon_agent_path_summary(
+    client: &reqwest::Client,
+    agent_urls: &[String],
+    statuses: &[AgentStatusResponse],
+    expected_path_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<DaemonAgentPathSummary> {
+    let started = Instant::now();
+    loop {
+        let summary = daemon_agent_path_summary(client, agent_urls, statuses).await?;
+        if summary.path_count_total >= expected_path_count
+            && summary.reachable_path_count_total >= expected_path_count
+        {
+            return Ok(summary);
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "daemon agent path validation observed total={}, reachable={}, expected at least {} within {}s",
+                summary.path_count_total,
+                summary.reachable_path_count_total,
+                expected_path_count,
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn daemon_agent_path_summary(
+    client: &reqwest::Client,
+    agent_urls: &[String],
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonAgentPathSummary> {
+    if agent_urls.len() != statuses.len() {
+        bail!(
+            "daemon agent path probe has {} URLs for {} statuses",
+            agent_urls.len(),
+            statuses.len()
+        );
+    }
+    let mut summary = DaemonAgentPathSummary {
+        endpoint_count: agent_urls.len(),
+        path_count_total: 0,
+        reachable_path_count_total: 0,
+        path_count_min: 0,
+        path_count_max: 0,
+    };
+    for (index, (url, status)) in agent_urls.iter().zip(statuses).enumerate() {
+        let response: AgentPathsResponse =
+            get_json(client, format!("{url}/v1/paths"), "daemon agent paths").await?;
+        for path in &response.paths {
+            if path.key.local != status.node_id {
+                bail!(
+                    "daemon agent path endpoint {index} for {} returned path owned by {}",
+                    status.node_id,
+                    path.key.local
+                );
+            }
+        }
+        let path_count = response.paths.len();
+        let reachable_count = response
+            .paths
+            .iter()
+            .filter(|path| path.selected_state != PathState::Unreachable)
+            .count();
+        summary.path_count_total = summary.path_count_total.saturating_add(path_count);
+        summary.reachable_path_count_total = summary
+            .reachable_path_count_total
+            .saturating_add(reachable_count);
+        if index == 0 {
+            summary.path_count_min = path_count;
+            summary.path_count_max = path_count;
+        } else {
+            summary.path_count_min = summary.path_count_min.min(path_count);
+            summary.path_count_max = summary.path_count_max.max(path_count);
+        }
+    }
+    Ok(summary)
 }
 
 fn daemon_advertised_route_count(peer_records: &[NodeRecord]) -> usize {
@@ -2360,6 +2574,7 @@ enum DaemonRuntimePhase {
     PeerMapProbe,
     SignalUpsert,
     SignalNegotiation,
+    AgentPathValidation,
     RelayMeasurement,
     FinalMetrics,
     ControlPlaneFailover,
@@ -6751,6 +6966,28 @@ mod tests {
         assert_eq!(active_pair_indices(6, 3), active_pair_indices(0, 3));
     }
 
+    #[test]
+    fn daemon_agent_path_expectation_caps_wrapped_active_pairs() {
+        assert_eq!(expected_daemon_agent_path_count(30, 4), 12);
+        assert_eq!(expected_daemon_agent_path_count(6, 3), 6);
+        assert_eq!(expected_daemon_agent_path_count(30, 1), 0);
+    }
+
+    #[test]
+    fn daemon_agent_activity_pairs_deduplicate_wrapped_pairs() {
+        let statuses = (0..4)
+            .map(|index| agent_status_for_summary(index, 1))
+            .collect::<Vec<_>>();
+
+        let pairs = daemon_agent_activity_pairs(&statuses, 30);
+
+        assert_eq!(pairs.len(), 12);
+        assert_eq!(pairs.iter().collect::<BTreeSet<_>>().len(), pairs.len());
+        assert!(!pairs
+            .iter()
+            .any(|(source, target)| statuses[*source].node_id == *target));
+    }
+
     #[tokio::test]
     async fn load_harness_uses_sampled_active_pairs_for_thousand_nodes() -> anyhow::Result<()> {
         let report = run_in_memory_scenario(Scenario::from_name(ScenarioName::Thousand)).await?;
@@ -6798,6 +7035,13 @@ mod tests {
         report.daemon_agent_status_endpoints = report.daemon_agent_processes;
         report.daemon_agent_candidate_count_min = 1;
         report.daemon_agent_candidate_count_max = 1;
+        let expected_agent_path_count =
+            expected_daemon_agent_path_count(report.active_pair_count, report.node_count);
+        report.daemon_agent_path_status_endpoints = report.daemon_agent_processes;
+        report.daemon_agent_paths_total = expected_agent_path_count;
+        report.daemon_agent_reachable_paths_total = expected_agent_path_count;
+        report.daemon_agent_path_count_min = expected_agent_path_count / report.node_count;
+        report.daemon_agent_path_count_max = expected_agent_path_count / report.node_count;
         report.daemon_control_plane_processes = 2;
         report.daemon_control_plane_metrics_endpoints = 2;
         report.daemon_control_plane_peer_map_endpoints = 2;
