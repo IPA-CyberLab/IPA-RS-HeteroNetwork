@@ -110,6 +110,7 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
+const MAX_PACKET_FLOW_EBPF_ATTACH_SPECS: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
@@ -1354,9 +1355,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             !args.packet_flow_ebpf_attach.is_empty(),
             "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
         );
-        for attach in &args.packet_flow_ebpf_attach {
-            EbpfTracepointAttachSpec::parse(attach)?;
-        }
+        validate_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
         anyhow::ensure!(
             args.packet_flow_ebpf_ringbuf_max_events > 0,
             "--packet-flow-ebpf-ringbuf-max-events must be greater than zero"
@@ -1452,6 +1451,26 @@ fn validate_runtime_backend_specific_args(args: &AgentArgs) -> anyhow::Result<()
         );
     }
 
+    Ok(())
+}
+
+fn validate_packet_flow_ebpf_attach_specs(values: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.len() <= MAX_PACKET_FLOW_EBPF_ATTACH_SPECS,
+        "--packet-flow-ebpf-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_ATTACH_SPECS} times"
+    );
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let spec = EbpfTracepointAttachSpec::parse(value)?;
+        let key = (spec.program, spec.category, spec.name);
+        anyhow::ensure!(
+            seen.insert(key.clone()),
+            "--packet-flow-ebpf-attach must not repeat {}:{}:{}",
+            key.0,
+            key.1,
+            key.2
+        );
+    }
     Ok(())
 }
 
@@ -13043,6 +13062,21 @@ mod tests {
                     "/run/ipars/ipars-packet-flow.bpf.o",
                     "--packet-flow-ebpf-attach",
                     "ipars_ingress:net:netif_receive_skb",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-attach must not repeat ipars_ingress:net:netif_receive_skb",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
                     "--packet-flow-ebpf-ringbuf-max-events",
                     "0",
                 ],
@@ -13062,6 +13096,31 @@ mod tests {
             } else {
                 anyhow::bail!("expected agent command");
             }
+        }
+
+        let mut too_many_attach = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--packet-flow-detector".to_string(),
+            "ebpf-ringbuf".to_string(),
+            "--packet-flow-ebpf-object-path".to_string(),
+            "/run/ipars/ipars-packet-flow.bpf.o".to_string(),
+        ];
+        for index in 0..=MAX_PACKET_FLOW_EBPF_ATTACH_SPECS {
+            too_many_attach.push("--packet-flow-ebpf-attach".to_string());
+            too_many_attach.push(format!("ipars_{index}:syscalls:sys_enter_sendto"));
+        }
+        let cli = Cli::try_parse_from(too_many_attach)?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid eBPF ringbuf config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-attach may be repeated at most 32 times"));
+        } else {
+            anyhow::bail!("expected agent command");
         }
         Ok(())
     }
