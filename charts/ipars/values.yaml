@@ -22,6 +22,7 @@ serviceAccount:
 
 agent:
   interfaceName: ipars0
+  routeBackend: command
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   routeProvider: false

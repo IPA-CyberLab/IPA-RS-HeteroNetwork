@@ -382,6 +382,8 @@ struct K8sInstallArgs {
     kubernetes_route_provider: Option<String>,
     #[arg(long, default_value_t = 60)]
     kubernetes_route_interval_seconds: u64,
+    #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
+    route_backend: String,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -3546,6 +3548,7 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
     if args.disable_rbac {
         command.push_str(" --set rbac.create=false");
     }
+    command.push_str(&format!(" --set agent.routeBackend={}", args.route_backend));
     command.push_str(&format!(
         " --set serviceExposure.discoverApiServer={}",
         args.kubernetes_discover_api_server
@@ -7013,6 +7016,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -7119,6 +7123,7 @@ mod tests {
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
         assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
         assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
+        assert!(plan.commands[2].contains("--set agent.routeBackend=command"));
         assert!(plan.commands[2].contains("--set networkPolicy.enabled=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
@@ -7330,6 +7335,26 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_wires_route_backend_selection() -> anyhow::Result<()> {
+        let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/values.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let values = std::fs::read_to_string(values_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(values.contains("routeBackend: command"));
+        assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
+        assert!(daemonset
+            .contains("agent.routeBackend=kernel-netlink requires serviceExposure.enabled=true"));
+        assert!(daemonset.contains("- --route-backend"));
+        assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_rejects_unsafe_external_service_ips() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")
@@ -7386,6 +7411,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -7485,12 +7511,14 @@ mod tests {
         args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
+        args.route_backend = "kernel-netlink".to_string();
         args.disable_rbac = true;
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
         assert!(helm.contains("--set rbac.create=false"));
+        assert!(helm.contains("--set agent.routeBackend=kernel-netlink"));
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
         assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
         assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
@@ -7503,6 +7531,13 @@ mod tests {
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
         Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_invalid_route_backend() {
+        assert!(
+            Cli::try_parse_from(["ipars", "k8s", "install", "--route-backend", "invalid"]).is_err()
+        );
     }
 
     #[test]
@@ -8310,6 +8345,8 @@ mod tests {
             "route-provider-a",
             "--kubernetes-route-interval-seconds",
             "15",
+            "--route-backend",
+            "kernel-netlink",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
@@ -8481,6 +8518,7 @@ mod tests {
                 Some("route-provider-a")
             );
             assert_eq!(args.kubernetes_route_interval_seconds, 15);
+            assert_eq!(args.route_backend, "kernel-netlink");
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -8692,6 +8730,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -8818,6 +8857,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -9962,6 +10002,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10075,6 +10116,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10195,6 +10237,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -10313,6 +10356,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10426,6 +10470,7 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,

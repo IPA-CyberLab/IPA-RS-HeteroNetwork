@@ -34,6 +34,7 @@
 {{- $agentSeccompProfileType := .Values.agent.securityContext.seccompProfile.type -}}
 {{- $agentSeccompLocalhostProfile := .Values.agent.securityContext.seccompProfile.localhostProfile -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
+{{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
@@ -43,6 +44,12 @@
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if not (or (eq $agentRouteBackend "command") (eq $agentRouteBackend "kernel-netlink")) -}}
+{{- fail "agent.routeBackend must be command or kernel-netlink" -}}
+{{- end -}}
+{{- if and (eq $agentRouteBackend "kernel-netlink") (not .Values.serviceExposure.enabled) -}}
+{{- fail "agent.routeBackend=kernel-netlink requires serviceExposure.enabled=true" -}}
 {{- end -}}
 {{- if or (eq $imageRepository "") (gt (len $imageRepository) 255) (not (regexMatch "^([a-z0-9]|[a-z0-9][a-z0-9._:/-]*[a-z0-9])$" $imageRepository)) (contains "@" $imageRepository) (contains "//" $imageRepository) (contains ":" (regexFind "[^/]+$" $imageRepository)) -}}
 {{- fail "image.repository must be a lowercase image repository path without tag or digest" -}}
@@ -496,6 +503,8 @@ spec:
             {{- end }}
             {{- if .Values.serviceExposure.enabled }}
             - --apply-kubernetes-underlay
+            - --route-backend
+            - {{ $agentRouteBackend | quote }}
             - --kubernetes-route-interval-seconds
             - {{ .Values.serviceExposure.routeIntervalSeconds | quote }}
             {{- if .Values.serviceExposure.discoverServices }}
