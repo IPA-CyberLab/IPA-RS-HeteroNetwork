@@ -845,6 +845,7 @@ impl LoadReport {
         let mut running_roles = Vec::new();
         let mut seen_log_paths = BTreeSet::new();
         let mut seen_log_serials = BTreeSet::new();
+        let mut seen_child_pids = BTreeMap::new();
         let mut previous_log_serial = None;
         for child in &manifest.children {
             let Some(log_path) = &child.log_path else {
@@ -968,6 +969,22 @@ impl LoadReport {
                     child.role,
                     log_path.display()
                 );
+            }
+            if let Some(pid) = child.pid {
+                if pid == 0 {
+                    bail!(
+                        "daemon load scenario retained manifest child {} recorded invalid PID 0",
+                        child.role
+                    );
+                }
+                if let Some(previous_role) = seen_child_pids.insert(pid, child.role.clone()) {
+                    bail!(
+                        "daemon load scenario retained manifest child {} PID {} duplicates child {}",
+                        child.role,
+                        pid,
+                        previous_role
+                    );
+                }
             }
             match child.state {
                 DaemonRuntimeManifestChildState::Running => {
@@ -5211,6 +5228,69 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("missing a PID"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut invalid_child_pid = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &invalid_child_pid,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        invalid_child_pid.daemon_runtime_dir = Some(runtime_dir.clone());
+        invalid_child_pid.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                agent.pid = Some(0);
+            }
+        })?;
+        let error = match invalid_child_pid.validate_success() {
+            Ok(_) => bail!("retained manifest with invalid child PID should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid PID 0"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut duplicate_child_pid = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &duplicate_child_pid,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        duplicate_child_pid.daemon_runtime_dir = Some(runtime_dir.clone());
+        duplicate_child_pid.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            let duplicate_pid = manifest.children[0].pid;
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                agent.pid = duplicate_pid;
+            }
+        })?;
+        let error = match duplicate_child_pid.validate_success() {
+            Ok(_) => bail!("retained manifest with duplicate child PID should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicates child"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut numeric_child_exit_code = daemon_report.clone();
