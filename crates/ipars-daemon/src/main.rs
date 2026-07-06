@@ -2168,8 +2168,12 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.kubernetes_route_interval_seconds,
         "--kubernetes-route-interval-seconds",
     )?;
+    let mut namespaces = BTreeSet::new();
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
+        if !namespaces.insert(namespace.as_str()) {
+            anyhow::bail!("--kubernetes-namespace `{namespace}` must not be repeated");
+        }
     }
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
@@ -17830,6 +17834,34 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error.to_string().contains(
                 "--kubernetes-service-label-selector requires --kubernetes-discover-services"
             ));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_discovery_namespaces_must_be_unique() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-services",
+            "--kubernetes-namespace",
+            "default",
+            "--kubernetes-namespace",
+            "default",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("duplicate Kubernetes namespace filter should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-namespace `default` must not be repeated"));
             return Ok(());
         }
 
