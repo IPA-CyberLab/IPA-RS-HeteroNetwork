@@ -116,6 +116,7 @@ const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
 const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
 const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
 const MAX_PACKET_FLOW_DEDUP_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_PACKET_FLOW_DEDUP_FINGERPRINTS: usize = 1_048_576;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
@@ -9167,6 +9168,7 @@ fn record_packet_flow_duplicate_suppressions(
 #[derive(Debug)]
 struct PacketFlowDeduper {
     ttl: Option<Duration>,
+    max_entries: usize,
     seen: BTreeMap<PacketFlowFingerprint, Instant>,
 }
 
@@ -9174,6 +9176,16 @@ impl PacketFlowDeduper {
     fn new(ttl: Option<Duration>) -> Self {
         Self {
             ttl,
+            max_entries: MAX_PACKET_FLOW_DEDUP_FINGERPRINTS,
+            seen: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_entries(ttl: Option<Duration>, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries,
             seen: BTreeMap::new(),
         }
     }
@@ -9197,7 +9209,25 @@ impl PacketFlowDeduper {
             self.seen.insert(fingerprint, now);
             retained.push(flow);
         }
+        self.prune_to_max_entries();
         (retained, duplicate_count)
+    }
+
+    fn prune_to_max_entries(&mut self) {
+        let excess = self.seen.len().saturating_sub(self.max_entries);
+        if excess == 0 {
+            return;
+        }
+
+        let mut oldest = self
+            .seen
+            .iter()
+            .map(|(fingerprint, last_seen)| (fingerprint.clone(), *last_seen))
+            .collect::<Vec<_>>();
+        oldest.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        for (fingerprint, _) in oldest.into_iter().take(excess) {
+            self.seen.remove(&fingerprint);
+        }
     }
 }
 
@@ -14260,6 +14290,47 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }]);
         assert_eq!(retained.len(), 1);
         assert_eq!(duplicates, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_deduper_prunes_oldest_fingerprints_to_capacity() -> anyhow::Result<()> {
+        let first = PacketFlowRecord {
+            destination: "100.64.0.11".parse()?,
+            observation: AgentPacketFlowObservation::default(),
+        };
+        let second = PacketFlowRecord {
+            destination: "100.64.0.12".parse()?,
+            observation: AgentPacketFlowObservation::default(),
+        };
+        let mut deduper = PacketFlowDeduper::with_max_entries(Some(Duration::from_secs(60)), 1);
+
+        let (retained, duplicates) = deduper.retain_new(vec![first.clone()]);
+        assert_eq!(retained, vec![first.clone()]);
+        assert_eq!(duplicates, 0);
+        assert_eq!(deduper.seen.len(), 1);
+        let old_seen = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap_or_else(Instant::now);
+        for last_seen in deduper.seen.values_mut() {
+            *last_seen = old_seen;
+        }
+
+        let (retained, duplicates) = deduper.retain_new(vec![second.clone()]);
+        assert_eq!(retained, vec![second.clone()]);
+        assert_eq!(duplicates, 0);
+        assert_eq!(deduper.seen.len(), 1);
+        assert!(deduper
+            .seen
+            .contains_key(&PacketFlowFingerprint::from(&second)));
+        assert!(!deduper
+            .seen
+            .contains_key(&PacketFlowFingerprint::from(&first)));
+
+        let (retained, duplicates) = deduper.retain_new(vec![first.clone(), second]);
+        assert_eq!(retained, vec![first]);
+        assert_eq!(duplicates, 1);
+        assert_eq!(deduper.seen.len(), 1);
         Ok(())
     }
 
