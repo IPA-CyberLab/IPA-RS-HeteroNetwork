@@ -22,6 +22,7 @@ const STUN_HEADER_LEN: usize = 20;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const CHANGE_REQUEST_CHANGE_IP: u32 = 0x04;
 const CHANGE_REQUEST_CHANGE_PORT: u32 = 0x02;
+const BINDING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const FILTERING_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
@@ -30,6 +31,11 @@ pub enum StunError {
     Socket(#[from] std::io::Error),
     #[error("stun response is invalid: {0}")]
     InvalidResponse(String),
+    #[error("stun request to {stun_server} timed out after {timeout:?}")]
+    Timeout {
+        stun_server: SocketAddr,
+        timeout: Duration,
+    },
 }
 
 #[async_trait]
@@ -373,7 +379,16 @@ async fn observe_binding_details_with_socket(
     let request = encode_binding_request(transaction_id, options)?;
     socket.send_to(&request, stun_server).await?;
     let mut buffer = [0_u8; 1500];
-    let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
+    let (len, _server_addr) =
+        match tokio::time::timeout(BINDING_RESPONSE_TIMEOUT, socket.recv_from(&mut buffer)).await {
+            Ok(response) => response?,
+            Err(_) => {
+                return Err(StunError::Timeout {
+                    stun_server,
+                    timeout: BINDING_RESPONSE_TIMEOUT,
+                })
+            }
+        };
     decode_binding_success_response_details(&buffer[..len], transaction_id)
 }
 
@@ -949,6 +964,27 @@ mod tests {
             Err(StunError::InvalidResponse(message))
                 if message.contains("STUN server 224.0.0.1:3478 is unusable")
         ));
+    }
+
+    #[tokio::test]
+    async fn udp_probe_times_out_when_server_does_not_answer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let unused_addr = socket.local_addr()?;
+        drop(socket);
+
+        let error = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                unused_addr,
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::Timeout { stun_server, .. }) if stun_server == unused_addr
+        ));
+        Ok(())
     }
 
     #[tokio::test]

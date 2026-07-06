@@ -4986,11 +4986,24 @@ async fn run_agent(
     let join_token = agent_join_token(&args)?;
     let stun_servers = agent_stun_servers(&args, join_token.as_ref()).await?;
     if stun_servers.len() > 1 {
-        runtime
+        if let Err(error) = runtime
             .classify_nat(args.stun_bind, stun_servers.clone())
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                %error,
+                stun_servers = stun_servers.len(),
+                "startup STUN NAT classification failed; continuing without initial NAT classification"
+            );
+        }
     } else if let Some(stun_server) = stun_servers.first().copied() {
-        runtime.probe_stun(args.stun_bind, stun_server).await?;
+        if let Err(error) = runtime.probe_stun(args.stun_bind, stun_server).await {
+            tracing::warn!(
+                %error,
+                %stun_server,
+                "startup STUN probe failed; continuing without initial reflexive candidate"
+            );
+        }
     }
     let mut registered_control_plane_base = None;
     let registered_node = if let Some(token) = &join_token {
