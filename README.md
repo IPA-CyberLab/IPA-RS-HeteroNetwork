@@ -69,6 +69,12 @@ Docker Compose smoke coverage is also gated because it requires a Docker daemon 
 IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
 ```
 
+Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, NetworkPolicy, route-disabled, relay-forwarder namespace, and expected-failure chart configurations:
+
+```bash
+scripts/helm-smoke.sh
+```
+
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
 HTTP admission plus UDP forwarding with `--transport relay-udp`, or across spawned `iparsd`
