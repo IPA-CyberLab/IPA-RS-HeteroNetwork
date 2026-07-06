@@ -3063,6 +3063,11 @@ fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow:
         if argument.chars().any(char::is_control) {
             anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
         }
+        if argument.contains(',') {
+            anyhow::bail!(
+                "--userspace-wireguard-arg must not contain ',' because Docker Compose passes userspace WireGuard arguments through comma-delimited IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"
+            );
+        }
     }
     Ok(())
 }
@@ -7917,6 +7922,18 @@ mod tests {
         assert!(invalid_arg
             .to_string()
             .contains("--userspace-wireguard-arg must not contain control characters"));
+
+        let comma_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["--option=a,b".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("comma userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(comma_arg.to_string().contains(
+            "--userspace-wireguard-arg must not contain ',' because Docker Compose passes"
+        ));
 
         let oversized_arg = match docker_install_plan(DockerInstallArgs {
             userspace_wireguard_command: Some("wireguard-go".to_string()),
