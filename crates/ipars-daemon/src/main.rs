@@ -4571,11 +4571,13 @@ async fn run_relay(
     validate_relay_config(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
-    let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
+    let public_endpoint = args
+        .public_endpoint
+        .context("--public-endpoint is required for relay advertisement")?;
     let admission_url = args
         .admission_url
         .clone()
-        .unwrap_or_else(|| format!("http://{}", args.http_listen));
+        .context("--admission-url is required for relay advertisement")?;
     let admission_rate_limit = (args.admission_rate_limit > 0).then_some(RelayAdmissionRateLimit {
         max_attempts: args.admission_rate_limit,
         window: chrono::Duration::seconds(args.admission_rate_limit_window_seconds as i64),
@@ -4619,9 +4621,15 @@ async fn run_relay(
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
-    if let Some(admission_url) = args.admission_url.as_deref() {
-        validate_http_url(admission_url, "--admission-url")?;
-    }
+    let public_endpoint = args
+        .public_endpoint
+        .context("--public-endpoint is required for relay advertisement")?;
+    validate_usable_socket_endpoint(public_endpoint, "--public-endpoint")?;
+    let admission_url = args
+        .admission_url
+        .as_deref()
+        .context("--admission-url is required for relay advertisement")?;
+    validate_http_url(admission_url, "--admission-url")?;
     if args.max_sessions == 0 {
         anyhow::bail!("--max-sessions must be greater than zero");
     }
@@ -16649,6 +16657,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
             "--admission-url",
             "http://relay-a:9580",
             "--session-ttl-seconds",
@@ -16668,6 +16678,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert_eq!(args.max_sessions_per_node, 25);
             assert_eq!(args.admission_rate_limit, 120);
             assert_eq!(args.admission_rate_limit_window_seconds, 30);
+            assert_eq!(args.public_endpoint, Some("203.0.113.10:51820".parse()?));
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.admission_bearer_token.as_deref(),
@@ -16681,11 +16692,71 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
     #[test]
     fn relay_config_rejects_invalid_admission_url_and_zero_capacity() -> anyhow::Result<()> {
+        let missing_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = missing_public_endpoint.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--public-endpoint is required"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let missing_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+        ])?;
+        if let Command::Relay(args) = missing_admission_url.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--admission-url is required"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let unusable_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "0.0.0.0:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = unusable_public_endpoint.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--public-endpoint must use a usable nonzero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let invalid_admission_url = Cli::try_parse_from([
             "iparsd",
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
             "--admission-url",
             "relay-a",
         ])?;
@@ -16706,6 +16777,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--max-sessions",
             "0",
         ])?;
@@ -16726,6 +16801,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--max-mbps",
             "0",
         ])?;
@@ -16746,6 +16825,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--max-sessions",
             "10",
             "--max-sessions-per-node",
@@ -16768,6 +16851,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--session-ttl-seconds",
             "0",
         ])?;
@@ -16788,6 +16875,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--admission-rate-limit-window-seconds",
             "0",
         ])?;
@@ -16808,6 +16899,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--admission-bearer-token",
             "not allowed",
         ])?;

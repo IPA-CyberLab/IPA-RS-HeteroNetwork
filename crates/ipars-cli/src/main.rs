@@ -2499,7 +2499,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
-        "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.docker_discover_networks {
@@ -5803,7 +5803,9 @@ mod tests {
             .iter()
             .any(|note| note.contains("join token") && note.contains("Compose secret")));
         assert!(plan.notes.iter().any(|note| {
-            note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
+            note.contains("IPARS_RELAY_PUBLIC_ENDPOINT")
+                && note.contains("IPARS_RELAY_ADMISSION_URL")
+                && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
                 && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
         }));
         Ok(())
@@ -5955,6 +5957,8 @@ mod tests {
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
         assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
         assert!(compose.contains(
