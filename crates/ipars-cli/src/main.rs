@@ -2227,6 +2227,23 @@ fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_kubernetes_annotation_args(
+    flag: &str,
+    annotations: &[KeyValueArg],
+) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for annotation in annotations {
+        validate_kubernetes_annotation_key(&annotation.key)
+            .map_err(|error| anyhow::anyhow!("{flag} {error}"))?;
+        validate_kubernetes_annotation_value(&annotation.value)
+            .map_err(|error| anyhow::anyhow!("{flag} {error}"))?;
+        if !seen.insert(annotation.key.as_str()) {
+            anyhow::bail!("{flag} must not repeat annotation key {}", annotation.key);
+        }
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -4285,10 +4302,10 @@ fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result
             "--service-account-annotation requires ServiceAccount creation; remove --disable-service-account-creation"
         );
     }
-    for annotation in &args.service_account_annotations {
-        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
-        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
-    }
+    validate_kubernetes_annotation_args(
+        "--service-account-annotation",
+        &args.service_account_annotations,
+    )?;
     Ok(())
 }
 
@@ -4806,10 +4823,7 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
         validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
         validate_kubernetes_label_value(&label.value).map_err(anyhow::Error::msg)?;
     }
-    for annotation in &args.agent_pod_annotations {
-        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
-        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
-    }
+    validate_kubernetes_annotation_args("--agent-pod-annotation", &args.agent_pod_annotations)?;
     if let Some(priority_class) = args.agent_priority_class.as_deref() {
         validate_kubernetes_dns_subdomain(priority_class, "agent priority class")
             .map_err(anyhow::Error::msg)?;
@@ -5026,6 +5040,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_session_affinity_timeout_seconds.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-session-affinity-timeout-seconds requires --expose-agent-api");
     }
+    if !args.agent_api_service_annotations.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-service-annotation requires --expose-agent-api");
+    }
     if args.relay_cluster_ip.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-cluster-ip requires --expose-relay");
     }
@@ -5080,6 +5097,17 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_session_affinity_timeout_seconds.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-session-affinity-timeout-seconds requires --expose-relay");
     }
+    if !args.relay_service_annotations.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-service-annotation requires --expose-relay");
+    }
+    validate_kubernetes_annotation_args(
+        "--agent-api-service-annotation",
+        &args.agent_api_service_annotations,
+    )?;
+    validate_kubernetes_annotation_args(
+        "--relay-service-annotation",
+        &args.relay_service_annotations,
+    )?;
     validate_kubernetes_service_ip_families(
         "agent-api",
         args.agent_api_ip_family_policy.as_deref(),
@@ -8056,6 +8084,70 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_validates_service_annotations_from_plan_args() -> anyhow::Result<()> {
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+            value: "nlb".to_string(),
+        }];
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent API Service annotations should require exposed service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-annotation requires --expose-agent-api"));
+
+        let mut invalid_agent_key = base_k8s_install_args();
+        invalid_agent_key.expose_agent_api = true;
+        invalid_agent_key.agent_api_service_annotations = vec![KeyValueArg {
+            key: "Example.com/lb".to_string(),
+            value: "nlb".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_agent_key) {
+            Ok(_) => panic!("invalid agent API Service annotation key should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-annotation annotation prefix"));
+
+        let mut duplicate_agent_key = base_k8s_install_args();
+        duplicate_agent_key.expose_agent_api = true;
+        duplicate_agent_key.agent_api_service_annotations = vec![
+            KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb".to_string(),
+            },
+            KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb-ip".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_agent_key) {
+            Ok(_) => panic!("duplicate agent API Service annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation must not repeat annotation key service.beta.kubernetes.io/aws-load-balancer-type"
+        ));
+
+        let mut invalid_relay_value = base_k8s_install_args();
+        invalid_relay_value.expose_relay = true;
+        invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        invalid_relay_value.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        invalid_relay_value.relay_service_annotations = vec![KeyValueArg {
+            key: "metallb.universe.tf/address-pool".to_string(),
+            value: "public pool".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_relay_value) {
+            Ok(_) => panic!("relay Service annotation value whitespace should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-service-annotation annotation value cannot contain whitespace")
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_plan_quotes_chart_path() -> anyhow::Result<()> {
         let mut args = base_k8s_install_args();
         args.chart = PathBuf::from("charts/ipars chart");
@@ -8944,6 +9036,25 @@ mod tests {
         };
         assert!(error.contains("--service-account-annotation"));
 
+        let mut duplicate_annotation = base_k8s_install_args();
+        duplicate_annotation.service_account_annotations = vec![
+            KeyValueArg {
+                key: "eks.amazonaws.com/role-arn".to_string(),
+                value: "arn:aws:iam::123456789012:role/ipars-agent".to_string(),
+            },
+            KeyValueArg {
+                key: "eks.amazonaws.com/role-arn".to_string(),
+                value: "arn:aws:iam::123456789012:role/ipars-agent-v2".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_annotation) {
+            Ok(_) => panic!("duplicate ServiceAccount annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--service-account-annotation must not repeat annotation key eks.amazonaws.com/role-arn"
+        ));
+
         Ok(())
     }
 
@@ -9035,6 +9146,25 @@ mod tests {
         assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
         assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+
+        let mut duplicate_pod_annotation = base_k8s_install_args();
+        duplicate_pod_annotation.agent_pod_annotations = vec![
+            KeyValueArg {
+                key: "prometheus.io/scrape".to_string(),
+                value: "true".to_string(),
+            },
+            KeyValueArg {
+                key: "prometheus.io/scrape".to_string(),
+                value: "false".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_pod_annotation) {
+            Ok(_) => panic!("duplicate agent pod annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-pod-annotation must not repeat annotation key prometheus.io/scrape"
+        ));
 
         let mut pod_network = base_k8s_install_args();
         pod_network.disable_agent_host_network = true;
