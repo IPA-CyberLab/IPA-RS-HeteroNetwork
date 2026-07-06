@@ -4406,90 +4406,217 @@ pub mod api {
     }
 
     fn nats_payload(payload: &[u8]) -> bool {
-        let Some(line) = nats_control_line(payload) else {
-            return false;
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            match nats_frame(payload, offset) {
+                Some(NatsFrameParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(NatsFrameParse::IncompleteBody) => return true,
+                Some(NatsFrameParse::IncompleteLine) => return frame_count > 0,
+                None => return false,
+            }
+        }
+        frame_count > 0
+    }
+
+    enum NatsFrameParse {
+        Complete(usize),
+        IncompleteLine,
+        IncompleteBody,
+    }
+
+    enum NatsLineParse<'a> {
+        Complete { line: &'a [u8], next_offset: usize },
+        Incomplete,
+    }
+
+    enum NatsCommandKind {
+        Line,
+        Payload {
+            bytes: usize,
+        },
+        Headers {
+            header_bytes: usize,
+            total_bytes: usize,
+        },
+    }
+
+    fn nats_frame(payload: &[u8], offset: usize) -> Option<NatsFrameParse> {
+        let NatsLineParse::Complete { line, next_offset } = nats_control_line(payload, offset)?
+        else {
+            return Some(NatsFrameParse::IncompleteLine);
         };
+        let command = nats_command_kind(line)?;
+        match command {
+            NatsCommandKind::Line => Some(NatsFrameParse::Complete(next_offset)),
+            NatsCommandKind::Payload { bytes } => {
+                nats_payload_body(payload, next_offset, bytes, None)
+            }
+            NatsCommandKind::Headers {
+                header_bytes,
+                total_bytes,
+            } => nats_payload_body(payload, next_offset, total_bytes, Some(header_bytes)),
+        }
+    }
+
+    fn nats_command_kind(line: &[u8]) -> Option<NatsCommandKind> {
         let fields = line
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
             .collect::<Vec<_>>();
-        let Some(command) = fields.first() else {
-            return false;
-        };
+        let command = *fields.first()?;
 
         if command.eq_ignore_ascii_case(b"INFO") || command.eq_ignore_ascii_case(b"CONNECT") {
-            return nats_json_object_after_command(line, command.len());
+            return nats_json_object_after_command(line, command.len())
+                .then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"PING") || command.eq_ignore_ascii_case(b"PONG") {
-            return fields.len() == 1;
+            return (fields.len() == 1).then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"+OK") {
-            return fields.len() == 1;
+            return (fields.len() == 1).then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"-ERR") {
-            return fields.len() >= 2;
+            return (fields.len() >= 2).then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"PUB") {
-            return (fields.len() == 3 || fields.len() == 4)
+            let bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 3 || fields.len() == 4)
                 && nats_subject(fields[1])
                 && fields
                     .get(fields.len().saturating_sub(2))
                     .is_some_and(|field| fields.len() == 3 || nats_reply_subject(field))
-                && nats_decimal(fields[fields.len() - 1]);
+                && nats_decimal(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Payload { bytes });
         }
         if command.eq_ignore_ascii_case(b"HPUB") {
-            return (fields.len() == 4 || fields.len() == 5)
+            let header_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(2)], 64 * 1024 * 1024)?;
+            let total_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 4 || fields.len() == 5)
                 && nats_subject(fields[1])
                 && fields
                     .get(fields.len().saturating_sub(3))
                     .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
                 && nats_decimal(fields[fields.len() - 2])
-                && nats_decimal(fields[fields.len() - 1]);
+                && nats_decimal(fields[fields.len() - 1])
+                && header_bytes <= total_bytes)
+                .then_some(NatsCommandKind::Headers {
+                    header_bytes,
+                    total_bytes,
+                });
         }
         if command.eq_ignore_ascii_case(b"SUB") {
-            return (fields.len() == 3 || fields.len() == 4)
+            return ((fields.len() == 3 || fields.len() == 4)
                 && nats_subscription_subject(fields[1])
                 && fields
                     .get(fields.len().saturating_sub(2))
                     .is_some_and(|field| fields.len() == 3 || nats_queue_group(field))
-                && nats_sid(fields[fields.len() - 1]);
+                && nats_sid(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"UNSUB") {
-            return (fields.len() == 2 || fields.len() == 3)
+            return ((fields.len() == 2 || fields.len() == 3)
                 && nats_sid(fields[1])
-                && (fields.len() == 2 || nats_decimal(fields[2]));
+                && (fields.len() == 2 || nats_decimal(fields[2])))
+            .then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"MSG") {
-            return (fields.len() == 4 || fields.len() == 5)
+            let bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 4 || fields.len() == 5)
                 && nats_subject(fields[1])
                 && nats_sid(fields[2])
                 && fields
                     .get(fields.len().saturating_sub(2))
                     .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
-                && nats_decimal(fields[fields.len() - 1]);
+                && nats_decimal(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Payload { bytes });
         }
         if command.eq_ignore_ascii_case(b"HMSG") {
-            return (fields.len() == 5 || fields.len() == 6)
+            let header_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(2)], 64 * 1024 * 1024)?;
+            let total_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 5 || fields.len() == 6)
                 && nats_subject(fields[1])
                 && nats_sid(fields[2])
                 && fields
                     .get(fields.len().saturating_sub(3))
                     .is_some_and(|field| fields.len() == 5 || nats_reply_subject(field))
                 && nats_decimal(fields[fields.len() - 2])
-                && nats_decimal(fields[fields.len() - 1]);
+                && nats_decimal(fields[fields.len() - 1])
+                && header_bytes <= total_bytes)
+                .then_some(NatsCommandKind::Headers {
+                    header_bytes,
+                    total_bytes,
+                });
         }
-        false
+        None
     }
 
-    fn nats_control_line(payload: &[u8]) -> Option<&[u8]> {
-        let newline = payload.iter().position(|byte| *byte == b'\n')?;
-        let line = payload.get(..newline)?;
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    fn nats_control_line(payload: &[u8], offset: usize) -> Option<NatsLineParse<'_>> {
+        let tail = payload.get(offset..)?;
+        let newline = tail.iter().position(|byte| *byte == b'\n');
+        let Some(newline) = newline else {
+            return Some(NatsLineParse::Incomplete);
+        };
+        if newline == 0 || tail.get(newline.saturating_sub(1)) != Some(&b'\r') {
+            return None;
+        }
+        let line = tail.get(..newline - 1)?;
         (!line.is_empty()
             && line
                 .iter()
                 .all(|byte| !byte.is_ascii_control() || *byte == b'\t'))
-        .then_some(line)
+        .then_some(NatsLineParse::Complete {
+            line,
+            next_offset: offset + newline + 1,
+        })
+    }
+
+    fn nats_payload_body(
+        payload: &[u8],
+        payload_offset: usize,
+        bytes: usize,
+        header_bytes: Option<usize>,
+    ) -> Option<NatsFrameParse> {
+        let data_end = payload_offset.checked_add(bytes)?;
+        let frame_end = data_end.checked_add(2)?;
+        if let Some(header_bytes) = header_bytes {
+            if header_bytes > bytes {
+                return None;
+            }
+            let header_end = payload_offset.checked_add(header_bytes)?;
+            if payload.len() >= header_end
+                && !nats_header_block(payload.get(payload_offset..header_end)?)
+            {
+                return None;
+            }
+        }
+        if payload.len() < data_end {
+            return Some(NatsFrameParse::IncompleteBody);
+        }
+        if payload.len() < frame_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(NatsFrameParse::IncompleteBody),
+                _ => None,
+            };
+        }
+        (payload.get(data_end..frame_end)? == b"\r\n")
+            .then_some(NatsFrameParse::Complete(frame_end))
+    }
+
+    fn nats_header_block(header: &[u8]) -> bool {
+        header.starts_with(b"NATS/1.0\r\n") && header.ends_with(b"\r\n\r\n")
     }
 
     fn nats_json_object_after_command(line: &[u8], command_len: usize) -> bool {
@@ -4549,6 +4676,24 @@ pub mod api {
 
     fn nats_decimal(field: &[u8]) -> bool {
         !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
+    }
+
+    fn nats_decimal_value(field: &[u8], max: usize) -> Option<usize> {
+        if field.is_empty() || field.len() > 20 {
+            return None;
+        }
+        let mut value = 0_usize;
+        for byte in field {
+            let digit = byte.checked_sub(b'0')?;
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(digit as usize)?;
+            if value > max {
+                return None;
+            }
+        }
+        Some(value)
     }
 
     fn mqtt_payload(payload: &[u8]) -> bool {
@@ -7718,6 +7863,33 @@ mod tests {
             api::AgentPacketFlowApplication::Nats
         );
         assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhe").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhello\r").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\nPUB events.created reply.inbox 5\r\nhello\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HMSG events.created sid-1 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
             observation_for_payload(b"SUB events.* workers sid-1\r\n").application(),
             api::AgentPacketFlowApplication::Nats
         );
@@ -7731,6 +7903,28 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"PUB events.created nope\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\njunk\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhello!\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 28 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 22 27\r\nNOTNATS\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
