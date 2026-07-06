@@ -29,9 +29,9 @@ use ipars_types::api::{
     RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind, PathRecord,
-    PathScore, PathState, Role, Route, Tag, VpnIp,
+    endpoint_addr_is_usable, CandidateSource, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, NatClassification, NatProbeObservation, NodeId, NodeRecord,
+    PathChangeEvent, PathChangeKind, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -2655,7 +2655,8 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
             PathState::Unreachable => Ok(None),
             _ => Ok(path
                 .selected_candidate
-                .map(|candidate| candidate.addr.to_string())
+                .as_ref()
+                .and_then(|candidate| wireguard_endpoint_for_candidate(candidate, &peer.node_id))
                 .or_else(|| preferred_endpoint(peer))),
         }
     }
@@ -2862,14 +2863,36 @@ fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
     peer.endpoint_candidates
         .iter()
-        .filter_map(|candidate| candidate_kind_rank(candidate.kind).map(|rank| (rank, candidate)))
-        .min_by(|(left_rank, left), (right_rank, right)| {
+        .filter_map(|candidate| ranked_wireguard_endpoint_for_candidate(candidate, &peer.node_id))
+        .min_by(|(left_rank, left, _), (right_rank, right, _)| {
             left_rank
                 .cmp(right_rank)
                 .then_with(|| left.cost.cmp(&right.cost))
                 .then_with(|| right.priority.cmp(&left.priority))
         })
-        .map(|(_, candidate)| candidate.addr.to_string())
+        .map(|(_, _, endpoint)| endpoint)
+}
+
+fn wireguard_endpoint_for_candidate(
+    candidate: &EndpointCandidate,
+    peer_id: &NodeId,
+) -> Option<String> {
+    ranked_wireguard_endpoint_for_candidate(candidate, peer_id).map(|(_, _, endpoint)| endpoint)
+}
+
+fn ranked_wireguard_endpoint_for_candidate<'a>(
+    candidate: &'a EndpointCandidate,
+    peer_id: &NodeId,
+) -> Option<(u8, &'a EndpointCandidate, String)> {
+    let rank = candidate_kind_rank(candidate.kind)?;
+    if &candidate.node_id != peer_id
+        || candidate.validate_kind_address().is_err()
+        || !endpoint_addr_is_usable(candidate.addr)
+    {
+        return None;
+    }
+
+    Some((rank, candidate, candidate.addr.to_string()))
 }
 
 fn candidate_kind_rank(kind: EndpointCandidateKind) -> Option<u8> {
@@ -3492,6 +3515,115 @@ mod tests {
     fn score_helper_keeps_metrics_type_in_scope() {
         let score = PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0);
         assert!(score.value > 0.0);
+    }
+
+    #[test]
+    fn preferred_endpoint_skips_invalid_or_unusable_direct_candidates() {
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-a",
+            vec![
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::Ipv6,
+                    addr: SocketAddr::from(([198, 51, 100, 10], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: NodeId::from_string("wrong-owner"),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 11], 0)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::StunReflexive,
+                    addr: SocketAddr::from(([198, 51, 100, 20], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 10,
+                    cost: 50,
+                    source: CandidateSource::StunProbe,
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            preferred_endpoint(&peer).as_deref(),
+            Some("198.51.100.20:51820")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_endpoint_resolver_falls_back_when_selected_candidate_is_unusable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: Some(EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 10], 0)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                }),
+                relay_node: None,
+                score: PathScore {
+                    value: 100.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await;
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-a",
+            vec![EndpointCandidate {
+                node_id: NodeId::from_string("peer-a"),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+
+        let endpoint = RuntimePeerEndpointResolver::new(runtime)
+            .endpoint_for_peer(&peer)
+            .await?;
+
+        assert_eq!(endpoint.as_deref(), Some("203.0.113.20:51820"));
+        Ok(())
     }
 
     #[tokio::test]
