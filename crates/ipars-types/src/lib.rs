@@ -2787,6 +2787,8 @@ pub mod api {
         pub relay_node: NodeId,
         pub relay_endpoint: SocketAddr,
         pub local_endpoint: SocketAddr,
+        #[serde(default)]
+        pub socket_receive_errors: u64,
         pub outbound_packets: u64,
         pub outbound_payload_bytes: u64,
         pub outbound_datagram_bytes: u64,

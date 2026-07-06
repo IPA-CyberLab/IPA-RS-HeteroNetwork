@@ -383,6 +383,14 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     }
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_socket_receive_errors_total Relay forwarder recoverable UDP receive errors that did not stop the forwarder."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_socket_receive_errors_total counter"
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarder_outbound_packets_total Relay forwarder packets sent from local WireGuard to relay."
     );
     prometheus_line!(
@@ -584,6 +592,11 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     for forwarder in &metrics.relay_forwarders {
         let peer = prometheus_label(forwarder.peer.as_str());
         let relay_node = prometheus_label(forwarder.relay_node.as_str());
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_socket_receive_errors_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.socket_receive_errors
+        );
         prometheus_line!(
             &mut body,
             "ipars_agent_relay_forwarder_outbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
@@ -1253,6 +1266,7 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 51820)),
             std::net::SocketAddr::from(([127, 0, 0, 1], 52000)),
         ));
+        forwarder_metrics.record_socket_receive_error();
         forwarder_metrics.record_outbound(64, 128);
         forwarder_metrics.record_outbound_expired_session_drop(96);
         forwarder_metrics.record_outbound_oversized_drop(112, 160);
@@ -1313,6 +1327,7 @@ mod tests {
         assert_eq!(metrics.relay_forwarder_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
         assert_eq!(metrics.relay_forwarders.len(), 1);
+        assert_eq!(metrics.relay_forwarders[0].socket_receive_errors, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_payload_bytes, 64);
         assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
@@ -1462,6 +1477,7 @@ mod tests {
         assert!(
             body.contains("ipars_agent_relay_forwarder_outbound_dropped_oversized_packets_total")
         );
+        assert!(body.contains("ipars_agent_relay_forwarder_socket_receive_errors_total"));
         assert!(body
             .contains("ipars_agent_relay_forwarder_outbound_dropped_socket_error_packets_total"));
         assert!(body

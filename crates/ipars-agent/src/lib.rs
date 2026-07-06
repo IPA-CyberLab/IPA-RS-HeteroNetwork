@@ -452,6 +452,7 @@ pub struct RelayForwarderStats {
     relay_node: NodeId,
     relay_endpoint: SocketAddr,
     local_endpoint: SocketAddr,
+    socket_receive_errors: AtomicU64,
     outbound_packets: AtomicU64,
     outbound_payload_bytes: AtomicU64,
     outbound_datagram_bytes: AtomicU64,
@@ -492,6 +493,7 @@ impl RelayForwarderStats {
             relay_node,
             relay_endpoint,
             local_endpoint,
+            socket_receive_errors: AtomicU64::new(0),
             outbound_packets: AtomicU64::new(0),
             outbound_payload_bytes: AtomicU64::new(0),
             outbound_datagram_bytes: AtomicU64::new(0),
@@ -523,6 +525,10 @@ impl RelayForwarderStats {
 
     pub fn peer(&self) -> &NodeId {
         &self.peer
+    }
+
+    pub fn record_socket_receive_error(&self) {
+        self.socket_receive_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_outbound(&self, payload_bytes: usize, datagram_bytes: usize) {
@@ -615,6 +621,7 @@ impl RelayForwarderStats {
             relay_node: self.relay_node.clone(),
             relay_endpoint: self.relay_endpoint,
             local_endpoint: self.local_endpoint,
+            socket_receive_errors: self.socket_receive_errors.load(Ordering::Relaxed),
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             outbound_payload_bytes: self.outbound_payload_bytes.load(Ordering::Relaxed),
             outbound_datagram_bytes: self.outbound_datagram_bytes.load(Ordering::Relaxed),
@@ -822,7 +829,16 @@ impl UdpRelayFrameForwarder {
                     }
                 }
                 packet = socket.recv_from(&mut buffer) => {
-                    let (len, peer) = packet?;
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) if recoverable_udp_recv_error(&error) => {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_socket_receive_error();
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     if peer == self.session.relay_endpoint {
                         self.forward_to_wireguard(&socket, &buffer[..len]).await?;
                     } else if wireguard_sender_matches_configured(self.wireguard_endpoint, peer) {
@@ -850,6 +866,13 @@ impl UdpRelayFrameForwarder {
         }
         Ok(())
     }
+}
+
+fn recoverable_udp_recv_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
 }
 
 fn wireguard_sender_matches_configured(configured: SocketAddr, observed: SocketAddr) -> bool {
@@ -4068,6 +4091,30 @@ mod tests {
         );
         assert!(snapshot.last_forwarded_at.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn relay_frame_forwarder_counts_recoverable_receive_errors() {
+        let stats = RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            SocketAddr::from(([127, 0, 0, 1], 52_000)),
+        );
+
+        assert!(recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+
+        stats.record_socket_receive_error();
+        stats.record_socket_receive_error();
+        assert_eq!(stats.snapshot().socket_receive_errors, 2);
     }
 
     #[tokio::test]
