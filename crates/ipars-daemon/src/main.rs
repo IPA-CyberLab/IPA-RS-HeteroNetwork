@@ -8576,7 +8576,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
         "unsupported eBPF packet-flow event version {}",
         event.version
     );
-    let protocol = ebpf_packet_flow_protocol(event.protocol);
+    let protocol = ebpf_packet_flow_protocol(event.protocol)?;
     let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
     let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status);
     let source_port = optional_nonzero_port(event.source_port());
@@ -8599,14 +8599,15 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
     })
 }
 
-fn ebpf_packet_flow_protocol(value: u8) -> Option<TransportProtocol> {
-    match value {
+fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtocol>> {
+    let protocol = match value {
         PACKET_FLOW_PROTOCOL_UNKNOWN => None,
         PACKET_FLOW_PROTOCOL_ICMP => Some(TransportProtocol::Icmp),
         PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
         PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
-        _ => Some(TransportProtocol::Any),
-    }
+        _ => anyhow::bail!("unsupported eBPF packet-flow protocol code {value}"),
+    };
+    Ok(protocol)
 }
 
 fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
@@ -11808,6 +11809,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported eBPF packet-flow event version"));
+
+        let mut unknown_protocol = event;
+        unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
+        let flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_protocol)?;
+        assert_eq!(flow.observation.protocol, None);
+
+        let mut unsupported_protocol = event;
+        unsupported_protocol[2] = 132;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&unsupported_protocol) {
+            Ok(_) => anyhow::bail!("unsupported eBPF protocol code should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow protocol code"));
         Ok(())
     }
 
