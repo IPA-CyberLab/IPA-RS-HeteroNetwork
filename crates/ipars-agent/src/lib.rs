@@ -1979,47 +1979,74 @@ async fn run_command_output(
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedCommandOutput, AgentError> {
-    tokio::time::timeout(
-        timeout,
-        collect_bounded_command_output(command, output_max_bytes),
-    )
-    .await
-    .map_err(|_| {
-        AgentError::WireGuard(format!(
-            "{command_label} timed out after {}",
-            command_timeout_label(timeout)
-        ))
-    })?
-    .map_err(AgentError::Io)
+    collect_bounded_command_output(command, timeout, output_max_bytes, command_label).await
 }
 
 async fn collect_bounded_command_output(
     command: LinuxCommand,
+    timeout: Duration,
     output_max_bytes: usize,
-) -> std::io::Result<BoundedCommandOutput> {
+    command_label: &str,
+) -> Result<BoundedCommandOutput, AgentError> {
     let mut child = Command::new(&command.program)
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(AgentError::Io)?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
+        .ok_or_else(|| AgentError::Io(std::io::Error::other("child stdout was not piped")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+        .ok_or_else(|| AgentError::Io(std::io::Error::other("child stderr was not piped")))?;
 
-    let (status, _stdout, stderr) = tokio::try_join!(
-        child.wait(),
-        read_limited_command_output(stdout, output_max_bytes),
-        read_limited_command_output(stderr, output_max_bytes)
-    )?;
+    let stdout_task = tokio::spawn(read_limited_command_output(stdout, output_max_bytes));
+    let stderr_task = tokio::spawn(read_limited_command_output(stderr, output_max_bytes));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(AgentError::Io(error));
+        }
+        Err(_) => {
+            let kill_error = child.start_kill().err();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let mut message = format!(
+                "{command_label} timed out after {}",
+                command_timeout_label(timeout)
+            );
+            if let Some(error) = kill_error {
+                message.push_str(&format!("; failed to kill timed-out child: {error}"));
+            }
+            return Err(AgentError::WireGuard(message));
+        }
+    };
+
+    let _stdout = collect_command_output_task(stdout_task).await?;
+    let stderr = collect_command_output_task(stderr_task).await?;
 
     Ok(BoundedCommandOutput { status, stderr })
+}
+
+async fn collect_command_output_task(
+    task: tokio::task::JoinHandle<std::io::Result<LimitedCommandOutput>>,
+) -> Result<LimitedCommandOutput, AgentError> {
+    match task.await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(AgentError::Io(error)),
+        Err(error) => Err(AgentError::WireGuard(format!(
+            "command output reader task failed: {error}"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -3137,6 +3164,8 @@ fn compare_score(left: &PathScore, right: &PathScore) -> std::cmp::Ordering {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
 
     use chrono::Duration as ChronoDuration;
     use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
@@ -3258,16 +3287,31 @@ mod tests {
         assert!(error.to_string().contains("wireguard-failed"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn timed_system_command_runner_times_out() {
+    async fn timed_system_command_runner_times_out_and_reaps_child() -> Result<(), AgentError> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-agent-command-timeout-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let script = format!("printf '%s\\n' $$ > {}; exec sleep 60", pid_path.display());
         let runner = TimedSystemCommandRunner::new(Duration::from_millis(10));
-        let error = match runner.run(LinuxCommand::new("sh", ["-c", "sleep 1"])).await {
+        let error = match runner.run(LinuxCommand::new("sh", ["-c", &script])).await {
             Ok(()) => panic!("command should time out"),
             Err(error) => error,
         };
 
         assert!(error.to_string().contains("timed out after 10ms"));
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(1)).await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "timed-out command child process {pid} was left running"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -3310,6 +3354,45 @@ mod tests {
                 ],
             ))
             .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid_file(path: &Path, timeout: Duration) -> Result<u32, AgentError> {
+        let started = Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        return contents.parse::<u32>().map_err(|error| {
+                            AgentError::WireGuard(format!("failed to parse child pid: {error}"))
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(AgentError::Io(error)),
+            }
+            if started.elapsed() >= timeout {
+                return Err(AgentError::WireGuard(format!(
+                    "timed out waiting for child pid file {}",
+                    path.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let process_path = Path::new("/proc").join(pid.to_string());
+        while started.elapsed() < timeout {
+            if !process_path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !process_path.exists()
     }
 
     #[derive(Debug, Default)]
