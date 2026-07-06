@@ -340,6 +340,9 @@
 {{- if and (eq $agentAllowPrivilegeEscalation "false") (or (hasKey $agentCapabilityAdds "SYS_ADMIN") (hasKey $agentCapabilityAdds "CAP_SYS_ADMIN")) -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used when SYS_ADMIN is added" -}}
 {{- end -}}
+{{- if and .Values.agent.relayForwarder.netns (eq $agentPrivileged "false") (not (or (hasKey $agentCapabilityAdds "ALL") (hasKey $agentCapabilityAdds "SYS_ADMIN") (hasKey $agentCapabilityAdds "CAP_SYS_ADMIN"))) -}}
+{{- fail "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" -}}
+{{- end -}}
 {{- $agentRolloutUpdateStrategy := .Values.agent.rollout.updateStrategy -}}
 {{- $agentRolloutMaxUnavailable := printf "%v" .Values.agent.rollout.maxUnavailable -}}
 {{- $agentRolloutMaxSurge := printf "%v" .Values.agent.rollout.maxSurge -}}
@@ -751,6 +754,11 @@ spec:
             - name: join-token
               mountPath: {{ printf "%s/token" $agentStateMountPath | quote }}
               readOnly: true
+            {{- if .Values.agent.relayForwarder.netns }}
+            - name: host-netns
+              mountPath: /var/run/netns
+              readOnly: true
+            {{- end }}
       volumes:
         - name: agent-state
           hostPath:
@@ -766,3 +774,9 @@ spec:
             items:
               - key: {{ .Values.agent.joinTokenSecretKey | quote }}
                 path: {{ .Values.agent.joinTokenSecretKey | quote }}
+        {{- if .Values.agent.relayForwarder.netns }}
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: Directory
+        {{- end }}

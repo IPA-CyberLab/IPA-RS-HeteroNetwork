@@ -4553,6 +4553,16 @@ fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<
             );
         }
     }
+    if args.relay_forwarder_netns.is_some()
+        && !args.agent_privileged
+        && !(effective_added.contains("ALL")
+            || effective_added.contains("SYS_ADMIN")
+            || effective_added.contains("CAP_SYS_ADMIN"))
+    {
+        anyhow::bail!(
+            "--relay-forwarder-netns requires --agent-privileged or --agent-add-capability SYS_ADMIN"
+        );
+    }
 
     if let Some(seccomp_profile) = args.agent_seccomp_profile.as_deref() {
         parse_kubernetes_seccomp_profile_type(seccomp_profile).map_err(anyhow::Error::msg)?;
@@ -7282,7 +7292,11 @@ mod tests {
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
-            agent_add_capabilities: Vec::new(),
+            agent_add_capabilities: vec![
+                "NET_ADMIN".to_string(),
+                "NET_RAW".to_string(),
+                "SYS_ADMIN".to_string(),
+            ],
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
             agent_read_only_root_filesystem: false,
@@ -7533,6 +7547,9 @@ mod tests {
         assert!(plan.commands[2].contains("--set agent.relayForwarder.crashWindowSeconds=22"));
         assert!(plan.commands[2].contains("--set agent.relayForwarder.maxCrashesPerWindow=4"));
         assert!(plan.commands[2].contains("--set agent.relayForwarder.crashCooldownSeconds=33"));
+        assert!(plan.commands[2].contains(
+            "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_ADMIN}'"
+        ));
         assert!(plan
             .security
             .iter()
@@ -7664,6 +7681,17 @@ mod tests {
         };
         assert!(error.contains("--relay-forwarder-max-sessions requires --relay-forwarder-bind"));
 
+        let mut netns_without_sys_admin = base_k8s_install_args();
+        netns_without_sys_admin.relay_forwarder_bind = Some("0.0.0.0:45182".to_string());
+        netns_without_sys_admin.relay_forwarder_wireguard_endpoint =
+            Some("127.0.0.1:51820".to_string());
+        netns_without_sys_admin.relay_forwarder_netns = Some("relay-fw".to_string());
+        let error = match k8s_install_plan(netns_without_sys_admin) {
+            Ok(_) => panic!("relay forwarder netns without SYS_ADMIN should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-netns requires"));
+
         Ok(())
     }
 
@@ -7737,6 +7765,12 @@ mod tests {
         assert!(daemonset.contains("- --relay-forwarder-bind"));
         assert!(daemonset.contains("- --relay-forwarder-wireguard-endpoint"));
         assert!(daemonset.contains("- --relay-forwarder-max-sessions"));
+        assert!(daemonset
+            .contains("agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN"));
+        assert!(daemonset.contains("- name: host-netns"));
+        assert!(daemonset.contains("mountPath: /var/run/netns"));
+        assert!(daemonset.contains("path: /var/run/netns"));
+        assert_eq!(daemonset.matches("port: 9780").count(), 2);
         assert!(!daemonset.contains("cluster.relayEndpoint"));
         assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
         Ok(())
