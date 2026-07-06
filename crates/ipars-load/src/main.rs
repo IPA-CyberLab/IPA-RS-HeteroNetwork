@@ -516,13 +516,56 @@ impl LoadReport {
                 self.relay_udp_payload_bytes_received
             );
         }
-        if self.relay_admission_successes_reported < self.active_pair_count as u64
-            || self.relay_admission_failures_reported != 0
+        if self.relay_udp_sessions != self.active_pair_count
+            || self.relay_active_sessions_reported != self.active_pair_count
         {
             bail!(
-                "{context} relay admission mismatch: successes={}, failures={}",
+                "{context} relay session mismatch: udp_sessions={}, active_sessions={}, expected {}",
+                self.relay_udp_sessions,
+                self.relay_active_sessions_reported,
+                self.active_pair_count
+            );
+        }
+        if self.relay_max_sessions_reported == 0
+            || self.relay_active_sessions_reported > self.relay_max_sessions_reported
+        {
+            bail!(
+                "{context} relay capacity snapshot is invalid: active={}, max={}",
+                self.relay_active_sessions_reported,
+                self.relay_max_sessions_reported
+            );
+        }
+        let expected_available_sessions = self
+            .relay_max_sessions_reported
+            .saturating_sub(self.relay_active_sessions_reported);
+        if self.relay_available_sessions_reported != expected_available_sessions {
+            bail!(
+                "{context} relay capacity snapshot reported {} available sessions, expected {expected_available_sessions}",
+                self.relay_available_sessions_reported
+            );
+        }
+        if self.relay_max_mbps_reported == 0
+            || !self.relay_enabled_by_policy_reported
+            || !self.relay_e2e_only_reported
+        {
+            bail!(
+                "{context} relay capability snapshot is not production-usable: max_mbps={}, enabled_by_policy={}, e2e_only={}",
+                self.relay_max_mbps_reported,
+                self.relay_enabled_by_policy_reported,
+                self.relay_e2e_only_reported
+            );
+        }
+        if self.relay_admission_attempts_reported != self.active_pair_count as u64
+            || self.relay_admission_successes_reported != self.active_pair_count as u64
+            || self.relay_admission_failures_reported != 0
+            || !self.relay_admission_failures_by_reason_reported.is_empty()
+        {
+            bail!(
+                "{context} relay admission mismatch: attempts={}, successes={}, failures={}, failures_by_reason={:?}",
+                self.relay_admission_attempts_reported,
                 self.relay_admission_successes_reported,
-                self.relay_admission_failures_reported
+                self.relay_admission_failures_reported,
+                self.relay_admission_failures_by_reason_reported
             );
         }
         Ok(())
@@ -3379,6 +3422,41 @@ mod tests {
         };
         assert!(error.contains("received"));
 
+        let mut missing_relay_session = relay_report.clone();
+        missing_relay_session.relay_active_sessions_reported -= 1;
+        let error = match missing_relay_session.validate_success() {
+            Ok(_) => bail!("missing relay active session should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay session mismatch"));
+
+        let mut skewed_relay_capacity = relay_report.clone();
+        skewed_relay_capacity.relay_available_sessions_reported -= 1;
+        let error = match skewed_relay_capacity.validate_success() {
+            Ok(_) => bail!("skewed relay capacity should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay capacity snapshot"));
+
+        let mut disabled_relay_policy = relay_report.clone();
+        disabled_relay_policy.relay_enabled_by_policy_reported = false;
+        let error = match disabled_relay_policy.validate_success() {
+            Ok(_) => bail!("disabled relay policy should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay capability snapshot"));
+
+        let mut skewed_admission_counters = relay_report.clone();
+        skewed_admission_counters.relay_admission_attempts_reported -= 1;
+        skewed_admission_counters
+            .relay_admission_failures_by_reason_reported
+            .insert(RelayAdmissionFailureReason::RateLimited, 1);
+        let error = match skewed_admission_counters.validate_success() {
+            Ok(_) => bail!("skewed relay admission counters should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay admission mismatch"));
+
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
 
@@ -4301,6 +4379,15 @@ mod tests {
         report.relay_udp_payload_bytes_sent = report.active_pair_count as u64 * 64;
         report.relay_udp_payload_bytes_received = report.relay_udp_payload_bytes_sent;
         report.relay_forwarded_bytes_reported = report.relay_udp_payload_bytes_received;
+        report.relay_udp_sessions = report.active_pair_count;
+        report.relay_active_sessions_reported = report.active_pair_count;
+        report.relay_max_sessions_reported = 10_000;
+        report.relay_available_sessions_reported =
+            report.relay_max_sessions_reported - report.relay_active_sessions_reported;
+        report.relay_max_mbps_reported = 10_000;
+        report.relay_enabled_by_policy_reported = true;
+        report.relay_e2e_only_reported = true;
+        report.relay_admission_attempts_reported = report.active_pair_count as u64;
         report.relay_admission_successes_reported = report.active_pair_count as u64;
         report.daemon_processes = 8;
         report.daemon_agent_processes = report.node_count;
