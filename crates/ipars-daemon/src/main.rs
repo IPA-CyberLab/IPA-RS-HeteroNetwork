@@ -2181,6 +2181,9 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
         validate_daemon_identifier(route_provider, "--kubernetes-route-provider")?;
     }
+    if let Some(api_url) = args.kubernetes_api_url.as_deref() {
+        validate_http_url(api_url, "--kubernetes-api-url")?;
+    }
     if !args.kubernetes_discover_services {
         if !args.kubernetes_namespaces.is_empty() {
             anyhow::bail!("--kubernetes-namespace requires --kubernetes-discover-services");
@@ -6862,6 +6865,7 @@ fn kubernetes_api_base_url(
     service_port: Option<&OsStr>,
 ) -> anyhow::Result<String> {
     if let Some(configured) = configured {
+        validate_http_url(configured, "--kubernetes-api-url")?;
         return Ok(configured.trim_end_matches('/').to_string());
     }
     let host = service_host
@@ -17899,6 +17903,32 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn kubernetes_underlay_rejects_invalid_api_url() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-services",
+            "--kubernetes-api-url",
+            "udp://kubernetes.default.svc",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("invalid Kubernetes API URL should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-api-url must use http or https"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn kubernetes_service_discovery_builds_host_route_cidrs() -> anyhow::Result<()> {
         let services = KubernetesServiceList {
             items: vec![
@@ -17949,6 +17979,20 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             kubernetes_api_server_env_cidr(Some(std::ffi::OsStr::new("10.96.0.1")))?,
             Some("10.96.0.1/32".parse::<ipnet::IpNet>()?)
         );
+        let scheme_error =
+            match kubernetes_api_base_url(Some("udp://kubernetes.default.svc"), None, None) {
+                Ok(url) => anyhow::bail!("invalid Kubernetes API URL should be rejected: {url}"),
+                Err(error) => error.to_string(),
+            };
+        assert!(scheme_error.contains("--kubernetes-api-url must use http or https"));
+        let numeric_host_error = match kubernetes_api_base_url(Some("https://0.0.0.0"), None, None)
+        {
+            Ok(url) => anyhow::bail!("unusable Kubernetes API URL should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(numeric_host_error.contains(
+            "--kubernetes-api-url must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        ));
         Ok(())
     }
 
