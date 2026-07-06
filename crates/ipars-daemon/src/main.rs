@@ -115,6 +115,7 @@ const MAX_PACKET_FLOW_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
 const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
 const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
+const MAX_PACKET_FLOW_DEDUP_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
@@ -1310,6 +1311,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--packet-flow-poll-interval-seconds",
         )?;
     }
+    validate_packet_flow_dedup_ttl_seconds(args.packet_flow_dedup_ttl_seconds)?;
     validate_packet_flow_detector_specific_args(args)?;
     if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
         validate_bounded_u64(
@@ -1519,6 +1521,15 @@ fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Resu
         anyhow::ensure!(
             !args.packet_flow_pin,
             "--packet-flow-pin requires --packet-flow-detector to be enabled"
+        );
+    }
+    Ok(())
+}
+
+fn validate_packet_flow_dedup_ttl_seconds(value: u64) -> anyhow::Result<()> {
+    if value > MAX_PACKET_FLOW_DEDUP_TTL_SECONDS {
+        anyhow::bail!(
+            "--packet-flow-dedup-ttl-seconds must not exceed {MAX_PACKET_FLOW_DEDUP_TTL_SECONDS}"
         );
     }
     Ok(())
@@ -12789,6 +12800,48 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn agent_packet_flow_dedup_ttl_may_be_disabled_but_must_be_bounded() -> anyhow::Result<()> {
+        let disabled = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-dedup-ttl-seconds",
+            "0",
+        ])?;
+        if let Command::Agent(args) = disabled.command {
+            validate_agent_runtime_config(&args)?;
+            assert_eq!(
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                None
+            );
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let oversized = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-dedup-ttl-seconds",
+            "86401",
+        ])?;
+        if let Command::Agent(args) = oversized.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("oversized packet-flow dedup TTL should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-dedup-ttl-seconds must not exceed 86400"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]
