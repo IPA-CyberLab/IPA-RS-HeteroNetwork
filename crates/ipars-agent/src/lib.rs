@@ -2998,8 +2998,14 @@ fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
 
 fn peer_routes_for_record(peer: &NodeRecord) -> Result<Vec<Route>, AgentError> {
     let mut routes = vec![peer_host_route(peer)?];
-    routes.extend(peer.routes.iter().cloned());
+    routes.extend(peer_owned_advertised_routes(peer).cloned());
     Ok(routes)
+}
+
+fn peer_owned_advertised_routes(peer: &NodeRecord) -> impl Iterator<Item = &Route> {
+    peer.routes
+        .iter()
+        .filter(|route| route.advertised_by == peer.node_id)
 }
 
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
@@ -3088,17 +3094,16 @@ impl LazyConnectManager {
         self.remove_observed_peer(&peer.node_id);
         self.peer_vpn_ips
             .insert(peer.vpn_ip.0, peer.node_id.clone());
-        let routes = peer
-            .routes
-            .iter()
+        let routes = peer_owned_advertised_routes(peer)
             .map(|route| route.cidr)
             .collect::<Vec<_>>();
+        let has_owned_routes = !routes.is_empty();
         if !routes.is_empty() {
             self.advertised_routes.insert(peer.node_id.clone(), routes);
         }
 
         if self.is_pinned_by_policy(&peer.role, &peer.tags)
-            || !peer.routes.is_empty()
+            || has_owned_routes
             || peer
                 .relay_capability
                 .as_ref()
@@ -5237,6 +5242,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_map_applier_ignores_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-owner");
+        let foreign_id = NodeId::from_string("foreign-owner");
+        let foreign_route = Route {
+            id: "foreign-route".to_string(),
+            cidr: "10.99.0.0/16".parse()?,
+            advertised_by: foreign_id,
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 22)),
+            "wg-peer-owner",
+            Vec::new(),
+            vec![foreign_route],
+        );
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 0,
+                routes_applied: 1,
+                routes_removed: 0,
+            }
+        );
+        let applied = applier.route_manager.applied.read().await;
+        let plan = applied
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing route plan".to_string()))?;
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].cidr, "100.64.0.22/32".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn peer_map_applier_removes_routes_for_stale_peer(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let applier = PeerMapApplier::new(
@@ -5904,6 +5961,62 @@ mod tests {
         );
         assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_ignores_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-route");
+        let foreign_id = NodeId::from_string("foreign-route-owner");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 40)),
+            "wg-peer-route",
+            Vec::new(),
+            vec![Route {
+                id: "foreign-route".to_string(),
+                cidr: "10.88.0.0/16".parse()?,
+                advertised_by: foreign_id,
+                via: None,
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(443),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(1)
+        );
         Ok(())
     }
 
