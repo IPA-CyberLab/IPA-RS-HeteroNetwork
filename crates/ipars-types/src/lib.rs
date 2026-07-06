@@ -2799,6 +2799,12 @@ pub mod api {
         #[serde(default)]
         pub outbound_dropped_expired_session_payload_bytes: u64,
         #[serde(default)]
+        pub outbound_dropped_oversized_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_oversized_payload_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_oversized_datagram_bytes: u64,
+        #[serde(default)]
         pub outbound_dropped_non_wireguard_packets: u64,
         #[serde(default)]
         pub outbound_dropped_non_wireguard_payload_bytes: u64,
@@ -2808,6 +2814,10 @@ pub mod api {
         pub inbound_dropped_expired_session_packets: u64,
         #[serde(default)]
         pub inbound_dropped_expired_session_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_oversized_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_oversized_payload_bytes: u64,
         #[serde(default)]
         pub inbound_dropped_non_wireguard_packets: u64,
         #[serde(default)]

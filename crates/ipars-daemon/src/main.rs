@@ -3652,12 +3652,17 @@ struct AgentOtelMetrics {
     forwarder_outbound_dropped_unexpected_source_payload_bytes: Counter<u64>,
     forwarder_outbound_dropped_expired_session_packets: Counter<u64>,
     forwarder_outbound_dropped_expired_session_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_oversized_packets: Counter<u64>,
+    forwarder_outbound_dropped_oversized_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_oversized_datagram_bytes: Counter<u64>,
     forwarder_outbound_dropped_non_wireguard_packets: Counter<u64>,
     forwarder_outbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
     forwarder_inbound_packets: Counter<u64>,
     forwarder_inbound_payload_bytes: Counter<u64>,
     forwarder_inbound_dropped_expired_session_packets: Counter<u64>,
     forwarder_inbound_dropped_expired_session_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_oversized_packets: Counter<u64>,
+    forwarder_inbound_dropped_oversized_payload_bytes: Counter<u64>,
     forwarder_inbound_dropped_non_wireguard_packets: Counter<u64>,
     forwarder_inbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
 }
@@ -3824,6 +3829,30 @@ impl AgentOtelMetrics {
                 )
                 .with_unit("By")
                 .build(),
+            forwarder_outbound_dropped_oversized_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.oversized.packets")
+                .with_description(
+                    "Relay forwarder local packets dropped before relay because the framed relay datagram would exceed the UDP payload limit.",
+                )
+                .build(),
+            forwarder_outbound_dropped_oversized_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.oversized.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder local payload bytes dropped before relay because the framed relay datagram would exceed the UDP payload limit.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_oversized_datagram_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.oversized.datagram.bytes",
+                )
+                .with_description(
+                    "Relay forwarder framed datagram bytes dropped before relay because they would exceed the UDP payload limit.",
+                )
+                .with_unit("By")
+                .build(),
             forwarder_outbound_dropped_non_wireguard_packets: meter
                 .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.non_wireguard.packets")
                 .with_description(
@@ -3862,6 +3891,21 @@ impl AgentOtelMetrics {
                 )
                 .with_description(
                     "Relay forwarder relay payload bytes dropped before local WireGuard because the relay session credential expired.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_oversized_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.oversized.packets")
+                .with_description(
+                    "Relay forwarder relay packets dropped before local WireGuard because the payload exceeds the UDP payload limit.",
+                )
+                .build(),
+            forwarder_inbound_dropped_oversized_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.inbound.dropped.oversized.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped before local WireGuard because the payload exceeds the UDP payload limit.",
                 )
                 .with_unit("By")
                 .build(),
@@ -4098,6 +4142,12 @@ impl AgentOtelMetrics {
                     forwarder.outbound_dropped_expired_session_payload_bytes,
                     &attrs,
                 );
+            self.forwarder_outbound_dropped_oversized_packets
+                .add(forwarder.outbound_dropped_oversized_packets, &attrs);
+            self.forwarder_outbound_dropped_oversized_payload_bytes
+                .add(forwarder.outbound_dropped_oversized_payload_bytes, &attrs);
+            self.forwarder_outbound_dropped_oversized_datagram_bytes
+                .add(forwarder.outbound_dropped_oversized_datagram_bytes, &attrs);
             self.forwarder_outbound_dropped_non_wireguard_packets
                 .add(forwarder.outbound_dropped_non_wireguard_packets, &attrs);
             self.forwarder_outbound_dropped_non_wireguard_payload_bytes
@@ -4116,6 +4166,10 @@ impl AgentOtelMetrics {
                     forwarder.inbound_dropped_expired_session_payload_bytes,
                     &attrs,
                 );
+            self.forwarder_inbound_dropped_oversized_packets
+                .add(forwarder.inbound_dropped_oversized_packets, &attrs);
+            self.forwarder_inbound_dropped_oversized_payload_bytes
+                .add(forwarder.inbound_dropped_oversized_payload_bytes, &attrs);
             self.forwarder_inbound_dropped_non_wireguard_packets
                 .add(forwarder.inbound_dropped_non_wireguard_packets, &attrs);
             self.forwarder_inbound_dropped_non_wireguard_payload_bytes
@@ -4183,6 +4237,18 @@ fn agent_forwarder_delta(
             current.outbound_dropped_expired_session_payload_bytes,
             previous.map(|previous| previous.outbound_dropped_expired_session_payload_bytes),
         ),
+        outbound_dropped_oversized_packets: counter_delta(
+            current.outbound_dropped_oversized_packets,
+            previous.map(|previous| previous.outbound_dropped_oversized_packets),
+        ),
+        outbound_dropped_oversized_payload_bytes: counter_delta(
+            current.outbound_dropped_oversized_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_oversized_payload_bytes),
+        ),
+        outbound_dropped_oversized_datagram_bytes: counter_delta(
+            current.outbound_dropped_oversized_datagram_bytes,
+            previous.map(|previous| previous.outbound_dropped_oversized_datagram_bytes),
+        ),
         outbound_dropped_non_wireguard_packets: counter_delta(
             current.outbound_dropped_non_wireguard_packets,
             previous.map(|previous| previous.outbound_dropped_non_wireguard_packets),
@@ -4207,6 +4273,14 @@ fn agent_forwarder_delta(
             current.inbound_dropped_expired_session_payload_bytes,
             previous.map(|previous| previous.inbound_dropped_expired_session_payload_bytes),
         ),
+        inbound_dropped_oversized_packets: counter_delta(
+            current.inbound_dropped_oversized_packets,
+            previous.map(|previous| previous.inbound_dropped_oversized_packets),
+        ),
+        inbound_dropped_oversized_payload_bytes: counter_delta(
+            current.inbound_dropped_oversized_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_oversized_payload_bytes),
+        ),
         inbound_dropped_non_wireguard_packets: counter_delta(
             current.inbound_dropped_non_wireguard_packets,
             previous.map(|previous| previous.inbound_dropped_non_wireguard_packets),
@@ -4227,12 +4301,17 @@ fn has_agent_forwarder_delta(delta: &AgentRelayForwarderMetrics) -> bool {
         || delta.outbound_dropped_unexpected_source_payload_bytes > 0
         || delta.outbound_dropped_expired_session_packets > 0
         || delta.outbound_dropped_expired_session_payload_bytes > 0
+        || delta.outbound_dropped_oversized_packets > 0
+        || delta.outbound_dropped_oversized_payload_bytes > 0
+        || delta.outbound_dropped_oversized_datagram_bytes > 0
         || delta.outbound_dropped_non_wireguard_packets > 0
         || delta.outbound_dropped_non_wireguard_payload_bytes > 0
         || delta.inbound_packets > 0
         || delta.inbound_payload_bytes > 0
         || delta.inbound_dropped_expired_session_packets > 0
         || delta.inbound_dropped_expired_session_payload_bytes > 0
+        || delta.inbound_dropped_oversized_packets > 0
+        || delta.inbound_dropped_oversized_payload_bytes > 0
         || delta.inbound_dropped_non_wireguard_packets > 0
         || delta.inbound_dropped_non_wireguard_payload_bytes > 0
 }
@@ -10810,12 +10889,17 @@ mod tests {
             outbound_dropped_unexpected_source_payload_bytes: 0,
             outbound_dropped_expired_session_packets: 0,
             outbound_dropped_expired_session_payload_bytes: 0,
+            outbound_dropped_oversized_packets: 0,
+            outbound_dropped_oversized_payload_bytes: 0,
+            outbound_dropped_oversized_datagram_bytes: 0,
             outbound_dropped_non_wireguard_packets: 0,
             outbound_dropped_non_wireguard_payload_bytes: 0,
             inbound_packets,
             inbound_payload_bytes,
             inbound_dropped_expired_session_packets: 0,
             inbound_dropped_expired_session_payload_bytes: 0,
+            inbound_dropped_oversized_packets: 0,
+            inbound_dropped_oversized_payload_bytes: 0,
             inbound_dropped_non_wireguard_packets: 0,
             inbound_dropped_non_wireguard_payload_bytes: 0,
             last_forwarded_at: None,
@@ -10829,10 +10913,15 @@ mod tests {
         current.outbound_dropped_unexpected_source_payload_bytes = 32;
         current.outbound_dropped_expired_session_packets = 1;
         current.outbound_dropped_expired_session_payload_bytes = 64;
+        current.outbound_dropped_oversized_packets = 1;
+        current.outbound_dropped_oversized_payload_bytes = 80;
+        current.outbound_dropped_oversized_datagram_bytes = 120;
         current.outbound_dropped_non_wireguard_packets = 2;
         current.outbound_dropped_non_wireguard_payload_bytes = 42;
         current.inbound_dropped_expired_session_packets = 1;
         current.inbound_dropped_expired_session_payload_bytes = 48;
+        current.inbound_dropped_oversized_packets = 1;
+        current.inbound_dropped_oversized_payload_bytes = 72;
         current.inbound_dropped_non_wireguard_packets = 1;
         current.inbound_dropped_non_wireguard_payload_bytes = 24;
 
@@ -10845,12 +10934,17 @@ mod tests {
         assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 32);
         assert_eq!(delta.outbound_dropped_expired_session_packets, 1);
         assert_eq!(delta.outbound_dropped_expired_session_payload_bytes, 64);
+        assert_eq!(delta.outbound_dropped_oversized_packets, 1);
+        assert_eq!(delta.outbound_dropped_oversized_payload_bytes, 80);
+        assert_eq!(delta.outbound_dropped_oversized_datagram_bytes, 120);
         assert_eq!(delta.outbound_dropped_non_wireguard_packets, 2);
         assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 42);
         assert_eq!(delta.inbound_packets, 3);
         assert_eq!(delta.inbound_payload_bytes, 300);
         assert_eq!(delta.inbound_dropped_expired_session_packets, 1);
         assert_eq!(delta.inbound_dropped_expired_session_payload_bytes, 48);
+        assert_eq!(delta.inbound_dropped_oversized_packets, 1);
+        assert_eq!(delta.inbound_dropped_oversized_payload_bytes, 72);
         assert_eq!(delta.inbound_dropped_non_wireguard_packets, 1);
         assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 24);
         assert!(has_agent_forwarder_delta(&delta));
@@ -10863,10 +10957,15 @@ mod tests {
         previous.outbound_dropped_unexpected_source_payload_bytes = 32;
         previous.outbound_dropped_expired_session_packets = 1;
         previous.outbound_dropped_expired_session_payload_bytes = 64;
+        previous.outbound_dropped_oversized_packets = 1;
+        previous.outbound_dropped_oversized_payload_bytes = 80;
+        previous.outbound_dropped_oversized_datagram_bytes = 120;
         previous.outbound_dropped_non_wireguard_packets = 2;
         previous.outbound_dropped_non_wireguard_payload_bytes = 100;
         previous.inbound_dropped_expired_session_packets = 1;
         previous.inbound_dropped_expired_session_payload_bytes = 48;
+        previous.inbound_dropped_oversized_packets = 1;
+        previous.inbound_dropped_oversized_payload_bytes = 72;
         previous.inbound_dropped_non_wireguard_packets = 1;
         previous.inbound_dropped_non_wireguard_payload_bytes = 50;
         let mut current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
@@ -10874,10 +10973,15 @@ mod tests {
         current.outbound_dropped_unexpected_source_payload_bytes = 96;
         current.outbound_dropped_expired_session_packets = 4;
         current.outbound_dropped_expired_session_payload_bytes = 160;
+        current.outbound_dropped_oversized_packets = 5;
+        current.outbound_dropped_oversized_payload_bytes = 208;
+        current.outbound_dropped_oversized_datagram_bytes = 280;
         current.outbound_dropped_non_wireguard_packets = 5;
         current.outbound_dropped_non_wireguard_payload_bytes = 140;
         current.inbound_dropped_expired_session_packets = 5;
         current.inbound_dropped_expired_session_payload_bytes = 144;
+        current.inbound_dropped_oversized_packets = 3;
+        current.inbound_dropped_oversized_payload_bytes = 136;
         current.inbound_dropped_non_wireguard_packets = 3;
         current.inbound_dropped_non_wireguard_payload_bytes = 90;
 
@@ -10890,12 +10994,17 @@ mod tests {
         assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 64);
         assert_eq!(delta.outbound_dropped_expired_session_packets, 3);
         assert_eq!(delta.outbound_dropped_expired_session_payload_bytes, 96);
+        assert_eq!(delta.outbound_dropped_oversized_packets, 4);
+        assert_eq!(delta.outbound_dropped_oversized_payload_bytes, 128);
+        assert_eq!(delta.outbound_dropped_oversized_datagram_bytes, 160);
         assert_eq!(delta.outbound_dropped_non_wireguard_packets, 3);
         assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 40);
         assert_eq!(delta.inbound_packets, 4);
         assert_eq!(delta.inbound_payload_bytes, 400);
         assert_eq!(delta.inbound_dropped_expired_session_packets, 4);
         assert_eq!(delta.inbound_dropped_expired_session_payload_bytes, 96);
+        assert_eq!(delta.inbound_dropped_oversized_packets, 2);
+        assert_eq!(delta.inbound_dropped_oversized_payload_bytes, 64);
         assert_eq!(delta.inbound_dropped_non_wireguard_packets, 2);
         assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 40);
         assert!(has_agent_forwarder_delta(&delta));
