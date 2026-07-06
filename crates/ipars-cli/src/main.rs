@@ -2253,7 +2253,14 @@ fn validate_kubernetes_qualified_name(value: &str, label: &str) -> Result<(), St
     Ok(())
 }
 
+const KUBERNETES_ANNOTATION_VALUE_MAX_BYTES: usize = 262_144;
+
 fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
+    if value.len() > KUBERNETES_ANNOTATION_VALUE_MAX_BYTES {
+        return Err(format!(
+            "annotation value exceeds {KUBERNETES_ANNOTATION_VALUE_MAX_BYTES} bytes"
+        ));
+    }
     if value.chars().any(char::is_control) {
         return Err("annotation value cannot contain control characters".to_string());
     }
@@ -8328,6 +8335,42 @@ mod tests {
             error.contains("--relay-service-annotation annotation value cannot contain whitespace")
         );
 
+        let mut oversized_agent_value = base_k8s_install_args();
+        oversized_agent_value.expose_agent_api = true;
+        oversized_agent_value.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-name".to_string(),
+            value: "a".repeat(KUBERNETES_ANNOTATION_VALUE_MAX_BYTES + 1),
+        }];
+        let error = match k8s_install_plan(oversized_agent_value) {
+            Ok(_) => panic!("oversized agent API Service annotation value should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--agent-api-service-annotation annotation value exceeds 262144 bytes")
+        );
+
+        let mut duplicate_relay_key = base_k8s_install_args();
+        duplicate_relay_key.expose_relay = true;
+        duplicate_relay_key.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_relay_key.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        duplicate_relay_key.relay_service_annotations = vec![
+            KeyValueArg {
+                key: "metallb.universe.tf/address-pool".to_string(),
+                value: "public".to_string(),
+            },
+            KeyValueArg {
+                key: "metallb.universe.tf/address-pool".to_string(),
+                value: "private".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_relay_key) {
+            Ok(_) => panic!("duplicate relay Service annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation must not repeat annotation key metallb.universe.tf/address-pool"
+        ));
+
         Ok(())
     }
 
@@ -12906,6 +12949,11 @@ mod tests {
         assert!(parse_key_value("example.com/bad?=value").is_err());
         assert!(parse_key_value("example.com/key=two words").is_err());
         assert!(parse_key_value("example.com/key=line\nbreak").is_err());
+        let oversized_annotation = format!(
+            "example.com/key={}",
+            "a".repeat(KUBERNETES_ANNOTATION_VALUE_MAX_BYTES + 1)
+        );
+        assert!(parse_key_value(&oversized_annotation).is_err());
         assert_eq!(
             helm_set_key("service.beta.kubernetes.io/aws-load-balancer-type"),
             "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
