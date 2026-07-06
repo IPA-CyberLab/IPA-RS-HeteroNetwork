@@ -8576,6 +8576,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
         "unsupported eBPF packet-flow event version {}",
         event.version
     );
+    validate_ebpf_packet_flow_unused_fields(&event)?;
     let protocol = ebpf_packet_flow_protocol(event.protocol)?;
     let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
     let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status);
@@ -8597,6 +8598,19 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
             tcp_state,
         },
     })
+}
+
+fn validate_ebpf_packet_flow_unused_fields(event: &PacketFlowEvent) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        event.flags == 0,
+        "unsupported eBPF packet-flow event flags 0x{:02x}",
+        event.flags
+    );
+    anyhow::ensure!(
+        event.reserved.iter().all(|byte| *byte == 0),
+        "unsupported eBPF packet-flow reserved bytes"
+    );
+    Ok(())
 }
 
 fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtocol>> {
@@ -11809,6 +11823,26 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported eBPF packet-flow event version"));
+
+        let mut bad_flags = event;
+        bad_flags[5] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_flags) {
+            Ok(_) => anyhow::bail!("nonzero eBPF event flags should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow event flags"));
+
+        let mut bad_reserved = event;
+        bad_reserved[10] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_reserved) {
+            Ok(_) => anyhow::bail!("nonzero eBPF event reserved bytes should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow reserved bytes"));
 
         let mut unknown_protocol = event;
         unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
