@@ -91,7 +91,7 @@ advertised route loss, missing control-plane metrics endpoint coverage, cross-co
 failed control-plane failover, all-unreachable path negotiation, relay-candidate loss, relay packet
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
-readiness-timeout, endpoint, child-role, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
+readiness-timeout, endpoint, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
 mismatch, duplicate, empty, role-mismatched, or serial/order-skewed retained child logs, retained file permission/owner drift across logs, manifests, and store artifacts, unexpected retained runtime artifacts, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
 records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced

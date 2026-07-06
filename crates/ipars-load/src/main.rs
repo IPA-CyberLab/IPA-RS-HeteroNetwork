@@ -841,6 +841,7 @@ impl LoadReport {
             )
         })?;
         let mut expected_runtime_entries = expected_daemon_retained_runtime_entries();
+        let mut child_roles = Vec::with_capacity(manifest.children.len());
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         let mut seen_log_paths = BTreeSet::new();
@@ -848,6 +849,7 @@ impl LoadReport {
         let mut seen_child_pids = BTreeMap::new();
         let mut previous_log_serial = None;
         for child in &manifest.children {
+            child_roles.push(child.role.clone());
             let Some(log_path) = &child.log_path else {
                 bail!(
                     "daemon load scenario retained manifest child {} is missing log path",
@@ -1040,6 +1042,14 @@ impl LoadReport {
                 self.daemon_processes
             );
         }
+        let expected_role_sequence = self.expected_daemon_child_role_sequence();
+        if child_roles != expected_role_sequence {
+            bail!(
+                "daemon load scenario retained manifest child role sequence {:?} does not match expected {:?}",
+                child_roles,
+                expected_role_sequence
+            );
+        }
         let expected_roles = self.expected_daemon_child_roles();
         if exited_roles != expected_roles {
             bail!(
@@ -1054,13 +1064,18 @@ impl LoadReport {
     }
 
     fn expected_daemon_child_roles(&self) -> Vec<String> {
+        let mut roles = self.expected_daemon_child_role_sequence();
+        roles.sort();
+        roles
+    }
+
+    fn expected_daemon_child_role_sequence(&self) -> Vec<String> {
         let mut roles = Vec::with_capacity(self.daemon_processes);
         roles.extend(
             (0..self.daemon_control_plane_processes).map(|index| format!("control-plane-{index}")),
         );
-        roles.extend(["relay", "signal", "stun"].into_iter().map(str::to_string));
+        roles.extend(["signal", "relay", "stun"].into_iter().map(str::to_string));
         roles.extend((0..self.daemon_agent_processes).map(|_| "agent".to_string()));
-        roles.sort();
         roles
     }
 }
@@ -4691,6 +4706,48 @@ mod tests {
         assert!(error.contains("invalid serial prefix"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut out_of_order_child_roles = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &out_of_order_child_roles,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        out_of_order_child_roles.daemon_runtime_dir = Some(runtime_dir.clone());
+        out_of_order_child_roles.daemon_runtime_manifest = Some(manifest_path.clone());
+        let relay_log_path = runtime_dir.join("0002-relay.log");
+        let signal_log_path = runtime_dir.join("0003-signal.log");
+        std::fs::rename(runtime_dir.join("0002-signal.log"), &relay_log_path)?;
+        std::fs::rename(runtime_dir.join("0003-relay.log"), &signal_log_path)?;
+        let relay_log_diagnostics =
+            daemon_log_diagnostics(&relay_log_path).context("renamed relay log was unreadable")?;
+        let signal_log_diagnostics = daemon_log_diagnostics(&signal_log_path)
+            .context("renamed signal log was unreadable")?;
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[2].role = "relay".to_string();
+            manifest.children[2].log_path = Some(relay_log_path);
+            manifest.children[2].log_bytes = Some(relay_log_diagnostics.bytes);
+            manifest.children[2].log_tail_sha256 = Some(relay_log_diagnostics.tail_sha256);
+            manifest.children[3].role = "signal".to_string();
+            manifest.children[3].log_path = Some(signal_log_path);
+            manifest.children[3].log_bytes = Some(signal_log_diagnostics.bytes);
+            manifest.children[3].log_tail_sha256 = Some(signal_log_diagnostics.tail_sha256);
+        })?;
+        let error = match out_of_order_child_roles.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with out-of-order child roles should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("child role sequence"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut out_of_order_child_log_serial = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &out_of_order_child_log_serial,
@@ -5194,7 +5251,7 @@ mod tests {
             Ok(_) => bail!("retained manifest with mismatched child roles should fail validation"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("child roles"));
+        assert!(error.contains("child role"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut missing_child_pid = daemon_report.clone();
