@@ -8005,7 +8005,8 @@ async fn negotiate_signal_paths(
         let request = signal_path_request(&status, &peer);
         let (signal_url, response) =
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
-        let relay_candidates = selected_relay_candidates(&response);
+        let mut relay_candidates = selected_relay_candidates(&response);
+        promote_active_relay_candidate(runtime, &peer.node_id, &mut relay_candidates).await;
         let candidate_record = signal_path_record(response, chrono::Utc::now());
         let (mut record, mut path_selection) =
             stable_signal_path_record(runtime, candidate_record).await;
@@ -8752,6 +8753,22 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
             })
     });
     candidates
+}
+
+async fn promote_active_relay_candidate(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    candidates: &mut Vec<NodeRecord>,
+) -> Option<NodeId> {
+    let session = active_relay_session(runtime, peer).await?;
+    let position = candidates
+        .iter()
+        .position(|relay| relay.node_id == session.relay_node)?;
+    if position > 0 {
+        let relay = candidates.remove(position);
+        candidates.insert(0, relay);
+    }
+    Some(session.relay_node)
 }
 
 fn unreachable_path_record(
@@ -18902,6 +18919,82 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].node_id, NodeId::from_string("relay-a"));
+    }
+
+    #[tokio::test]
+    async fn active_relay_candidate_is_promoted_for_path_stability() {
+        let mut low_load = node_record("relay-low-load");
+        low_load.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut current = node_record("relay-current");
+        current.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some("http://203.0.113.32:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 50,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![current.clone(), low_load.clone()],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let mut selected = selected_relay_candidates(&response);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                NodeId::from_string("relay-low-load"),
+                NodeId::from_string("relay-current")
+            ]
+        );
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-current"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 32], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-current".to_string(),
+                session_token: "token-current".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+
+        let promoted = promote_active_relay_candidate(&runtime, &peer, &mut selected).await;
+
+        assert_eq!(promoted, Some(NodeId::from_string("relay-current")));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                NodeId::from_string("relay-current"),
+                NodeId::from_string("relay-low-load")
+            ]
+        );
     }
 
     #[test]
