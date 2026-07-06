@@ -28,6 +28,9 @@ const MAX_JOIN_TOKEN_TAGS: usize = 64;
 const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
 const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
+const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
+const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -2804,20 +2807,40 @@ fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow:
         anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
     }
     if let Some(command) = args.userspace_wireguard_command.as_deref() {
-        if command.is_empty() {
-            anyhow::bail!("--userspace-wireguard-command cannot be empty");
-        }
-        if command.chars().any(char::is_control) {
-            anyhow::bail!("--userspace-wireguard-command must not contain control characters");
-        }
+        validate_docker_runtime_program_token(command, "--userspace-wireguard-command")?;
     }
+    anyhow::ensure!(
+        args.userspace_wireguard_args.len() <= MAX_USERSPACE_WIREGUARD_ARGS,
+        "--userspace-wireguard-arg may be repeated at most {MAX_USERSPACE_WIREGUARD_ARGS} times"
+    );
     for argument in &args.userspace_wireguard_args {
         if argument.is_empty() {
             anyhow::bail!("--userspace-wireguard-arg cannot be empty");
         }
-        if argument.chars().any(|character| character == '\0') {
-            anyhow::bail!("--userspace-wireguard-arg must not contain NUL bytes");
+        if argument.len() > MAX_USERSPACE_WIREGUARD_ARG_BYTES {
+            anyhow::bail!(
+                "--userspace-wireguard-arg exceeds {MAX_USERSPACE_WIREGUARD_ARG_BYTES} bytes"
+            );
         }
+        if argument.chars().any(char::is_control) {
+            anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
+        }
+    }
+    Ok(())
+}
+
+fn validate_docker_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_USERSPACE_WIREGUARD_COMMAND_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_USERSPACE_WIREGUARD_COMMAND_BYTES} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+    if value.contains('/') && !Path::new(value).is_absolute() {
+        anyhow::bail!("{label} must be a bare command name or an absolute path");
     }
     Ok(())
 }
@@ -6602,6 +6625,70 @@ mod tests {
         assert!(oversized_shutdown_timeout
             .to_string()
             .contains("--userspace-wireguard-shutdown-timeout-seconds must not exceed 3600"));
+
+        let relative_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("./wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relative userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relative_command.to_string().contains(
+            "--userspace-wireguard-command must be a bare command name or an absolute path"
+        ));
+
+        let oversized_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some(
+                "x".repeat(MAX_USERSPACE_WIREGUARD_COMMAND_BYTES + 1),
+            ),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("oversized userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(oversized_command
+            .to_string()
+            .contains("--userspace-wireguard-command exceeds 4096 bytes"));
+
+        let mut too_many_args = Vec::new();
+        for index in 0..=MAX_USERSPACE_WIREGUARD_ARGS {
+            too_many_args.push(format!("arg-{index}"));
+        }
+        let too_many_args = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: too_many_args,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("too many userspace WireGuard args should be rejected"),
+            Err(error) => error,
+        };
+        assert!(too_many_args
+            .to_string()
+            .contains("--userspace-wireguard-arg may be repeated at most 128 times"));
+
+        let invalid_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["ipars0\n--unexpected".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("control-character userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_arg
+            .to_string()
+            .contains("--userspace-wireguard-arg must not contain control characters"));
+
+        let oversized_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES + 1)],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("oversized userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(oversized_arg
+            .to_string()
+            .contains("--userspace-wireguard-arg exceeds 4096 bytes"));
         Ok(())
     }
 
