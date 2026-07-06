@@ -1478,14 +1478,26 @@ fn validate_runtime_backend_specific_args(args: &AgentArgs) -> anyhow::Result<()
 }
 
 fn validate_packet_flow_ebpf_attach_specs(values: &[String]) -> anyhow::Result<()> {
+    let _ = parse_packet_flow_ebpf_attach_specs(values)?;
+    Ok(())
+}
+
+fn parse_packet_flow_ebpf_attach_specs(
+    values: &[String],
+) -> anyhow::Result<Vec<EbpfTracepointAttachSpec>> {
     anyhow::ensure!(
         values.len() <= MAX_PACKET_FLOW_EBPF_ATTACH_SPECS,
         "--packet-flow-ebpf-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_ATTACH_SPECS} times"
     );
     let mut seen = BTreeSet::new();
+    let mut specs = Vec::with_capacity(values.len());
     for value in values {
         let spec = EbpfTracepointAttachSpec::parse(value)?;
-        let key = (spec.program, spec.category, spec.name);
+        let key = (
+            spec.program.clone(),
+            spec.category.clone(),
+            spec.name.clone(),
+        );
         anyhow::ensure!(
             seen.insert(key.clone()),
             "--packet-flow-ebpf-attach must not repeat {}:{}:{}",
@@ -1493,8 +1505,9 @@ fn validate_packet_flow_ebpf_attach_specs(values: &[String]) -> anyhow::Result<(
             key.1,
             key.2
         );
+        specs.push(spec);
     }
-    Ok(())
+    Ok(specs)
 }
 
 fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
@@ -9632,11 +9645,15 @@ impl EbpfRingbufConfig {
             .packet_flow_ebpf_object_path
             .clone()
             .context("--packet-flow-ebpf-object-path is required")?;
-        let attachments = args
-            .packet_flow_ebpf_attach
-            .iter()
-            .map(|attach| EbpfTracepointAttachSpec::parse(attach))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        validate_ebpf_identifier(
+            &args.packet_flow_ebpf_ringbuf_map,
+            "--packet-flow-ebpf-ringbuf-map",
+        )?;
+        anyhow::ensure!(
+            !args.packet_flow_ebpf_attach.is_empty(),
+            "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
+        );
+        let attachments = parse_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
         Ok(Self {
             object_path,
             ringbuf_map: args.packet_flow_ebpf_ringbuf_map.clone(),
@@ -13730,6 +13747,69 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn ebpf_ringbuf_config_revalidates_runtime_boundaries() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-ringbuf-map",
+                    "bad/map",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-ringbuf-map",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                ],
+                "--packet-flow-ebpf-attach must be set at least once",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-attach must not repeat ipars_ingress:net:netif_receive_skb",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match EbpfRingbufConfig::from_args(&args) {
+                    Ok(config) => anyhow::bail!("unexpected valid eBPF ringbuf config: {config:?}"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected `{expected}`, got `{error}`"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
