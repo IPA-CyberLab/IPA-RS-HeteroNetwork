@@ -95,6 +95,8 @@ The agent runtime records peer activity through typed peer-activity and packet-f
 
 Elasticsearch transport frames are also recognized from bounded TCP payload prefixes using the `ES` frame marker and transport header shape, so internal cluster/search traffic does not rely only on port guesses or HTTP API paths.
 
+TLS ClientHello SNI names are parsed when they fit in the bounded payload prefix, allowing Kubernetes API, etcd, Prometheus, OpenTelemetry/OTLP, and Elasticsearch endpoints to be classified ahead of the generic HTTPS fallback.
+
 Packet-flow runtime ingestion treats inconsistent transport metadata as a filtered observation with the `inconsistent_transport_metadata` reason before it can activate a peer, pin a path, or increment lifecycle/application classification metrics. This keeps direct API and detector-call paths aligned with the stricter HTTP and JSONL input validation.
 
 ## NAT Traversal

@@ -1942,6 +1942,7 @@ pub mod api {
                 return None;
             }
             http_payload_application(payload)
+                .or_else(|| tls_client_hello_sni_application(payload))
                 .or_else(|| {
                     tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
                 })
@@ -2273,6 +2274,191 @@ pub mod api {
             && (0x01..=0x04).contains(&payload[2])
             && (1..=16_384).contains(&record_len)
             && matches!(payload[5], 0x01 | 0x02)
+    }
+
+    fn tls_client_hello_sni_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if payload.len() < 9
+            || payload[0] != 0x16
+            || payload[1] != 0x03
+            || !(0x01..=0x04).contains(&payload[2])
+            || payload[5] != 0x01
+        {
+            return None;
+        }
+        let record_len = read_u16_be(payload, 3)? as usize;
+        if !(1..=16_384).contains(&record_len) {
+            return None;
+        }
+        let handshake_len = read_u24_be(payload, 6)?;
+        if handshake_len < 38 || handshake_len.checked_add(4)? > record_len {
+            return None;
+        }
+        let handshake_end = 9_usize.checked_add(handshake_len)?;
+        if handshake_end > payload.len() {
+            return None;
+        }
+
+        let mut offset = 9_usize.checked_add(34)?;
+        let session_id_len = *payload.get(offset)? as usize;
+        offset = offset.checked_add(1)?.checked_add(session_id_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let cipher_suites_len = read_u16_be(payload, offset)? as usize;
+        if cipher_suites_len == 0 || !cipher_suites_len.is_multiple_of(2) {
+            return None;
+        }
+        offset = offset.checked_add(2)?.checked_add(cipher_suites_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let compression_methods_len = *payload.get(offset)? as usize;
+        if compression_methods_len == 0 {
+            return None;
+        }
+        offset = offset
+            .checked_add(1)?
+            .checked_add(compression_methods_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let extensions_len = read_u16_be(payload, offset)? as usize;
+        offset = offset.checked_add(2)?;
+        let extensions_end = offset.checked_add(extensions_len)?;
+        if extensions_end != handshake_end {
+            return None;
+        }
+
+        while offset.checked_add(4)? <= extensions_end {
+            let extension_type = read_u16_be(payload, offset)?;
+            let extension_len = read_u16_be(payload, offset + 2)? as usize;
+            offset = offset.checked_add(4)?;
+            let extension_end = offset.checked_add(extension_len)?;
+            if extension_end > extensions_end {
+                return None;
+            }
+            if extension_type == 0 {
+                return tls_sni_extension_application(payload.get(offset..extension_end)?);
+            }
+            offset = extension_end;
+        }
+        None
+    }
+
+    fn tls_sni_extension_application(extension: &[u8]) -> Option<AgentPacketFlowApplication> {
+        let server_name_list_len = read_u16_be(extension, 0)? as usize;
+        let server_name_list_end = 2_usize.checked_add(server_name_list_len)?;
+        if server_name_list_end > extension.len() {
+            return None;
+        }
+
+        let mut offset = 2_usize;
+        while offset < server_name_list_end {
+            let name_type = *extension.get(offset)?;
+            let name_len = read_u16_be(extension, offset + 1)? as usize;
+            let name_offset = offset.checked_add(3)?;
+            let name_end = name_offset.checked_add(name_len)?;
+            if name_end > server_name_list_end {
+                return None;
+            }
+            if name_type == 0 {
+                if let Some(application) =
+                    tls_sni_hostname_application(extension.get(name_offset..name_end)?)
+                {
+                    return Some(application);
+                }
+            }
+            offset = name_end;
+        }
+        None
+    }
+
+    fn tls_sni_hostname_application(hostname: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if !tls_sni_hostname_is_valid(hostname) {
+            return None;
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kubernetes")
+            || tls_sni_hostname_has_label_prefix(hostname, b"kube-apiserver")
+            || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
+        {
+            return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"etcd") {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"prometheus") {
+            return Some(AgentPacketFlowApplication::Prometheus);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"opentelemetry")
+            || tls_sni_hostname_has_label_prefix(hostname, b"otel")
+            || tls_sni_hostname_has_label_prefix(hostname, b"otlp")
+        {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
+            || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
+        {
+            return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        None
+    }
+
+    fn tls_sni_hostname_is_valid(hostname: &[u8]) -> bool {
+        if hostname.is_empty() || hostname.len() > 253 {
+            return false;
+        }
+        let mut previous_dot = true;
+        for byte in hostname {
+            match *byte {
+                b'.' => {
+                    if previous_dot {
+                        return false;
+                    }
+                    previous_dot = true;
+                }
+                byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') => {
+                    previous_dot = false;
+                }
+                _ => return false,
+            }
+        }
+        !previous_dot
+    }
+
+    fn tls_sni_hostname_has_label_prefix(hostname: &[u8], prefix: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        while offset < hostname.len() {
+            let relative_end = hostname[offset..]
+                .iter()
+                .position(|byte| *byte == b'.')
+                .unwrap_or(hostname.len() - offset);
+            let label_end = offset + relative_end;
+            let label = &hostname[offset..label_end];
+            if label.eq_ignore_ascii_case(prefix)
+                || (label.len() > prefix.len()
+                    && label
+                        .get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    && label.get(prefix.len()) == Some(&b'-'))
+            {
+                return true;
+            }
+            offset = label_end.saturating_add(1);
+        }
+        false
+    }
+
+    fn read_u16_be(payload: &[u8], offset: usize) -> Option<u16> {
+        let bytes = payload.get(offset..offset.checked_add(2)?)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u24_be(payload: &[u8], offset: usize) -> Option<usize> {
+        let bytes = payload.get(offset..offset.checked_add(3)?)?;
+        Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize)
     }
 
     fn quic_long_header_payload(payload: &[u8]) -> bool {
@@ -3147,6 +3333,46 @@ mod tests {
 
     #[test]
     fn packet_flow_observation_classifies_payload_prefix_application_protocol() {
+        fn tls_client_hello_with_sni(name: &str) -> Vec<u8> {
+            let mut server_name = Vec::new();
+            server_name.push(0);
+            server_name.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            server_name.extend_from_slice(name.as_bytes());
+
+            let mut sni = Vec::new();
+            sni.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+            sni.extend_from_slice(&server_name);
+
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&0_u16.to_be_bytes());
+            extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&sni);
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]);
+            body.extend_from_slice(&[0; 32]);
+            body.push(0);
+            body.extend_from_slice(&2_u16.to_be_bytes());
+            body.extend_from_slice(&[0x13, 0x01]);
+            body.push(1);
+            body.push(0);
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions);
+
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[0x16, 0x03, 0x03]);
+            payload.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+            payload.push(0x01);
+            let handshake_len = body.len() as u32;
+            payload.extend_from_slice(&[
+                ((handshake_len >> 16) & 0xff) as u8,
+                ((handshake_len >> 8) & 0xff) as u8,
+                (handshake_len & 0xff) as u8,
+            ]);
+            payload.extend_from_slice(&body);
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             payload_prefix: payload.to_vec(),
@@ -3238,6 +3464,46 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
                 .application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let kubernetes_sni = tls_client_hello_with_sni("kubernetes.default.svc.cluster.local");
+        assert!(kubernetes_sni.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
+        assert_eq!(
+            observation_for_payload(&kubernetes_sni).application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("etcd-0.kube-system.svc"))
+                .application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni(
+                "prometheus-server.monitoring.svc"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+        let otel_sni = tls_client_hello_with_sni("otel-collector.observability.svc");
+        let otel_on_https_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            payload_prefix: otel_sni,
+            ..Default::default()
+        };
+        assert_eq!(
+            otel_on_https_port.application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni(
+                "elasticsearch-master.logging.svc"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("api.example.com")).application(),
             api::AgentPacketFlowApplication::Https
         );
         let quic = api::AgentPacketFlowObservation {
