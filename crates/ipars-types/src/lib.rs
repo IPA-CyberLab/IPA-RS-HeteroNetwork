@@ -4942,10 +4942,21 @@ pub mod api {
     }
 
     fn elasticsearch_transport_payload(payload: &[u8]) -> bool {
-        if payload.len() < 23 || payload.get(..2) != Some(b"ES") {
+        const FRAME_PREFIX_LEN: usize = 6;
+        const HEADER_LEN: usize = 17;
+        const HEADER_END: usize = FRAME_PREFIX_LEN + HEADER_LEN;
+        const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+
+        if payload.len() < HEADER_END || payload.get(..2) != Some(b"ES") {
             return false;
         }
         let Some(message_len) = read_u32_be(payload, 2).map(|len| len as usize) else {
+            return false;
+        };
+        if !(HEADER_LEN..=MAX_MESSAGE_LEN).contains(&message_len) {
+            return false;
+        }
+        let Some(frame_end) = FRAME_PREFIX_LEN.checked_add(message_len) else {
             return false;
         };
         let Some(&status) = payload.get(14) else {
@@ -4957,17 +4968,27 @@ pub mod api {
         let Some(variable_header_size) = read_u32_be(payload, 19).map(|len| len as usize) else {
             return false;
         };
+        let Some(variable_header_end) = HEADER_END.checked_add(variable_header_size) else {
+            return false;
+        };
 
-        (17..=128 * 1024 * 1024).contains(&message_len)
-            && elasticsearch_transport_status(status)
-            && version_id != 0
-            && variable_header_size <= message_len - 17
+        elasticsearch_transport_status(status)
+            && elasticsearch_transport_version_id(version_id)
+            && variable_header_size <= message_len - HEADER_LEN
+            && variable_header_end <= frame_end
     }
 
     fn elasticsearch_transport_status(status: u8) -> bool {
         let response = status & 0x01 != 0;
         let error = status & 0x02 != 0;
         status & !0x0f == 0 && (response || !error)
+    }
+
+    fn elasticsearch_transport_version_id(version_id: u32) -> bool {
+        const MIN_VERSION_WITH_VARIABLE_HEADER_SIZE: u32 = 7_06_00_00;
+        const MAX_PLAUSIBLE_VERSION: u32 = 99_99_99_99;
+
+        (MIN_VERSION_WITH_VARIABLE_HEADER_SIZE..=MAX_PLAUSIBLE_VERSION).contains(&version_id)
     }
 
     fn starts_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
@@ -6003,13 +6024,22 @@ mod tests {
             variable_header: &[u8],
             body: &[u8],
         ) -> Vec<u8> {
+            elasticsearch_transport_frame_with_version(status, 8_00_00_99, variable_header, body)
+        }
+
+        fn elasticsearch_transport_frame_with_version(
+            status: u8,
+            version_id: u32,
+            variable_header: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
             let message_len = 17 + variable_header.len() + body.len();
             let mut payload = Vec::with_capacity(6 + message_len);
             payload.extend_from_slice(b"ES");
             payload.extend_from_slice(&(message_len as u32).to_be_bytes());
             payload.extend_from_slice(&1_u64.to_be_bytes());
             payload.push(status);
-            payload.extend_from_slice(&8_00_00_99_u32.to_be_bytes());
+            payload.extend_from_slice(&version_id.to_be_bytes());
             payload.extend_from_slice(&(variable_header.len() as u32).to_be_bytes());
             payload.extend_from_slice(variable_header);
             payload.extend_from_slice(body);
@@ -7184,6 +7214,14 @@ mod tests {
                 .application(),
             api::AgentPacketFlowApplication::Elasticsearch
         );
+        let mut elasticsearch_with_trailing_frame =
+            elasticsearch_transport_frame(0x08, b"", b"body");
+        elasticsearch_with_trailing_frame
+            .extend_from_slice(&elasticsearch_transport_frame(0x09, b"vh", b"body"));
+        assert_eq!(
+            observation_for_payload(&elasticsearch_with_trailing_frame).application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
         assert_eq!(
             observation_for_payload(&[
                 b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x40, 0, 0, 0, 1, 0, 0, 0, 0,
@@ -7199,6 +7237,13 @@ mod tests {
             observation_for_payload(&[
                 b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 8, 0, 0, 99, 0, 0, 0, 1,
             ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame_with_version(
+                0x08, 1, b"", b""
+            ))
             .application(),
             api::AgentPacketFlowApplication::Unknown
         );

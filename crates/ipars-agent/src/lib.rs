@@ -5389,8 +5389,8 @@ mod tests {
                 AgentPacketFlowObservation {
                     protocol: Some(TransportProtocol::Tcp),
                     payload_prefix: vec![
-                        b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 0, 0, 1, 0, 0, 0,
-                        0,
+                        b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 122, 18, 99, 0,
+                        0, 0, 0,
                     ],
                     ..Default::default()
                 },
