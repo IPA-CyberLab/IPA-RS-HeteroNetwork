@@ -314,6 +314,8 @@ struct DockerInstallArgs {
     disable_docker_expose_host_routes: bool,
     #[arg(long = "docker-route-interval-seconds", default_value_t = 60)]
     docker_route_interval_seconds: u64,
+    #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
+    route_backend: String,
     #[arg(long)]
     userspace_wireguard_command: Option<String>,
     #[arg(long = "userspace-wireguard-arg")]
@@ -1541,6 +1543,15 @@ fn parse_bootstrap_scheme(value: &str) -> Result<String, String> {
         "http" | "https" => Ok(value.to_string()),
         _ => Err(format!(
             "bootstrap scheme must be http or https; got {value}"
+        )),
+    }
+}
+
+fn parse_route_backend(value: &str) -> Result<String, String> {
+    match value {
+        "command" | "kernel-netlink" => Ok(value.to_string()),
+        _ => Err(format!(
+            "route backend must be command or kernel-netlink; got {value}"
         )),
     }
 }
@@ -2988,6 +2999,10 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
             value: args.docker_route_interval_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
+            value: args.route_backend.clone(),
         },
     ];
     if args.docker_discover_networks {
@@ -6253,6 +6268,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6274,6 +6290,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6307,6 +6324,10 @@ mod tests {
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
             Some("60")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            Some("command")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
@@ -6355,6 +6376,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6399,6 +6421,24 @@ mod tests {
     }
 
     #[test]
+    fn docker_install_plan_wires_route_backend_selection() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            route_backend: "kernel-netlink".to_string(),
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            Some("kernel-netlink")
+        );
+        assert!(
+            Cli::try_parse_from(["ipars", "docker", "install", "--route-backend", "invalid"])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn docker_install_plan_exports_rootless_multi_network_settings() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
@@ -6412,6 +6452,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: vec!["ipars0".to_string()],
             userspace_wireguard_ready_timeout_seconds: 30,
@@ -6510,6 +6551,7 @@ mod tests {
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
         assert!(compose
             .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
+        assert!(compose.contains("IPARS_AGENT_ROUTE_BACKEND=${IPARS_AGENT_ROUTE_BACKEND:-command}"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
@@ -6551,6 +6593,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6582,6 +6625,7 @@ mod tests {
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6606,6 +6650,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6630,6 +6675,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6654,6 +6700,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6678,6 +6725,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6714,6 +6762,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 0,
@@ -6738,6 +6787,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6762,6 +6812,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 3601,
@@ -6788,6 +6839,7 @@ mod tests {
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -8167,6 +8219,8 @@ mod tests {
             "--disable-docker-expose-host-routes",
             "--docker-route-interval-seconds",
             "15",
+            "--route-backend",
+            "kernel-netlink",
             "--userspace-wireguard-command",
             "wireguard-go",
             "--userspace-wireguard-arg",
@@ -8197,6 +8251,7 @@ mod tests {
             assert!(args.docker_container_cidrs.is_empty());
             assert!(args.disable_docker_expose_host_routes);
             assert_eq!(args.docker_route_interval_seconds, 15);
+            assert_eq!(args.route_backend, "kernel-netlink");
             assert_eq!(
                 args.userspace_wireguard_command.as_deref(),
                 Some("wireguard-go")
