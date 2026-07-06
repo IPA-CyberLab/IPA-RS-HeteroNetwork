@@ -1800,6 +1800,12 @@ pub mod api {
 
     impl AgentPacketFlowObservation {
         pub fn validate_transport_metadata(&self) -> Result<(), String> {
+            if self.protocol == Some(TransportProtocol::Any) {
+                return Err(
+                    "packet-flow protocol must be a concrete transport protocol, not any"
+                        .to_string(),
+                );
+            }
             if self.protocol != Some(TransportProtocol::Tcp) && self.tcp_state.is_some() {
                 return Err("packet-flow TCP state requires TCP protocol".to_string());
             }
@@ -8423,6 +8429,16 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("port metadata requires TCP or UDP protocol"));
+
+        let any_protocol: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"any"}"#)?;
+        let error = match any_protocol.validate_transport_metadata() {
+            Ok(()) => {
+                return Err("packet-flow observation with protocol any should be rejected".into())
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("concrete transport protocol"));
         Ok(())
     }
 

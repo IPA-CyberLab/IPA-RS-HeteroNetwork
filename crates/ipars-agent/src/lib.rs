@@ -5971,6 +5971,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_flow_observation_rejects_any_protocol() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                peer.vpn_ip.0,
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Any),
+                    ..Default::default()
+                },
+                Utc::now(),
+                true,
+            )
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                })
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn peer_map_sync_fetches_and_applies_once() -> Result<(), AgentError> {
         let node_id = NodeId::from_string("local");
         let peer_map = PeerMap {
