@@ -3823,7 +3823,7 @@ pub mod api {
         }
         if command.eq_ignore_ascii_case(b"SUB") {
             return (fields.len() == 3 || fields.len() == 4)
-                && nats_subject(fields[1])
+                && nats_subscription_subject(fields[1])
                 && fields
                     .get(fields.len().saturating_sub(2))
                     .is_some_and(|field| fields.len() == 3 || nats_queue_group(field))
@@ -3876,7 +3876,30 @@ pub mod api {
     }
 
     fn nats_subject(field: &[u8]) -> bool {
-        nats_token(field) && !field.starts_with(b".") && !field.ends_with(b".")
+        nats_subject_tokens(field, false)
+    }
+
+    fn nats_subscription_subject(field: &[u8]) -> bool {
+        nats_subject_tokens(field, true)
+    }
+
+    fn nats_subject_tokens(field: &[u8], allow_wildcards: bool) -> bool {
+        if !nats_token(field) || field.starts_with(b".") || field.ends_with(b".") {
+            return false;
+        }
+        let mut tokens = field.split(|byte| *byte == b'.').peekable();
+        while let Some(token) = tokens.next() {
+            if token.is_empty() {
+                return false;
+            }
+            if token.contains(&b'*') || token.contains(&b'>') {
+                let valid_wildcard = token == b"*" || (token == b">" && tokens.peek().is_none());
+                if !allow_wildcards || !valid_wildcard {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn nats_reply_subject(field: &[u8]) -> bool {
@@ -6329,11 +6352,39 @@ mod tests {
             api::AgentPacketFlowApplication::Nats
         );
         assert_eq!(
+            observation_for_payload(b"SUB events.> workers sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
             observation_for_payload(b"CONNECT not-json\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"PUB events.created nope\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.* 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created reply.* 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events..created 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events.>.tail sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events* sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"MSG events.* 1 0\r\n\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
