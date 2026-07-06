@@ -120,6 +120,7 @@ const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
+const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -1703,6 +1704,22 @@ fn validate_relay_admission_bearer_token(value: &str, name: &str) -> anyhow::Res
     Ok(())
 }
 
+fn validate_daemon_identifier(value: &str, name: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{name} cannot be empty");
+    }
+    if value.len() > MAX_DAEMON_IDENTIFIER_BYTES {
+        anyhow::bail!("{name} exceeds {MAX_DAEMON_IDENTIFIER_BYTES} bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("{name} must contain only ASCII letters, digits, '_', '.' or '-'");
+    }
+    Ok(())
+}
+
 fn validate_ebpf_identifier(value: &str, name: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{name} cannot be empty");
@@ -2801,6 +2818,16 @@ where
 }
 
 fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Result<()> {
+    validate_daemon_identifier(&args.cluster_id, "--cluster-id")?;
+    validate_daemon_identifier(&args.issuer_node_id, "--issuer-node-id")?;
+    validate_daemon_identifier(&args.issuer_key_id, "--issuer-key-id")?;
+    for trusted in &args.trusted_issuer_keys {
+        validate_daemon_identifier(
+            &trusted.issuer_node_id,
+            "--trusted-issuer-key issuer_node_id",
+        )?;
+        validate_daemon_identifier(&trusted.key_id, "--trusted-issuer-key key_id")?;
+    }
     validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
     validate_positive_seconds(
         args.endpoint_candidate_ttl_seconds,
@@ -4882,6 +4909,7 @@ async fn run_relay(
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
+    validate_daemon_identifier(&args.relay_node_id, "--relay-node-id")?;
     let public_endpoint = args
         .public_endpoint
         .context("--public-endpoint is required for relay advertisement")?;
@@ -11165,6 +11193,92 @@ mod tests {
         assert!(parse_trusted_issuer_key("issuer,,pub").is_err());
         assert!(parse_trusted_issuer_key(",key,pub").is_err());
         assert!(parse_trusted_issuer_key("issuer,key,").is_err());
+    }
+
+    #[test]
+    fn control_plane_runtime_identifiers_must_be_path_safe() -> anyhow::Result<()> {
+        let oversized_key_id = "x".repeat(MAX_DAEMON_IDENTIFIER_BYTES + 1);
+        let cases = vec![
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "bad/cluster".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                "--cluster-id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                "--issuer-node-id must contain only ASCII letters, digits, '_', '.' or '-'"
+                    .to_string(),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    oversized_key_id,
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                format!("--issuer-key-id exceeds {MAX_DAEMON_IDENTIFIER_BYTES} bytes"),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                    "--trusted-issuer-key".to_string(),
+                    "issuer/b,root-next,pub-b".to_string(),
+                ],
+                "--trusted-issuer-key issuer_node_id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv)?;
+            let Command::ControlPlane(args) = cli.command else {
+                anyhow::bail!("expected control-plane command");
+            };
+            let error = match validate_control_plane_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid control-plane runtime config"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(&expected),
+                "expected {expected}, got {error}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -17747,6 +17861,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 Err(error) => error,
             };
             assert!(error.to_string().contains("--admission-url is required"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let invalid_relay_node_id = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay/a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = invalid_relay_node_id.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--relay-node-id must contain only ASCII letters, digits, '_', '.' or '-'"
+            ));
         } else {
             anyhow::bail!("expected relay command");
         }
