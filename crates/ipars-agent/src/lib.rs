@@ -3402,6 +3402,77 @@ mod tests {
     }
 
     #[test]
+    fn lazy_manager_pins_default_important_peer_classes() {
+        let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let mut control_plane = peer_record(
+            NodeId::from_string("control-plane-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
+            "wg-control-plane",
+            Vec::new(),
+            Vec::new(),
+        );
+        control_plane.role = Role::control_plane();
+        let mut route_provider = peer_record(
+            NodeId::from_string("route-provider-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 21)),
+            "wg-route-provider",
+            Vec::new(),
+            Vec::new(),
+        );
+        route_provider.tags.insert(Tag::route_provider());
+        let mut kubernetes_control_plane = peer_record(
+            NodeId::from_string("kubernetes-control-plane-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 22)),
+            "wg-kubernetes-control-plane",
+            Vec::new(),
+            Vec::new(),
+        );
+        kubernetes_control_plane
+            .tags
+            .insert(Tag::kubernetes_control_plane());
+        let mut relay = peer_record(
+            NodeId::from_string("relay-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 23)),
+            "wg-relay",
+            Vec::new(),
+            Vec::new(),
+        );
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 3478))),
+            admission_url: Some("https://relay-a.example.test/v1/sessions".to_string()),
+            max_sessions: 100,
+            active_sessions: 10,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let ordinary = peer_record(
+            NodeId::from_string("ordinary-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 24)),
+            "wg-ordinary",
+            Vec::new(),
+            Vec::new(),
+        );
+
+        for peer in [
+            &control_plane,
+            &route_provider,
+            &kubernetes_control_plane,
+            &relay,
+            &ordinary,
+        ] {
+            manager.observe_peer(peer);
+        }
+
+        assert!(manager.should_connect_peer(&control_plane));
+        assert!(manager.should_connect_peer(&route_provider));
+        assert!(manager.should_connect_peer(&kubernetes_control_plane));
+        assert!(manager.should_connect_peer(&relay));
+        assert!(!manager.should_connect_peer(&ordinary));
+        assert_eq!(manager.metrics().pinned_peer_count, 4);
+    }
+
+    #[test]
     fn selector_promotes_direct_path_over_relay_when_score_improves() {
         let relay = path("peer-a", PathState::Relay, 70.0);
         let direct = path("peer-a", PathState::DirectNatTraversal, 90.0);

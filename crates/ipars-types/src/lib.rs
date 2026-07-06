@@ -121,6 +121,14 @@ impl Tag {
         Self(value.into())
     }
 
+    pub fn route_provider() -> Self {
+        Self::from_string("route-provider")
+    }
+
+    pub fn kubernetes_control_plane() -> Self {
+        Self::from_string("kubernetes-control-plane")
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -749,6 +757,9 @@ impl Default for ClusterPolicy {
     fn default() -> Self {
         let mut pinned_roles = BTreeSet::new();
         pinned_roles.insert(Role::control_plane());
+        let mut pinned_tags = BTreeSet::new();
+        pinned_tags.insert(Tag::route_provider());
+        pinned_tags.insert(Tag::kubernetes_control_plane());
         Self {
             allow_ipv6_direct: true,
             allow_nat_traversal: true,
@@ -761,7 +772,7 @@ impl Default for ClusterPolicy {
             nat_classification_min_confidence_percent:
                 default_nat_classification_min_confidence_percent(),
             pinned_roles,
-            pinned_tags: BTreeSet::new(),
+            pinned_tags,
             acl_rules: Vec::new(),
         }
     }
