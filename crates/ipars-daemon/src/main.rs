@@ -5105,7 +5105,7 @@ async fn run_agent(
     match args.packet_flow_detector {
         PacketFlowDetector::Disabled => {}
         PacketFlowDetector::ProcNetConntrack => {
-            let limits = ProcNetConntrackReadLimits::from_args(&args);
+            let limits = ProcNetConntrackReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
@@ -5127,7 +5127,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::ConntrackNetlink => {
-            let limits = ConntrackNetlinkReadLimits::from_args(&args);
+            let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 interval_seconds = args.packet_flow_poll_interval_seconds,
@@ -5145,7 +5145,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::ConntrackNetlinkEvents => {
-            let limits = ConntrackNetlinkReadLimits::from_args(&args);
+            let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds,
@@ -5163,7 +5163,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::EbpfJsonl => {
-            let limits = EbpfJsonlReadLimits::from_args(&args);
+            let limits = EbpfJsonlReadLimits::from_args(&args)?;
             let event_path = args
                 .packet_flow_ebpf_event_path
                 .clone()
@@ -5190,7 +5190,7 @@ async fn run_agent(
         }
         PacketFlowDetector::EbpfRingbuf => {
             let config = EbpfRingbufConfig::from_args(&args)?;
-            let limits = EbpfRingbufReadLimits::from_args(&args);
+            let limits = EbpfRingbufReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 object_path = %config.object_path.display(),
@@ -9565,12 +9565,27 @@ struct ProcNetConntrackReadLimits {
 }
 
 impl ProcNetConntrackReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_u64(
+            args.packet_flow_procfs_max_bytes,
+            "--packet-flow-procfs-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_line_bytes,
+            "--packet-flow-procfs-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_flows,
+            "--packet-flow-procfs-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_bytes: args.packet_flow_procfs_max_bytes,
             max_line_bytes: args.packet_flow_procfs_max_line_bytes,
             max_flows: args.packet_flow_procfs_max_flows,
-        }
+        })
     }
 }
 
@@ -9590,10 +9605,15 @@ struct ConntrackNetlinkReadLimits {
 }
 
 impl ConntrackNetlinkReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_usize(
+            args.packet_flow_netlink_max_flows,
+            "--packet-flow-netlink-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_flows: args.packet_flow_netlink_max_flows,
-        }
+        })
     }
 }
 
@@ -9613,12 +9633,27 @@ struct EbpfJsonlReadLimits {
 }
 
 impl EbpfJsonlReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_u64(
+            args.packet_flow_ebpf_event_max_bytes,
+            "--packet-flow-ebpf-event-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_line_bytes,
+            "--packet-flow-ebpf-event-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_flows,
+            "--packet-flow-ebpf-event-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_bytes: args.packet_flow_ebpf_event_max_bytes,
             max_line_bytes: args.packet_flow_ebpf_event_max_line_bytes,
             max_flows: args.packet_flow_ebpf_event_max_flows,
-        }
+        })
     }
 }
 
@@ -9697,10 +9732,15 @@ struct EbpfRingbufReadLimits {
 }
 
 impl EbpfRingbufReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_usize(
+            args.packet_flow_ebpf_ringbuf_max_events,
+            "--packet-flow-ebpf-ringbuf-max-events",
+            MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE,
+        )?;
+        Ok(Self {
             max_events_per_wake: args.packet_flow_ebpf_ringbuf_max_events,
-        }
+        })
     }
 }
 
@@ -13136,7 +13176,7 @@ mod tests {
             assert_eq!(args.packet_flow_procfs_max_line_bytes, 2048);
             assert_eq!(args.packet_flow_procfs_max_flows, 4096);
             assert_eq!(
-                ProcNetConntrackReadLimits::from_args(&args),
+                ProcNetConntrackReadLimits::from_args(&args)?,
                 ProcNetConntrackReadLimits {
                     max_bytes: 1_048_576,
                     max_line_bytes: 2048,
@@ -13377,7 +13417,7 @@ mod tests {
             assert_eq!(args.packet_flow_poll_interval_seconds, 3);
             assert_eq!(args.packet_flow_netlink_max_flows, 8192);
             assert_eq!(
-                ConntrackNetlinkReadLimits::from_args(&args),
+                ConntrackNetlinkReadLimits::from_args(&args)?,
                 ConntrackNetlinkReadLimits { max_flows: 8192 }
             );
             return Ok(());
@@ -13444,7 +13484,7 @@ mod tests {
             assert_eq!(args.packet_flow_ebpf_event_max_line_bytes, 1024);
             assert_eq!(args.packet_flow_ebpf_event_max_flows, 2048);
             assert_eq!(
-                EbpfJsonlReadLimits::from_args(&args),
+                EbpfJsonlReadLimits::from_args(&args)?,
                 EbpfJsonlReadLimits {
                     max_bytes: 1_048_576,
                     max_line_bytes: 1024,
@@ -13563,6 +13603,99 @@ mod tests {
                 anyhow::bail!("expected agent command");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_read_limit_configs_revalidate_runtime_boundaries() -> anyhow::Result<()> {
+        let procfs_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-procfs-max-bytes",
+            "0",
+        ])?;
+        if let Command::Agent(args) = procfs_cli.command {
+            let error = match ProcNetConntrackReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected procfs read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-procfs-max-bytes must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let netlink_limit = (MAX_PACKET_FLOW_RECORDS + 1).to_string();
+        let netlink_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "conntrack-netlink",
+            "--packet-flow-netlink-max-flows",
+            netlink_limit.as_str(),
+        ])?;
+        if let Command::Agent(args) = netlink_cli.command {
+            let error = match ConntrackNetlinkReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected netlink read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-netlink-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let jsonl_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-jsonl",
+            "--packet-flow-ebpf-event-path",
+            "/run/ipars/ebpf-flows.jsonl",
+            "--packet-flow-ebpf-event-max-line-bytes",
+            "0",
+        ])?;
+        if let Command::Agent(args) = jsonl_cli.command {
+            let error = match EbpfJsonlReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected eBPF JSONL read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-event-max-line-bytes must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let ringbuf_limit = (MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE + 1).to_string();
+        let ringbuf_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+            "--packet-flow-ebpf-ringbuf-max-events",
+            ringbuf_limit.as_str(),
+        ])?;
+        if let Command::Agent(args) = ringbuf_cli.command {
+            let error = match EbpfRingbufReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected eBPF ringbuf read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-ebpf-ringbuf-max-events must not exceed {MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         Ok(())
     }
 
@@ -13732,7 +13865,7 @@ mod tests {
             assert_eq!(args.packet_flow_ebpf_attach.len(), 2);
             assert_eq!(args.packet_flow_ebpf_ringbuf_max_events, 128);
             assert_eq!(
-                EbpfRingbufReadLimits::from_args(&args),
+                EbpfRingbufReadLimits::from_args(&args)?,
                 EbpfRingbufReadLimits {
                     max_events_per_wake: 128,
                 }
