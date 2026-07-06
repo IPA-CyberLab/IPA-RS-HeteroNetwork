@@ -1290,6 +1290,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--packet-flow-poll-interval-seconds",
         )?;
     }
+    validate_packet_flow_detector_specific_args(args)?;
     if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
         anyhow::ensure!(
             args.packet_flow_procfs_max_bytes > 0,
@@ -1393,6 +1394,38 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_relay_forwarder_config(args)?;
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.packet_flow_detector != PacketFlowDetector::ProcNetConntrack {
+        anyhow::ensure!(
+            args.packet_flow_conntrack_path.is_none(),
+            "--packet-flow-conntrack-path requires --packet-flow-detector proc-net-conntrack"
+        );
+    }
+    if args.packet_flow_detector != PacketFlowDetector::EbpfJsonl {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_path.is_none(),
+            "--packet-flow-ebpf-event-path requires --packet-flow-detector ebpf-jsonl"
+        );
+    }
+    if args.packet_flow_detector != PacketFlowDetector::EbpfRingbuf {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_object_path.is_none(),
+            "--packet-flow-ebpf-object-path requires --packet-flow-detector ebpf-ringbuf"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_attach.is_empty(),
+            "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf"
+        );
+    }
+    if args.packet_flow_detector == PacketFlowDetector::Disabled {
+        anyhow::ensure!(
+            !args.packet_flow_pin,
+            "--packet-flow-pin requires --packet-flow-detector to be enabled"
+        );
     }
     Ok(())
 }
@@ -12470,6 +12503,79 @@ mod tests {
                 assert!(
                     error.to_string().contains(expected),
                     "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_detector_specific_options_require_matching_detector() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "conntrack-netlink",
+                    "--packet-flow-conntrack-path",
+                    "/tmp/nf_conntrack",
+                ],
+                "--packet-flow-conntrack-path requires --packet-flow-detector proc-net-conntrack",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "proc-net-conntrack",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                ],
+                "--packet-flow-ebpf-event-path requires --packet-flow-detector ebpf-jsonl",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                ],
+                "--packet-flow-ebpf-object-path requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_sys_enter_connect:syscalls:sys_enter_connect",
+                ],
+                "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
+                vec!["iparsd", "agent", "--packet-flow-pin"],
+                "--packet-flow-pin requires --packet-flow-detector to be enabled",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid packet-flow detector config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
                 );
             } else {
                 anyhow::bail!("expected agent command");
