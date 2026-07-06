@@ -9,7 +9,6 @@ cluster:
   controlPlaneUrl: "http://ipars-control-plane:8443"
   signalUrl: "http://ipars-signal:9443"
   stunEndpoint: ""
-  relayEndpoint: "ipars-relay:51820"
   relayAdmissionUrl: "http://ipars-relay:9580"
 
 rbac:

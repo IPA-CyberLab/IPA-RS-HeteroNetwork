@@ -19,7 +19,6 @@
 {{- fail "agent.relayAdmissionBearerTokenSecret.key must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
 {{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
-{{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
 {{- $imageRepository := printf "%v" .Values.image.repository -}}
 {{- $imageTag := printf "%v" .Values.image.tag -}}
 {{- $imagePullPolicy := printf "%v" .Values.image.pullPolicy -}}
@@ -280,12 +279,6 @@
 {{- end -}}
 {{- if .Values.cluster.stunEndpoint -}}
 {{- include "ipars.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
-{{- end -}}
-{{- if and .Values.cluster.relayEndpoint (not (regexMatch $hostPortPattern .Values.cluster.relayEndpoint)) -}}
-{{- fail "cluster.relayEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if and .Values.cluster.relayEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 65535)) -}}
-{{- fail "cluster.relayEndpoint port must be between 1 and 65535" -}}
 {{- end -}}
 {{- if .Values.agent.relayAdvertisement.enabled -}}
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
@@ -554,8 +547,6 @@ spec:
               value: {{ .Values.cluster.signalUrl | quote }}
             - name: IPARS_STUN_ENDPOINT
               value: {{ .Values.cluster.stunEndpoint | quote }}
-            - name: IPARS_RELAY_ENDPOINT
-              value: {{ .Values.cluster.relayEndpoint | quote }}
             {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
             - name: IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN
               valueFrom:

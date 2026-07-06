@@ -7458,6 +7458,33 @@ mod tests {
         assert!(daemonset.contains(
             "ipars.validateSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
         ));
+        assert!(!daemonset.contains("cluster.relayEndpoint"));
+        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_uses_relay_advertisement_instead_of_static_relay_endpoint(
+    ) -> anyhow::Result<()> {
+        let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/values.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let values = std::fs::read_to_string(values_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(!values.contains("relayEndpoint:"));
+        assert!(!values.contains("IPARS_RELAY_ENDPOINT"));
+        assert!(values.contains("relayAdvertisement:"));
+        assert!(values.contains("publicEndpoint: \"\""));
+        assert!(daemonset.contains("- --relay-public-endpoint"));
+        assert!(
+            daemonset.contains("- {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}")
+        );
+        assert!(!daemonset.contains("cluster.relayEndpoint"));
+        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
         Ok(())
     }
 
