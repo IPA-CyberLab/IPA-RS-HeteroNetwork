@@ -419,6 +419,7 @@ impl LoadReport {
                         self.node_count
                     );
                 }
+                self.validate_daemon_retained_manifest()?;
             }
         }
         Ok(())
@@ -568,6 +569,165 @@ impl LoadReport {
                 self.relay_admission_failures_by_reason_reported
             );
         }
+        Ok(())
+    }
+
+    fn validate_daemon_retained_manifest(&self) -> anyhow::Result<()> {
+        let (runtime_dir, manifest_path) = match (
+            &self.daemon_runtime_dir,
+            &self.daemon_runtime_manifest,
+        ) {
+            (None, None) => return Ok(()),
+            (Some(runtime_dir), Some(manifest_path)) => (runtime_dir, manifest_path),
+            _ => bail!(
+                "daemon load scenario retained runtime directory and manifest path must be set together"
+            ),
+        };
+
+        let expected_manifest_path = daemon_runtime_manifest_path(runtime_dir);
+        if manifest_path != &expected_manifest_path {
+            bail!(
+                "daemon load scenario retained manifest path {} does not match expected {}",
+                manifest_path.display(),
+                expected_manifest_path.display()
+            );
+        }
+        let runtime_metadata = std::fs::metadata(runtime_dir).with_context(|| {
+            format!(
+                "daemon load scenario retained runtime directory {} is not accessible",
+                runtime_dir.display()
+            )
+        })?;
+        if !runtime_metadata.is_dir() {
+            bail!(
+                "daemon load scenario retained runtime path {} is not a directory",
+                runtime_dir.display()
+            );
+        }
+        let manifest_bytes = std::fs::read(manifest_path).with_context(|| {
+            format!(
+                "daemon load scenario retained manifest {} is not readable",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: DaemonRuntimeManifest = serde_json::from_slice(&manifest_bytes)
+            .context("failed to parse daemon load scenario retained runtime manifest")?;
+
+        if manifest.phase != DaemonRuntimePhase::Completed {
+            bail!(
+                "daemon load scenario retained manifest ended in {:?}, expected {:?}",
+                manifest.phase,
+                DaemonRuntimePhase::Completed
+            );
+        }
+        if manifest.scenario != self.scenario {
+            bail!(
+                "daemon load scenario retained manifest scenario {:?} does not match report {:?}",
+                manifest.scenario,
+                self.scenario
+            );
+        }
+        if manifest.runtime_dir != *runtime_dir {
+            bail!(
+                "daemon load scenario retained manifest runtime_dir {} does not match report {}",
+                manifest.runtime_dir.display(),
+                runtime_dir.display()
+            );
+        }
+        if !manifest.keep_runtime_dir {
+            bail!("daemon load scenario retained manifest did not record keep_runtime_dir=true");
+        }
+
+        let workload = manifest.workload;
+        if workload.daemon_agent_processes != self.daemon_agent_processes
+            || workload.daemon_control_plane_processes != self.daemon_control_plane_processes
+            || workload.scenario_active_pair_count != self.active_pair_count
+            || workload.relay_packets_per_session != self.relay_packets_per_session
+            || workload.relay_payload_bytes != self.relay_payload_bytes_per_packet
+        {
+            bail!(
+                "daemon load scenario retained manifest workload does not match report: agents={}/{}, control_planes={}/{}, active_pairs={}/{}, relay_packets={}/{}, relay_payload={}/{}",
+                workload.daemon_agent_processes,
+                self.daemon_agent_processes,
+                workload.daemon_control_plane_processes,
+                self.daemon_control_plane_processes,
+                workload.scenario_active_pair_count,
+                self.active_pair_count,
+                workload.relay_packets_per_session,
+                self.relay_packets_per_session,
+                workload.relay_payload_bytes,
+                self.relay_payload_bytes_per_packet
+            );
+        }
+        if manifest.control_plane_urls.len() != self.daemon_control_plane_processes {
+            bail!(
+                "daemon load scenario retained manifest recorded {} control-plane URLs, expected {}",
+                manifest.control_plane_urls.len(),
+                self.daemon_control_plane_processes
+            );
+        }
+        if manifest.agent_urls.len() != self.daemon_agent_processes {
+            bail!(
+                "daemon load scenario retained manifest recorded {} agent URLs, expected {}",
+                manifest.agent_urls.len(),
+                self.daemon_agent_processes
+            );
+        }
+        if manifest.children.len() != self.daemon_processes {
+            bail!(
+                "daemon load scenario retained manifest recorded {} child processes, expected {}",
+                manifest.children.len(),
+                self.daemon_processes
+            );
+        }
+
+        let mut exited_roles = Vec::new();
+        for child in &manifest.children {
+            if child.log_path.is_none()
+                || child.log_bytes.is_none()
+                || child.log_tail_sha256.as_deref().is_none_or(str::is_empty)
+            {
+                bail!(
+                    "daemon load scenario retained manifest child {} is missing log diagnostics",
+                    child.role
+                );
+            }
+            match child.state {
+                DaemonRuntimeManifestChildState::Running => {
+                    if child.pid.is_none() {
+                        bail!(
+                            "daemon load scenario retained manifest running child {} is missing a PID",
+                            child.role
+                        );
+                    }
+                }
+                DaemonRuntimeManifestChildState::Exited => {
+                    if child.exit_status.is_none() {
+                        bail!(
+                            "daemon load scenario retained manifest exited child {} is missing exit status",
+                            child.role
+                        );
+                    }
+                    exited_roles.push(child.role.clone());
+                }
+            }
+        }
+        exited_roles.sort();
+        let expected_exited_roles = if self.daemon_control_plane_processes > 1
+            && self.daemon_control_plane_failover_checked
+        {
+            vec!["control-plane-0".to_string()]
+        } else {
+            Vec::new()
+        };
+        if exited_roles != expected_exited_roles {
+            bail!(
+                "daemon load scenario retained manifest exited roles {:?}, expected {:?}",
+                exited_roles,
+                expected_exited_roles
+            );
+        }
+
         Ok(())
     }
 }
@@ -3460,6 +3620,41 @@ mod tests {
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
 
+        let mut retained_manifest = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &retained_manifest,
+            DaemonRuntimePhase::Completed,
+            &["control-plane-0"],
+        )?;
+        retained_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
+        retained_manifest.daemon_runtime_manifest = Some(manifest_path);
+        retained_manifest.validate_success()?;
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut incomplete_retained_manifest_fields = daemon_report.clone();
+        incomplete_retained_manifest_fields.daemon_runtime_dir =
+            Some(synthetic_runtime_dir("manifest-missing-path"));
+        let error = match incomplete_retained_manifest_fields.validate_success() {
+            Ok(_) => bail!("partial retained manifest fields should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("must be set together"));
+
+        let mut incomplete_manifest = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &incomplete_manifest,
+            DaemonRuntimePhase::StartupReady,
+            &[],
+        )?;
+        incomplete_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
+        incomplete_manifest.daemon_runtime_manifest = Some(manifest_path);
+        let error = match incomplete_manifest.validate_success() {
+            Ok(_) => bail!("incomplete retained manifest should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retained manifest ended"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut missing_failover = daemon_report.clone();
         missing_failover.daemon_control_plane_failover_checked = false;
         let error = match missing_failover.validate_success() {
@@ -4566,5 +4761,103 @@ mod tests {
             relay_packets_per_session: 1,
             relay_payload_bytes: 64,
         }
+    }
+
+    fn write_synthetic_retained_daemon_manifest(
+        report: &LoadReport,
+        phase: DaemonRuntimePhase,
+        exited_roles: &[&str],
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let runtime_dir = synthetic_runtime_dir("retained-manifest");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let exited_roles = exited_roles.iter().copied().collect::<BTreeSet<_>>();
+        let mut children = Vec::with_capacity(report.daemon_processes);
+        for index in 0..report.daemon_control_plane_processes {
+            let role = format!("control-plane-{index}");
+            children.push(synthetic_manifest_child(
+                &runtime_dir,
+                children.len(),
+                &role,
+                exited_roles.contains(role.as_str()),
+            )?);
+        }
+        for role in ["signal", "relay", "stun"] {
+            children.push(synthetic_manifest_child(
+                &runtime_dir,
+                children.len(),
+                role,
+                exited_roles.contains(role),
+            )?);
+        }
+        for _index in 0..report.daemon_agent_processes {
+            children.push(synthetic_manifest_child(
+                &runtime_dir,
+                children.len(),
+                "agent",
+                exited_roles.contains("agent"),
+            )?);
+        }
+
+        let now = Utc::now();
+        let manifest = DaemonRuntimeManifest {
+            scenario: report.scenario,
+            phase,
+            workload: DaemonRuntimeManifestWorkload {
+                scenario_node_count: report.node_count,
+                scenario_relay_node_count: report.relay_count,
+                scenario_route_provider_count: report.route_provider_count,
+                scenario_active_pair_count: report.active_pair_count,
+                daemon_control_plane_processes: report.daemon_control_plane_processes,
+                daemon_agent_processes: report.daemon_agent_processes,
+                daemon_http_readiness_timeout_seconds: 5,
+                daemon_agent_readiness_timeout_seconds: 15,
+                relay_packets_per_session: report.relay_packets_per_session,
+                relay_payload_bytes: report.relay_payload_bytes_per_packet,
+            },
+            runtime_dir: runtime_dir.clone(),
+            control_plane_urls: (0..report.daemon_control_plane_processes)
+                .map(|index| format!("http://127.0.0.1:31{index:03}"))
+                .collect(),
+            signal_url: "http://127.0.0.1:32000".to_string(),
+            relay_http_url: "http://127.0.0.1:32001".to_string(),
+            relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_002),
+            stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_003),
+            agent_urls: (0..report.daemon_agent_processes)
+                .map(|index| format!("http://127.0.0.1:33{index:03}"))
+                .collect(),
+            keep_runtime_dir: true,
+            started_at: now,
+            updated_at: now,
+            generated_at: now,
+            children,
+        };
+        let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest)?;
+        Ok((runtime_dir, manifest_path))
+    }
+
+    fn synthetic_manifest_child(
+        runtime_dir: &Path,
+        index: usize,
+        role: &str,
+        exited: bool,
+    ) -> anyhow::Result<DaemonRuntimeManifestChild> {
+        let log_path = runtime_dir.join(format!("{index:04}-{role}.log"));
+        std::fs::write(&log_path, format!("{role} retained manifest log\n"))?;
+        let log_diagnostics =
+            daemon_log_diagnostics(&log_path).context("synthetic manifest log was unreadable")?;
+        Ok(DaemonRuntimeManifestChild {
+            role: role.to_string(),
+            pid: (!exited).then_some(40_000 + index as u32),
+            log_path: Some(log_path),
+            log_bytes: Some(log_diagnostics.bytes),
+            log_tail_sha256: Some(log_diagnostics.tail_sha256),
+            state: if exited {
+                DaemonRuntimeManifestChildState::Exited
+            } else {
+                DaemonRuntimeManifestChildState::Running
+            },
+            exit_status: exited.then(|| "signal: 15 (SIGTERM)".to_string()),
+            exit_code: exited.then_some(143),
+        })
     }
 }
