@@ -2799,7 +2799,55 @@ pub mod api {
     }
 
     fn ssh_payload(payload: &[u8]) -> bool {
-        payload.starts_with(b"SSH-")
+        let mut offset = 0_usize;
+        while offset < payload.len() {
+            let remaining = &payload[offset..];
+            let line_end = remaining.iter().position(|byte| *byte == b'\n');
+            let (raw_line, complete) = match line_end {
+                Some(line_end) => (&remaining[..line_end], true),
+                None => (remaining, false),
+            };
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line.starts_with(b"SSH-") {
+                let wire_len = raw_line.len() + usize::from(complete);
+                return ssh_identification_line(line, wire_len);
+            }
+            if !complete || raw_line.contains(&0) {
+                return false;
+            }
+            offset = offset.saturating_add(line_end.unwrap_or(remaining.len()) + 1);
+        }
+        false
+    }
+
+    fn ssh_identification_line(line: &[u8], wire_len: usize) -> bool {
+        if wire_len > 255 || line.len() < b"SSH-2.0-a".len() {
+            return false;
+        }
+        let rest = &line[4..];
+        let Some(version_end) = rest.iter().position(|byte| *byte == b'-') else {
+            return false;
+        };
+        let version = &rest[..version_end];
+        if !matches!(version, b"2.0" | b"1.99") {
+            return false;
+        }
+        let software_and_comments = &rest[version_end + 1..];
+        let software_end = software_and_comments
+            .iter()
+            .position(|byte| *byte == b' ')
+            .unwrap_or(software_and_comments.len());
+        let software = &software_and_comments[..software_end];
+        if software.is_empty()
+            || !software
+                .iter()
+                .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'-')
+        {
+            return false;
+        }
+        software_and_comments[software_end..]
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
     }
 
     fn ldap_payload(payload: &[u8]) -> bool {
@@ -5743,6 +5791,31 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"SSH-2.0-OpenSSH_9.0\r\n").application(),
             api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"tcp-wrapper notice\r\nSSH-2.0-OpenSSH_9.0 comment\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0").application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-3.0-OpenSSH_9.0\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-Open-SSH\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0\0\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
