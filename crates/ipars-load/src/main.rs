@@ -642,18 +642,42 @@ impl LoadReport {
                 expected_manifest_path.display()
             );
         }
-        let runtime_metadata = std::fs::metadata(runtime_dir).with_context(|| {
+        let runtime_metadata = std::fs::symlink_metadata(runtime_dir).with_context(|| {
             format!(
                 "daemon load scenario retained runtime directory {} is not accessible",
                 runtime_dir.display()
             )
         })?;
-        if !runtime_metadata.is_dir() {
+        if runtime_metadata.file_type().is_symlink() || !runtime_metadata.is_dir() {
             bail!(
                 "daemon load scenario retained runtime path {} is not a directory",
                 runtime_dir.display()
             );
         }
+        validate_daemon_retained_path_mode(
+            runtime_dir,
+            &runtime_metadata,
+            0o700,
+            "retained runtime directory",
+        )?;
+        let manifest_metadata = std::fs::symlink_metadata(manifest_path).with_context(|| {
+            format!(
+                "daemon load scenario retained manifest {} is not accessible",
+                manifest_path.display()
+            )
+        })?;
+        if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+            bail!(
+                "daemon load scenario retained manifest {} is not a regular file",
+                manifest_path.display()
+            );
+        }
+        validate_daemon_retained_path_mode(
+            manifest_path,
+            &manifest_metadata,
+            0o600,
+            "retained manifest",
+        )?;
         let manifest_bytes = std::fs::read(manifest_path).with_context(|| {
             format!(
                 "daemon load scenario retained manifest {} is not readable",
@@ -852,6 +876,12 @@ impl LoadReport {
                     log_path.display()
                 );
             }
+            validate_daemon_retained_path_mode(
+                log_path,
+                &log_metadata,
+                0o600,
+                &format!("retained manifest child {} log", child.role),
+            )?;
             let canonical_log_path = log_path.canonicalize().with_context(|| {
                 format!(
                     "daemon load scenario retained manifest child {} log {} cannot be canonicalized",
@@ -1019,6 +1049,30 @@ fn validate_daemon_manifest_ip_addr(ip: IpAddr, label: &str) -> anyhow::Result<(
     };
     if unusable {
         bail!("daemon load scenario retained manifest {label} uses unusable IP address {ip}");
+    }
+    Ok(())
+}
+
+fn validate_daemon_retained_path_mode(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    expected_mode: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != expected_mode {
+            bail!(
+                "daemon load scenario {label} {} permissions are {mode:o}; expected {expected_mode:o}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, metadata, expected_mode, label);
     }
     Ok(())
 }
@@ -4204,6 +4258,86 @@ mod tests {
         assert!(error.contains("log diagnostics mismatch"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut world_readable_runtime_dir = daemon_report.clone();
+            let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+                &world_readable_runtime_dir,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+            world_readable_runtime_dir.daemon_runtime_dir = Some(runtime_dir.clone());
+            world_readable_runtime_dir.daemon_runtime_manifest = Some(manifest_path);
+            std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o755))?;
+            let error = match world_readable_runtime_dir.validate_success() {
+                Ok(_) => bail!("world-readable retained runtime dir should fail validation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("retained runtime directory"));
+            assert!(error.contains("permissions"));
+            std::fs::remove_dir_all(&runtime_dir)?;
+
+            let mut world_readable_manifest = daemon_report.clone();
+            let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+                &world_readable_manifest,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+            world_readable_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
+            world_readable_manifest.daemon_runtime_manifest = Some(manifest_path.clone());
+            std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+            let error = match world_readable_manifest.validate_success() {
+                Ok(_) => bail!("world-readable retained manifest should fail validation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("retained manifest"));
+            assert!(error.contains("permissions"));
+            std::fs::remove_dir_all(&runtime_dir)?;
+
+            let mut world_readable_child_log = daemon_report.clone();
+            let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+                &world_readable_child_log,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+            world_readable_child_log.daemon_runtime_dir = Some(runtime_dir.clone());
+            world_readable_child_log.daemon_runtime_manifest = Some(manifest_path.clone());
+            std::fs::set_permissions(
+                runtime_dir.join("0000-control-plane-0.log"),
+                std::fs::Permissions::from_mode(0o644),
+            )?;
+            let error = match world_readable_child_log.validate_success() {
+                Ok(_) => bail!("world-readable retained child log should fail validation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("child control-plane-0 log"));
+            assert!(error.contains("permissions"));
+            std::fs::remove_dir_all(&runtime_dir)?;
+        }
+
         let mut stale_generated_timestamp = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &stale_generated_timestamp,
@@ -5857,6 +5991,7 @@ mod tests {
     ) -> anyhow::Result<(PathBuf, PathBuf)> {
         let runtime_dir = synthetic_runtime_dir("retained-manifest");
         std::fs::create_dir_all(&runtime_dir)?;
+        secure_daemon_runtime_dir(&runtime_dir)?;
         let exited_roles = exited_roles.iter().copied().collect::<BTreeSet<_>>();
         let mut children = Vec::with_capacity(report.daemon_processes);
         for index in 0..report.daemon_control_plane_processes {
@@ -5941,7 +6076,13 @@ mod tests {
         exited: bool,
     ) -> anyhow::Result<DaemonRuntimeManifestChild> {
         let log_path = runtime_dir.join(format!("{index:04}-{role}.log"));
-        std::fs::write(&log_path, format!("{role} retained manifest log\n"))?;
+        let mut log_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .private_on_unix()
+            .open(&log_path)?;
+        log_file.write_all(format!("{role} retained manifest log\n").as_bytes())?;
+        log_file.sync_all()?;
         let log_diagnostics =
             daemon_log_diagnostics(&log_path).context("synthetic manifest log was unreadable")?;
         Ok(DaemonRuntimeManifestChild {
