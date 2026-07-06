@@ -3133,6 +3133,12 @@ fn validate_linux_namespace_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 64 {
         anyhow::bail!("linux network namespace name `{name}` exceeds 64 bytes");
     }
+    if matches!(name, "." | "..") {
+        anyhow::bail!("linux network namespace name `{name}` must not be '.' or '..'");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("linux network namespace name `{name}` must not start with '-'");
+    }
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -7703,6 +7709,26 @@ mod tests {
         assert!(invalid_namespace
             .to_string()
             .contains("linux network namespace name"));
+
+        for namespace in [".", "..", "-compose"] {
+            let invalid_special_namespace = match docker_install_plan(DockerInstallArgs {
+                docker_container_namespace: Some(namespace.to_string()),
+                ..docker_install_test_args()
+            }) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "special Docker container namespace {namespace} should be rejected"
+                    )
+                }
+                Err(error) => error,
+            };
+            assert!(
+                invalid_special_namespace
+                    .to_string()
+                    .contains("linux network namespace name"),
+                "unexpected error for {namespace}: {invalid_special_namespace}"
+            );
+        }
 
         let relative_api_socket = match docker_install_plan(DockerInstallArgs {
             docker_discover_networks: true,

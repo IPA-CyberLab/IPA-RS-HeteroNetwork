@@ -17101,6 +17101,30 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected agent command");
         }
 
+        let option_like_relay_forwarder_namespace = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-netns=-node-a",
+        ])?;
+        if let Command::Agent(args) = option_like_relay_forwarder_namespace.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("invalid linux network namespace name"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         let unusable_relay_forwarder_endpoint = Cli::try_parse_from([
             "iparsd",
             "agent",

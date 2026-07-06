@@ -104,6 +104,8 @@ impl LinuxNetworkNamespace {
 fn is_valid_namespace_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
+        && !matches!(name, "." | "..")
+        && !name.starts_with('-')
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -1832,6 +1834,18 @@ mod tests {
         assert!(matches!(
             LinuxNetworkNamespace::from_name("node a"),
             Err(RouteManagerError::InvalidNamespace(name)) if name == "node a"
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("."),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "."
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name(".."),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == ".."
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("-node-a"),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "-node-a"
         ));
         Ok(())
     }
