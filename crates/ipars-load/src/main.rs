@@ -681,15 +681,82 @@ impl LoadReport {
             );
         }
 
+        let canonical_runtime_dir = runtime_dir.canonicalize().with_context(|| {
+            format!(
+                "daemon load scenario retained runtime directory {} cannot be canonicalized",
+                runtime_dir.display()
+            )
+        })?;
         let mut exited_roles = Vec::new();
         for child in &manifest.children {
-            if child.log_path.is_none()
-                || child.log_bytes.is_none()
-                || child.log_tail_sha256.as_deref().is_none_or(str::is_empty)
+            let Some(log_path) = &child.log_path else {
+                bail!(
+                    "daemon load scenario retained manifest child {} is missing log path",
+                    child.role
+                );
+            };
+            let Some(recorded_log_bytes) = child.log_bytes else {
+                bail!(
+                    "daemon load scenario retained manifest child {} is missing log byte count",
+                    child.role
+                );
+            };
+            let Some(recorded_log_tail_sha256) = child
+                .log_tail_sha256
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            else {
+                bail!(
+                    "daemon load scenario retained manifest child {} is missing log tail hash",
+                    child.role
+                );
+            };
+            let log_metadata = std::fs::symlink_metadata(log_path).with_context(|| {
+                format!(
+                    "daemon load scenario retained manifest child {} log {} is not accessible",
+                    child.role,
+                    log_path.display()
+                )
+            })?;
+            if log_metadata.file_type().is_symlink() || !log_metadata.is_file() {
+                bail!(
+                    "daemon load scenario retained manifest child {} log {} is not a regular file",
+                    child.role,
+                    log_path.display()
+                );
+            }
+            let canonical_log_path = log_path.canonicalize().with_context(|| {
+                format!(
+                    "daemon load scenario retained manifest child {} log {} cannot be canonicalized",
+                    child.role,
+                    log_path.display()
+                )
+            })?;
+            if !canonical_log_path.starts_with(&canonical_runtime_dir) {
+                bail!(
+                    "daemon load scenario retained manifest child {} log {} is outside retained runtime directory {}",
+                    child.role,
+                    canonical_log_path.display(),
+                    canonical_runtime_dir.display()
+                );
+            }
+            let log_diagnostics = daemon_log_diagnostics(log_path).with_context(|| {
+                format!(
+                    "daemon load scenario retained manifest child {} log {} diagnostics are unavailable",
+                    child.role,
+                    log_path.display()
+                )
+            })?;
+            if log_diagnostics.bytes != recorded_log_bytes
+                || log_diagnostics.tail_sha256 != recorded_log_tail_sha256
             {
                 bail!(
-                    "daemon load scenario retained manifest child {} is missing log diagnostics",
-                    child.role
+                    "daemon load scenario retained manifest child {} log diagnostics mismatch: bytes={}/{}, tail_sha256={}/{}",
+                    child.role,
+                    recorded_log_bytes,
+                    log_diagnostics.bytes,
+                    recorded_log_tail_sha256,
+                    log_diagnostics.tail_sha256
                 );
             }
             match child.state {
@@ -3629,6 +3696,17 @@ mod tests {
         retained_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
         retained_manifest.daemon_runtime_manifest = Some(manifest_path);
         retained_manifest.validate_success()?;
+        std::fs::write(
+            runtime_dir.join("0000-control-plane-0.log"),
+            "tampered retained log\n",
+        )?;
+        let error = match retained_manifest.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched log diagnostics should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("log diagnostics mismatch"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut incomplete_retained_manifest_fields = daemon_report.clone();
