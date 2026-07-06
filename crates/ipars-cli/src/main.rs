@@ -8701,6 +8701,7 @@ mod tests {
             "agent.hostNetwork",
             "agent.automountServiceAccountToken",
             "agent.privileged",
+            "agent.routeProvider",
             "agent.securityContext.allowPrivilegeEscalation",
             "agent.securityContext.readOnlyRootFilesystem",
             "agent.peerMap.enabled",

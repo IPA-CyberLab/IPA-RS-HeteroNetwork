@@ -44,6 +44,7 @@
 {{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.automountServiceAccountToken" "value" .Values.agent.automountServiceAccountToken) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.privileged" "value" .Values.agent.privileged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.routeProvider" "value" .Values.agent.routeProvider) -}}
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
