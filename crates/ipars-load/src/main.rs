@@ -337,6 +337,15 @@ impl LoadReport {
                 if !self.daemon_control_plane_metrics_consistent {
                     bail!("daemon load scenario control-plane metrics are inconsistent");
                 }
+                if self.daemon_control_plane_metrics_endpoints
+                    != self.daemon_control_plane_processes
+                {
+                    bail!(
+                        "daemon load scenario checked {} control-plane metrics endpoints, expected {}",
+                        self.daemon_control_plane_metrics_endpoints,
+                        self.daemon_control_plane_processes
+                    );
+                }
                 if self.daemon_control_plane_relay_candidates_min != self.relay_count
                     || self.daemon_control_plane_relay_candidates_max != self.relay_count
                 {
@@ -3759,6 +3768,14 @@ mod tests {
 
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
+
+        let mut missing_daemon_metrics_endpoint = daemon_report.clone();
+        missing_daemon_metrics_endpoint.daemon_control_plane_metrics_endpoints = 1;
+        let error = match missing_daemon_metrics_endpoint.validate_success() {
+            Ok(_) => bail!("daemon report with missing metrics endpoint should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("metrics endpoints"));
 
         let mut missing_daemon_relay_candidate = daemon_report.clone();
         missing_daemon_relay_candidate.daemon_control_plane_relay_candidates_min = 0;
