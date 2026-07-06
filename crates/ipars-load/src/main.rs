@@ -22,10 +22,11 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
     AgentPathsResponse, AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
+    SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -246,6 +247,12 @@ struct LoadReport {
     daemon_control_plane_path_count_max: usize,
     daemon_control_plane_reachable_path_count_min: usize,
     daemon_control_plane_reachable_path_count_max: usize,
+    daemon_control_plane_path_status_requests: usize,
+    daemon_control_plane_path_status_count_min: usize,
+    daemon_control_plane_path_status_count_max: usize,
+    daemon_control_plane_path_status_reachable_count_min: usize,
+    daemon_control_plane_path_status_reachable_count_max: usize,
+    daemon_control_plane_path_status_stale_count_max: usize,
     daemon_control_plane_healthy_nodes: usize,
     daemon_control_plane_healthy_nodes_min: usize,
     daemon_control_plane_healthy_nodes_max: usize,
@@ -427,6 +434,29 @@ impl LoadReport {
                         self.daemon_control_plane_path_count_max,
                         self.daemon_control_plane_reachable_path_count_min,
                         self.daemon_control_plane_reachable_path_count_max
+                    );
+                }
+                let expected_path_status_requests = self
+                    .daemon_control_plane_processes
+                    .saturating_mul(self.daemon_agent_processes);
+                if self.daemon_control_plane_path_status_requests != expected_path_status_requests {
+                    bail!(
+                        "daemon load scenario checked {} control-plane path status requests, expected {expected_path_status_requests}",
+                        self.daemon_control_plane_path_status_requests
+                    );
+                }
+                if self.daemon_control_plane_path_status_count_min < expected_agent_path_count
+                    || self.daemon_control_plane_path_status_reachable_count_min
+                        < expected_agent_path_count
+                    || self.daemon_control_plane_path_status_stale_count_max != 0
+                {
+                    bail!(
+                        "daemon load scenario control-plane path status mismatch: path min/max={}/{}, reachable min/max={}/{}, stale max={}, expected at least {expected_agent_path_count} fresh reachable paths",
+                        self.daemon_control_plane_path_status_count_min,
+                        self.daemon_control_plane_path_status_count_max,
+                        self.daemon_control_plane_path_status_reachable_count_min,
+                        self.daemon_control_plane_path_status_reachable_count_max,
+                        self.daemon_control_plane_path_status_stale_count_max
                     );
                 }
                 if self.daemon_control_plane_peer_map_endpoints
@@ -1454,6 +1484,12 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_path_count_max: 0,
         daemon_control_plane_reachable_path_count_min: 0,
         daemon_control_plane_reachable_path_count_max: 0,
+        daemon_control_plane_path_status_requests: 0,
+        daemon_control_plane_path_status_count_min: 0,
+        daemon_control_plane_path_status_count_max: 0,
+        daemon_control_plane_path_status_reachable_count_min: 0,
+        daemon_control_plane_path_status_reachable_count_max: 0,
+        daemon_control_plane_path_status_stale_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1646,6 +1682,12 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_path_count_max: 0,
         daemon_control_plane_reachable_path_count_min: 0,
         daemon_control_plane_reachable_path_count_max: 0,
+        daemon_control_plane_path_status_requests: 0,
+        daemon_control_plane_path_status_count_min: 0,
+        daemon_control_plane_path_status_count_max: 0,
+        daemon_control_plane_path_status_reachable_count_min: 0,
+        daemon_control_plane_path_status_reachable_count_max: 0,
+        daemon_control_plane_path_status_stale_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1812,6 +1854,12 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_path_count_max: 0,
         daemon_control_plane_reachable_path_count_min: 0,
         daemon_control_plane_reachable_path_count_max: 0,
+        daemon_control_plane_path_status_requests: 0,
+        daemon_control_plane_path_status_count_min: 0,
+        daemon_control_plane_path_status_count_max: 0,
+        daemon_control_plane_path_status_reachable_count_min: 0,
+        daemon_control_plane_path_status_reachable_count_max: 0,
+        daemon_control_plane_path_status_stale_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1961,6 +2009,14 @@ async fn run_daemon_scenario(
     let control_path_summary = wait_for_daemon_control_plane_path_summary(
         &client,
         &services.control_plane_urls,
+        expected_agent_path_count,
+        agent_readiness_timeout,
+    )
+    .await?;
+    let control_path_status_summary = wait_for_daemon_control_plane_path_status_summary(
+        &client,
+        &services.control_plane_urls,
+        &agent_statuses,
         expected_agent_path_count,
         agent_readiness_timeout,
     )
@@ -2156,6 +2212,15 @@ async fn run_daemon_scenario(
             .reachable_path_count_min,
         daemon_control_plane_reachable_path_count_max: control_path_summary
             .reachable_path_count_max,
+        daemon_control_plane_path_status_requests: control_path_status_summary.request_count,
+        daemon_control_plane_path_status_count_min: control_path_status_summary.path_count_min,
+        daemon_control_plane_path_status_count_max: control_path_status_summary.path_count_max,
+        daemon_control_plane_path_status_reachable_count_min: control_path_status_summary
+            .reachable_path_count_min,
+        daemon_control_plane_path_status_reachable_count_max: control_path_status_summary
+            .reachable_path_count_max,
+        daemon_control_plane_path_status_stale_count_max: control_path_status_summary
+            .stale_path_count_max,
         daemon_control_plane_healthy_nodes: control_summary.healthy_node_count_min,
         daemon_control_plane_healthy_nodes_min: control_summary.healthy_node_count_min,
         daemon_control_plane_healthy_nodes_max: control_summary.healthy_node_count_max,
@@ -4166,6 +4231,149 @@ async fn wait_for_daemon_control_plane_path_summary(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonControlPlanePathStatusSummary {
+    request_count: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+    reachable_path_count_min: usize,
+    reachable_path_count_max: usize,
+    stale_path_count_max: usize,
+}
+
+async fn wait_for_daemon_control_plane_path_status_summary(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    statuses: &[AgentStatusResponse],
+    expected_path_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<DaemonControlPlanePathStatusSummary> {
+    let started = Instant::now();
+    loop {
+        let summary =
+            daemon_control_plane_path_status_summary(client, control_plane_urls, statuses).await?;
+        if summary.path_count_min >= expected_path_count
+            && summary.reachable_path_count_min >= expected_path_count
+            && summary.stale_path_count_max == 0
+        {
+            return Ok(summary);
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "daemon control-plane path status validation observed path min/max={}/{}, reachable min/max={}/{}, stale max={}, expected at least {} fresh reachable paths within {}s",
+                summary.path_count_min,
+                summary.path_count_max,
+                summary.reachable_path_count_min,
+                summary.reachable_path_count_max,
+                summary.stale_path_count_max,
+                expected_path_count,
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn daemon_control_plane_path_status_summary(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonControlPlanePathStatusSummary> {
+    if control_plane_urls.is_empty() {
+        bail!("at least one daemon control-plane URL is required");
+    }
+    let first = control_plane_path_status_endpoint_summary(
+        client,
+        control_plane_urls
+            .first()
+            .context("at least one daemon control-plane URL is required")?,
+        statuses,
+    )
+    .await?;
+    let mut summary = DaemonControlPlanePathStatusSummary {
+        request_count: first.request_count,
+        path_count_min: first.path_count,
+        path_count_max: first.path_count,
+        reachable_path_count_min: first.reachable_path_count,
+        reachable_path_count_max: first.reachable_path_count,
+        stale_path_count_max: first.stale_path_count,
+    };
+    for control_plane_url in &control_plane_urls[1..] {
+        let endpoint =
+            control_plane_path_status_endpoint_summary(client, control_plane_url, statuses).await?;
+        summary.request_count = summary.request_count.saturating_add(endpoint.request_count);
+        summary.path_count_min = summary.path_count_min.min(endpoint.path_count);
+        summary.path_count_max = summary.path_count_max.max(endpoint.path_count);
+        summary.reachable_path_count_min = summary
+            .reachable_path_count_min
+            .min(endpoint.reachable_path_count);
+        summary.reachable_path_count_max = summary
+            .reachable_path_count_max
+            .max(endpoint.reachable_path_count);
+        summary.stale_path_count_max = summary.stale_path_count_max.max(endpoint.stale_path_count);
+    }
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonControlPlanePathStatusEndpointSummary {
+    request_count: usize,
+    path_count: usize,
+    reachable_path_count: usize,
+    stale_path_count: usize,
+}
+
+async fn control_plane_path_status_endpoint_summary(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonControlPlanePathStatusEndpointSummary> {
+    let mut summary = DaemonControlPlanePathStatusEndpointSummary {
+        request_count: 0,
+        path_count: 0,
+        reachable_path_count: 0,
+        stale_path_count: 0,
+    };
+    for (index, status) in statuses.iter().enumerate() {
+        let response: ControlPlanePathsResponse = get_json(
+            client,
+            format!("{control_plane_url}/v1/paths/{}", status.node_id),
+            "daemon control-plane path status",
+        )
+        .await?;
+        if response.node_id != status.node_id {
+            bail!(
+                "daemon control-plane path status endpoint {control_plane_url} request {index} returned node {} instead of {}",
+                response.node_id,
+                status.node_id
+            );
+        }
+        for path in &response.paths {
+            if path.key.local != status.node_id && path.key.remote != status.node_id {
+                bail!(
+                    "daemon control-plane path status endpoint {control_plane_url} for {} returned unrelated path {} -> {}",
+                    status.node_id,
+                    path.key.local,
+                    path.key.remote
+                );
+            }
+        }
+        summary.request_count += 1;
+        summary.path_count = summary.path_count.saturating_add(response.paths.len());
+        summary.reachable_path_count = summary.reachable_path_count.saturating_add(
+            response
+                .paths
+                .iter()
+                .filter(|path| path.selected_state != PathState::Unreachable)
+                .count(),
+        );
+        summary.stale_path_count = summary
+            .stale_path_count
+            .saturating_add(response.stale_path_count);
+    }
+    Ok(summary)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7164,6 +7372,13 @@ mod tests {
         report.daemon_control_plane_path_count_max = expected_agent_path_count;
         report.daemon_control_plane_reachable_path_count_min = expected_agent_path_count;
         report.daemon_control_plane_reachable_path_count_max = expected_agent_path_count;
+        report.daemon_control_plane_path_status_requests =
+            report.daemon_control_plane_processes * report.daemon_agent_processes;
+        report.daemon_control_plane_path_status_count_min = expected_agent_path_count;
+        report.daemon_control_plane_path_status_count_max = expected_agent_path_count;
+        report.daemon_control_plane_path_status_reachable_count_min = expected_agent_path_count;
+        report.daemon_control_plane_path_status_reachable_count_max = expected_agent_path_count;
+        report.daemon_control_plane_path_status_stale_count_max = 0;
         report.daemon_control_plane_healthy_nodes = report.node_count;
         report.daemon_control_plane_healthy_nodes_min = report.node_count;
         report.daemon_control_plane_healthy_nodes_max = report.node_count;
