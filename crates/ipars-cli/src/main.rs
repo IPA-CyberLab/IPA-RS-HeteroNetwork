@@ -384,6 +384,10 @@ struct K8sInstallArgs {
     kubernetes_route_interval_seconds: u64,
     #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
     route_backend: String,
+    #[arg(long = "disable-agent-peer-map", default_value_t = false)]
+    disable_agent_peer_map: bool,
+    #[arg(long = "agent-peer-map-poll-interval-seconds", default_value_t = 30)]
+    agent_peer_map_poll_interval_seconds: u64,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -3590,6 +3594,13 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
 }
 
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.disable_agent_peer_map {
+        command.push_str(" --set agent.peerMap.enabled=false");
+    }
+    command.push_str(&format!(
+        " --set agent.peerMap.pollIntervalSeconds={}",
+        args.agent_peer_map_poll_interval_seconds
+    ));
     if args.disable_agent_host_network {
         command.push_str(" --set agent.hostNetwork=false");
     }
@@ -4308,6 +4319,9 @@ fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<
 }
 
 fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if args.agent_peer_map_poll_interval_seconds == 0 {
+        anyhow::bail!("--agent-peer-map-poll-interval-seconds must be greater than zero");
+    }
     for label in &args.agent_pod_labels {
         validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
         validate_kubernetes_label_value(&label.value).map_err(anyhow::Error::msg)?;
@@ -7017,6 +7031,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -7124,6 +7140,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
         assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
         assert!(plan.commands[2].contains("--set agent.routeBackend=command"));
+        assert!(plan.commands[2].contains("--set agent.peerMap.pollIntervalSeconds=30"));
         assert!(plan.commands[2].contains("--set networkPolicy.enabled=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
@@ -7347,8 +7364,19 @@ mod tests {
 
         assert!(values.contains("routeBackend: command"));
         assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
-        assert!(daemonset
-            .contains("agent.routeBackend=kernel-netlink requires serviceExposure.enabled=true"));
+        assert!(values.contains("peerMap:"));
+        assert!(values.contains("enabled: true"));
+        assert!(values.contains("pollIntervalSeconds: 30"));
+        assert!(daemonset.contains("agent.peerMap.enabled must be true or false"));
+        assert!(daemonset.contains(
+            "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true"
+        ));
+        assert!(daemonset.contains(
+            "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true"
+        ));
+        assert!(daemonset.contains("- --apply-peer-map"));
+        assert!(daemonset.contains("- --peer-map-poll-interval-seconds"));
+        assert!(daemonset.contains("- {{ $agentPeerMapPollIntervalSeconds | quote }}"));
         assert!(daemonset.contains("- --route-backend"));
         assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
         Ok(())
@@ -7412,6 +7440,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -7512,6 +7542,7 @@ mod tests {
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
         args.route_backend = "kernel-netlink".to_string();
+        args.agent_peer_map_poll_interval_seconds = 45;
         args.disable_rbac = true;
 
         let plan = k8s_install_plan(args)?;
@@ -7519,6 +7550,7 @@ mod tests {
 
         assert!(helm.contains("--set rbac.create=false"));
         assert!(helm.contains("--set agent.routeBackend=kernel-netlink"));
+        assert!(helm.contains("--set agent.peerMap.pollIntervalSeconds=45"));
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
         assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
         assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
@@ -7538,6 +7570,30 @@ mod tests {
         assert!(
             Cli::try_parse_from(["ipars", "k8s", "install", "--route-backend", "invalid"]).is_err()
         );
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_peer_map_sync() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.disable_agent_peer_map = true;
+        args.agent_peer_map_poll_interval_seconds = 45;
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.peerMap.enabled=false"));
+        assert!(helm.contains("--set agent.peerMap.pollIntervalSeconds=45"));
+
+        let mut invalid_interval = base_k8s_install_args();
+        invalid_interval.agent_peer_map_poll_interval_seconds = 0;
+        let error = match k8s_install_plan(invalid_interval) {
+            Ok(_) => anyhow::bail!("zero agent peer-map poll interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--agent-peer-map-poll-interval-seconds must be greater than zero"));
+        Ok(())
     }
 
     #[test]
@@ -8347,6 +8403,9 @@ mod tests {
             "15",
             "--route-backend",
             "kernel-netlink",
+            "--disable-agent-peer-map",
+            "--agent-peer-map-poll-interval-seconds",
+            "45",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
@@ -8519,6 +8578,8 @@ mod tests {
             );
             assert_eq!(args.kubernetes_route_interval_seconds, 15);
             assert_eq!(args.route_backend, "kernel-netlink");
+            assert!(args.disable_agent_peer_map);
+            assert_eq!(args.agent_peer_map_poll_interval_seconds, 45);
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -8731,6 +8792,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -8858,6 +8921,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -10003,6 +10068,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10117,6 +10184,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10238,6 +10307,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -10357,6 +10428,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -10471,6 +10544,8 @@ mod tests {
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,

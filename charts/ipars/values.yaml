@@ -23,6 +23,9 @@ serviceAccount:
 agent:
   interfaceName: ipars0
   routeBackend: command
+  peerMap:
+    enabled: true
+    pollIntervalSeconds: 30
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   routeProvider: false

@@ -35,6 +35,8 @@
 {{- $agentSeccompLocalhostProfile := .Values.agent.securityContext.seccompProfile.localhostProfile -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
+{{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
+{{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
@@ -48,8 +50,15 @@
 {{- if not (or (eq $agentRouteBackend "command") (eq $agentRouteBackend "kernel-netlink")) -}}
 {{- fail "agent.routeBackend must be command or kernel-netlink" -}}
 {{- end -}}
-{{- if and (eq $agentRouteBackend "kernel-netlink") (not .Values.serviceExposure.enabled) -}}
-{{- fail "agent.routeBackend=kernel-netlink requires serviceExposure.enabled=true" -}}
+{{- if not (or (eq $agentPeerMapEnabled "true") (eq $agentPeerMapEnabled "false")) -}}
+{{- fail "agent.peerMap.enabled must be true or false" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds) -}}
+{{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentPeerMapPollIntervalSeconds) 1) -}}
+{{- fail "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true" -}}
+{{- end -}}
+{{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
+{{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
 {{- end -}}
 {{- if or (eq $imageRepository "") (gt (len $imageRepository) 255) (not (regexMatch "^([a-z0-9]|[a-z0-9][a-z0-9._:/-]*[a-z0-9])$" $imageRepository)) (contains "@" $imageRepository) (contains "//" $imageRepository) (contains ":" (regexFind "[^/]+$" $imageRepository)) -}}
 {{- fail "image.repository must be a lowercase image repository path without tag or digest" -}}
@@ -479,6 +488,11 @@ spec:
             - {{ .Values.agent.interfaceName | quote }}
             - --join-token-path
             - {{ printf "%s/token/%s" $agentStateMountPath .Values.agent.joinTokenSecretKey | quote }}
+            {{- if eq $agentPeerMapEnabled "true" }}
+            - --apply-peer-map
+            - --peer-map-poll-interval-seconds
+            - {{ $agentPeerMapPollIntervalSeconds | quote }}
+            {{- end }}
             {{- if .Values.agent.relayAdvertisement.enabled }}
             - --relay-public-endpoint
             - {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
@@ -501,10 +515,12 @@ spec:
             - --stun-server
             - {{ .Values.cluster.stunEndpoint | quote }}
             {{- end }}
-            {{- if .Values.serviceExposure.enabled }}
-            - --apply-kubernetes-underlay
+            {{- if or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled }}
             - --route-backend
             - {{ $agentRouteBackend | quote }}
+            {{- end }}
+            {{- if .Values.serviceExposure.enabled }}
+            - --apply-kubernetes-underlay
             - --kubernetes-route-interval-seconds
             - {{ .Values.serviceExposure.routeIntervalSeconds | quote }}
             {{- if .Values.serviceExposure.discoverServices }}
