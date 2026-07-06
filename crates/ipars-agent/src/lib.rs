@@ -462,6 +462,9 @@ pub struct RelayForwarderStats {
     outbound_dropped_oversized_packets: AtomicU64,
     outbound_dropped_oversized_payload_bytes: AtomicU64,
     outbound_dropped_oversized_datagram_bytes: AtomicU64,
+    outbound_dropped_socket_error_packets: AtomicU64,
+    outbound_dropped_socket_error_payload_bytes: AtomicU64,
+    outbound_dropped_socket_error_datagram_bytes: AtomicU64,
     outbound_dropped_non_wireguard_packets: AtomicU64,
     outbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     inbound_packets: AtomicU64,
@@ -470,6 +473,8 @@ pub struct RelayForwarderStats {
     inbound_dropped_expired_session_payload_bytes: AtomicU64,
     inbound_dropped_oversized_packets: AtomicU64,
     inbound_dropped_oversized_payload_bytes: AtomicU64,
+    inbound_dropped_socket_error_packets: AtomicU64,
+    inbound_dropped_socket_error_payload_bytes: AtomicU64,
     inbound_dropped_non_wireguard_packets: AtomicU64,
     inbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     last_forwarded_unix_millis: AtomicI64,
@@ -497,6 +502,9 @@ impl RelayForwarderStats {
             outbound_dropped_oversized_packets: AtomicU64::new(0),
             outbound_dropped_oversized_payload_bytes: AtomicU64::new(0),
             outbound_dropped_oversized_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_socket_error_packets: AtomicU64::new(0),
+            outbound_dropped_socket_error_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_socket_error_datagram_bytes: AtomicU64::new(0),
             outbound_dropped_non_wireguard_packets: AtomicU64::new(0),
             outbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             inbound_packets: AtomicU64::new(0),
@@ -505,6 +513,8 @@ impl RelayForwarderStats {
             inbound_dropped_expired_session_payload_bytes: AtomicU64::new(0),
             inbound_dropped_oversized_packets: AtomicU64::new(0),
             inbound_dropped_oversized_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_socket_error_packets: AtomicU64::new(0),
+            inbound_dropped_socket_error_payload_bytes: AtomicU64::new(0),
             inbound_dropped_non_wireguard_packets: AtomicU64::new(0),
             inbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             last_forwarded_unix_millis: AtomicI64::new(-1),
@@ -547,6 +557,15 @@ impl RelayForwarderStats {
             .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
     }
 
+    pub fn record_outbound_socket_error_drop(&self, payload_bytes: usize, datagram_bytes: usize) {
+        self.outbound_dropped_socket_error_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_socket_error_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.outbound_dropped_socket_error_datagram_bytes
+            .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
+    }
+
     pub fn record_outbound_drop(&self, payload_bytes: usize) {
         self.outbound_dropped_non_wireguard_packets
             .fetch_add(1, Ordering::Relaxed);
@@ -572,6 +591,13 @@ impl RelayForwarderStats {
         self.inbound_dropped_oversized_packets
             .fetch_add(1, Ordering::Relaxed);
         self.inbound_dropped_oversized_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_inbound_socket_error_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_socket_error_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_socket_error_payload_bytes
             .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
@@ -613,6 +639,15 @@ impl RelayForwarderStats {
             outbound_dropped_oversized_datagram_bytes: self
                 .outbound_dropped_oversized_datagram_bytes
                 .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_packets: self
+                .outbound_dropped_socket_error_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_payload_bytes: self
+                .outbound_dropped_socket_error_payload_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_datagram_bytes: self
+                .outbound_dropped_socket_error_datagram_bytes
+                .load(Ordering::Relaxed),
             outbound_dropped_non_wireguard_packets: self
                 .outbound_dropped_non_wireguard_packets
                 .load(Ordering::Relaxed),
@@ -632,6 +667,12 @@ impl RelayForwarderStats {
                 .load(Ordering::Relaxed),
             inbound_dropped_oversized_payload_bytes: self
                 .inbound_dropped_oversized_payload_bytes
+                .load(Ordering::Relaxed),
+            inbound_dropped_socket_error_packets: self
+                .inbound_dropped_socket_error_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_socket_error_payload_bytes: self
+                .inbound_dropped_socket_error_payload_bytes
                 .load(Ordering::Relaxed),
             inbound_dropped_non_wireguard_packets: self
                 .inbound_dropped_non_wireguard_packets
@@ -714,9 +755,15 @@ impl UdpRelayFrameForwarder {
             }
             return Ok(0);
         }
-        let bytes_sent = socket
-            .send_to(&datagram, self.session.relay_endpoint)
-            .await?;
+        let bytes_sent = match socket.send_to(&datagram, self.session.relay_endpoint).await {
+            Ok(bytes_sent) => bytes_sent,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_outbound_socket_error_drop(payload.len(), datagram.len());
+                }
+                return Ok(0);
+            }
+        };
         if let Some(metrics) = &self.metrics {
             metrics.record_outbound(payload.len(), datagram.len());
         }
@@ -746,7 +793,15 @@ impl UdpRelayFrameForwarder {
             }
             return Ok(0);
         }
-        let bytes_sent = socket.send_to(payload, self.wireguard_endpoint).await?;
+        let bytes_sent = match socket.send_to(payload, self.wireguard_endpoint).await {
+            Ok(bytes_sent) => bytes_sent,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_inbound_socket_error_drop(payload.len());
+                }
+                return Ok(0);
+            }
+        };
         if let Some(metrics) = &self.metrics {
             metrics.record_inbound(payload.len());
         }
@@ -3946,6 +4001,69 @@ mod tests {
         assert_eq!(snapshot.inbound_dropped_oversized_packets, 1);
         assert_eq!(
             snapshot.inbound_dropped_oversized_payload_bytes,
+            inbound_payload.len() as u64
+        );
+        assert!(snapshot.last_forwarded_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_records_socket_errors_without_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            forwarder_socket.local_addr()?,
+        ));
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
+                admitted_local_addr: forwarder_socket.local_addr()?,
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_002)),
+                session_id: "active-session".to_string(),
+                session_token: "active-token".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            },
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .with_metrics(stats.clone());
+
+        let outbound_payload = wireguard_transport_payload(0xe5);
+        let outbound_datagram_bytes = forwarder.encode_outbound(&outbound_payload)?.len();
+        assert_eq!(
+            forwarder
+                .send_to_relay(&forwarder_socket, &outbound_payload)
+                .await?,
+            0
+        );
+        let inbound_payload = wireguard_transport_payload(0xe6);
+        assert_eq!(
+            forwarder
+                .forward_to_wireguard(&forwarder_socket, &inbound_payload)
+                .await?,
+            0
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.outbound_packets, 0);
+        assert_eq!(snapshot.inbound_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_socket_error_packets, 1);
+        assert_eq!(
+            snapshot.outbound_dropped_socket_error_payload_bytes,
+            outbound_payload.len() as u64
+        );
+        assert_eq!(
+            snapshot.outbound_dropped_socket_error_datagram_bytes,
+            outbound_datagram_bytes as u64
+        );
+        assert_eq!(snapshot.inbound_dropped_socket_error_packets, 1);
+        assert_eq!(
+            snapshot.inbound_dropped_socket_error_payload_bytes,
             inbound_payload.len() as u64
         );
         assert!(snapshot.last_forwarded_at.is_none());
