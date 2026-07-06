@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use chrono::{DateTime, Utc};
 use ipnet::{IpNet, Ipv4Net};
@@ -1605,6 +1605,32 @@ pub mod api {
                 Self::NoOverlayMatch => "no_overlay_match",
                 Self::InconsistentTransportMetadata => "inconsistent_transport_metadata",
             }
+        }
+    }
+
+    pub fn packet_flow_destination_drop_reason(
+        destination: IpAddr,
+    ) -> Option<AgentPacketFlowDropReason> {
+        if destination.is_unspecified() {
+            return Some(AgentPacketFlowDropReason::Unspecified);
+        }
+        if destination.is_loopback() {
+            return Some(AgentPacketFlowDropReason::Loopback);
+        }
+        if destination.is_multicast() {
+            return Some(AgentPacketFlowDropReason::Multicast);
+        }
+        match destination {
+            IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
+                Some(AgentPacketFlowDropReason::Broadcast)
+            }
+            IpAddr::V4(address) if address.is_link_local() => {
+                Some(AgentPacketFlowDropReason::LinkLocal)
+            }
+            IpAddr::V6(address) if address.is_unicast_link_local() => {
+                Some(AgentPacketFlowDropReason::LinkLocal)
+            }
+            _ => None,
         }
     }
 
@@ -8439,6 +8465,62 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("concrete transport protocol"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_destination_classifier_rejects_unusable_targets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for destination in [
+            "100.64.0.11",
+            "10.42.7.25",
+            "172.20.1.10",
+            "fd00::42",
+            "2001:db8::42",
+        ] {
+            assert_eq!(
+                api::packet_flow_destination_drop_reason(destination.parse()?),
+                None,
+                "{destination} should remain eligible"
+            );
+        }
+
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("0.0.0.0".parse()?),
+            Some(api::AgentPacketFlowDropReason::Unspecified)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("::".parse()?),
+            Some(api::AgentPacketFlowDropReason::Unspecified)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("127.0.0.1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Loopback)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Loopback)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("224.0.0.1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Multicast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("ff02::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Multicast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("255.255.255.255".parse()?),
+            Some(api::AgentPacketFlowDropReason::Broadcast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("169.254.10.20".parse()?),
+            Some(api::AgentPacketFlowDropReason::LinkLocal)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("fe80::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::LinkLocal)
+        );
         Ok(())
     }
 

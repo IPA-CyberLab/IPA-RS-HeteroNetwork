@@ -19,14 +19,15 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
-    AgentManagedProcessState, AgentManagedProcessStatus, AgentMetricsResponse,
-    AgentPacketFlowApplication, AgentPacketFlowApplicationCount, AgentPacketFlowClassification,
-    AgentPacketFlowClassificationCount, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
-    AgentPacketFlowDuplicateSource, AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch,
-    AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPathProbeRequest,
-    AgentRelayAdmissionFailureReason, AgentRelayAdmissionFailureReasonCount,
-    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
-    RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentManagedProcessStatus,
+    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
+    AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
+    AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSource,
+    AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
+    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayAdmissionFailureReason,
+    AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, AgentStatusResponse,
+    LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
+    SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, CandidateSource, ClusterPolicy, EndpointCandidate,
@@ -1515,6 +1516,10 @@ impl AgentRuntime {
             self.record_packet_flow_filtered(
                 AgentPacketFlowDropReason::InconsistentTransportMetadata,
             );
+            return None;
+        }
+        if let Some(reason) = packet_flow_destination_drop_reason(destination) {
+            self.record_packet_flow_filtered(reason);
             return None;
         }
         self.packet_flow_observation_count
@@ -6016,6 +6021,55 @@ mod tests {
                 })
                 .map(|entry| entry.count),
             Some(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_filters_unusable_destinations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_activity(IpAddr::V4(Ipv4Addr::LOCALHOST), Utc::now(), true)
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Loopback)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(0)
         );
         Ok(())
     }

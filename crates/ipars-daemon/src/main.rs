@@ -48,12 +48,12 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::BindingStunServer;
 use ipars_types::api::{
-    AgentManagedProcessState, AgentMetricsResponse, AgentPacketFlowApplication,
-    AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
-    AgentPacketFlowDuplicateSource, AgentPacketFlowObservation, AgentPacketFlowTcpState,
-    AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, NatTraversalStrategyCount,
-    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
+    AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
+    AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowObservation,
+    AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
+    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
     RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
     SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
@@ -9799,34 +9799,6 @@ fn ebpf_packet_flow_ip(ip_family: u8, field: &str, bytes: &[u8]) -> anyhow::Resu
         PACKET_FLOW_IP_FAMILY_IPV6 => Ok(IpAddr::V6(Ipv6Addr::from(octets))),
         _ => anyhow::bail!("unsupported eBPF packet-flow IP family {ip_family}"),
     }
-}
-
-fn packet_flow_destination_drop_reason(destination: IpAddr) -> Option<AgentPacketFlowDropReason> {
-    if destination.is_unspecified() {
-        return Some(AgentPacketFlowDropReason::Unspecified);
-    }
-    if destination.is_loopback() {
-        return Some(AgentPacketFlowDropReason::Loopback);
-    }
-    if destination.is_multicast() {
-        return Some(AgentPacketFlowDropReason::Multicast);
-    }
-    match destination {
-        IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
-            Some(AgentPacketFlowDropReason::Broadcast)
-        }
-        IpAddr::V4(address) if address.is_link_local() => {
-            Some(AgentPacketFlowDropReason::LinkLocal)
-        }
-        IpAddr::V6(address) if is_ipv6_unicast_link_local(address) => {
-            Some(AgentPacketFlowDropReason::LinkLocal)
-        }
-        _ => None,
-    }
-}
-
-fn is_ipv6_unicast_link_local(address: Ipv6Addr) -> bool {
-    address.segments()[0] & 0xffc0 == 0xfe80
 }
 
 async fn read_conntrack_netlink_packet_flows(
