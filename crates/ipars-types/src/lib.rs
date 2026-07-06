@@ -186,6 +186,17 @@ impl EndpointCandidate {
     }
 }
 
+pub fn endpoint_addr_is_usable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return false;
+    }
+
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_broadcast(),
+        IpAddr::V6(_) => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointCandidateKind {
@@ -3291,6 +3302,37 @@ mod tests {
             51820,
         );
         assert_eq!(candidate.validate_kind_address(), Ok(()));
+    }
+
+    #[test]
+    fn endpoint_addr_usability_rejects_unrouteable_session_endpoints() {
+        let unusable = [
+            std::net::SocketAddr::from(([203, 0, 113, 10], 0)),
+            std::net::SocketAddr::from(([0, 0, 0, 0], 51820)),
+            std::net::SocketAddr::from(([224, 0, 0, 1], 51820)),
+            std::net::SocketAddr::from(([255, 255, 255, 255], 51820)),
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 51820),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+        ];
+        for addr in unusable {
+            assert!(!endpoint_addr_is_usable(addr), "{addr} should be unusable");
+        }
+
+        let usable = [
+            std::net::SocketAddr::from(([10, 0, 0, 1], 51820)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 51820)),
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 51820),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+        ];
+        for addr in usable {
+            assert!(endpoint_addr_is_usable(addr), "{addr} should be usable");
+        }
     }
 
     #[test]

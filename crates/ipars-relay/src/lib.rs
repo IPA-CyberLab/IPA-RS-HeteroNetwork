@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -8,7 +8,7 @@ use ipars_types::api::{
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
     RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
 };
-use ipars_types::{HealthState, NodeId, RelayCapability};
+use ipars_types::{endpoint_addr_is_usable, HealthState, NodeId, RelayCapability};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, RwLock};
@@ -477,8 +477,8 @@ fn validate_relay_session_admission(
     if admission.left == admission.right || admission.left_addr == admission.right_addr {
         return Err(RelayError::AdmissionDenied);
     }
-    if !relay_session_addr_is_usable(admission.left_addr)
-        || !relay_session_addr_is_usable(admission.right_addr)
+    if !endpoint_addr_is_usable(admission.left_addr)
+        || !endpoint_addr_is_usable(admission.right_addr)
     {
         return Err(RelayError::AdmissionDenied);
     }
@@ -491,16 +491,6 @@ fn validate_relay_session_admission(
         return Err(RelayError::InvalidSessionCredential);
     }
     Ok(())
-}
-
-fn relay_session_addr_is_usable(addr: SocketAddr) -> bool {
-    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
-        return false;
-    }
-    match addr.ip() {
-        IpAddr::V4(ip) => !ip.is_broadcast(),
-        IpAddr::V6(_) => true,
-    }
 }
 
 fn validate_relay_frame_sizes(

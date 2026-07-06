@@ -8,9 +8,9 @@ use ipars_types::api::{
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    AclAction, AclRule, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState,
-    NatClassification, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
-    PathScore, PathState, PeerPathKey, TransportProtocol,
+    endpoint_addr_is_usable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
+    NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, TransportProtocol,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -770,23 +770,9 @@ fn fresh_endpoint_candidates(
     candidates
         .iter()
         .filter(|candidate| endpoint_candidate_is_fresh(candidate, now, ttl_seconds))
-        .filter(|candidate| endpoint_candidate_is_usable(candidate))
+        .filter(|candidate| endpoint_addr_is_usable(candidate.addr))
         .cloned()
         .collect()
-}
-
-fn endpoint_candidate_is_usable(candidate: &EndpointCandidate) -> bool {
-    if candidate.addr.port() == 0
-        || candidate.addr.ip().is_unspecified()
-        || candidate.addr.ip().is_multicast()
-    {
-        return false;
-    }
-
-    match candidate.addr.ip() {
-        std::net::IpAddr::V4(ip) => !ip.is_broadcast(),
-        std::net::IpAddr::V6(_) => true,
-    }
 }
 
 fn endpoint_candidate_is_fresh(

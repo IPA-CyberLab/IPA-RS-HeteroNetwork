@@ -70,10 +70,10 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord,
-    PathScore, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
-    TransportProtocol,
+    endpoint_addr_is_usable, AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy,
+    EndpointCandidate, HealthState, KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord,
+    PathMetrics, PathRecord, PathScore, PathState, RelayCapability, Route, SignedJoinToken,
+    TokenLedgerMetrics, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -8211,7 +8211,7 @@ fn relay_admission_request(
 fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr> {
     candidates
         .iter()
-        .filter(|candidate| relay_session_endpoint_is_usable(candidate.addr))
+        .filter(|candidate| endpoint_addr_is_usable(candidate.addr))
         .filter_map(|candidate| {
             relay_session_endpoint_rank(candidate).map(|rank| (rank, candidate))
         })
@@ -8222,17 +8222,6 @@ fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr
                 .then_with(|| right.priority.cmp(&left.priority))
         })
         .map(|(_, candidate)| candidate.addr)
-}
-
-fn relay_session_endpoint_is_usable(addr: SocketAddr) -> bool {
-    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
-        return false;
-    }
-
-    match addr.ip() {
-        IpAddr::V4(ip) => !ip.is_broadcast(),
-        IpAddr::V6(_) => true,
-    }
 }
 
 fn relay_session_endpoint_rank(candidate: &EndpointCandidate) -> Option<u8> {

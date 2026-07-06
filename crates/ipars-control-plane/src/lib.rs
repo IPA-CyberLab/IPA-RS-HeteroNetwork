@@ -16,9 +16,10 @@ use ipars_types::api::{
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
-    AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
-    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    endpoint_addr_is_usable, AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate,
+    HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState,
+    RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus,
+    TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -1200,7 +1201,7 @@ where
                 .filter(|peer| peer.node_id != source.node_id)
                 .filter_map(|peer| acl_filter_peer(source, peer, &self.config.cluster_policy))
                 .map(|peer| {
-                    filter_stale_endpoint_candidates(
+                    filter_served_endpoint_candidates(
                         peer,
                         generated_at,
                         &self.config.cluster_policy,
@@ -1238,7 +1239,7 @@ where
                     }
                 })
                 .map(|peer| {
-                    filter_stale_endpoint_candidates(
+                    filter_served_endpoint_candidates(
                         peer,
                         generated_at,
                         &self.config.cluster_policy,
@@ -1299,13 +1300,14 @@ fn peer_map_visibility_metrics(
     metrics
 }
 
-fn filter_stale_endpoint_candidates(
+fn filter_served_endpoint_candidates(
     mut node: NodeRecord,
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> NodeRecord {
     node.endpoint_candidates.retain(|candidate| {
         endpoint_candidate_is_fresh(candidate, now, policy.endpoint_candidate_ttl_seconds)
+            && endpoint_addr_is_usable(candidate.addr)
     });
     node
 }
@@ -1903,6 +1905,13 @@ mod tests {
             priority: 100,
             cost: 10,
             source: CandidateSource::StunProbe,
+        }
+    }
+
+    fn candidate_at(node_id: &str, addr: std::net::SocketAddr) -> EndpointCandidate {
+        EndpointCandidate {
+            addr,
+            ..candidate(node_id)
         }
     }
 
@@ -2592,6 +2601,109 @@ mod tests {
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.stale_endpoint_candidate_count, 2);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 30);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_filters_unusable_endpoint_candidates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let source = node_record("source");
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![
+            candidate_at("peer-a", std::net::SocketAddr::from(([203, 0, 113, 10], 0))),
+            candidate_at("peer-a", std::net::SocketAddr::from(([0, 0, 0, 0], 51820))),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([224, 0, 0, 1], 51820)),
+            ),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([255, 255, 255, 255], 51820)),
+            ),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([198, 51, 100, 20], 51820)),
+            ),
+        ];
+        let mut relay = node_record("relay-a");
+        relay.endpoint_candidates = vec![
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 51820),
+            ),
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                    51820,
+                ),
+            ),
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::from(([198, 51, 100, 30], 51820)),
+            ),
+        ];
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            ..relay_capability()
+        });
+
+        store.insert_node(source.clone()).await?;
+        store.insert_node(peer).await?;
+        store.insert_node(relay).await?;
+        store
+            .upsert_health(
+                node_id("relay-a"),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.10),
+                    message: None,
+                },
+            )
+            .await?;
+
+        let peer_map = plane.peer_map_for(&source.node_id).await?;
+        let peer = peer_map
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == node_id("peer-a"))
+            .ok_or("peer should remain visible with usable candidate")?;
+        assert_eq!(
+            peer.endpoint_candidates
+                .iter()
+                .map(|candidate| candidate.addr)
+                .collect::<Vec<_>>(),
+            vec![std::net::SocketAddr::from(([198, 51, 100, 20], 51820))]
+        );
+
+        let relay_registration = plane
+            .register_with_claims(
+                claims(ClusterId::from_string("cluster-a")),
+                registration_request("node-b"),
+            )
+            .await?;
+        let relay = relay_registration
+            .relay_map
+            .relays
+            .iter()
+            .find(|relay| relay.node_id == node_id("relay-a"))
+            .ok_or("relay should remain visible with usable candidate")?;
+        assert_eq!(
+            relay
+                .endpoint_candidates
+                .iter()
+                .map(|candidate| candidate.addr)
+                .collect::<Vec<_>>(),
+            vec![std::net::SocketAddr::from(([198, 51, 100, 30], 51820))]
+        );
         Ok(())
     }
 
