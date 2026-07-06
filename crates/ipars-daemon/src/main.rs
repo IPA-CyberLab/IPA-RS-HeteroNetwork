@@ -1653,6 +1653,9 @@ fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()
     if value.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
     }
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{label} must not contain whitespace");
+    }
     if value.contains('/') && !Path::new(value).is_absolute() {
         anyhow::bail!("{label} must be a bare command name or an absolute path");
     }
@@ -2250,6 +2253,7 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
 }
 
 fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    validate_runtime_program_token(program, "configured userspace WireGuard command")?;
     if program.contains('/') {
         let program_path = Path::new(program);
         anyhow::ensure!(
@@ -15596,6 +15600,43 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(error
             .to_string()
             .contains("must be a bare command name or an absolute path"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn userspace_wireguard_command_rejects_whitespace() -> anyhow::Result<()> {
+        for command in ["wireguard go", "/usr/local/bin/wireguard go"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--wireguard-backend",
+                "userspace-command",
+                "--userspace-wireguard-command",
+                command,
+            ])?;
+
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard command"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--userspace-wireguard-command must not contain whitespace"),
+                    "unexpected error for {command}: {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let error = match ensure_runtime_program_ready("wireguard go", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful whitespace command preflight"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not contain whitespace"));
 
         Ok(())
     }

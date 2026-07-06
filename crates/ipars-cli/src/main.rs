@@ -3077,6 +3077,9 @@ fn validate_docker_runtime_program_token(value: &str, label: &str) -> anyhow::Re
     if value.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
     }
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{label} must not contain whitespace");
+    }
     if value.contains('/') && !Path::new(value).is_absolute() {
         anyhow::bail!("{label} must be a bare command name or an absolute path");
     }
@@ -7862,6 +7865,17 @@ mod tests {
         assert!(relative_command.to_string().contains(
             "--userspace-wireguard-command must be a bare command name or an absolute path"
         ));
+
+        let whitespace_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("whitespace userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(whitespace_command
+            .to_string()
+            .contains("--userspace-wireguard-command must not contain whitespace"));
 
         let oversized_command = match docker_install_plan(DockerInstallArgs {
             userspace_wireguard_command: Some(
