@@ -248,16 +248,50 @@ fn open_netlink_socket_in_namespace(
         )
     })?;
 
-    nix::sched::setns(&target_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from)?;
+    set_thread_netns(&target_namespace)?;
+    let restore_guard = ThreadNetnsRestoreGuard::new(current_namespace);
     let socket = Socket::new(protocol);
-    let restore =
-        nix::sched::setns(&current_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from);
+    let restore = restore_guard.restore();
 
     match (socket, restore) {
         (_, Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Ok(socket), Ok(())) => Ok(socket),
     }
+}
+
+struct ThreadNetnsRestoreGuard {
+    namespace: File,
+    restored: bool,
+}
+
+impl ThreadNetnsRestoreGuard {
+    fn new(namespace: File) -> Self {
+        Self {
+            namespace,
+            restored: false,
+        }
+    }
+
+    fn restore(mut self) -> io::Result<()> {
+        let result = set_thread_netns(&self.namespace);
+        if result.is_ok() {
+            self.restored = true;
+        }
+        result
+    }
+}
+
+impl Drop for ThreadNetnsRestoreGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = set_thread_netns(&self.namespace);
+        }
+    }
+}
+
+fn set_thread_netns(namespace: &File) -> io::Result<()> {
+    nix::sched::setns(namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from)
 }
 
 fn open_current_thread_netns() -> io::Result<File> {
@@ -1848,6 +1882,67 @@ mod tests {
             Err(RouteManagerError::InvalidNamespace(name)) if name == "-node-a"
         ));
         Ok(())
+    }
+
+    #[test]
+    fn netlink_namespace_context_restores_after_error_and_nested_scope(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let outer = LinuxNetworkNamespace::from_name("outer-ns")?;
+        let inner = LinuxNetworkNamespace::from_name("inner-ns")?;
+
+        let error = match with_netlink_namespace(Some(&outer), || {
+            assert_eq!(
+                current_test_netlink_namespace_name().as_deref(),
+                Some("outer-ns")
+            );
+            let nested: io::Result<()> = with_netlink_namespace(Some(&inner), || {
+                assert_eq!(
+                    current_test_netlink_namespace_name().as_deref(),
+                    Some("inner-ns")
+                );
+                Err(io::Error::other("nested failure"))
+            });
+            assert_eq!(
+                current_test_netlink_namespace_name().as_deref(),
+                Some("outer-ns")
+            );
+            nested
+        }) {
+            Ok(()) => return Err("nested namespace operation should fail".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "nested failure");
+        assert_eq!(current_test_netlink_namespace_name(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn netlink_namespace_context_restores_after_panic() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("panic-ns")?;
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_netlink_namespace(Some(&namespace), || -> io::Result<()> {
+                assert_eq!(
+                    current_test_netlink_namespace_name().as_deref(),
+                    Some("panic-ns")
+                );
+                panic!("forced namespace panic");
+            });
+        });
+
+        assert!(result.is_err());
+        assert_eq!(current_test_netlink_namespace_name(), None);
+        Ok(())
+    }
+
+    fn current_test_netlink_namespace_name() -> Option<String> {
+        NETLINK_NAMESPACE.with(|namespace| {
+            namespace
+                .borrow()
+                .as_ref()
+                .map(|namespace| namespace.name().to_string())
+        })
     }
 
     #[test]
