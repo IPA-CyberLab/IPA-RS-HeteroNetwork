@@ -874,8 +874,27 @@ impl LoadReport {
                 self.daemon_processes
             );
         }
+        let expected_roles = self.expected_daemon_child_roles();
+        if exited_roles != expected_roles {
+            bail!(
+                "daemon load scenario retained manifest child roles {:?} do not match expected {:?}",
+                exited_roles,
+                expected_roles
+            );
+        }
 
         Ok(())
+    }
+
+    fn expected_daemon_child_roles(&self) -> Vec<String> {
+        let mut roles = Vec::with_capacity(self.daemon_processes);
+        roles.extend(
+            (0..self.daemon_control_plane_processes).map(|index| format!("control-plane-{index}")),
+        );
+        roles.extend(["relay", "signal", "stun"].into_iter().map(str::to_string));
+        roles.extend((0..self.daemon_agent_processes).map(|_| "agent".to_string()));
+        roles.sort();
+        roles
     }
 }
 
@@ -4045,6 +4064,37 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("scenario workload"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut mismatched_child_roles = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_child_roles,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_child_roles.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_child_roles.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(relay) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "relay")
+            {
+                relay.role = "agent".to_string();
+            }
+        })?;
+        let error = match mismatched_child_roles.validate_success() {
+            Ok(_) => bail!("retained manifest with mismatched child roles should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("child roles"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut incomplete_retained_manifest_fields = daemon_report.clone();
