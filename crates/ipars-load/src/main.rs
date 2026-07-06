@@ -903,6 +903,12 @@ impl LoadReport {
                             child.role
                         );
                     }
+                    if let Some(exit_code) = child.exit_code {
+                        bail!(
+                            "daemon load scenario retained manifest exited child {} recorded numeric exit code {exit_code}; expected harness-controlled shutdown",
+                            child.role
+                        );
+                    }
                     exited_roles.push(child.role.clone());
                 }
             }
@@ -2768,7 +2774,16 @@ fn stop_daemon_children(children: &mut [DaemonChild]) -> anyhow::Result<()> {
                 status: status.to_string(),
                 code: status.code(),
             });
-            continue;
+            let log_tail = daemon_child
+                .log_tail()
+                .map(|tail| format!("\n{tail}"))
+                .unwrap_or_default();
+            bail!(
+                "iparsd {} process exited before completed manifest shutdown: {}{}",
+                daemon_child.role,
+                status,
+                log_tail
+            );
         }
         daemon_child.child.kill().with_context(|| {
             format!(
@@ -4245,6 +4260,38 @@ mod tests {
         assert!(error.contains("child roles"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut numeric_child_exit_code = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &numeric_child_exit_code,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        numeric_child_exit_code.daemon_runtime_dir = Some(runtime_dir.clone());
+        numeric_child_exit_code.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                agent.exit_status = Some("exit status: 7".to_string());
+                agent.exit_code = Some(7);
+            }
+        })?;
+        let error = match numeric_child_exit_code.validate_success() {
+            Ok(_) => bail!("retained manifest with numeric child exit code should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("numeric exit code"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut duplicated_manifest_endpoint = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &duplicated_manifest_endpoint,
@@ -4714,6 +4761,51 @@ mod tests {
         assert_eq!(
             manifest.children[0].log_tail_sha256.as_deref(),
             Some(diagnostics.tail_sha256.as_str())
+        );
+        drop(group);
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_completed_manifest_rejects_pre_shutdown_child_exit() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("completed-pre-shutdown-exit");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut group = synthetic_daemon_group(runtime_dir.clone(), true);
+        group.agent_urls = vec!["http://127.0.0.1:31006".to_string()];
+        let log_path = runtime_dir.join("0000-agent.log");
+        std::fs::write(&log_path, "agent exited before shutdown\n")?;
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 13"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn synthetic pre-shutdown child")?;
+        let status = child
+            .wait()
+            .context("failed to wait for synthetic pre-shutdown child")?;
+        assert_eq!(status.code(), Some(13));
+        group.children.push(DaemonChild {
+            role: "agent".to_string(),
+            child,
+            log_path: Some(log_path),
+            last_exit: None,
+        });
+
+        let error = match group.stop_all_for_completed_manifest() {
+            Ok(_) => bail!("pre-shutdown child exit should fail completed manifest generation"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("exited before completed manifest shutdown"));
+        assert!(error.contains("13"));
+        assert_eq!(
+            group.children[0].last_exit,
+            Some(DaemonChildExit {
+                status: "exit status: 13".to_string(),
+                code: Some(13),
+            })
         );
         drop(group);
         std::fs::remove_dir_all(&runtime_dir)?;
@@ -5735,7 +5827,7 @@ mod tests {
                 DaemonRuntimeManifestChildState::Running
             },
             exit_status: exited.then(|| "signal: 15 (SIGTERM)".to_string()),
-            exit_code: exited.then_some(143),
+            exit_code: None,
         })
     }
 }
