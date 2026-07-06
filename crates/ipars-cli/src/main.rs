@@ -5100,8 +5100,14 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_secondary_cluster_ip.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-secondary-cluster-ip requires --expose-agent-api");
     }
+    if args.agent_api_service_type != "ClusterIP" && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-service-type requires --expose-agent-api");
+    }
     if args.agent_api_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-port requires --expose-agent-api");
+    }
+    if args.agent_api_target_port.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-target-port requires --expose-agent-api");
     }
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
@@ -5153,6 +5159,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_secondary_cluster_ip.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-secondary-cluster-ip requires --expose-relay");
+    }
+    if args.relay_service_type != "LoadBalancer" && !args.expose_relay {
+        anyhow::bail!("--relay-service-type requires --expose-relay");
     }
     if args.relay_udp_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-port requires --expose-relay");
@@ -9393,15 +9402,18 @@ mod tests {
     }
 
     #[test]
-    fn k8s_install_plan_wires_agent_api_target_port_without_service_exposure() -> anyhow::Result<()>
-    {
+    fn k8s_install_plan_rejects_agent_api_target_port_without_service_exposure(
+    ) -> anyhow::Result<()> {
         let mut args = base_k8s_install_args();
         args.agent_api_target_port = Some(9790);
 
-        let plan = k8s_install_plan(args)?;
-        let helm = &plan.commands[2];
-        assert!(helm.contains("--set agent.apiService.targetPort=9790"));
-        assert!(!helm.contains("--set agent.apiService.enabled=true"));
+        let error = match k8s_install_plan(args) {
+            Ok(_) => anyhow::bail!("inactive agent API targetPort override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--agent-api-target-port requires --expose-agent-api"));
         Ok(())
     }
 
@@ -12469,6 +12481,35 @@ mod tests {
         assert!(error.contains(
             "--allow-cluster-external-traffic-policy requires at least one exposed NodePort or LoadBalancer Service with externalTrafficPolicy=Cluster"
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_inactive_service_type_and_target_port_overrides() -> anyhow::Result<()> {
+        let mut inactive_agent_type = base_k8s_install_args();
+        inactive_agent_type.agent_api_service_type = "NodePort".to_string();
+        let error = match k8s_install_plan(inactive_agent_type) {
+            Ok(_) => panic!("inactive agent API Service type override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-type requires --expose-agent-api"));
+
+        let mut inactive_agent_target_port = base_k8s_install_args();
+        inactive_agent_target_port.agent_api_target_port = Some(9790);
+        let error = match k8s_install_plan(inactive_agent_target_port) {
+            Ok(_) => panic!("inactive agent API targetPort override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-target-port requires --expose-agent-api"));
+
+        let mut inactive_relay_type = base_k8s_install_args();
+        inactive_relay_type.relay_service_type = "ClusterIP".to_string();
+        let error = match k8s_install_plan(inactive_relay_type) {
+            Ok(_) => panic!("inactive relay Service type override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-service-type requires --expose-relay"));
 
         Ok(())
     }

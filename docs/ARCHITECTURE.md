@@ -188,6 +188,8 @@ Fixed Kubernetes ClusterIPs, LoadBalancer IPs, and externalIPs are rejected when
 Service discovery and its RBAC-only namespace/selector settings are rejected when `serviceExposure.enabled=false`, so disabled Kubernetes underlay route application cannot still render Service-list permissions.
 Agent API NetworkPolicy ingress rules follow the configured `agent.apiService.targetPort` value, and relay NetworkPolicy ingress rules follow the configured relay target ports, keeping CIDR allowlists aligned when operators override Service ports.
 
+`ipars k8s install` rejects Service type or targetPort overrides for inactive agent API or relay Services before emitting Helm values, matching the chart's direct-value inactive exposure checks.
+
 Direct Helm values for agent and relay Service and target ports, NodePorts, LoadBalancer health-check NodePorts, session-affinity timeouts, peer-map cadence, relay-forwarder supervision limits, relay advertisement capacity, Kubernetes route intervals, probe/lifecycle/scheduling fields, and rollout/PodDisruptionBudget integer-or-percent values are validated as bounded non-negative integers or bounded integer-percentage values before template `int` conversion, preventing non-numeric strings, fractional values, oversized numeric values, or empty required numeric fields from being silently coerced during rendering.
 
 CNI-owned pod networking remains the responsibility of the cluster CNI.
