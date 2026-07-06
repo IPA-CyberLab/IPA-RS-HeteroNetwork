@@ -8416,6 +8416,8 @@ mod tests {
         ));
         assert!(network_policy_template
             .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
+        assert!(network_policy_template.contains("port: {{ .Values.agent.apiService.port }}"));
+        assert!(!network_policy_template.contains("port: 9780"));
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));

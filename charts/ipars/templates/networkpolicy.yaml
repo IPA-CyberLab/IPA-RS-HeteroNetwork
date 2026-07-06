@@ -60,7 +60,7 @@ spec:
 {{- end }}
       ports:
         - protocol: TCP
-          port: 9780
+          port: {{ .Values.agent.apiService.port }}
 {{- end }}
 {{- if and $agentApiNetworkPolicyEnabled $relayNetworkPolicyEnabled }}
 ---
