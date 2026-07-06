@@ -9363,6 +9363,7 @@ struct PacketFlowFingerprint {
     protocol: Option<u8>,
     source_port: Option<u16>,
     destination_port: Option<u16>,
+    application: AgentPacketFlowApplication,
     conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
     tcp_state: Option<AgentPacketFlowTcpState>,
 }
@@ -9375,6 +9376,7 @@ impl From<&PacketFlowRecord> for PacketFlowFingerprint {
             protocol: flow.observation.protocol.map(transport_protocol_number),
             source_port: flow.observation.source_port,
             destination_port: flow.observation.destination_port,
+            application: flow.observation.application(),
             conntrack_status: flow.observation.conntrack_status.clone(),
             tcp_state: flow.observation.tcp_state,
         }
@@ -14576,6 +14578,33 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }]);
         assert_eq!(retained.len(), 1);
         assert_eq!(duplicates, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_deduper_keeps_application_classification_changes() -> anyhow::Result<()> {
+        let base = PacketFlowRecord {
+            destination: "100.64.0.11".parse()?,
+            observation: AgentPacketFlowObservation {
+                source: Some("192.0.2.10".parse()?),
+                protocol: Some(TransportProtocol::Tcp),
+                source_port: Some(54_321),
+                destination_port: Some(15_432),
+                ..AgentPacketFlowObservation::default()
+            },
+        };
+        let mut classified = base.clone();
+        classified.observation.application = Some(AgentPacketFlowApplication::Postgres);
+
+        let mut deduper = PacketFlowDeduper::new(Some(Duration::from_secs(60)));
+        let (retained, duplicates) =
+            deduper.retain_new(vec![base.clone(), classified.clone(), classified.clone()]);
+        assert_eq!(retained, vec![base.clone(), classified.clone()]);
+        assert_eq!(duplicates, 1);
+
+        let (retained, duplicates) = deduper.retain_new(vec![base, classified]);
+        assert!(retained.is_empty());
+        assert_eq!(duplicates, 2);
         Ok(())
     }
 
