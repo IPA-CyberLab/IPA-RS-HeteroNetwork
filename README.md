@@ -81,7 +81,7 @@ post-write validated owner-only regular private runtime files using the selected
 relay/route-provider distribution for the launched agent prefix and all runtime control-plane
 bootstrap URLs, and passes
 `--join-token-path` so token material is not exposed through child process argv, then scrubs those
-token files after agent readiness. Daemon transport
+token files after agent readiness and agent state files after child shutdown. Daemon transport
 probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
 min/max plus full source/target edge consistency, then stops one control-plane process when
 redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps.
@@ -92,7 +92,7 @@ failed control-plane failover, all-unreachable path negotiation, relay-candidate
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
 readiness-timeout, endpoint, child-role, or child exit-status/code skew, file-backed log diagnostic
-mismatch, retained file permission/owner drift, retained join-token residue after final child shutdown, or daemon health inconsistencies fail the run
+mismatch, retained file permission/owner drift, retained secret-bearing runtime residue after final child shutdown, or daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
 records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced
 runtime manifest, and reports log tails
