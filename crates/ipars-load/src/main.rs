@@ -204,6 +204,10 @@ struct LoadReport {
     relay_udp_packets_received: usize,
     relay_udp_payload_bytes_sent: u64,
     relay_udp_payload_bytes_received: u64,
+    daemon_failover_relay_udp_packets_sent: usize,
+    daemon_failover_relay_udp_packets_received: usize,
+    daemon_failover_relay_udp_payload_bytes_sent: u64,
+    daemon_failover_relay_udp_payload_bytes_received: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
     relay_available_sessions_reported: usize,
@@ -573,6 +577,32 @@ impl LoadReport {
                             "daemon load scenario failover agent path min/max is invalid: min={}, max={}",
                             self.daemon_agent_failover_path_count_min,
                             self.daemon_agent_failover_path_count_max
+                        );
+                    }
+                    let expected_failover_relay_packets = self.active_pair_count;
+                    if self.daemon_failover_relay_udp_packets_sent
+                        != expected_failover_relay_packets
+                    {
+                        bail!(
+                            "daemon load scenario failover relay dataplane sent {} packets, expected {expected_failover_relay_packets}",
+                            self.daemon_failover_relay_udp_packets_sent
+                        );
+                    }
+                    if self.daemon_failover_relay_udp_packets_received
+                        != expected_failover_relay_packets
+                    {
+                        bail!(
+                            "daemon load scenario failover relay dataplane received {} packets, expected {expected_failover_relay_packets}",
+                            self.daemon_failover_relay_udp_packets_received
+                        );
+                    }
+                    if self.daemon_failover_relay_udp_payload_bytes_sent
+                        != self.daemon_failover_relay_udp_payload_bytes_received
+                    {
+                        bail!(
+                            "daemon load scenario failover relay payload byte mismatch: sent {}, received {}",
+                            self.daemon_failover_relay_udp_payload_bytes_sent,
+                            self.daemon_failover_relay_udp_payload_bytes_received
                         );
                     }
                     if self.daemon_control_plane_failover_peer_map_edges_min != expected_peer_edges
@@ -1589,6 +1619,10 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_udp_packets_received: 0,
         relay_udp_payload_bytes_sent: 0,
         relay_udp_payload_bytes_received: 0,
+        daemon_failover_relay_udp_packets_sent: 0,
+        daemon_failover_relay_udp_packets_received: 0,
+        daemon_failover_relay_udp_payload_bytes_sent: 0,
+        daemon_failover_relay_udp_payload_bytes_received: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -1815,6 +1849,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_udp_packets_received: 0,
         relay_udp_payload_bytes_sent: 0,
         relay_udp_payload_bytes_received: 0,
+        daemon_failover_relay_udp_packets_sent: 0,
+        daemon_failover_relay_udp_packets_received: 0,
+        daemon_failover_relay_udp_payload_bytes_sent: 0,
+        daemon_failover_relay_udp_payload_bytes_received: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -2015,6 +2053,10 @@ async fn run_relay_udp_scenario(
         relay_udp_packets_received: packets_received,
         relay_udp_payload_bytes_sent: payload_bytes_sent,
         relay_udp_payload_bytes_received: payload_bytes_received,
+        daemon_failover_relay_udp_packets_sent: 0,
+        daemon_failover_relay_udp_packets_received: 0,
+        daemon_failover_relay_udp_payload_bytes_sent: 0,
+        daemon_failover_relay_udp_payload_bytes_received: 0,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -2266,6 +2308,7 @@ async fn run_daemon_scenario(
     let mut relay_payload_bytes_sent = 0_u64;
     let mut relay_payload_bytes_received = 0_u64;
     let mut receive_buffer = vec![0_u8; relay_options.payload_bytes];
+    let mut relay_admissions = Vec::with_capacity(active_pair_count);
     for pair_index in 0..active_pair_count {
         let admission: RelayAdmissionResponse = post_json(
             &client,
@@ -2279,6 +2322,7 @@ async fn run_daemon_scenario(
             "daemon relay admission",
         )
         .await?;
+        relay_admissions.push(admission.clone());
         for packet_index in 0..relay_options.packets_per_session {
             let payload = relay_payload(pair_index, packet_index, relay_options.payload_bytes);
             let datagram =
@@ -2373,6 +2417,10 @@ async fn run_daemon_scenario(
     let mut failover_agent_reachable_paths_total = 0;
     let mut failover_agent_path_count_min = 0;
     let mut failover_agent_path_count_max = 0;
+    let mut failover_relay_udp_packets_sent = 0;
+    let mut failover_relay_udp_packets_received = 0;
+    let mut failover_relay_udp_payload_bytes_sent = 0_u64;
+    let mut failover_relay_udp_payload_bytes_received = 0_u64;
     if services.control_plane_urls.len() > 1 {
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
         let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
@@ -2420,6 +2468,36 @@ async fn run_daemon_scenario(
             failover_agent_path_summary.reachable_path_count_total;
         failover_agent_path_count_min = failover_agent_path_summary.path_count_min;
         failover_agent_path_count_max = failover_agent_path_summary.path_count_max;
+        for (pair_index, admission) in relay_admissions.iter().enumerate() {
+            let packet_index = relay_options.packets_per_session;
+            let payload = relay_payload(pair_index, packet_index, relay_options.payload_bytes);
+            let datagram =
+                encode_relay_datagram(&admission.session_id, &admission.session_token, &payload)?;
+            left_socket
+                .send_to(&datagram, services.relay_udp_addr)
+                .await?;
+            failover_relay_udp_packets_sent += 1;
+            failover_relay_udp_payload_bytes_sent =
+                failover_relay_udp_payload_bytes_sent.saturating_add(payload.len() as u64);
+            let (len, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                right_socket.recv_from(&mut receive_buffer),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out waiting for daemon relay UDP failover payload after stopping {stopped_role}"
+                )
+            })??;
+            if &receive_buffer[..len] != payload.as_slice() {
+                bail!(
+                    "daemon relay UDP failover payload mismatch for pair {pair_index} after stopping {stopped_role}"
+                );
+            }
+            failover_relay_udp_packets_received += 1;
+            failover_relay_udp_payload_bytes_received =
+                failover_relay_udp_payload_bytes_received.saturating_add(len as u64);
+        }
         let failover_probe = daemon_peer_map_probe(&client, &survivor_urls, &agent_statuses)
             .await
             .with_context(|| {
@@ -2508,6 +2586,10 @@ async fn run_daemon_scenario(
         relay_udp_packets_received: relay_packets_received,
         relay_udp_payload_bytes_sent: relay_payload_bytes_sent,
         relay_udp_payload_bytes_received: relay_payload_bytes_received,
+        daemon_failover_relay_udp_packets_sent: failover_relay_udp_packets_sent,
+        daemon_failover_relay_udp_packets_received: failover_relay_udp_packets_received,
+        daemon_failover_relay_udp_payload_bytes_sent: failover_relay_udp_payload_bytes_sent,
+        daemon_failover_relay_udp_payload_bytes_received: failover_relay_udp_payload_bytes_received,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -7650,6 +7732,18 @@ mod tests {
         assert_eq!(report.relay_udp_packets_sent, report.active_pair_count);
         assert_eq!(report.relay_udp_packets_received, report.active_pair_count);
         assert_eq!(
+            report.daemon_failover_relay_udp_packets_sent,
+            report.active_pair_count
+        );
+        assert_eq!(
+            report.daemon_failover_relay_udp_packets_received,
+            report.active_pair_count
+        );
+        assert_eq!(
+            report.daemon_failover_relay_udp_payload_bytes_sent,
+            report.daemon_failover_relay_udp_payload_bytes_received
+        );
+        assert_eq!(
             report.relay_active_sessions_reported,
             report.active_pair_count
         );
@@ -7737,6 +7831,11 @@ mod tests {
         report.relay_udp_packets_received = report.active_pair_count;
         report.relay_udp_payload_bytes_sent = report.active_pair_count as u64 * 64;
         report.relay_udp_payload_bytes_received = report.relay_udp_payload_bytes_sent;
+        report.daemon_failover_relay_udp_packets_sent = report.active_pair_count;
+        report.daemon_failover_relay_udp_packets_received = report.active_pair_count;
+        report.daemon_failover_relay_udp_payload_bytes_sent = report.active_pair_count as u64 * 64;
+        report.daemon_failover_relay_udp_payload_bytes_received =
+            report.daemon_failover_relay_udp_payload_bytes_sent;
         report.relay_forwarded_bytes_reported = report.relay_udp_payload_bytes_received;
         report.relay_udp_sessions = report.active_pair_count;
         report.relay_active_sessions_reported = report.active_pair_count;
