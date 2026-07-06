@@ -1296,6 +1296,8 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) {
+        let remote = record.key.remote.clone();
+        let selected_state = record.selected_state;
         let previous = self.path_state.write().await.insert(
             (record.key.local.clone(), record.key.remote.clone()),
             record.clone(),
@@ -1312,6 +1314,9 @@ impl AgentRuntime {
                 events.pop_front();
             }
             events.push_back(event);
+        }
+        if selected_state != PathState::Relay {
+            self.remove_relay_session(&remote).await;
         }
     }
 
@@ -1395,7 +1400,9 @@ impl AgentRuntime {
     }
 
     pub async fn remove_relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
-        self.relay_sessions.write().await.remove(peer)
+        let removed = self.relay_sessions.write().await.remove(peer);
+        self.remove_relay_forwarder_endpoint(peer).await;
+        removed
     }
 
     pub async fn upsert_relay_forwarder_endpoint(&self, peer: NodeId, endpoint: SocketAddr) {
@@ -3642,6 +3649,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_direct_path_state_clears_relay_session_and_forwarder_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local, peer.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore {
+                    value: 110.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await;
+
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
     async fn runtime_records_path_change_events_and_metrics() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -4100,6 +4153,12 @@ mod tests {
                 expires_at: now + ChronoDuration::seconds(120),
             })
             .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
 
         assert!(
             !runtime
@@ -4133,6 +4192,7 @@ mod tests {
         );
         assert!(runtime.remove_relay_session(&peer).await.is_some());
         assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
     #[tokio::test]
