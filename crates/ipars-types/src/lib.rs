@@ -3379,10 +3379,50 @@ pub mod api {
         if payload.len() < 12 {
             return false;
         }
-        let frame_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let frame_len =
+            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
         let api_key = u16::from_be_bytes([payload[4], payload[5]]);
         let api_version = u16::from_be_bytes([payload[6], payload[7]]);
-        (8..=100_000_000).contains(&frame_len) && api_key <= 75 && api_version <= 20
+        if !(8..=100_000_000).contains(&frame_len) || api_key > 92 || api_version > 20 {
+            return false;
+        }
+        let Some(frame_end) = 4_usize.checked_add(frame_len) else {
+            return false;
+        };
+        if frame_end < 12 {
+            return false;
+        }
+        if frame_len == 8 {
+            return true;
+        }
+        if payload.len() < 14 {
+            return false;
+        }
+        kafka_client_id_header_payload(&payload[12..], frame_len - 8)
+    }
+
+    fn kafka_client_id_header_payload(payload: &[u8], remaining_frame_len: usize) -> bool {
+        if remaining_frame_len < 2 || payload.len() < 2 {
+            return false;
+        }
+        let client_id_len = i16::from_be_bytes([payload[0], payload[1]]);
+        if client_id_len == -1 {
+            return true;
+        }
+        if client_id_len < 0 {
+            return false;
+        }
+        let client_id_len = client_id_len as usize;
+        let Some(header_len) = 2_usize.checked_add(client_id_len) else {
+            return false;
+        };
+        if client_id_len > 1_024 || header_len > remaining_frame_len {
+            return false;
+        }
+        if payload.len() < header_len {
+            return true;
+        }
+        std::str::from_utf8(&payload[2..header_len]).is_ok()
     }
 
     fn nats_payload(payload: &[u8]) -> bool {
@@ -5648,6 +5688,31 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
             api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0, 0, 0, 21, 0, 18, 0, 3, 0, 0, 0, 1, 0, 11, b'r', b'u', b's', b't', b'-', b'c',
+                b'l', b'i', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 7, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 0, 93, 0, 1, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 10, 0, 18, 0, 3, 0, 0, 0, 1, 0, 4]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 10, 0, 18, 0, 3, 0, 0, 0, 1, 0xff, 0xfe])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"CONNECT {\"verbose\":false}\r\n").application(),
