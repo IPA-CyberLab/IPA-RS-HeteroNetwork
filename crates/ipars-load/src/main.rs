@@ -243,6 +243,8 @@ struct LoadReport {
     daemon_control_plane_failover_peer_maps_consistent: bool,
     daemon_control_plane_failover_metrics_endpoints: usize,
     daemon_control_plane_failover_metrics_consistent: bool,
+    daemon_control_plane_failover_relay_candidates_min: usize,
+    daemon_control_plane_failover_relay_candidates_max: usize,
     daemon_control_plane_failover_path_count_min: usize,
     daemon_control_plane_failover_path_count_max: usize,
     daemon_control_plane_failover_reachable_path_count_min: usize,
@@ -253,6 +255,12 @@ struct LoadReport {
     daemon_control_plane_failover_path_status_reachable_count_min: usize,
     daemon_control_plane_failover_path_status_reachable_count_max: usize,
     daemon_control_plane_failover_path_status_stale_count_max: usize,
+    daemon_control_plane_failover_healthy_nodes_min: usize,
+    daemon_control_plane_failover_healthy_nodes_max: usize,
+    daemon_control_plane_failover_degraded_nodes_min: usize,
+    daemon_control_plane_failover_degraded_nodes_max: usize,
+    daemon_control_plane_failover_unhealthy_nodes_min: usize,
+    daemon_control_plane_failover_unhealthy_nodes_max: usize,
     daemon_control_plane_relay_candidates_min: usize,
     daemon_control_plane_relay_candidates_max: usize,
     daemon_control_plane_path_count_min: usize,
@@ -537,6 +545,17 @@ impl LoadReport {
                             "daemon load scenario failover control-plane metrics are inconsistent"
                         );
                     }
+                    if self.daemon_control_plane_failover_relay_candidates_min != self.relay_count
+                        || self.daemon_control_plane_failover_relay_candidates_max
+                            != self.relay_count
+                    {
+                        bail!(
+                            "daemon load scenario failover relay candidate mismatch: min/max={}/{}, expected {}",
+                            self.daemon_control_plane_failover_relay_candidates_min,
+                            self.daemon_control_plane_failover_relay_candidates_max,
+                            self.relay_count
+                        );
+                    }
                     if self.daemon_control_plane_failover_path_count_min < expected_agent_path_count
                         || self.daemon_control_plane_failover_reachable_path_count_min
                             < expected_agent_path_count
@@ -572,6 +591,20 @@ impl LoadReport {
                             self.daemon_control_plane_failover_path_status_reachable_count_min,
                             self.daemon_control_plane_failover_path_status_reachable_count_max,
                             self.daemon_control_plane_failover_path_status_stale_count_max
+                        );
+                    }
+                    if self.daemon_control_plane_failover_healthy_nodes_min != self.node_count
+                        || self.daemon_control_plane_failover_healthy_nodes_max != self.node_count
+                        || self.daemon_control_plane_failover_degraded_nodes_max != 0
+                        || self.daemon_control_plane_failover_unhealthy_nodes_max != 0
+                    {
+                        bail!(
+                            "daemon load scenario failover health mismatch: healthy min/max={}/{}, degraded max={}, unhealthy max={}, expected {} healthy nodes",
+                            self.daemon_control_plane_failover_healthy_nodes_min,
+                            self.daemon_control_plane_failover_healthy_nodes_max,
+                            self.daemon_control_plane_failover_degraded_nodes_max,
+                            self.daemon_control_plane_failover_unhealthy_nodes_max,
+                            self.node_count
                         );
                     }
                 }
@@ -1542,6 +1575,8 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_failover_metrics_endpoints: 0,
         daemon_control_plane_failover_metrics_consistent: false,
+        daemon_control_plane_failover_relay_candidates_min: 0,
+        daemon_control_plane_failover_relay_candidates_max: 0,
         daemon_control_plane_failover_path_count_min: 0,
         daemon_control_plane_failover_path_count_max: 0,
         daemon_control_plane_failover_reachable_path_count_min: 0,
@@ -1552,6 +1587,12 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_failover_path_status_reachable_count_min: 0,
         daemon_control_plane_failover_path_status_reachable_count_max: 0,
         daemon_control_plane_failover_path_status_stale_count_max: 0,
+        daemon_control_plane_failover_healthy_nodes_min: 0,
+        daemon_control_plane_failover_healthy_nodes_max: 0,
+        daemon_control_plane_failover_degraded_nodes_min: 0,
+        daemon_control_plane_failover_degraded_nodes_max: 0,
+        daemon_control_plane_failover_unhealthy_nodes_min: 0,
+        daemon_control_plane_failover_unhealthy_nodes_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -1752,6 +1793,8 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_failover_metrics_endpoints: 0,
         daemon_control_plane_failover_metrics_consistent: false,
+        daemon_control_plane_failover_relay_candidates_min: 0,
+        daemon_control_plane_failover_relay_candidates_max: 0,
         daemon_control_plane_failover_path_count_min: 0,
         daemon_control_plane_failover_path_count_max: 0,
         daemon_control_plane_failover_reachable_path_count_min: 0,
@@ -1762,6 +1805,12 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_failover_path_status_reachable_count_min: 0,
         daemon_control_plane_failover_path_status_reachable_count_max: 0,
         daemon_control_plane_failover_path_status_stale_count_max: 0,
+        daemon_control_plane_failover_healthy_nodes_min: 0,
+        daemon_control_plane_failover_healthy_nodes_max: 0,
+        daemon_control_plane_failover_degraded_nodes_min: 0,
+        daemon_control_plane_failover_degraded_nodes_max: 0,
+        daemon_control_plane_failover_unhealthy_nodes_min: 0,
+        daemon_control_plane_failover_unhealthy_nodes_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -1936,6 +1985,8 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_failover_metrics_endpoints: 0,
         daemon_control_plane_failover_metrics_consistent: false,
+        daemon_control_plane_failover_relay_candidates_min: 0,
+        daemon_control_plane_failover_relay_candidates_max: 0,
         daemon_control_plane_failover_path_count_min: 0,
         daemon_control_plane_failover_path_count_max: 0,
         daemon_control_plane_failover_reachable_path_count_min: 0,
@@ -1946,6 +1997,12 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_failover_path_status_reachable_count_min: 0,
         daemon_control_plane_failover_path_status_reachable_count_max: 0,
         daemon_control_plane_failover_path_status_stale_count_max: 0,
+        daemon_control_plane_failover_healthy_nodes_min: 0,
+        daemon_control_plane_failover_healthy_nodes_max: 0,
+        daemon_control_plane_failover_degraded_nodes_min: 0,
+        daemon_control_plane_failover_degraded_nodes_max: 0,
+        daemon_control_plane_failover_unhealthy_nodes_min: 0,
+        daemon_control_plane_failover_unhealthy_nodes_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -2213,6 +2270,8 @@ async fn run_daemon_scenario(
     let mut failover_peer_maps_consistent = false;
     let mut failover_metrics_endpoints = 0;
     let mut failover_metrics_consistent = false;
+    let mut failover_relay_candidates_min = 0;
+    let mut failover_relay_candidates_max = 0;
     let mut failover_path_count_min = 0;
     let mut failover_path_count_max = 0;
     let mut failover_reachable_path_count_min = 0;
@@ -2223,6 +2282,12 @@ async fn run_daemon_scenario(
     let mut failover_path_status_reachable_count_min = 0;
     let mut failover_path_status_reachable_count_max = 0;
     let mut failover_path_status_stale_count_max = 0;
+    let mut failover_healthy_nodes_min = 0;
+    let mut failover_healthy_nodes_max = 0;
+    let mut failover_degraded_nodes_min = 0;
+    let mut failover_degraded_nodes_max = 0;
+    let mut failover_unhealthy_nodes_min = 0;
+    let mut failover_unhealthy_nodes_max = 0;
     if services.control_plane_urls.len() > 1 {
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
         let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
@@ -2248,10 +2313,18 @@ async fn run_daemon_scenario(
                 .context(failover_metrics_context)?;
         failover_metrics_endpoints = failover_control_summary.endpoint_count;
         failover_metrics_consistent = failover_control_summary.metrics_consistent();
+        failover_relay_candidates_min = failover_control_summary.relay_candidate_count_min;
+        failover_relay_candidates_max = failover_control_summary.relay_candidate_count_max;
         failover_path_count_min = failover_control_summary.path_count_min;
         failover_path_count_max = failover_control_summary.path_count_max;
         failover_reachable_path_count_min = failover_control_summary.reachable_path_count_min;
         failover_reachable_path_count_max = failover_control_summary.reachable_path_count_max;
+        failover_healthy_nodes_min = failover_control_summary.healthy_node_count_min;
+        failover_healthy_nodes_max = failover_control_summary.healthy_node_count_max;
+        failover_degraded_nodes_min = failover_control_summary.degraded_node_count_min;
+        failover_degraded_nodes_max = failover_control_summary.degraded_node_count_max;
+        failover_unhealthy_nodes_min = failover_control_summary.unhealthy_node_count_min;
+        failover_unhealthy_nodes_max = failover_control_summary.unhealthy_node_count_max;
         control_plane_http_requests += failover_control_summary.endpoint_count;
         let failover_path_status = daemon_control_plane_path_status_summary(
             &client,
@@ -2348,6 +2421,8 @@ async fn run_daemon_scenario(
         daemon_control_plane_failover_peer_maps_consistent: failover_peer_maps_consistent,
         daemon_control_plane_failover_metrics_endpoints: failover_metrics_endpoints,
         daemon_control_plane_failover_metrics_consistent: failover_metrics_consistent,
+        daemon_control_plane_failover_relay_candidates_min: failover_relay_candidates_min,
+        daemon_control_plane_failover_relay_candidates_max: failover_relay_candidates_max,
         daemon_control_plane_failover_path_count_min: failover_path_count_min,
         daemon_control_plane_failover_path_count_max: failover_path_count_max,
         daemon_control_plane_failover_reachable_path_count_min: failover_reachable_path_count_min,
@@ -2361,6 +2436,12 @@ async fn run_daemon_scenario(
             failover_path_status_reachable_count_max,
         daemon_control_plane_failover_path_status_stale_count_max:
             failover_path_status_stale_count_max,
+        daemon_control_plane_failover_healthy_nodes_min: failover_healthy_nodes_min,
+        daemon_control_plane_failover_healthy_nodes_max: failover_healthy_nodes_max,
+        daemon_control_plane_failover_degraded_nodes_min: failover_degraded_nodes_min,
+        daemon_control_plane_failover_degraded_nodes_max: failover_degraded_nodes_max,
+        daemon_control_plane_failover_unhealthy_nodes_min: failover_unhealthy_nodes_min,
+        daemon_control_plane_failover_unhealthy_nodes_max: failover_unhealthy_nodes_max,
         daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
         daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
         daemon_control_plane_path_count_min: control_path_summary.path_count_min,
@@ -7377,6 +7458,8 @@ mod tests {
         assert!(report.daemon_control_plane_failover_peer_maps_consistent);
         assert_eq!(report.daemon_control_plane_failover_metrics_endpoints, 1);
         assert!(report.daemon_control_plane_failover_metrics_consistent);
+        assert_eq!(report.daemon_control_plane_failover_relay_candidates_min, 1);
+        assert_eq!(report.daemon_control_plane_failover_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_failover_path_count_min >= 2);
         assert!(report.daemon_control_plane_failover_reachable_path_count_min >= 2);
         assert_eq!(report.daemon_control_plane_failover_path_status_requests, 2);
@@ -7386,6 +7469,13 @@ mod tests {
             report.daemon_control_plane_failover_path_status_stale_count_max,
             0
         );
+        assert!(report.daemon_control_plane_failover_healthy_nodes_min >= 2);
+        assert_eq!(
+            report.daemon_control_plane_failover_healthy_nodes_min,
+            report.daemon_control_plane_failover_healthy_nodes_max
+        );
+        assert_eq!(report.daemon_control_plane_failover_degraded_nodes_max, 0);
+        assert_eq!(report.daemon_control_plane_failover_unhealthy_nodes_max, 0);
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
         assert!(report.daemon_control_plane_healthy_nodes >= 2);
@@ -7536,6 +7626,8 @@ mod tests {
         report.daemon_control_plane_failover_peer_maps_consistent = true;
         report.daemon_control_plane_failover_metrics_endpoints = 1;
         report.daemon_control_plane_failover_metrics_consistent = true;
+        report.daemon_control_plane_failover_relay_candidates_min = report.relay_count;
+        report.daemon_control_plane_failover_relay_candidates_max = report.relay_count;
         report.daemon_control_plane_failover_path_count_min = expected_agent_path_count;
         report.daemon_control_plane_failover_path_count_max = expected_agent_path_count;
         report.daemon_control_plane_failover_reachable_path_count_min = expected_agent_path_count;
@@ -7549,6 +7641,12 @@ mod tests {
         report.daemon_control_plane_failover_path_status_reachable_count_max =
             expected_agent_path_count;
         report.daemon_control_plane_failover_path_status_stale_count_max = 0;
+        report.daemon_control_plane_failover_healthy_nodes_min = report.node_count;
+        report.daemon_control_plane_failover_healthy_nodes_max = report.node_count;
+        report.daemon_control_plane_failover_degraded_nodes_min = 0;
+        report.daemon_control_plane_failover_degraded_nodes_max = 0;
+        report.daemon_control_plane_failover_unhealthy_nodes_min = 0;
+        report.daemon_control_plane_failover_unhealthy_nodes_max = 0;
         report.daemon_control_plane_relay_candidates_min = report.relay_count;
         report.daemon_control_plane_relay_candidates_max = report.relay_count;
         report.daemon_control_plane_path_count_min = expected_agent_path_count;

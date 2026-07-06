@@ -84,11 +84,12 @@ bootstrap URLs, and passes
 token files after agent readiness and agent state files after child shutdown. Daemon transport
 probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
 min/max plus full source/target edge consistency, then stops one control-plane process when
-redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps.
+redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps,
+relay-candidate metrics, health metrics, and path status.
 Load reports are validated before CLI success so missing
 registrations, agent status endpoint coverage, agent endpoint candidates, agent path-state endpoint coverage,
 advertised route loss, missing control-plane metrics endpoint coverage, cross-control-plane skew,
-failed control-plane failover, missing failover survivor control-plane path metrics or status, all-unreachable path negotiation, missing agent runtime or control-plane path-status reachable paths, relay-candidate loss, relay packet
+failed control-plane failover, missing failover survivor relay/health/path metrics or path status, all-unreachable path negotiation, missing agent runtime or control-plane path-status reachable paths, relay-candidate loss, relay packet
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
 readiness-timeout, endpoint, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
