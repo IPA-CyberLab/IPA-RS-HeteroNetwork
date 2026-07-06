@@ -1725,6 +1725,10 @@ mod tests {
         missing_public_endpoint.public_endpoint = None;
         invalid_capabilities.push(missing_public_endpoint);
 
+        let mut unusable_public_endpoint = relay_capability();
+        unusable_public_endpoint.public_endpoint = Some(SocketAddr::from(([0, 0, 0, 0], 51820)));
+        invalid_capabilities.push(unusable_public_endpoint);
+
         let mut missing_admission_url = relay_capability();
         missing_admission_url.admission_url = None;
         invalid_capabilities.push(missing_admission_url);

@@ -1526,6 +1526,9 @@ fn validate_agent_relay_capability_config(args: &AgentArgs) -> anyhow::Result<()
             "--relay-public-endpoint and --relay-admission-url must be set together for relay capability advertisement"
         );
     }
+    if let Some(public_endpoint) = args.relay_public_endpoint {
+        validate_usable_socket_endpoint(public_endpoint, "--relay-public-endpoint")?;
+    }
     if let Some(admission_url) = args.relay_admission_url.as_deref() {
         validate_http_url(admission_url, "--relay-admission-url")?;
     }
@@ -11785,6 +11788,28 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-max-mbps must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "0.0.0.0:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_public_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-public-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
         } else {
             anyhow::bail!("expected agent command");
         }

@@ -713,7 +713,7 @@ impl RelayCapability {
 
     pub fn can_admit(&self) -> bool {
         self.enabled_by_policy
-            && self.public_endpoint.is_some()
+            && self.public_endpoint.is_some_and(endpoint_addr_is_usable)
             && self.admission_url.is_some()
             && self.e2e_only
             && self.available_capacity() > 0
@@ -3460,6 +3460,25 @@ mod tests {
 
         assert!(relay.can_admit());
         assert_eq!(relay.available_capacity(), 1);
+    }
+
+    #[test]
+    fn relay_rejects_unusable_public_endpoint() {
+        let mut relay = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 51820))),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+
+        assert!(!relay.can_admit());
+
+        relay.public_endpoint = Some(std::net::SocketAddr::from(([203, 0, 113, 10], 0)));
+
+        assert!(!relay.can_admit());
     }
 
     #[test]
