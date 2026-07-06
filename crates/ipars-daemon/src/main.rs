@@ -8651,6 +8651,15 @@ fn validate_ebpf_packet_flow_transport_metadata(event: &PacketFlowEvent) -> anyh
         event.tcp_state,
         event.protocol
     );
+    let protocol_has_ports = matches!(
+        event.protocol,
+        PACKET_FLOW_PROTOCOL_TCP | PACKET_FLOW_PROTOCOL_UDP
+    );
+    anyhow::ensure!(
+        protocol_has_ports || (event.source_port() == 0 && event.destination_port() == 0),
+        "unsupported eBPF packet-flow port metadata for protocol code {}",
+        event.protocol
+    );
     Ok(())
 }
 
@@ -11920,10 +11929,22 @@ mod tests {
             .to_string()
             .contains("unsupported eBPF packet-flow TCP state"));
 
+        let mut inconsistent_port_metadata = event;
+        inconsistent_port_metadata[2] = PACKET_FLOW_PROTOCOL_ICMP;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&inconsistent_port_metadata) {
+            Ok(_) => anyhow::bail!("port metadata on non-port eBPF event should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow port metadata"));
+
         let mut unknown_protocol = event;
         unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
+        unknown_protocol[8..10].copy_from_slice(&0_u16.to_be_bytes());
         let flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_protocol)?;
         assert_eq!(flow.observation.protocol, None);
+        assert_eq!(flow.observation.destination_port, None);
 
         let mut unsupported_protocol = event;
         unsupported_protocol[2] = 132;
