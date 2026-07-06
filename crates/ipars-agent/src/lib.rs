@@ -2674,6 +2674,7 @@ pub struct PeerMapApplySummary {
     pub peers_applied: usize,
     pub peers_removed: usize,
     pub routes_applied: usize,
+    pub routes_removed: usize,
 }
 
 #[derive(Debug)]
@@ -2684,6 +2685,7 @@ pub struct PeerMapApplier<W, R> {
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
     lazy_runtime: Option<Arc<AgentRuntime>>,
     applied_peers: tokio::sync::RwLock<BTreeSet<NodeId>>,
+    applied_routes: tokio::sync::RwLock<BTreeMap<NodeId, Vec<Route>>>,
 }
 
 impl<W, R> PeerMapApplier<W, R>
@@ -2699,6 +2701,7 @@ where
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
             lazy_runtime: None,
             applied_peers: tokio::sync::RwLock::new(BTreeSet::new()),
+            applied_routes: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -2746,17 +2749,38 @@ where
         peers_to_remove.extend(stale_peers);
 
         let mut peers_removed = 0;
+        let mut routes_removed = 0;
         for peer in peers_to_remove {
             let was_applied = self.applied_peers.read().await.contains(&peer);
             if !was_applied {
                 continue;
             }
+            let routes_to_remove = self
+                .applied_routes
+                .read()
+                .await
+                .get(&peer)
+                .cloned()
+                .unwrap_or_default();
+            if !routes_to_remove.is_empty() {
+                self.route_manager
+                    .remove_routes(RoutePlan {
+                        interface: self.interface.clone(),
+                        routes: routes_to_remove.clone(),
+                        policy_rules: Vec::new(),
+                    })
+                    .await?;
+                routes_removed += routes_to_remove.len();
+                self.applied_routes.write().await.remove(&peer);
+            }
             self.wireguard.remove_peer(&peer).await?;
             self.applied_peers.write().await.remove(&peer);
+            self.applied_routes.write().await.remove(&peer);
             peers_removed += 1;
         }
 
         let mut routes = Vec::new();
+        let mut peer_routes = BTreeMap::new();
         let mut peers_applied = 0;
 
         for peer in peer_map.peers {
@@ -2783,8 +2807,33 @@ where
                 .insert(peer.node_id.clone());
             peers_applied += 1;
 
-            routes.push(peer_host_route(&peer)?);
-            routes.extend(peer.routes);
+            let desired_routes = peer_routes_for_record(&peer)?;
+            let routes_to_remove = self
+                .applied_routes
+                .read()
+                .await
+                .get(&peer.node_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|route| !desired_routes.contains(route))
+                .collect::<Vec<_>>();
+            if !routes_to_remove.is_empty() {
+                self.route_manager
+                    .remove_routes(RoutePlan {
+                        interface: self.interface.clone(),
+                        routes: routes_to_remove.clone(),
+                        policy_rules: Vec::new(),
+                    })
+                    .await?;
+                routes_removed += routes_to_remove.len();
+                if let Some(applied) = self.applied_routes.write().await.get_mut(&peer.node_id) {
+                    applied.retain(|route| !routes_to_remove.contains(route));
+                }
+            }
+
+            routes.extend(desired_routes.iter().cloned());
+            peer_routes.insert(peer.node_id.clone(), desired_routes);
         }
 
         let routes_applied = routes.len();
@@ -2796,12 +2845,17 @@ where
                     policy_rules: Vec::new(),
                 })
                 .await?;
+            let mut applied_routes = self.applied_routes.write().await;
+            for (peer, routes) in peer_routes {
+                applied_routes.insert(peer, routes);
+            }
         }
 
         Ok(PeerMapApplySummary {
             peers_applied,
             peers_removed,
             routes_applied,
+            routes_removed,
         })
     }
 }
@@ -2865,6 +2919,12 @@ fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
         metric: 10,
         tags: peer.tags.clone(),
     })
+}
+
+fn peer_routes_for_record(peer: &NodeRecord) -> Result<Vec<Route>, AgentError> {
+    let mut routes = vec![peer_host_route(peer)?];
+    routes.extend(peer.routes.iter().cloned());
+    Ok(routes)
 }
 
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
@@ -5007,6 +5067,7 @@ mod tests {
                 peers_applied: 1,
                 peers_removed: 0,
                 routes_applied: 2,
+                routes_removed: 0,
             }
         );
 
@@ -5030,6 +5091,129 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_routes_for_stale_peer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-stale");
+        let advertised_route = Route {
+            id: "advertised-stale".to_string(),
+            cidr: "10.11.0.0/16".parse()?,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)),
+            "wg-peer-stale",
+            Vec::new(),
+            vec![advertised_route.clone()],
+        );
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 0,
+                peers_removed: 1,
+                routes_applied: 0,
+                routes_removed: 2,
+            }
+        );
+        assert!(!applier.wireguard.peers.read().await.contains_key(&peer_id));
+        let removed = applier.route_manager.removed.read().await;
+        let plan = removed
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing remove route plan".to_string()))?;
+        assert_eq!(plan.interface, "ipars0");
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].cidr, "100.64.0.3/32".parse()?);
+        assert_eq!(plan.routes[1], advertised_route);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_dropped_advertised_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-routes");
+        let advertised_route = Route {
+            id: "advertised-routes".to_string(),
+            cidr: "10.12.0.0/16".parse()?,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer_with_route = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)),
+            "wg-peer-routes",
+            Vec::new(),
+            vec![advertised_route.clone()],
+        );
+        let peer_without_route = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)),
+            "wg-peer-routes",
+            Vec::new(),
+            Vec::new(),
+        );
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_with_route],
+                generated_at: Utc::now(),
+            })
+            .await?;
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_without_route],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 0,
+                routes_applied: 1,
+                routes_removed: 1,
+            }
+        );
+        let removed = applier.route_manager.removed.read().await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].routes, vec![advertised_route]);
         Ok(())
     }
 
@@ -5179,6 +5363,7 @@ mod tests {
                 peers_applied: 2,
                 peers_removed: 0,
                 routes_applied: 2,
+                routes_removed: 0,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
@@ -5202,6 +5387,7 @@ mod tests {
                 peers_applied: 1,
                 peers_removed: 1,
                 routes_applied: 1,
+                routes_removed: 1,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
@@ -5660,6 +5846,7 @@ mod tests {
             peers_applied: 3,
             peers_removed: 0,
             routes_applied: 5,
+            routes_removed: 0,
         });
         let sync = PeerMapSync::new(node_id.clone(), source.clone(), sink.clone());
 
@@ -5671,6 +5858,7 @@ mod tests {
                 peers_applied: 3,
                 peers_removed: 0,
                 routes_applied: 5,
+                routes_removed: 0,
             }
         );
         assert_eq!(source.requests.read().await.as_slice(), &[node_id]);

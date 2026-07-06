@@ -8831,6 +8831,7 @@ async fn run_peer_map_sync_loop<S, A>(
                 peers_applied = summary.peers_applied,
                 peers_removed = summary.peers_removed,
                 routes_applied = summary.routes_applied,
+                routes_removed = summary.routes_removed,
                 interface = %interface,
                 "applied control-plane peer map"
             ),
