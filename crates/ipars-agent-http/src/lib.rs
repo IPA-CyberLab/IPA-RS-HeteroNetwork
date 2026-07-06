@@ -1026,6 +1026,8 @@ mod tests {
             .await;
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
+        runtime
+            .record_packet_flow_filtered(AgentPacketFlowDropReason::InconsistentTransportMetadata);
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -1074,7 +1076,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
-        assert_eq!(metrics.packet_flow_filtered_count, 3);
+        assert_eq!(metrics.packet_flow_filtered_count, 4);
         assert!(metrics
             .packet_flow_classification_counts
             .iter()
@@ -1098,6 +1100,13 @@ mod tests {
             .iter()
             .any(
                 |entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch
+                    && entry.count == 1
+            ));
+        assert!(metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .any(
+                |entry| entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
                     && entry.count == 1
             ));
 
@@ -1147,6 +1156,9 @@ mod tests {
         ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"no_overlay_match\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"inconsistent_transport_metadata\"}} 1")
         ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{prometheus_node_id}\",classification=\"unknown\"}} 1")

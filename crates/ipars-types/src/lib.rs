@@ -1527,16 +1527,18 @@ pub mod api {
         Broadcast,
         LinkLocal,
         NoOverlayMatch,
+        InconsistentTransportMetadata,
     }
 
     impl AgentPacketFlowDropReason {
-        pub const ALL: [Self; 6] = [
+        pub const ALL: [Self; 7] = [
             Self::Unspecified,
             Self::Loopback,
             Self::Multicast,
             Self::Broadcast,
             Self::LinkLocal,
             Self::NoOverlayMatch,
+            Self::InconsistentTransportMetadata,
         ];
 
         pub const fn as_str(self) -> &'static str {
@@ -1547,6 +1549,7 @@ pub mod api {
                 Self::Broadcast => "broadcast",
                 Self::LinkLocal => "link_local",
                 Self::NoOverlayMatch => "no_overlay_match",
+                Self::InconsistentTransportMetadata => "inconsistent_transport_metadata",
             }
         }
     }

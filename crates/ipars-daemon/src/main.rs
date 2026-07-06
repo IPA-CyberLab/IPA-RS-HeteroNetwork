@@ -12410,6 +12410,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             AgentPacketFlowDropReason::NoOverlayMatch.as_str(),
             "no_overlay_match"
         );
+        assert_eq!(
+            AgentPacketFlowDropReason::InconsistentTransportMetadata.as_str(),
+            "inconsistent_transport_metadata"
+        );
         Ok(())
     }
 

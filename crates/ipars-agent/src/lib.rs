@@ -397,6 +397,7 @@ pub struct AgentRuntime {
     packet_flow_filtered_broadcast_count: AtomicU64,
     packet_flow_filtered_link_local_count: AtomicU64,
     packet_flow_filtered_no_overlay_match_count: AtomicU64,
+    packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64,
     packet_flow_classification_unknown_count: AtomicU64,
     packet_flow_classification_opening_count: AtomicU64,
     packet_flow_classification_unreplied_count: AtomicU64,
@@ -654,6 +655,7 @@ impl AgentRuntime {
             packet_flow_filtered_broadcast_count: AtomicU64::new(0),
             packet_flow_filtered_link_local_count: AtomicU64::new(0),
             packet_flow_filtered_no_overlay_match_count: AtomicU64::new(0),
+            packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64::new(0),
             packet_flow_classification_unknown_count: AtomicU64::new(0),
             packet_flow_classification_opening_count: AtomicU64::new(0),
             packet_flow_classification_unreplied_count: AtomicU64::new(0),
@@ -1159,6 +1161,12 @@ impl AgentRuntime {
         at: DateTime<Utc>,
         pin: bool,
     ) -> Option<AgentPacketFlowMatch> {
+        if observation.validate_transport_metadata().is_err() {
+            self.record_packet_flow_filtered(
+                AgentPacketFlowDropReason::InconsistentTransportMetadata,
+            );
+            return None;
+        }
         self.packet_flow_observation_count
             .fetch_add(1, Ordering::Relaxed);
         self.packet_flow_classification_counter(observation.classification())
@@ -1209,6 +1217,9 @@ impl AgentRuntime {
             AgentPacketFlowDropReason::LinkLocal => &self.packet_flow_filtered_link_local_count,
             AgentPacketFlowDropReason::NoOverlayMatch => {
                 &self.packet_flow_filtered_no_overlay_match_count
+            }
+            AgentPacketFlowDropReason::InconsistentTransportMetadata => {
+                &self.packet_flow_filtered_inconsistent_transport_metadata_count
             }
         }
     }
@@ -4508,6 +4519,74 @@ mod tests {
         );
         assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_rejects_inconsistent_transport_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                peer.vpn_ip.0,
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Icmp),
+                    destination_port: Some(8),
+                    ..Default::default()
+                },
+                Utc::now(),
+                true,
+            )
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                })
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_classification_counts
+                .iter()
+                .find(|entry| entry.classification == AgentPacketFlowClassification::Unknown)
+                .map(|entry| entry.count),
+            Some(0)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_application_counts
+                .iter()
+                .find(|entry| entry.application == AgentPacketFlowApplication::Unknown)
+                .map(|entry| entry.count),
+            Some(0)
+        );
         Ok(())
     }
 
