@@ -1585,6 +1585,9 @@ fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()
     if value.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
     }
+    if value.contains('/') && !Path::new(value).is_absolute() {
+        anyhow::bail!("{label} must be a bare command name or an absolute path");
+    }
     Ok(())
 }
 
@@ -2145,6 +2148,10 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
 fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
     if program.contains('/') {
         let program_path = Path::new(program);
+        anyhow::ensure!(
+            program_path.is_absolute(),
+            "configured userspace WireGuard command `{program}` must be a bare command name or an absolute path"
+        );
         if is_executable_file(program_path) {
             return Ok(());
         }
@@ -14671,6 +14678,45 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_command_rejects_relative_paths() -> anyhow::Result<()> {
+        for command in ["./wireguard-go", "bin/wireguard-go"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--wireguard-backend",
+                "userspace-command",
+                "--userspace-wireguard-command",
+                command,
+            ])?;
+
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard command"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--userspace-wireguard-command must be a bare command name or an absolute path"),
+                    "unexpected error for {command}: {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let error = match ensure_runtime_program_ready("./wireguard-go", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful relative command preflight"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must be a bare command name or an absolute path"));
+
+        Ok(())
     }
 
     #[test]
