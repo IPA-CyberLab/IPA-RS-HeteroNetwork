@@ -118,6 +118,7 @@ const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
@@ -1287,9 +1288,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--hole-punch-interval-millis",
         )?;
     }
-    validate_positive_seconds(
+    validate_bounded_u64(
         args.runtime_command_timeout_seconds,
         "--runtime-command-timeout-seconds",
+        MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS,
     )?;
     validate_userspace_wireguard_config(args)?;
     validate_runtime_backend_specific_args(args)?;
@@ -17147,6 +17149,15 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             (
                 vec!["iparsd", "agent", "--runtime-command-timeout-seconds", "0"],
                 "--runtime-command-timeout-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-command-timeout-seconds",
+                    "3601",
+                ],
+                "--runtime-command-timeout-seconds must not exceed 3600",
             ),
             (
                 vec!["iparsd", "agent", "--runtime-command-output-max-bytes", "0"],
