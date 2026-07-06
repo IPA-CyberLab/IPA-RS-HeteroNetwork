@@ -1938,6 +1938,9 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Https);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && wireguard_payload(payload) {
+                return Some(AgentPacketFlowApplication::WireGuard);
+            }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
             }
@@ -2480,6 +2483,19 @@ pub mod api {
             .checked_add(1)
             .and_then(|offset| offset.checked_add(scid_len))
             .is_some_and(|minimum_len| payload.len() >= minimum_len)
+    }
+
+    fn wireguard_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 {
+            return false;
+        }
+        match u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) {
+            1 => payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
+            2 => payload.len() >= 92,
+            3 => payload.len() >= 64,
+            4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
+            _ => false,
+        }
     }
 
     fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
@@ -3373,8 +3389,21 @@ mod tests {
             payload
         }
 
+        fn wireguard_message(message_type: u32, len: usize) -> Vec<u8> {
+            let mut payload = vec![0xa5; len];
+            payload[..4].copy_from_slice(&message_type.to_le_bytes());
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
+        let observation_for_udp_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(30123),
+            destination_port: Some(30234),
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
@@ -3523,6 +3552,34 @@ mod tests {
         };
         assert_eq!(
             non_quic_udp_443.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 128)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 64)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 92)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(3, 64)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 32)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 31)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&wireguard_message(2, 92)).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
