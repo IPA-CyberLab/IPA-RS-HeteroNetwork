@@ -843,6 +843,7 @@ impl LoadReport {
         let mut expected_runtime_entries = expected_daemon_retained_runtime_entries();
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
+        let mut seen_log_paths = BTreeSet::new();
         for child in &manifest.children {
             let Some(log_path) = &child.log_path else {
                 bail!(
@@ -901,6 +902,13 @@ impl LoadReport {
                     canonical_runtime_dir.display()
                 );
             }
+            if !seen_log_paths.insert(canonical_log_path.clone()) {
+                bail!(
+                    "daemon load scenario retained manifest child {} log {} is duplicated",
+                    child.role,
+                    canonical_log_path.display()
+                );
+            }
             let log_file_name = log_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -929,6 +937,13 @@ impl LoadReport {
                     log_diagnostics.bytes,
                     recorded_log_tail_sha256,
                     log_diagnostics.tail_sha256
+                );
+            }
+            if log_diagnostics.bytes == 0 {
+                bail!(
+                    "daemon load scenario retained manifest child {} log {} is empty",
+                    child.role,
+                    log_path.display()
                 );
             }
             match child.state {
@@ -4506,6 +4521,75 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("log diagnostics mismatch"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut duplicate_child_log_path = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &duplicate_child_log_path,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        duplicate_child_log_path.daemon_runtime_dir = Some(runtime_dir.clone());
+        duplicate_child_log_path.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            let duplicate_log_path = manifest.children[0].log_path.clone();
+            let duplicate_log_bytes = manifest.children[0].log_bytes;
+            let duplicate_log_tail_sha256 = manifest.children[0].log_tail_sha256.clone();
+            manifest.children[1].log_path = duplicate_log_path;
+            manifest.children[1].log_bytes = duplicate_log_bytes;
+            manifest.children[1].log_tail_sha256 = duplicate_log_tail_sha256;
+        })?;
+        let error = match duplicate_child_log_path.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with duplicate child log path should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicated"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut empty_child_log = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &empty_child_log,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        empty_child_log.daemon_runtime_dir = Some(runtime_dir.clone());
+        empty_child_log.daemon_runtime_manifest = Some(manifest_path.clone());
+        let empty_log_path = runtime_dir.join("0000-control-plane-0.log");
+        let empty_log_file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&empty_log_path)?;
+        empty_log_file.sync_all()?;
+        drop(empty_log_file);
+        let empty_log_diagnostics =
+            daemon_log_diagnostics(&empty_log_path).context("empty child log was unreadable")?;
+        let empty_log_bytes = empty_log_diagnostics.bytes;
+        let empty_log_tail_sha256 = empty_log_diagnostics.tail_sha256;
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[0].log_bytes = Some(empty_log_bytes);
+            manifest.children[0].log_tail_sha256 = Some(empty_log_tail_sha256.clone());
+        })?;
+        let error = match empty_child_log.validate_success() {
+            Ok(_) => bail!("retained manifest with empty child log should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("is empty"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         #[cfg(unix)]
