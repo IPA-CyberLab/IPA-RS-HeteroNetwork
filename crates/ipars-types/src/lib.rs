@@ -3639,6 +3639,10 @@ pub mod api {
     }
 
     fn amqp_payload(payload: &[u8]) -> bool {
+        amqp_protocol_header_payload(payload) || amqp_frame_payload(payload)
+    }
+
+    fn amqp_protocol_header_payload(payload: &[u8]) -> bool {
         if payload.len() < 8 || payload.get(..4) != Some(b"AMQP") {
             return false;
         }
@@ -3646,6 +3650,29 @@ pub mod api {
             (payload[4], payload[5], payload[6], payload[7]),
             (0, 0, 9, 1) | (0, 1, 0, 0) | (3, 1, 0, 0)
         )
+    }
+
+    fn amqp_frame_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let frame_type = payload[0];
+        let channel = u16::from_be_bytes([payload[1], payload[2]]);
+        let frame_size =
+            u32::from_be_bytes([payload[3], payload[4], payload[5], payload[6]]) as usize;
+        let Some(frame_end_offset) = 7_usize.checked_add(frame_size) else {
+            return false;
+        };
+        if frame_end_offset >= payload.len() || payload[frame_end_offset] != 0xce {
+            return false;
+        }
+        match frame_type {
+            1 => (4..=131_072).contains(&frame_size),
+            2 => channel != 0 && (14..=131_072).contains(&frame_size),
+            3 => channel != 0 && frame_size <= 16_777_216,
+            8 => channel == 0 && frame_size == 0,
+            _ => false,
+        }
     }
 
     fn cassandra_payload(payload: &[u8]) -> bool {
@@ -5691,7 +5718,27 @@ mod tests {
             api::AgentPacketFlowApplication::Amqp
         );
         assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[8, 0, 0, 0, 0, 0, 0, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
             observation_for_payload(b"AMQPxxxx").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[8, 0, 1, 0, 0, 0, 0, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[4, 0, 1, 0, 0, 0, 0, 0xce]).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
