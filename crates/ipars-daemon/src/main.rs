@@ -112,6 +112,9 @@ const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
+const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
+const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
@@ -1552,9 +1555,18 @@ fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
     }
+    anyhow::ensure!(
+        args.userspace_wireguard_args.len() <= MAX_USERSPACE_WIREGUARD_ARGS,
+        "--userspace-wireguard-arg may be repeated at most {MAX_USERSPACE_WIREGUARD_ARGS} times"
+    );
     for argument in &args.userspace_wireguard_args {
         if argument.is_empty() {
             anyhow::bail!("--userspace-wireguard-arg cannot be empty");
+        }
+        if argument.len() > MAX_USERSPACE_WIREGUARD_ARG_BYTES {
+            anyhow::bail!(
+                "--userspace-wireguard-arg exceeds {MAX_USERSPACE_WIREGUARD_ARG_BYTES} bytes"
+            );
         }
         if argument.chars().any(char::is_control) {
             anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
@@ -1566,6 +1578,9 @@ fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
 fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_RUNTIME_PROGRAM_TOKEN_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_RUNTIME_PROGRAM_TOKEN_BYTES} bytes");
     }
     if value.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
@@ -14656,6 +14671,71 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_process_config_rejects_oversized_tokens() -> anyhow::Result<()> {
+        let validate = |argv: Vec<String>, expected: &str| -> anyhow::Result<()> {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
+                );
+                return Ok(());
+            }
+
+            Err(anyhow::anyhow!("expected agent command"))
+        };
+
+        validate(
+            vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                "--userspace-wireguard-command".to_string(),
+                "x".repeat(MAX_RUNTIME_PROGRAM_TOKEN_BYTES + 1),
+            ],
+            "--userspace-wireguard-command exceeds 4096 bytes",
+        )?;
+
+        let mut too_many_args = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--wireguard-backend".to_string(),
+            "userspace-command".to_string(),
+            "--userspace-wireguard-command".to_string(),
+            "wireguard-go".to_string(),
+        ];
+        for index in 0..=MAX_USERSPACE_WIREGUARD_ARGS {
+            too_many_args.push("--userspace-wireguard-arg".to_string());
+            too_many_args.push(format!("arg-{index}"));
+        }
+        validate(
+            too_many_args,
+            "--userspace-wireguard-arg may be repeated at most 128 times",
+        )?;
+
+        validate(
+            vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                "--userspace-wireguard-command".to_string(),
+                "wireguard-go".to_string(),
+                "--userspace-wireguard-arg".to_string(),
+                "x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES + 1),
+            ],
+            "--userspace-wireguard-arg exceeds 4096 bytes",
+        )?;
+
+        Ok(())
     }
 
     #[test]
