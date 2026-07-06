@@ -1345,11 +1345,22 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.docker_route_interval_seconds,
             "--docker-route-interval-seconds",
         )?;
+        if let Some(namespace) = args.docker_container_namespace.as_deref() {
+            LinuxNetworkNamespace::from_name(namespace)?;
+        }
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
         } else if !args.docker_networks.is_empty() {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
         } else {
+            anyhow::ensure!(
+                args.docker_container_namespace.is_some(),
+                "--apply-docker-routes requires --docker-container-namespace unless --docker-discover-networks is set"
+            );
+            anyhow::ensure!(
+                !args.docker_container_cidrs.is_empty(),
+                "--apply-docker-routes requires at least one --docker-container-cidr unless --docker-discover-networks is set"
+            );
             validate_docker_container_cidrs(
                 "--docker-container-cidr",
                 &args.docker_container_cidrs,
@@ -1917,6 +1928,11 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
         if args.kubernetes_service_label_selector.is_some() {
             anyhow::bail!(
                 "--kubernetes-service-label-selector requires --kubernetes-discover-services"
+            );
+        }
+        if args.kubernetes_api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
+            anyhow::bail!(
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr unless --kubernetes-discover-services is set"
             );
         }
     }
@@ -14951,6 +14967,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "--apply-docker-routes",
             "--route-backend",
             "kernel-netlink",
+            "--docker-container-namespace",
+            "compose-default",
             "--docker-container-cidr",
             "172.18.0.0/16",
         ])?;
@@ -15992,6 +16010,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "172.18.0.0/16",
         ])?;
         if let Command::Agent(args) = missing_namespace.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Docker namespace should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("--apply-docker-routes requires --docker-container-namespace"));
             assert!(docker_network_intent(&args).is_err());
         }
 
@@ -16003,6 +16026,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "compose-default",
         ])?;
         if let Command::Agent(args) = missing_routes.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Docker CIDR should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error
+                .contains("--apply-docker-routes requires at least one --docker-container-cidr"));
             assert!(docker_network_intent(&args).is_err());
             return Ok(());
         }
@@ -16794,6 +16823,13 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-kubernetes-underlay"])?;
 
         if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Kubernetes routes should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
+            ));
             assert!(kubernetes_underlay_intent(&args, NodeId::from_string("local")).is_err());
             return Ok(());
         }
