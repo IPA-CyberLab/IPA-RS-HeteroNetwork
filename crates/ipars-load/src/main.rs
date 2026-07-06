@@ -980,6 +980,12 @@ impl LoadReport {
                     running_roles.push(child.role.clone());
                 }
                 DaemonRuntimeManifestChildState::Exited => {
+                    if child.pid.is_none() {
+                        bail!(
+                            "daemon load scenario retained manifest exited child {} is missing a PID",
+                            child.role
+                        );
+                    }
                     let Some(exit_status) = child.exit_status.as_deref() else {
                         bail!(
                             "daemon load scenario retained manifest exited child {} is missing exit status",
@@ -5174,6 +5180,39 @@ mod tests {
         assert!(error.contains("child roles"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut missing_child_pid = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &missing_child_pid,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        missing_child_pid.daemon_runtime_dir = Some(runtime_dir.clone());
+        missing_child_pid.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                agent.pid = None;
+            }
+        })?;
+        let error = match missing_child_pid.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with missing exited child PID should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing a PID"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut numeric_child_exit_code = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &numeric_child_exit_code,
@@ -6944,7 +6983,7 @@ mod tests {
             daemon_log_diagnostics(&log_path).context("synthetic manifest log was unreadable")?;
         Ok(DaemonRuntimeManifestChild {
             role: role.to_string(),
-            pid: (!exited).then_some(40_000 + index as u32),
+            pid: Some(40_000 + index as u32),
             log_path: Some(log_path),
             log_bytes: Some(log_diagnostics.bytes),
             log_tail_sha256: Some(log_diagnostics.tail_sha256),
