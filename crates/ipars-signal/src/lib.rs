@@ -770,8 +770,23 @@ fn fresh_endpoint_candidates(
     candidates
         .iter()
         .filter(|candidate| endpoint_candidate_is_fresh(candidate, now, ttl_seconds))
+        .filter(|candidate| endpoint_candidate_is_usable(candidate))
         .cloned()
         .collect()
+}
+
+fn endpoint_candidate_is_usable(candidate: &EndpointCandidate) -> bool {
+    if candidate.addr.port() == 0
+        || candidate.addr.ip().is_unspecified()
+        || candidate.addr.ip().is_multicast()
+    {
+        return false;
+    }
+
+    match candidate.addr.ip() {
+        std::net::IpAddr::V4(ip) => !ip.is_broadcast(),
+        std::net::IpAddr::V6(_) => true,
+    }
 }
 
 fn endpoint_candidate_is_fresh(
@@ -945,6 +960,13 @@ mod tests {
             priority: 100,
             cost: 10,
             source: CandidateSource::StunProbe,
+        }
+    }
+
+    fn candidate_at(kind: EndpointCandidateKind, addr: SocketAddr) -> EndpointCandidate {
+        EndpointCandidate {
+            addr,
+            ..candidate(kind)
         }
     }
 
@@ -1146,6 +1168,79 @@ mod tests {
     }
 
     #[test]
+    fn unusable_public_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([0, 0, 0, 0], 51820)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([203, 0, 113, 10], 0)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([224, 0, 0, 1], 51820)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([255, 255, 255, 255], 51820)),
+                ),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
+    fn unusable_ipv6_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 51820),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                        51820,
+                    ),
+                ),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
     fn stale_reflexive_candidate_is_not_used_for_nat_traversal() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
         let response = coordinator.negotiate(
@@ -1162,6 +1257,41 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
+    fn unusable_reflexive_candidate_is_not_used_for_nat_traversal_or_punch_plan() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let unusable_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([0, 0, 0, 0], 40000)),
+        );
+        let usable_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([198, 51, 100, 20], 40000)),
+        );
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![unusable_reflexive.clone()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![usable_reflexive.clone()]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+
+        let plan = coordinator.punch_plan(&[unusable_reflexive], None, &[usable_reflexive], None);
+
+        assert!(plan.source_reflexive.is_none());
+        assert_eq!(
+            plan.target_reflexive.map(|candidate| candidate.addr),
+            Some(SocketAddr::from(([198, 51, 100, 20], 40000)))
+        );
     }
 
     #[test]
