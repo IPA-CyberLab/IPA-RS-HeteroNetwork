@@ -6857,19 +6857,46 @@ fn kubernetes_api_base_url(
         validate_http_url(configured, "--kubernetes-api-url")?;
         return Ok(configured.trim_end_matches('/').to_string());
     }
-    let host = service_host
-        .and_then(OsStr::to_str)
-        .filter(|host| !host.is_empty())
-        .context("--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST")?;
-    let port = service_port
-        .and_then(OsStr::to_str)
-        .filter(|port| !port.is_empty())
-        .unwrap_or("443");
+    let Some(host) = service_host else {
+        anyhow::bail!(
+            "--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST"
+        );
+    };
+    let host = host
+        .to_str()
+        .context("KUBERNETES_SERVICE_HOST must be valid UTF-8")?;
+    if host.is_empty() {
+        anyhow::bail!(
+            "--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST"
+        );
+    }
+    let port = kubernetes_service_port(service_port)?;
     let host = match host.parse::<IpAddr>() {
         Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
         _ => host.to_string(),
     };
-    Ok(format!("https://{host}:{port}"))
+    let api_url = format!("https://{host}:{port}");
+    validate_http_url(&api_url, "KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT")?;
+    Ok(api_url)
+}
+
+fn kubernetes_service_port(service_port: Option<&OsStr>) -> anyhow::Result<u16> {
+    let Some(port) = service_port else {
+        return Ok(443);
+    };
+    let port = port
+        .to_str()
+        .context("KUBERNETES_SERVICE_PORT must be valid UTF-8")?;
+    if port.is_empty() {
+        return Ok(443);
+    }
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("KUBERNETES_SERVICE_PORT `{port}` must be an integer port"))?;
+    if port == 0 {
+        anyhow::bail!("KUBERNETES_SERVICE_PORT must be greater than zero");
+    }
+    Ok(port)
 }
 
 fn default_kubernetes_service_account_ca_cert() -> Option<PathBuf> {
@@ -18076,6 +18103,37 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
         assert!(numeric_host_error.contains(
             "--kubernetes-api-url must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        ));
+        let port_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("10.96.0.1")),
+            Some(std::ffi::OsStr::new("abc")),
+        ) {
+            Ok(url) => anyhow::bail!("invalid Kubernetes Service port should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(port_error.contains("KUBERNETES_SERVICE_PORT `abc` must be an integer port"));
+        let zero_port_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("10.96.0.1")),
+            Some(std::ffi::OsStr::new("0")),
+        ) {
+            Ok(url) => {
+                anyhow::bail!("zero Kubernetes Service port should be rejected: {url}");
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(zero_port_error.contains("KUBERNETES_SERVICE_PORT must be greater than zero"));
+        let env_host_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("0.0.0.0")),
+            Some(std::ffi::OsStr::new("443")),
+        ) {
+            Ok(url) => anyhow::bail!("unusable Kubernetes Service host should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(env_host_error.contains(
+            "KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
         ));
         Ok(())
     }
