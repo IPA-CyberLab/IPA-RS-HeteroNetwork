@@ -2723,6 +2723,11 @@ pub mod api {
         Some(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    fn read_u16_le(payload: &[u8], offset: usize) -> Option<u16> {
+        let bytes = payload.get(offset..offset.checked_add(2)?)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     fn read_u24_be(payload: &[u8], offset: usize) -> Option<usize> {
         let bytes = payload.get(offset..offset.checked_add(3)?)?;
         Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize)
@@ -2837,14 +2842,114 @@ pub mod api {
     }
 
     fn smb_payload(payload: &[u8]) -> bool {
-        smb_magic_at(payload, 0) || smb_magic_at(payload, 4)
+        smb_message_payload(payload, 0, None) || smb_direct_tcp_payload(payload)
     }
 
-    fn smb_magic_at(payload: &[u8], offset: usize) -> bool {
+    fn smb_direct_tcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 || payload[0] != 0 {
+            return false;
+        }
+        let message_len =
+            ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
+        if !(32..=16_777_215).contains(&message_len) {
+            return false;
+        }
+        if payload.len() > message_len.saturating_add(4) {
+            return false;
+        }
+        smb_message_payload(payload, 4, Some(message_len))
+    }
+
+    fn smb_message_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        let Some(protocol_id) = payload.get(offset..offset.saturating_add(4)) else {
+            return false;
+        };
+        match protocol_id {
+            [0xff, b'S', b'M', b'B'] => smb1_header_payload(payload, offset, declared_len),
+            [0xfe, b'S', b'M', b'B'] => smb2_header_payload(payload, offset, declared_len),
+            _ => false,
+        }
+    }
+
+    fn smb1_header_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        if declared_len.is_some_and(|len| len < 32) {
+            return false;
+        }
+        let Some(command) = payload.get(offset.saturating_add(4)) else {
+            return false;
+        };
+        if !smb1_command(*command) {
+            return false;
+        }
+        payload.len() >= offset.saturating_add(32)
+    }
+
+    fn smb1_command(command: u8) -> bool {
         matches!(
-            payload.get(offset..offset + 4),
-            Some([0xff, b'S', b'M', b'B']) | Some([0xfe, b'S', b'M', b'B'])
+            command,
+            0x04 | 0x06
+                | 0x07
+                | 0x08
+                | 0x0a
+                | 0x0b
+                | 0x0c
+                | 0x0d
+                | 0x0e
+                | 0x0f
+                | 0x10
+                | 0x11
+                | 0x12
+                | 0x1a
+                | 0x1d
+                | 0x23
+                | 0x24
+                | 0x25
+                | 0x26
+                | 0x2d
+                | 0x2e
+                | 0x2f
+                | 0x32
+                | 0x33
+                | 0x34
+                | 0x35
+                | 0x70
+                | 0x71
+                | 0x72
+                | 0x73
+                | 0x74
+                | 0x75
+                | 0x80
+                | 0xa0
+                | 0xa2
+                | 0xa4
+                | 0xa5
+                | 0xc0
+                | 0xd8
         )
+    }
+
+    fn smb2_header_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        if declared_len.is_some_and(|len| len < 64) {
+            return false;
+        }
+        let Some(structure_size) = read_u16_le(payload, offset.saturating_add(4)) else {
+            return false;
+        };
+        if structure_size != 64 {
+            return false;
+        }
+        if let Some(command) = read_u16_le(payload, offset.saturating_add(12)) {
+            if command > 0x12 {
+                return false;
+            }
+        }
+        if let Some(flags) = read_u32_le(payload, offset.saturating_add(16)) {
+            let known_flags = 0x0000_007f | 0x1000_0000 | 0x2000_0000;
+            if flags & !known_flags != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     fn rdp_payload(payload: &[u8]) -> bool {
@@ -5542,6 +5647,40 @@ mod tests {
                 0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00,
             ])
             .application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        let mut smb1_negotiate = vec![0x00, 0x00, 0x00, 0x20, 0xff, b'S', b'M', b'B', 0x72];
+        smb1_negotiate.resize(36, 0);
+        assert_eq!(
+            observation_for_payload(&smb1_negotiate).application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x41, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00])
+                .application(),
             api::AgentPacketFlowApplication::Smb
         );
         assert_eq!(
