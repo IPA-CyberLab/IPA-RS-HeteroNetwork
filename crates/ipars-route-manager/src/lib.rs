@@ -26,7 +26,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_ROUTE_COMMAND_ARG_BYTES: usize = 128 * 1024;
@@ -700,6 +702,7 @@ async fn run_system_route_command(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<(), RouteManagerError> {
+    validate_system_route_command_runtime_bounds(timeout, output_max_bytes)?;
     validate_linux_route_command(&command)?;
     let command_label = command_label(&command.program, &command.args);
     let output =
@@ -712,6 +715,36 @@ async fn run_system_route_command(
         "{command_label} failed: {}",
         command_stderr_message(&output.stderr)
     )))
+}
+
+fn validate_system_route_command_runtime_bounds(
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<(), RouteManagerError> {
+    if timeout.is_zero() {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command runtime bounds: timeout must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if timeout > MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command runtime bounds: timeout must not exceed {}s",
+            MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT.as_secs()
+        )));
+    }
+    if output_max_bytes == 0 {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command runtime bounds: output_max_bytes must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if output_max_bytes > MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command runtime bounds: output_max_bytes must not exceed {MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_linux_route_command(command: &LinuxRouteCommand) -> Result<(), RouteManagerError> {
@@ -1501,6 +1534,58 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("too many arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_rejects_invalid_runtime_bounds() {
+        let error = match TimedSystemRouteCommandRunner::new(Duration::ZERO)
+            .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("timeout must be greater than zero"));
+
+        let error = match TimedSystemRouteCommandRunner::new(
+            MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT + Duration::from_secs(1),
+        )
+        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timeout must not exceed 3600s"));
+
+        let error =
+            match TimedSystemRouteCommandRunner::with_output_max_bytes(Duration::from_secs(1), 0)
+                .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+                .await
+            {
+                Ok(()) => panic!("command should be rejected"),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must be greater than zero"));
+
+        let error = match TimedSystemRouteCommandRunner::with_output_max_bytes(
+            Duration::from_secs(1),
+            MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES + 1,
+        )
+        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must not exceed 1048576"));
     }
 
     #[cfg(unix)]

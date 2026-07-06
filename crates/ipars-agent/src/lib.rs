@@ -53,7 +53,9 @@ use rtnetlink::{LinkUnspec, LinkWireguard};
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINUX_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_COMMAND_ARG_BYTES: usize = 128 * 1024;
@@ -1970,6 +1972,7 @@ async fn run_system_command(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<(), AgentError> {
+    validate_system_command_runtime_bounds(timeout, output_max_bytes)?;
     validate_linux_command(&command)?;
     let command_label = command_label(&command.program, &command.args);
     let output = run_command_output(command, timeout, output_max_bytes, &command_label).await?;
@@ -1981,6 +1984,35 @@ async fn run_system_command(
         "{command_label} failed: {}",
         command_stderr_message(&output.stderr)
     )))
+}
+
+fn validate_system_command_runtime_bounds(
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<(), AgentError> {
+    if timeout.is_zero() {
+        return Err(AgentError::WireGuard(
+            "invalid linux command runtime bounds: timeout must be greater than zero".to_string(),
+        ));
+    }
+    if timeout > MAX_SYSTEM_COMMAND_TIMEOUT {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command runtime bounds: timeout must not exceed {}s",
+            MAX_SYSTEM_COMMAND_TIMEOUT.as_secs()
+        )));
+    }
+    if output_max_bytes == 0 {
+        return Err(AgentError::WireGuard(
+            "invalid linux command runtime bounds: output_max_bytes must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if output_max_bytes > MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command runtime bounds: output_max_bytes must not exceed {MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_linux_command(command: &LinuxCommand) -> Result<(), AgentError> {
@@ -3424,6 +3456,57 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("too many arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_rejects_invalid_runtime_bounds() {
+        let error = match TimedSystemCommandRunner::new(Duration::ZERO)
+            .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("timeout must be greater than zero"));
+
+        let error = match TimedSystemCommandRunner::new(
+            MAX_SYSTEM_COMMAND_TIMEOUT + Duration::from_secs(1),
+        )
+        .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timeout must not exceed 3600s"));
+
+        let error = match TimedSystemCommandRunner::with_output_max_bytes(Duration::from_secs(1), 0)
+            .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must be greater than zero"));
+
+        let error = match TimedSystemCommandRunner::with_output_max_bytes(
+            Duration::from_secs(1),
+            MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES + 1,
+        )
+        .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must not exceed 1048576"));
     }
 
     #[cfg(target_os = "linux")]
