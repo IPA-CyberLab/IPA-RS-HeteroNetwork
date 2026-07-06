@@ -1361,13 +1361,49 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         LinuxNetworkNamespace::from_name(namespace)?;
     }
     validate_agent_relay_capability_config(args)?;
-    if args.relay_forwarder_bind.is_some() && args.relay_forwarder_max_sessions == 0 {
-        anyhow::bail!(
-            "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
-        );
-    }
+    validate_relay_forwarder_config(args)?;
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn validate_relay_forwarder_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if let Some(endpoint) = args.relay_forwarder_endpoint {
+        validate_usable_socket_endpoint(endpoint, "--relay-forwarder-endpoint")?;
+    }
+
+    if args.relay_forwarder_bind.is_some() {
+        let wireguard_endpoint = args.relay_forwarder_wireguard_endpoint.context(
+            "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
+        )?;
+        validate_usable_socket_endpoint(
+            wireguard_endpoint,
+            "--relay-forwarder-wireguard-endpoint",
+        )?;
+        validate_positive_usize(
+            args.relay_forwarder_max_sessions,
+            "--relay-forwarder-max-sessions",
+        )?;
+    } else {
+        anyhow::ensure!(
+            args.relay_forwarder_wireguard_endpoint.is_none(),
+            "--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind"
+        );
+        anyhow::ensure!(
+            args.relay_forwarder_netns.is_none(),
+            "--relay-forwarder-netns requires --relay-forwarder-bind"
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_usable_socket_endpoint(endpoint: SocketAddr, label: &str) -> anyhow::Result<()> {
+    if !endpoint_addr_is_usable(endpoint) {
+        anyhow::bail!(
+            "{label} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
     }
     Ok(())
 }
@@ -15074,6 +15110,92 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("invalid linux network namespace name"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_relay_forwarder_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-endpoint",
+            "127.0.0.1:0",
+        ])?;
+        if let Command::Agent(args) = unusable_relay_forwarder_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-forwarder-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let missing_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+        ])?;
+        if let Command::Agent(args) = missing_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind"
+            ));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "0.0.0.0:51820",
+        ])?;
+        if let Command::Agent(args) = unusable_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-forwarder-wireguard-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let inactive_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+        ])?;
+        if let Command::Agent(args) = inactive_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind"));
         } else {
             anyhow::bail!("expected agent command");
         }
