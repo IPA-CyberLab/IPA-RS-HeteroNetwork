@@ -867,6 +867,7 @@ struct RuntimePreflightNeeds {
     generic_netlink: bool,
     netfilter_netlink: bool,
     docker_api_socket: bool,
+    conntrack_procfs_path: bool,
     ebpf_jsonl_event_path: bool,
     ipv4_forwarding: bool,
     ipv6_forwarding: bool,
@@ -889,6 +890,7 @@ impl RuntimePreflightNeeds {
             generic_netlink: false,
             netfilter_netlink: false,
             docker_api_socket: false,
+            conntrack_procfs_path: false,
             ebpf_jsonl_event_path: false,
             ipv4_forwarding: false,
             ipv6_forwarding: false,
@@ -910,6 +912,7 @@ impl RuntimePreflightNeeds {
             && !self.generic_netlink
             && !self.netfilter_netlink
             && !self.docker_api_socket
+            && !self.conntrack_procfs_path
             && !self.ebpf_jsonl_event_path
             && !self.ipv4_forwarding
             && !self.ipv6_forwarding
@@ -960,6 +963,7 @@ struct RuntimePreflightChecks {
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
     docker_api_socket: fn(&Path) -> anyhow::Result<()>,
+    conntrack_procfs_path: fn(&Path) -> anyhow::Result<()>,
     ipv4_forwarding: fn() -> anyhow::Result<()>,
     ipv6_forwarding: fn() -> anyhow::Result<()>,
 }
@@ -977,6 +981,7 @@ impl RuntimePreflightChecks {
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
             docker_api_socket: ensure_docker_api_socket_ready,
+            conntrack_procfs_path: ensure_conntrack_procfs_path_ready,
             ipv4_forwarding: ensure_ipv4_forwarding_if_known,
             ipv6_forwarding: ensure_ipv6_forwarding_if_known,
         }
@@ -1147,6 +1152,13 @@ fn preflight_agent_runtime_with_path_and_checks(
         let socket = docker_api_socket_path(args)?;
         (checks.docker_api_socket)(&socket)?;
     }
+    if needs.conntrack_procfs_path {
+        let path = args
+            .packet_flow_conntrack_path
+            .as_deref()
+            .context("--packet-flow-conntrack-path is required")?;
+        (checks.conntrack_procfs_path)(path)?;
+    }
     if needs.ebpf_jsonl_event_path {
         let event_path = args
             .packet_flow_ebpf_event_path
@@ -1211,6 +1223,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
         needs_docker_api_socket = needs.docker_api_socket,
+        needs_conntrack_procfs_path = needs.conntrack_procfs_path,
         needs_ebpf_jsonl_event_path = needs.ebpf_jsonl_event_path,
         needs_ipv4_forwarding = needs.ipv4_forwarding,
         needs_ipv6_forwarding = needs.ipv6_forwarding,
@@ -1593,6 +1606,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         args.packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
+    let conntrack_procfs_path = args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack
+        && args.packet_flow_conntrack_path.is_some();
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
     let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
@@ -1602,6 +1617,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         return RuntimePreflightNeeds {
             netfilter_netlink,
             docker_api_socket,
+            conntrack_procfs_path,
             ebpf_jsonl_event_path: ebpf_jsonl,
             cap_net_admin: netfilter_netlink,
             cap_sys_admin: relay_forwarder_netns,
@@ -1614,6 +1630,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
         return RuntimePreflightNeeds {
             docker_api_socket,
+            conntrack_procfs_path,
             ebpf_jsonl_event_path: ebpf_jsonl,
             cap_sys_admin: relay_forwarder_netns,
             relay_forwarder_netns,
@@ -1650,6 +1667,7 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
         docker_api_socket,
+        conntrack_procfs_path,
         ebpf_jsonl_event_path: ebpf_jsonl,
         ipv4_forwarding,
         ipv6_forwarding,
@@ -2147,6 +2165,32 @@ fn ensure_ebpf_jsonl_event_path_ready(path: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         metadata.is_file(),
         "eBPF packet-flow JSONL event path {} must be a regular file when it exists",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_conntrack_procfs_path_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "conntrack procfs packet-flow path {} is not readable",
+                    path.display()
+                )
+            })
+        }
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "conntrack procfs packet-flow path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "conntrack procfs packet-flow path {} must be a regular file when it exists",
         path.display()
     );
     Ok(())
@@ -12634,6 +12678,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn runtime_preflight_checks_procfs_conntrack_custom_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("conntrack-procfs-path-preflight")?;
+        let regular = base.join("nf_conntrack");
+        std::fs::write(&regular, b"")?;
+        let missing = base.join("missing_conntrack");
+        let directory = base.join("conntrack-dir");
+        std::fs::create_dir(&directory)?;
+
+        ensure_conntrack_procfs_path_ready(&regular)?;
+        ensure_conntrack_procfs_path_ready(&missing)?;
+
+        let default_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+        ])?;
+        if let Command::Agent(args) = default_cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.conntrack_procfs_path);
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let custom_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-conntrack-path",
+            directory.to_str().context("non-UTF-8 temp path")?,
+        ])?;
+        if let Command::Agent(args) = custom_cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.conntrack_procfs_path);
+
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful conntrack path preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must be a regular file"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conntrack_procfs_path_preflight_rejects_symlink() -> anyhow::Result<()> {
+        let base = unique_test_dir("conntrack-procfs-path-symlink")?;
+        let target = base.join("nf_conntrack");
+        let link = base.join("nf_conntrack_link");
+        std::fs::write(&target, b"")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_conntrack_procfs_path_ready(&link) {
+            Ok(()) => anyhow::bail!("unexpected successful conntrack symlink preflight"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn ebpf_jsonl_event_path_preflight_rejects_symlink() -> anyhow::Result<()> {
@@ -14732,6 +14849,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             linux_netns: preflight_noop_netns,
             netlink,
             docker_api_socket: preflight_noop_path,
+            conntrack_procfs_path: preflight_noop_path,
             ipv4_forwarding: preflight_noop,
             ipv6_forwarding: preflight_noop,
         }
@@ -14752,6 +14870,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             linux_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
             docker_api_socket: preflight_noop_path,
+            conntrack_procfs_path: preflight_noop_path,
             ipv4_forwarding,
             ipv6_forwarding,
         }
