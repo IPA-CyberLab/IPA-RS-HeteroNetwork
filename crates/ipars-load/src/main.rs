@@ -1069,10 +1069,35 @@ fn validate_daemon_retained_path_mode(
                 path.display()
             );
         }
+        validate_daemon_retained_path_owner(
+            path,
+            metadata,
+            nix::unistd::geteuid().as_raw(),
+            label,
+        )?;
     }
     #[cfg(not(unix))]
     {
         let _ = (path, metadata, expected_mode, label);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_daemon_retained_path_owner(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    expected_uid: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner_uid = metadata.uid();
+    if owner_uid != expected_uid {
+        bail!(
+            "daemon load scenario {label} {} owner uid is {owner_uid}; expected current process uid {expected_uid}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -4260,7 +4285,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
             let mut world_readable_runtime_dir = daemon_report.clone();
             let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
@@ -4335,6 +4360,33 @@ mod tests {
             };
             assert!(error.contains("child control-plane-0 log"));
             assert!(error.contains("permissions"));
+            std::fs::remove_dir_all(&runtime_dir)?;
+
+            let (runtime_dir, _manifest_path) = write_synthetic_retained_daemon_manifest(
+                &daemon_report,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+            let metadata = std::fs::symlink_metadata(&runtime_dir)?;
+            let mismatched_uid = if metadata.uid() == 0 { 1 } else { 0 };
+            let error = match validate_daemon_retained_path_owner(
+                &runtime_dir,
+                &metadata,
+                mismatched_uid,
+                "retained runtime directory",
+            ) {
+                Ok(_) => bail!("retained runtime owner UID mismatch should fail validation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("owner uid"));
+            assert!(error.contains("retained runtime directory"));
             std::fs::remove_dir_all(&runtime_dir)?;
         }
 

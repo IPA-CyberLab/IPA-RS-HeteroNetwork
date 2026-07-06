@@ -24,6 +24,7 @@ ipars-relay-http = { path = "../ipars-relay-http" }
 ipars-signal = { path = "../ipars-signal" }
 ipars-signal-http = { path = "../ipars-signal-http" }
 ipars-types = { path = "../ipars-types" }
+nix.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1226,6 +1226,7 @@ dependencies = [
  "ipars-signal-http",
  "ipars-types",
  "ipnet",
+ "nix",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
