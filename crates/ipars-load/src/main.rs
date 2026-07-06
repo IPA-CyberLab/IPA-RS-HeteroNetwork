@@ -215,6 +215,8 @@ struct LoadReport {
     daemon_processes: usize,
     daemon_runtime_dir: Option<PathBuf>,
     daemon_runtime_manifest: Option<PathBuf>,
+    daemon_http_readiness_timeout_seconds: u64,
+    daemon_agent_readiness_timeout_seconds: u64,
     daemon_agent_processes: usize,
     daemon_agent_status_endpoints: usize,
     daemon_agent_candidate_count_min: usize,
@@ -737,6 +739,19 @@ impl LoadReport {
                 self.relay_payload_bytes_per_packet
             );
         }
+        if workload.daemon_http_readiness_timeout_seconds
+            != self.daemon_http_readiness_timeout_seconds
+            || workload.daemon_agent_readiness_timeout_seconds
+                != self.daemon_agent_readiness_timeout_seconds
+        {
+            bail!(
+                "daemon load scenario retained manifest readiness timeout workload does not match report: http={}/{}, agent={}/{}",
+                workload.daemon_http_readiness_timeout_seconds,
+                self.daemon_http_readiness_timeout_seconds,
+                workload.daemon_agent_readiness_timeout_seconds,
+                self.daemon_agent_readiness_timeout_seconds
+            );
+        }
         if manifest.control_plane_urls.len() != self.daemon_control_plane_processes {
             bail!(
                 "daemon load scenario retained manifest recorded {} control-plane URLs, expected {}",
@@ -1102,6 +1117,8 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_processes: 0,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
+        daemon_http_readiness_timeout_seconds: 0,
+        daemon_agent_readiness_timeout_seconds: 0,
         daemon_agent_processes: 0,
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
@@ -1283,6 +1300,8 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_processes: 0,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
+        daemon_http_readiness_timeout_seconds: 0,
+        daemon_agent_readiness_timeout_seconds: 0,
         daemon_agent_processes: 0,
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
@@ -1438,6 +1457,8 @@ async fn run_relay_udp_scenario(
         daemon_processes: 0,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
+        daemon_http_readiness_timeout_seconds: 0,
+        daemon_agent_readiness_timeout_seconds: 0,
         daemon_agent_processes: 0,
         daemon_agent_status_endpoints: 0,
         daemon_agent_candidate_count_min: 0,
@@ -1742,6 +1763,8 @@ async fn run_daemon_scenario(
             .keep_runtime_dir
             .then(|| services.runtime_dir.clone()),
         daemon_runtime_manifest: options.keep_runtime_dir.then_some(completed_manifest_path),
+        daemon_http_readiness_timeout_seconds: http_readiness_timeout.as_secs(),
+        daemon_agent_readiness_timeout_seconds: agent_readiness_timeout.as_secs(),
         daemon_agent_processes: agent_processes,
         daemon_agent_status_endpoints: agent_status_summary.endpoint_count,
         daemon_agent_candidate_count_min: agent_status_summary.candidate_count_min,
@@ -4164,6 +4187,33 @@ mod tests {
         assert!(error.contains("scenario workload"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_readiness_timeout = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_readiness_timeout,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_readiness_timeout.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_readiness_timeout.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.workload.daemon_http_readiness_timeout_seconds += 1;
+        })?;
+        let error = match mismatched_readiness_timeout.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched readiness timeout should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("readiness timeout"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut mismatched_child_roles = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &mismatched_child_roles,
@@ -5355,6 +5405,8 @@ mod tests {
         report.relay_admission_attempts_reported = report.active_pair_count as u64;
         report.relay_admission_successes_reported = report.active_pair_count as u64;
         report.daemon_processes = 8;
+        report.daemon_http_readiness_timeout_seconds = 5;
+        report.daemon_agent_readiness_timeout_seconds = 15;
         report.daemon_agent_processes = report.node_count;
         report.daemon_agent_status_endpoints = report.daemon_agent_processes;
         report.daemon_agent_candidate_count_min = 1;
