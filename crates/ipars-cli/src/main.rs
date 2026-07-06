@@ -310,6 +310,10 @@ struct DockerInstallArgs {
     docker_host_interface: String,
     #[arg(long = "docker-container-cidr")]
     docker_container_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "disable-docker-expose-host-routes", default_value_t = false)]
+    disable_docker_expose_host_routes: bool,
+    #[arg(long = "docker-route-interval-seconds", default_value_t = 60)]
+    docker_route_interval_seconds: u64,
     #[arg(long)]
     userspace_wireguard_command: Option<String>,
     #[arg(long = "userspace-wireguard-arg")]
@@ -2678,6 +2682,10 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     if let Some(socket) = args.docker_api_socket.as_ref() {
         validate_docker_api_socket_path(socket)?;
     }
+    validate_positive_docker_seconds(
+        args.docker_route_interval_seconds,
+        "--docker-route-interval-seconds",
+    )?;
     validate_docker_userspace_wireguard_args(args)?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
@@ -2884,6 +2892,13 @@ fn validate_bounded_docker_seconds(value: u64, label: &str, max: u64) -> anyhow:
     Ok(())
 }
 
+fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{label} must be greater than zero");
+    }
+    Ok(())
+}
+
 fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("linux interface name cannot be empty");
@@ -2968,11 +2983,11 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         },
         InstallEnvironment {
             name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
-            value: "true".to_string(),
+            value: (!args.disable_docker_expose_host_routes).to_string(),
         },
         InstallEnvironment {
             name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
-            value: "60".to_string(),
+            value: args.docker_route_interval_seconds.to_string(),
         },
     ];
     if args.docker_discover_networks {
@@ -6236,6 +6251,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6255,6 +6272,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6334,6 +6353,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6344,6 +6365,36 @@ mod tests {
             plan.commands[0],
             "docker compose -p edge -f 'ops/compose file.yaml' config"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_route_advertisement_controls() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            disable_docker_expose_host_routes: true,
+            docker_route_interval_seconds: 15,
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            Some("false")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            Some("15")
+        );
+
+        let error = match docker_install_plan(DockerInstallArgs {
+            docker_route_interval_seconds: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero Docker route interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--docker-route-interval-seconds must be greater than zero"));
         Ok(())
     }
 
@@ -6359,6 +6410,8 @@ mod tests {
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_host_interface: "br-edge".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: vec!["ipars0".to_string()],
             userspace_wireguard_ready_timeout_seconds: 30,
@@ -6496,6 +6549,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6525,6 +6580,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6547,6 +6604,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6569,6 +6628,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6591,6 +6652,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker/0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6613,6 +6676,8 @@ mod tests {
             docker_container_namespace: Some("../compose".to_string()),
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6647,6 +6712,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 0,
@@ -6669,6 +6736,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -6691,6 +6760,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 3601,
@@ -6715,6 +6786,8 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
@@ -8091,6 +8164,9 @@ mod tests {
             "compose-edge",
             "--docker-host-interface",
             "br-edge",
+            "--disable-docker-expose-host-routes",
+            "--docker-route-interval-seconds",
+            "15",
             "--userspace-wireguard-command",
             "wireguard-go",
             "--userspace-wireguard-arg",
@@ -8119,6 +8195,8 @@ mod tests {
             );
             assert_eq!(args.docker_host_interface, "br-edge");
             assert!(args.docker_container_cidrs.is_empty());
+            assert!(args.disable_docker_expose_host_routes);
+            assert_eq!(args.docker_route_interval_seconds, 15);
             assert_eq!(
                 args.userspace_wireguard_command.as_deref(),
                 Some("wireguard-go")
