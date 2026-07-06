@@ -1280,6 +1280,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         "--runtime-command-timeout-seconds",
     )?;
     validate_userspace_wireguard_config(args)?;
+    validate_runtime_backend_specific_args(args)?;
     validate_positive_usize(
         args.runtime_command_output_max_bytes,
         "--runtime-command-output-max-bytes",
@@ -1395,6 +1396,54 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
     }
+    Ok(())
+}
+
+fn validate_runtime_backend_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
+    let applies_wireguard = args.apply_peer_map;
+    let applies_routes =
+        args.apply_peer_map || args.apply_docker_routes || args.apply_kubernetes_underlay;
+    let manages_userspace_wireguard = args.userspace_wireguard_command.is_some();
+    let uses_relay_forwarder_namespace = args.relay_forwarder_bind.is_some();
+
+    if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
+        anyhow::ensure!(
+            args.wireguard_backend == WireGuardApplyBackend::Command,
+            "--wireguard-backend requires --runtime-backend linux-command"
+        );
+        anyhow::ensure!(
+            args.route_backend == RouteApplyBackend::Command,
+            "--route-backend requires --runtime-backend linux-command"
+        );
+    }
+
+    if args.wireguard_backend == WireGuardApplyBackend::KernelNetlink {
+        anyhow::ensure!(
+            applies_wireguard,
+            "--wireguard-backend kernel-netlink requires --apply-peer-map"
+        );
+    }
+    if args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand {
+        anyhow::ensure!(
+            applies_wireguard || manages_userspace_wireguard,
+            "--wireguard-backend userspace-command requires --apply-peer-map or --userspace-wireguard-command"
+        );
+    }
+    if args.route_backend == RouteApplyBackend::KernelNetlink {
+        anyhow::ensure!(
+            applies_routes,
+            "--route-backend kernel-netlink requires --apply-peer-map, --apply-docker-routes, or --apply-kubernetes-underlay"
+        );
+    }
+    if args.linux_netns.is_some() {
+        let uses_linux_netns = args.runtime_backend == AgentRuntimeBackend::LinuxCommand
+            && (applies_routes || manages_userspace_wireguard);
+        anyhow::ensure!(
+            uses_linux_netns || uses_relay_forwarder_namespace,
+            "--linux-netns requires an active Linux dataplane loop, --userspace-wireguard-command, or --relay-forwarder-bind"
+        );
+    }
+
     Ok(())
 }
 
@@ -14329,6 +14378,74 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_backend_specific_options_require_active_linux_dataplane() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-backend",
+                    "dry-run",
+                    "--apply-peer-map",
+                    "--wireguard-backend",
+                    "kernel-netlink",
+                ],
+                "--wireguard-backend requires --runtime-backend linux-command",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-backend",
+                    "dry-run",
+                    "--apply-peer-map",
+                    "--route-backend",
+                    "kernel-netlink",
+                ],
+                "--route-backend requires --runtime-backend linux-command",
+            ),
+            (
+                vec!["iparsd", "agent", "--wireguard-backend", "kernel-netlink"],
+                "--wireguard-backend kernel-netlink requires --apply-peer-map",
+            ),
+            (
+                vec!["iparsd", "agent", "--wireguard-backend", "userspace-command"],
+                "--wireguard-backend userspace-command requires --apply-peer-map or --userspace-wireguard-command",
+            ),
+            (
+                vec!["iparsd", "agent", "--route-backend", "kernel-netlink"],
+                "--route-backend kernel-netlink requires --apply-peer-map, --apply-docker-routes, or --apply-kubernetes-underlay",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--linux-netns",
+                    "node-a",
+                    "--skip-runtime-preflight",
+                ],
+                "--linux-netns requires an active Linux dataplane loop, --userspace-wireguard-command, or --relay-forwarder-bind",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
