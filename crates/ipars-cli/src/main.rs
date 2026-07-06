@@ -7476,14 +7476,19 @@ mod tests {
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(!values.contains("relayEndpoint:"));
+        assert!(!values.contains("relayAdmissionUrl:"));
         assert!(!values.contains("IPARS_RELAY_ENDPOINT"));
         assert!(values.contains("relayAdvertisement:"));
         assert!(values.contains("publicEndpoint: \"\""));
+        assert!(values.contains("admissionUrl: \"\""));
         assert!(daemonset.contains("- --relay-public-endpoint"));
         assert!(
             daemonset.contains("- {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}")
         );
+        assert!(daemonset.contains("- --relay-admission-url"));
+        assert!(daemonset.contains("- {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}"));
         assert!(!daemonset.contains("cluster.relayEndpoint"));
+        assert!(!daemonset.contains("cluster.relayAdmissionUrl"));
         assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
         Ok(())
     }
