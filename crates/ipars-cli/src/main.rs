@@ -2785,11 +2785,13 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
     ];
-    if args.rootless {
+    if args.rootless && args.docker_discover_networks {
         prerequisites.push(
             "Rootless Docker Engine with a reachable user Docker socket for network discovery"
                 .to_string(),
         );
+    }
+    if args.rootless {
         prerequisites.push(
             "A userspace WireGuard implementation started before the agent and exposing the configured interface through wg(8)"
                 .to_string(),
@@ -2881,6 +2883,9 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     }
     if let Some(socket) = args.docker_api_socket.as_ref() {
         validate_docker_api_socket_path(socket)?;
+        if !args.docker_discover_networks {
+            anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+        }
     }
     validate_positive_docker_seconds(
         args.docker_route_interval_seconds,
@@ -3235,7 +3240,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: socket.display().to_string(),
         });
-    } else if args.rootless {
+    } else if args.rootless && args.docker_discover_networks {
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
@@ -7781,6 +7786,17 @@ mod tests {
             .to_string()
             .contains("--docker-api-socket must be an absolute Unix socket path"));
 
+        let inactive_api_socket = match docker_install_plan(DockerInstallArgs {
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("Docker API socket without discovery should be rejected"),
+            Err(error) => error,
+        };
+        assert!(inactive_api_socket
+            .to_string()
+            .contains("--docker-api-socket requires --docker-discover-networks"));
+
         let invalid_ready_timeout = match docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
@@ -8011,6 +8027,27 @@ mod tests {
         assert!(oversized_arg
             .to_string()
             .contains("--userspace-wireguard-arg exceeds 4096 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rootless_static_routes_do_not_export_socket() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            docker_container_namespace: Some("compose-edge".to_string()),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("userspace-command")
+        );
+        assert!(!plan.commands[0].contains("docker --host"));
         Ok(())
     }
 

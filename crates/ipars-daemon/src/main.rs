@@ -1397,6 +1397,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         }
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
+        } else if args.docker_api_socket.is_some() {
+            anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
         } else if !args.docker_networks.is_empty() {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
         } else {
@@ -1413,6 +1415,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
                 &args.docker_container_cidrs,
             )?;
         }
+    } else {
+        validate_inactive_docker_route_config(args)?;
     }
     if args.apply_kubernetes_underlay {
         validate_kubernetes_underlay_config(args)?;
@@ -1978,11 +1982,42 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
 
 fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_docker_api_version(&args.docker_api_version)?;
+    if let Some(socket) = args.docker_api_socket.as_deref() {
+        validate_docker_api_socket_path(socket, "--docker-api-socket")?;
+    }
     validate_docker_network_filters(&args.docker_networks)?;
     if !args.docker_container_cidrs.is_empty() {
         anyhow::bail!(
             "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
         );
+    }
+    Ok(())
+}
+
+fn validate_inactive_docker_route_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.docker_discover_networks {
+        anyhow::bail!("--docker-discover-networks requires --apply-docker-routes");
+    }
+    if args.docker_api_socket.is_some() {
+        anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+    }
+    if !args.docker_networks.is_empty() {
+        anyhow::bail!("--docker-network requires --docker-discover-networks");
+    }
+    if args.docker_container_namespace.is_some() {
+        anyhow::bail!("--docker-container-namespace requires --apply-docker-routes");
+    }
+    if !args.docker_container_cidrs.is_empty() {
+        anyhow::bail!("--docker-container-cidr requires --apply-docker-routes");
+    }
+    if args.docker_host_interface != "docker0" {
+        anyhow::bail!("--docker-host-interface requires --apply-docker-routes");
+    }
+    if args.docker_route_interval_seconds != 60 {
+        anyhow::bail!("--docker-route-interval-seconds requires --apply-docker-routes");
+    }
+    if !args.docker_expose_host_routes {
+        anyhow::bail!("--docker-expose-host-routes=false requires --apply-docker-routes");
     }
     Ok(())
 }
@@ -18263,6 +18298,71 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_route_settings_require_route_application() -> anyhow::Result<()> {
+        let discovery_error =
+            agent_runtime_config_error(vec!["iparsd", "agent", "--docker-discover-networks"])?;
+        assert!(
+            discovery_error.contains("--docker-discover-networks requires --apply-docker-routes")
+        );
+
+        let namespace_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-container-namespace",
+            "compose-default",
+        ])?;
+        assert!(
+            namespace_error.contains("--docker-container-namespace requires --apply-docker-routes")
+        );
+
+        let cidr_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(cidr_error.contains("--docker-container-cidr requires --apply-docker-routes"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_requires_network_discovery() -> anyhow::Result<()> {
+        let static_mode_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-api-socket",
+            "/var/run/docker.sock",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(
+            static_mode_error.contains("--docker-api-socket requires --docker-discover-networks")
+        );
+
+        let inactive_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-api-socket",
+            "/var/run/docker.sock",
+        ])?;
+        assert!(inactive_error.contains("--docker-api-socket requires --docker-discover-networks"));
+
+        let relative_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            "docker.sock",
+        ])?;
+        assert!(relative_error.contains("--docker-api-socket must be an absolute Unix socket path"));
+        Ok(())
     }
 
     #[test]
