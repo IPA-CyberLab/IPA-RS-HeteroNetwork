@@ -216,6 +216,9 @@ struct LoadReport {
     daemon_runtime_dir: Option<PathBuf>,
     daemon_runtime_manifest: Option<PathBuf>,
     daemon_agent_processes: usize,
+    daemon_agent_status_endpoints: usize,
+    daemon_agent_candidate_count_min: usize,
+    daemon_agent_candidate_count_max: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
     daemon_control_plane_peer_map_endpoints: usize,
@@ -332,6 +335,25 @@ impl LoadReport {
                     bail!(
                         "daemon load scenario reported {} processes, expected {expected_processes}",
                         self.daemon_processes
+                    );
+                }
+                if self.node_count != self.daemon_agent_processes
+                    || self.daemon_agent_status_endpoints != self.daemon_agent_processes
+                {
+                    bail!(
+                        "daemon load scenario checked {} agent status endpoints and registered {} nodes, expected {} agents",
+                        self.daemon_agent_status_endpoints,
+                        self.node_count,
+                        self.daemon_agent_processes
+                    );
+                }
+                if self.daemon_agent_candidate_count_min == 0
+                    || self.daemon_agent_candidate_count_max < self.daemon_agent_candidate_count_min
+                {
+                    bail!(
+                        "daemon load scenario agent endpoint candidate mismatch: min/max={}/{}, expected every agent to advertise at least one candidate",
+                        self.daemon_agent_candidate_count_min,
+                        self.daemon_agent_candidate_count_max
                     );
                 }
                 if !self.daemon_control_plane_metrics_consistent {
@@ -934,6 +956,9 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
+        daemon_agent_status_endpoints: 0,
+        daemon_agent_candidate_count_min: 0,
+        daemon_agent_candidate_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1112,6 +1137,9 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
+        daemon_agent_status_endpoints: 0,
+        daemon_agent_candidate_count_min: 0,
+        daemon_agent_candidate_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1264,6 +1292,9 @@ async fn run_relay_udp_scenario(
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_agent_processes: 0,
+        daemon_agent_status_endpoints: 0,
+        daemon_agent_candidate_count_min: 0,
+        daemon_agent_candidate_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1343,6 +1374,7 @@ async fn run_daemon_scenario(
         agent_statuses
             .push(get_json(&client, format!("{url}/v1/status"), "daemon agent status").await?);
     }
+    let agent_status_summary = daemon_agent_status_summary(&agent_statuses)?;
     services.ensure_running(DaemonRuntimePhase::RegistrationProbe)?;
     let registration_millis = registration_started.elapsed().as_millis();
 
@@ -1564,6 +1596,9 @@ async fn run_daemon_scenario(
             .then(|| services.runtime_dir.clone()),
         daemon_runtime_manifest: options.keep_runtime_dir.then_some(completed_manifest_path),
         daemon_agent_processes: agent_processes,
+        daemon_agent_status_endpoints: agent_status_summary.endpoint_count,
+        daemon_agent_candidate_count_min: agent_status_summary.candidate_count_min,
+        daemon_agent_candidate_count_max: agent_status_summary.candidate_count_max,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
         daemon_control_plane_peer_map_endpoints: peer_map_summary.endpoint_count,
@@ -1622,6 +1657,47 @@ fn daemon_route_provider_agent_count(scenario: Scenario, agent_processes: usize)
     agent_processes
         .saturating_sub(scenario.relay_count)
         .min(scenario.route_provider_count)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonAgentStatusSummary {
+    endpoint_count: usize,
+    candidate_count_min: usize,
+    candidate_count_max: usize,
+}
+
+fn daemon_agent_status_summary(
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonAgentStatusSummary> {
+    let first = statuses
+        .first()
+        .context("daemon agent status summary was empty")?;
+    let first_candidate_count = daemon_agent_status_candidate_count(first)?;
+    let mut summary = DaemonAgentStatusSummary {
+        endpoint_count: statuses.len(),
+        candidate_count_min: first_candidate_count,
+        candidate_count_max: first_candidate_count,
+    };
+
+    for status in &statuses[1..] {
+        let candidate_count = daemon_agent_status_candidate_count(status)?;
+        summary.candidate_count_min = summary.candidate_count_min.min(candidate_count);
+        summary.candidate_count_max = summary.candidate_count_max.max(candidate_count);
+    }
+
+    Ok(summary)
+}
+
+fn daemon_agent_status_candidate_count(status: &AgentStatusResponse) -> anyhow::Result<usize> {
+    if status.candidate_count != status.candidates.len() {
+        bail!(
+            "daemon agent status for {} reported candidate_count={} but returned {} candidates",
+            status.node_id,
+            status.candidate_count,
+            status.candidates.len()
+        );
+    }
+    Ok(status.candidate_count)
 }
 
 fn daemon_advertised_route_count(peer_records: &[NodeRecord]) -> usize {
@@ -3826,6 +3902,22 @@ mod tests {
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
 
+        let mut missing_daemon_agent_status = daemon_report.clone();
+        missing_daemon_agent_status.daemon_agent_status_endpoints -= 1;
+        let error = match missing_daemon_agent_status.validate_success() {
+            Ok(_) => bail!("daemon report with missing agent status should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent status endpoints"));
+
+        let mut missing_daemon_candidate = daemon_report.clone();
+        missing_daemon_candidate.daemon_agent_candidate_count_min = 0;
+        let error = match missing_daemon_candidate.validate_success() {
+            Ok(_) => bail!("daemon report with missing endpoint candidate should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("endpoint candidate"));
+
         let mut missing_daemon_metrics_endpoint = daemon_report.clone();
         missing_daemon_metrics_endpoint.daemon_control_plane_metrics_endpoints = 1;
         let error = match missing_daemon_metrics_endpoint.validate_success() {
@@ -4039,6 +4131,31 @@ mod tests {
             tags: BTreeSet::new(),
         });
         assert_eq!(daemon_advertised_route_count(&[first_view]), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_agent_status_summary_reports_candidate_ranges() -> anyhow::Result<()> {
+        let first = agent_status_for_summary(0, 1);
+        let second = agent_status_for_summary(1, 2);
+        let summary = daemon_agent_status_summary(&[first.clone(), second])?;
+        assert_eq!(summary.endpoint_count, 2);
+        assert_eq!(summary.candidate_count_min, 1);
+        assert_eq!(summary.candidate_count_max, 2);
+
+        let error = match daemon_agent_status_summary(&[]) {
+            Ok(_) => bail!("empty daemon agent status summary should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("summary was empty"));
+
+        let mut inconsistent = first;
+        inconsistent.candidate_count += 1;
+        let error = match daemon_agent_status_summary(&[inconsistent]) {
+            Ok(_) => bail!("inconsistent daemon agent candidate count should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("candidate_count"));
         Ok(())
     }
 
@@ -4812,6 +4929,9 @@ mod tests {
         assert_eq!(report.daemon_control_plane_processes, 2);
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 2);
+        assert_eq!(report.daemon_agent_status_endpoints, 2);
+        assert!(report.daemon_agent_candidate_count_min > 0);
+        assert!(report.daemon_agent_candidate_count_max >= report.daemon_agent_candidate_count_min);
         assert_eq!(report.relay_count, 1);
         assert_eq!(report.route_provider_count, 1);
         assert_eq!(report.advertised_routes, 1);
@@ -4948,6 +5068,9 @@ mod tests {
         report.relay_admission_successes_reported = report.active_pair_count as u64;
         report.daemon_processes = 8;
         report.daemon_agent_processes = report.node_count;
+        report.daemon_agent_status_endpoints = report.daemon_agent_processes;
+        report.daemon_agent_candidate_count_min = 1;
+        report.daemon_agent_candidate_count_max = 1;
         report.daemon_control_plane_processes = 2;
         report.daemon_control_plane_metrics_endpoints = 2;
         report.daemon_control_plane_peer_map_endpoints = 2;
@@ -5038,6 +5161,28 @@ mod tests {
             token_policy: TokenPolicy::default(),
             routes,
             registered_at: Utc::now(),
+        }
+    }
+
+    fn agent_status_for_summary(index: usize, candidate_count: usize) -> AgentStatusResponse {
+        let mut candidates = endpoint_candidates(index, Scenario::from_name(ScenarioName::Ten));
+        while candidates.len() < candidate_count {
+            let mut candidate = candidates[0].clone();
+            candidate
+                .addr
+                .set_port(candidate.addr.port() + candidates.len() as u16);
+            candidate.priority = candidate.priority.saturating_sub(candidates.len() as u16);
+            candidates.push(candidate);
+        }
+        AgentStatusResponse {
+            node_id: node_id(index),
+            identity_public_key: identity_for_index(index).public_key_b64(),
+            wireguard_public_key: wireguard_public_key_for_index(index),
+            candidate_count: candidates.len(),
+            candidates,
+            nat_classification: None,
+            userspace_wireguard_process: None,
+            state_updated_at: Utc::now(),
         }
     }
 
