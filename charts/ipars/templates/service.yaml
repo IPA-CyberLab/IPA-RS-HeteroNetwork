@@ -91,6 +91,9 @@
 {{- if and $relayServiceActive (not $relayServiceTypeValid) -}}
 {{- fail "agent.relayService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
+{{- if and .Values.agent.relayService.enabled (not .Values.agent.relayAdvertisement.enabled) -}}
+{{- fail "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true so the Service exposes an advertised relay endpoint" -}}
+{{- end -}}
 {{- if not .Values.agent.apiService.enabled -}}
 {{- if or (ne .Values.agent.apiService.type "ClusterIP") (ne $agentApiPort 9780) (ne .Values.agent.apiService.appProtocol "http") (ne $agentApiClusterIP "") $agentApiClusterIPs (ne $agentApiNodePort 0) (ne $agentApiLoadBalancerClass "") (ne $agentApiLoadBalancerIP "") $agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0) (not $agentApiAllocateLoadBalancerNodePorts) (ne $agentApiIpFamilyPolicy "") $agentApiIpFamilies (ne .Values.agent.apiService.internalTrafficPolicy "") (ne .Values.agent.apiService.trafficDistribution "") (ne .Values.agent.apiService.sessionAffinity "") (ne $agentApiSessionAffinityTimeoutSeconds 0) (ne .Values.agent.apiService.externalTrafficPolicy "Local") .Values.agent.apiService.publishNotReadyAddresses .Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged .Values.agent.apiService.allowUnrestrictedLoadBalancer .Values.agent.apiService.allowClusterExternalTrafficPolicy -}}
 {{- fail "agent.apiService exposure-specific values require agent.apiService.enabled=true" -}}

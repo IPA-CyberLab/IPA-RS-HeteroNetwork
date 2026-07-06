@@ -9179,6 +9179,12 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
         ));
+        assert!(service_template.contains(
+            "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true so the Service exposes an advertised relay endpoint"
+        ));
+        assert!(service_template.contains(
+            "and .Values.agent.relayService.enabled (not .Values.agent.relayAdvertisement.enabled)"
+        ));
         assert!(service_template.contains("(ne .Values.agent.apiService.type \"ClusterIP\")"));
         assert!(service_template.contains("(ne $agentApiPort 9780)"));
         assert!(service_template.contains("(ne .Values.agent.apiService.appProtocol \"http\")"));
