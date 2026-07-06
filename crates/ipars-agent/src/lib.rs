@@ -798,8 +798,18 @@ impl UdpRelayFrameForwarder {
 }
 
 fn wireguard_sender_matches_configured(configured: SocketAddr, observed: SocketAddr) -> bool {
-    configured.port() == observed.port()
-        && (configured.ip().is_unspecified() || configured.ip() == observed.ip())
+    if configured.port() != observed.port() {
+        return false;
+    }
+    match (configured.ip(), observed.ip()) {
+        (IpAddr::V4(configured), IpAddr::V4(observed)) => {
+            configured.is_unspecified() || configured == observed
+        }
+        (IpAddr::V6(configured), IpAddr::V6(observed)) => {
+            configured.is_unspecified() || configured == observed
+        }
+        _ => false,
+    }
 }
 
 fn wireguard_datagram_payload(payload: &[u8]) -> bool {
@@ -3128,18 +3138,31 @@ mod tests {
 
     #[test]
     fn relay_forwarder_sender_match_allows_unspecified_wireguard_address() {
-        let observed = SocketAddr::from(([127, 0, 0, 1], 51_820));
+        let observed_v4 = SocketAddr::from(([127, 0, 0, 1], 51_820));
+        let observed_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 51_820));
         assert!(wireguard_sender_matches_configured(
             SocketAddr::from(([0, 0, 0, 0], 51_820)),
-            observed
+            observed_v4
+        ));
+        assert!(wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 51_820)),
+            observed_v6
         ));
         assert!(!wireguard_sender_matches_configured(
             SocketAddr::from(([0, 0, 0, 0], 51_821)),
-            observed
+            observed_v4
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_820)),
+            observed_v6
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 51_820)),
+            observed_v4
         ));
         assert!(!wireguard_sender_matches_configured(
             SocketAddr::from(([127, 0, 0, 2], 51_820)),
-            observed
+            observed_v4
         ));
     }
 
