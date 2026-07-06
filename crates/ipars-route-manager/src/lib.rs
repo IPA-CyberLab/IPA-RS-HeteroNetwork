@@ -27,6 +27,10 @@ use tokio::process::Command;
 
 const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES: usize = 4096;
+const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
+const MAX_LINUX_ROUTE_COMMAND_ARG_BYTES: usize = 128 * 1024;
+const MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -696,6 +700,7 @@ async fn run_system_route_command(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<(), RouteManagerError> {
+    validate_linux_route_command(&command)?;
     let command_label = command_label(&command.program, &command.args);
     let output =
         run_route_command_output(command, timeout, output_max_bytes, &command_label).await?;
@@ -707,6 +712,52 @@ async fn run_system_route_command(
         "{command_label} failed: {}",
         command_stderr_message(&output.stderr)
     )))
+}
+
+fn validate_linux_route_command(command: &LinuxRouteCommand) -> Result<(), RouteManagerError> {
+    if command.program.is_empty() {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program cannot be empty".to_string(),
+        ));
+    }
+    if command.program.len() > MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command: program exceeds {MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES} bytes"
+        )));
+    }
+    if command.program.as_bytes().contains(&0) {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program must not contain NUL bytes".to_string(),
+        ));
+    }
+    if command.args.len() > MAX_LINUX_ROUTE_COMMAND_ARGS {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command: too many arguments: {} > {MAX_LINUX_ROUTE_COMMAND_ARGS}",
+            command.args.len()
+        )));
+    }
+
+    let mut total_bytes = command.program.len();
+    for (index, arg) in command.args.iter().enumerate() {
+        if arg.len() > MAX_LINUX_ROUTE_COMMAND_ARG_BYTES {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argument {index} exceeds {MAX_LINUX_ROUTE_COMMAND_ARG_BYTES} bytes"
+            )));
+        }
+        if arg.as_bytes().contains(&0) {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argument {index} must not contain NUL bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(arg.len());
+        if total_bytes > MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argv exceeds {MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES} bytes"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_route_command_output(
@@ -1346,6 +1397,41 @@ mod tests {
         };
 
         assert!(error.to_string().contains("route-failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_rejects_invalid_command_vectors() {
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+
+        let error = match runner.run(LinuxRouteCommand::new("", ["route"])).await {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("program cannot be empty"));
+
+        let error = match runner
+            .run(LinuxRouteCommand::new("ip", ["route\0bad".to_string()]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("argument 0 must not contain NUL bytes"));
+
+        let error = match runner
+            .run(LinuxRouteCommand::new(
+                "ip",
+                std::iter::repeat_n("route", MAX_LINUX_ROUTE_COMMAND_ARGS + 1),
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("too many arguments"));
     }
 
     #[cfg(unix)]
