@@ -6172,6 +6172,7 @@ fn resolve_docker_api_socket(
     exists: impl Fn(&Path) -> bool,
 ) -> anyhow::Result<PathBuf> {
     if let Some(configured) = configured {
+        validate_docker_api_socket_path(configured, "--docker-api-socket")?;
         return Ok(configured.to_path_buf());
     }
     if let Some(path) = docker_host
@@ -6190,6 +6191,7 @@ fn resolve_docker_api_socket(
     if let Some(runtime_dir) = xdg_runtime_dir {
         let rootless = PathBuf::from(runtime_dir).join("docker.sock");
         if exists(&rootless) {
+            validate_docker_api_socket_path(&rootless, "XDG_RUNTIME_DIR/docker.sock")?;
             return Ok(rootless);
         }
     }
@@ -6208,11 +6210,27 @@ fn docker_host_unix_socket_path(docker_host: &OsStr) -> anyhow::Result<Option<Pa
         if path.is_empty() {
             anyhow::bail!("DOCKER_HOST unix:// value must include a socket path");
         }
-        return Ok(Some(PathBuf::from(path)));
+        let path = PathBuf::from(path);
+        validate_docker_api_socket_path(&path, "DOCKER_HOST unix:// socket path")?;
+        return Ok(Some(path));
     }
     anyhow::bail!(
         "Docker API discovery only supports unix:// DOCKER_HOST values; set --docker-api-socket for a local Unix socket"
     )
+}
+
+fn validate_docker_api_socket_path(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute Unix socket path");
+    }
+    let value = path
+        .as_os_str()
+        .to_str()
+        .with_context(|| format!("{label} must be valid UTF-8"))?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+    Ok(())
 }
 
 fn docker_discovered_routes(
@@ -19057,6 +19075,44 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(error
             .to_string()
             .contains("only supports unix:// DOCKER_HOST"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_resolution_requires_absolute_socket_paths() -> anyhow::Result<()> {
+        let explicit_error = match resolve_docker_api_socket(
+            Some(Path::new("docker.sock")),
+            None,
+            None,
+            |_| false,
+        ) {
+            Ok(path) => anyhow::bail!("relative explicit socket should be rejected: {path:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(explicit_error.contains("--docker-api-socket must be an absolute Unix socket path"));
+
+        let docker_host_error = match resolve_docker_api_socket(
+            None,
+            Some(OsStr::new("unix://docker.sock")),
+            None,
+            |_| false,
+        ) {
+            Ok(path) => anyhow::bail!("relative DOCKER_HOST socket should be rejected: {path:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(docker_host_error
+            .contains("DOCKER_HOST unix:// socket path must be an absolute Unix socket path"));
+        let rootless_error =
+            match resolve_docker_api_socket(None, None, Some(OsStr::new("run/user/1000")), |path| {
+                path == Path::new("run/user/1000/docker.sock")
+            }) {
+                Ok(path) => {
+                    anyhow::bail!("relative XDG runtime socket should be rejected: {path:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+        assert!(rootless_error
+            .contains("XDG_RUNTIME_DIR/docker.sock must be an absolute Unix socket path"));
         Ok(())
     }
 
