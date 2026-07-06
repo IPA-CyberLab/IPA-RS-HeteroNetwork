@@ -356,6 +356,13 @@
 {{- if eq $value "" -}}
 {{- fail (printf "%s must be a non-negative integer" $path) -}}
 {{- end -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" . -}}
+{{- end -}}
+
+{{- define "ipars.validateOptionalNonNegativeIntegerMax" -}}
+{{- $value := .value -}}
+{{- $path := .path -}}
+{{- $max := printf "%v" .max -}}
 {{- include "ipars.validateNonNegativeInteger" . -}}
 {{- if or (gt (len $value) (len $max)) (and (eq (len $value) (len $max)) (gt $value $max)) -}}
 {{- fail (printf "%s must be a non-negative integer no greater than %s" $path $max) -}}

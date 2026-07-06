@@ -8598,27 +8598,85 @@ mod tests {
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
-        for path in [
-            "agent.relayAdvertisement.maxSessions",
-            "agent.relayAdvertisement.maxMbps",
-            "serviceExposure.routeIntervalSeconds",
+        assert!(helpers_template.contains("define \"ipars.validateOptionalNonNegativeIntegerMax\""));
+        for (path, value, max) in [
+            (
+                "agent.peerMap.pollIntervalSeconds",
+                "$agentPeerMapPollIntervalSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.maxSessions",
+                "$agentRelayForwarderMaxSessions",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.restartBackoffSeconds",
+                "$agentRelayForwarderRestartBackoffSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.crashWindowSeconds",
+                "$agentRelayForwarderCrashWindowSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.maxCrashesPerWindow",
+                "$agentRelayForwarderMaxCrashesPerWindow",
+                "4294967295",
+            ),
+            (
+                "agent.relayForwarder.crashCooldownSeconds",
+                "$agentRelayForwarderCrashCooldownSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayAdvertisement.maxSessions",
+                "$relayAdvertisementMaxSessions",
+                "4294967295",
+            ),
+            (
+                "agent.relayAdvertisement.maxMbps",
+                "$relayAdvertisementMaxMbps",
+                "4294967295",
+            ),
+            (
+                "serviceExposure.routeIntervalSeconds",
+                "$serviceExposureRouteIntervalSeconds",
+                "9223372036854775807",
+            ),
         ] {
             assert!(
-                daemonset.contains(&format!(
-                    "ipars.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
-                )),
+                daemonset.contains(&format!("\"{path}\" \"value\" {value} \"max\" {max}")),
                 "{path} should validate as a bounded integer before int conversion"
             );
         }
+        for probe_field in [
+            "initialDelaySeconds",
+            "periodSeconds",
+            "timeoutSeconds",
+            "failureThreshold",
+        ] {
+            assert!(
+                daemonset.contains(&format!(
+                    "printf \"agent.probes.%s.{probe_field}\" $probeName"
+                )) && daemonset.contains(&format!("\"value\" ${probe_field} \"max\" 2147483647")),
+                "agent probe {probe_field} should validate as a bounded int32 before rendering"
+            );
+        }
         assert!(daemonset.contains(
-            "\"agent.relayAdvertisement.maxSessions\" \"value\" $relayAdvertisementMaxSessions \"max\" 4294967295"
+            "ipars.validateNonNegativeInt64\" (dict \"path\" \"agent.terminationGracePeriodSeconds\""
         ));
         assert!(daemonset.contains(
-            "\"agent.relayAdvertisement.maxMbps\" \"value\" $relayAdvertisementMaxMbps \"max\" 4294967295"
+            "ipars.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
         ));
         assert!(daemonset.contains(
-            "\"serviceExposure.routeIntervalSeconds\" \"value\" $serviceExposureRouteIntervalSeconds \"max\" 9223372036854775807"
+            "\"agent.rollout.minReadySeconds\" \"value\" $agentMinReadySeconds \"max\" 2147483647"
         ));
+        assert!(daemonset.contains(
+            "\"agent.rollout.revisionHistoryLimit\" \"value\" $agentRevisionHistoryLimit \"max\" 2147483647"
+        ));
+        assert!(!daemonset.contains("ipars.validateNonNegativeInteger\" (dict"));
         Ok(())
     }
 

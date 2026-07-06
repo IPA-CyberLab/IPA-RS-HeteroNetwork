@@ -58,7 +58,7 @@
 {{- if not (or (eq $agentPeerMapEnabled "true") (eq $agentPeerMapEnabled "false")) -}}
 {{- fail "agent.peerMap.enabled must be true or false" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds "max" 9223372036854775807) -}}
 {{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentPeerMapPollIntervalSeconds) 1) -}}
 {{- fail "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true" -}}
 {{- end -}}
@@ -68,11 +68,11 @@
 {{- if not (or (eq $agentRelayForwarderEnabled "true") (eq $agentRelayForwarderEnabled "false")) -}}
 {{- fail "agent.relayForwarder.enabled must be true or false" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow "max" 4294967295) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds "max" 9223372036854775807) -}}
 {{- if eq $agentRelayForwarderEnabled "true" -}}
 {{- if not (or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind) -}}
 {{- fail "agent.relayForwarder.enabled=true requires agent.relayForwarder.endpoint or agent.relayForwarder.bind" -}}
@@ -246,10 +246,10 @@
 {{- $periodSeconds := printf "%v" $probe.periodSeconds -}}
 {{- $timeoutSeconds := printf "%v" $probe.timeoutSeconds -}}
 {{- $failureThreshold := printf "%v" $probe.failureThreshold -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold "max" 2147483647) -}}
 {{- if lt (int $periodSeconds) 1 -}}
 {{- fail (printf "agent.probes.%s.periodSeconds must be greater than zero" $probeName) -}}
 {{- end -}}
@@ -304,7 +304,7 @@
 {{- end -}}
 {{- if hasKey $toleration "tolerationSeconds" -}}
 {{- $tolerationSeconds := printf "%v" $toleration.tolerationSeconds -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
 {{- if ne $tolerationEffect "NoExecute" -}}
 {{- fail (printf "%s.tolerationSeconds requires effect NoExecute" $path) -}}
 {{- end -}}
@@ -359,8 +359,8 @@
 {{- end -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxUnavailable" "value" $agentRolloutMaxUnavailable) -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxSurge" "value" $agentRolloutMaxSurge) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit) -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds "max" 2147483647) -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit "max" 2147483647) -}}
 {{- if and (or (eq $agentRolloutMaxUnavailable "0") (eq $agentRolloutMaxUnavailable "0%")) (or (eq $agentRolloutMaxSurge "") (eq $agentRolloutMaxSurge "0") (eq $agentRolloutMaxSurge "0%")) -}}
 {{- fail "agent.rollout.maxUnavailable cannot be zero when agent.rollout.maxSurge is zero or unset" -}}
 {{- end -}}
