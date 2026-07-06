@@ -167,7 +167,6 @@ agent:
 serviceExposure:
   enabled: true
   discoverServices: false
-  apiServer: true
   discoverApiServer: true
   apiServerCidrs: []
   serviceCidrs:

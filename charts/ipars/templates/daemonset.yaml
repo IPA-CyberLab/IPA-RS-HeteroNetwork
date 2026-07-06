@@ -48,6 +48,9 @@
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- if hasKey .Values.serviceExposure "apiServer" -}}
+{{- fail "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs" -}}
+{{- end -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}

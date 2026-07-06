@@ -9117,7 +9117,11 @@ mod tests {
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(values.contains("routeBackend: command"));
+        assert!(!values.contains("  apiServer:"));
         assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
+        assert!(daemonset.contains(
+            "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs"
+        ));
         assert!(values.contains("peerMap:"));
         assert!(values.contains("enabled: true"));
         assert!(values.contains("pollIntervalSeconds: 30"));
