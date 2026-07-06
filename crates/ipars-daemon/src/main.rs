@@ -8582,8 +8582,8 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
     let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status)?;
     let source_port = optional_nonzero_port(event.source_port());
     let destination_port = optional_nonzero_port(event.destination_port());
-    let source = ebpf_packet_flow_ip(event.ip_family, &event.source)?;
-    let destination = ebpf_packet_flow_ip(event.ip_family, &event.destination)?;
+    let source = ebpf_packet_flow_ip(event.ip_family, "source", &event.source)?;
+    let destination = ebpf_packet_flow_ip(event.ip_family, "destination", &event.destination)?;
     Ok(PacketFlowRecord {
         destination,
         observation: AgentPacketFlowObservation {
@@ -8666,17 +8666,21 @@ fn optional_nonzero_port(value: u16) -> Option<u16> {
     (value != 0).then_some(value)
 }
 
-fn ebpf_packet_flow_ip(ip_family: u8, bytes: &[u8]) -> anyhow::Result<IpAddr> {
+fn ebpf_packet_flow_ip(ip_family: u8, field: &str, bytes: &[u8]) -> anyhow::Result<IpAddr> {
+    let octets: [u8; 16] = bytes
+        .try_into()
+        .with_context(|| format!("eBPF packet-flow {field} IP field had invalid length"))?;
     match ip_family {
-        PACKET_FLOW_IP_FAMILY_IPV4 => Ok(IpAddr::V4(Ipv4Addr::new(
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ))),
-        PACKET_FLOW_IP_FAMILY_IPV6 => {
-            let octets: [u8; 16] = bytes
-                .try_into()
-                .context("eBPF packet-flow IPv6 field had invalid length")?;
-            Ok(IpAddr::V6(Ipv6Addr::from(octets)))
+        PACKET_FLOW_IP_FAMILY_IPV4 => {
+            anyhow::ensure!(
+                octets[4..].iter().all(|byte| *byte == 0),
+                "unsupported eBPF packet-flow IPv4 {field} padding bytes"
+            );
+            Ok(IpAddr::V4(Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            )))
         }
+        PACKET_FLOW_IP_FAMILY_IPV6 => Ok(IpAddr::V6(Ipv6Addr::from(octets))),
         _ => anyhow::bail!("unsupported eBPF packet-flow IP family {ip_family}"),
     }
 }
@@ -11790,6 +11794,37 @@ mod tests {
             flow.observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_ringbuf_parser_rejects_packet_flow_ipv4_padding_bytes() -> anyhow::Result<()> {
+        let mut event = [0_u8; PACKET_FLOW_EVENT_LEN];
+        event[0] = PACKET_FLOW_EVENT_VERSION;
+        event[1] = PACKET_FLOW_IP_FAMILY_IPV4;
+        event[2] = PACKET_FLOW_PROTOCOL_UDP;
+        event[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        event[32..36].copy_from_slice(&[100, 64, 0, 11]);
+
+        let mut bad_source_padding = event;
+        bad_source_padding[20] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_source_padding) {
+            Ok(_) => anyhow::bail!("nonzero eBPF IPv4 source padding should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow IPv4 source padding bytes"));
+
+        let mut bad_destination_padding = event;
+        bad_destination_padding[36] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_destination_padding) {
+            Ok(_) => anyhow::bail!("nonzero eBPF IPv4 destination padding should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow IPv4 destination padding bytes"));
         Ok(())
     }
 
