@@ -8599,6 +8599,10 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
         ));
+        assert!(service_template
+            .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
+        assert!(service_template
+            .contains("(ne .Values.agent.relayService.externalTrafficPolicy \"Local\")"));
         assert!(service_template.contains(
             "agent.apiService.loadBalancerSourceRanges requires agent.apiService.type LoadBalancer"
         ));
@@ -8616,6 +8620,12 @@ mod tests {
         ));
         assert!(service_template.contains(
             "agent.relayService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.externalTrafficPolicy requires agent.apiService.type NodePort or LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
         ));
         assert!(service_template.contains(
             "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs"

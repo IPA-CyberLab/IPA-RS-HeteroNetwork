@@ -50,12 +50,12 @@
 {{- fail "agent.relayService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
 {{- if not .Values.agent.apiService.enabled -}}
-{{- if or (ne $agentApiClusterIP "") $agentApiClusterIPs (ne $agentApiNodePort 0) (ne $agentApiLoadBalancerClass "") (ne $agentApiLoadBalancerIP "") $agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0) (not $agentApiAllocateLoadBalancerNodePorts) (ne $agentApiIpFamilyPolicy "") $agentApiIpFamilies (ne .Values.agent.apiService.internalTrafficPolicy "") (ne .Values.agent.apiService.trafficDistribution "") (ne .Values.agent.apiService.sessionAffinity "") (ne $agentApiSessionAffinityTimeoutSeconds 0) .Values.agent.apiService.publishNotReadyAddresses .Values.agent.apiService.exposureAcknowledged .Values.agent.apiService.allowUnrestrictedLoadBalancer .Values.agent.apiService.allowClusterExternalTrafficPolicy -}}
+{{- if or (ne $agentApiClusterIP "") $agentApiClusterIPs (ne $agentApiNodePort 0) (ne $agentApiLoadBalancerClass "") (ne $agentApiLoadBalancerIP "") $agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0) (not $agentApiAllocateLoadBalancerNodePorts) (ne $agentApiIpFamilyPolicy "") $agentApiIpFamilies (ne .Values.agent.apiService.internalTrafficPolicy "") (ne .Values.agent.apiService.trafficDistribution "") (ne .Values.agent.apiService.sessionAffinity "") (ne $agentApiSessionAffinityTimeoutSeconds 0) (ne .Values.agent.apiService.externalTrafficPolicy "Local") .Values.agent.apiService.publishNotReadyAddresses .Values.agent.apiService.exposureAcknowledged .Values.agent.apiService.allowUnrestrictedLoadBalancer .Values.agent.apiService.allowClusterExternalTrafficPolicy -}}
 {{- fail "agent.apiService exposure-specific values require agent.apiService.enabled=true" -}}
 {{- end -}}
 {{- end -}}
 {{- if not $relayServiceActive -}}
-{{- if or (ne $relayClusterIP "") $relayClusterIPs (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0) (ne $relayLoadBalancerClass "") (ne $relayLoadBalancerIP "") $relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0) (not $relayAllocateLoadBalancerNodePorts) (ne $relayIpFamilyPolicy "") $relayIpFamilies (ne .Values.agent.relayService.internalTrafficPolicy "") (ne .Values.agent.relayService.trafficDistribution "") (ne .Values.agent.relayService.sessionAffinity "") (ne $relaySessionAffinityTimeoutSeconds 0) .Values.agent.relayService.publishNotReadyAddresses .Values.agent.relayService.exposureAcknowledged .Values.agent.relayService.allowUnrestrictedLoadBalancer .Values.agent.relayService.allowClusterExternalTrafficPolicy -}}
+{{- if or (ne $relayClusterIP "") $relayClusterIPs (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0) (ne $relayLoadBalancerClass "") (ne $relayLoadBalancerIP "") $relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0) (not $relayAllocateLoadBalancerNodePorts) (ne $relayIpFamilyPolicy "") $relayIpFamilies (ne .Values.agent.relayService.internalTrafficPolicy "") (ne .Values.agent.relayService.trafficDistribution "") (ne .Values.agent.relayService.sessionAffinity "") (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.externalTrafficPolicy "Local") .Values.agent.relayService.publishNotReadyAddresses .Values.agent.relayService.exposureAcknowledged .Values.agent.relayService.allowUnrestrictedLoadBalancer .Values.agent.relayService.allowClusterExternalTrafficPolicy -}}
 {{- fail "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
 {{- end -}}
@@ -416,11 +416,17 @@
 {{- if and $relayServiceActive (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- fail "agent.relayService.sessionAffinityTimeoutSeconds requires agent.relayService.sessionAffinity ClientIP" -}}
 {{- end -}}
-{{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
-{{- if and $relayServiceActive $relayExternal (not $relayExternalTrafficPolicyValid) -}}
+{{- if and $relayServiceActive (not $relayExternalTrafficPolicyValid) -}}
 {{- fail "agent.relayService.externalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiExternal) (ne .Values.agent.apiService.externalTrafficPolicy "Local") -}}
+{{- fail "agent.apiService.externalTrafficPolicy requires agent.apiService.type NodePort or LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayExternal) (ne .Values.agent.relayService.externalTrafficPolicy "Local") -}}
+{{- fail "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not .Values.agent.apiService.exposureAcknowledged) -}}
 {{- fail "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" -}}
