@@ -1733,6 +1733,10 @@ mod tests {
         missing_admission_url.admission_url = None;
         invalid_capabilities.push(missing_admission_url);
 
+        let mut invalid_admission_url = relay_capability();
+        invalid_admission_url.admission_url = Some("udp://203.0.113.20:9580".to_string());
+        invalid_capabilities.push(invalid_admission_url);
+
         let mut full_capacity = relay_capability();
         full_capacity.active_sessions = full_capacity.max_sessions;
         invalid_capabilities.push(full_capacity);

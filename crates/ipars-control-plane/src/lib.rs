@@ -2051,6 +2051,16 @@ mod tests {
         assert!(relay_registration.relay_map.relays.is_empty());
         assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
 
+        let mut invalid_relay_capability = relay_capability();
+        invalid_relay_capability.admission_url = Some("udp://203.0.113.11:9580".to_string());
+        let mut invalid_relay_claims = claims(cluster_id.clone());
+        invalid_relay_claims.policy.allow_relay = true;
+        let mut invalid_relay_request = registration_request("relay-b");
+        invalid_relay_request.relay_capability = Some(invalid_relay_capability.clone());
+        plane
+            .register_with_claims(invalid_relay_claims, invalid_relay_request)
+            .await?;
+
         plane
             .heartbeat(signed_heartbeat(
                 "relay-a",
@@ -2065,6 +2075,28 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-b",
+                HeartbeatRequest {
+                    node_id: node_id("relay-b"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.10),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(invalid_relay_capability),
                     routes: None,
                     path_state: Vec::new(),
                     node_signature: None,

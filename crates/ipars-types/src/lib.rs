@@ -197,6 +197,14 @@ pub fn endpoint_addr_is_usable(addr: SocketAddr) -> bool {
     }
 }
 
+pub fn relay_admission_url_is_usable(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+
+    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointCandidateKind {
@@ -714,7 +722,10 @@ impl RelayCapability {
     pub fn can_admit(&self) -> bool {
         self.enabled_by_policy
             && self.public_endpoint.is_some_and(endpoint_addr_is_usable)
-            && self.admission_url.is_some()
+            && self
+                .admission_url
+                .as_deref()
+                .is_some_and(relay_admission_url_is_usable)
             && self.e2e_only
             && self.available_capacity() > 0
             && self.max_mbps > 0
@@ -3477,6 +3488,29 @@ mod tests {
         assert!(!relay.can_admit());
 
         relay.public_endpoint = Some(std::net::SocketAddr::from(([203, 0, 113, 10], 0)));
+
+        assert!(!relay.can_admit());
+    }
+
+    #[test]
+    fn relay_rejects_unusable_admission_url() {
+        let mut relay = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
+            admission_url: Some("relay-a:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+
+        assert!(!relay.can_admit());
+
+        relay.admission_url = Some("udp://203.0.113.10:9580".to_string());
+
+        assert!(!relay.can_admit());
+
+        relay.admission_url = Some("http://".to_string());
 
         assert!(!relay.can_admit());
     }

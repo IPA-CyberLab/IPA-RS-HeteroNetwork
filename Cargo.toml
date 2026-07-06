@@ -61,6 +61,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+url = "2.5"
 uuid = { version = "1.10", features = ["serde", "v4"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
