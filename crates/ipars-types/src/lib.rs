@@ -3051,10 +3051,84 @@ pub mod api {
     }
 
     fn redis_payload(payload: &[u8]) -> bool {
-        if !payload.starts_with(b"*") {
+        redis_resp_array_payload(payload) || redis_inline_command_payload(payload)
+    }
+
+    fn redis_resp_array_payload(payload: &[u8]) -> bool {
+        if payload.first() != Some(&b'*') {
             return false;
         }
-        let commands: [&[u8]; 14] = [
+        let Some((_array_len, offset)) = redis_decimal_crlf(payload, 1, 1, 1024) else {
+            return false;
+        };
+        let Some((command, _next_offset)) = redis_bulk_string(payload, offset) else {
+            return false;
+        };
+        redis_known_command(command)
+    }
+
+    fn redis_inline_command_payload(payload: &[u8]) -> bool {
+        if payload.first() == Some(&b'*') {
+            return false;
+        }
+        let line_end = payload
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(payload.len());
+        let line = trim_ascii_space(&payload[..line_end]);
+        if line.is_empty() {
+            return false;
+        }
+        let command_end = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        redis_known_inline_command(&line[..command_end])
+    }
+
+    fn redis_bulk_string(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        if payload.get(offset) != Some(&b'$') {
+            return None;
+        }
+        let (len, data_offset) = redis_decimal_crlf(payload, offset.checked_add(1)?, 1, 64)?;
+        let data_end = data_offset.checked_add(len)?;
+        let crlf_end = data_end.checked_add(2)?;
+        if payload.get(data_end..crlf_end)? != b"\r\n" {
+            return None;
+        }
+        Some((payload.get(data_offset..data_end)?, crlf_end))
+    }
+
+    fn redis_decimal_crlf(
+        payload: &[u8],
+        mut offset: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<(usize, usize)> {
+        let mut value = 0_usize;
+        let mut digits = 0_usize;
+        loop {
+            let byte = *payload.get(offset)?;
+            match byte {
+                b'0'..=b'9' => {
+                    value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+                    digits += 1;
+                    if value > max || digits > 10 {
+                        return None;
+                    }
+                    offset += 1;
+                }
+                b'\r' if payload.get(offset + 1) == Some(&b'\n') => {
+                    return (digits > 0 && value >= min && value <= max)
+                        .then_some((value, offset + 2));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn redis_known_command(command: &[u8]) -> bool {
+        let commands: [&[u8]; 38] = [
             b"PING",
             b"ECHO",
             b"GET",
@@ -3068,11 +3142,67 @@ pub mod api {
             b"HELLO",
             b"CLIENT",
             b"EVAL",
+            b"EVALSHA",
             b"XADD",
+            b"XREAD",
+            b"XGROUP",
+            b"INFO",
+            b"COMMAND",
+            b"ACL",
+            b"CONFIG",
+            b"DBSIZE",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            b"QUIT",
+            b"MONITOR",
+            b"MULTI",
+            b"EXEC",
+            b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
+            b"PSUBSCRIBE",
+            b"PUNSUBSCRIBE",
+            b"ZADD",
+            b"HGET",
+            b"HSET",
+            b"LPUSH",
+            b"RPUSH",
         ];
         commands
             .iter()
-            .any(|command| contains_ascii_case_insensitive(payload, command))
+            .any(|known| command.eq_ignore_ascii_case(known))
+    }
+
+    fn redis_known_inline_command(command: &[u8]) -> bool {
+        let commands: [&[u8]; 24] = [
+            b"HELLO",
+            b"CLIENT",
+            b"INFO",
+            b"COMMAND",
+            b"SUBSCRIBE",
+            b"UNSUBSCRIBE",
+            b"PSUBSCRIBE",
+            b"PUNSUBSCRIBE",
+            b"PUBLISH",
+            b"EVAL",
+            b"EVALSHA",
+            b"XADD",
+            b"XREAD",
+            b"XGROUP",
+            b"ACL",
+            b"CONFIG",
+            b"DBSIZE",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            b"MONITOR",
+            b"MULTI",
+            b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
+        ];
+        commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(known))
     }
 
     fn memcached_payload(payload: &[u8]) -> bool {
@@ -4663,6 +4793,26 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").application(),
             api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$4\r\nPING\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"XADD stream * field value\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$6\r\nNOTGET\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SELECT 1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\n").application(),
