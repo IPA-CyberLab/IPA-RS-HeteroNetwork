@@ -95,6 +95,8 @@ The agent runtime records peer activity through typed peer-activity and packet-f
 
 Packet-flow detector read-limit structs revalidate positive and maximum bounds when detector tasks build their procfs, conntrack-netlink, eBPF JSONL, or eBPF ring-buffer configs, so internal callers cannot bypass the CLI/runtime preflight caps.
 
+eBPF tracepoint preflight inspects tracepoint `id` entries without following symlinks, rejecting symlinked or non-file IDs under tracefs before loading an in-process ring-buffer detector.
+
 Packet-flow duplicate suppression TTL uses `0` to disable suppression, caps nonzero `--packet-flow-dedup-ttl-seconds` values at 24 hours, and caps the retained fingerprint table at 1,048,576 entries so detector fingerprints cannot be retained or accumulated indefinitely.
 
 During peer-map application, the agent revalidates selected path candidates and peer-map fallback candidates for peer ownership, direct endpoint kind, address-family consistency, and endpoint usability before passing them to WireGuard.

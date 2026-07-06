@@ -2471,7 +2471,16 @@ fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
             .join(&attachment.name)
             .join("id");
         checked.push(tracepoint_id.display().to_string());
-        match std::fs::metadata(&tracepoint_id) {
+        match std::fs::symlink_metadata(&tracepoint_id) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "eBPF tracepoint `{}/{}` for program `{}` has symlink id path {}",
+                    attachment.category,
+                    attachment.name,
+                    attachment.program,
+                    tracepoint_id.display()
+                );
+            }
             Ok(metadata) if metadata.is_file() => return Ok(()),
             Ok(_) => {
                 anyhow::bail!(
@@ -16772,8 +16781,22 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let tracepoint_dir = second_root.join("syscalls/sys_enter_connect");
         std::fs::create_dir_all(&tracepoint_dir)?;
-        std::fs::write(tracepoint_dir.join("id"), b"123\n")?;
+        let tracepoint_id = tracepoint_dir.join("id");
+        std::fs::write(&tracepoint_id, b"123\n")?;
         ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots)?;
+
+        #[cfg(unix)]
+        {
+            let target = base.join("tracepoint-id-target");
+            std::fs::write(&target, b"123\n")?;
+            std::fs::remove_file(&tracepoint_id)?;
+            std::os::unix::fs::symlink(&target, &tracepoint_id)?;
+            let symlink_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+                Ok(()) => anyhow::bail!("unexpected successful symlink tracepoint preflight"),
+                Err(error) => error,
+            };
+            assert!(symlink_error.to_string().contains("symlink id path"));
+        }
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
