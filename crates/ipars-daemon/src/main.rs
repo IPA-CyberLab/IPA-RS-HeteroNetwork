@@ -11946,6 +11946,25 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--packet-flow-ebpf-event-max-line-bytes"));
+
+        let oversized_detector = "x".repeat(ipars_types::api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1);
+        let oversized_detector_line =
+            format!(r#"{{"destination":"100.64.0.13","detector":"{oversized_detector}"}}"#) + "\n";
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            oversized_detector_line.as_bytes(),
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized eBPF JSONL detector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .chain()
+            .any(|cause| cause.to_string().contains("packet-flow detector exceeds")));
         Ok(())
     }
 

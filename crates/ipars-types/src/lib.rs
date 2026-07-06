@@ -1711,6 +1711,7 @@ pub mod api {
         pub observation: AgentPacketFlowObservation,
     }
 
+    pub const PACKET_FLOW_DETECTOR_MAX_BYTES: usize = 64;
     pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1723,7 +1724,7 @@ pub mod api {
         pub source_port: Option<u16>,
         #[serde(default)]
         pub destination_port: Option<u16>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_packet_flow_detector")]
         pub detector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub application: Option<AgentPacketFlowApplication>,
@@ -1947,6 +1948,22 @@ pub mod api {
 
     fn protocol_is(protocol: Option<TransportProtocol>, expected: TransportProtocol) -> bool {
         protocol.is_none() || protocol == Some(expected)
+    }
+
+    fn deserialize_packet_flow_detector<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let detector = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let Some(detector) = detector else {
+            return Ok(None);
+        };
+        if detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(Some(detector))
     }
 
     fn deserialize_packet_flow_payload_prefix<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -3278,6 +3295,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("packet-flow payload_prefix exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_detector_deserialization_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"detector":"ebpf-jsonl"}"#)?;
+        assert_eq!(parsed.detector.as_deref(), Some("ebpf-jsonl"));
+
+        let oversized_detector = "x".repeat(api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1);
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"detector":"{oversized_detector}"}}"#
+        )) {
+            Ok(_) => return Err("oversized detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("packet-flow detector exceeds"));
         Ok(())
     }
 
