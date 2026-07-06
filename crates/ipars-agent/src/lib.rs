@@ -456,10 +456,14 @@ pub struct RelayForwarderStats {
     outbound_datagram_bytes: AtomicU64,
     outbound_dropped_unexpected_source_packets: AtomicU64,
     outbound_dropped_unexpected_source_payload_bytes: AtomicU64,
+    outbound_dropped_expired_session_packets: AtomicU64,
+    outbound_dropped_expired_session_payload_bytes: AtomicU64,
     outbound_dropped_non_wireguard_packets: AtomicU64,
     outbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     inbound_packets: AtomicU64,
     inbound_payload_bytes: AtomicU64,
+    inbound_dropped_expired_session_packets: AtomicU64,
+    inbound_dropped_expired_session_payload_bytes: AtomicU64,
     inbound_dropped_non_wireguard_packets: AtomicU64,
     inbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     last_forwarded_unix_millis: AtomicI64,
@@ -482,10 +486,14 @@ impl RelayForwarderStats {
             outbound_datagram_bytes: AtomicU64::new(0),
             outbound_dropped_unexpected_source_packets: AtomicU64::new(0),
             outbound_dropped_unexpected_source_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_expired_session_packets: AtomicU64::new(0),
+            outbound_dropped_expired_session_payload_bytes: AtomicU64::new(0),
             outbound_dropped_non_wireguard_packets: AtomicU64::new(0),
             outbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             inbound_packets: AtomicU64::new(0),
             inbound_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_expired_session_packets: AtomicU64::new(0),
+            inbound_dropped_expired_session_payload_bytes: AtomicU64::new(0),
             inbound_dropped_non_wireguard_packets: AtomicU64::new(0),
             inbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             last_forwarded_unix_millis: AtomicI64::new(-1),
@@ -512,6 +520,13 @@ impl RelayForwarderStats {
             .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
+    pub fn record_outbound_expired_session_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_expired_session_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_expired_session_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
     pub fn record_outbound_drop(&self, payload_bytes: usize) {
         self.outbound_dropped_non_wireguard_packets
             .fetch_add(1, Ordering::Relaxed);
@@ -524,6 +539,13 @@ impl RelayForwarderStats {
         self.inbound_payload_bytes
             .fetch_add(payload_bytes as u64, Ordering::Relaxed);
         self.record_forwarded_at();
+    }
+
+    pub fn record_inbound_expired_session_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_expired_session_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_expired_session_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
     pub fn record_inbound_drop(&self, payload_bytes: usize) {
@@ -549,6 +571,12 @@ impl RelayForwarderStats {
             outbound_dropped_unexpected_source_payload_bytes: self
                 .outbound_dropped_unexpected_source_payload_bytes
                 .load(Ordering::Relaxed),
+            outbound_dropped_expired_session_packets: self
+                .outbound_dropped_expired_session_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_expired_session_payload_bytes: self
+                .outbound_dropped_expired_session_payload_bytes
+                .load(Ordering::Relaxed),
             outbound_dropped_non_wireguard_packets: self
                 .outbound_dropped_non_wireguard_packets
                 .load(Ordering::Relaxed),
@@ -557,6 +585,12 @@ impl RelayForwarderStats {
                 .load(Ordering::Relaxed),
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             inbound_payload_bytes: self.inbound_payload_bytes.load(Ordering::Relaxed),
+            inbound_dropped_expired_session_packets: self
+                .inbound_dropped_expired_session_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_expired_session_payload_bytes: self
+                .inbound_dropped_expired_session_payload_bytes
+                .load(Ordering::Relaxed),
             inbound_dropped_non_wireguard_packets: self
                 .inbound_dropped_non_wireguard_packets
                 .load(Ordering::Relaxed),
@@ -619,6 +653,12 @@ impl UdpRelayFrameForwarder {
         socket: &tokio::net::UdpSocket,
         payload: &[u8],
     ) -> Result<usize, AgentError> {
+        if !self.session_active() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_outbound_expired_session_drop(payload.len());
+            }
+            return Ok(0);
+        }
         if !wireguard_datagram_payload(payload) {
             if let Some(metrics) = &self.metrics {
                 metrics.record_outbound_drop(payload.len());
@@ -640,7 +680,12 @@ impl UdpRelayFrameForwarder {
         socket: &tokio::net::UdpSocket,
         payload: &[u8],
     ) -> Result<usize, AgentError> {
-        self.ensure_session_active()?;
+        if !self.session_active() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_inbound_expired_session_drop(payload.len());
+            }
+            return Ok(0);
+        }
         if !wireguard_datagram_payload(payload) {
             if let Some(metrics) = &self.metrics {
                 metrics.record_inbound_drop(payload.len());
@@ -683,8 +728,12 @@ impl UdpRelayFrameForwarder {
         }
     }
 
+    fn session_active(&self) -> bool {
+        Utc::now() < self.session.expires_at
+    }
+
     fn ensure_session_active(&self) -> Result<(), AgentError> {
-        if Utc::now() >= self.session.expires_at {
+        if !self.session_active() {
             return Err(AgentError::RelaySession(format!(
                 "relay session {} expired at {}",
                 self.session.session_id, self.session.expires_at
@@ -3652,6 +3701,83 @@ mod tests {
         assert_eq!(&buffer[..len], outbound_payload.as_slice());
         shutdown_tx.send(true)?;
         relay_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_drops_expired_session_datagrams_without_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let wireguard_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_addr = relay_receiver.local_addr()?;
+        let wireguard_addr = wireguard_receiver.local_addr()?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            relay_addr,
+            forwarder_socket.local_addr()?,
+        ));
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: relay_addr,
+                admitted_local_addr: forwarder_socket.local_addr()?,
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_000)),
+                session_id: "expired-session".to_string(),
+                session_token: "expired-token".to_string(),
+                expires_at: Utc::now() - ChronoDuration::seconds(1),
+            },
+            wireguard_addr,
+        )
+        .with_metrics(stats.clone());
+
+        let outbound_payload = wireguard_transport_payload(0xe1);
+        assert_eq!(
+            forwarder
+                .send_to_relay(&forwarder_socket, &outbound_payload)
+                .await?,
+            0
+        );
+        let inbound_payload = wireguard_transport_payload(0xe2);
+        assert_eq!(
+            forwarder
+                .forward_to_wireguard(&forwarder_socket, &inbound_payload)
+                .await?,
+            0
+        );
+        let mut buffer = [0_u8; 128];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            relay_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wireguard_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.outbound_packets, 0);
+        assert_eq!(snapshot.inbound_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_expired_session_packets, 1);
+        assert_eq!(
+            snapshot.outbound_dropped_expired_session_payload_bytes,
+            outbound_payload.len() as u64
+        );
+        assert_eq!(snapshot.inbound_dropped_expired_session_packets, 1);
+        assert_eq!(
+            snapshot.inbound_dropped_expired_session_payload_bytes,
+            inbound_payload.len() as u64
+        );
+        assert!(snapshot.last_forwarded_at.is_none());
         Ok(())
     }
 

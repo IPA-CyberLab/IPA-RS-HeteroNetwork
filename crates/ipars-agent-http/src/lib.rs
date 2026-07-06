@@ -423,6 +423,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total Relay forwarder local packets dropped before relay because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total Relay forwarder local payload bytes dropped before relay because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total Relay forwarder local packets dropped before relay because they were not WireGuard datagrams."
     );
     prometheus_line!(
@@ -452,6 +468,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     prometheus_line!(
         &mut body,
         "# TYPE ipars_agent_relay_forwarder_inbound_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total Relay forwarder relay packets dropped before local WireGuard because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total Relay forwarder relay payload bytes dropped before local WireGuard because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total counter"
     );
     prometheus_line!(
         &mut body,
@@ -499,6 +531,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         );
         prometheus_line!(
             &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_expired_session_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_expired_session_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
             "ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.outbound_dropped_non_wireguard_packets
         );
@@ -516,6 +558,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
             &mut body,
             "ipars_agent_relay_forwarder_inbound_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.inbound_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_expired_session_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_expired_session_payload_bytes
         );
         prometheus_line!(
             &mut body,
@@ -1072,7 +1124,9 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 52000)),
         ));
         forwarder_metrics.record_outbound(64, 128);
+        forwarder_metrics.record_outbound_expired_session_drop(96);
         forwarder_metrics.record_inbound(32);
+        forwarder_metrics.record_inbound_expired_session_drop(48);
         runtime
             .upsert_relay_forwarder_endpoint(
                 NodeId::from_string("peer-a"),
@@ -1128,8 +1182,24 @@ mod tests {
         assert_eq!(metrics.relay_forwarders[0].outbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_payload_bytes, 64);
         assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_expired_session_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_expired_session_payload_bytes,
+            96
+        );
         assert_eq!(metrics.relay_forwarders[0].inbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].inbound_payload_bytes, 32);
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_expired_session_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_expired_session_payload_bytes,
+            48
+        );
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 0);
@@ -1212,8 +1282,13 @@ mod tests {
         assert!(body.contains(
             "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total"
         ));
+        assert!(body.contains(
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total"
+        ));
         assert!(body
             .contains("ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total"));
         assert!(body
             .contains("ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total"));
         assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
