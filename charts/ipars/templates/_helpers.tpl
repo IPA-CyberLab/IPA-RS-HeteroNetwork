@@ -377,6 +377,9 @@
 {{- if and (ne $value "") (not (regexMatch "^([0-9]|[1-9][0-9]*|[0-9]%|[1-9][0-9]%|100%)$" $value)) -}}
 {{- fail (printf "%s %q must be a non-negative integer or percentage from 0%% to 100%%" $path $value) -}}
 {{- end -}}
+{{- if and (ne $value "") (not (regexMatch "%$" $value)) (or (gt (len $value) 10) (and (eq (len $value) 10) (gt $value "2147483647"))) -}}
+{{- fail (printf "%s %q must be a non-negative IntOrString integer no greater than 2147483647" $path $value) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "ipars.validateAnnotationKey" -}}

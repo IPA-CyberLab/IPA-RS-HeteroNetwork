@@ -8623,6 +8623,46 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_bounds_int_or_percent_values_before_int_conversion() -> anyhow::Result<()> {
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let pdb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/poddisruptionbudget.yaml")
+            .canonicalize()?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let pdb = std::fs::read_to_string(pdb_path)?;
+
+        assert!(helpers_template.contains("define \"ipars.validateIntOrPercent\""));
+        assert!(helpers_template.contains("no greater than 2147483647"));
+        assert!(helpers_template.contains("percentage from 0%% to 100%%"));
+        for path in ["agent.rollout.maxUnavailable", "agent.rollout.maxSurge"] {
+            assert!(
+                daemonset.contains(&format!(
+                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as bounded IntOrString before rendering"
+            );
+        }
+        for path in [
+            "agent.podDisruptionBudget.minAvailable",
+            "agent.podDisruptionBudget.maxUnavailable",
+        ] {
+            assert!(
+                pdb.contains(&format!(
+                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as bounded IntOrString before rendering"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_rejects_inconsistent_service_exposure_values() -> anyhow::Result<()> {
         let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/service.yaml")
