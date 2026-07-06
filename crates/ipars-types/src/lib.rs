@@ -3512,12 +3512,15 @@ pub mod api {
         if payload.len() < 8 || payload[0] != 0x10 {
             return false;
         }
-        let Some((remaining_len, mut offset)) = mqtt_remaining_length(payload) else {
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
             return false;
         };
         if remaining_len < 10 {
             return false;
         }
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
         let Some(protocol_name_len) = read_u16_be(payload, offset).map(|len| len as usize) else {
             return false;
         };
@@ -3544,28 +3547,95 @@ pub mod api {
             return false;
         };
         let keepalive_end = protocol_name_end + 4;
-        if payload.get(protocol_name_end + 2..keepalive_end).is_none() || connect_flags & 0x01 != 0
+        if payload.get(protocol_name_end + 2..keepalive_end).is_none()
+            || !mqtt_connect_flags(connect_flags)
+            || remaining_end < keepalive_end
         {
             return false;
         }
 
-        (protocol_name == b"MQTT"
-            && (protocol_level == 4 || (protocol_level == 5 && remaining_len > 10)))
-            || (protocol_name == b"MQIsdp" && protocol_level == 3)
+        let payload_start = if protocol_name == b"MQTT" && protocol_level == 5 {
+            let Some((properties_len, properties_offset)) =
+                mqtt_variable_integer(payload, keepalive_end)
+            else {
+                return false;
+            };
+            let Some(payload_start) = properties_offset.checked_add(properties_len) else {
+                return false;
+            };
+            if payload_start > remaining_end {
+                return false;
+            }
+            payload_start
+        } else {
+            keepalive_end
+        };
+
+        let protocol_ok = protocol_name == b"MQTT" && matches!(protocol_level, 4 | 5)
+            || protocol_name == b"MQIsdp" && protocol_level == 3;
+        protocol_ok && mqtt_connect_payload(payload, payload_start, remaining_end, connect_flags)
     }
 
-    fn mqtt_remaining_length(payload: &[u8]) -> Option<(usize, usize)> {
+    fn mqtt_variable_integer(payload: &[u8], mut offset: usize) -> Option<(usize, usize)> {
         let mut value = 0_usize;
         let mut multiplier = 1_usize;
-        for offset in 1..=4 {
+        for _ in 0..4 {
             let byte = *payload.get(offset)?;
             value = value.checked_add(((byte & 0x7f) as usize).checked_mul(multiplier)?)?;
+            offset += 1;
             if byte & 0x80 == 0 {
-                return Some((value, offset + 1));
+                return Some((value, offset));
             }
             multiplier = multiplier.checked_mul(128)?;
         }
         None
+    }
+
+    fn mqtt_connect_flags(flags: u8) -> bool {
+        let username = flags & 0x80 != 0;
+        let password = flags & 0x40 != 0;
+        let will_retain = flags & 0x20 != 0;
+        let will_qos = (flags >> 3) & 0x03;
+        let will = flags & 0x04 != 0;
+
+        flags & 0x01 == 0
+            && (!password || username)
+            && (will || (!will_retain && will_qos == 0))
+            && will_qos != 0x03
+    }
+
+    fn mqtt_connect_payload(
+        payload: &[u8],
+        payload_start: usize,
+        remaining_end: usize,
+        connect_flags: u8,
+    ) -> bool {
+        let Some(client_id_len) = read_u16_be(payload, payload_start).map(|len| len as usize)
+        else {
+            return false;
+        };
+        let Some(client_id_start) = payload_start.checked_add(2) else {
+            return false;
+        };
+        let Some(client_id_end) = client_id_start.checked_add(client_id_len) else {
+            return false;
+        };
+        if client_id_end > remaining_end {
+            return false;
+        }
+        let Some(client_id) = payload.get(client_id_start..client_id_end) else {
+            return false;
+        };
+        mqtt_client_identifier(client_id, connect_flags)
+    }
+
+    fn mqtt_client_identifier(client_id: &[u8], connect_flags: u8) -> bool {
+        let clean_start = connect_flags & 0x02 != 0;
+        (!client_id.is_empty() || clean_start)
+            && client_id.len() <= 65_535
+            && client_id
+                .iter()
+                .all(|byte| *byte != 0 && !byte.is_ascii_control())
     }
 
     fn amqp_payload(payload: &[u8]) -> bool {
@@ -5586,14 +5656,32 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[
-                0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c,
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
             ])
             .application(),
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
             observation_for_payload(&[
-                0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c,
+                0x10, 0x12, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x00, 0x00,
+                0x05, b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x42, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
             ])
             .application(),
             api::AgentPacketFlowApplication::Unknown
