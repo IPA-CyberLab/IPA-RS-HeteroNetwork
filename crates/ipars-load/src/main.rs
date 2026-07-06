@@ -472,6 +472,13 @@ impl LoadReport {
                 self.peer_map_edges_seen
             );
         }
+        if self.advertised_routes != self.route_provider_count {
+            bail!(
+                "{context} advertised {} routes, expected {} route-provider routes",
+                self.advertised_routes,
+                self.route_provider_count
+            );
+        }
         if self.signal_negotiations != self.active_pair_count {
             bail!(
                 "{context} completed {} signal negotiations, expected {}",
@@ -1368,7 +1375,7 @@ async fn run_daemon_scenario(
 
     services.write_manifest(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_started = Instant::now();
-    let advertised_routes = peer_records.iter().map(|node| node.routes.len()).sum();
+    let advertised_routes = daemon_advertised_route_count(&peer_records);
     let active_pair_count = if agent_statuses.len() > 1 {
         scenario.active_pair_count
     } else {
@@ -1615,6 +1622,22 @@ fn daemon_route_provider_agent_count(scenario: Scenario, agent_processes: usize)
     agent_processes
         .saturating_sub(scenario.relay_count)
         .min(scenario.route_provider_count)
+}
+
+fn daemon_advertised_route_count(peer_records: &[NodeRecord]) -> usize {
+    peer_records
+        .iter()
+        .flat_map(|node| {
+            node.routes.iter().map(|route| {
+                (
+                    route.advertised_by.to_string(),
+                    route.id.clone(),
+                    route.cidr.to_string(),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn validate_daemon_control_plane_processes(
@@ -2197,6 +2220,20 @@ impl DaemonProcessGroup {
                     "--relay-max-mbps".to_string(),
                     "10000".to_string(),
                 ]);
+            }
+            let route_provider_routes = advertised_routes(index, scenario)?;
+            if !route_provider_routes.is_empty() {
+                agent_args.extend([
+                    "--apply-docker-routes".to_string(),
+                    "--docker-container-namespace".to_string(),
+                    format!("ipars-load-agent-{index:04}"),
+                ]);
+                for route in route_provider_routes {
+                    agent_args.extend([
+                        "--docker-container-cidr".to_string(),
+                        route.cidr.to_string(),
+                    ]);
+                }
             }
             startup.children.push(spawn_iparsd(
                 iparsd_bin,
@@ -3727,6 +3764,14 @@ mod tests {
         };
         assert!(error.contains("no reachable paths"));
 
+        let mut missing_advertised_route = report.clone();
+        missing_advertised_route.advertised_routes = 0;
+        let error = match missing_advertised_route.validate_success() {
+            Ok(_) => bail!("missing advertised route should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("advertised"));
+
         let relay_report = run_relay_udp_scenario(
             Scenario::from_name(ScenarioName::Three),
             RelayLoadOptions {
@@ -3965,6 +4010,36 @@ mod tests {
         let thousand = Scenario::from_name(ScenarioName::Thousand);
         assert_eq!(daemon_relay_agent_count(thousand, 4), 4);
         assert_eq!(daemon_route_provider_agent_count(thousand, 4), 0);
+    }
+
+    #[test]
+    fn daemon_advertised_route_count_deduplicates_peer_map_views() -> anyhow::Result<()> {
+        let route_provider = NodeId::from_string("route-provider-a");
+        let route = Route {
+            id: "docker-0".to_string(),
+            cidr: "10.128.0.0/24".parse()?,
+            advertised_by: route_provider.clone(),
+            via: Some(route_provider.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        let mut first_view = node_record_with_routes("peer-view-a", vec![route.clone()]);
+        let second_view = node_record_with_routes("peer-view-b", vec![route.clone()]);
+        assert_eq!(
+            daemon_advertised_route_count(&[first_view.clone(), second_view]),
+            1
+        );
+
+        first_view.routes.push(Route {
+            id: "docker-1".to_string(),
+            cidr: "10.128.1.0/24".parse()?,
+            advertised_by: route_provider,
+            via: None,
+            metric: 100,
+            tags: BTreeSet::new(),
+        });
+        assert_eq!(daemon_advertised_route_count(&[first_view]), 2);
+        Ok(())
     }
 
     #[test]
@@ -4739,6 +4814,7 @@ mod tests {
         assert_eq!(report.daemon_agent_processes, 2);
         assert_eq!(report.relay_count, 1);
         assert_eq!(report.route_provider_count, 1);
+        assert_eq!(report.advertised_routes, 1);
         assert_eq!(report.registrations, 2);
         assert_eq!(report.peer_map_requests, 6);
         assert_eq!(report.peer_map_edges_seen, 2);
@@ -4946,6 +5022,23 @@ mod tests {
             summary.record_edge(source, peer);
         }
         summary
+    }
+
+    fn node_record_with_routes(label: &str, routes: Vec<Route>) -> NodeRecord {
+        NodeRecord {
+            node_id: NodeId::from_string(label),
+            cluster_id: ClusterId::from_string("load-route-count-test"),
+            vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
+            identity_public_key: "identity-public-key".to_string(),
+            wireguard_public_key: "wireguard-public-key".to_string(),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes,
+            registered_at: Utc::now(),
+        }
     }
 
     fn synthetic_sleep_child(role: &str, log_path: PathBuf) -> anyhow::Result<DaemonChild> {
