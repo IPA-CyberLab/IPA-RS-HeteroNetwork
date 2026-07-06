@@ -4530,6 +4530,23 @@ fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyho
     Ok(())
 }
 
+fn validate_kubernetes_external_service_ip_disjoint(
+    left_flag: &str,
+    left_ips: &[IpAddr],
+    right_flag: &str,
+    right_ips: &[IpAddr],
+) -> anyhow::Result<()> {
+    let left_ips = left_ips.iter().copied().collect::<BTreeSet<_>>();
+    for ip in right_ips {
+        if left_ips.contains(ip) {
+            anyhow::bail!(
+                "{right_flag} must not reuse external Service IP address {ip} already assigned by {left_flag}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_restricted_cidrs(
     flag: &str,
     cidrs: &[ipnet::IpNet],
@@ -5166,6 +5183,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         &args.agent_api_external_ips,
     )?;
     validate_kubernetes_external_service_ips("--relay-external-ip", &args.relay_external_ips)?;
+    validate_kubernetes_external_service_ip_disjoint(
+        "--agent-api-external-ip",
+        &args.agent_api_external_ips,
+        "--relay-external-ip",
+        &args.relay_external_ips,
+    )?;
     if args.agent_api_health_check_node_port.is_some()
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -8455,6 +8478,9 @@ mod tests {
         );
         assert!(service_template
             .contains("agent.relayService.externalIPs entry %q must not be repeated"));
+        assert!(service_template.contains(
+            "agent.relayService.externalIPs entry %q must not reuse agent.apiService.externalIPs"
+        ));
         Ok(())
     }
 
@@ -10492,6 +10518,24 @@ mod tests {
         };
         assert!(error.contains(
             "--agent-api-external-ip must not repeat external Service IP address 198.51.100.11"
+        ));
+
+        let mut duplicate_cross_service_external_ip = base_k8s_install_args();
+        duplicate_cross_service_external_ip.expose_agent_api = true;
+        duplicate_cross_service_external_ip.expose_relay = true;
+        duplicate_cross_service_external_ip.allow_public_service_exposure = true;
+        duplicate_cross_service_external_ip.agent_api_external_ips = vec!["198.51.100.11".parse()?];
+        duplicate_cross_service_external_ip.relay_external_ips = vec!["198.51.100.11".parse()?];
+        duplicate_cross_service_external_ip.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_external_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_external_ip) {
+            Ok(_) => panic!("agent and relay externalIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-ip must not reuse external Service IP address 198.51.100.11 already assigned by --agent-api-external-ip"
         ));
 
         let parsed = Cli::try_parse_from([
