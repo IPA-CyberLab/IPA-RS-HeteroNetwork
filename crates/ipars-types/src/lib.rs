@@ -4050,14 +4050,32 @@ pub mod api {
     }
 
     fn elasticsearch_transport_payload(payload: &[u8]) -> bool {
-        if payload.len() < 19 || payload.get(..2) != Some(b"ES") {
+        if payload.len() < 23 || payload.get(..2) != Some(b"ES") {
             return false;
         }
-        let message_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
-        let status = payload[14];
-        let version_id = u32::from_be_bytes([payload[15], payload[16], payload[17], payload[18]]);
+        let Some(message_len) = read_u32_be(payload, 2).map(|len| len as usize) else {
+            return false;
+        };
+        let Some(&status) = payload.get(14) else {
+            return false;
+        };
+        let Some(version_id) = read_u32_be(payload, 15) else {
+            return false;
+        };
+        let Some(variable_header_size) = read_u32_be(payload, 19).map(|len| len as usize) else {
+            return false;
+        };
 
-        (13..=128 * 1024 * 1024).contains(&message_len) && status & !0x0f == 0 && version_id != 0
+        (17..=128 * 1024 * 1024).contains(&message_len)
+            && elasticsearch_transport_status(status)
+            && version_id != 0
+            && variable_header_size <= message_len - 17
+    }
+
+    fn elasticsearch_transport_status(status: u8) -> bool {
+        let response = status & 0x01 != 0;
+        let error = status & 0x02 != 0;
+        status & !0x0f == 0 && (response || !error)
     }
 
     fn starts_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
@@ -5015,6 +5033,24 @@ mod tests {
             [5, 0, 0, 0, 0]
         }
 
+        fn elasticsearch_transport_frame(
+            status: u8,
+            variable_header: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            let message_len = 17 + variable_header.len() + body.len();
+            let mut payload = Vec::with_capacity(6 + message_len);
+            payload.extend_from_slice(b"ES");
+            payload.extend_from_slice(&(message_len as u32).to_be_bytes());
+            payload.extend_from_slice(&1_u64.to_be_bytes());
+            payload.push(status);
+            payload.extend_from_slice(&8_00_00_99_u32.to_be_bytes());
+            payload.extend_from_slice(&(variable_header.len() as u32).to_be_bytes());
+            payload.extend_from_slice(variable_header);
+            payload.extend_from_slice(body);
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             payload_prefix: payload.to_vec(),
@@ -5671,15 +5707,28 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
-            observation_for_payload(&[
-                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 0, 0, 1, 0, 0, 0, 0,
-            ])
-            .application(),
+            observation_for_payload(&elasticsearch_transport_frame(0x08, b"", b"")).application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame(0x09, b"vh", b"body"))
+                .application(),
             api::AgentPacketFlowApplication::Elasticsearch
         );
         assert_eq!(
             observation_for_payload(&[
                 b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x40, 0, 0, 0, 1, 0, 0, 0, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame(0x02, b"", b"")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 8, 0, 0, 99, 0, 0, 0, 1,
             ])
             .application(),
             api::AgentPacketFlowApplication::Unknown
