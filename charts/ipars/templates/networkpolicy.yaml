@@ -5,8 +5,14 @@
 {{- if and (not $networkPolicyEnabled) (or .Values.networkPolicy.agentApi.enabled .Values.networkPolicy.relay.enabled) -}}
 {{- fail "networkPolicy.agentApi.enabled and networkPolicy.relay.enabled require networkPolicy.enabled=true" -}}
 {{- end -}}
+{{- if and (not $networkPolicyEnabled) .Values.networkPolicy.acknowledgeHostNetwork -}}
+{{- fail "networkPolicy.acknowledgeHostNetwork=true requires networkPolicy.enabled=true" -}}
+{{- end -}}
 {{- if and $networkPolicyEnabled (not (or .Values.networkPolicy.agentApi.enabled .Values.networkPolicy.relay.enabled)) -}}
 {{- fail "networkPolicy.enabled=true requires networkPolicy.agentApi.enabled=true or networkPolicy.relay.enabled=true" -}}
+{{- end -}}
+{{- if and $networkPolicyEnabled (ne $agentHostNetwork "true") .Values.networkPolicy.acknowledgeHostNetwork -}}
+{{- fail "networkPolicy.acknowledgeHostNetwork=true only applies when agent.hostNetwork=true" -}}
 {{- end -}}
 {{- if and $networkPolicyEnabled (eq $agentHostNetwork "true") (not .Values.networkPolicy.acknowledgeHostNetwork) -}}
 {{- fail "networkPolicy with agent.hostNetwork=true requires networkPolicy.acknowledgeHostNetwork=true because enforcement is CNI-dependent for host-networked pods" -}}

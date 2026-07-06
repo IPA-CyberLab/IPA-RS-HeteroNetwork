@@ -4867,6 +4867,11 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.network_policy_acknowledge_host_network && !args.enable_network_policy {
         anyhow::bail!("--network-policy-acknowledge-host-network requires --enable-network-policy");
     }
+    if args.network_policy_acknowledge_host_network && args.disable_agent_host_network {
+        anyhow::bail!(
+            "--network-policy-acknowledge-host-network only applies when agent host networking is enabled; remove it with --disable-agent-host-network"
+        );
+    }
     if !args.agent_api_network_policy_cidrs.is_empty() && !args.enable_network_policy {
         anyhow::bail!("--agent-api-network-policy-cidr requires --enable-network-policy");
     }
@@ -8142,6 +8147,12 @@ mod tests {
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.acknowledgeHostNetwork=true requires networkPolicy.enabled=true"
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.acknowledgeHostNetwork=true only applies when agent.hostNetwork=true"
+        ));
         assert!(network_policy_template
             .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
         assert!(network_policy_template.contains(
@@ -10825,6 +10836,19 @@ mod tests {
         let plan = k8s_install_plan(pod_network_policy)?;
         assert!(plan.commands[2].contains("--set agent.hostNetwork=false"));
         assert!(!plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
+
+        let mut pod_network_policy_with_irrelevant_ack = base_k8s_install_args();
+        pod_network_policy_with_irrelevant_ack.disable_agent_host_network = true;
+        pod_network_policy_with_irrelevant_ack.enable_network_policy = true;
+        pod_network_policy_with_irrelevant_ack.network_policy_acknowledge_host_network = true;
+        pod_network_policy_with_irrelevant_ack.expose_agent_api = true;
+        pod_network_policy_with_irrelevant_ack.agent_api_network_policy_cidrs =
+            vec!["10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(pod_network_policy_with_irrelevant_ack) {
+            Ok(_) => panic!("hostNetwork acknowledgement should not apply to pod-network agents"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--network-policy-acknowledge-host-network only applies"));
 
         let mut no_cidrs = base_k8s_install_args();
         no_cidrs.enable_network_policy = true;
