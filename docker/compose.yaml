@@ -148,7 +148,6 @@ services:
       - IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS=${IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS:-5}
       - IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}
       - IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}
-      - IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock
       - IPARS_DOCKER_NETWORKS
       - IPARS_DOCKER_CONTAINER_NAMESPACE
       - IPARS_DOCKER_HOST_INTERFACE=${IPARS_DOCKER_HOST_INTERFACE:-docker0}
@@ -195,7 +194,6 @@ services:
       - ipars-agent-join-token
     volumes:
       - agent-data:/var/lib/ipars
-      - ${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro
 
 secrets:
   ipars-agent-join-token:

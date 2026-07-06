@@ -36,6 +36,7 @@ const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
 const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
+const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -2772,11 +2773,11 @@ struct InstallEnvironment {
 fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_docker_install_args(&args)?;
     let compose_file = args.compose_file.display().to_string();
-    let compose_prefix = format!(
-        "docker compose -p {} -f {}",
-        shell_word(&args.project_name),
-        shell_word(&compose_file)
-    );
+    let mut compose_prefix = format!("docker compose -p {}", shell_word(&args.project_name));
+    for compose_file in docker_install_compose_files(&args) {
+        compose_prefix.push_str(" -f ");
+        compose_prefix.push_str(&shell_word(&compose_file));
+    }
     let environment = docker_install_environment(&args);
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
@@ -2815,14 +2816,14 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
-        "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
+        "Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.docker_discover_networks {
-        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before Compose bind-mounts it into the agent".to_string());
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         if args.userspace_wireguard_command.is_some() {
@@ -2858,6 +2859,14 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         ],
         notes,
     })
+}
+
+fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
+    let mut files = vec![args.compose_file.display().to_string()];
+    if args.docker_discover_networks {
+        files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
+    }
+    files
 }
 
 fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
@@ -3227,6 +3236,10 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
             value: "true".to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            value: "/run/ipars/docker.sock".to_string(),
         });
     }
     if !args.docker_networks.is_empty() {
@@ -7118,6 +7131,11 @@ mod tests {
             environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
             Some("command")
         );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            None
+        );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
             Some("compose-default")
@@ -7403,6 +7421,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET"),
+            Some("/run/ipars/docker.sock")
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
             Some("edge_default,edge_apps")
         );
@@ -7458,7 +7480,7 @@ mod tests {
         assert!(plan.commands[0].contains("docker --host"));
         assert_eq!(
             plan.commands[1],
-            "docker compose -p edge -f ops/compose.yaml config"
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.docker-discovery.yaml config"
         );
         assert!(plan
             .notes
@@ -7481,6 +7503,10 @@ mod tests {
             .join("../../docker/compose.yaml")
             .canonicalize()?;
         let compose = std::fs::read_to_string(compose_path)?;
+        let discovery_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.docker-discovery.yaml")
+            .canonicalize()?;
+        let discovery_compose = std::fs::read_to_string(discovery_compose_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
@@ -7493,7 +7519,7 @@ mod tests {
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
-        assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(!compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
         assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
@@ -7518,7 +7544,11 @@ mod tests {
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"));
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"));
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"));
-        assert!(compose.contains(
+        assert!(!compose.contains(
+            "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
+        ));
+        assert!(discovery_compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(discovery_compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
         Ok(())
@@ -8049,6 +8079,7 @@ mod tests {
             environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
             None
         );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
             Some("userspace-command")

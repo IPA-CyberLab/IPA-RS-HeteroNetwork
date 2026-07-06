@@ -75,18 +75,21 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let rendered =
         String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
     anyhow::ensure!(
-        rendered.contains(&format!("source: {}", docker_socket.display())),
-        "rendered base Compose config did not include the Docker API socket bind"
+        !rendered.contains(&format!("source: {}", docker_socket.display())),
+        "rendered base Compose config unexpectedly included the Docker API socket bind"
     );
     anyhow::ensure!(
-        rendered.contains("target: /run/ipars/docker.sock"),
-        "rendered base Compose config did not mount the Docker API socket in the agent container"
+        !rendered.contains("target: /run/ipars/docker.sock"),
+        "rendered base Compose config unexpectedly mounted the Docker API socket in the agent container"
     );
 
     let multi_network_compose = ComposeProject {
         repo_root: repo_root.clone(),
         project_name: format!("ipars-config-{}", unique_suffix()?),
-        compose_files: vec![PathBuf::from("docker/compose.yaml")],
+        compose_files: vec![
+            PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.docker-discovery.yaml"),
+        ],
         docker_socket,
         extra_env: vec![
             (
@@ -183,6 +186,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         &[
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
+            ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
             ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
             ("IPARS_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
             ("IPARS_DOCKER_HOST_INTERFACE", "br-edge"),
@@ -216,6 +220,10 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS", "33"),
         ],
     )?;
+    anyhow::ensure!(
+        rendered.contains("target: /run/ipars/docker.sock"),
+        "rendered Docker discovery Compose config did not mount the Docker API socket"
+    );
 
     let compose = ComposeProject {
         repo_root,
