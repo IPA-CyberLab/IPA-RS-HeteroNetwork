@@ -407,6 +407,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total Relay forwarder packets dropped before relay because the sender did not match the configured local WireGuard endpoint."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total Relay forwarder payload bytes dropped before relay because the sender did not match the configured local WireGuard endpoint."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total Relay forwarder local packets dropped before relay because they were not WireGuard datagrams."
     );
     prometheus_line!(
@@ -470,6 +486,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
             &mut body,
             "ipars_agent_relay_forwarder_outbound_datagram_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.outbound_datagram_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_unexpected_source_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_unexpected_source_payload_bytes
         );
         prometheus_line!(
             &mut body,
@@ -1183,6 +1209,9 @@ mod tests {
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
         assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
+        assert!(body.contains(
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total"
+        ));
         assert!(body
             .contains("ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total"));
         assert!(body

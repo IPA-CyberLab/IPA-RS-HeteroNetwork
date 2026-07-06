@@ -3648,6 +3648,8 @@ struct AgentOtelMetrics {
     forwarder_outbound_packets: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
+    forwarder_outbound_dropped_unexpected_source_packets: Counter<u64>,
+    forwarder_outbound_dropped_unexpected_source_payload_bytes: Counter<u64>,
     forwarder_outbound_dropped_non_wireguard_packets: Counter<u64>,
     forwarder_outbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
     forwarder_inbound_packets: Counter<u64>,
@@ -3782,6 +3784,23 @@ impl AgentOtelMetrics {
             forwarder_outbound_datagram_bytes: meter
                 .u64_counter("ipars.agent.relay.forwarder.outbound.datagram.bytes")
                 .with_description("Relay forwarder framed datagram bytes sent to relay.")
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_unexpected_source_packets: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.unexpected_source.packets",
+                )
+                .with_description(
+                    "Relay forwarder packets dropped before relay because the sender did not match the configured local WireGuard endpoint.",
+                )
+                .build(),
+            forwarder_outbound_dropped_unexpected_source_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.unexpected_source.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder payload bytes dropped before relay because the sender did not match the configured local WireGuard endpoint.",
+                )
                 .with_unit("By")
                 .build(),
             forwarder_outbound_dropped_non_wireguard_packets: meter
@@ -4027,6 +4046,13 @@ impl AgentOtelMetrics {
                 .add(forwarder.outbound_payload_bytes, &attrs);
             self.forwarder_outbound_datagram_bytes
                 .add(forwarder.outbound_datagram_bytes, &attrs);
+            self.forwarder_outbound_dropped_unexpected_source_packets
+                .add(forwarder.outbound_dropped_unexpected_source_packets, &attrs);
+            self.forwarder_outbound_dropped_unexpected_source_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_unexpected_source_payload_bytes,
+                    &attrs,
+                );
             self.forwarder_outbound_dropped_non_wireguard_packets
                 .add(forwarder.outbound_dropped_non_wireguard_packets, &attrs);
             self.forwarder_outbound_dropped_non_wireguard_payload_bytes
@@ -4089,6 +4115,14 @@ fn agent_forwarder_delta(
             current.outbound_datagram_bytes,
             previous.map(|previous| previous.outbound_datagram_bytes),
         ),
+        outbound_dropped_unexpected_source_packets: counter_delta(
+            current.outbound_dropped_unexpected_source_packets,
+            previous.map(|previous| previous.outbound_dropped_unexpected_source_packets),
+        ),
+        outbound_dropped_unexpected_source_payload_bytes: counter_delta(
+            current.outbound_dropped_unexpected_source_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_unexpected_source_payload_bytes),
+        ),
         outbound_dropped_non_wireguard_packets: counter_delta(
             current.outbound_dropped_non_wireguard_packets,
             previous.map(|previous| previous.outbound_dropped_non_wireguard_packets),
@@ -4121,6 +4155,8 @@ fn has_agent_forwarder_delta(delta: &AgentRelayForwarderMetrics) -> bool {
     delta.outbound_packets > 0
         || delta.outbound_payload_bytes > 0
         || delta.outbound_datagram_bytes > 0
+        || delta.outbound_dropped_unexpected_source_packets > 0
+        || delta.outbound_dropped_unexpected_source_payload_bytes > 0
         || delta.outbound_dropped_non_wireguard_packets > 0
         || delta.outbound_dropped_non_wireguard_payload_bytes > 0
         || delta.inbound_packets > 0
@@ -10698,6 +10734,8 @@ mod tests {
             outbound_packets,
             outbound_payload_bytes,
             outbound_datagram_bytes,
+            outbound_dropped_unexpected_source_packets: 0,
+            outbound_dropped_unexpected_source_payload_bytes: 0,
             outbound_dropped_non_wireguard_packets: 0,
             outbound_dropped_non_wireguard_payload_bytes: 0,
             inbound_packets,
@@ -10711,6 +10749,8 @@ mod tests {
     #[test]
     fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
         let mut current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        current.outbound_dropped_unexpected_source_packets = 1;
+        current.outbound_dropped_unexpected_source_payload_bytes = 32;
         current.outbound_dropped_non_wireguard_packets = 2;
         current.outbound_dropped_non_wireguard_payload_bytes = 42;
         current.inbound_dropped_non_wireguard_packets = 1;
@@ -10721,6 +10761,8 @@ mod tests {
         assert_eq!(delta.outbound_packets, 5);
         assert_eq!(delta.outbound_payload_bytes, 500);
         assert_eq!(delta.outbound_datagram_bytes, 620);
+        assert_eq!(delta.outbound_dropped_unexpected_source_packets, 1);
+        assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 32);
         assert_eq!(delta.outbound_dropped_non_wireguard_packets, 2);
         assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 42);
         assert_eq!(delta.inbound_packets, 3);
@@ -10733,11 +10775,15 @@ mod tests {
     #[test]
     fn agent_otel_delta_records_only_forwarder_increments_since_previous_snapshot() {
         let mut previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        previous.outbound_dropped_unexpected_source_packets = 1;
+        previous.outbound_dropped_unexpected_source_payload_bytes = 32;
         previous.outbound_dropped_non_wireguard_packets = 2;
         previous.outbound_dropped_non_wireguard_payload_bytes = 100;
         previous.inbound_dropped_non_wireguard_packets = 1;
         previous.inbound_dropped_non_wireguard_payload_bytes = 50;
         let mut current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
+        current.outbound_dropped_unexpected_source_packets = 3;
+        current.outbound_dropped_unexpected_source_payload_bytes = 96;
         current.outbound_dropped_non_wireguard_packets = 5;
         current.outbound_dropped_non_wireguard_payload_bytes = 140;
         current.inbound_dropped_non_wireguard_packets = 3;
@@ -10748,6 +10794,8 @@ mod tests {
         assert_eq!(delta.outbound_packets, 4);
         assert_eq!(delta.outbound_payload_bytes, 350);
         assert_eq!(delta.outbound_datagram_bytes, 430);
+        assert_eq!(delta.outbound_dropped_unexpected_source_packets, 2);
+        assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 64);
         assert_eq!(delta.outbound_dropped_non_wireguard_packets, 3);
         assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 40);
         assert_eq!(delta.inbound_packets, 4);

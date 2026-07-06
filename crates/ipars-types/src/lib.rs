@@ -2791,6 +2791,10 @@ pub mod api {
         pub outbound_payload_bytes: u64,
         pub outbound_datagram_bytes: u64,
         #[serde(default)]
+        pub outbound_dropped_unexpected_source_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_unexpected_source_payload_bytes: u64,
+        #[serde(default)]
         pub outbound_dropped_non_wireguard_packets: u64,
         #[serde(default)]
         pub outbound_dropped_non_wireguard_payload_bytes: u64,

@@ -454,6 +454,8 @@ pub struct RelayForwarderStats {
     outbound_packets: AtomicU64,
     outbound_payload_bytes: AtomicU64,
     outbound_datagram_bytes: AtomicU64,
+    outbound_dropped_unexpected_source_packets: AtomicU64,
+    outbound_dropped_unexpected_source_payload_bytes: AtomicU64,
     outbound_dropped_non_wireguard_packets: AtomicU64,
     outbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     inbound_packets: AtomicU64,
@@ -478,6 +480,8 @@ impl RelayForwarderStats {
             outbound_packets: AtomicU64::new(0),
             outbound_payload_bytes: AtomicU64::new(0),
             outbound_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_unexpected_source_packets: AtomicU64::new(0),
+            outbound_dropped_unexpected_source_payload_bytes: AtomicU64::new(0),
             outbound_dropped_non_wireguard_packets: AtomicU64::new(0),
             outbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             inbound_packets: AtomicU64::new(0),
@@ -499,6 +503,13 @@ impl RelayForwarderStats {
         self.outbound_datagram_bytes
             .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
         self.record_forwarded_at();
+    }
+
+    pub fn record_outbound_unexpected_source_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_unexpected_source_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_unexpected_source_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
     pub fn record_outbound_drop(&self, payload_bytes: usize) {
@@ -532,6 +543,12 @@ impl RelayForwarderStats {
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             outbound_payload_bytes: self.outbound_payload_bytes.load(Ordering::Relaxed),
             outbound_datagram_bytes: self.outbound_datagram_bytes.load(Ordering::Relaxed),
+            outbound_dropped_unexpected_source_packets: self
+                .outbound_dropped_unexpected_source_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_unexpected_source_payload_bytes: self
+                .outbound_dropped_unexpected_source_payload_bytes
+                .load(Ordering::Relaxed),
             outbound_dropped_non_wireguard_packets: self
                 .outbound_dropped_non_wireguard_packets
                 .load(Ordering::Relaxed),
@@ -654,8 +671,12 @@ impl UdpRelayFrameForwarder {
                     let (len, peer) = packet?;
                     if peer == self.session.relay_endpoint {
                         self.forward_to_wireguard(&socket, &buffer[..len]).await?;
-                    } else {
+                    } else if wireguard_sender_matches_configured(self.wireguard_endpoint, peer) {
                         self.send_to_relay(&socket, &buffer[..len]).await?;
+                    } else {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_outbound_unexpected_source_drop(len);
+                        }
                     }
                 }
             }
@@ -671,6 +692,11 @@ impl UdpRelayFrameForwarder {
         }
         Ok(())
     }
+}
+
+fn wireguard_sender_matches_configured(configured: SocketAddr, observed: SocketAddr) -> bool {
+    configured.port() == observed.port()
+        && (configured.ip().is_unspecified() || configured.ip() == observed.ip())
 }
 
 fn wireguard_datagram_payload(payload: &[u8]) -> bool {
@@ -2986,6 +3012,23 @@ mod tests {
         payload
     }
 
+    #[test]
+    fn relay_forwarder_sender_match_allows_unspecified_wireguard_address() {
+        let observed = SocketAddr::from(([127, 0, 0, 1], 51_820));
+        assert!(wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_820)),
+            observed
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_821)),
+            observed
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([127, 0, 0, 2], 51_820)),
+            observed
+        ));
+    }
+
     #[derive(Debug, Clone)]
     struct RecordingPeerMapSink {
         summary: PeerMapApplySummary,
@@ -3623,6 +3666,8 @@ mod tests {
         let wireguard_socket =
             tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let wireguard_addr = wireguard_socket.local_addr()?;
+        let unexpected_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let peer_socket =
             tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let peer_addr = peer_socket.local_addr()?;
@@ -3682,6 +3727,17 @@ mod tests {
         .await
         .is_err());
 
+        let unexpected_source_payload = wireguard_transport_payload(0xd1);
+        unexpected_socket
+            .send_to(&unexpected_source_payload, forwarder_addr)
+            .await?;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
         let outbound_payload = wireguard_transport_payload(0xb1);
         wireguard_socket
             .send_to(&outbound_payload, forwarder_addr)
@@ -3723,6 +3779,11 @@ mod tests {
         assert_eq!(stats.outbound_packets, 1);
         assert_eq!(stats.outbound_payload_bytes, outbound_payload.len() as u64);
         assert!(stats.outbound_datagram_bytes > stats.outbound_payload_bytes);
+        assert_eq!(stats.outbound_dropped_unexpected_source_packets, 1);
+        assert_eq!(
+            stats.outbound_dropped_unexpected_source_payload_bytes,
+            unexpected_source_payload.len() as u64
+        );
         assert_eq!(stats.outbound_dropped_non_wireguard_packets, 1);
         assert_eq!(
             stats.outbound_dropped_non_wireguard_payload_bytes,
