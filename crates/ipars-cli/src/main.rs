@@ -8138,6 +8138,30 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_validates_metadata_names() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateChartMetadata\""));
+        assert!(helpers.contains("define \"ipars.validateDnsLabelWithMax\""));
+        assert!(helpers.contains("\"path\" \"Release.Name\""));
+        assert!(helpers.contains("\"path\" \"Release.Namespace\""));
+        assert!(helpers.contains("\"path\" \"nameOverride\""));
+        assert!(helpers.contains("\"path\" \"fullnameOverride\""));
+        assert!(helpers.contains("must be a DNS label of at most %d bytes"));
+        assert!(helpers.contains("\"maxBytes\" 53"));
+        assert!(helpers.contains("\"maxBytes\" 63"));
+        assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")

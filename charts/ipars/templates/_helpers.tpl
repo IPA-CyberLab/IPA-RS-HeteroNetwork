@@ -18,6 +18,28 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateDnsLabelWithMax" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- $maxBytes := int .maxBytes -}}
+{{- if or (eq $value "") (gt (len $value) $maxBytes) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $value)) -}}
+{{- fail (printf "%s %q must be a DNS label of at most %d bytes using lowercase ASCII letters, digits, and '-' with alphanumeric edges" $path $value $maxBytes) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateChartMetadata" -}}
+{{- include "ipars.validateDnsLabelWithMax" (dict "path" "Release.Name" "value" .Release.Name "maxBytes" 53) -}}
+{{- include "ipars.validateDnsLabelWithMax" (dict "path" "Release.Namespace" "value" .Release.Namespace "maxBytes" 63) -}}
+{{- $nameOverride := printf "%v" (default "" .Values.nameOverride) -}}
+{{- $fullnameOverride := printf "%v" (default "" .Values.fullnameOverride) -}}
+{{- if ne $nameOverride "" -}}
+{{- include "ipars.validateDnsLabelWithMax" (dict "path" "nameOverride" "value" $nameOverride "maxBytes" 53) -}}
+{{- end -}}
+{{- if ne $fullnameOverride "" -}}
+{{- include "ipars.validateDnsLabelWithMax" (dict "path" "fullnameOverride" "value" $fullnameOverride "maxBytes" 53) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateCidr" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
