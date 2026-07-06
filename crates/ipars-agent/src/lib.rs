@@ -1988,13 +1988,15 @@ async fn collect_bounded_command_output(
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedCommandOutput, AgentError> {
-    let mut child = Command::new(&command.program)
+    let mut child_command = Command::new(&command.program);
+    child_command
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(AgentError::Io)?;
+        .kill_on_drop(true);
+    configure_command_process_group(&mut child_command);
+
+    let mut child = child_command.spawn().map_err(AgentError::Io)?;
 
     let stdout = child
         .stdout
@@ -2016,7 +2018,7 @@ async fn collect_bounded_command_output(
             return Err(AgentError::Io(error));
         }
         Err(_) => {
-            let kill_error = child.start_kill().err();
+            let kill_error = kill_timed_out_child(&mut child);
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
@@ -2035,6 +2037,47 @@ async fn collect_bounded_command_output(
     let stderr = collect_command_output_task(stderr_task).await?;
 
     Ok(BoundedCommandOutput { status, stderr })
+}
+
+fn configure_command_process_group(_command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        _command.process_group(0);
+    }
+}
+
+fn kill_timed_out_child(child: &mut tokio::process::Child) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id() {
+        match kill_process_group(pid) {
+            Ok(()) => return None,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => return None,
+            Err(group_error) => {
+                return match child.start_kill() {
+                    Ok(()) => Some(format!(
+                        "process group {pid}: {group_error}; direct child kill succeeded"
+                    )),
+                    Err(child_error) => Some(format!(
+                        "process group {pid}: {group_error}; direct child: {child_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    child.start_kill().err().map(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    let pgid: i32 = pid
+        .try_into()
+        .map_err(|_| std::io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
 }
 
 async fn collect_command_output_task(
@@ -3297,18 +3340,29 @@ mod tests {
         ));
         std::fs::create_dir(&temp_dir)?;
         let pid_path = temp_dir.join("child.pid");
-        let script = format!("printf '%s\\n' $$ > {}; exec sleep 60", pid_path.display());
-        let runner = TimedSystemCommandRunner::new(Duration::from_millis(10));
+        let grandchild_pid_path = temp_dir.join("grandchild.pid");
+        let script = format!(
+            "printf '%s\\n' $$ > {}; sleep 60 & printf '%s\\n' $! > {}; wait",
+            pid_path.display(),
+            grandchild_pid_path.display()
+        );
+        let runner = TimedSystemCommandRunner::new(Duration::from_millis(100));
         let error = match runner.run(LinuxCommand::new("sh", ["-c", &script])).await {
             Ok(()) => panic!("command should time out"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("timed out after 10ms"));
+        assert!(error.to_string().contains("timed out after 100ms"));
         let pid = wait_for_pid_file(&pid_path, Duration::from_secs(1)).await?;
+        let grandchild_pid =
+            wait_for_pid_file(&grandchild_pid_path, Duration::from_secs(1)).await?;
         assert!(
             wait_for_process_absent(pid, Duration::from_secs(2)).await,
             "timed-out command child process {pid} was left running"
+        );
+        assert!(
+            wait_for_process_absent(grandchild_pid, Duration::from_secs(2)).await,
+            "timed-out command grandchild process {grandchild_pid} was left running"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
