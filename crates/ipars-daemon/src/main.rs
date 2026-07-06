@@ -111,6 +111,7 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
@@ -1285,6 +1286,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.runtime_command_output_max_bytes,
         "--runtime-command-output-max-bytes",
     )?;
+    anyhow::ensure!(
+        args.runtime_command_output_max_bytes <= MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES,
+        "--runtime-command-output-max-bytes must not exceed {MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES}"
+    );
     if args.packet_flow_detector != PacketFlowDetector::Disabled {
         validate_positive_seconds(
             args.packet_flow_poll_interval_seconds,
@@ -1551,8 +1556,8 @@ fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
         if argument.is_empty() {
             anyhow::bail!("--userspace-wireguard-arg cannot be empty");
         }
-        if argument.chars().any(|character| character == '\0') {
-            anyhow::bail!("--userspace-wireguard-arg must not contain NUL bytes");
+        if argument.chars().any(char::is_control) {
+            anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
         }
     }
     Ok(())
@@ -14627,6 +14632,33 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn userspace_wireguard_args_reject_control_characters() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg",
+            "ipars0\n--unexpected",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--userspace-wireguard-arg must not contain control characters"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn userspace_wireguard_process_config_requires_userspace_backend() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -16552,6 +16584,15 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             (
                 vec!["iparsd", "agent", "--runtime-command-output-max-bytes", "0"],
                 "--runtime-command-output-max-bytes must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-command-output-max-bytes",
+                    "1048577",
+                ],
+                "--runtime-command-output-max-bytes must not exceed 1048576",
             ),
             (
                 vec![
