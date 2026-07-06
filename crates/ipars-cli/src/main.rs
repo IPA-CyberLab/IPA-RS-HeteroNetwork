@@ -1080,6 +1080,7 @@ fn validate_http_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
     if parsed.host_str().is_none() {
         anyhow::bail!("{flag} must include a host");
     }
+    validate_literal_bootstrap_socket(&parsed, flag)?;
     Ok(())
 }
 
@@ -1094,6 +1095,26 @@ fn validate_udp_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
     }
     if parsed.port().is_none() {
         anyhow::bail!("{flag} must include a port");
+    }
+    validate_literal_bootstrap_socket(&parsed, flag)?;
+    Ok(())
+}
+
+fn validate_literal_bootstrap_socket(parsed: &reqwest::Url, flag: &str) -> anyhow::Result<()> {
+    let Some(host) = parsed.host_str() else {
+        return Ok(());
+    };
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+    let port = parsed
+        .port_or_known_default()
+        .with_context(|| format!("{flag} must include a port"))?;
+    let addr = SocketAddr::new(ip, port);
+    if !endpoint_addr_is_usable(addr) {
+        anyhow::bail!(
+            "{flag} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast bootstrap address"
+        );
     }
     Ok(())
 }
@@ -4956,6 +4977,76 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("--signal-bootstrap"));
         assert!(error.contains("must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_rejects_unusable_bootstrap_addresses() -> anyhow::Result<()> {
+        fn token_args() -> TokenCreateArgs {
+            TokenCreateArgs {
+                cluster_id: None,
+                issuer_key_id: "root".to_string(),
+                issuer_private_key_b64: None,
+                issuer_private_key_path: None,
+                role: "edge".to_string(),
+                tags: Vec::new(),
+                allowed_routes: Vec::new(),
+                ttl_seconds: 300,
+                bootstrap_endpoints: Vec::new(),
+                control_plane_bootstrap_endpoints: Vec::new(),
+                signal_bootstrap_endpoints: Vec::new(),
+                stun_bootstrap_endpoints: Vec::new(),
+                relay_bootstrap_endpoints: Vec::new(),
+                allow_relay: false,
+                max_uses: Some(1),
+                unlimited_uses: false,
+            }
+        }
+
+        let http_unspecified = TokenCreateArgs {
+            bootstrap_endpoints: vec!["https://0.0.0.0:8443".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_unspecified) else {
+            anyhow::bail!("unspecified HTTP bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--bootstrap/--control-plane-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let http_zero_port = TokenCreateArgs {
+            signal_bootstrap_endpoints: vec!["https://203.0.113.10:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_zero_port) else {
+            anyhow::bail!("port-zero signal bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--signal-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let udp_multicast = TokenCreateArgs {
+            stun_bootstrap_endpoints: vec!["udp://224.0.0.1:3478".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_multicast) else {
+            anyhow::bail!("multicast STUN bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--stun-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let udp_zero_port = TokenCreateArgs {
+            relay_bootstrap_endpoints: vec!["udp://203.0.113.10:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_zero_port) else {
+            anyhow::bail!("port-zero relay bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--relay-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
         Ok(())
     }
 

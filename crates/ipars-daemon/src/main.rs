@@ -10445,7 +10445,15 @@ async fn agent_stun_servers(
     args: &AgentArgs,
     token: Option<&SignedJoinToken>,
 ) -> anyhow::Result<Vec<SocketAddr>> {
-    let mut servers = args.stun_servers.clone();
+    let mut servers = Vec::new();
+    for server in &args.stun_servers {
+        if !endpoint_addr_is_usable(*server) {
+            anyhow::bail!(
+                "--stun-server must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+            );
+        }
+        servers.push(*server);
+    }
     if let Some(token) = token {
         for endpoint in token
             .claims
@@ -10478,9 +10486,10 @@ async fn resolve_udp_bootstrap_socket_addrs(
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("failed to resolve {name} {url}"))?
+        .filter(|addr| endpoint_addr_is_usable(*addr))
         .collect::<Vec<_>>();
     if addrs.is_empty() {
-        anyhow::bail!("{name} {url} resolved to no socket addresses");
+        anyhow::bail!("{name} {url} resolved to no usable socket addresses");
     }
     Ok(addrs)
 }
@@ -18826,6 +18835,34 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Err(error) => error,
         };
         assert!(error.to_string().contains("STUN bootstrap must use udp"));
+
+        let unusable_token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://0.0.0.0:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+        let error = match agent_stun_servers(&args, Some(&unusable_token)).await {
+            Ok(_) => anyhow::bail!("unusable STUN bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("resolved to no usable socket addresses"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_reject_unusable_explicit_servers() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--stun-server", "0.0.0.0:3478"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        let error = match agent_stun_servers(&args, None).await {
+            Ok(_) => anyhow::bail!("unusable explicit STUN server should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--stun-server"));
+        assert!(error.to_string().contains("usable nonzero"));
         Ok(())
     }
 
