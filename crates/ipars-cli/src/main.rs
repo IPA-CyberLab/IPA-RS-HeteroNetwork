@@ -661,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
+    validate_init_bootstrap_inputs(&args)?;
     let identity = issuer_key_from_source(
         args.issuer_private_key_b64.as_deref(),
         args.issuer_private_key_path.as_deref(),
@@ -730,6 +731,29 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         daemon_commands,
         daemon_processes,
     })
+}
+
+fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
+    if !endpoint_addr_is_usable(args.public_endpoint) {
+        anyhow::bail!(
+            "--public-endpoint must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
+    }
+    validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
+    validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
+    if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
+        anyhow::bail!(
+            "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
+        );
+    }
+    Ok(())
+}
+
+fn validate_listen_port_for_bootstrap(addr: SocketAddr, flag: &str) -> anyhow::Result<()> {
+    if addr.port() == 0 {
+        anyhow::bail!("{flag} must use a nonzero port for bootstrap token generation");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4699,6 +4723,34 @@ mod tests {
         }
     }
 
+    fn valid_init_args() -> InitArgs {
+        InitArgs {
+            public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            bootstrap_scheme: "http".to_string(),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: None,
+            emit_issuer_private_key: false,
+            token_ttl_seconds: 300,
+            default_role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            allow_relay: true,
+            max_uses: Some(10),
+            unlimited_uses: false,
+            spawn_daemons: false,
+            daemon_binary: PathBuf::from("iparsd"),
+            daemon_state_dir: temp_path("state"),
+            control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            control_plane_database_url: None,
+            signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
+            stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
+            relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
+            relay_admission_url: None,
+        }
+    }
+
     #[test]
     fn join_url_uses_control_plane_bootstrap_endpoint() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
@@ -5048,6 +5100,52 @@ mod tests {
         assert!(error.contains("usable nonzero"));
 
         Ok(())
+    }
+
+    #[test]
+    fn init_rejects_unusable_bootstrap_generation_inputs() {
+        let mut unusable_public = valid_init_args();
+        unusable_public.public_endpoint = SocketAddr::from(([0, 0, 0, 0], 51820));
+        let Err(error) = init(unusable_public) else {
+            panic!("unspecified public endpoint should fail");
+        };
+        assert!(error.to_string().contains("--public-endpoint"));
+        assert!(error.to_string().contains("usable nonzero"));
+
+        let mut zero_control = valid_init_args();
+        zero_control.control_plane_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_control) else {
+            panic!("port-zero control-plane listen should fail");
+        };
+        assert!(error.to_string().contains("--control-plane-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
+        let mut zero_signal = valid_init_args();
+        zero_signal.signal_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_signal) else {
+            panic!("port-zero signal listen should fail");
+        };
+        assert!(error.to_string().contains("--signal-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
+        let mut zero_relay_http = valid_init_args();
+        zero_relay_http.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_relay_http) else {
+            panic!("port-zero relay HTTP listen should fail");
+        };
+        assert!(error.to_string().contains("--relay-http-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port when --relay-admission-url is omitted"));
+
+        let mut explicit_admission = valid_init_args();
+        explicit_admission.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        explicit_admission.relay_admission_url = Some("http://relay.example.test:9580".to_string());
+        assert!(init(explicit_admission).is_ok());
     }
 
     #[test]
