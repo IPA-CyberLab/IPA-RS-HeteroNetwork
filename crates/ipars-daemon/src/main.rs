@@ -8579,7 +8579,7 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
     validate_ebpf_packet_flow_unused_fields(&event)?;
     let protocol = ebpf_packet_flow_protocol(event.protocol)?;
     let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
-    let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status);
+    let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status)?;
     let source_port = optional_nonzero_port(event.source_port());
     let destination_port = optional_nonzero_port(event.destination_port());
     let source = ebpf_packet_flow_ip(event.ip_family, &event.source)?;
@@ -8642,7 +8642,16 @@ fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlo
     Ok(state)
 }
 
-fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackStatus> {
+fn ebpf_packet_flow_conntrack_status(
+    value: u8,
+) -> anyhow::Result<Vec<AgentPacketFlowConntrackStatus>> {
+    let known_bits = PACKET_FLOW_CONNTRACK_UNREPLIED | PACKET_FLOW_CONNTRACK_ASSURED;
+    let unsupported_bits = value & !known_bits;
+    anyhow::ensure!(
+        unsupported_bits == 0,
+        "unsupported eBPF packet-flow conntrack status bits 0x{:02x}",
+        unsupported_bits
+    );
     let mut status = Vec::new();
     if value & PACKET_FLOW_CONNTRACK_UNREPLIED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Unreplied);
@@ -8650,7 +8659,7 @@ fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackS
     if value & PACKET_FLOW_CONNTRACK_ASSURED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Assured);
     }
-    status
+    Ok(status)
 }
 
 fn optional_nonzero_port(value: u16) -> Option<u16> {
@@ -11843,6 +11852,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported eBPF packet-flow reserved bytes"));
+
+        let mut unsupported_conntrack_status = event;
+        unsupported_conntrack_status[4] = PACKET_FLOW_CONNTRACK_UNREPLIED | 0x80;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&unsupported_conntrack_status) {
+            Ok(_) => anyhow::bail!("unsupported eBPF conntrack status bits should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow conntrack status bits"));
 
         let mut unknown_protocol = event;
         unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
