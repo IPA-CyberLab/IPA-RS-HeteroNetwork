@@ -8895,6 +8895,12 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
         ));
+        assert!(service_template.contains(
+            ".Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged"
+        ));
+        assert!(service_template.contains(
+            ".Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged"
+        ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
         assert!(service_template
