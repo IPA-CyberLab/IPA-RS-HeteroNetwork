@@ -582,11 +582,11 @@ struct K8sInstallArgs {
     relay_admission_bearer_token_secret: Option<String>,
     #[arg(long = "relay-admission-bearer-token-key")]
     relay_admission_bearer_token_key: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "expose_relay")]
     relay_public_endpoint: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "expose_relay")]
     relay_admission_url: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "expose_relay")]
     relay_status_url: Option<String>,
 }
 
@@ -3098,6 +3098,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
     validate_k8s_image_pull_secrets(&args)?;
     validate_k8s_relay_admission_bearer_token_secret(&args)?;
+    validate_k8s_relay_advertisement(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_security_context(&args)?;
@@ -3874,6 +3875,68 @@ fn validate_k8s_relay_admission_bearer_token_secret(args: &K8sInstallArgs) -> an
             );
         }
     }
+}
+
+fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if !args.expose_relay {
+        if args.relay_public_endpoint.is_some() {
+            anyhow::bail!("--relay-public-endpoint requires --expose-relay");
+        }
+        if args.relay_admission_url.is_some() {
+            anyhow::bail!("--relay-admission-url requires --expose-relay");
+        }
+        if args.relay_status_url.is_some() {
+            anyhow::bail!("--relay-status-url requires --expose-relay");
+        }
+        return Ok(());
+    }
+
+    let public_endpoint = args
+        .relay_public_endpoint
+        .as_deref()
+        .context("--expose-relay requires --relay-public-endpoint")?;
+    validate_relay_public_endpoint_arg(public_endpoint, "--relay-public-endpoint")?;
+
+    let admission_url = args
+        .relay_admission_url
+        .as_deref()
+        .context("--expose-relay requires --relay-admission-url")?;
+    validate_relay_http_url_arg(admission_url, "--relay-admission-url")?;
+
+    if let Some(status_url) = args.relay_status_url.as_deref() {
+        validate_relay_http_url_arg(status_url, "--relay-status-url")?;
+    }
+
+    Ok(())
+}
+
+fn validate_relay_public_endpoint_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let endpoint = value.parse::<SocketAddr>().with_context(|| {
+        format!("{flag} must be an IPv4 host:port or [IPv6]:port socket address")
+    })?;
+    if !endpoint_addr_is_usable(endpoint) {
+        anyhow::bail!(
+            "{flag} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
+    }
+    Ok(())
+}
+
+fn validate_relay_http_url_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let url =
+        reqwest::Url::parse(value).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{flag} must use http or https");
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    if !http_url_is_usable_endpoint(value) {
+        anyhow::bail!(
+            "{flag} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast endpoint"
+        );
+    }
+    Ok(())
 }
 
 fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
@@ -7269,6 +7332,72 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_validates_relay_advertisement_endpoints() -> anyhow::Result<()> {
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--relay-public-endpoint",
+            "203.0.113.10:51820",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut domain_public_endpoint = base_k8s_install_args();
+        domain_public_endpoint.expose_relay = true;
+        domain_public_endpoint.relay_public_endpoint = Some("relay.example.test:51820".to_string());
+        domain_public_endpoint.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(domain_public_endpoint) {
+            Ok(_) => panic!("domain relay public endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("IPv4 host:port or [IPv6]:port socket address"));
+
+        let mut unspecified_public_endpoint = base_k8s_install_args();
+        unspecified_public_endpoint.expose_relay = true;
+        unspecified_public_endpoint.relay_public_endpoint = Some("0.0.0.0:51820".to_string());
+        unspecified_public_endpoint.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unspecified_public_endpoint) {
+            Ok(_) => panic!("unspecified relay public endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("usable nonzero"));
+
+        let mut unusable_admission_url = base_k8s_install_args();
+        unusable_admission_url.expose_relay = true;
+        unusable_admission_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        unusable_admission_url.relay_admission_url = Some("http://0.0.0.0:9580".to_string());
+        let error = match k8s_install_plan(unusable_admission_url) {
+            Ok(_) => panic!("unusable relay admission URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-admission-url must use a nonzero port"));
+
+        let mut invalid_status_url = base_k8s_install_args();
+        invalid_status_url.expose_relay = true;
+        invalid_status_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        invalid_status_url.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        invalid_status_url.relay_status_url = Some("ftp://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(invalid_status_url) {
+            Ok(_) => panic!("invalid relay status URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-status-url must use http or https"));
+
+        let mut valid_ipv6 = base_k8s_install_args();
+        valid_ipv6.expose_relay = true;
+        valid_ipv6.relay_service_type = "ClusterIP".to_string();
+        valid_ipv6.relay_public_endpoint = Some("[2001:db8::10]:51820".to_string());
+        valid_ipv6.relay_admission_url = Some("https://relay.example.test:9580".to_string());
+        valid_ipv6.relay_status_url = Some("http://[2001:db8::10]:9580".to_string());
+        let plan = k8s_install_plan(valid_ipv6)?;
+        assert!(plan.commands[2].contains(
+            "--set-string 'agent.relayAdvertisement.publicEndpoint=[2001:db8::10]:51820'"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_load_balancer_source_ranges() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")
@@ -7305,6 +7434,30 @@ mod tests {
         ));
         assert!(network_policy_template
             .contains("networkPolicy.relay.allowedCidrs entry %q must not be repeated"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateSocketAddress\""));
+        assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port socket address"));
+        assert!(helpers.contains("must not use an unspecified address"));
+        assert!(helpers.contains("must not use a multicast address"));
+        assert!(helpers.contains("must not use a broadcast address"));
+        assert!(daemonset
+            .contains("ipars.validateSocketAddress\" (dict \"path\" \"cluster.stunEndpoint\""));
+        assert!(daemonset.contains(
+            "ipars.validateSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
+        ));
         Ok(())
     }
 

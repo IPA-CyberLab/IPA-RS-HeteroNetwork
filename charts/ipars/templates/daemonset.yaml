@@ -278,11 +278,8 @@
 {{- if not (regexMatch $clusterUrlPattern .Values.cluster.signalUrl) -}}
 {{- fail "cluster.signalUrl must be an absolute HTTP(S) URL with a host" -}}
 {{- end -}}
-{{- if and .Values.cluster.stunEndpoint (not (regexMatch $hostPortPattern .Values.cluster.stunEndpoint)) -}}
-{{- fail "cluster.stunEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if and .Values.cluster.stunEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 65535)) -}}
-{{- fail "cluster.stunEndpoint port must be between 1 and 65535" -}}
+{{- if .Values.cluster.stunEndpoint -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
 {{- end -}}
 {{- if and .Values.cluster.relayEndpoint (not (regexMatch $hostPortPattern .Values.cluster.relayEndpoint)) -}}
 {{- fail "cluster.relayEndpoint must be host:port or [ipv6]:port" -}}
@@ -294,12 +291,7 @@
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- if not (regexMatch $hostPortPattern .Values.agent.relayAdvertisement.publicEndpoint) -}}
-{{- fail "agent.relayAdvertisement.publicEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if or (lt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 65535) -}}
-{{- fail "agent.relayAdvertisement.publicEndpoint port must be between 1 and 65535" -}}
-{{- end -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
