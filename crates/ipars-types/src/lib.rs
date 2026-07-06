@@ -1829,6 +1829,9 @@ pub mod api {
             if let Some(detector) = self.detector.as_deref() {
                 validate_packet_flow_detector(detector)?;
             }
+            if let Some(source) = self.source {
+                validate_packet_flow_source(source)?;
+            }
             if self.payload_prefix.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
                 return Err(format!(
                     "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
@@ -2117,6 +2120,16 @@ pub mod api {
             )),
             _ => Ok(()),
         }
+    }
+
+    fn validate_packet_flow_source(source: IpAddr) -> Result<(), String> {
+        if let Some(reason) = packet_flow_destination_drop_reason(source) {
+            return Err(format!(
+                "packet-flow source must not use {} address",
+                reason.as_str()
+            ));
+        }
+        Ok(())
     }
 
     fn deserialize_packet_flow_detector<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -8605,6 +8618,26 @@ mod tests {
         let udp_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","destination_port":53}"#)?;
         udp_with_port.validate_transport_metadata()?;
+
+        let usable_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"192.0.2.10"}"#)?;
+        usable_source.validate_transport_metadata()?;
+
+        let unspecified_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"0.0.0.0"}"#)?;
+        let error = match unspecified_source.validate_transport_metadata() {
+            Ok(()) => return Err("unspecified packet-flow source should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("source must not use unspecified address"));
+
+        let link_local_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"fe80::1"}"#)?;
+        let error = match link_local_source.validate_transport_metadata() {
+            Ok(()) => return Err("link-local packet-flow source should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("source must not use link_local address"));
 
         let tcp_with_zero_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","destination_port":0}"#)?;

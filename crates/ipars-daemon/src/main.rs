@@ -9880,12 +9880,12 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
     let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status)?;
     let source_port = optional_nonzero_port(event.source_port());
     let destination_port = optional_nonzero_port(event.destination_port());
-    let source = ebpf_packet_flow_ip(event.ip_family, "source", &event.source)?;
+    let source = optional_ebpf_packet_flow_source(event.ip_family, &event.source)?;
     let destination = ebpf_packet_flow_ip(event.ip_family, "destination", &event.destination)?;
     Ok(PacketFlowRecord {
         destination,
         observation: AgentPacketFlowObservation {
-            source: Some(source),
+            source,
             protocol,
             source_port,
             destination_port,
@@ -10001,6 +10001,11 @@ fn ebpf_packet_flow_ip(ip_family: u8, field: &str, bytes: &[u8]) -> anyhow::Resu
         PACKET_FLOW_IP_FAMILY_IPV6 => Ok(IpAddr::V6(Ipv6Addr::from(octets))),
         _ => anyhow::bail!("unsupported eBPF packet-flow IP family {ip_family}"),
     }
+}
+
+fn optional_ebpf_packet_flow_source(ip_family: u8, bytes: &[u8]) -> anyhow::Result<Option<IpAddr>> {
+    let source = ebpf_packet_flow_ip(ip_family, "source", bytes)?;
+    Ok((!source.is_unspecified()).then_some(source))
 }
 
 async fn read_conntrack_netlink_packet_flows(
@@ -14301,6 +14306,15 @@ mod tests {
             flow.observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
         );
+
+        let mut unknown_source_event = event;
+        unknown_source_event[16..32].fill(0);
+        let unknown_source_flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_source_event)?;
+        assert_eq!(
+            unknown_source_flow.destination,
+            "100.64.0.11".parse::<IpAddr>()?
+        );
+        assert_eq!(unknown_source_flow.observation.source, None);
         Ok(())
     }
 
@@ -14630,6 +14644,22 @@ mod tests {
         assert!(error.chain().any(|cause| cause
             .to_string()
             .contains("packet-flow detector must not contain control characters")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"source\":\"127.0.0.1\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("loopback eBPF JSONL source should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("source must not use loopback address")));
 
         let oversized_statuses =
             ["\"assured\""; ipars_types::api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");

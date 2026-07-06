@@ -9095,6 +9095,12 @@ mod tests {
             service_template.contains("(ne .Values.agent.relayService.httpAppProtocol \"http\")")
         );
         assert!(service_template.contains(
+            "$agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0)"
+        ));
+        assert!(service_template.contains(
+            "$relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0)"
+        ));
+        assert!(service_template.contains(
             ".Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged"
         ));
         assert!(service_template.contains(

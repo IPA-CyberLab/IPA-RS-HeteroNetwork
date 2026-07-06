@@ -6344,6 +6344,12 @@ mod tests {
                 detector: Some("sidecar\nspoof".to_string()),
                 ..Default::default()
             },
+            AgentPacketFlowObservation {
+                source: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                ..Default::default()
+            },
         ] {
             let matched = runtime
                 .record_packet_flow_observation(peer.vpn_ip.0, observation, Utc::now(), true)
@@ -6356,7 +6362,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 0);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
-        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -6365,7 +6371,7 @@ mod tests {
                     entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
                 })
                 .map(|entry| entry.count),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             metrics
