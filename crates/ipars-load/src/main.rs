@@ -230,6 +230,14 @@ struct LoadReport {
     daemon_agent_reachable_paths_total: usize,
     daemon_agent_path_count_min: usize,
     daemon_agent_path_count_max: usize,
+    daemon_agent_failover_status_endpoints: usize,
+    daemon_agent_failover_candidate_count_min: usize,
+    daemon_agent_failover_candidate_count_max: usize,
+    daemon_agent_failover_path_status_endpoints: usize,
+    daemon_agent_failover_paths_total: usize,
+    daemon_agent_failover_reachable_paths_total: usize,
+    daemon_agent_failover_path_count_min: usize,
+    daemon_agent_failover_path_count_max: usize,
     daemon_control_plane_processes: usize,
     daemon_control_plane_metrics_endpoints: usize,
     daemon_control_plane_peer_map_endpoints: usize,
@@ -520,6 +528,51 @@ impl LoadReport {
                     if !self.daemon_control_plane_failover_peer_maps_consistent {
                         bail!(
                             "daemon load scenario failover control-plane peer maps are inconsistent"
+                        );
+                    }
+                    if self.daemon_agent_failover_status_endpoints != self.daemon_agent_processes {
+                        bail!(
+                            "daemon load scenario failover checked {} agent status endpoints, expected {}",
+                            self.daemon_agent_failover_status_endpoints,
+                            self.daemon_agent_processes
+                        );
+                    }
+                    if self.daemon_agent_failover_candidate_count_min == 0
+                        || self.daemon_agent_failover_candidate_count_max
+                            < self.daemon_agent_failover_candidate_count_min
+                    {
+                        bail!(
+                            "daemon load scenario failover agent endpoint candidate mismatch: min/max={}/{}, expected every agent to keep at least one candidate",
+                            self.daemon_agent_failover_candidate_count_min,
+                            self.daemon_agent_failover_candidate_count_max
+                        );
+                    }
+                    if self.daemon_agent_failover_path_status_endpoints
+                        != self.daemon_agent_processes
+                    {
+                        bail!(
+                            "daemon load scenario failover checked {} agent path endpoints, expected {}",
+                            self.daemon_agent_failover_path_status_endpoints,
+                            self.daemon_agent_processes
+                        );
+                    }
+                    if self.daemon_agent_failover_paths_total < expected_agent_path_count
+                        || self.daemon_agent_failover_reachable_paths_total
+                            < expected_agent_path_count
+                    {
+                        bail!(
+                            "daemon load scenario failover agent path state mismatch: total={}, reachable={}, expected at least {expected_agent_path_count}",
+                            self.daemon_agent_failover_paths_total,
+                            self.daemon_agent_failover_reachable_paths_total
+                        );
+                    }
+                    if self.daemon_agent_failover_path_count_max
+                        < self.daemon_agent_failover_path_count_min
+                    {
+                        bail!(
+                            "daemon load scenario failover agent path min/max is invalid: min={}, max={}",
+                            self.daemon_agent_failover_path_count_min,
+                            self.daemon_agent_failover_path_count_max
                         );
                     }
                     if self.daemon_control_plane_failover_peer_map_edges_min != expected_peer_edges
@@ -1562,6 +1615,14 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_agent_reachable_paths_total: 0,
         daemon_agent_path_count_min: 0,
         daemon_agent_path_count_max: 0,
+        daemon_agent_failover_status_endpoints: 0,
+        daemon_agent_failover_candidate_count_min: 0,
+        daemon_agent_failover_candidate_count_max: 0,
+        daemon_agent_failover_path_status_endpoints: 0,
+        daemon_agent_failover_paths_total: 0,
+        daemon_agent_failover_reachable_paths_total: 0,
+        daemon_agent_failover_path_count_min: 0,
+        daemon_agent_failover_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1780,6 +1841,14 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_agent_reachable_paths_total: 0,
         daemon_agent_path_count_min: 0,
         daemon_agent_path_count_max: 0,
+        daemon_agent_failover_status_endpoints: 0,
+        daemon_agent_failover_candidate_count_min: 0,
+        daemon_agent_failover_candidate_count_max: 0,
+        daemon_agent_failover_path_status_endpoints: 0,
+        daemon_agent_failover_paths_total: 0,
+        daemon_agent_failover_reachable_paths_total: 0,
+        daemon_agent_failover_path_count_min: 0,
+        daemon_agent_failover_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -1972,6 +2041,14 @@ async fn run_relay_udp_scenario(
         daemon_agent_reachable_paths_total: 0,
         daemon_agent_path_count_min: 0,
         daemon_agent_path_count_max: 0,
+        daemon_agent_failover_status_endpoints: 0,
+        daemon_agent_failover_candidate_count_min: 0,
+        daemon_agent_failover_candidate_count_max: 0,
+        daemon_agent_failover_path_status_endpoints: 0,
+        daemon_agent_failover_paths_total: 0,
+        daemon_agent_failover_reachable_paths_total: 0,
+        daemon_agent_failover_path_count_min: 0,
+        daemon_agent_failover_path_count_max: 0,
         daemon_control_plane_processes: 0,
         daemon_control_plane_metrics_endpoints: 0,
         daemon_control_plane_peer_map_endpoints: 0,
@@ -2288,10 +2365,61 @@ async fn run_daemon_scenario(
     let mut failover_degraded_nodes_max = 0;
     let mut failover_unhealthy_nodes_min = 0;
     let mut failover_unhealthy_nodes_max = 0;
+    let mut failover_agent_status_endpoints = 0;
+    let mut failover_agent_candidate_count_min = 0;
+    let mut failover_agent_candidate_count_max = 0;
+    let mut failover_agent_path_status_endpoints = 0;
+    let mut failover_agent_paths_total = 0;
+    let mut failover_agent_reachable_paths_total = 0;
+    let mut failover_agent_path_count_min = 0;
+    let mut failover_agent_path_count_max = 0;
     if services.control_plane_urls.len() > 1 {
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
         let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
         failover_survivor_endpoints = survivor_urls.len();
+        let mut failover_agent_statuses = Vec::with_capacity(services.agent_urls.len());
+        for (index, (url, previous_status)) in
+            services.agent_urls.iter().zip(&agent_statuses).enumerate()
+        {
+            let status: AgentStatusResponse = get_json(
+                &client,
+                format!("{url}/v1/status"),
+                "daemon failover agent status",
+            )
+            .await
+            .with_context(|| {
+                format!("daemon agent status probe {index} failed after stopping {stopped_role}")
+            })?;
+            if status.node_id != previous_status.node_id {
+                bail!(
+                    "daemon failover agent status endpoint {index} returned node {} instead of {} after stopping {stopped_role}",
+                    status.node_id,
+                    previous_status.node_id
+                );
+            }
+            failover_agent_statuses.push(status);
+        }
+        let failover_agent_status_summary = daemon_agent_status_summary(&failover_agent_statuses)?;
+        failover_agent_status_endpoints = failover_agent_status_summary.endpoint_count;
+        failover_agent_candidate_count_min = failover_agent_status_summary.candidate_count_min;
+        failover_agent_candidate_count_max = failover_agent_status_summary.candidate_count_max;
+        let failover_agent_path_summary = wait_for_daemon_agent_path_summary(
+            &client,
+            &services.agent_urls,
+            &failover_agent_statuses,
+            expected_agent_path_count,
+            agent_readiness_timeout,
+        )
+        .await
+        .with_context(|| {
+            format!("daemon agent path-state probe failed after stopping {stopped_role}")
+        })?;
+        failover_agent_path_status_endpoints = failover_agent_path_summary.endpoint_count;
+        failover_agent_paths_total = failover_agent_path_summary.path_count_total;
+        failover_agent_reachable_paths_total =
+            failover_agent_path_summary.reachable_path_count_total;
+        failover_agent_path_count_min = failover_agent_path_summary.path_count_min;
+        failover_agent_path_count_max = failover_agent_path_summary.path_count_max;
         let failover_probe = daemon_peer_map_probe(&client, &survivor_urls, &agent_statuses)
             .await
             .with_context(|| {
@@ -2408,6 +2536,14 @@ async fn run_daemon_scenario(
         daemon_agent_reachable_paths_total: agent_path_summary.reachable_path_count_total,
         daemon_agent_path_count_min: agent_path_summary.path_count_min,
         daemon_agent_path_count_max: agent_path_summary.path_count_max,
+        daemon_agent_failover_status_endpoints: failover_agent_status_endpoints,
+        daemon_agent_failover_candidate_count_min: failover_agent_candidate_count_min,
+        daemon_agent_failover_candidate_count_max: failover_agent_candidate_count_max,
+        daemon_agent_failover_path_status_endpoints: failover_agent_path_status_endpoints,
+        daemon_agent_failover_paths_total: failover_agent_paths_total,
+        daemon_agent_failover_reachable_paths_total: failover_agent_reachable_paths_total,
+        daemon_agent_failover_path_count_min: failover_agent_path_count_min,
+        daemon_agent_failover_path_count_max: failover_agent_path_count_max,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
         daemon_control_plane_peer_map_endpoints: peer_map_summary.endpoint_count,
@@ -7453,6 +7589,19 @@ mod tests {
         assert!(report.daemon_control_plane_peer_maps_consistent);
         assert!(report.daemon_control_plane_failover_checked);
         assert_eq!(report.daemon_control_plane_failover_survivor_endpoints, 1);
+        assert_eq!(report.daemon_agent_failover_status_endpoints, 2);
+        assert!(report.daemon_agent_failover_candidate_count_min > 0);
+        assert!(
+            report.daemon_agent_failover_candidate_count_max
+                >= report.daemon_agent_failover_candidate_count_min
+        );
+        assert_eq!(report.daemon_agent_failover_path_status_endpoints, 2);
+        assert!(report.daemon_agent_failover_paths_total >= 2);
+        assert!(report.daemon_agent_failover_reachable_paths_total >= 2);
+        assert!(
+            report.daemon_agent_failover_path_count_max
+                >= report.daemon_agent_failover_path_count_min
+        );
         assert_eq!(report.daemon_control_plane_failover_peer_map_edges_min, 2);
         assert_eq!(report.daemon_control_plane_failover_peer_map_edges_max, 2);
         assert!(report.daemon_control_plane_failover_peer_maps_consistent);
@@ -7621,6 +7770,14 @@ mod tests {
         report.daemon_control_plane_peer_maps_consistent = true;
         report.daemon_control_plane_failover_checked = true;
         report.daemon_control_plane_failover_survivor_endpoints = 1;
+        report.daemon_agent_failover_status_endpoints = report.daemon_agent_processes;
+        report.daemon_agent_failover_candidate_count_min = 1;
+        report.daemon_agent_failover_candidate_count_max = 1;
+        report.daemon_agent_failover_path_status_endpoints = report.daemon_agent_processes;
+        report.daemon_agent_failover_paths_total = expected_agent_path_count;
+        report.daemon_agent_failover_reachable_paths_total = expected_agent_path_count;
+        report.daemon_agent_failover_path_count_min = report.daemon_agent_path_count_min;
+        report.daemon_agent_failover_path_count_max = report.daemon_agent_path_count_max;
         report.daemon_control_plane_failover_peer_map_edges_min = expected_peer_edges;
         report.daemon_control_plane_failover_peer_map_edges_max = expected_peer_edges;
         report.daemon_control_plane_failover_peer_maps_consistent = true;
