@@ -3939,6 +3939,9 @@ pub mod api {
         let Some(remaining_end) = offset.checked_add(remaining_len) else {
             return false;
         };
+        if remaining_end > payload.len() {
+            return false;
+        }
         let Some(protocol_name_len) = read_u16_be(payload, offset).map(|len| len as usize) else {
             return false;
         };
@@ -3974,7 +3977,7 @@ pub mod api {
 
         let payload_start = if protocol_name == b"MQTT" && protocol_level == 5 {
             let Some((properties_len, properties_offset)) =
-                mqtt_variable_integer(payload, keepalive_end)
+                mqtt_variable_integer_until(payload, keepalive_end, remaining_end)
             else {
                 return false;
             };
@@ -3991,13 +3994,31 @@ pub mod api {
 
         let protocol_ok = protocol_name == b"MQTT" && matches!(protocol_level, 4 | 5)
             || protocol_name == b"MQIsdp" && protocol_level == 3;
-        protocol_ok && mqtt_connect_payload(payload, payload_start, remaining_end, connect_flags)
+        protocol_ok
+            && mqtt_connect_payload(
+                payload,
+                payload_start,
+                remaining_end,
+                connect_flags,
+                protocol_level,
+            )
     }
 
-    fn mqtt_variable_integer(payload: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    fn mqtt_variable_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        mqtt_variable_integer_until(payload, offset, payload.len())
+    }
+
+    fn mqtt_variable_integer_until(
+        payload: &[u8],
+        mut offset: usize,
+        limit: usize,
+    ) -> Option<(usize, usize)> {
         let mut value = 0_usize;
         let mut multiplier = 1_usize;
         for _ in 0..4 {
+            if offset >= limit {
+                return None;
+            }
             let byte = *payload.get(offset)?;
             value = value.checked_add(((byte & 0x7f) as usize).checked_mul(multiplier)?)?;
             offset += 1;
@@ -4027,31 +4048,93 @@ pub mod api {
         payload_start: usize,
         remaining_end: usize,
         connect_flags: u8,
+        protocol_level: u8,
     ) -> bool {
-        let Some(client_id_len) = read_u16_be(payload, payload_start).map(|len| len as usize)
+        let Some((client_id, mut offset)) = mqtt_utf8_field(payload, payload_start, remaining_end)
         else {
             return false;
         };
-        let Some(client_id_start) = payload_start.checked_add(2) else {
-            return false;
-        };
-        let Some(client_id_end) = client_id_start.checked_add(client_id_len) else {
-            return false;
-        };
-        if client_id_end > remaining_end {
+        if !mqtt_client_identifier(client_id, connect_flags) {
             return false;
         }
-        let Some(client_id) = payload.get(client_id_start..client_id_end) else {
-            return false;
-        };
-        mqtt_client_identifier(client_id, connect_flags)
+
+        if connect_flags & 0x04 != 0 {
+            if protocol_level == 5 {
+                let Some((will_properties_len, will_properties_offset)) =
+                    mqtt_variable_integer_until(payload, offset, remaining_end)
+                else {
+                    return false;
+                };
+                let Some(will_topic_offset) =
+                    will_properties_offset.checked_add(will_properties_len)
+                else {
+                    return false;
+                };
+                if will_topic_offset > remaining_end {
+                    return false;
+                }
+                offset = will_topic_offset;
+            }
+            let Some((_, will_payload_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            let Some((_, next_offset)) =
+                mqtt_len_prefixed_field(payload, will_payload_offset, remaining_end)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+
+        if connect_flags & 0x80 != 0 {
+            let Some((_, next_offset)) = mqtt_utf8_field(payload, offset, remaining_end) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if connect_flags & 0x40 != 0 {
+            let Some((_, next_offset)) = mqtt_len_prefixed_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+
+        offset == remaining_end
     }
 
     fn mqtt_client_identifier(client_id: &[u8], connect_flags: u8) -> bool {
         let clean_start = connect_flags & 0x02 != 0;
-        (!client_id.is_empty() || clean_start)
-            && client_id.len() <= 65_535
-            && client_id
+        (!client_id.is_empty() || clean_start) && mqtt_utf8_string(client_id)
+    }
+
+    fn mqtt_utf8_field(
+        payload: &[u8],
+        offset: usize,
+        remaining_end: usize,
+    ) -> Option<(&[u8], usize)> {
+        let (field, next_offset) = mqtt_len_prefixed_field(payload, offset, remaining_end)?;
+        mqtt_utf8_string(field).then_some((field, next_offset))
+    }
+
+    fn mqtt_len_prefixed_field(
+        payload: &[u8],
+        offset: usize,
+        remaining_end: usize,
+    ) -> Option<(&[u8], usize)> {
+        let len = read_u16_be(payload, offset)? as usize;
+        let start = offset.checked_add(2)?;
+        let end = start.checked_add(len)?;
+        if end > remaining_end {
+            return None;
+        }
+        payload.get(start..end).map(|field| (field, end))
+    }
+
+    fn mqtt_utf8_string(field: &[u8]) -> bool {
+        std::str::from_utf8(field).is_ok()
+            && field
                 .iter()
                 .all(|byte| *byte != 0 && !byte.is_ascii_control())
     }
@@ -5533,6 +5616,57 @@ mod tests {
             payload
         }
 
+        fn mqtt_connect_packet(
+            protocol_level: u8,
+            connect_flags: u8,
+            payload_fields: &[Vec<u8>],
+        ) -> Vec<u8> {
+            let mut body = vec![
+                0,
+                4,
+                b'M',
+                b'Q',
+                b'T',
+                b'T',
+                protocol_level,
+                connect_flags,
+                0,
+                60,
+            ];
+            if protocol_level == 5 {
+                body.push(0);
+            }
+            for field in payload_fields {
+                body.extend_from_slice(field);
+            }
+            let mut payload = vec![0x10];
+            payload.extend_from_slice(&mqtt_remaining_length(body.len()));
+            payload.extend_from_slice(&body);
+            payload
+        }
+
+        fn mqtt_field(value: &[u8]) -> Vec<u8> {
+            let mut field = (value.len() as u16).to_be_bytes().to_vec();
+            field.extend_from_slice(value);
+            field
+        }
+
+        fn mqtt_remaining_length(mut value: usize) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            loop {
+                let mut byte = (value % 128) as u8;
+                value /= 128;
+                if value > 0 {
+                    byte |= 0x80;
+                }
+                encoded.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            encoded
+        }
+
         fn mongodb_message(opcode: u32, body: &[u8]) -> Vec<u8> {
             let length = (16 + body.len()) as u32;
             let mut payload = Vec::with_capacity(length as usize);
@@ -6408,6 +6542,41 @@ mod tests {
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0x82,
+                &[mqtt_field(b"agent"), mqtt_field(b"user")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0xc2,
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_field(b"user"),
+                    mqtt_field(&[0, 1])
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0x06,
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
             observation_for_payload(&[
                 0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
                 b'a', b'g', b'e', b'n', b't',
@@ -6421,6 +6590,27 @@ mod tests {
                 b'a', b'g', b'e', b'n', b't',
             ])
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x82, &[mqtt_field(b"agent")]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x06, &[mqtt_field(b"agent")]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_overstated_remaining = mqtt_connect_packet(4, 0x02, &[mqtt_field(b"agent")]);
+        mqtt_overstated_remaining[1] += 1;
+        assert_eq!(
+            observation_for_payload(&mqtt_overstated_remaining).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x02, &[mqtt_field(&[0xff])]))
+                .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
