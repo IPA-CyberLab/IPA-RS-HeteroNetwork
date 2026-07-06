@@ -242,6 +242,10 @@ struct LoadReport {
     daemon_control_plane_failover_peer_maps_consistent: bool,
     daemon_control_plane_relay_candidates_min: usize,
     daemon_control_plane_relay_candidates_max: usize,
+    daemon_control_plane_path_count_min: usize,
+    daemon_control_plane_path_count_max: usize,
+    daemon_control_plane_reachable_path_count_min: usize,
+    daemon_control_plane_reachable_path_count_max: usize,
     daemon_control_plane_healthy_nodes: usize,
     daemon_control_plane_healthy_nodes_min: usize,
     daemon_control_plane_healthy_nodes_max: usize,
@@ -411,6 +415,18 @@ impl LoadReport {
                         self.daemon_control_plane_relay_candidates_min,
                         self.daemon_control_plane_relay_candidates_max,
                         self.relay_count
+                    );
+                }
+                if self.daemon_control_plane_path_count_min < expected_agent_path_count
+                    || self.daemon_control_plane_reachable_path_count_min
+                        < expected_agent_path_count
+                {
+                    bail!(
+                        "daemon load scenario control-plane path-state mismatch: path min/max={}/{}, reachable min/max={}/{}, expected at least {expected_agent_path_count}",
+                        self.daemon_control_plane_path_count_min,
+                        self.daemon_control_plane_path_count_max,
+                        self.daemon_control_plane_reachable_path_count_min,
+                        self.daemon_control_plane_reachable_path_count_max
                     );
                 }
                 if self.daemon_control_plane_peer_map_endpoints
@@ -1434,6 +1450,10 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
+        daemon_control_plane_path_count_min: 0,
+        daemon_control_plane_path_count_max: 0,
+        daemon_control_plane_reachable_path_count_min: 0,
+        daemon_control_plane_reachable_path_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1622,6 +1642,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
+        daemon_control_plane_path_count_min: 0,
+        daemon_control_plane_path_count_max: 0,
+        daemon_control_plane_reachable_path_count_min: 0,
+        daemon_control_plane_reachable_path_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1784,6 +1808,10 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_failover_peer_maps_consistent: false,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
+        daemon_control_plane_path_count_min: 0,
+        daemon_control_plane_path_count_max: 0,
+        daemon_control_plane_reachable_path_count_min: 0,
+        daemon_control_plane_reachable_path_count_max: 0,
         daemon_control_plane_healthy_nodes: 0,
         daemon_control_plane_healthy_nodes_min: 0,
         daemon_control_plane_healthy_nodes_max: 0,
@@ -1926,6 +1954,13 @@ async fn run_daemon_scenario(
         &client,
         &services.agent_urls,
         &agent_statuses,
+        expected_agent_path_count,
+        agent_readiness_timeout,
+    )
+    .await?;
+    let control_path_summary = wait_for_daemon_control_plane_path_summary(
+        &client,
+        &services.control_plane_urls,
         expected_agent_path_count,
         agent_readiness_timeout,
     )
@@ -2115,6 +2150,12 @@ async fn run_daemon_scenario(
         daemon_control_plane_failover_peer_maps_consistent: failover_peer_maps_consistent,
         daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
         daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
+        daemon_control_plane_path_count_min: control_path_summary.path_count_min,
+        daemon_control_plane_path_count_max: control_path_summary.path_count_max,
+        daemon_control_plane_reachable_path_count_min: control_path_summary
+            .reachable_path_count_min,
+        daemon_control_plane_reachable_path_count_max: control_path_summary
+            .reachable_path_count_max,
         daemon_control_plane_healthy_nodes: control_summary.healthy_node_count_min,
         daemon_control_plane_healthy_nodes_min: control_summary.healthy_node_count_min,
         daemon_control_plane_healthy_nodes_max: control_summary.healthy_node_count_max,
@@ -3984,6 +4025,10 @@ struct ControlPlaneHealthSummary {
     endpoint_count: usize,
     relay_candidate_count_min: usize,
     relay_candidate_count_max: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+    reachable_path_count_min: usize,
+    reachable_path_count_max: usize,
     healthy_node_count_min: usize,
     healthy_node_count_max: usize,
     degraded_node_count_min: usize,
@@ -4001,6 +4046,10 @@ impl ControlPlaneHealthSummary {
             endpoint_count: metrics.len(),
             relay_candidate_count_min: first.relay_candidate_count,
             relay_candidate_count_max: first.relay_candidate_count,
+            path_count_min: first.path_count,
+            path_count_max: first.path_count,
+            reachable_path_count_min: control_plane_reachable_path_count(first),
+            reachable_path_count_max: control_plane_reachable_path_count(first),
             healthy_node_count_min: first.healthy_node_count,
             healthy_node_count_max: first.healthy_node_count,
             degraded_node_count_min: first.degraded_node_count,
@@ -4016,6 +4065,13 @@ impl ControlPlaneHealthSummary {
             summary.relay_candidate_count_max = summary
                 .relay_candidate_count_max
                 .max(metrics.relay_candidate_count);
+            summary.path_count_min = summary.path_count_min.min(metrics.path_count);
+            summary.path_count_max = summary.path_count_max.max(metrics.path_count);
+            let reachable_path_count = control_plane_reachable_path_count(metrics);
+            summary.reachable_path_count_min =
+                summary.reachable_path_count_min.min(reachable_path_count);
+            summary.reachable_path_count_max =
+                summary.reachable_path_count_max.max(reachable_path_count);
             summary.healthy_node_count_min = summary
                 .healthy_node_count_min
                 .min(metrics.healthy_node_count);
@@ -4041,10 +4097,21 @@ impl ControlPlaneHealthSummary {
 
     fn metrics_consistent(&self) -> bool {
         self.relay_candidate_count_min == self.relay_candidate_count_max
+            && self.path_count_min == self.path_count_max
+            && self.reachable_path_count_min == self.reachable_path_count_max
             && self.healthy_node_count_min == self.healthy_node_count_max
             && self.degraded_node_count_min == self.degraded_node_count_max
             && self.unhealthy_node_count_min == self.unhealthy_node_count_max
     }
+}
+
+fn control_plane_reachable_path_count(metrics: &ControlPlaneMetricsResponse) -> usize {
+    metrics
+        .path_state_counts
+        .iter()
+        .filter(|count| count.state != PathState::Unreachable)
+        .map(|count| count.count)
+        .sum()
 }
 
 async fn control_plane_health_summary(
@@ -4069,6 +4136,36 @@ async fn control_plane_health_summary(
     }
 
     ControlPlaneHealthSummary::from_metrics(&metrics_samples)
+}
+
+async fn wait_for_daemon_control_plane_path_summary(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    expected_path_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<ControlPlaneHealthSummary> {
+    let started = Instant::now();
+    loop {
+        let summary =
+            control_plane_health_summary(client, control_plane_urls, "daemon path-state").await?;
+        if summary.path_count_min >= expected_path_count
+            && summary.reachable_path_count_min >= expected_path_count
+        {
+            return Ok(summary);
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "daemon control-plane path-state validation observed path min/max={}/{}, reachable min/max={}/{}, expected at least {} within {}s",
+                summary.path_count_min,
+                summary.path_count_max,
+                summary.reachable_path_count_min,
+                summary.reachable_path_count_max,
+                expected_path_count,
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5946,22 +6043,30 @@ mod tests {
     #[test]
     fn daemon_control_plane_summary_reports_endpoint_ranges() -> anyhow::Result<()> {
         let consistent = ControlPlaneHealthSummary::from_metrics(&[
-            control_plane_metrics(2, 3, 0, 0),
-            control_plane_metrics(2, 3, 0, 0),
+            control_plane_metrics(2, 6, 6, 3, 0, 0),
+            control_plane_metrics(2, 6, 6, 3, 0, 0),
         ])?;
         assert_eq!(consistent.endpoint_count, 2);
         assert_eq!(consistent.relay_candidate_count_min, 2);
         assert_eq!(consistent.relay_candidate_count_max, 2);
+        assert_eq!(consistent.path_count_min, 6);
+        assert_eq!(consistent.path_count_max, 6);
+        assert_eq!(consistent.reachable_path_count_min, 6);
+        assert_eq!(consistent.reachable_path_count_max, 6);
         assert_eq!(consistent.healthy_node_count_min, 3);
         assert_eq!(consistent.healthy_node_count_max, 3);
         assert!(consistent.metrics_consistent());
 
         let skewed = ControlPlaneHealthSummary::from_metrics(&[
-            control_plane_metrics(1, 2, 0, 0),
-            control_plane_metrics(2, 3, 1, 0),
+            control_plane_metrics(1, 4, 4, 2, 0, 0),
+            control_plane_metrics(2, 6, 5, 3, 1, 0),
         ])?;
         assert_eq!(skewed.relay_candidate_count_min, 1);
         assert_eq!(skewed.relay_candidate_count_max, 2);
+        assert_eq!(skewed.path_count_min, 4);
+        assert_eq!(skewed.path_count_max, 6);
+        assert_eq!(skewed.reachable_path_count_min, 4);
+        assert_eq!(skewed.reachable_path_count_max, 5);
         assert_eq!(skewed.healthy_node_count_min, 2);
         assert_eq!(skewed.healthy_node_count_max, 3);
         assert_eq!(skewed.degraded_node_count_min, 0);
@@ -7055,6 +7160,10 @@ mod tests {
         report.daemon_control_plane_failover_peer_maps_consistent = true;
         report.daemon_control_plane_relay_candidates_min = report.relay_count;
         report.daemon_control_plane_relay_candidates_max = report.relay_count;
+        report.daemon_control_plane_path_count_min = expected_agent_path_count;
+        report.daemon_control_plane_path_count_max = expected_agent_path_count;
+        report.daemon_control_plane_reachable_path_count_min = expected_agent_path_count;
+        report.daemon_control_plane_reachable_path_count_max = expected_agent_path_count;
         report.daemon_control_plane_healthy_nodes = report.node_count;
         report.daemon_control_plane_healthy_nodes_min = report.node_count;
         report.daemon_control_plane_healthy_nodes_max = report.node_count;
@@ -7074,10 +7183,25 @@ mod tests {
 
     fn control_plane_metrics(
         relay_candidate_count: usize,
+        path_count: usize,
+        reachable_path_count: usize,
         healthy_node_count: usize,
         degraded_node_count: usize,
         unhealthy_node_count: usize,
     ) -> ControlPlaneMetricsResponse {
+        let mut path_state_counts = Vec::new();
+        if reachable_path_count > 0 {
+            path_state_counts.push(ipars_types::api::PathStateCount {
+                state: PathState::DirectPublic,
+                count: reachable_path_count,
+            });
+        }
+        if path_count > reachable_path_count {
+            path_state_counts.push(ipars_types::api::PathStateCount {
+                state: PathState::Unreachable,
+                count: path_count - reachable_path_count,
+            });
+        }
         ControlPlaneMetricsResponse {
             cluster_id: ClusterId::from_string("load-summary-test"),
             node_count: healthy_node_count + degraded_node_count + unhealthy_node_count,
@@ -7102,8 +7226,8 @@ mod tests {
             peer_map_route_visible_count: 0,
             peer_map_route_acl_denied_count: 0,
             stale_path_count: 0,
-            path_count: 0,
-            path_state_counts: Vec::new(),
+            path_count,
+            path_state_counts,
             endpoint_candidate_ttl_seconds: 0,
             path_state_ttl_seconds: 0,
             generated_at: Utc::now(),
