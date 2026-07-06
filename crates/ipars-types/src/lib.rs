@@ -3210,31 +3210,138 @@ pub mod api {
     }
 
     fn memcached_text_payload(payload: &[u8]) -> bool {
-        let commands: [&[u8]; 20] = [
-            b"get",
-            b"gets",
-            b"gat",
-            b"gats",
-            b"set",
-            b"add",
-            b"replace",
-            b"append",
-            b"prepend",
-            b"cas",
-            b"delete",
-            b"incr",
-            b"decr",
-            b"touch",
-            b"stats",
-            b"version",
-            b"flush_all",
-            b"verbosity",
-            b"quit",
-            b"slabs",
-        ];
-        commands
+        let line_end = payload
             .iter()
-            .any(|command| starts_ascii_word(payload, command))
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(payload.len());
+        let fields = payload[..line_end]
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let Some(command) = fields.first() else {
+            return false;
+        };
+
+        if command.eq_ignore_ascii_case(b"get") || command.eq_ignore_ascii_case(b"gets") {
+            return fields.len() >= 2 && fields[1..].iter().all(|field| memcached_key(field));
+        }
+        if command.eq_ignore_ascii_case(b"gat") || command.eq_ignore_ascii_case(b"gats") {
+            return fields.len() >= 3
+                && memcached_decimal(fields[1])
+                && fields[2..].iter().all(|field| memcached_key(field));
+        }
+        if command.eq_ignore_ascii_case(b"set")
+            || command.eq_ignore_ascii_case(b"add")
+            || command.eq_ignore_ascii_case(b"replace")
+            || command.eq_ignore_ascii_case(b"append")
+            || command.eq_ignore_ascii_case(b"prepend")
+        {
+            return memcached_storage_fields(&fields, false);
+        }
+        if command.eq_ignore_ascii_case(b"cas") {
+            return memcached_storage_fields(&fields, true);
+        }
+        if command.eq_ignore_ascii_case(b"delete") {
+            return fields.len() == 2 && memcached_key(fields[1])
+                || fields.len() == 3
+                    && memcached_key(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"incr") || command.eq_ignore_ascii_case(b"decr") {
+            return fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+                || fields.len() == 4
+                    && memcached_key(fields[1])
+                    && memcached_decimal(fields[2])
+                    && fields[3].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"touch") {
+            return fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+                || fields.len() == 4
+                    && memcached_key(fields[1])
+                    && memcached_decimal(fields[2])
+                    && fields[3].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"stats") {
+            return fields.len() <= 4
+                && fields
+                    .iter()
+                    .skip(1)
+                    .all(|field| memcached_ascii_argument(field));
+        }
+        if command.eq_ignore_ascii_case(b"version") {
+            return fields.len() == 1;
+        }
+        if command.eq_ignore_ascii_case(b"flush_all") {
+            return fields.len() == 1
+                || fields.len() == 2
+                    && (memcached_decimal(fields[1])
+                        || fields[1].eq_ignore_ascii_case(b"noreply"))
+                || fields.len() == 3
+                    && memcached_decimal(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"verbosity") {
+            return fields.len() == 2 && memcached_decimal(fields[1])
+                || fields.len() == 3
+                    && memcached_decimal(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"quit") {
+            return fields.len() == 1
+                || fields.len() == 2 && fields[1].eq_ignore_ascii_case(b"noreply");
+        }
+        if command.eq_ignore_ascii_case(b"slabs") {
+            return memcached_slabs_fields(&fields);
+        }
+        false
+    }
+
+    fn memcached_storage_fields(fields: &[&[u8]], includes_cas: bool) -> bool {
+        let required = if includes_cas { 6 } else { 5 };
+        if fields.len() != required
+            && !(fields.len() == required + 1 && fields[required].eq_ignore_ascii_case(b"noreply"))
+        {
+            return false;
+        }
+        memcached_key(fields[1])
+            && memcached_decimal(fields[2])
+            && memcached_decimal(fields[3])
+            && memcached_decimal(fields[4])
+            && (!includes_cas || memcached_decimal(fields[5]))
+    }
+
+    fn memcached_slabs_fields(fields: &[&[u8]]) -> bool {
+        if fields.len() < 2 {
+            return false;
+        }
+        if fields[1].eq_ignore_ascii_case(b"reassign") {
+            return fields.len() == 4
+                && memcached_decimal(fields[2])
+                && memcached_decimal(fields[3]);
+        }
+        if fields[1].eq_ignore_ascii_case(b"automove") {
+            return fields.len() == 2 || fields.len() == 3 && memcached_decimal(fields[2]);
+        }
+        false
+    }
+
+    fn memcached_key(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.len() <= 250
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(*byte, b' ' | 0x7f))
+    }
+
+    fn memcached_decimal(field: &[u8]) -> bool {
+        !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
+    }
+
+    fn memcached_ascii_argument(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b':' | b'.')
+            })
     }
 
     fn memcached_binary_payload(payload: &[u8]) -> bool {
@@ -4817,6 +4924,35 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\n").application(),
             api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"get cache-key another-key\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"cas cache-key 0 60 5 12345 noreply\r\nvalue\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"incr cache-key 1\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"stats cachedump 1 20\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"settings cache-key 0 60 5\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"getaway cache-key\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
