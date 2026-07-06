@@ -36,9 +36,15 @@
 {{- $relayUdpPortValue := printf "%v" .Values.agent.relayService.udpPort -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpPort" "value" $relayUdpPortValue "max" 65535) -}}
 {{- $relayUdpPort := int $relayUdpPortValue -}}
+{{- $relayUdpTargetPortValue := printf "%v" .Values.agent.relayService.udpTargetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpTargetPort" "value" $relayUdpTargetPortValue "max" 65535) -}}
+{{- $relayUdpTargetPort := int $relayUdpTargetPortValue -}}
 {{- $relayHttpPortValue := printf "%v" .Values.agent.relayService.httpPort -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpPort" "value" $relayHttpPortValue "max" 65535) -}}
 {{- $relayHttpPort := int $relayHttpPortValue -}}
+{{- $relayHttpTargetPortValue := printf "%v" .Values.agent.relayService.httpTargetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpTargetPort" "value" $relayHttpTargetPortValue "max" 65535) -}}
+{{- $relayHttpTargetPort := int $relayHttpTargetPortValue -}}
 {{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
 {{- $relayClusterIPs := .Values.agent.relayService.clusterIPs -}}
 {{- $relayUdpNodePortValue := printf "%v" .Values.agent.relayService.udpNodePort -}}
@@ -222,8 +228,14 @@
 {{- if and $relayServiceActive (or (lt $relayUdpPort 1) (gt $relayUdpPort 65535)) -}}
 {{- fail "agent.relayService.udpPort must be between 1 and 65535" -}}
 {{- end -}}
+{{- if and $relayServiceActive (or (lt $relayUdpTargetPort 1) (gt $relayUdpTargetPort 65535)) -}}
+{{- fail "agent.relayService.udpTargetPort must be between 1 and 65535" -}}
+{{- end -}}
 {{- if and $relayServiceActive (or (lt $relayHttpPort 1) (gt $relayHttpPort 65535)) -}}
 {{- fail "agent.relayService.httpPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (or (lt $relayHttpTargetPort 1) (gt $relayHttpTargetPort 65535)) -}}
+{{- fail "agent.relayService.httpTargetPort must be between 1 and 65535" -}}
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayClusterIP "") -}}
 {{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}
@@ -656,7 +668,7 @@ spec:
       appProtocol: {{ .Values.agent.relayService.udpAppProtocol | quote }}
       {{- end }}
       port: {{ .Values.agent.relayService.udpPort }}
-      targetPort: {{ .Values.agent.relayService.udpPort }}
+      targetPort: {{ .Values.agent.relayService.udpTargetPort }}
       {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
       nodePort: {{ $relayUdpNodePort }}
       {{- end }}
@@ -666,7 +678,7 @@ spec:
       appProtocol: {{ .Values.agent.relayService.httpAppProtocol | quote }}
       {{- end }}
       port: {{ .Values.agent.relayService.httpPort }}
-      targetPort: {{ .Values.agent.relayService.httpPort }}
+      targetPort: {{ .Values.agent.relayService.httpTargetPort }}
       {{- if and $relayExternal (ne $relayHttpNodePort 0) }}
       nodePort: {{ $relayHttpNodePort }}
       {{- end }}

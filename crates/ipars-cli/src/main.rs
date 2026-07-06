@@ -560,8 +560,12 @@ struct K8sInstallArgs {
     relay_secondary_cluster_ip: Option<IpAddr>,
     #[arg(long = "relay-udp-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
     relay_udp_port: Option<u16>,
+    #[arg(long = "relay-udp-target-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_udp_target_port: Option<u16>,
     #[arg(long = "relay-http-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
     relay_http_port: Option<u16>,
+    #[arg(long = "relay-http-target-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_http_target_port: Option<u16>,
     #[arg(long = "relay-udp-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
@@ -3531,8 +3535,14 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         if let Some(port) = args.relay_udp_port {
             helm_command.push_str(&format!(" --set agent.relayService.udpPort={port}"));
         }
+        if let Some(port) = args.relay_udp_target_port {
+            helm_command.push_str(&format!(" --set agent.relayService.udpTargetPort={port}"));
+        }
         if let Some(port) = args.relay_http_port {
             helm_command.push_str(&format!(" --set agent.relayService.httpPort={port}"));
+        }
+        if let Some(port) = args.relay_http_target_port {
+            helm_command.push_str(&format!(" --set agent.relayService.httpTargetPort={port}"));
         }
         if let Some(node_port) = args.relay_udp_node_port {
             helm_command.push_str(&format!(
@@ -5098,8 +5108,14 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_udp_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-port requires --expose-relay");
     }
+    if args.relay_udp_target_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-target-port requires --expose-relay");
+    }
     if args.relay_http_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-http-port requires --expose-relay");
+    }
+    if args.relay_http_target_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-target-port requires --expose-relay");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -8032,7 +8048,9 @@ mod tests {
             relay_cluster_ip: Some("2001:db8::41".parse()?),
             relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
             relay_udp_port: Some(51821),
+            relay_udp_target_port: Some(51820),
             relay_http_port: Some(9581),
+            relay_http_target_port: Some(9580),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
             relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
@@ -8147,7 +8165,9 @@ mod tests {
             plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
         );
         assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
         assert!(plan.commands[2]
@@ -8822,7 +8842,9 @@ mod tests {
             "agent.apiService.healthCheckNodePort",
             "agent.apiService.sessionAffinityTimeoutSeconds",
             "agent.relayService.udpPort",
+            "agent.relayService.udpTargetPort",
             "agent.relayService.httpPort",
+            "agent.relayService.httpTargetPort",
             "agent.relayService.udpNodePort",
             "agent.relayService.httpNodePort",
             "agent.relayService.healthCheckNodePort",
@@ -8853,6 +8875,13 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs"
         ));
+        assert!(
+            service_template.contains("targetPort: {{ .Values.agent.relayService.udpTargetPort }}")
+        );
+        assert!(service_template
+            .contains("targetPort: {{ .Values.agent.relayService.httpTargetPort }}"));
+        assert!(!service_template.contains("targetPort: {{ .Values.agent.relayService.udpPort }}"));
+        assert!(!service_template.contains("targetPort: {{ .Values.agent.relayService.httpPort }}"));
         Ok(())
     }
 
@@ -9025,7 +9054,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -10068,8 +10099,12 @@ mod tests {
             "LoadBalancer",
             "--relay-udp-port",
             "51821",
+            "--relay-udp-target-port",
+            "51820",
             "--relay-http-port",
             "9581",
+            "--relay-http-target-port",
+            "9580",
             "--relay-udp-node-port",
             "31820",
             "--relay-http-node-port",
@@ -10281,7 +10316,9 @@ mod tests {
             assert!(args.expose_relay);
             assert_eq!(args.relay_service_type, "LoadBalancer");
             assert_eq!(args.relay_udp_port, Some(51821));
+            assert_eq!(args.relay_udp_target_port, Some(51820));
             assert_eq!(args.relay_http_port, Some(9581));
+            assert_eq!(args.relay_http_target_port, Some(9580));
             assert_eq!(args.relay_udp_node_port, Some(31820));
             assert_eq!(args.relay_http_node_port, Some(31580));
             assert_eq!(
@@ -10437,7 +10474,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -10579,7 +10618,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -11876,7 +11917,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12005,7 +12048,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12223,7 +12268,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12357,7 +12404,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12486,7 +12535,9 @@ mod tests {
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
             relay_udp_port: None,
+            relay_udp_target_port: None,
             relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
