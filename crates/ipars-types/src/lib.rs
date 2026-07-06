@@ -2848,15 +2848,29 @@ pub mod api {
         Some((value, offset + len))
     }
 
+    const WIREGUARD_HANDSHAKE_INITIATION_LEN: usize = 148;
+    const WIREGUARD_HANDSHAKE_RESPONSE_LEN: usize = 92;
+    const WIREGUARD_COOKIE_REPLY_LEN: usize = 64;
+    const WIREGUARD_TRANSPORT_KEEPALIVE_LEN: usize = 32;
+
+    fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
+        payload_len == wire_len
+            || (wire_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
+                && payload_len == PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
     fn wireguard_payload(payload: &[u8]) -> bool {
         if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
             return false;
         }
         match payload[0] {
-            1 => payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
-            2 => payload.len() >= 92,
-            3 => payload.len() >= 64,
-            4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
+            1 => wireguard_observed_len_matches(payload.len(), WIREGUARD_HANDSHAKE_INITIATION_LEN),
+            2 => payload.len() == WIREGUARD_HANDSHAKE_RESPONSE_LEN,
+            3 => payload.len() == WIREGUARD_COOKIE_REPLY_LEN,
+            4 => {
+                payload.len() >= WIREGUARD_TRANSPORT_KEEPALIVE_LEN
+                    && payload.len().is_multiple_of(16)
+            }
             _ => false,
         }
     }
@@ -5911,12 +5925,36 @@ mod tests {
             api::AgentPacketFlowApplication::WireGuard
         );
         assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 148)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 149)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(
+                1,
+                api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES - 1
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_udp_payload(&wireguard_message(1, 64)).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_udp_payload(&wireguard_message(2, 92)).application(),
             api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 91)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 93)).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut wireguard_with_nonzero_reserved = wireguard_message(2, 92);
         wireguard_with_nonzero_reserved[1] = 1;
@@ -5929,11 +5967,23 @@ mod tests {
             api::AgentPacketFlowApplication::WireGuard
         );
         assert_eq!(
+            observation_for_udp_payload(&wireguard_message(3, 65)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_udp_payload(&wireguard_message(4, 32)).application(),
             api::AgentPacketFlowApplication::WireGuard
         );
         assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 48)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
             observation_for_udp_payload(&wireguard_message(4, 31)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 33)).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
