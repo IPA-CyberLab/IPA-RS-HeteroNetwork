@@ -123,6 +123,14 @@ cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin targ
 IPARS_TEST_IPARSD_BIN="$(pwd)/target/debug/iparsd" cargo test -p ipars-load load_harness_can_drive_daemon_processes_when_binary_is_provided -- --nocapture
 ```
 
+For a repeatable lightweight load harness check, run:
+
+```bash
+scripts/load-smoke.sh
+```
+
+It covers 3/10/1000-node in-memory scenarios plus 3-node HTTP and relay-UDP scenarios, and can include daemon transport when `IPARS_LOAD_SMOKE_DAEMON_BIN` points at an `iparsd` binary.
+
 The in-process eBPF packet-flow detector uses a separately built BPF object. Build it with a nightly Rust toolchain, `rust-src`, and `bpf-linker`:
 
 ```bash
