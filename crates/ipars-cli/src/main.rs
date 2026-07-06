@@ -1326,10 +1326,7 @@ async fn control_plane_path_status(
         .control_plane_url
         .as_deref()
         .context("ipars path status requires --control-plane-url")?;
-    let node_id = args
-        .node_id
-        .as_deref()
-        .context("ipars path status requires --node-id with --control-plane-url")?;
+    let node_id = required_node_id(args.node_id.as_deref(), "path status")?;
     get_json(
         control_plane_url,
         &format!("/v1/paths/{node_id}"),
@@ -1342,7 +1339,7 @@ async fn path_activity(
     agent_url: &str,
     args: &PathActivityArgs,
 ) -> anyhow::Result<AgentPeerActivityResponse> {
-    let request = path_activity_request(args);
+    let request = path_activity_request(args)?;
     post_json(
         agent_url,
         "/v1/peer-activity",
@@ -1352,11 +1349,11 @@ async fn path_activity(
     .await
 }
 
-fn path_activity_request(args: &PathActivityArgs) -> AgentPeerActivityRequest {
-    AgentPeerActivityRequest {
-        peer: NodeId::from_string(args.peer.clone()),
+fn path_activity_request(args: &PathActivityArgs) -> anyhow::Result<AgentPeerActivityRequest> {
+    Ok(AgentPeerActivityRequest {
+        peer: validated_node_id(&args.peer, "--peer")?,
         pin: args.pin,
-    }
+    })
 }
 
 async fn path_probe(
@@ -1371,11 +1368,17 @@ fn path_probe_request(
     args: &PathProbeArgs,
     observed_at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<AgentPathProbeRequest> {
+    let peer = validated_node_id(&args.peer, "--peer")?;
+    let relay_node = args
+        .relay_node
+        .as_deref()
+        .map(|relay_node| validated_node_id(relay_node, "--relay-node"))
+        .transpose()?;
     let request = AgentPathProbeRequest {
-        peer: NodeId::from_string(args.peer.clone()),
+        peer: peer.clone(),
         selected_state: args.state,
-        selected_candidate: path_probe_candidate(args, observed_at)?,
-        relay_node: args.relay_node.clone().map(NodeId::from_string),
+        selected_candidate: path_probe_candidate(args, observed_at, &peer)?,
+        relay_node,
         metrics: PathMetrics {
             latency_ms: args.latency_ms,
             loss_ppm: args.loss_ppm,
@@ -1394,6 +1397,7 @@ fn path_probe_request(
 fn path_probe_candidate(
     args: &PathProbeArgs,
     observed_at: chrono::DateTime<Utc>,
+    peer: &NodeId,
 ) -> anyhow::Result<Option<EndpointCandidate>> {
     let Some(addr) = args.candidate_addr else {
         if args.candidate_kind.is_some()
@@ -1407,7 +1411,7 @@ fn path_probe_candidate(
     };
 
     let candidate = EndpointCandidate {
-        node_id: NodeId::from_string(args.peer.clone()),
+        node_id: peer.clone(),
         kind: args
             .candidate_kind
             .unwrap_or(EndpointCandidateKind::PublicUdp),
@@ -2312,9 +2316,14 @@ fn shell_word(value: &str) -> String {
 }
 
 fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
-    value
-        .map(NodeId::from_string)
-        .with_context(|| format!("ipars {command} requires --node-id with --control-plane-url"))
+    let value = value
+        .with_context(|| format!("ipars {command} requires --node-id with --control-plane-url"))?;
+    validated_node_id(value, "--node-id")
+}
+
+fn validated_node_id(value: &str, label: &str) -> anyhow::Result<NodeId> {
+    validate_token_identifier(value, label)?;
+    Ok(NodeId::from_string(value))
 }
 
 fn routes_output(node_id: NodeId, peer_map: PeerMap) -> RoutesOutput {
@@ -5755,9 +5764,35 @@ mod tests {
         };
 
         assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
-        let request = path_activity_request(&args);
+        let request = path_activity_request(&args)?;
         assert_eq!(request.peer, NodeId::from_string("peer-a"));
         assert!(request.pin);
+        Ok(())
+    }
+
+    #[test]
+    fn path_activity_rejects_path_unsafe_peer_id() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer/a",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Activity(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path activity command");
+        };
+
+        let error = match path_activity_request(&args) {
+            Ok(_) => anyhow::bail!("path-unsafe peer ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--peer must contain only"));
         Ok(())
     }
 
@@ -5862,6 +5897,50 @@ mod tests {
         assert!(error
             .to_string()
             .contains("candidate metadata requires --candidate-addr"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_path_unsafe_peer_and_relay_ids() -> anyhow::Result<()> {
+        let peer_path = Cli::try_parse_from([
+            "ipars", "path", "probe", "--peer", "peer/a", "--state", "relay",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(peer_args),
+        } = peer_path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&peer_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("path-unsafe peer ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--peer must contain only"));
+
+        let relay_path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "relay",
+            "--relay-node",
+            "relay/a",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(relay_args),
+        } = relay_path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&relay_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("path-unsafe relay node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--relay-node must contain only"));
         Ok(())
     }
 
@@ -6007,6 +6086,22 @@ mod tests {
         }
 
         anyhow::bail!("expected relay status command")
+    }
+
+    #[test]
+    fn control_plane_node_id_rejects_path_unsafe_values() -> anyhow::Result<()> {
+        let error = match required_node_id(Some("node/a"), "peers") {
+            Ok(_) => anyhow::bail!("path-unsafe node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--node-id must contain only"));
+
+        let error = match required_node_id(Some(""), "path status") {
+            Ok(_) => anyhow::bail!("empty node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--node-id cannot be empty"));
+        Ok(())
     }
 
     #[test]
