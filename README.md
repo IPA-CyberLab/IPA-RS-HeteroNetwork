@@ -88,8 +88,9 @@ registrations, agent status endpoint coverage, agent endpoint candidates, peer-m
 advertised route loss, missing control-plane metrics endpoint coverage, cross-control-plane skew,
 failed control-plane failover, all-unreachable path negotiation, relay-candidate loss, relay packet
 loss, relay capacity/policy/E2E/admission counter skew,
-relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload or
-child-role skew, file-backed log diagnostic mismatch after final child shutdown, or daemon health inconsistencies fail the run
+relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
+endpoint, or child-role skew, file-backed log diagnostic mismatch after final child shutdown, or
+daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
 records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced
 runtime manifest, and reports log tails

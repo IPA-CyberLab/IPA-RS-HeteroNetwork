@@ -751,6 +751,39 @@ impl LoadReport {
                 self.daemon_agent_processes
             );
         }
+        let mut seen_http_endpoints = BTreeMap::new();
+        for (index, url) in manifest.control_plane_urls.iter().enumerate() {
+            validate_daemon_manifest_http_endpoint(
+                url,
+                &format!("control-plane URL {index}"),
+                &mut seen_http_endpoints,
+            )?;
+        }
+        validate_daemon_manifest_http_endpoint(
+            &manifest.signal_url,
+            "signal URL",
+            &mut seen_http_endpoints,
+        )?;
+        validate_daemon_manifest_http_endpoint(
+            &manifest.relay_http_url,
+            "relay HTTP URL",
+            &mut seen_http_endpoints,
+        )?;
+        for (index, url) in manifest.agent_urls.iter().enumerate() {
+            validate_daemon_manifest_http_endpoint(
+                url,
+                &format!("agent URL {index}"),
+                &mut seen_http_endpoints,
+            )?;
+        }
+        validate_daemon_manifest_socket_addr(manifest.relay_udp_addr, "relay UDP address")?;
+        validate_daemon_manifest_socket_addr(manifest.stun_addr, "STUN address")?;
+        if manifest.relay_udp_addr == manifest.stun_addr {
+            bail!(
+                "daemon load scenario retained manifest reuses UDP socket {} for relay and STUN",
+                manifest.relay_udp_addr
+            );
+        }
         if manifest.children.len() != self.daemon_processes {
             bail!(
                 "daemon load scenario retained manifest recorded {} child processes, expected {}",
@@ -896,6 +929,71 @@ impl LoadReport {
         roles.sort();
         roles
     }
+}
+
+fn validate_daemon_manifest_http_endpoint(
+    value: &str,
+    label: &str,
+    seen_http_endpoints: &mut BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(value).with_context(|| {
+        format!("daemon load scenario retained manifest {label} must be an absolute HTTP(S) URL")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!(
+            "daemon load scenario retained manifest {label} uses unsupported URL scheme {}",
+            parsed.scheme()
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("daemon load scenario retained manifest {label} must not include credentials");
+    }
+    let Some(host) = parsed.host_str().filter(|host| !host.is_empty()) else {
+        bail!("daemon load scenario retained manifest {label} is missing a host");
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        validate_daemon_manifest_ip_addr(ip, label)?;
+    }
+    let Some(port) = parsed.port() else {
+        bail!("daemon load scenario retained manifest {label} must include an explicit port");
+    };
+    if port == 0 {
+        bail!("daemon load scenario retained manifest {label} uses port zero");
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!(
+            "daemon load scenario retained manifest {label} must be a base URL without path, query, or fragment"
+        );
+    }
+
+    let endpoint_key = format!("{}://{}:{port}", parsed.scheme(), host.to_ascii_lowercase());
+    if let Some(existing_label) =
+        seen_http_endpoints.insert(endpoint_key.clone(), label.to_string())
+    {
+        bail!(
+            "daemon load scenario retained manifest duplicate HTTP endpoint {endpoint_key} for {existing_label} and {label}"
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_daemon_manifest_socket_addr(addr: SocketAddr, label: &str) -> anyhow::Result<()> {
+    if addr.port() == 0 {
+        bail!("daemon load scenario retained manifest {label} uses port zero");
+    }
+    validate_daemon_manifest_ip_addr(addr.ip(), label)
+}
+
+fn validate_daemon_manifest_ip_addr(ip: IpAddr, label: &str) -> anyhow::Result<()> {
+    let unusable = match ip {
+        IpAddr::V4(addr) => addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast(),
+        IpAddr::V6(addr) => addr.is_unspecified() || addr.is_multicast(),
+    };
+    if unusable {
+        bail!("daemon load scenario retained manifest {label} uses unusable IP address {ip}");
+    }
+    Ok(())
 }
 
 async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
@@ -4095,6 +4193,62 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("child roles"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut duplicated_manifest_endpoint = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &duplicated_manifest_endpoint,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        duplicated_manifest_endpoint.daemon_runtime_dir = Some(runtime_dir.clone());
+        duplicated_manifest_endpoint.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(control_plane_url) = manifest.control_plane_urls.first().cloned() {
+                manifest.signal_url = control_plane_url;
+            }
+        })?;
+        let error = match duplicated_manifest_endpoint.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with duplicate HTTP endpoints should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate HTTP endpoint"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut unusable_manifest_socket = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &unusable_manifest_socket,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        unusable_manifest_socket.daemon_runtime_dir = Some(runtime_dir.clone());
+        unusable_manifest_socket.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.relay_udp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        })?;
+        let error = match unusable_manifest_socket.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with unusable relay UDP address should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay UDP address"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut incomplete_retained_manifest_fields = daemon_report.clone();
