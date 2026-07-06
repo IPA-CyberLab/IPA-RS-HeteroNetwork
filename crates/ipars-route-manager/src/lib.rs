@@ -40,6 +40,8 @@ pub enum RouteManagerError {
     InvalidDockerNetworkIntent(String),
     #[error("invalid Kubernetes underlay intent: {0}")]
     InvalidKubernetesUnderlayIntent(String),
+    #[error("invalid route plan: {0}")]
+    InvalidRoutePlan(String),
     #[error("invalid policy rule: {0}")]
     InvalidPolicyRule(String),
 }
@@ -337,7 +339,74 @@ pub fn checked_docker_route_plan(
 pub fn validate_docker_network_intent(
     intent: &DockerNetworkIntent,
 ) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&intent.host_interface).map_err(invalid_docker_network_intent)?;
+    validate_linux_interface_name(&intent.overlay_interface)
+        .map_err(invalid_docker_network_intent)?;
     validate_docker_container_cidrs(&intent.container_cidrs)
+}
+
+pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&plan.interface).map_err(invalid_route_plan)?;
+    let mut seen_routes = BTreeSet::new();
+    for route in &plan.routes {
+        if let Some(reason) = restricted_route_cidr_reason(&route.cidr) {
+            return Err(invalid_route_plan(format!(
+                "route {} must not include {reason} CIDR {}",
+                route.id, route.cidr
+            )));
+        }
+        let canonical = route.cidr.trunc();
+        if route.cidr != canonical {
+            return Err(invalid_route_plan(format!(
+                "route {} must use canonical CIDR {canonical}, not {}",
+                route.id, route.cidr
+            )));
+        }
+        if !seen_routes.insert(route.cidr) {
+            return Err(invalid_route_plan(format!(
+                "route plan must not repeat CIDR {}",
+                route.cidr
+            )));
+        }
+    }
+    for rule in &plan.policy_rules {
+        validate_policy_rule(rule)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_rule(rule: &PolicyRule) -> Result<(), RouteManagerError> {
+    if rule.table == 0 {
+        return Err(RouteManagerError::InvalidPolicyRule(format!(
+            "rule priority {} must use a nonzero routing table",
+            rule.priority
+        )));
+    }
+    if rule.priority == 0 {
+        return Err(RouteManagerError::InvalidPolicyRule(
+            "policy rule priority must be greater than zero".to_string(),
+        ));
+    }
+    policy_rule_address_family(rule)?;
+    Ok(())
+}
+
+fn validate_linux_interface_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("linux interface name cannot be empty".to_string());
+    }
+    if name.len() > 15 {
+        return Err(format!("linux interface name `{name}` exceeds 15 bytes"));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_docker_container_cidrs(cidrs: &[IpNet]) -> Result<(), RouteManagerError> {
@@ -375,6 +444,10 @@ fn validate_docker_container_cidrs(cidrs: &[IpNet]) -> Result<(), RouteManagerEr
 
 fn invalid_docker_network_intent(message: impl Into<String>) -> RouteManagerError {
     RouteManagerError::InvalidDockerNetworkIntent(message.into())
+}
+
+fn invalid_route_plan(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidRoutePlan(message.into())
 }
 
 fn restricted_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
@@ -502,6 +575,8 @@ pub fn checked_kubernetes_route_plan(
 pub fn validate_kubernetes_underlay_intent(
     intent: &KubernetesUnderlayIntent,
 ) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&intent.overlay_interface)
+        .map_err(invalid_kubernetes_underlay_intent)?;
     let mut seen = BTreeSet::new();
     validate_kubernetes_underlay_cidrs(
         "Kubernetes API server CIDR",
@@ -885,6 +960,7 @@ where
     R: LinuxRouteCommandRunner,
 {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         for command in Self::apply_route_commands(&plan) {
             self.runner.run(command).await?;
         }
@@ -901,6 +977,7 @@ where
     }
 
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         for rule in &plan.policy_rules {
             self.runner
                 .run(Self::policy_rule_command("del", rule))
@@ -1053,6 +1130,7 @@ impl LinuxNetlinkRouteManager {
 #[async_trait]
 impl RouteManager for LinuxNetlinkRouteManager {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for table in LinuxRouteManager::<SystemRouteCommandRunner>::route_tables(&plan) {
@@ -1068,6 +1146,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
     }
 
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for rule in &plan.policy_rules {
@@ -1179,11 +1258,13 @@ pub struct DryRunLinuxRouteManager;
 
 #[async_trait]
 impl RouteManager for DryRunLinuxRouteManager {
-    async fn apply_routes(&self, _plan: RoutePlan) -> Result<(), RouteManagerError> {
+    async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         Ok(())
     }
 
-    async fn remove_routes(&self, _plan: RoutePlan) -> Result<(), RouteManagerError> {
+    async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         Ok(())
     }
 
@@ -1327,6 +1408,79 @@ mod tests {
                 fwmark: Some(0x6473),
             }],
         })
+    }
+
+    #[tokio::test]
+    async fn route_plan_validation_rejects_unsafe_and_noncanonical_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            ("", "linux interface name cannot be empty", "10.42.0.0/16"),
+            (
+                "bad interface",
+                "must contain only ASCII letters",
+                "10.42.0.0/16",
+            ),
+            ("ipars0", "unrestricted CIDR 0.0.0.0/0", "0.0.0.0/0"),
+            ("ipars0", "loopback CIDR 127.0.0.0/8", "127.0.0.0/8"),
+            ("ipars0", "canonical CIDR 10.42.0.0/16", "10.42.0.1/16"),
+        ];
+
+        for (interface, expected, cidr) in cases {
+            let mut plan = route_plan()?;
+            plan.interface = interface.to_string();
+            plan.routes[0].cidr = cidr.parse()?;
+            let error = match manager.apply_routes(plan).await {
+                Ok(()) => return Err("invalid route plan should be rejected".into()),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error}"
+            );
+        }
+
+        let mut duplicate = route_plan()?;
+        duplicate.routes.push(Route {
+            id: "route-b".to_string(),
+            ..duplicate.routes[0].clone()
+        });
+        let error = match manager.apply_routes(duplicate).await {
+            Ok(()) => return Err("duplicate route plan should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not repeat CIDR"));
+
+        let mut invalid_rule = route_plan()?;
+        invalid_rule.policy_rules[0].table = 0;
+        let error = match manager.apply_routes(invalid_rule).await {
+            Ok(()) => return Err("invalid policy rule should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidPolicyRule(ref message)
+                if message.contains("must use a nonzero routing table")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_validates_plan_before_running_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+        let mut plan = route_plan()?;
+        plan.routes[0].cidr = "10.42.0.1/16".parse()?;
+
+        let error = match manager.apply_routes(plan).await {
+            Ok(()) => return Err("invalid route plan should be rejected".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RouteManagerError::InvalidRoutePlan(_)));
+        assert!(runner.commands().await.is_empty());
+        Ok(())
     }
 
     #[test]
