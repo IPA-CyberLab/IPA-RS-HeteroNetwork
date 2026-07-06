@@ -2598,7 +2598,7 @@ struct LinuxNetnsPathReport {
 }
 
 fn ensure_linux_netns_ready(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
-    let path = Path::new("/var/run/netns").join(namespace.name());
+    let path = netns_path(namespace);
     let current_path = current_process_netns_path();
     let report = inspect_linux_netns_path(namespace, &path, current_path.as_deref())?;
     if report.same_as_current == Some(true) {
@@ -7507,24 +7507,33 @@ impl RelayForwarderSupervisor {
 
 #[cfg(unix)]
 fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let current = std::fs::metadata("/proc/self/ns/net")
-        .context("failed to inspect current network namespace")?;
     let target_path = netns_path(namespace);
-    let target = std::fs::metadata(&target_path).with_context(|| {
-        format!(
-            "failed to inspect network namespace {}; run the agent inside it or create {}",
-            namespace.name(),
-            target_path.display()
-        )
-    })?;
-    if current.dev() == target.dev() && current.ino() == target.ino() {
+    let current_path =
+        current_process_netns_path().context("failed to locate current network namespace")?;
+    ensure_process_in_netns_path(namespace, &target_path, &current_path)
+}
+
+#[cfg(unix)]
+fn ensure_process_in_netns_path(
+    namespace: &LinuxNetworkNamespace,
+    target_path: &Path,
+    current_netns_path: &Path,
+) -> anyhow::Result<()> {
+    let report = inspect_linux_netns_path(namespace, target_path, Some(current_netns_path))
+        .with_context(|| {
+            format!(
+                "failed to inspect network namespace {}; run the agent inside it or create {}",
+                namespace.name(),
+                target_path.display()
+            )
+        })?;
+    if report.same_as_current == Some(true) {
         return Ok(());
     }
     anyhow::bail!(
-        "relay forwarder requires process network namespace {}; current process is in a different namespace",
-        namespace.name()
+        "relay forwarder requires process network namespace {}; current process is in a different namespace than {}",
+        namespace.name(),
+        target_path.display()
     )
 }
 
@@ -7537,7 +7546,7 @@ fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<
 }
 
 fn netns_path(namespace: &LinuxNetworkNamespace) -> std::path::PathBuf {
-    Path::new("/var/run/netns").join(namespace.name())
+    namespace.path()
 }
 
 #[derive(Debug)]
@@ -13648,7 +13657,7 @@ mod tests {
             Ok(()) => anyhow::bail!("unexpected successful conntrack symlink preflight"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(format!("{error:#}").contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
@@ -13667,7 +13676,7 @@ mod tests {
             Ok(()) => anyhow::bail!("unexpected successful eBPF JSONL symlink preflight"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(format!("{error:#}").contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
@@ -14390,7 +14399,7 @@ mod tests {
             Ok(_) => anyhow::bail!("unexpected successful symlinked eBPF JSONL read"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(format!("{error:#}").contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(base);
         Ok(())
@@ -15131,7 +15140,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Ok(()) => anyhow::bail!("symlinked Docker socket should fail preflight"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(format!("{error:#}").contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
@@ -16983,6 +16992,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
 
         assert!(error.to_string().contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_forwarder_process_netns_check_rejects_symlink_target() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("relay-forwarder-netns-symlink")?;
+        let target = base.join("target");
+        let link = base.join("node-a");
+        let current = base.join("current");
+        std::fs::write(&target, b"netns")?;
+        std::fs::write(&current, b"netns")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_process_in_netns_path(&namespace, &link, &current) {
+            Ok(_) => anyhow::bail!("unexpected successful relay forwarder netns check"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("must not be a symlink"));
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
