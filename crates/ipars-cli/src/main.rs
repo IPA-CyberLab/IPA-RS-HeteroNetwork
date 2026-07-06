@@ -5127,6 +5127,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if !args.agent_api_external_ips.is_empty() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-external-ip requires --expose-agent-api");
     }
+    if !args.agent_api_allow_source_cidrs.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-allow-source-cidr requires --expose-agent-api");
+    }
     if args.agent_api_health_check_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-health-check-node-port requires --expose-agent-api");
     }
@@ -5198,6 +5201,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if !args.relay_external_ips.is_empty() && !args.expose_relay {
         anyhow::bail!("--relay-external-ip requires --expose-relay");
+    }
+    if !args.relay_allow_source_cidrs.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-allow-source-cidr requires --expose-relay");
     }
     if args.relay_health_check_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-health-check-node-port requires --expose-relay");
@@ -12503,6 +12509,14 @@ mod tests {
         };
         assert!(error.contains("--agent-api-target-port requires --expose-agent-api"));
 
+        let mut inactive_agent_source_range = base_k8s_install_args();
+        inactive_agent_source_range.agent_api_allow_source_cidrs = vec!["198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(inactive_agent_source_range) {
+            Ok(_) => panic!("inactive agent API source range should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-allow-source-cidr requires --expose-agent-api"));
+
         let mut inactive_relay_type = base_k8s_install_args();
         inactive_relay_type.relay_service_type = "ClusterIP".to_string();
         let error = match k8s_install_plan(inactive_relay_type) {
@@ -12510,6 +12524,14 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-service-type requires --expose-relay"));
+
+        let mut inactive_relay_source_range = base_k8s_install_args();
+        inactive_relay_source_range.relay_allow_source_cidrs = vec!["203.0.113.0/24".parse()?];
+        let error = match k8s_install_plan(inactive_relay_source_range) {
+            Ok(_) => panic!("inactive relay source range should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-allow-source-cidr requires --expose-relay"));
 
         Ok(())
     }
