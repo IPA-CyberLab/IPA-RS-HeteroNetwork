@@ -1956,7 +1956,7 @@ pub mod api {
                 return None;
             }
             http_payload_application(payload)
-                .or_else(|| tls_client_hello_sni_application(payload))
+                .or_else(|| tls_client_hello_application(payload))
                 .or_else(|| {
                     tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
                 })
@@ -2290,7 +2290,7 @@ pub mod api {
             && matches!(payload[5], 0x01 | 0x02)
     }
 
-    fn tls_client_hello_sni_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+    fn tls_client_hello_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
         if payload.len() < 9
             || payload[0] != 0x16
             || payload[1] != 0x03
@@ -2346,6 +2346,7 @@ pub mod api {
             return None;
         }
 
+        let mut alpn_application = None;
         while offset.checked_add(4)? <= extensions_end {
             let extension_type = read_u16_be(payload, offset)?;
             let extension_len = read_u16_be(payload, offset + 2)? as usize;
@@ -2354,12 +2355,21 @@ pub mod api {
             if extension_end > extensions_end {
                 return None;
             }
-            if extension_type == 0 {
-                return tls_sni_extension_application(payload.get(offset..extension_end)?);
+            let extension = payload.get(offset..extension_end)?;
+            match extension_type {
+                0 => {
+                    if let Some(application) = tls_sni_extension_application(extension) {
+                        return Some(application);
+                    }
+                }
+                16 if alpn_application.is_none() => {
+                    alpn_application = tls_alpn_extension_application(extension);
+                }
+                _ => {}
             }
             offset = extension_end;
         }
-        None
+        alpn_application
     }
 
     fn tls_sni_extension_application(extension: &[u8]) -> Option<AgentPacketFlowApplication> {
@@ -2482,6 +2492,142 @@ pub mod api {
             return Some(AgentPacketFlowApplication::Ssh);
         }
         None
+    }
+
+    fn tls_alpn_extension_application(extension: &[u8]) -> Option<AgentPacketFlowApplication> {
+        let protocol_list_len = read_u16_be(extension, 0)? as usize;
+        let protocol_list_end = 2_usize.checked_add(protocol_list_len)?;
+        if protocol_list_end != extension.len() {
+            return None;
+        }
+
+        let mut offset = 2_usize;
+        while offset < protocol_list_end {
+            let protocol_len = *extension.get(offset)? as usize;
+            let protocol_offset = offset.checked_add(1)?;
+            let protocol_end = protocol_offset.checked_add(protocol_len)?;
+            if protocol_len == 0 || protocol_end > protocol_list_end {
+                return None;
+            }
+            if let Some(application) =
+                tls_alpn_protocol_application(extension.get(protocol_offset..protocol_end)?)
+            {
+                return Some(application);
+            }
+            offset = protocol_end;
+        }
+        None
+    }
+
+    fn tls_alpn_protocol_application(protocol: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if protocol.eq_ignore_ascii_case(b"kubernetes")
+            || protocol.eq_ignore_ascii_case(b"kube-apiserver")
+            || protocol.eq_ignore_ascii_case(b"kube-api")
+        {
+            return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if protocol.eq_ignore_ascii_case(b"etcd") {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if protocol.eq_ignore_ascii_case(b"prometheus") {
+            return Some(AgentPacketFlowApplication::Prometheus);
+        }
+        if protocol.eq_ignore_ascii_case(b"opentelemetry")
+            || protocol.eq_ignore_ascii_case(b"otel")
+            || protocol.eq_ignore_ascii_case(b"otlp")
+            || tls_alpn_protocol_has_token(protocol, b"otlp")
+        {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if protocol.eq_ignore_ascii_case(b"kafka") {
+            return Some(AgentPacketFlowApplication::Kafka);
+        }
+        if protocol.eq_ignore_ascii_case(b"nats") {
+            return Some(AgentPacketFlowApplication::Nats);
+        }
+        if protocol.eq_ignore_ascii_case(b"mqtt")
+            || protocol
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"mqttv"))
+            || tls_alpn_protocol_has_token(protocol, b"mqtt")
+            || protocol.eq_ignore_ascii_case(b"mosquitto")
+            || protocol.eq_ignore_ascii_case(b"emqx")
+        {
+            return Some(AgentPacketFlowApplication::Mqtt);
+        }
+        if protocol.eq_ignore_ascii_case(b"amqp")
+            || protocol.eq_ignore_ascii_case(b"amqp/1.0")
+            || protocol.eq_ignore_ascii_case(b"rabbitmq")
+        {
+            return Some(AgentPacketFlowApplication::Amqp);
+        }
+        if protocol.eq_ignore_ascii_case(b"cassandra") {
+            return Some(AgentPacketFlowApplication::Cassandra);
+        }
+        if protocol.eq_ignore_ascii_case(b"mongodb") || protocol.eq_ignore_ascii_case(b"mongo") {
+            return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"elasticsearch")
+            || protocol.eq_ignore_ascii_case(b"elastic")
+        {
+            return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        if protocol.eq_ignore_ascii_case(b"postgres")
+            || protocol.eq_ignore_ascii_case(b"postgresql")
+            || protocol.eq_ignore_ascii_case(b"pg")
+        {
+            return Some(AgentPacketFlowApplication::Postgres);
+        }
+        if protocol.eq_ignore_ascii_case(b"mysql") || protocol.eq_ignore_ascii_case(b"mariadb") {
+            return Some(AgentPacketFlowApplication::Mysql);
+        }
+        if protocol.eq_ignore_ascii_case(b"redis") || protocol.eq_ignore_ascii_case(b"valkey") {
+            return Some(AgentPacketFlowApplication::Redis);
+        }
+        if protocol.eq_ignore_ascii_case(b"memcached") || protocol.eq_ignore_ascii_case(b"memcache")
+        {
+            return Some(AgentPacketFlowApplication::Memcached);
+        }
+        if protocol.eq_ignore_ascii_case(b"ldap") || protocol.eq_ignore_ascii_case(b"ldaps") {
+            return Some(AgentPacketFlowApplication::Ldap);
+        }
+        if protocol.eq_ignore_ascii_case(b"smb") {
+            return Some(AgentPacketFlowApplication::Smb);
+        }
+        if protocol.eq_ignore_ascii_case(b"rdp") {
+            return Some(AgentPacketFlowApplication::Rdp);
+        }
+        if protocol.eq_ignore_ascii_case(b"ssh") {
+            return Some(AgentPacketFlowApplication::Ssh);
+        }
+        None
+    }
+
+    fn tls_alpn_protocol_has_token(protocol: &[u8], token: &[u8]) -> bool {
+        if token.is_empty() || token.len() > protocol.len() {
+            return false;
+        }
+        for offset in 0..=protocol.len() - token.len() {
+            let token_end = offset + token.len();
+            if !protocol[offset..token_end].eq_ignore_ascii_case(token) {
+                continue;
+            }
+            let previous_is_separator = offset == 0
+                || protocol
+                    .get(offset - 1)
+                    .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+            let next_is_separator = token_end == protocol.len()
+                || protocol
+                    .get(token_end)
+                    .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+            if previous_is_separator && next_is_separator {
+                return true;
+            }
+        }
+        false
     }
 
     fn tls_sni_hostname_is_valid(hostname: &[u8]) -> bool {
@@ -3545,19 +3691,46 @@ mod tests {
     #[test]
     fn packet_flow_observation_classifies_payload_prefix_application_protocol() {
         fn tls_client_hello_with_sni(name: &str) -> Vec<u8> {
-            let mut server_name = Vec::new();
-            server_name.push(0);
-            server_name.extend_from_slice(&(name.len() as u16).to_be_bytes());
-            server_name.extend_from_slice(name.as_bytes());
+            tls_client_hello(Some(name), &[])
+        }
 
-            let mut sni = Vec::new();
-            sni.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
-            sni.extend_from_slice(&server_name);
+        fn tls_client_hello_with_alpn(protocols: &[&[u8]]) -> Vec<u8> {
+            tls_client_hello(None, protocols)
+        }
 
+        fn tls_client_hello(sni_name: Option<&str>, alpn_protocols: &[&[u8]]) -> Vec<u8> {
             let mut extensions = Vec::new();
-            extensions.extend_from_slice(&0_u16.to_be_bytes());
-            extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-            extensions.extend_from_slice(&sni);
+
+            if let Some(name) = sni_name {
+                let mut server_name = Vec::new();
+                server_name.push(0);
+                server_name.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                server_name.extend_from_slice(name.as_bytes());
+
+                let mut sni = Vec::new();
+                sni.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+                sni.extend_from_slice(&server_name);
+
+                extensions.extend_from_slice(&0_u16.to_be_bytes());
+                extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&sni);
+            }
+
+            if !alpn_protocols.is_empty() {
+                let mut protocol_list = Vec::new();
+                for protocol in alpn_protocols {
+                    protocol_list.push(protocol.len() as u8);
+                    protocol_list.extend_from_slice(protocol);
+                }
+
+                let mut alpn = Vec::new();
+                alpn.extend_from_slice(&(protocol_list.len() as u16).to_be_bytes());
+                alpn.extend_from_slice(&protocol_list);
+
+                extensions.extend_from_slice(&16_u16.to_be_bytes());
+                extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&alpn);
+            }
 
             let mut body = Vec::new();
             body.extend_from_slice(&[0x03, 0x03]);
@@ -3802,6 +3975,75 @@ mod tests {
                 .application(),
             api::AgentPacketFlowApplication::Https
         );
+        for (protocols, expected) in [
+            (
+                &[b"grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Grpc,
+            ),
+            (
+                &[b"otlp-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::OpenTelemetry,
+            ),
+            (
+                &[b"kafka".as_slice()][..],
+                api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                &[b"nats".as_slice()][..],
+                api::AgentPacketFlowApplication::Nats,
+            ),
+            (
+                &[b"x-amzn-mqtt-ca".as_slice()][..],
+                api::AgentPacketFlowApplication::Mqtt,
+            ),
+            (
+                &[b"amqp/1.0".as_slice()][..],
+                api::AgentPacketFlowApplication::Amqp,
+            ),
+            (
+                &[b"postgresql".as_slice()][..],
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                &[b"valkey".as_slice()][..],
+                api::AgentPacketFlowApplication::Redis,
+            ),
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_alpn(protocols)).application(),
+                expected
+            );
+        }
+        assert_eq!(
+            observation_for_payload(&tls_client_hello(
+                Some("kafka-broker.messaging.svc"),
+                &[b"mqtt".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello(
+                Some("api.example.com"),
+                &[b"amqp".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"h2".as_slice()])).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        for protocols in [
+            &[b"notlp".as_slice()][..],
+            &[b"amqtt".as_slice()][..],
+            &[b"h2".as_slice(), b"http/1.1".as_slice()][..],
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_alpn(protocols)).application(),
+                api::AgentPacketFlowApplication::Https
+            );
+        }
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("api.example.com")).application(),
             api::AgentPacketFlowApplication::Https
