@@ -2728,6 +2728,11 @@ pub mod api {
         Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize)
     }
 
+    fn read_u32_be(payload: &[u8], offset: usize) -> Option<u32> {
+        let bytes = payload.get(offset..offset.checked_add(4)?)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     fn quic_long_header_payload(payload: &[u8]) -> bool {
         if payload.len() < 7 || payload[0] & 0xc0 != 0xc0 {
             return false;
@@ -2845,12 +2850,108 @@ pub mod api {
     }
 
     fn postgres_payload(payload: &[u8]) -> bool {
+        postgres_startup_payload(payload) || postgres_frontend_message_payload(payload)
+    }
+
+    fn postgres_startup_payload(payload: &[u8]) -> bool {
         if payload.len() < 8 {
             return false;
         }
         let length = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         (8..=10_000).contains(&length) && matches!(code, 196_608 | 80_877_102 | 80_877_103)
+    }
+
+    fn postgres_frontend_message_payload(payload: &[u8]) -> bool {
+        if payload.len() < 5 {
+            return false;
+        }
+        let Some(length) = read_u32_be(payload, 1).map(|length| length as usize) else {
+            return false;
+        };
+        if !(4..=10_000).contains(&length) {
+            return false;
+        }
+        let Some(frame_end) = 1_usize.checked_add(length) else {
+            return false;
+        };
+        let Some(frame) = payload.get(..frame_end) else {
+            return false;
+        };
+        let body = &frame[5..];
+        match payload[0] {
+            b'Q' => postgres_query_message_payload(body),
+            b'P' => postgres_parse_message_payload(body),
+            b'B' => postgres_bind_message_payload(body),
+            b'C' | b'D' => postgres_named_portal_or_statement_payload(body),
+            b'E' => postgres_execute_message_payload(body),
+            b'p' => postgres_password_message_payload(body),
+            b'H' | b'S' | b'X' => body.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn postgres_query_message_payload(body: &[u8]) -> bool {
+        body.len() >= 2 && body.last() == Some(&0) && postgres_nonempty_cstring(body, 0)
+    }
+
+    fn postgres_parse_message_payload(body: &[u8]) -> bool {
+        let Some(after_statement_name) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        let Some(after_query) = postgres_cstring_end(body, after_statement_name) else {
+            return false;
+        };
+        if after_query <= after_statement_name + 1 {
+            return false;
+        }
+        let Some(parameter_count) = read_u16_be(body, after_query).map(|count| count as usize)
+        else {
+            return false;
+        };
+        after_query
+            .checked_add(2)
+            .and_then(|offset| offset.checked_add(parameter_count.checked_mul(4)?))
+            == Some(body.len())
+    }
+
+    fn postgres_bind_message_payload(body: &[u8]) -> bool {
+        let Some(after_portal) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        let Some(after_statement) = postgres_cstring_end(body, after_portal) else {
+            return false;
+        };
+        body.get(after_statement..after_statement.saturating_add(2))
+            .is_some()
+    }
+
+    fn postgres_named_portal_or_statement_payload(body: &[u8]) -> bool {
+        let Some((&kind, name)) = body.split_first() else {
+            return false;
+        };
+        matches!(kind, b'P' | b'S') && postgres_cstring_end(name, 0) == Some(name.len())
+    }
+
+    fn postgres_execute_message_payload(body: &[u8]) -> bool {
+        let Some(after_portal) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        after_portal.checked_add(4) == Some(body.len())
+    }
+
+    fn postgres_password_message_payload(body: &[u8]) -> bool {
+        postgres_nonempty_cstring(body, 0)
+    }
+
+    fn postgres_nonempty_cstring(payload: &[u8], offset: usize) -> bool {
+        postgres_cstring_end(payload, offset).is_some_and(|end| end > offset + 1)
+    }
+
+    fn postgres_cstring_end(payload: &[u8], offset: usize) -> Option<usize> {
+        let tail = payload.get(offset..)?;
+        let terminator = tail.iter().position(|byte| *byte == 0)?;
+        Some(offset + terminator + 1)
     }
 
     fn mysql_payload(payload: &[u8]) -> bool {
@@ -3994,6 +4095,14 @@ mod tests {
             payload
         }
 
+        fn postgres_frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut payload = vec![tag];
+            let length = (body.len() as u32) + 4;
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(body);
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             payload_prefix: payload.to_vec(),
@@ -4360,6 +4469,31 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1\0")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let mut parse_body = Vec::new();
+        parse_body.push(0);
+        parse_body.extend_from_slice(b"SELECT $1\0");
+        parse_body.extend_from_slice(&1_u16.to_be_bytes());
+        parse_body.extend_from_slice(&23_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'P', &parse_body)).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'D', b"Sprepared\0")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'S', b"")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1")).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[0x4a, 0, 0, 0, 10, b'8', b'.', b'0']).application(),
