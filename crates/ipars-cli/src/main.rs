@@ -2687,7 +2687,7 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
         "docker_socket=/var/run/docker.sock".to_string()
     };
     format!(
-        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
     )
 }
 
@@ -6534,7 +6534,8 @@ mod tests {
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
             None
         );
-        assert!(plan.commands[0].contains("test -S"));
+        assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
+        assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
         assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
         assert!(plan.commands[0].contains("XDG_RUNTIME_DIR"));
         assert!(plan.commands[0].contains("docker --host"));
@@ -6623,6 +6624,8 @@ mod tests {
         );
         assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
         assert!(plan.commands[0].contains("/run/user/1000/docker.sock"));
+        assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
+        assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
         assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
         Ok(())
     }
