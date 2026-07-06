@@ -119,6 +119,7 @@ const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
@@ -1579,13 +1580,15 @@ fn validate_usable_socket_endpoint(endpoint: SocketAddr, label: &str) -> anyhow:
 }
 
 fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
-    validate_positive_seconds(
+    validate_bounded_u64(
         args.userspace_wireguard_ready_timeout_seconds,
         "--userspace-wireguard-ready-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
     )?;
-    validate_positive_seconds(
+    validate_bounded_u64(
         args.userspace_wireguard_shutdown_timeout_seconds,
         "--userspace-wireguard-shutdown-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
     )?;
 
     let has_userspace_process_config =
@@ -17171,6 +17174,24 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                     "1048577",
                 ],
                 "--runtime-command-output-max-bytes must not exceed 1048576",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--userspace-wireguard-ready-timeout-seconds",
+                    "3601",
+                ],
+                "--userspace-wireguard-ready-timeout-seconds must not exceed 3600",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--userspace-wireguard-shutdown-timeout-seconds",
+                    "3601",
+                ],
+                "--userspace-wireguard-shutdown-timeout-seconds must not exceed 3600",
             ),
             (
                 vec![

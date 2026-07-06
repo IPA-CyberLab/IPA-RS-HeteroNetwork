@@ -27,6 +27,7 @@ const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
 const MAX_JOIN_TOKEN_TAGS: usize = 64;
 const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
 const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -2789,13 +2790,15 @@ fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
 }
 
 fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
-    validate_positive_docker_seconds(
+    validate_bounded_docker_seconds(
         args.userspace_wireguard_ready_timeout_seconds,
         "--userspace-wireguard-ready-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
     )?;
-    validate_positive_docker_seconds(
+    validate_bounded_docker_seconds(
         args.userspace_wireguard_shutdown_timeout_seconds,
         "--userspace-wireguard-shutdown-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
     )?;
     if !args.userspace_wireguard_args.is_empty() && args.userspace_wireguard_command.is_none() {
         anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
@@ -2819,9 +2822,12 @@ fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow:
     Ok(())
 }
 
-fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
+fn validate_bounded_docker_seconds(value: u64, label: &str, max: u64) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{label} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{label} must not exceed {max}");
     }
     Ok(())
 }
@@ -6548,6 +6554,54 @@ mod tests {
         assert!(invalid_shutdown_timeout
             .to_string()
             .contains("--userspace-wireguard-shutdown-timeout-seconds"));
+
+        let oversized_ready_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 3601,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+        }) {
+            Ok(_) => {
+                anyhow::bail!("oversized userspace WireGuard ready timeout should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(oversized_ready_timeout
+            .to_string()
+            .contains("--userspace-wireguard-ready-timeout-seconds must not exceed 3600"));
+
+        let oversized_shutdown_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 3601,
+        }) {
+            Ok(_) => {
+                anyhow::bail!("oversized userspace WireGuard shutdown timeout should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(oversized_shutdown_timeout
+            .to_string()
+            .contains("--userspace-wireguard-shutdown-timeout-seconds must not exceed 3600"));
         Ok(())
     }
 
