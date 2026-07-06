@@ -3581,14 +3581,208 @@ pub mod api {
         let version = version_byte & 0x7f;
         let flags = payload[1];
         let opcode = payload[4];
-        let body_len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
-        let valid_opcode = matches!(opcode, 0x00 | 0x01 | 0x02 | 0x03 | 0x05..=0x10);
+        let body_len =
+            u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+        let body_prefix = &payload[9..];
 
-        matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
-            && (3..=5).contains(&version)
-            && flags & !0x1f == 0
-            && valid_opcode
-            && body_len <= 16_777_216
+        if !matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
+            || !(3..=5).contains(&version)
+            || flags & !0x1f != 0
+            || body_len > 16_777_216
+        {
+            return false;
+        }
+
+        let is_response = version_byte & 0x80 != 0;
+        if is_response {
+            cassandra_response_body(opcode, body_len, body_prefix)
+        } else {
+            cassandra_request_body(opcode, body_len, body_prefix)
+        }
+    }
+
+    fn cassandra_request_body(opcode: u8, body_len: usize, body_prefix: &[u8]) -> bool {
+        match opcode {
+            0x01 => cassandra_startup_body(body_len, body_prefix),
+            0x05 => body_len == 0,
+            0x07 => cassandra_cql_query_body(body_len, body_prefix, true),
+            0x09 => cassandra_cql_query_body(body_len, body_prefix, false),
+            0x0a => cassandra_execute_body(body_len, body_prefix),
+            0x0b => cassandra_string_list_body(body_len, body_prefix),
+            0x0d => body_len >= 6 && body_prefix.len() >= 6,
+            0x0f => body_len >= 4 && body_prefix.len() >= 4,
+            _ => false,
+        }
+    }
+
+    fn cassandra_response_body(opcode: u8, body_len: usize, body_prefix: &[u8]) -> bool {
+        match opcode {
+            0x00 => body_len >= 8 && body_prefix.len() >= 8,
+            0x02 => body_len == 0,
+            0x03 => cassandra_string_body(body_len, body_prefix),
+            0x06 => body_len >= 2 && body_prefix.len() >= 2,
+            0x08 => body_len >= 4 && body_prefix.len() >= 4,
+            0x0c => cassandra_string_prefix_body(body_len, body_prefix),
+            0x0e | 0x10 => body_len >= 4 && body_prefix.len() >= 4,
+            _ => false,
+        }
+    }
+
+    fn cassandra_startup_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 64 {
+            return false;
+        }
+
+        let mut offset = 2;
+        let mut has_cql_version = false;
+        for _ in 0..count {
+            let Some((key, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            let Some((value, next_offset)) = cassandra_string_field(body_prefix, next_offset)
+            else {
+                return false;
+            };
+            has_cql_version |= key.eq_ignore_ascii_case(b"CQL_VERSION") && value.starts_with(b"3.");
+            offset = next_offset;
+        }
+        offset == body_len && has_cql_version
+    }
+
+    fn cassandra_cql_query_body(
+        body_len: usize,
+        body_prefix: &[u8],
+        has_consistency: bool,
+    ) -> bool {
+        if body_len < 5 || body_prefix.len() < 4 {
+            return false;
+        }
+        let Some(query_len) = read_u32_be(body_prefix, 0).map(|len| len as usize) else {
+            return false;
+        };
+        if query_len == 0 || query_len > 1_048_576 {
+            return false;
+        }
+        let Some(query_end) = 4_usize.checked_add(query_len) else {
+            return false;
+        };
+        let required_len = if has_consistency {
+            query_end.checked_add(3)
+        } else {
+            Some(query_end)
+        };
+        let Some(required_len) = required_len else {
+            return false;
+        };
+        if body_len < required_len || body_prefix.len() < required_len {
+            return false;
+        }
+        if !has_consistency && body_len != required_len {
+            return false;
+        }
+        let query = trim_ascii_space(&body_prefix[4..query_end]);
+        cassandra_cql_statement(query)
+    }
+
+    fn cassandra_cql_statement(query: &[u8]) -> bool {
+        let keywords: [&[u8]; 17] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"BEGIN",
+            b"APPLY",
+            b"USE",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"GRANT",
+            b"REVOKE",
+            b"LIST",
+            b"DESCRIBE",
+            b"DESC",
+            b"UNLOGGED",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_ascii_keyword(query, keyword))
+    }
+
+    fn cassandra_execute_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < 2 {
+            return false;
+        }
+        let Some(prepared_id_len) = read_u16_be(body_prefix, 0).map(|len| len as usize) else {
+            return false;
+        };
+        if prepared_id_len == 0 || prepared_id_len > 65_535 {
+            return false;
+        }
+        let Some(required_len) = 2_usize
+            .checked_add(prepared_id_len)
+            .and_then(|len| len.checked_add(3))
+        else {
+            return false;
+        };
+        body_len >= required_len && body_prefix.len() >= required_len
+    }
+
+    fn cassandra_string_list_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 64 {
+            return false;
+        }
+        let mut offset = 2;
+        for _ in 0..count {
+            let Some((_value, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == body_len
+    }
+
+    fn cassandra_string_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_string_field(body_prefix, 0).is_some_and(|(_value, offset)| offset == body_len)
+    }
+
+    fn cassandra_string_prefix_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_string_field(body_prefix, 0).is_some_and(|(_value, offset)| offset <= body_len)
+    }
+
+    fn cassandra_string_field(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        let len = read_u16_be(payload, offset)? as usize;
+        if len == 0 || len > 4096 {
+            return None;
+        }
+        let value_start = offset.checked_add(2)?;
+        let value_end = value_start.checked_add(len)?;
+        let value = payload.get(value_start..value_end)?;
+        if !value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        {
+            return None;
+        }
+        Some((value, value_end))
     }
 
     fn mongodb_payload(payload: &[u8]) -> bool {
@@ -5138,8 +5332,28 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
-            observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x07, 0, 0, 0, 15, 0, 0, 0, 8, b'S', b'E', b'L', b'E', b'C', b'T',
+                b' ', b'1', 0, 1, 0,
+            ])
+            .application(),
             api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x01, 0, 0, 0, 22, 0, 1, 0, 11, b'C', b'Q', b'L', b'_', b'V', b'E',
+                b'R', b'S', b'I', b'O', b'N', 0, 5, b'3', b'.', b'0', b'.', b'0',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0xe0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
@@ -5147,6 +5361,14 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x04, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x07, 0, 0, 0, 13, 0, 0, 0, 6, b'n', b'o', b't', b'c', b'q', b'l',
+                0, 1, 0,
+            ])
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
