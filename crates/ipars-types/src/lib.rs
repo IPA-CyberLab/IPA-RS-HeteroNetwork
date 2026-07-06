@@ -3843,25 +3843,92 @@ pub mod api {
     }
 
     fn memcached_text_payload(payload: &[u8]) -> bool {
-        let line_end = payload
-            .iter()
-            .position(|byte| matches!(*byte, b'\r' | b'\n'))
-            .unwrap_or(payload.len());
-        let fields = payload[..line_end]
+        let mut offset = 0_usize;
+        let mut command_count = 0_usize;
+        while offset < payload.len() {
+            match memcached_text_command(payload, offset) {
+                Some(MemcachedTextCommandParse::Complete(next_offset)) => {
+                    command_count += 1;
+                    if command_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MemcachedTextCommandParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        command_count > 0
+    }
+
+    enum MemcachedTextCommandParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum MemcachedTextCommandKind {
+        Storage { bytes: usize },
+        Line,
+    }
+
+    fn memcached_text_command(payload: &[u8], offset: usize) -> Option<MemcachedTextCommandParse> {
+        let tail = payload.get(offset..)?;
+        let line_delimiter = tail.iter().position(|byte| matches!(*byte, b'\r' | b'\n'));
+        let (line, line_end) = match line_delimiter {
+            Some(index) if tail.get(index) == Some(&b'\r') => {
+                if tail.get(index + 1).is_none() {
+                    return Some(MemcachedTextCommandParse::Incomplete);
+                }
+                if tail.get(index + 1) != Some(&b'\n') {
+                    return None;
+                }
+                (tail.get(..index)?, Some(offset + index + 2))
+            }
+            Some(_) => return None,
+            None => (tail, None),
+        };
+        let fields = line
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
             .collect::<Vec<_>>();
-        let Some(command) = fields.first() else {
-            return false;
+        let command = memcached_text_command_kind(&fields)?;
+        let Some(line_end) = line_end else {
+            return Some(MemcachedTextCommandParse::Incomplete);
         };
+        match command {
+            MemcachedTextCommandKind::Line => Some(MemcachedTextCommandParse::Complete(line_end)),
+            MemcachedTextCommandKind::Storage { bytes } => {
+                let data_end = line_end.checked_add(bytes)?;
+                let frame_end = data_end.checked_add(2)?;
+                if payload.len() < data_end {
+                    return Some(MemcachedTextCommandParse::Incomplete);
+                }
+                if payload.len() < frame_end {
+                    return match payload.get(data_end..) {
+                        Some(b"") | Some(b"\r") => Some(MemcachedTextCommandParse::Incomplete),
+                        _ => None,
+                    };
+                }
+                if payload.get(data_end..frame_end)? != b"\r\n" {
+                    return None;
+                }
+                Some(MemcachedTextCommandParse::Complete(frame_end))
+            }
+        }
+    }
+
+    fn memcached_text_command_kind(fields: &[&[u8]]) -> Option<MemcachedTextCommandKind> {
+        let command = *fields.first()?;
 
         if command.eq_ignore_ascii_case(b"get") || command.eq_ignore_ascii_case(b"gets") {
-            return fields.len() >= 2 && fields[1..].iter().all(|field| memcached_key(field));
+            return (fields.len() >= 2 && fields[1..].iter().all(|field| memcached_key(field)))
+                .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"gat") || command.eq_ignore_ascii_case(b"gats") {
-            return fields.len() >= 3
+            return (fields.len() >= 3
                 && memcached_decimal(fields[1])
-                && fields[2..].iter().all(|field| memcached_key(field));
+                && fields[2..].iter().all(|field| memcached_key(field)))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"set")
             || command.eq_ignore_ascii_case(b"add")
@@ -3869,78 +3936,88 @@ pub mod api {
             || command.eq_ignore_ascii_case(b"append")
             || command.eq_ignore_ascii_case(b"prepend")
         {
-            return memcached_storage_fields(&fields, false);
+            return memcached_storage_fields(fields, false)
+                .map(|bytes| MemcachedTextCommandKind::Storage { bytes });
         }
         if command.eq_ignore_ascii_case(b"cas") {
-            return memcached_storage_fields(&fields, true);
+            return memcached_storage_fields(fields, true)
+                .map(|bytes| MemcachedTextCommandKind::Storage { bytes });
         }
         if command.eq_ignore_ascii_case(b"delete") {
-            return fields.len() == 2 && memcached_key(fields[1])
+            return (fields.len() == 2 && memcached_key(fields[1])
                 || fields.len() == 3
                     && memcached_key(fields[1])
-                    && fields[2].eq_ignore_ascii_case(b"noreply");
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"incr") || command.eq_ignore_ascii_case(b"decr") {
-            return fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+            return (fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
                 || fields.len() == 4
                     && memcached_key(fields[1])
                     && memcached_decimal(fields[2])
-                    && fields[3].eq_ignore_ascii_case(b"noreply");
+                    && fields[3].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"touch") {
-            return fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+            return (fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
                 || fields.len() == 4
                     && memcached_key(fields[1])
                     && memcached_decimal(fields[2])
-                    && fields[3].eq_ignore_ascii_case(b"noreply");
+                    && fields[3].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"stats") {
-            return fields.len() <= 4
+            return (fields.len() <= 4
                 && fields
                     .iter()
                     .skip(1)
-                    .all(|field| memcached_ascii_argument(field));
+                    .all(|field| memcached_ascii_argument(field)))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"version") {
-            return fields.len() == 1;
+            return (fields.len() == 1).then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"flush_all") {
-            return fields.len() == 1
+            return (fields.len() == 1
                 || fields.len() == 2
                     && (memcached_decimal(fields[1])
                         || fields[1].eq_ignore_ascii_case(b"noreply"))
                 || fields.len() == 3
                     && memcached_decimal(fields[1])
-                    && fields[2].eq_ignore_ascii_case(b"noreply");
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"verbosity") {
-            return fields.len() == 2 && memcached_decimal(fields[1])
+            return (fields.len() == 2 && memcached_decimal(fields[1])
                 || fields.len() == 3
                     && memcached_decimal(fields[1])
-                    && fields[2].eq_ignore_ascii_case(b"noreply");
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"quit") {
-            return fields.len() == 1
-                || fields.len() == 2 && fields[1].eq_ignore_ascii_case(b"noreply");
+            return (fields.len() == 1
+                || fields.len() == 2 && fields[1].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"slabs") {
-            return memcached_slabs_fields(&fields);
+            return memcached_slabs_fields(fields).then_some(MemcachedTextCommandKind::Line);
         }
-        false
+        None
     }
 
-    fn memcached_storage_fields(fields: &[&[u8]], includes_cas: bool) -> bool {
+    fn memcached_storage_fields(fields: &[&[u8]], includes_cas: bool) -> Option<usize> {
         let required = if includes_cas { 6 } else { 5 };
         if fields.len() != required
             && !(fields.len() == required + 1 && fields[required].eq_ignore_ascii_case(b"noreply"))
         {
-            return false;
+            return None;
         }
-        memcached_key(fields[1])
+        let bytes = memcached_decimal_value(fields[4], 1_048_576)?;
+        (memcached_key(fields[1])
             && memcached_decimal(fields[2])
             && memcached_decimal(fields[3])
-            && memcached_decimal(fields[4])
-            && (!includes_cas || memcached_decimal(fields[5]))
+            && (!includes_cas || memcached_decimal(fields[5])))
+        .then_some(bytes)
     }
 
     fn memcached_slabs_fields(fields: &[&[u8]]) -> bool {
@@ -3970,6 +4047,24 @@ pub mod api {
         !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
     }
 
+    fn memcached_decimal_value(field: &[u8], max: usize) -> Option<usize> {
+        if field.is_empty() || field.len() > 20 {
+            return None;
+        }
+        let mut value = 0_usize;
+        for byte in field {
+            let digit = byte.checked_sub(b'0')?;
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(digit as usize)?;
+            if value > max {
+                return None;
+            }
+        }
+        Some(value)
+    }
+
     fn memcached_ascii_argument(field: &[u8]) -> bool {
         !field.is_empty()
             && field.iter().all(|byte| {
@@ -3978,18 +4073,89 @@ pub mod api {
     }
 
     fn memcached_binary_payload(payload: &[u8]) -> bool {
-        if payload.len() < 24 || !matches!(payload[0], 0x80 | 0x81) {
-            return false;
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            match memcached_binary_packet(payload, offset) {
+                Some(MemcachedBinaryPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MemcachedBinaryPacketParse::Incomplete) => return true,
+                None => return false,
+            }
         }
-        let opcode = payload[1];
-        let key_len = u16::from_be_bytes([payload[2], payload[3]]) as u32;
-        let extras_len = payload[4] as u32;
-        let data_type = payload[5];
-        let total_body_len = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
-        data_type == 0
-            && opcode <= 0x22
-            && key_len.saturating_add(extras_len) <= total_body_len
-            && total_body_len <= 1_048_576
+        packet_count > 0
+    }
+
+    enum MemcachedBinaryPacketParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn memcached_binary_packet(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<MemcachedBinaryPacketParse> {
+        let header = payload.get(offset..offset.checked_add(24)?)?;
+        let magic = header[0];
+        if !matches!(magic, 0x80 | 0x81) {
+            return None;
+        }
+        let opcode = header[1];
+        let key_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let extras_len = header[4] as usize;
+        let data_type = header[5];
+        let total_body_len =
+            u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let frame_end = offset.checked_add(24)?.checked_add(total_body_len)?;
+        if data_type != 0
+            || total_body_len > 1_048_576
+            || key_len > 250
+            || extras_len > 32
+            || key_len.checked_add(extras_len)? > total_body_len
+            || !memcached_binary_opcode_shape(magic, opcode, key_len, extras_len, total_body_len)
+        {
+            return None;
+        }
+        if payload.len() < frame_end {
+            Some(MemcachedBinaryPacketParse::Incomplete)
+        } else {
+            Some(MemcachedBinaryPacketParse::Complete(frame_end))
+        }
+    }
+
+    fn memcached_binary_opcode_shape(
+        magic: u8,
+        opcode: u8,
+        key_len: usize,
+        extras_len: usize,
+        total_body_len: usize,
+    ) -> bool {
+        if magic == 0x81 {
+            return opcode <= 0x22;
+        }
+        match opcode {
+            0x00 | 0x09 | 0x0c | 0x0d => {
+                extras_len == 0 && key_len > 0 && total_body_len == key_len
+            }
+            0x01..=0x03 => extras_len == 8 && key_len > 0 && total_body_len >= extras_len + key_len,
+            0x04 => extras_len == 0 && key_len > 0 && total_body_len == key_len,
+            0x05 | 0x06 => {
+                extras_len == 20 && key_len > 0 && total_body_len == extras_len + key_len
+            }
+            0x07 | 0x0a | 0x0b => extras_len == 0 && key_len == 0 && total_body_len == 0,
+            0x08 => key_len == 0 && matches!(extras_len, 0 | 4) && total_body_len == extras_len,
+            0x0e | 0x0f => extras_len == 0 && key_len > 0 && total_body_len >= key_len,
+            0x10 => extras_len == 0 && total_body_len == key_len,
+            0x1c..=0x1e => extras_len == 4 && key_len > 0 && total_body_len == extras_len + key_len,
+            0x20 => extras_len == 0 && key_len == 0 && total_body_len == 0,
+            0x21 | 0x22 => extras_len == 0 && key_len > 0 && total_body_len >= key_len,
+            _ => false,
+        }
     }
 
     fn kafka_payload(payload: &[u8]) -> bool {
@@ -6212,6 +6378,29 @@ mod tests {
             mysql_packet(0, &body)
         }
 
+        fn memcached_binary_request(
+            opcode: u8,
+            key: &[u8],
+            extras: &[u8],
+            value: &[u8],
+        ) -> Vec<u8> {
+            let total_body_len = extras.len() + key.len() + value.len();
+            let mut payload = Vec::with_capacity(24 + total_body_len);
+            payload.push(0x80);
+            payload.push(opcode);
+            payload.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            payload.push(extras.len() as u8);
+            payload.push(0);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&(total_body_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(extras);
+            payload.extend_from_slice(key);
+            payload.extend_from_slice(value);
+            payload
+        }
+
         fn mqtt_connect_packet(
             protocol_level: u8,
             connect_flags: u8,
@@ -7092,7 +7281,24 @@ mod tests {
             api::AgentPacketFlowApplication::Memcached
         );
         assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nval").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\nget another-key\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
             observation_for_payload(b"get cache-key another-key\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"get cache-key\r\ngets another-key\r\n").application(),
             api::AgentPacketFlowApplication::Memcached
         );
         assert_eq!(
@@ -7121,12 +7327,49 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
-            observation_for_payload(&[
-                0x80, 0x00, 0x00, 0x03, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0,
-                b'k', b'e', b'y',
-            ])
+            observation_for_payload(b"get cache-key\r\njunk").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalueX\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 1048577\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(0x00, b"key", b"", b""))
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(
+                0x01,
+                b"key",
+                &[0, 0, 0, 0, 0, 0, 0, 60],
+                b"val"
+            ))
             .application(),
             api::AgentPacketFlowApplication::Memcached
+        );
+        let mut partial_memcached_binary =
+            memcached_binary_request(0x01, b"key", &[0, 0, 0, 0, 0, 0, 0, 60], b"value");
+        partial_memcached_binary.truncate(24 + 8 + 3);
+        assert_eq!(
+            observation_for_payload(&partial_memcached_binary).application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        let mut memcached_binary_with_trailing = memcached_binary_request(0x00, b"key", b"", b"");
+        memcached_binary_with_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&memcached_binary_with_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(0x00, b"key", &[0, 0, 0, 0], b""))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
