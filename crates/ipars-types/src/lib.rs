@@ -4601,6 +4601,7 @@ pub mod api {
 
         match opcode {
             1 => mongodb_op_reply_payload(payload, message_len),
+            2012 => mongodb_op_compressed_payload(payload, message_len),
             2001 => mongodb_op_update_payload(payload, message_len),
             2002 => mongodb_op_insert_payload(payload, message_len),
             2004 => mongodb_op_query_payload(payload, message_len),
@@ -4628,7 +4629,38 @@ pub mod api {
         if number_returned == 0 {
             return message_len == 36;
         }
-        mongodb_bson_document_prefix(payload, 36, message_len).is_some()
+        let min_documents = if mongodb_full_message_observed(payload, message_len) {
+            number_returned
+        } else {
+            1
+        };
+        mongodb_bson_document_sequence(
+            payload,
+            36,
+            message_len,
+            min_documents,
+            Some(number_returned),
+        )
+    }
+
+    fn mongodb_op_compressed_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 25 || payload.len() < 25 {
+            return false;
+        }
+        let Some(original_opcode) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        let Some(uncompressed_size) = read_u32_le(payload, 20).map(|size| size as usize) else {
+            return false;
+        };
+        let Some(compressor_id) = payload.get(24) else {
+            return false;
+        };
+        mongodb_wire_opcode(original_opcode)
+            && original_opcode != 2012
+            && uncompressed_size <= 100_000_000
+            && matches!(*compressor_id, 0..=3)
+            && (!mongodb_full_message_observed(payload, message_len) || message_len > 25)
     }
 
     fn mongodb_op_update_payload(payload: &[u8], message_len: usize) -> bool {
@@ -4646,12 +4678,7 @@ pub mod api {
             return false;
         }
         let selector_offset = flags_offset + 4;
-        let Some(update_offset) =
-            mongodb_bson_document_prefix(payload, selector_offset, message_len)
-        else {
-            return false;
-        };
-        mongodb_bson_document_prefix(payload, update_offset, message_len).is_some()
+        mongodb_bson_document_sequence(payload, selector_offset, message_len, 2, Some(2))
     }
 
     fn mongodb_op_insert_payload(payload: &[u8], message_len: usize) -> bool {
@@ -4667,7 +4694,7 @@ pub mod api {
         };
         flags & !0x01 == 0
             && mongodb_collection_namespace(namespace)
-            && mongodb_bson_document_prefix(payload, document_offset, message_len).is_some()
+            && mongodb_bson_document_sequence(payload, document_offset, message_len, 1, None)
     }
 
     fn mongodb_op_query_payload(payload: &[u8], message_len: usize) -> bool {
@@ -4687,7 +4714,7 @@ pub mod api {
             && mongodb_collection_namespace(namespace)
             && query_offset <= message_len
             && payload.len() >= skip_offset.saturating_add(8)
-            && mongodb_bson_document_prefix(payload, query_offset, message_len).is_some()
+            && mongodb_bson_document_sequence(payload, query_offset, message_len, 1, Some(2))
     }
 
     fn mongodb_op_get_more_payload(payload: &[u8], message_len: usize) -> bool {
@@ -4719,7 +4746,7 @@ pub mod api {
         let selector_offset = flags_offset + 4;
         flags & !0x01 == 0
             && mongodb_collection_namespace(namespace)
-            && mongodb_bson_document_prefix(payload, selector_offset, message_len).is_some()
+            && mongodb_bson_document_sequence(payload, selector_offset, message_len, 1, Some(1))
     }
 
     fn mongodb_op_kill_cursors_payload(payload: &[u8], message_len: usize) -> bool {
@@ -4748,7 +4775,7 @@ pub mod api {
         let Some(flags) = read_u32_le(payload, 16) else {
             return false;
         };
-        if flags & !0x0001_0003 != 0 {
+        if flags & 0x0000_fffc != 0 {
             return false;
         }
         let checksum_len = if flags & 0x0000_0001 != 0 { 4 } else { 0 };
@@ -4758,7 +4785,26 @@ pub mod api {
         if section_limit <= 20 {
             return false;
         }
-        mongodb_op_msg_section(payload, 20, section_limit).is_some()
+        mongodb_op_msg_sections(payload, 20, section_limit)
+    }
+
+    fn mongodb_op_msg_sections(payload: &[u8], mut offset: usize, section_limit: usize) -> bool {
+        let full_message = mongodb_full_message_observed(payload, section_limit);
+        let mut section_count = 0_usize;
+        while offset < section_limit {
+            let Some(next_offset) = mongodb_op_msg_section(payload, offset, section_limit) else {
+                return false;
+            };
+            section_count += 1;
+            if next_offset > payload.len() {
+                return !full_message;
+            }
+            offset = next_offset;
+            if !full_message && offset >= payload.len() {
+                return true;
+            }
+        }
+        section_count > 0 && offset == section_limit
     }
 
     fn mongodb_op_msg_section(
@@ -4771,7 +4817,7 @@ pub mod api {
             0 => mongodb_bson_document_prefix(payload, offset.checked_add(1)?, section_limit),
             1 => {
                 let section_size = read_u32_le(payload, offset.checked_add(1)?)? as usize;
-                if !(10..=16_777_216).contains(&section_size) {
+                if !(6..=16_777_216).contains(&section_size) {
                     return None;
                 }
                 let section_body_offset = offset.checked_add(5)?;
@@ -4784,7 +4830,8 @@ pub mod api {
                 if !mongodb_sequence_identifier(identifier) {
                     return None;
                 }
-                mongodb_bson_document_prefix(payload, document_offset, section_end)?;
+                mongodb_bson_document_sequence(payload, document_offset, section_end, 0, None)
+                    .then_some(())?;
                 Some(section_end)
             }
             _ => None,
@@ -4810,6 +4857,45 @@ pub mod api {
         Some(document_end)
     }
 
+    fn mongodb_bson_document_sequence(
+        payload: &[u8],
+        mut offset: usize,
+        message_len: usize,
+        min_documents: usize,
+        max_documents: Option<usize>,
+    ) -> bool {
+        if offset > message_len {
+            return false;
+        }
+        let full_message = mongodb_full_message_observed(payload, message_len);
+        let mut document_count = 0_usize;
+        while offset < message_len {
+            if !full_message && payload.len().saturating_sub(offset) < 4 {
+                return document_count >= min_documents
+                    && max_documents.is_none_or(|max| document_count <= max);
+            }
+            if max_documents.is_some_and(|max| document_count >= max) {
+                return false;
+            }
+            let Some(next_offset) = mongodb_bson_document_prefix(payload, offset, message_len)
+            else {
+                return false;
+            };
+            document_count += 1;
+            if next_offset > payload.len() {
+                return !full_message && document_count >= min_documents;
+            }
+            offset = next_offset;
+            if !full_message && offset >= payload.len() {
+                return document_count >= min_documents
+                    && max_documents.is_none_or(|max| document_count <= max);
+            }
+        }
+        document_count >= min_documents
+            && max_documents.is_none_or(|max| document_count <= max)
+            && offset == message_len
+    }
+
     fn mongodb_cstring_field(
         payload: &[u8],
         offset: usize,
@@ -4830,6 +4916,17 @@ pub mod api {
             && namespace.contains(&b'.')
             && !namespace.starts_with(b".")
             && !namespace.ends_with(b".")
+    }
+
+    fn mongodb_wire_opcode(opcode: u32) -> bool {
+        matches!(
+            opcode,
+            1 | 2001 | 2002 | 2004 | 2005 | 2006 | 2007 | 2012 | 2013
+        )
+    }
+
+    fn mongodb_full_message_observed(payload: &[u8], message_len: usize) -> bool {
+        payload.len() >= message_len
     }
 
     fn mongodb_sequence_identifier(identifier: &[u8]) -> bool {
@@ -6968,6 +7065,30 @@ mod tests {
             observation_for_payload(&mongodb_message(2013, &mongodb_op_msg)).application(),
             api::AgentPacketFlowApplication::MongoDb
         );
+        let mut mongodb_op_msg_with_sequence = Vec::new();
+        mongodb_op_msg_with_sequence.extend_from_slice(&0_u32.to_le_bytes());
+        mongodb_op_msg_with_sequence.push(0);
+        mongodb_op_msg_with_sequence.extend_from_slice(&empty_bson);
+        mongodb_op_msg_with_sequence.push(1);
+        let sequence_identifier = b"documents\0";
+        let sequence_size = 4 + sequence_identifier.len() + empty_bson.len();
+        mongodb_op_msg_with_sequence.extend_from_slice(&(sequence_size as u32).to_le_bytes());
+        mongodb_op_msg_with_sequence.extend_from_slice(sequence_identifier);
+        mongodb_op_msg_with_sequence.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &mongodb_op_msg_with_sequence))
+                .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut mongodb_compressed = Vec::new();
+        mongodb_compressed.extend_from_slice(&2013_u32.to_le_bytes());
+        mongodb_compressed.extend_from_slice(&9_u32.to_le_bytes());
+        mongodb_compressed.push(0);
+        mongodb_compressed.extend_from_slice(b"compressed");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2012, &mongodb_compressed)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
         let mut mongodb_op_query = Vec::new();
         mongodb_op_query.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_query.extend_from_slice(b"admin.$cmd\0");
@@ -6986,6 +7107,41 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mongodb_message(1, &mongodb_op_reply)).application(),
             api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut invalid_mongodb_op_msg_trailing = mongodb_op_msg.clone();
+        invalid_mongodb_op_msg_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &invalid_mongodb_op_msg_trailing))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_query_trailing = mongodb_op_query.clone();
+        invalid_mongodb_query_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &invalid_mongodb_query_trailing))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_reply_count = Vec::new();
+        invalid_mongodb_reply_count.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&0_u64.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&0_i32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&2_i32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(1, &invalid_mongodb_reply_count))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_compressed = Vec::new();
+        invalid_mongodb_compressed.extend_from_slice(&2012_u32.to_le_bytes());
+        invalid_mongodb_compressed.extend_from_slice(&9_u32.to_le_bytes());
+        invalid_mongodb_compressed.push(4);
+        invalid_mongodb_compressed.extend_from_slice(b"compressed");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2012, &invalid_mongodb_compressed))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0])
