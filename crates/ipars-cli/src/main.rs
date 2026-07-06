@@ -497,6 +497,8 @@ struct K8sInstallArgs {
     agent_api_cluster_ip: Option<IpAddr>,
     #[arg(long = "agent-api-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_agent_api", "agent_api_cluster_ip"])]
     agent_api_secondary_cluster_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-port", value_parser = parse_kubernetes_service_port, requires = "expose_agent_api")]
+    agent_api_port: Option<u16>,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
     #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
@@ -556,6 +558,10 @@ struct K8sInstallArgs {
     relay_cluster_ip: Option<IpAddr>,
     #[arg(long = "relay-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_relay", "relay_cluster_ip"])]
     relay_secondary_cluster_ip: Option<IpAddr>,
+    #[arg(long = "relay-udp-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_udp_port: Option<u16>,
+    #[arg(long = "relay-http-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_http_port: Option<u16>,
     #[arg(long = "relay-udp-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
@@ -1795,6 +1801,23 @@ fn parse_kubernetes_service_ip(value: &str) -> Result<IpAddr, String> {
 
 const KUBERNETES_NODE_PORT_MIN: u16 = 30000;
 const KUBERNETES_NODE_PORT_MAX: u16 = 32767;
+const KUBERNETES_SERVICE_PORT_MIN: u16 = 1;
+const KUBERNETES_SERVICE_PORT_MAX: u16 = 65535;
+
+fn parse_kubernetes_service_port(value: &str) -> Result<u16, String> {
+    let port = value.parse::<u16>().map_err(|_| {
+        format!(
+            "Service port must be an integer between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}; got {value}"
+        )
+    })?;
+    if (KUBERNETES_SERVICE_PORT_MIN..=KUBERNETES_SERVICE_PORT_MAX).contains(&port) {
+        Ok(port)
+    } else {
+        Err(format!(
+            "Service port must be between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}; got {value}"
+        ))
+    }
+}
 
 fn parse_kubernetes_node_port(value: &str) -> Result<u16, String> {
     let port = value
@@ -3360,6 +3383,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 );
             }
         }
+        if let Some(port) = args.agent_api_port {
+            helm_command.push_str(&format!(" --set agent.apiService.port={port}"));
+        }
         if let Some(node_port) = args.agent_api_node_port {
             helm_command.push_str(&format!(" --set agent.apiService.nodePort={node_port}"));
         }
@@ -3501,6 +3527,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                     &secondary_cluster_ip.to_string(),
                 );
             }
+        }
+        if let Some(port) = args.relay_udp_port {
+            helm_command.push_str(&format!(" --set agent.relayService.udpPort={port}"));
+        }
+        if let Some(port) = args.relay_http_port {
+            helm_command.push_str(&format!(" --set agent.relayService.httpPort={port}"));
         }
         if let Some(node_port) = args.relay_udp_node_port {
             helm_command.push_str(&format!(
@@ -5009,6 +5041,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_secondary_cluster_ip.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-secondary-cluster-ip requires --expose-agent-api");
     }
+    if args.agent_api_port.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-port requires --expose-agent-api");
+    }
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
     }
@@ -5059,6 +5094,12 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if args.relay_secondary_cluster_ip.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-secondary-cluster-ip requires --expose-relay");
+    }
+    if args.relay_udp_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-port requires --expose-relay");
+    }
+    if args.relay_http_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-port requires --expose-relay");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -7964,6 +8005,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: Some("10.96.0.40".parse()?),
             agent_api_secondary_cluster_ip: Some("2001:db8::40".parse()?),
+            agent_api_port: Some(9781),
             agent_api_node_port: Some(31080),
             agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
             agent_api_publish_not_ready_addresses: true,
@@ -7989,6 +8031,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: Some("2001:db8::41".parse()?),
             relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
+            relay_udp_port: Some(51821),
+            relay_http_port: Some(9581),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
             relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
@@ -8057,6 +8101,7 @@ mod tests {
         assert!(
             plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
         );
+        assert!(plan.commands[2].contains("--set agent.apiService.port=9781"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
@@ -8101,6 +8146,8 @@ mod tests {
         assert!(
             plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
         );
+        assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
         assert!(plan.commands[2]
@@ -8954,6 +9001,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -8976,6 +9024,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -9983,6 +10033,8 @@ mod tests {
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
+            "--agent-api-port",
+            "9781",
             "--agent-api-node-port",
             "31080",
             "--agent-api-load-balancer-class",
@@ -10014,6 +10066,10 @@ mod tests {
             "--expose-relay",
             "--relay-service-type",
             "LoadBalancer",
+            "--relay-udp-port",
+            "51821",
+            "--relay-http-port",
+            "9581",
             "--relay-udp-node-port",
             "31820",
             "--relay-http-node-port",
@@ -10184,6 +10240,7 @@ mod tests {
             assert_eq!(args.agent_pdb_max_unavailable, None);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
+            assert_eq!(args.agent_api_port, Some(9781));
             assert_eq!(args.agent_api_node_port, Some(31080));
             assert_eq!(
                 args.agent_api_load_balancer_class.as_deref(),
@@ -10223,6 +10280,8 @@ mod tests {
             );
             assert!(args.expose_relay);
             assert_eq!(args.relay_service_type, "LoadBalancer");
+            assert_eq!(args.relay_udp_port, Some(51821));
+            assert_eq!(args.relay_http_port, Some(9581));
             assert_eq!(args.relay_udp_node_port, Some(31820));
             assert_eq!(args.relay_http_node_port, Some(31580));
             assert_eq!(
@@ -10354,6 +10413,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -10376,6 +10436,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -10493,6 +10555,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -10515,6 +10578,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -11787,6 +11852,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -11809,6 +11875,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -11913,6 +11981,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -11935,6 +12004,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12128,6 +12199,7 @@ mod tests {
             agent_api_service_type: "ClusterIP".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12150,6 +12222,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12259,6 +12333,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12281,6 +12356,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12385,6 +12462,7 @@ mod tests {
             agent_api_service_type: "LoadBalancer".to_string(),
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12407,6 +12485,8 @@ mod tests {
             relay_service_type: "LoadBalancer".to_string(),
             relay_cluster_ip: None,
             relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_http_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
             relay_udp_app_protocol: None,
@@ -12645,6 +12725,10 @@ mod tests {
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());
         assert!(parse_kubernetes_node_port("32768").is_err());
+        assert_eq!(parse_kubernetes_service_port("1"), Ok(1));
+        assert_eq!(parse_kubernetes_service_port("65535"), Ok(65_535));
+        assert!(parse_kubernetes_service_port("0").is_err());
+        assert!(parse_kubernetes_service_port("65536").is_err());
         assert_eq!(
             parse_kubernetes_ip_family_policy("RequireDualStack"),
             Ok("RequireDualStack".to_string())
