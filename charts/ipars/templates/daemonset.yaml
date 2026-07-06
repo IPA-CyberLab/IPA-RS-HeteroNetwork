@@ -479,6 +479,10 @@
 {{- if and .Values.serviceExposure.serviceLabelSelector (regexMatch "[[:cntrl:]]" .Values.serviceExposure.serviceLabelSelector) -}}
 {{- fail "serviceExposure.serviceLabelSelector must not contain control characters" -}}
 {{- end -}}
+{{- $serviceExposureRouteProviderNodeId := printf "%v" .Values.serviceExposure.routeProviderNodeId -}}
+{{- if and (ne $serviceExposureRouteProviderNodeId "") (or (gt (len $serviceExposureRouteProviderNodeId) 255) (not (regexMatch "^[A-Za-z0-9._-]+$" $serviceExposureRouteProviderNodeId))) -}}
+{{- fail "serviceExposure.routeProviderNodeId must contain only ASCII letters, digits, '_', '.' or '-' and must not exceed 255 bytes" -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet

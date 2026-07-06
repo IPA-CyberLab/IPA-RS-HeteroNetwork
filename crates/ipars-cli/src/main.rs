@@ -4110,6 +4110,9 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
     }
+    if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        validate_token_identifier(route_provider, "--kubernetes-route-provider")?;
+    }
     if !args.kubernetes_discover_services {
         if !args.kubernetes_namespaces.is_empty() {
             anyhow::bail!("--kubernetes-namespace requires --kubernetes-discover-services");
@@ -9236,6 +9239,9 @@ mod tests {
         ));
         assert!(daemonset
             .contains("serviceExposure.routeProviderNodeId requires serviceExposure.enabled=true"));
+        assert!(daemonset.contains(
+            "serviceExposure.routeProviderNodeId must contain only ASCII letters, digits, '_', '.' or '-' and must not exceed 255 bytes"
+        ));
         assert!(values.contains("peerMap:"));
         assert!(values.contains("enabled: true"));
         assert!(values.contains("pollIntervalSeconds: 30"));
@@ -9482,6 +9488,21 @@ mod tests {
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_invalid_route_provider() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.kubernetes_route_provider = Some("route provider".to_string());
+
+        let error = match k8s_install_plan(args) {
+            Ok(_) => anyhow::bail!("invalid Kubernetes route provider should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--kubernetes-route-provider must contain only ASCII letters, digits, '_', '.' or '-'"
+        ));
         Ok(())
     }
 

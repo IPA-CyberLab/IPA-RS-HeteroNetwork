@@ -2178,6 +2178,9 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
     }
+    if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        validate_daemon_identifier(route_provider, "--kubernetes-route-provider")?;
+    }
     if !args.kubernetes_discover_services {
         if !args.kubernetes_namespaces.is_empty() {
             anyhow::bail!("--kubernetes-namespace requires --kubernetes-discover-services");
@@ -17862,6 +17865,33 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--kubernetes-namespace `default` must not be repeated"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_rejects_invalid_route_provider() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-route-provider",
+            "route provider",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("invalid Kubernetes route provider should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--kubernetes-route-provider must contain only ASCII letters, digits, '_', '.' or '-'"
+            ));
             return Ok(());
         }
 
