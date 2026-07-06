@@ -2619,7 +2619,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.docker_discover_networks {
-        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST or /var/run/docker.sock before Compose bind-mounts it into the agent".to_string());
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock before Compose bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         if args.userspace_wireguard_command.is_some() {
@@ -2633,7 +2633,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
 
     let mut commands = Vec::new();
     if args.docker_discover_networks {
-        commands.push(docker_api_socket_preflight_command());
+        commands.push(docker_api_socket_preflight_command(&args));
     }
     commands.push(format!("{compose_prefix} config"));
     commands.push(format!("{compose_prefix} up -d --build"));
@@ -2654,14 +2654,29 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     })
 }
 
-fn docker_api_socket_preflight_command() -> String {
-    "test -S \"${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}\" && docker --host \"unix://${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}\" version >/dev/null".to_string()
+fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
+    let fallback = if let Some(socket) = args.docker_api_socket.as_ref() {
+        format!(
+            "docker_socket={}",
+            shell_word(&socket.display().to_string())
+        )
+    } else if args.rootless {
+        ": \"${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}\"; docker_socket=\"${XDG_RUNTIME_DIR}/docker.sock\"".to_string()
+    } else {
+        "docker_socket=/var/run/docker.sock".to_string()
+    };
+    format!(
+        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+    )
 }
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.docker_host_interface)?;
     if let Some(namespace) = args.docker_container_namespace.as_deref() {
         validate_linux_namespace_name(namespace)?;
+    }
+    if let Some(socket) = args.docker_api_socket.as_ref() {
+        validate_docker_api_socket_path(socket)?;
     }
     validate_docker_userspace_wireguard_args(args)?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
@@ -2675,6 +2690,20 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
     for filter in &args.docker_networks {
         validate_docker_network_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_docker_api_socket_path(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("--docker-api-socket must be an absolute Unix socket path");
+    }
+    let value = path
+        .as_os_str()
+        .to_str()
+        .context("--docker-api-socket must be valid UTF-8")?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("--docker-api-socket must not contain control characters");
     }
     Ok(())
 }
@@ -6378,6 +6407,7 @@ mod tests {
         );
         assert!(plan.commands[0].contains("test -S"));
         assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("XDG_RUNTIME_DIR"));
         assert!(plan.commands[0].contains("docker --host"));
         assert_eq!(
             plan.commands[1],
@@ -6428,6 +6458,34 @@ mod tests {
         assert!(compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_explicit_api_socket_preflight() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            Some("/run/user/1000/docker.sock")
+        );
+        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("/run/user/1000/docker.sock"));
+        assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
         Ok(())
     }
 
@@ -6543,6 +6601,18 @@ mod tests {
         assert!(invalid_namespace
             .to_string()
             .contains("linux network namespace name"));
+
+        let relative_api_socket = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_api_socket: Some(PathBuf::from("run/docker.sock")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relative Docker API socket path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relative_api_socket
+            .to_string()
+            .contains("--docker-api-socket must be an absolute Unix socket path"));
 
         let invalid_ready_timeout = match docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
