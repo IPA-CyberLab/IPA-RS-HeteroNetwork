@@ -4048,10 +4048,16 @@ fn validate_kubernetes_restricted_cidrs(
     flag: &str,
     cidrs: &[ipnet::IpNet],
     guidance: &str,
+    duplicate_label: &str,
 ) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
     for cidr in cidrs {
         if cidr.prefix_len() == 0 {
             anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+        }
+        let canonical = cidr.trunc();
+        if !seen.insert(canonical) {
+            anyhow::bail!("{flag} must not repeat {duplicate_label} {canonical}");
         }
     }
     Ok(())
@@ -4389,11 +4395,13 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
         "--agent-api-network-policy-cidr",
         &args.agent_api_network_policy_cidrs,
         "NetworkPolicy allowlists must narrow ingress sources",
+        "NetworkPolicy CIDR allowlist",
     )?;
     validate_kubernetes_restricted_cidrs(
         "--relay-network-policy-cidr",
         &args.relay_network_policy_cidrs,
         "NetworkPolicy allowlists must narrow ingress sources",
+        "NetworkPolicy CIDR allowlist",
     )?;
     Ok(())
 }
@@ -4583,11 +4591,13 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         "--agent-api-allow-source-cidr",
         &args.agent_api_allow_source_cidrs,
         "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+        "LoadBalancer source CIDR",
     )?;
     validate_kubernetes_restricted_cidrs(
         "--relay-allow-source-cidr",
         &args.relay_allow_source_cidrs,
         "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+        "LoadBalancer source CIDR",
     )?;
     if args.agent_api_node_port.is_some()
         && !is_external_kubernetes_service_type(&args.agent_api_service_type)
@@ -7045,9 +7055,13 @@ mod tests {
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
+        assert!(network_policy_template
+            .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
+        assert!(network_policy_template
+            .contains("networkPolicy.relay.allowedCidrs entry %q must not be repeated"));
         Ok(())
     }
 
@@ -9488,6 +9502,37 @@ mod tests {
             error.contains("--relay-network-policy-cidr must not include unrestricted CIDR ::/0")
         );
 
+        let mut duplicate_agent_policy = base_k8s_install_args();
+        duplicate_agent_policy.enable_network_policy = true;
+        duplicate_agent_policy.network_policy_acknowledge_host_network = true;
+        duplicate_agent_policy.expose_agent_api = true;
+        duplicate_agent_policy.agent_api_network_policy_cidrs =
+            vec!["10.0.0.0/8".parse()?, "10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not repeat NetworkPolicy CIDR allowlist 10.0.0.0/8"
+        ));
+
+        let mut duplicate_relay_policy = base_k8s_install_args();
+        duplicate_relay_policy.enable_network_policy = true;
+        duplicate_relay_policy.network_policy_acknowledge_host_network = true;
+        duplicate_relay_policy.expose_relay = true;
+        duplicate_relay_policy.relay_service_type = "ClusterIP".to_string();
+        duplicate_relay_policy.relay_network_policy_cidrs =
+            vec!["203.0.113.0/24".parse()?, "203.0.113.0/24".parse()?];
+        duplicate_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_relay_policy.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_relay_policy) {
+            Ok(_) => panic!("relay NetworkPolicy should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-network-policy-cidr must not repeat NetworkPolicy CIDR allowlist 203.0.113.0/24"
+        ));
+
         Ok(())
     }
 
@@ -10273,6 +10318,20 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-allow-source-cidr must not include unrestricted CIDR ::/0"));
+
+        let mut duplicate_agent_source_range = base_k8s_install_args();
+        duplicate_agent_source_range.expose_agent_api = true;
+        duplicate_agent_source_range.allow_public_service_exposure = true;
+        duplicate_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["198.51.100.0/24".parse()?, "198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not repeat LoadBalancer source CIDR 198.51.100.0/24"
+        ));
         Ok(())
     }
 

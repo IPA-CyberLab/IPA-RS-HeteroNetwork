@@ -24,8 +24,14 @@
 {{- fail "networkPolicy.relay.allowedCidrs must contain at least one CIDR" -}}
 {{- end -}}
 {{- if $agentApiNetworkPolicyEnabled -}}
-{{- range .Values.networkPolicy.agentApi.allowedCidrs -}}
-{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" .) -}}
+{{- $agentApiNetworkPolicyCidrSet := dict -}}
+{{- range $cidr := .Values.networkPolicy.agentApi.allowedCidrs -}}
+{{- $cidrValue := printf "%v" $cidr -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue) -}}
+{{- if hasKey $agentApiNetworkPolicyCidrSet $cidrValue -}}
+{{- fail (printf "networkPolicy.agentApi.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiNetworkPolicyCidrSet $cidrValue true -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -54,8 +60,14 @@ spec:
 ---
 {{- end }}
 {{- if $relayNetworkPolicyEnabled -}}
-{{- range .Values.networkPolicy.relay.allowedCidrs -}}
-{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" .) -}}
+{{- $relayNetworkPolicyCidrSet := dict -}}
+{{- range $cidr := .Values.networkPolicy.relay.allowedCidrs -}}
+{{- $cidrValue := printf "%v" $cidr -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue) -}}
+{{- if hasKey $relayNetworkPolicyCidrSet $cidrValue -}}
+{{- fail (printf "networkPolicy.relay.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
+{{- end -}}
+{{- $_ := set $relayNetworkPolicyCidrSet $cidrValue true -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
