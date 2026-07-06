@@ -43,6 +43,7 @@ static DAEMON_MANIFEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
+const DAEMON_CONTROL_PLANE_SQLITE_FILE: &str = "control-plane.sqlite";
 const DAEMON_JOIN_TOKEN_FILE_SUFFIX: &str = ".join-token.json";
 const DAEMON_AGENT_STATE_FILE_SUFFIX: &str = ".state.json";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
@@ -839,6 +840,7 @@ impl LoadReport {
                 runtime_dir.display()
             )
         })?;
+        let mut expected_runtime_entries = expected_daemon_retained_runtime_entries();
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         for child in &manifest.children {
@@ -899,6 +901,17 @@ impl LoadReport {
                     canonical_runtime_dir.display()
                 );
             }
+            let log_file_name = log_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| {
+                    format!(
+                        "daemon load scenario retained manifest child {} log {} has invalid file name",
+                        child.role,
+                        log_path.display()
+                    )
+                })?;
+            expected_runtime_entries.insert(log_file_name.to_string());
             let log_diagnostics = daemon_log_diagnostics(log_path).with_context(|| {
                 format!(
                     "daemon load scenario retained manifest child {} log {} diagnostics are unavailable",
@@ -974,7 +987,7 @@ impl LoadReport {
                 expected_roles
             );
         }
-        validate_daemon_retained_runtime_has_no_transient_files(runtime_dir)?;
+        validate_daemon_retained_runtime_entries(runtime_dir, &expected_runtime_entries)?;
 
         Ok(())
     }
@@ -1086,8 +1099,21 @@ fn validate_daemon_retained_path_mode(
     Ok(())
 }
 
-fn validate_daemon_retained_runtime_has_no_transient_files(
+fn expected_daemon_retained_runtime_entries() -> BTreeSet<String> {
+    [
+        DAEMON_RUNTIME_MANIFEST_FILE,
+        DAEMON_CONTROL_PLANE_SQLITE_FILE,
+        "control-plane.sqlite-wal",
+        "control-plane.sqlite-shm",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn validate_daemon_retained_runtime_entries(
     runtime_dir: &Path,
+    expected_entries: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(runtime_dir).with_context(|| {
         format!(
@@ -1102,7 +1128,10 @@ fn validate_daemon_retained_runtime_has_no_transient_files(
             )
         })?;
         let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
+            bail!(
+                "daemon load scenario retained runtime directory {} contains non-UTF-8 entry name",
+                runtime_dir.display()
+            );
         };
         if file_name.ends_with(DAEMON_JOIN_TOKEN_FILE_SUFFIX) {
             bail!(
@@ -1121,6 +1150,13 @@ fn validate_daemon_retained_runtime_has_no_transient_files(
         if is_daemon_runtime_manifest_temp_name(&file_name) {
             bail!(
                 "daemon load scenario retained runtime directory {} still contains temporary manifest file {} after atomic manifest replacement",
+                runtime_dir.display(),
+                entry.path().display()
+            );
+        }
+        if !expected_entries.contains(&file_name) {
+            bail!(
+                "daemon load scenario retained runtime directory {} contains unexpected entry {}",
                 runtime_dir.display(),
                 entry.path().display()
             );
@@ -2439,7 +2475,7 @@ impl DaemonProcessGroup {
             &startup.children,
         )?;
         let control_plane_database_url =
-            daemon_sqlite_database_url(&runtime_dir.join("control-plane.sqlite"));
+            daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
@@ -4681,6 +4717,67 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("temporary manifest"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut retained_unexpected_entry = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &retained_unexpected_entry,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        retained_unexpected_entry.daemon_runtime_dir = Some(runtime_dir.clone());
+        retained_unexpected_entry.daemon_runtime_manifest = Some(manifest_path);
+        let unexpected_path = runtime_dir.join("unexpected-debug.txt");
+        let mut unexpected_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .private_on_unix()
+            .open(&unexpected_path)?;
+        unexpected_file.write_all(b"unexpected retained artifact\n")?;
+        unexpected_file.sync_all()?;
+        let error = match retained_unexpected_entry.validate_success() {
+            Ok(_) => bail!("retained runtime with unexpected entry should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unexpected entry"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut retained_sqlite_sidecars = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &retained_sqlite_sidecars,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        retained_sqlite_sidecars.daemon_runtime_dir = Some(runtime_dir.clone());
+        retained_sqlite_sidecars.daemon_runtime_manifest = Some(manifest_path);
+        for name in [
+            DAEMON_CONTROL_PLANE_SQLITE_FILE,
+            "control-plane.sqlite-wal",
+            "control-plane.sqlite-shm",
+        ] {
+            let mut sqlite_file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .private_on_unix()
+                .open(runtime_dir.join(name))?;
+            sqlite_file.write_all(b"sqlite retained artifact\n")?;
+            sqlite_file.sync_all()?;
+        }
+        retained_sqlite_sidecars.validate_success()?;
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut stale_generated_timestamp = daemon_report.clone();
