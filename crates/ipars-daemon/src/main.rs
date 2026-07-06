@@ -6304,12 +6304,14 @@ where
                     Err(error) => Err(error),
                 };
                 match result {
-                    Ok(plan) => tracing::info!(
+                    Ok(summary) => tracing::info!(
                         route_source = source.source_label(),
                         container_namespace = %intent.container_namespace,
                         host_interface = %intent.host_interface,
-                        routes = plan.routes.len(),
-                        policy_rules = plan.policy_rules.len(),
+                        routes = summary.plan.routes.len(),
+                        policy_rules = summary.plan.policy_rules.len(),
+                        routes_removed = summary.routes_removed,
+                        policy_rules_removed = summary.policy_rules_removed,
                         "applied Docker overlay routes"
                     ),
                     Err(error) => tracing::warn!(
@@ -6334,20 +6336,35 @@ async fn apply_managed_route_plan<M>(
     manager: &M,
     applied_plan: &mut Option<RoutePlan>,
     plan: RoutePlan,
-) -> Result<RoutePlan, RouteManagerError>
+) -> Result<ManagedRouteApplySummary, RouteManagerError>
 where
     M: RouteManager + ?Sized,
 {
+    let mut routes_removed = 0;
+    let mut policy_rules_removed = 0;
     if let Some(previous) = applied_plan.as_ref().cloned() {
         let stale = stale_managed_route_plan(&previous, &plan);
         if !stale.routes.is_empty() || !stale.policy_rules.is_empty() {
+            routes_removed = stale.routes.len();
+            policy_rules_removed = stale.policy_rules.len();
             manager.remove_routes(stale).await?;
             *applied_plan = Some(retained_managed_route_plan(&previous, &plan));
         }
     }
     manager.apply_routes(plan.clone()).await?;
     *applied_plan = Some(plan.clone());
-    Ok(plan)
+    Ok(ManagedRouteApplySummary {
+        plan,
+        routes_removed,
+        policy_rules_removed,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedRouteApplySummary {
+    plan: RoutePlan,
+    routes_removed: usize,
+    policy_rules_removed: usize,
 }
 
 fn stale_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
@@ -6845,12 +6862,14 @@ async fn run_kubernetes_underlay_route_loop<M>(
                     Err(error) => Err(error),
                 };
                 match result {
-                    Ok(plan) => tracing::info!(
+                    Ok(summary) => tracing::info!(
                         route_source = source.source_label(),
                         node_name = %intent.node_name,
                         route_provider = %intent.route_provider,
-                        routes = plan.routes.len(),
-                        policy_rules = plan.policy_rules.len(),
+                        routes = summary.plan.routes.len(),
+                        policy_rules = summary.plan.policy_rules.len(),
+                        routes_removed = summary.routes_removed,
+                        policy_rules_removed = summary.policy_rules_removed,
                         "applied Kubernetes underlay routes"
                     ),
                     Err(error) => tracing::warn!(
@@ -11294,16 +11313,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_route_plan_reconciles_removed_routes_before_apply() -> anyhow::Result<()> {
+    async fn managed_route_plan_reconciles_removed_routes_and_rules_before_apply(
+    ) -> anyhow::Result<()> {
         let manager = RecordingManagedRouteManager::default();
         let mut applied_plan = None;
-        let first = test_route_plan("ipars0", &["10.10.0.0/16", "10.11.0.0/16"], &[10_050])?;
-        let second = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_050])?;
+        let first = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let second = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
 
-        apply_managed_route_plan(&manager, &mut applied_plan, first.clone()).await?;
-        apply_managed_route_plan(&manager, &mut applied_plan, second.clone()).await?;
+        let first_summary =
+            apply_managed_route_plan(&manager, &mut applied_plan, first.clone()).await?;
+        let second_summary =
+            apply_managed_route_plan(&manager, &mut applied_plan, second.clone()).await?;
 
         assert_eq!(applied_plan, Some(second.clone()));
+        assert_eq!(
+            first_summary,
+            ManagedRouteApplySummary {
+                plan: first.clone(),
+                routes_removed: 0,
+                policy_rules_removed: 0,
+            }
+        );
+        assert_eq!(
+            second_summary,
+            ManagedRouteApplySummary {
+                plan: second.clone(),
+                routes_removed: 1,
+                policy_rules_removed: 1,
+            }
+        );
         assert_eq!(manager.applied.read().await.as_slice(), &[first, second]);
         let removed = manager.removed.read().await;
         assert_eq!(removed.len(), 1);
@@ -11312,7 +11354,8 @@ mod tests {
             removed[0].routes[0].cidr,
             "10.10.0.0/16".parse::<ipnet::IpNet>()?
         );
-        assert!(removed[0].policy_rules.is_empty());
+        assert_eq!(removed[0].policy_rules.len(), 1);
+        assert_eq!(removed[0].policy_rules[0].priority, 10_050);
         Ok(())
     }
 
