@@ -60,7 +60,7 @@ spec:
 {{- end }}
       ports:
         - protocol: TCP
-          port: {{ .Values.agent.apiService.port }}
+          port: {{ .Values.agent.apiService.targetPort }}
 {{- end }}
 {{- if and $agentApiNetworkPolicyEnabled $relayNetworkPolicyEnabled }}
 ---
@@ -96,7 +96,7 @@ spec:
 {{- end }}
       ports:
         - protocol: UDP
-          port: {{ .Values.agent.relayService.udpPort }}
+          port: {{ .Values.agent.relayService.udpTargetPort }}
         - protocol: TCP
-          port: {{ .Values.agent.relayService.httpPort }}
+          port: {{ .Values.agent.relayService.httpTargetPort }}
 {{- end }}

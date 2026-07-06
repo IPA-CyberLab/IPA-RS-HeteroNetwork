@@ -3745,7 +3745,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
-            "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
+            "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
@@ -8513,7 +8513,16 @@ mod tests {
         ));
         assert!(network_policy_template
             .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
-        assert!(network_policy_template.contains("port: {{ .Values.agent.apiService.port }}"));
+        assert!(network_policy_template.contains("port: {{ .Values.agent.apiService.targetPort }}"));
+        assert!(!network_policy_template.contains("port: {{ .Values.agent.apiService.port }}"));
+        assert!(network_policy_template
+            .contains("port: {{ .Values.agent.relayService.udpTargetPort }}"));
+        assert!(network_policy_template
+            .contains("port: {{ .Values.agent.relayService.httpTargetPort }}"));
+        assert!(!network_policy_template.contains("port: {{ .Values.agent.relayService.udpPort }}"));
+        assert!(
+            !network_policy_template.contains("port: {{ .Values.agent.relayService.httpPort }}")
+        );
         assert!(!network_policy_template.contains("port: 9780"));
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
