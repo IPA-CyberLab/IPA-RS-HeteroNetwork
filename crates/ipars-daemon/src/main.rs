@@ -1977,9 +1977,7 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
 
 fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_docker_api_version(&args.docker_api_version)?;
-    for filter in &args.docker_networks {
-        validate_docker_network_filter(filter)?;
-    }
+    validate_docker_network_filters(&args.docker_networks)?;
     if !args.docker_container_cidrs.is_empty() {
         anyhow::bail!(
             "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
@@ -2132,6 +2130,17 @@ fn validate_docker_api_version(version: &str) -> anyhow::Result<()> {
 
 fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
     validate_docker_network_token(filter, "Docker network filter")
+}
+
+fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for filter in filters {
+        validate_docker_network_filter(filter)?;
+        if !seen.insert(filter.as_str()) {
+            anyhow::bail!("--docker-network `{filter}` must not be repeated");
+        }
+    }
+    Ok(())
 }
 
 fn validate_docker_network_name(name: &str) -> anyhow::Result<()> {
@@ -18693,6 +18702,34 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--docker-network requires --docker-discover-networks"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_network_filters_must_be_unique() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-network",
+            "compose_default",
+            "--docker-network",
+            "compose_default",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("duplicate Docker network filter should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--docker-network `compose_default` must not be repeated"));
             return Ok(());
         }
 

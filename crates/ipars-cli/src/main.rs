@@ -2897,9 +2897,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         );
     }
     validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
-    for filter in &args.docker_networks {
-        validate_docker_network_filter(filter)?;
-    }
+    validate_docker_network_filters(&args.docker_networks)?;
     Ok(())
 }
 
@@ -3186,6 +3184,17 @@ fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Docker network filter `{filter}` must contain only ASCII letters, digits, '.', '_' or '-'"
         );
+    }
+    Ok(())
+}
+
+fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for filter in filters {
+        validate_docker_network_filter(filter)?;
+        if !seen.insert(filter.as_str()) {
+            anyhow::bail!("--docker-network `{filter}` must not be repeated");
+        }
     }
     Ok(())
 }
@@ -7654,6 +7663,18 @@ mod tests {
         assert!(invalid_filter
             .to_string()
             .contains("must contain only ASCII letters"));
+
+        let duplicate_filter = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string(), "edge_default".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("duplicate Docker network filter should be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate_filter
+            .to_string()
+            .contains("--docker-network `edge_default` must not be repeated"));
 
         let invalid_host_interface = match docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
