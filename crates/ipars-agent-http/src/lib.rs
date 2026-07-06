@@ -8,12 +8,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
-    AgentManagedProcessState, AgentMetricsResponse, AgentNatClassifyRequest,
-    AgentNatClassifyResponse, AgentPacketFlowRequest, AgentPacketFlowResponse,
-    AgentPathEventsResponse, AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse,
-    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    AgentStunProbeRequest, AgentStunProbeResponse, AgentWireGuardKeyRotationRequest,
-    AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
+    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentPacketFlowDropReason,
+    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
+    AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse,
 };
 use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
 use serde::{Deserialize, Serialize};
@@ -278,6 +279,7 @@ async fn packet_flow(
     observation
         .validate_transport_metadata()
         .map_err(ApiError::BadRequest)?;
+    let destination_drop_reason = packet_flow_destination_drop_reason(request.destination);
     let matched = state
         .runtime
         .record_packet_flow_observation(
@@ -287,12 +289,18 @@ async fn packet_flow(
             request.pin,
         )
         .await;
+    let filtered_reason = destination_drop_reason.or_else(|| {
+        matched
+            .is_none()
+            .then_some(AgentPacketFlowDropReason::NoOverlayMatch)
+    });
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPacketFlowResponse {
             destination: request.destination,
             recorded_at,
             observation,
+            filtered_reason,
             matched,
         }),
     ))
@@ -1947,6 +1955,7 @@ mod tests {
             vec![AgentPacketFlowConntrackStatus::Assured]
         );
         assert_eq!(packet_flow.observation.tcp_state, None);
+        assert_eq!(packet_flow.filtered_reason, None);
         let matched = packet_flow
             .matched
             .ok_or_else(|| std::io::Error::other("route should match peer"))?;
@@ -2013,6 +2022,10 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
         assert!(packet_flow.matched.is_none());
+        assert_eq!(
+            packet_flow.filtered_reason,
+            Some(AgentPacketFlowDropReason::Loopback)
+        );
 
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.packet_flow_observation_count, 0);
@@ -2035,6 +2048,44 @@ mod tests {
                 .map(|entry| entry.count),
             Some(0)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_reports_no_overlay_packet_flow_matches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"192.0.2.10","protocol":"tcp","destination_port":443}"#,
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(packet_flow.matched.is_none());
+        assert_eq!(
+            packet_flow.filtered_reason,
+            Some(AgentPacketFlowDropReason::NoOverlayMatch)
+        );
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 1);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
         Ok(())
     }
 }
