@@ -116,6 +116,8 @@ const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
 const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
 const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
@@ -4830,10 +4832,17 @@ async fn run_relay(
         .admission_url
         .clone()
         .context("--admission-url is required for relay advertisement")?;
-    let admission_rate_limit = (args.admission_rate_limit > 0).then_some(RelayAdmissionRateLimit {
-        max_attempts: args.admission_rate_limit,
-        window: chrono::Duration::seconds(args.admission_rate_limit_window_seconds as i64),
-    });
+    let admission_rate_limit = if args.admission_rate_limit > 0 {
+        Some(RelayAdmissionRateLimit {
+            max_attempts: args.admission_rate_limit,
+            window: chrono_duration_seconds(
+                args.admission_rate_limit_window_seconds,
+                "--admission-rate-limit-window-seconds",
+            )?,
+        })
+    } else {
+        None
+    };
     let max_sessions_per_node =
         (args.max_sessions_per_node > 0).then_some(args.max_sessions_per_node);
     let service = Arc::new(RelayService::with_session_ttl_admission_controls(
@@ -4847,7 +4856,7 @@ async fn run_relay(
             max_mbps: args.max_mbps,
             e2e_only: true,
         },
-        chrono::Duration::seconds(args.session_ttl_seconds as i64),
+        chrono_duration_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?,
         admission_rate_limit,
         max_sessions_per_node,
     ));
@@ -4891,17 +4900,27 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
     if args.max_sessions_per_node > args.max_sessions {
         anyhow::bail!("--max-sessions-per-node must be less than or equal to --max-sessions");
     }
-    validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
+    validate_bounded_u64(
+        args.session_ttl_seconds,
+        "--session-ttl-seconds",
+        MAX_RELAY_SESSION_TTL_SECONDS,
+    )?;
     if args.admission_rate_limit > 0 {
-        validate_positive_seconds(
+        validate_bounded_u64(
             args.admission_rate_limit_window_seconds,
             "--admission-rate-limit-window-seconds",
+            MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
         )?;
     }
     if let Some(token) = args.admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--admission-bearer-token")?;
     }
     Ok(())
+}
+
+fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Duration> {
+    let seconds = i64::try_from(value).with_context(|| format!("{name} is too large"))?;
+    Ok(chrono::Duration::seconds(seconds))
 }
 
 async fn run_agent(
@@ -17895,6 +17914,31 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected relay command");
         }
 
+        let oversized_ttl_seconds = (MAX_RELAY_SESSION_TTL_SECONDS + 1).to_string();
+        let oversized_ttl = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--session-ttl-seconds",
+            oversized_ttl_seconds.as_str(),
+        ])?;
+        if let Command::Relay(args) = oversized_ttl.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--session-ttl-seconds must not exceed {MAX_RELAY_SESSION_TTL_SECONDS}"
+            )));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let zero_rate_window = Cli::try_parse_from([
             "iparsd",
             "relay",
@@ -17915,6 +17959,32 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--admission-rate-limit-window-seconds must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let oversized_rate_window_seconds =
+            (MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS + 1).to_string();
+        let oversized_rate_window = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--admission-rate-limit-window-seconds",
+            oversized_rate_window_seconds.as_str(),
+        ])?;
+        if let Command::Relay(args) = oversized_rate_window.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--admission-rate-limit-window-seconds must not exceed {MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}"
+            )));
         } else {
             anyhow::bail!("expected relay command");
         }
