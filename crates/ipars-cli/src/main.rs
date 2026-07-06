@@ -4992,6 +4992,17 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
 }
 
 fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let agent_api_public_exposure = k8s_agent_api_public_exposure_requires_ack(args);
+    let relay_public_exposure = k8s_relay_public_exposure_requires_ack(args);
+    let agent_api_unrestricted_load_balancer_ack =
+        k8s_agent_api_unrestricted_load_balancer_ack_applies(args);
+    let relay_unrestricted_load_balancer_ack =
+        k8s_relay_unrestricted_load_balancer_ack_applies(args);
+    let agent_api_cluster_external_traffic_policy_ack =
+        k8s_agent_api_cluster_external_traffic_policy_ack_applies(args);
+    let relay_cluster_external_traffic_policy_ack =
+        k8s_relay_cluster_external_traffic_policy_ack_applies(args);
+
     if args.agent_api_cluster_ip.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-cluster-ip requires --expose-agent-api");
     }
@@ -5186,6 +5197,11 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             args.relay_service_type
         );
     }
+    if args.allow_public_service_exposure && !(agent_api_public_exposure || relay_public_exposure) {
+        anyhow::bail!(
+            "--allow-public-service-exposure requires an exposed NodePort/LoadBalancer Service or Service externalIPs"
+        );
+    }
     if !args.agent_api_allow_source_cidrs.is_empty()
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -5216,6 +5232,20 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "--relay-udp-node-port and --relay-http-node-port only apply to NodePort or LoadBalancer services"
+        );
+    }
+    if args.agent_api_external_traffic_policy == "Cluster"
+        && !k8s_agent_api_external_traffic_policy_applies(args)
+    {
+        anyhow::bail!(
+            "--agent-api-external-traffic-policy Cluster requires --expose-agent-api with NodePort or LoadBalancer service type"
+        );
+    }
+    if args.relay_external_traffic_policy == "Cluster"
+        && !k8s_relay_external_traffic_policy_applies(args)
+    {
+        anyhow::bail!(
+            "--relay-external-traffic-policy Cluster requires --expose-relay with NodePort or LoadBalancer service type"
         );
     }
     if args.relay_udp_node_port.is_some()
@@ -5339,6 +5369,13 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--expose-relay with LoadBalancer requires --relay-allow-source-cidr or --allow-unrestricted-load-balancer"
         );
     }
+    if args.allow_unrestricted_load_balancer
+        && !(agent_api_unrestricted_load_balancer_ack || relay_unrestricted_load_balancer_ack)
+    {
+        anyhow::bail!(
+            "--allow-unrestricted-load-balancer requires at least one exposed LoadBalancer Service without source CIDR ranges"
+        );
+    }
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
         && args.agent_api_external_traffic_policy == "Cluster"
@@ -5357,7 +5394,57 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--expose-relay with externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy"
         );
     }
+    if args.allow_cluster_external_traffic_policy
+        && !(agent_api_cluster_external_traffic_policy_ack
+            || relay_cluster_external_traffic_policy_ack)
+    {
+        anyhow::bail!(
+            "--allow-cluster-external-traffic-policy requires at least one exposed NodePort or LoadBalancer Service with externalTrafficPolicy=Cluster"
+        );
+    }
     Ok(())
+}
+
+fn k8s_agent_api_public_exposure_requires_ack(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api
+        && (is_external_kubernetes_service_type(&args.agent_api_service_type)
+            || !args.agent_api_external_ips.is_empty())
+}
+
+fn k8s_relay_public_exposure_requires_ack(args: &K8sInstallArgs) -> bool {
+    args.expose_relay
+        && (is_external_kubernetes_service_type(&args.relay_service_type)
+            || !args.relay_external_ips.is_empty())
+}
+
+fn k8s_agent_api_unrestricted_load_balancer_ack_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api
+        && args.agent_api_service_type == "LoadBalancer"
+        && args.agent_api_allow_source_cidrs.is_empty()
+}
+
+fn k8s_relay_unrestricted_load_balancer_ack_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_relay
+        && args.relay_service_type == "LoadBalancer"
+        && args.relay_allow_source_cidrs.is_empty()
+}
+
+fn k8s_agent_api_external_traffic_policy_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api && is_external_kubernetes_service_type(&args.agent_api_service_type)
+}
+
+fn k8s_relay_external_traffic_policy_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_relay && is_external_kubernetes_service_type(&args.relay_service_type)
+}
+
+fn k8s_agent_api_cluster_external_traffic_policy_ack_applies(args: &K8sInstallArgs) -> bool {
+    k8s_agent_api_external_traffic_policy_applies(args)
+        && args.agent_api_external_traffic_policy == "Cluster"
+}
+
+fn k8s_relay_cluster_external_traffic_policy_ack_applies(args: &K8sInstallArgs) -> bool {
+    k8s_relay_external_traffic_policy_applies(args)
+        && args.relay_external_traffic_policy == "Cluster"
 }
 
 fn validate_kubernetes_node_port_uniqueness(args: &K8sInstallArgs) -> anyhow::Result<()> {
@@ -11717,6 +11804,88 @@ mod tests {
             .contains("--set agent.apiService.allowClusterExternalTrafficPolicy=true"));
         assert!(acknowledged.commands[2]
             .contains("--set agent.relayService.allowClusterExternalTrafficPolicy=true"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_irrelevant_service_exposure_acknowledgements() -> anyhow::Result<()> {
+        let mut public_ack_without_public_service = base_k8s_install_args();
+        public_ack_without_public_service.expose_agent_api = true;
+        public_ack_without_public_service.allow_public_service_exposure = true;
+        let error = match k8s_install_plan(public_ack_without_public_service) {
+            Ok(_) => {
+                panic!("public exposure acknowledgement should require public Service exposure")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-public-service-exposure requires an exposed NodePort/LoadBalancer Service or Service externalIPs"
+        ));
+
+        let mut unrestricted_ack_with_source_ranges = base_k8s_install_args();
+        unrestricted_ack_with_source_ranges.expose_agent_api = true;
+        unrestricted_ack_with_source_ranges.allow_public_service_exposure = true;
+        unrestricted_ack_with_source_ranges.allow_unrestricted_load_balancer = true;
+        unrestricted_ack_with_source_ranges.agent_api_service_type = "LoadBalancer".to_string();
+        unrestricted_ack_with_source_ranges.agent_api_allow_source_cidrs =
+            vec!["198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(unrestricted_ack_with_source_ranges) {
+            Ok(_) => panic!("unrestricted LoadBalancer acknowledgement should require unrestricted LoadBalancer exposure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-unrestricted-load-balancer requires at least one exposed LoadBalancer Service without source CIDR ranges"
+        ));
+
+        let mut cluster_policy_ack_without_cluster_policy = base_k8s_install_args();
+        cluster_policy_ack_without_cluster_policy.expose_agent_api = true;
+        cluster_policy_ack_without_cluster_policy.allow_public_service_exposure = true;
+        cluster_policy_ack_without_cluster_policy.allow_cluster_external_traffic_policy = true;
+        cluster_policy_ack_without_cluster_policy.agent_api_service_type = "NodePort".to_string();
+        let error = match k8s_install_plan(cluster_policy_ack_without_cluster_policy) {
+            Ok(_) => panic!("cluster external traffic policy acknowledgement should require Cluster externalTrafficPolicy"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-cluster-external-traffic-policy requires at least one exposed NodePort or LoadBalancer Service with externalTrafficPolicy=Cluster"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_cluster_external_traffic_policy_on_inactive_services(
+    ) -> anyhow::Result<()> {
+        let mut cluster_policy_without_agent_service = base_k8s_install_args();
+        cluster_policy_without_agent_service.agent_api_external_traffic_policy =
+            "Cluster".to_string();
+        let error = match k8s_install_plan(cluster_policy_without_agent_service) {
+            Ok(_) => panic!(
+                "agent externalTrafficPolicy=Cluster should require exposed external Service"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-external-traffic-policy Cluster requires --expose-agent-api with NodePort or LoadBalancer service type"
+        ));
+
+        let mut cluster_policy_on_cluster_ip = base_k8s_install_args();
+        cluster_policy_on_cluster_ip.expose_relay = true;
+        cluster_policy_on_cluster_ip.relay_service_type = "ClusterIP".to_string();
+        cluster_policy_on_cluster_ip.relay_external_traffic_policy = "Cluster".to_string();
+        cluster_policy_on_cluster_ip.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        cluster_policy_on_cluster_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(cluster_policy_on_cluster_ip) {
+            Ok(_) => panic!(
+                "relay externalTrafficPolicy=Cluster should require exposed external Service"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-traffic-policy Cluster requires --expose-relay with NodePort or LoadBalancer service type"
+        ));
+
         Ok(())
     }
 
