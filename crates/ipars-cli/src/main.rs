@@ -2822,7 +2822,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.docker_discover_networks {
-        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock before Compose bind-mounts it into the agent".to_string());
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before Compose bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         if args.userspace_wireguard_command.is_some() {
@@ -2872,7 +2872,7 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
         "docker_socket=/var/run/docker.sock".to_string()
     };
     format!(
-        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
     )
 }
 
@@ -7450,6 +7450,9 @@ mod tests {
         );
         assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
         assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
+        assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
+        assert!(plan.commands[0]
+            .contains("Docker API socket path must be an absolute Unix socket path"));
         assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
         assert!(plan.commands[0].contains("XDG_RUNTIME_DIR"));
         assert!(plan.commands[0].contains("docker --host"));
@@ -7560,6 +7563,9 @@ mod tests {
         assert!(plan.commands[0].contains("/run/user/1000/docker.sock"));
         assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
         assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
+        assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
+        assert!(plan.commands[0]
+            .contains("Docker API socket path must be an absolute Unix socket path"));
         assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
         Ok(())
     }
