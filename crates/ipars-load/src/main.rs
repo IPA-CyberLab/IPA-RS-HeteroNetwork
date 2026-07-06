@@ -845,6 +845,7 @@ impl LoadReport {
         let mut running_roles = Vec::new();
         let mut seen_log_paths = BTreeSet::new();
         let mut seen_log_serials = BTreeSet::new();
+        let mut previous_log_serial = None;
         for child in &manifest.children {
             let Some(log_path) = &child.log_path else {
                 bail!(
@@ -921,7 +922,7 @@ impl LoadReport {
                     )
                 })?;
             let log_serial = validate_daemon_child_log_file_name(&child.role, log_file_name)?;
-            if !seen_log_serials.insert(log_serial.clone()) {
+            if !seen_log_serials.insert(log_serial) {
                 bail!(
                     "daemon load scenario retained manifest child {} log file name {} reuses serial prefix {}",
                     child.role,
@@ -929,6 +930,18 @@ impl LoadReport {
                     log_serial
                 );
             }
+            if let Some(previous_log_serial) = previous_log_serial {
+                if log_serial <= previous_log_serial {
+                    bail!(
+                        "daemon load scenario retained manifest child {} log file name {} serial prefix {} is not greater than previous serial prefix {}",
+                        child.role,
+                        log_file_name,
+                        log_serial,
+                        previous_log_serial
+                    );
+                }
+            }
+            previous_log_serial = Some(log_serial);
             expected_runtime_entries.insert(log_file_name.to_string());
             let log_diagnostics = daemon_log_diagnostics(log_path).with_context(|| {
                 format!(
@@ -3177,7 +3190,7 @@ fn sanitized_daemon_child_role(role: &str) -> String {
 fn validate_daemon_child_log_file_name(
     child_role: &str,
     log_file_name: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<usize> {
     let sanitized_role = sanitized_daemon_child_role(child_role);
     let expected_suffix = format!("-{sanitized_role}.log");
     let Some(serial_prefix) = log_file_name.strip_suffix(&expected_suffix) else {
@@ -3190,7 +3203,11 @@ fn validate_daemon_child_log_file_name(
             "daemon load scenario retained manifest child {child_role} log file name {log_file_name} has invalid serial prefix"
         );
     }
-    Ok(serial_prefix.to_string())
+    serial_prefix.parse::<usize>().with_context(|| {
+        format!(
+            "daemon load scenario retained manifest child {child_role} log file name {log_file_name} has invalid serial prefix"
+        )
+    })
 }
 
 fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
@@ -4649,6 +4666,45 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("invalid serial prefix"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut out_of_order_child_log_serial = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &out_of_order_child_log_serial,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        out_of_order_child_log_serial.daemon_runtime_dir = Some(runtime_dir.clone());
+        out_of_order_child_log_serial.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            let first_agent_log_path = manifest.children[5].log_path.clone();
+            let first_agent_log_bytes = manifest.children[5].log_bytes;
+            let first_agent_log_tail_sha256 = manifest.children[5].log_tail_sha256.clone();
+            let second_agent_log_path = manifest.children[6].log_path.clone();
+            let second_agent_log_bytes = manifest.children[6].log_bytes;
+            let second_agent_log_tail_sha256 = manifest.children[6].log_tail_sha256.clone();
+
+            manifest.children[5].log_path = second_agent_log_path;
+            manifest.children[5].log_bytes = second_agent_log_bytes;
+            manifest.children[5].log_tail_sha256 = second_agent_log_tail_sha256;
+            manifest.children[6].log_path = first_agent_log_path;
+            manifest.children[6].log_bytes = first_agent_log_bytes;
+            manifest.children[6].log_tail_sha256 = first_agent_log_tail_sha256;
+        })?;
+        let error = match out_of_order_child_log_serial.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with out-of-order child log serial should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not greater than previous serial prefix"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut role_mismatched_child_log_path = daemon_report.clone();
