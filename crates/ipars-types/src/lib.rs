@@ -2956,12 +2956,39 @@ pub mod api {
         if payload.len() < 7 || payload[0] != 0x03 || payload[1] != 0x00 {
             return false;
         }
-        let length = u16::from_be_bytes([payload[2], payload[3]]);
-        let x224_len = payload[4] as u16;
-        (7..=4096).contains(&length)
-            && x224_len >= 2
-            && x224_len + 5 <= length
-            && matches!(payload[5], 0xd0 | 0xe0 | 0xf0)
+        let length = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+        if !(7..=65_535).contains(&length) || payload.len() > length {
+            return false;
+        }
+        let x224_len = payload[4] as usize;
+        let Some(tpdu_end) = 5_usize.checked_add(x224_len) else {
+            return false;
+        };
+        if x224_len < 2 || tpdu_end > length {
+            return false;
+        }
+        match payload[5] {
+            0xe0 | 0xd0 => rdp_x224_connection_tpdu(payload, x224_len),
+            0xf0 => rdp_x224_data_tpdu(payload, x224_len),
+            _ => false,
+        }
+    }
+
+    fn rdp_x224_connection_tpdu(payload: &[u8], x224_len: usize) -> bool {
+        if x224_len < 6 || payload.len() < 11 {
+            return false;
+        }
+        let dst_ref = u16::from_be_bytes([payload[6], payload[7]]);
+        let src_ref = u16::from_be_bytes([payload[8], payload[9]]);
+        let class_options = payload[10];
+        if payload[5] == 0xe0 && (dst_ref != 0 || src_ref != 0 || class_options != 0) {
+            return false;
+        }
+        class_options & 0x0f == 0
+    }
+
+    fn rdp_x224_data_tpdu(payload: &[u8], x224_len: usize) -> bool {
+        x224_len == 2 && payload.len() >= 7 && payload[6] & 0x7f == 0
     }
 
     fn postgres_payload(payload: &[u8]) -> bool {
@@ -5689,6 +5716,39 @@ mod tests {
             ])
             .application(),
             api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x0b, 0x06, 0xd0, 0x12, 0x34, 0x56, 0x78, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x80]).application(),
+            api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x01, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x06, 0xff, 0xf0, 0x80]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x0b, 0x06, 0xe0, 0x00, 0x01, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x01]).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
