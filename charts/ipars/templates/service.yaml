@@ -24,7 +24,15 @@
 {{- $agentApiIpFamilyPolicy := .Values.agent.apiService.ipFamilyPolicy -}}
 {{- $agentApiIpFamilies := .Values.agent.apiService.ipFamilies -}}
 {{- $agentApiIpFamilyPolicyDual := or (eq $agentApiIpFamilyPolicy "PreferDualStack") (eq $agentApiIpFamilyPolicy "RequireDualStack") -}}
-{{- $agentApiSessionAffinityTimeoutSeconds := int .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
+{{- $agentApiSessionAffinityTimeoutValue := printf "%v" .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
+{{- if eq $agentApiSessionAffinityTimeoutValue "" -}}
+{{- fail "agent.apiService.sessionAffinityTimeoutSeconds must be a non-negative integer" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.apiService.sessionAffinityTimeoutSeconds" "value" $agentApiSessionAffinityTimeoutValue) -}}
+{{- if or (gt (len $agentApiSessionAffinityTimeoutValue) 5) (and (eq (len $agentApiSessionAffinityTimeoutValue) 5) (gt $agentApiSessionAffinityTimeoutValue "86400")) -}}
+{{- fail "agent.apiService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
+{{- end -}}
+{{- $agentApiSessionAffinityTimeoutSeconds := int $agentApiSessionAffinityTimeoutValue -}}
 {{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
 {{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
 {{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
@@ -40,7 +48,15 @@
 {{- $relayIpFamilyPolicy := .Values.agent.relayService.ipFamilyPolicy -}}
 {{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
 {{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
-{{- $relaySessionAffinityTimeoutSeconds := int .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
+{{- $relaySessionAffinityTimeoutValue := printf "%v" .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
+{{- if eq $relaySessionAffinityTimeoutValue "" -}}
+{{- fail "agent.relayService.sessionAffinityTimeoutSeconds must be a non-negative integer" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayService.sessionAffinityTimeoutSeconds" "value" $relaySessionAffinityTimeoutValue) -}}
+{{- if or (gt (len $relaySessionAffinityTimeoutValue) 5) (and (eq (len $relaySessionAffinityTimeoutValue) 5) (gt $relaySessionAffinityTimeoutValue "86400")) -}}
+{{- fail "agent.relayService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
+{{- end -}}
+{{- $relaySessionAffinityTimeoutSeconds := int $relaySessionAffinityTimeoutValue -}}
 {{- $agentApiClusterIPSet := dict -}}
 {{- $agentApiExternalIPSet := dict -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}

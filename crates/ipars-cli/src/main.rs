@@ -8628,6 +8628,22 @@ mod tests {
             "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
         ));
         assert!(service_template.contains(
+            "$agentApiSessionAffinityTimeoutValue := printf \"%v\" .Values.agent.apiService.sessionAffinityTimeoutSeconds"
+        ));
+        assert!(service_template.contains(
+            "$relaySessionAffinityTimeoutValue := printf \"%v\" .Values.agent.relayService.sessionAffinityTimeoutSeconds"
+        ));
+        assert!(service_template.contains(
+            "ipars.validateNonNegativeInteger\" (dict \"path\" \"agent.apiService.sessionAffinityTimeoutSeconds\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateNonNegativeInteger\" (dict \"path\" \"agent.relayService.sessionAffinityTimeoutSeconds\""
+        ));
+        assert!(service_template.contains("gt (len $agentApiSessionAffinityTimeoutValue) 5"));
+        assert!(service_template.contains("gt $agentApiSessionAffinityTimeoutValue \"86400\""));
+        assert!(service_template.contains("gt (len $relaySessionAffinityTimeoutValue) 5"));
+        assert!(service_template.contains("gt $relaySessionAffinityTimeoutValue \"86400\""));
+        assert!(service_template.contains(
             "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs"
         ));
         assert!(service_template.contains(
