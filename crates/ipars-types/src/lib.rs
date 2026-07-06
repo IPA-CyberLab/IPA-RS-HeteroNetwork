@@ -2728,6 +2728,11 @@ pub mod api {
         Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize)
     }
 
+    fn read_u24_le(payload: &[u8], offset: usize) -> Option<usize> {
+        let bytes = payload.get(offset..offset.checked_add(3)?)?;
+        Some((bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16))
+    }
+
     fn read_u32_be(payload: &[u8], offset: usize) -> Option<u32> {
         let bytes = payload.get(offset..offset.checked_add(4)?)?;
         Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -2955,7 +2960,94 @@ pub mod api {
     }
 
     fn mysql_payload(payload: &[u8]) -> bool {
+        mysql_initial_handshake_payload(payload) || mysql_command_packet_payload(payload)
+    }
+
+    fn mysql_initial_handshake_payload(payload: &[u8]) -> bool {
         payload.len() >= 5 && payload[3] == 0 && payload[4] == 10
+    }
+
+    fn mysql_command_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 5 {
+            return false;
+        }
+        let Some(payload_len) = read_u24_le(payload, 0) else {
+            return false;
+        };
+        if !(1..=16_777_215).contains(&payload_len) || payload[3] > 64 {
+            return false;
+        }
+        let observed_body = &payload[4..];
+        if observed_body.is_empty() {
+            return false;
+        }
+        let body_len = payload_len.min(observed_body.len());
+        let body = &observed_body[..body_len];
+        let Some((&command, args)) = body.split_first() else {
+            return false;
+        };
+        match command {
+            0x01 | 0x09 | 0x0a | 0x0d | 0x0e | 0x0f | 0x10 | 0x1f => payload_len == 1,
+            0x02 | 0x05 | 0x06 | 0x11 => mysql_nonempty_text_arg(args),
+            0x03 | 0x16 => mysql_sql_command_arg(args),
+            0x04 => mysql_nonempty_text_arg(args),
+            0x07 => payload_len == 2 && args.len() == 1,
+            0x08 => payload_len <= 2 && args.len() == payload_len.saturating_sub(1),
+            0x0c | 0x19 | 0x1a => payload_len == 5 && args.len() == 4,
+            0x17 => payload_len >= 10 && args.len() >= 9,
+            0x18 => payload_len >= 7 && args.len() >= 6,
+            0x1b => payload_len == 3 && args.len() == 2,
+            0x1c => payload_len == 9 && args.len() == 8,
+            _ => false,
+        }
+    }
+
+    fn mysql_sql_command_arg(args: &[u8]) -> bool {
+        let statement = trim_ascii_space(args);
+        if statement.is_empty() {
+            return false;
+        }
+        let keywords: [&[u8]; 29] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"REPLACE",
+            b"CALL",
+            b"SHOW",
+            b"SET",
+            b"USE",
+            b"BEGIN",
+            b"START",
+            b"COMMIT",
+            b"ROLLBACK",
+            b"SAVEPOINT",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"EXPLAIN",
+            b"DESCRIBE",
+            b"DESC",
+            b"WITH",
+            b"ANALYZE",
+            b"OPTIMIZE",
+            b"LOCK",
+            b"UNLOCK",
+            b"GRANT",
+            b"REVOKE",
+            b"DO",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_ascii_keyword(statement, keyword))
+    }
+
+    fn mysql_nonempty_text_arg(args: &[u8]) -> bool {
+        !args.is_empty()
+            && args
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
     }
 
     fn redis_payload(payload: &[u8]) -> bool {
@@ -3198,6 +3290,31 @@ pub mod api {
         payload
             .get(word.len())
             .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
+    fn starts_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
+        let Some(head) = payload.get(..keyword.len()) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        payload
+            .get(keyword.len())
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+    }
+
+    fn trim_ascii_space(payload: &[u8]) -> &[u8] {
+        let start = payload
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(payload.len());
+        let end = payload
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(start);
+        &payload[start..end]
     }
 
     fn path_starts_with_any(path: &[u8], prefixes: &[&[u8]]) -> bool {
@@ -4103,6 +4220,18 @@ mod tests {
             payload
         }
 
+        fn mysql_packet(sequence_id: u8, body: &[u8]) -> Vec<u8> {
+            let length = body.len() as u32;
+            let mut payload = vec![
+                (length & 0xff) as u8,
+                ((length >> 8) & 0xff) as u8,
+                ((length >> 16) & 0xff) as u8,
+                sequence_id,
+            ];
+            payload.extend_from_slice(body);
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             payload_prefix: payload.to_vec(),
@@ -4498,6 +4627,38 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0x4a, 0, 0, 0, 10, b'8', b'.', b'0']).application(),
             api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x16, b'I', b'N', b'S', b'E', b'R', b'T', b' ', b'I', b'N', b'T', b'O']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(0, &[0x0e])).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(0, &[0x03])).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'n', b'o', b't', b's', b'q', b'l']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").application(),
