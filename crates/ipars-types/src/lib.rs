@@ -2949,21 +2949,91 @@ pub mod api {
     }
 
     fn mqtt_payload(payload: &[u8]) -> bool {
-        payload.len() >= 8 && payload[0] & 0xf0 == 0x10 && payload.windows(4).any(|w| w == b"MQTT")
+        if payload.len() < 8 || payload[0] != 0x10 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_remaining_length(payload) else {
+            return false;
+        };
+        if remaining_len < 10 {
+            return false;
+        }
+        let Some(protocol_name_len) = read_u16_be(payload, offset).map(|len| len as usize) else {
+            return false;
+        };
+        offset += 2;
+        let Some(protocol_name_end) = offset.checked_add(protocol_name_len) else {
+            return false;
+        };
+        let Some(variable_header_len) = 2_usize
+            .checked_add(protocol_name_len)
+            .and_then(|len| len.checked_add(4))
+        else {
+            return false;
+        };
+        if remaining_len < variable_header_len {
+            return false;
+        }
+        let Some(protocol_name) = payload.get(offset..protocol_name_end) else {
+            return false;
+        };
+        let Some(&protocol_level) = payload.get(protocol_name_end) else {
+            return false;
+        };
+        let Some(&connect_flags) = payload.get(protocol_name_end + 1) else {
+            return false;
+        };
+        let keepalive_end = protocol_name_end + 4;
+        if payload.get(protocol_name_end + 2..keepalive_end).is_none() || connect_flags & 0x01 != 0
+        {
+            return false;
+        }
+
+        (protocol_name == b"MQTT"
+            && (protocol_level == 4 || (protocol_level == 5 && remaining_len > 10)))
+            || (protocol_name == b"MQIsdp" && protocol_level == 3)
+    }
+
+    fn mqtt_remaining_length(payload: &[u8]) -> Option<(usize, usize)> {
+        let mut value = 0_usize;
+        let mut multiplier = 1_usize;
+        for offset in 1..=4 {
+            let byte = *payload.get(offset)?;
+            value = value.checked_add(((byte & 0x7f) as usize).checked_mul(multiplier)?)?;
+            if byte & 0x80 == 0 {
+                return Some((value, offset + 1));
+            }
+            multiplier = multiplier.checked_mul(128)?;
+        }
+        None
     }
 
     fn amqp_payload(payload: &[u8]) -> bool {
-        payload.starts_with(b"AMQP")
+        if payload.len() < 8 || payload.get(..4) != Some(b"AMQP") {
+            return false;
+        }
+        matches!(
+            (payload[4], payload[5], payload[6], payload[7]),
+            (0, 0, 9, 1) | (0, 1, 0, 0) | (3, 1, 0, 0)
+        )
     }
 
     fn cassandra_payload(payload: &[u8]) -> bool {
         if payload.len() < 9 {
             return false;
         }
-        let version = payload[0] & 0x7f;
+        let version_byte = payload[0];
+        let version = version_byte & 0x7f;
+        let flags = payload[1];
         let opcode = payload[4];
         let body_len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
-        (3..=5).contains(&version) && (1..=0x10).contains(&opcode) && body_len <= 16_777_216
+        let valid_opcode = matches!(opcode, 0x00 | 0x01 | 0x02 | 0x03 | 0x05..=0x10);
+
+        matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
+            && (3..=5).contains(&version)
+            && flags & !0x1f == 0
+            && valid_opcode
+            && body_len <= 16_777_216
     }
 
     fn mongodb_payload(payload: &[u8]) -> bool {
@@ -2972,22 +3042,38 @@ pub mod api {
         }
         let message_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let opcode = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-        (16..=100_000_000).contains(&message_len)
-            && matches!(
-                opcode,
-                1 | 1000
-                    | 2001
-                    | 2002
-                    | 2003
-                    | 2004
-                    | 2005
-                    | 2006
-                    | 2007
-                    | 2010
-                    | 2011
-                    | 2012
-                    | 2013
-            )
+        if !(16..=100_000_000).contains(&message_len) {
+            return false;
+        }
+
+        match opcode {
+            1 => message_len >= 36 && payload.len() >= 20,
+            1000 | 2001 | 2002 | 2003 | 2005 | 2006 | 2007 | 2010 | 2011 | 2012 => {
+                message_len >= 20 && payload.len() >= 20
+            }
+            2004 => mongodb_op_query_payload(payload, message_len),
+            2013 => mongodb_op_msg_payload(payload, message_len),
+            _ => false,
+        }
+    }
+
+    fn mongodb_op_query_payload(payload: &[u8], message_len: u32) -> bool {
+        if message_len < 34 || payload.len() < 20 {
+            return false;
+        }
+        let flags = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
+        flags & !0xfe == 0
+    }
+
+    fn mongodb_op_msg_payload(payload: &[u8], message_len: u32) -> bool {
+        if message_len < 26 || payload.len() < 21 {
+            return false;
+        }
+        let flags = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
+        let section_kind = payload[20];
+        flags & !0x0001_0003 == 0
+            && (flags & 0x0000_0001 == 0 || message_len >= 30)
+            && matches!(section_kind, 0 | 1)
     }
 
     fn elasticsearch_transport_payload(payload: &[u8]) -> bool {
@@ -4311,17 +4397,52 @@ mod tests {
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(b"AMQP\0\0\x09\x01").application(),
             api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(b"AMQPxxxx").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
             api::AgentPacketFlowApplication::Cassandra
         );
         assert_eq!(
+            observation_for_payload(&[0x04, 0xe0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x04, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0,
+                0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
             observation_for_payload(&[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0,])
                 .application(),
-            api::AgentPacketFlowApplication::MongoDb
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0, 0, 0, 0, 0, 3, 5, 0, 0, 0,
+                0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
