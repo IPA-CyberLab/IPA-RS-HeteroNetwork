@@ -2412,10 +2412,74 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::OpenTelemetry);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
+            return Some(AgentPacketFlowApplication::Kafka);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"nats") {
+            return Some(AgentPacketFlowApplication::Nats);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mqtt")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mosquitto")
+            || tls_sni_hostname_has_label_prefix(hostname, b"emqx")
+        {
+            return Some(AgentPacketFlowApplication::Mqtt);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"amqp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"amqps")
+            || tls_sni_hostname_has_label_prefix(hostname, b"rabbitmq")
+        {
+            return Some(AgentPacketFlowApplication::Amqp);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"cassandra") {
+            return Some(AgentPacketFlowApplication::Cassandra);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mongodb")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mongo")
+        {
+            return Some(AgentPacketFlowApplication::MongoDb);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
             || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
         {
             return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"postgres")
+            || tls_sni_hostname_has_label_prefix(hostname, b"postgresql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"pg")
+        {
+            return Some(AgentPacketFlowApplication::Postgres);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mysql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mariadb")
+        {
+            return Some(AgentPacketFlowApplication::Mysql);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"redis")
+            || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
+        {
+            return Some(AgentPacketFlowApplication::Redis);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"memcached")
+            || tls_sni_hostname_has_label_prefix(hostname, b"memcache")
+        {
+            return Some(AgentPacketFlowApplication::Memcached);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ldap")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ldaps")
+        {
+            return Some(AgentPacketFlowApplication::Ldap);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
+            return Some(AgentPacketFlowApplication::Smb);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"rdp") {
+            return Some(AgentPacketFlowApplication::Rdp);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ssh") {
+            return Some(AgentPacketFlowApplication::Ssh);
         }
         None
     }
@@ -3661,6 +3725,82 @@ mod tests {
             ))
             .application(),
             api::AgentPacketFlowApplication::Elasticsearch
+        );
+        for (hostname, expected) in [
+            (
+                "grpc-api.default.svc",
+                api::AgentPacketFlowApplication::Grpc,
+            ),
+            (
+                "kafka-broker.messaging.svc",
+                api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                "nats-leaf.messaging.svc",
+                api::AgentPacketFlowApplication::Nats,
+            ),
+            ("mqtt-broker.iot.svc", api::AgentPacketFlowApplication::Mqtt),
+            (
+                "rabbitmq.messaging.svc",
+                api::AgentPacketFlowApplication::Amqp,
+            ),
+            (
+                "cassandra-seed.db.svc",
+                api::AgentPacketFlowApplication::Cassandra,
+            ),
+            (
+                "mongo-router.db.svc",
+                api::AgentPacketFlowApplication::MongoDb,
+            ),
+            (
+                "postgres-primary.db.svc",
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                "pg-analytics.db.svc",
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                "mysql-primary.db.svc",
+                api::AgentPacketFlowApplication::Mysql,
+            ),
+            (
+                "mariadb-replica.db.svc",
+                api::AgentPacketFlowApplication::Mysql,
+            ),
+            (
+                "redis-cache.cache.svc",
+                api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                "valkey-primary.cache.svc",
+                api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                "memcache-shard.cache.svc",
+                api::AgentPacketFlowApplication::Memcached,
+            ),
+            (
+                "ldaps-directory.identity.svc",
+                api::AgentPacketFlowApplication::Ldap,
+            ),
+            (
+                "smb-files.storage.svc",
+                api::AgentPacketFlowApplication::Smb,
+            ),
+            ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
+            ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_sni(hostname)).application(),
+                expected,
+                "{hostname}"
+            );
+        }
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("notkafka.example.com"))
+                .application(),
+            api::AgentPacketFlowApplication::Https
         );
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("api.example.com")).application(),
