@@ -4,8 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_types::{
-    CandidateSource, EndpointCandidate, EndpointCandidateKind, NatFilteringObservation,
-    NatFilteringProbeKind, NatProbeObservation, NodeId,
+    endpoint_addr_is_usable, CandidateSource, EndpointCandidate, EndpointCandidateKind,
+    NatFilteringObservation, NatFilteringProbeKind, NatProbeObservation, NodeId,
 };
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
@@ -51,6 +51,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_server: SocketAddr,
     ) -> Result<NatProbeObservation, StunError> {
+        validate_stun_server(stun_server)?;
         let socket = UdpSocket::bind(local_bind).await?;
         observe_binding_with_socket(&socket, stun_server).await
     }
@@ -60,6 +61,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_servers: &[SocketAddr],
     ) -> Result<Vec<NatProbeObservation>, StunError> {
+        validate_stun_servers(stun_servers)?;
         let socket = UdpSocket::bind(local_bind).await?;
         let mut observations = Vec::with_capacity(stun_servers.len());
         for stun_server in stun_servers {
@@ -73,6 +75,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_server: SocketAddr,
     ) -> Result<Vec<NatFilteringObservation>, StunError> {
+        validate_stun_server(stun_server)?;
         let socket = UdpSocket::bind(local_bind).await?;
         let baseline = match tokio::time::timeout(
             FILTERING_PROBE_TIMEOUT,
@@ -127,6 +130,22 @@ impl UdpStunProbe {
 
         Ok(observations)
     }
+}
+
+fn validate_stun_servers(stun_servers: &[SocketAddr]) -> Result<(), StunError> {
+    for stun_server in stun_servers {
+        validate_stun_server(*stun_server)?;
+    }
+    Ok(())
+}
+
+fn validate_stun_server(stun_server: SocketAddr) -> Result<(), StunError> {
+    if !endpoint_addr_is_usable(stun_server) {
+        return Err(StunError::InvalidResponse(format!(
+            "STUN server {stun_server} is unusable"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -887,6 +906,49 @@ mod tests {
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_ne!(candidate.addr.port(), 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_rejects_unusable_stun_servers_before_send() {
+        let error = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddr::from(([203, 0, 113, 10], 0)),
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 203.0.113.10:0 is unusable")
+        ));
+
+        let error = UdpStunProbe
+            .observe_binding_many(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                &[
+                    SocketAddr::from(([203, 0, 113, 10], 3478)),
+                    SocketAddr::from(([0, 0, 0, 0], 3478)),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 0.0.0.0:3478 is unusable")
+        ));
+
+        let error = UdpStunProbe
+            .observe_filtering(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddr::from(([224, 0, 0, 1], 3478)),
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 224.0.0.1:3478 is unusable")
+        ));
     }
 
     #[tokio::test]
