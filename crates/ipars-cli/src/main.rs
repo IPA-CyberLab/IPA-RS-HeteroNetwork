@@ -4538,8 +4538,11 @@ fn validate_kubernetes_restricted_cidrs(
 ) -> anyhow::Result<()> {
     let mut seen = BTreeSet::new();
     for cidr in cidrs {
-        if cidr.prefix_len() == 0 {
-            anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            if reason == "unrestricted" {
+                anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+            }
+            anyhow::bail!("{flag} must not include {reason} CIDR {cidr}; {guidance}");
         }
         let canonical = cidr.trunc();
         if !seen.insert(canonical) {
@@ -8134,6 +8137,11 @@ mod tests {
 
         assert!(helpers.contains("ipars.validateRestrictedCidr"));
         assert!(helpers.contains("must not be an unrestricted CIDR"));
+        assert!(helpers.contains("must not include unspecified CIDRs"));
+        assert!(helpers.contains("must not include loopback CIDRs"));
+        assert!(helpers.contains("must not include link-local CIDRs"));
+        assert!(helpers.contains("must not include multicast CIDRs"));
+        assert!(helpers.contains("must not include broadcast CIDRs"));
         assert!(service_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
         ));
@@ -10892,6 +10900,19 @@ mod tests {
             "--agent-api-network-policy-cidr must not include unrestricted CIDR 0.0.0.0/0"
         ));
 
+        let mut loopback_agent_policy = base_k8s_install_args();
+        loopback_agent_policy.enable_network_policy = true;
+        loopback_agent_policy.network_policy_acknowledge_host_network = true;
+        loopback_agent_policy.expose_agent_api = true;
+        loopback_agent_policy.agent_api_network_policy_cidrs = vec!["127.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(loopback_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject loopback CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not include loopback CIDR 127.0.0.0/8"
+        ));
+
         let mut unrestricted_relay_policy = base_k8s_install_args();
         unrestricted_relay_policy.enable_network_policy = true;
         unrestricted_relay_policy.network_policy_acknowledge_host_network = true;
@@ -11824,6 +11845,20 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-allow-source-cidr must not include unrestricted CIDR ::/0"));
+
+        let mut link_local_agent_source_range = base_k8s_install_args();
+        link_local_agent_source_range.expose_agent_api = true;
+        link_local_agent_source_range.allow_public_service_exposure = true;
+        link_local_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        link_local_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["169.254.0.0/16".parse()?];
+        let error = match k8s_install_plan(link_local_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject link-local CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not include link-local CIDR 169.254.0.0/16"
+        ));
 
         let mut duplicate_agent_source_range = base_k8s_install_args();
         duplicate_agent_source_range.expose_agent_api = true;
