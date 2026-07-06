@@ -839,7 +839,7 @@ impl LoadReport {
                 runtime_dir.display()
             )
         })?;
-        validate_daemon_retained_runtime_has_no_sensitive_files(runtime_dir)?;
+        validate_daemon_retained_runtime_has_no_transient_files(runtime_dir)?;
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         for child in &manifest.children {
@@ -1086,7 +1086,7 @@ fn validate_daemon_retained_path_mode(
     Ok(())
 }
 
-fn validate_daemon_retained_runtime_has_no_sensitive_files(
+fn validate_daemon_retained_runtime_has_no_transient_files(
     runtime_dir: &Path,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(runtime_dir).with_context(|| {
@@ -1114,6 +1114,13 @@ fn validate_daemon_retained_runtime_has_no_sensitive_files(
         if file_name.ends_with(DAEMON_AGENT_STATE_FILE_SUFFIX) {
             bail!(
                 "daemon load scenario retained runtime directory {} still contains agent state file {} after child shutdown",
+                runtime_dir.display(),
+                entry.path().display()
+            );
+        }
+        if is_daemon_runtime_manifest_temp_name(&file_name) {
+            bail!(
+                "daemon load scenario retained runtime directory {} still contains temporary manifest file {} after atomic manifest replacement",
                 runtime_dir.display(),
                 entry.path().display()
             );
@@ -3103,6 +3110,10 @@ fn daemon_runtime_manifest_temp_path(runtime_dir: &Path) -> PathBuf {
     ))
 }
 
+fn is_daemon_runtime_manifest_temp_name(name: &str) -> bool {
+    name.contains(DAEMON_RUNTIME_MANIFEST_FILE) && name.ends_with(".tmp")
+}
+
 fn write_daemon_runtime_manifest(
     runtime_dir: &Path,
     manifest: DaemonRuntimeManifest,
@@ -4549,6 +4560,32 @@ mod tests {
         assert!(error.contains("agent state"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut retained_manifest_temp = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &retained_manifest_temp,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        retained_manifest_temp.daemon_runtime_dir = Some(runtime_dir.clone());
+        retained_manifest_temp.daemon_runtime_manifest = Some(manifest_path);
+        std::fs::write(
+            runtime_dir.join(format!(".{DAEMON_RUNTIME_MANIFEST_FILE}.synthetic.tmp")),
+            "{}\n",
+        )?;
+        let error = match retained_manifest_temp.validate_success() {
+            Ok(_) => bail!("retained runtime with temporary manifest should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("temporary manifest"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut stale_generated_timestamp = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &stale_generated_timestamp,
@@ -5403,9 +5440,10 @@ mod tests {
         let stale_temp_manifest_count = std::fs::read_dir(&runtime_dir)?
             .filter_map(Result::ok)
             .filter(|entry| {
-                entry.file_name().to_str().is_some_and(|name| {
-                    name.contains(DAEMON_RUNTIME_MANIFEST_FILE) && name.ends_with(".tmp")
-                })
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_daemon_runtime_manifest_temp_name)
             })
             .count();
         assert_eq!(stale_temp_manifest_count, 0);
