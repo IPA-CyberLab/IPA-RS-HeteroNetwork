@@ -4159,53 +4159,250 @@ pub mod api {
     }
 
     fn kafka_payload(payload: &[u8]) -> bool {
-        if payload.len() < 12 {
-            return false;
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            if payload.len().saturating_sub(offset) < 4 {
+                return frame_count > 0;
+            }
+            match kafka_request_frame(payload, offset) {
+                Some(KafkaFrameParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(KafkaFrameParse::Incomplete) => {
+                    return true;
+                }
+                None => return false,
+            }
         }
-        let frame_len =
-            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-        let api_key = u16::from_be_bytes([payload[4], payload[5]]);
-        let api_version = u16::from_be_bytes([payload[6], payload[7]]);
-        if !(8..=100_000_000).contains(&frame_len) || api_key > 92 || api_version > 20 {
-            return false;
-        }
-        let Some(frame_end) = 4_usize.checked_add(frame_len) else {
-            return false;
-        };
-        if frame_end < 12 {
-            return false;
-        }
-        if frame_len == 8 {
-            return true;
-        }
-        if payload.len() < 14 {
-            return false;
-        }
-        kafka_client_id_header_payload(&payload[12..], frame_len - 8)
+        frame_count > 0
     }
 
-    fn kafka_client_id_header_payload(payload: &[u8], remaining_frame_len: usize) -> bool {
-        if remaining_frame_len < 2 || payload.len() < 2 {
-            return false;
+    enum KafkaFrameParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum KafkaHeaderParse {
+        Complete,
+        Incomplete,
+    }
+
+    enum KafkaVarintParse {
+        Complete(u64, usize),
+        Incomplete,
+    }
+
+    fn kafka_request_frame(payload: &[u8], offset: usize) -> Option<KafkaFrameParse> {
+        let frame_len = read_u32_be(payload, offset)? as usize;
+        let header_offset = offset.checked_add(4)?;
+        let api_key = read_u16_be(payload, header_offset)?;
+        let api_version = read_u16_be(payload, header_offset.checked_add(2)?)?;
+        if !(8..=100_000_000).contains(&frame_len) || api_key > 92 || api_version > 20 {
+            return None;
+        }
+        let frame_end = header_offset.checked_add(frame_len)?;
+        let correlation_id_end = header_offset.checked_add(8)?;
+        if payload.len() < correlation_id_end {
+            return Some(KafkaFrameParse::Incomplete);
+        }
+        if frame_len == 8 {
+            return if payload.len() < frame_end {
+                Some(KafkaFrameParse::Incomplete)
+            } else {
+                Some(KafkaFrameParse::Complete(frame_end))
+            };
+        }
+        let header_tail = payload.get(correlation_id_end..)?;
+        let remaining_frame_len = frame_len - 8;
+        let header_parse = kafka_request_header_payload(header_tail, remaining_frame_len)?;
+        match header_parse {
+            KafkaHeaderParse::Complete => {
+                if payload.len() < frame_end {
+                    Some(KafkaFrameParse::Incomplete)
+                } else {
+                    Some(KafkaFrameParse::Complete(frame_end))
+                }
+            }
+            KafkaHeaderParse::Incomplete => Some(KafkaFrameParse::Incomplete),
+        }
+    }
+
+    fn kafka_request_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        kafka_nullable_client_id_header_payload(payload, remaining_frame_len)
+            .or_else(|| kafka_compact_client_id_header_payload(payload, remaining_frame_len))
+    }
+
+    fn kafka_nullable_client_id_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        if remaining_frame_len < 2 {
+            return None;
+        }
+        if payload.len() < 2 {
+            return Some(KafkaHeaderParse::Incomplete);
         }
         let client_id_len = i16::from_be_bytes([payload[0], payload[1]]);
         if client_id_len == -1 {
-            return true;
+            return Some(KafkaHeaderParse::Complete);
         }
         if client_id_len < 0 {
-            return false;
-        }
-        let client_id_len = client_id_len as usize;
-        let Some(header_len) = 2_usize.checked_add(client_id_len) else {
-            return false;
+            return None;
         };
+        let client_id_len = client_id_len as usize;
+        let header_len = 2_usize.checked_add(client_id_len)?;
         if client_id_len > 1_024 || header_len > remaining_frame_len {
-            return false;
+            return None;
         }
         if payload.len() < header_len {
+            return Some(KafkaHeaderParse::Incomplete);
+        }
+        kafka_client_id_payload(&payload[2..header_len]).then_some(KafkaHeaderParse::Complete)
+    }
+
+    fn kafka_compact_client_id_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        let (client_id_len_plus_one, client_id_offset) =
+            match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                KafkaVarintParse::Complete(value, offset) => (value, offset),
+                KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+            };
+        let client_id_remaining = remaining_frame_len.checked_sub(client_id_offset)?;
+        let client_id_len = client_id_len_plus_one.saturating_sub(1) as usize;
+        let client_id_end = client_id_offset.checked_add(client_id_len)?;
+        if client_id_len > 1_024 || client_id_len > client_id_remaining {
+            return None;
+        }
+        if payload.len() < client_id_end {
+            return Some(KafkaHeaderParse::Incomplete);
+        }
+        if !kafka_client_id_payload(&payload[client_id_offset..client_id_end]) {
+            return None;
+        }
+        let tag_payload = payload.get(client_id_end..)?;
+        let tag_count_remaining = remaining_frame_len.checked_sub(client_id_end)?;
+        let (tags_len, tags_len_bytes) =
+            match kafka_unsigned_varint_prefix(tag_payload, tag_count_remaining)? {
+                KafkaVarintParse::Complete(value, offset) => (value, offset),
+                KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+            };
+        if tags_len > 16 || tags_len_bytes > tag_count_remaining {
+            return None;
+        };
+        let tags_len = tags_len as usize;
+        let tag_section_remaining = tag_count_remaining.checked_sub(tags_len_bytes)?;
+        if tags_len == 0 {
+            return Some(KafkaHeaderParse::Complete);
+        }
+        if tags_len.checked_mul(2)? > tag_section_remaining {
+            return None;
+        }
+        kafka_tag_buffer_payload(
+            tag_payload.get(tags_len_bytes..)?,
+            tags_len,
+            tag_section_remaining,
+        )
+    }
+
+    fn kafka_tag_buffer_payload(
+        mut payload: &[u8],
+        tags_len: usize,
+        mut remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        let mut previous_tag = None;
+        for _ in 0..tags_len {
+            let (tag, tag_len_bytes) =
+                match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                    KafkaVarintParse::Complete(value, offset) => (value, offset),
+                    KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+                };
+            if tag_len_bytes > remaining_frame_len {
+                return None;
+            };
+            if previous_tag.is_some_and(|previous| tag <= previous) || tag > u32::MAX as u64 {
+                return None;
+            }
+            previous_tag = Some(tag);
+            payload = payload.get(tag_len_bytes..)?;
+            remaining_frame_len = remaining_frame_len.checked_sub(tag_len_bytes)?;
+            let (size, size_len_bytes) =
+                match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                    KafkaVarintParse::Complete(value, offset) => (value, offset),
+                    KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+                };
+            if size_len_bytes > remaining_frame_len {
+                return None;
+            };
+            let size = size as usize;
+            payload = payload.get(size_len_bytes..)?;
+            remaining_frame_len = remaining_frame_len.checked_sub(size_len_bytes)?;
+            if size > remaining_frame_len {
+                return None;
+            }
+            if payload.len() < size {
+                return Some(KafkaHeaderParse::Incomplete);
+            }
+            payload = payload.get(size..)?;
+            remaining_frame_len -= size;
+        }
+        Some(KafkaHeaderParse::Complete)
+    }
+
+    fn kafka_client_id_payload(client_id: &[u8]) -> bool {
+        client_id.is_empty()
+            || (std::str::from_utf8(client_id).is_ok()
+                && client_id
+                    .iter()
+                    .all(|byte| !byte.is_ascii_control() || *byte == b'\t'))
+    }
+
+    fn kafka_unsigned_varint_prefix(
+        payload: &[u8],
+        remaining_len: usize,
+    ) -> Option<KafkaVarintParse> {
+        if remaining_len == 0 {
+            return None;
+        }
+        let available_len = payload.len().min(remaining_len);
+        let available = payload.get(..available_len)?;
+        if let Some((value, offset)) = kafka_unsigned_varint(available) {
+            return Some(KafkaVarintParse::Complete(value, offset));
+        }
+        (payload.len() < remaining_len && kafka_unsigned_varint_incomplete(available))
+            .then_some(KafkaVarintParse::Incomplete)
+    }
+
+    fn kafka_unsigned_varint(payload: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        for (index, byte) in payload.iter().take(10).enumerate() {
+            value |= ((byte & 0x7f) as u64).checked_shl((7 * index) as u32)?;
+            if byte & 0x80 == 0 {
+                return Some((value, index + 1));
+            }
+        }
+        None
+    }
+
+    fn kafka_unsigned_varint_incomplete(payload: &[u8]) -> bool {
+        if payload.is_empty() {
             return true;
         }
-        std::str::from_utf8(&payload[2..header_len]).is_ok()
+        for byte in payload.iter().take(10) {
+            if byte & 0x80 == 0 {
+                return false;
+            }
+        }
+        payload.len() < 10
     }
 
     fn nats_payload(payload: &[u8]) -> bool {
@@ -6401,6 +6598,69 @@ mod tests {
             payload
         }
 
+        fn kafka_request(
+            api_key: u16,
+            api_version: u16,
+            client_id: Option<&[u8]>,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&api_key.to_be_bytes());
+            frame.extend_from_slice(&api_version.to_be_bytes());
+            frame.extend_from_slice(&1_u32.to_be_bytes());
+            match client_id {
+                Some(client_id) => {
+                    frame.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+                    frame.extend_from_slice(client_id);
+                }
+                None => frame.extend_from_slice(&(-1_i16).to_be_bytes()),
+            }
+            frame.extend_from_slice(body);
+            let mut payload = (frame.len() as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&frame);
+            payload
+        }
+
+        fn kafka_flexible_request(
+            api_key: u16,
+            api_version: u16,
+            client_id: Option<&[u8]>,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&api_key.to_be_bytes());
+            frame.extend_from_slice(&api_version.to_be_bytes());
+            frame.extend_from_slice(&1_u32.to_be_bytes());
+            match client_id {
+                Some(client_id) => {
+                    frame.extend_from_slice(&kafka_unsigned_varint(client_id.len() as u64 + 1));
+                    frame.extend_from_slice(client_id);
+                }
+                None => frame.push(0),
+            }
+            frame.push(0);
+            frame.extend_from_slice(body);
+            let mut payload = (frame.len() as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&frame);
+            payload
+        }
+
+        fn kafka_unsigned_varint(mut value: u64) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                encoded.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            encoded
+        }
+
         fn mqtt_connect_packet(
             protocol_level: u8,
             connect_flags: u8,
@@ -7376,6 +7636,47 @@ mod tests {
             api::AgentPacketFlowApplication::Kafka
         );
         assert_eq!(
+            observation_for_payload(&kafka_request(3, 9, Some(b"rust-client"), b"body"))
+                .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(18, 3, None, b"body")).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_flexible_request(
+                18,
+                3,
+                Some(b"rust-client"),
+                b"body"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_pipelined = kafka_request(18, 3, None, b"");
+        kafka_pipelined.extend_from_slice(&kafka_request(3, 9, Some(b"rust-client"), b""));
+        assert_eq!(
+            observation_for_payload(&kafka_pipelined).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_partial_body = kafka_request(3, 9, Some(b"rust-client"), b"body");
+        kafka_partial_body.truncate(kafka_partial_body.len() - 2);
+        assert_eq!(
+            observation_for_payload(&kafka_partial_body).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_with_trailing_junk = kafka_request(18, 3, None, b"");
+        kafka_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&kafka_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(18, 3, Some(b"bad\0client"), b"")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(&[
                 0, 0, 0, 21, 0, 18, 0, 3, 0, 0, 0, 1, 0, 11, b'r', b'u', b's', b't', b'-', b'c',
                 b'l', b'i', b'e', b'n', b't',
@@ -7384,7 +7685,7 @@ mod tests {
             api::AgentPacketFlowApplication::Kafka
         );
         assert_eq!(
-            observation_for_payload(&[0, 0, 0, 7, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
+            observation_for_payload(&[0, 0, 0, 7, 0, 4, 0, 9, 0, 0, 0, 1]).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
