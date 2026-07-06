@@ -186,8 +186,9 @@
 {{- if and (eq $serviceAccountCreate "false") .Values.serviceAccount.annotations -}}
 {{- fail "serviceAccount.annotations require serviceAccount.create=true" -}}
 {{- end -}}
-{{- range $key, $_ := .Values.serviceAccount.annotations -}}
+{{- range $key, $value := .Values.serviceAccount.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "serviceAccount.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "serviceAccount.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
@@ -270,8 +271,9 @@
 {{- include "ipars.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
 {{- include "ipars.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
 {{- end -}}
-{{- range $key, $_ := .Values.agent.podAnnotations -}}
+{{- range $key, $value := .Values.agent.podAnnotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.podAnnotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.podAnnotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- range $key, $value := .Values.agent.nodeSelector -}}
 {{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}

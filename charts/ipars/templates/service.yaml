@@ -422,8 +422,9 @@
 {{- fail "agent.apiService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster" -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
-{{- range $key, $_ := .Values.agent.apiService.annotations -}}
+{{- range $key, $value := .Values.agent.apiService.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.apiService.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.apiService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
@@ -445,8 +446,9 @@
 {{- fail "agent.relayService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster" -}}
 {{- end -}}
 {{- if $relayServiceActive -}}
-{{- range $key, $_ := .Values.agent.relayService.annotations -}}
+{{- range $key, $value := .Values.agent.relayService.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.relayService.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.relayService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled }}

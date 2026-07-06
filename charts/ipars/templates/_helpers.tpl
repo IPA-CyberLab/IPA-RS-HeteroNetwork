@@ -290,6 +290,21 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateAnnotationValue" -}}
+{{- $rawValue := .value -}}
+{{- $path := .path -}}
+{{- if not (kindIs "string" $rawValue) -}}
+{{- fail (printf "%s annotation value must be a string" $path) -}}
+{{- end -}}
+{{- $value := printf "%v" $rawValue -}}
+{{- if gt (len $value) 262144 -}}
+{{- fail (printf "%s annotation value exceeds 262144 bytes" $path) -}}
+{{- end -}}
+{{- if regexMatch "[[:cntrl:]]" $value -}}
+{{- fail (printf "%s annotation value must not contain control characters" $path) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateOptionalQualifiedNameWithPrefix" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}

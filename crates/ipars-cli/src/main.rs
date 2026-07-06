@@ -8162,6 +8162,40 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_validates_annotation_values() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateAnnotationValue\""));
+        assert!(helpers.contains("annotation value must be a string"));
+        assert!(helpers.contains("annotation value exceeds 262144 bytes"));
+        assert!(helpers.contains("annotation value must not contain control characters"));
+        assert!(daemonset.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.podAnnotations.%s\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.apiService.annotations.%s\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.relayService.annotations.%s\""
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")
