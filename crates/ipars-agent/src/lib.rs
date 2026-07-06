@@ -4438,6 +4438,23 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(hinted_postgres_match.peer, peer_b_id);
+        let elasticsearch_transport_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 35)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: vec![
+                        b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 0, 0, 1, 0, 0, 0,
+                        0,
+                    ],
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(elasticsearch_transport_match.peer, peer_b_id);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
@@ -4447,8 +4464,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 13);
-        assert_eq!(metrics.packet_flow_match_count, 11);
+        assert_eq!(metrics.packet_flow_observation_count, 14);
+        assert_eq!(metrics.packet_flow_match_count, 12);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -4460,7 +4477,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            11
+            12
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -4492,6 +4509,10 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Rdp), 1);
+        assert_eq!(
+            application_count(AgentPacketFlowApplication::Elasticsearch),
+            1
+        );
         assert_eq!(metrics.packet_flow_filtered_count, 5);
         assert_eq!(
             metrics

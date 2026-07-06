@@ -1965,6 +1965,10 @@ pub mod api {
                     cassandra_payload(payload).then_some(AgentPacketFlowApplication::Cassandra)
                 })
                 .or_else(|| mongodb_payload(payload).then_some(AgentPacketFlowApplication::MongoDb))
+                .or_else(|| {
+                    elasticsearch_transport_payload(payload)
+                        .then_some(AgentPacketFlowApplication::Elasticsearch)
+                })
         }
     }
 
@@ -2518,6 +2522,17 @@ pub mod api {
                     | 2012
                     | 2013
             )
+    }
+
+    fn elasticsearch_transport_payload(payload: &[u8]) -> bool {
+        if payload.len() < 19 || payload.get(..2) != Some(b"ES") {
+            return false;
+        }
+        let message_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        let status = payload[14];
+        let version_id = u32::from_be_bytes([payload[15], payload[16], payload[17], payload[18]]);
+
+        (13..=128 * 1024 * 1024).contains(&message_len) && status & !0x0f == 0 && version_id != 0
     }
 
     fn starts_ascii_word(payload: &[u8], word: &[u8]) -> bool {
@@ -3320,6 +3335,20 @@ mod tests {
             observation_for_payload(&[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0,])
                 .application(),
             api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 0, 0, 1, 0, 0, 0, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x40, 0, 0, 0, 1, 0, 0, 0, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
     }
 
