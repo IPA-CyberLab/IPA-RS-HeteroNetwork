@@ -1033,6 +1033,42 @@ impl LoadReport {
                 self.daemon_agent_readiness_timeout_seconds
             );
         }
+        let measurement = manifest.measurement.context(
+            "daemon load scenario retained completed manifest is missing measurement summary",
+        )?;
+        if measurement.relay_udp_packets_sent != self.relay_udp_packets_sent
+            || measurement.relay_udp_packets_received != self.relay_udp_packets_received
+            || measurement.relay_udp_payload_bytes_sent != self.relay_udp_payload_bytes_sent
+            || measurement.relay_udp_payload_bytes_received != self.relay_udp_payload_bytes_received
+            || measurement.failover_relay_udp_packets_sent
+                != self.daemon_failover_relay_udp_packets_sent
+            || measurement.failover_relay_udp_packets_received
+                != self.daemon_failover_relay_udp_packets_received
+            || measurement.failover_relay_udp_payload_bytes_sent
+                != self.daemon_failover_relay_udp_payload_bytes_sent
+            || measurement.failover_relay_udp_payload_bytes_received
+                != self.daemon_failover_relay_udp_payload_bytes_received
+            || measurement.relay_forwarded_bytes_reported != self.relay_forwarded_bytes_reported
+            || measurement.relay_active_sessions_reported != self.relay_active_sessions_reported
+            || measurement.control_plane_failover_checked
+                != self.daemon_control_plane_failover_checked
+            || measurement.control_plane_failover_survivor_endpoints
+                != self.daemon_control_plane_failover_survivor_endpoints
+        {
+            bail!(
+                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
+                measurement.relay_udp_packets_received,
+                self.relay_udp_packets_received,
+                measurement.failover_relay_udp_packets_received,
+                self.daemon_failover_relay_udp_packets_received,
+                measurement.relay_forwarded_bytes_reported,
+                self.relay_forwarded_bytes_reported,
+                measurement.relay_active_sessions_reported,
+                self.relay_active_sessions_reported,
+                measurement.control_plane_failover_checked,
+                self.daemon_control_plane_failover_checked
+            );
+        }
         if manifest.control_plane_urls.len() != self.daemon_control_plane_processes {
             bail!(
                 "daemon load scenario retained manifest recorded {} control-plane URLs, expected {}",
@@ -2556,7 +2592,22 @@ async fn run_daemon_scenario(
         )?;
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
     }
-    let completed_manifest_path = services.stop_all_for_completed_manifest()?;
+    let completed_measurement = DaemonRuntimeManifestMeasurement {
+        relay_udp_packets_sent: relay_packets_sent,
+        relay_udp_packets_received: relay_packets_received,
+        relay_udp_payload_bytes_sent: relay_payload_bytes_sent,
+        relay_udp_payload_bytes_received: relay_payload_bytes_received,
+        failover_relay_udp_packets_sent,
+        failover_relay_udp_packets_received,
+        failover_relay_udp_payload_bytes_sent,
+        failover_relay_udp_payload_bytes_received,
+        relay_forwarded_bytes_reported: forwarded_bytes,
+        relay_active_sessions_reported: status.capability.active_sessions as usize,
+        control_plane_failover_checked: failover_checked,
+        control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
+    };
+    let completed_manifest_path =
+        services.stop_all_for_completed_manifest(completed_measurement)?;
 
     Ok(LoadReport {
         transport: TransportMode::Daemon,
@@ -3148,6 +3199,7 @@ struct DaemonRuntimeManifest {
     scenario: ScenarioName,
     phase: DaemonRuntimePhase,
     workload: DaemonRuntimeManifestWorkload,
+    measurement: Option<DaemonRuntimeManifestMeasurement>,
     runtime_dir: PathBuf,
     control_plane_urls: Vec<String>,
     signal_url: String,
@@ -3174,6 +3226,22 @@ struct DaemonRuntimeManifestWorkload {
     daemon_agent_readiness_timeout_seconds: u64,
     relay_packets_per_session: usize,
     relay_payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonRuntimeManifestMeasurement {
+    relay_udp_packets_sent: usize,
+    relay_udp_packets_received: usize,
+    relay_udp_payload_bytes_sent: u64,
+    relay_udp_payload_bytes_received: u64,
+    failover_relay_udp_packets_sent: usize,
+    failover_relay_udp_packets_received: usize,
+    failover_relay_udp_payload_bytes_sent: u64,
+    failover_relay_udp_payload_bytes_received: u64,
+    relay_forwarded_bytes_reported: u64,
+    relay_active_sessions_reported: usize,
+    control_plane_failover_checked: bool,
+    control_plane_failover_survivor_endpoints: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3216,6 +3284,16 @@ impl DaemonRuntimeManifestSeed {
         agent_urls: &[String],
         children: &[DaemonChild],
     ) -> anyhow::Result<PathBuf> {
+        self.write_with_measurement(phase, agent_urls, children, None)
+    }
+
+    fn write_with_measurement(
+        &self,
+        phase: DaemonRuntimePhase,
+        agent_urls: &[String],
+        children: &[DaemonChild],
+        measurement: Option<DaemonRuntimeManifestMeasurement>,
+    ) -> anyhow::Result<PathBuf> {
         let updated_at = Utc::now();
         write_daemon_runtime_manifest(
             &self.runtime_dir,
@@ -3223,6 +3301,7 @@ impl DaemonRuntimeManifestSeed {
                 scenario: self.scenario,
                 phase,
                 workload: self.workload,
+                measurement,
                 runtime_dir: self.runtime_dir.clone(),
                 control_plane_urls: self.control_plane_urls.clone(),
                 signal_url: self.signal_url.clone(),
@@ -3680,11 +3759,19 @@ impl DaemonProcessGroup {
             .write(phase, &self.agent_urls, &self.children)
     }
 
-    fn stop_all_for_completed_manifest(&mut self) -> anyhow::Result<PathBuf> {
+    fn stop_all_for_completed_manifest(
+        &mut self,
+        measurement: DaemonRuntimeManifestMeasurement,
+    ) -> anyhow::Result<PathBuf> {
         stop_daemon_children(&mut self.children)?;
         remove_daemon_agent_state_files(&mut self.agent_state_paths)?;
         secure_daemon_retained_runtime_file_modes(&self.runtime_dir)?;
-        self.write_manifest(DaemonRuntimePhase::Completed)
+        self.manifest_seed.write_with_measurement(
+            DaemonRuntimePhase::Completed,
+            &self.agent_urls,
+            &self.children,
+            Some(measurement),
+        )
     }
 }
 
@@ -5586,6 +5673,60 @@ mod tests {
         assert!(error.contains("log diagnostics mismatch"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_manifest_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_manifest_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_manifest_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_manifest_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement.failover_relay_udp_packets_received -= 1;
+            }
+        })?;
+        let error = match mismatched_manifest_measurement.validate_success() {
+            Ok(_) => bail!(
+                "retained manifest with mismatched measurement summary should fail validation"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("measurement summary"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut missing_manifest_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &missing_manifest_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        missing_manifest_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        missing_manifest_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.measurement = None;
+        })?;
+        let error = match missing_manifest_measurement.validate_success() {
+            Ok(_) => bail!("retained manifest without measurement summary should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing measurement summary"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut duplicate_child_log_path = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &duplicate_child_log_path,
@@ -6847,11 +6988,13 @@ mod tests {
             runtime_dir.join("0000-agent.log"),
         )?);
 
-        let manifest_path = group.stop_all_for_completed_manifest()?;
+        let measurement = synthetic_manifest_measurement();
+        let manifest_path = group.stop_all_for_completed_manifest(measurement)?;
         let contents = std::fs::read_to_string(&manifest_path)?;
         let manifest: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
 
         assert_eq!(manifest.phase, DaemonRuntimePhase::Completed);
+        assert_eq!(manifest.measurement, Some(measurement));
         assert_eq!(manifest.children.len(), 1);
         assert_eq!(manifest.children[0].role, "agent");
         assert_eq!(
@@ -6890,7 +7033,8 @@ mod tests {
             runtime_dir.join("0000-agent.log"),
         )?);
 
-        let manifest_path = group.stop_all_for_completed_manifest()?;
+        let manifest_path =
+            group.stop_all_for_completed_manifest(synthetic_manifest_measurement())?;
 
         assert!(manifest_path.exists());
         assert!(!state_path.exists());
@@ -6917,7 +7061,8 @@ mod tests {
             runtime_dir.join("0000-agent.log"),
         )?);
 
-        let manifest_path = group.stop_all_for_completed_manifest()?;
+        let manifest_path =
+            group.stop_all_for_completed_manifest(synthetic_manifest_measurement())?;
 
         assert!(manifest_path.exists());
         #[cfg(unix)]
@@ -6962,7 +7107,7 @@ mod tests {
             last_exit: None,
         });
 
-        let error = match group.stop_all_for_completed_manifest() {
+        let error = match group.stop_all_for_completed_manifest(synthetic_manifest_measurement()) {
             Ok(_) => bail!("pre-shutdown child exit should fail completed manifest generation"),
             Err(error) => error.to_string(),
         };
@@ -7131,6 +7276,7 @@ mod tests {
         assert_eq!(decoded.scenario, manifest.scenario);
         assert_eq!(decoded.phase, DaemonRuntimePhase::StartupReady);
         assert_eq!(decoded.workload, manifest.workload);
+        assert_eq!(decoded.measurement, None);
         assert_eq!(decoded.runtime_dir, runtime_dir);
         assert_eq!(decoded.started_at, manifest.started_at);
         assert_eq!(decoded.updated_at, manifest.updated_at);
@@ -7171,6 +7317,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(initial.phase, DaemonRuntimePhase::ReservedEndpoints);
         assert_eq!(initial.workload, seed.workload);
+        assert_eq!(initial.measurement, None);
         assert_eq!(initial.started_at, seed.started_at);
         assert!(initial.updated_at >= initial.started_at);
         assert_eq!(initial.generated_at, initial.updated_at);
@@ -7204,6 +7351,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(updated.phase, DaemonRuntimePhase::SignalNegotiation);
         assert_eq!(updated.workload, seed.workload);
+        assert_eq!(updated.measurement, None);
         assert_eq!(updated.started_at, seed.started_at);
         assert!(updated.updated_at >= initial.updated_at);
         assert_eq!(updated.generated_at, updated.updated_at);
@@ -7660,6 +7808,17 @@ mod tests {
         let manifest: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(manifest.phase, DaemonRuntimePhase::Completed);
+        let manifest_measurement = manifest
+            .measurement
+            .context("daemon completed manifest did not record measurement summary")?;
+        assert_eq!(
+            manifest_measurement.failover_relay_udp_packets_received,
+            report.active_pair_count
+        );
+        assert_eq!(
+            manifest_measurement.failover_relay_udp_payload_bytes_received,
+            report.daemon_failover_relay_udp_payload_bytes_received
+        );
         assert_eq!(manifest.children.len(), report.daemon_processes);
         assert!(manifest
             .children
@@ -8096,6 +8255,7 @@ mod tests {
             scenario: ScenarioName::Three,
             phase: DaemonRuntimePhase::StartupReady,
             workload: synthetic_manifest_workload(),
+            measurement: None,
             runtime_dir,
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
@@ -8134,6 +8294,23 @@ mod tests {
             daemon_agent_readiness_timeout_seconds: 15,
             relay_packets_per_session: 1,
             relay_payload_bytes: 64,
+        }
+    }
+
+    fn synthetic_manifest_measurement() -> DaemonRuntimeManifestMeasurement {
+        DaemonRuntimeManifestMeasurement {
+            relay_udp_packets_sent: 6,
+            relay_udp_packets_received: 6,
+            relay_udp_payload_bytes_sent: 384,
+            relay_udp_payload_bytes_received: 384,
+            failover_relay_udp_packets_sent: 6,
+            failover_relay_udp_packets_received: 6,
+            failover_relay_udp_payload_bytes_sent: 384,
+            failover_relay_udp_payload_bytes_received: 384,
+            relay_forwarded_bytes_reported: 384,
+            relay_active_sessions_reported: 6,
+            control_plane_failover_checked: true,
+            control_plane_failover_survivor_endpoints: 1,
         }
     }
 
@@ -8189,6 +8366,24 @@ mod tests {
                 relay_packets_per_session: report.relay_packets_per_session,
                 relay_payload_bytes: report.relay_payload_bytes_per_packet,
             },
+            measurement: Some(DaemonRuntimeManifestMeasurement {
+                relay_udp_packets_sent: report.relay_udp_packets_sent,
+                relay_udp_packets_received: report.relay_udp_packets_received,
+                relay_udp_payload_bytes_sent: report.relay_udp_payload_bytes_sent,
+                relay_udp_payload_bytes_received: report.relay_udp_payload_bytes_received,
+                failover_relay_udp_packets_sent: report.daemon_failover_relay_udp_packets_sent,
+                failover_relay_udp_packets_received: report
+                    .daemon_failover_relay_udp_packets_received,
+                failover_relay_udp_payload_bytes_sent: report
+                    .daemon_failover_relay_udp_payload_bytes_sent,
+                failover_relay_udp_payload_bytes_received: report
+                    .daemon_failover_relay_udp_payload_bytes_received,
+                relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
+                relay_active_sessions_reported: report.relay_active_sessions_reported,
+                control_plane_failover_checked: report.daemon_control_plane_failover_checked,
+                control_plane_failover_survivor_endpoints: report
+                    .daemon_control_plane_failover_survivor_endpoints,
+            }),
             runtime_dir: runtime_dir.clone(),
             control_plane_urls: (0..report.daemon_control_plane_processes)
                 .map(|index| format!("http://127.0.0.1:31{index:03}"))

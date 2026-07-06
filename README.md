@@ -96,7 +96,8 @@ relay admission failure reasons, retained runtime manifest incompleteness, times
 readiness-timeout, endpoint, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
 mismatch, duplicate, empty, role-mismatched, or serial/order-skewed retained child logs, retained file permission/owner drift across logs, manifests, and store artifacts, unexpected retained runtime artifacts, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
-records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced
+records per-child log byte counts, redacted log-tail hashes, and completed relay/failover dataplane
+measurement counters in an owner-only atomically replaced
 runtime manifest, and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration
 visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
