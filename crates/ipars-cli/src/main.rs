@@ -1782,9 +1782,15 @@ fn parse_kubernetes_ip_family(value: &str) -> Result<String, String> {
 }
 
 fn parse_kubernetes_service_ip(value: &str) -> Result<IpAddr, String> {
-    value
+    let ip = value
         .parse::<IpAddr>()
-        .map_err(|_| format!("Service IP address must be IPv4 or IPv6; got {value}"))
+        .map_err(|_| format!("Service IP address must be IPv4 or IPv6; got {value}"))?;
+    if let Some(reason) = kubernetes_service_ip_rejection_reason(ip) {
+        return Err(format!(
+            "Service IP address must not use {reason} address {ip}"
+        ));
+    }
+    Ok(ip)
 }
 
 const KUBERNETES_NODE_PORT_MIN: u16 = 30000;
@@ -4487,7 +4493,7 @@ fn kubernetes_ip_family(ip: IpAddr) -> &'static str {
     }
 }
 
-fn kubernetes_external_service_ip_rejection_reason(ip: IpAddr) -> Option<&'static str> {
+fn kubernetes_service_ip_rejection_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(ip) if ip.is_unspecified() => Some("unspecified"),
         IpAddr::V4(ip) if ip.is_loopback() => Some("loopback"),
@@ -4502,11 +4508,15 @@ fn kubernetes_external_service_ip_rejection_reason(ip: IpAddr) -> Option<&'stati
     }
 }
 
-fn validate_kubernetes_external_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
-    if let Some(reason) = kubernetes_external_service_ip_rejection_reason(ip) {
+fn validate_kubernetes_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
+    if let Some(reason) = kubernetes_service_ip_rejection_reason(ip) {
         anyhow::bail!("{flag} must not use {reason} address {ip}");
     }
     Ok(())
+}
+
+fn validate_kubernetes_external_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
+    validate_kubernetes_service_ip(flag, ip)
 }
 
 fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyhow::Result<()> {
@@ -4575,6 +4585,7 @@ fn validate_kubernetes_service_cluster_ips(
         }
         return Ok(());
     };
+    validate_kubernetes_service_ip(&format!("--{flag_prefix}-cluster-ip"), cluster_ip)?;
     let cluster_ip_family = kubernetes_ip_family(cluster_ip);
     if let Some(primary_family) = families.first() {
         if primary_family != cluster_ip_family {
@@ -4584,6 +4595,10 @@ fn validate_kubernetes_service_cluster_ips(
         }
     }
     if let Some(secondary_cluster_ip) = secondary_cluster_ip {
+        validate_kubernetes_service_ip(
+            &format!("--{flag_prefix}-secondary-cluster-ip"),
+            secondary_cluster_ip,
+        )?;
         let secondary_cluster_ip_family = kubernetes_ip_family(secondary_cluster_ip);
         if secondary_cluster_ip_family == cluster_ip_family {
             anyhow::bail!(
@@ -8354,12 +8369,25 @@ mod tests {
         let helpers = std::fs::read_to_string(helpers_path)?;
         let service_template = std::fs::read_to_string(service_template_path)?;
 
+        assert!(helpers.contains("ipars.validateUsableServiceIPAddress"));
         assert!(helpers.contains("ipars.validateExternalServiceIPAddress"));
         assert!(helpers.contains("must not be an unspecified address"));
         assert!(helpers.contains("must not be a loopback address"));
         assert!(helpers.contains("must not be a link-local address"));
         assert!(helpers.contains("must not be a multicast address"));
         assert!(helpers.contains("must not be a broadcast address"));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIPs\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIPs\""
+        ));
         assert!(service_template.contains(
             "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.apiService.loadBalancerIP\""
         ));
@@ -11016,6 +11044,40 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--agent-api-secondary-cluster-ip requires --agent-api-cluster-ip"));
+
+        let mut loopback_cluster_ip = base_k8s_install_args();
+        loopback_cluster_ip.expose_agent_api = true;
+        loopback_cluster_ip.agent_api_cluster_ip = Some("127.0.0.1".parse()?);
+        let error = match k8s_install_plan(loopback_cluster_ip) {
+            Ok(_) => panic!("loopback clusterIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-cluster-ip must not use loopback address 127.0.0.1"));
+
+        let mut link_local_secondary_cluster_ip = base_k8s_install_args();
+        link_local_secondary_cluster_ip.expose_agent_api = true;
+        link_local_secondary_cluster_ip.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        link_local_secondary_cluster_ip.agent_api_secondary_cluster_ip = Some("fe80::40".parse()?);
+        link_local_secondary_cluster_ip.agent_api_ip_family_policy =
+            Some("RequireDualStack".to_string());
+        link_local_secondary_cluster_ip.agent_api_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        let error = match k8s_install_plan(link_local_secondary_cluster_ip) {
+            Ok(_) => panic!("link-local secondary clusterIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error
+            .contains("--agent-api-secondary-cluster-ip must not use link-local address fe80::40"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-cluster-ip",
+            "127.0.0.1",
+        ]);
+        assert!(parsed.is_err());
 
         let parsed = Cli::try_parse_from([
             "ipars",

@@ -118,7 +118,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateExternalServiceIPAddress" -}}
+{{- define "ipars.validateUsableServiceIPAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- include "ipars.validateIPAddress" (dict "path" $path "value" $value) -}}
@@ -137,6 +137,10 @@
 {{- if eq $value "255.255.255.255" -}}
 {{- fail (printf "%s value %q must not be a broadcast address" $path $value) -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateExternalServiceIPAddress" -}}
+{{- include "ipars.validateUsableServiceIPAddress" . -}}
 {{- end -}}
 
 {{- define "ipars.validateSocketAddress" -}}
