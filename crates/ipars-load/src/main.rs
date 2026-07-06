@@ -2128,33 +2128,48 @@ impl DaemonProcessGroup {
                 &control_plane_urls,
             )?)?;
             let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
+            let mut agent_args = vec![
+                "agent".to_string(),
+                "--listen".to_string(),
+                agent_addr.to_string(),
+                "--state-path".to_string(),
+                state_path.display().to_string(),
+                "--join-token-path".to_string(),
+                token_path.display().to_string(),
+                "--signal-url".to_string(),
+                signal_url.clone(),
+                "--stun-server".to_string(),
+                stun_addr.to_string(),
+                "--runtime-backend".to_string(),
+                "dry-run".to_string(),
+                "--skip-runtime-preflight".to_string(),
+                "--apply-peer-map".to_string(),
+                "--peer-map-poll-interval-seconds".to_string(),
+                "1".to_string(),
+                "--heartbeat-interval-seconds".to_string(),
+                "1".to_string(),
+                "--signal-registration-interval-seconds".to_string(),
+                "1".to_string(),
+                "--signal-path-interval-seconds".to_string(),
+                "1".to_string(),
+            ];
+            if index < scenario.relay_count {
+                agent_args.extend([
+                    "--relay-public-endpoint".to_string(),
+                    relay_udp_addr.to_string(),
+                    "--relay-admission-url".to_string(),
+                    relay_http_url.clone(),
+                    "--relay-status-url".to_string(),
+                    relay_http_url.clone(),
+                    "--relay-max-sessions".to_string(),
+                    "10000".to_string(),
+                    "--relay-max-mbps".to_string(),
+                    "10000".to_string(),
+                ]);
+            }
             startup.children.push(spawn_iparsd(
                 iparsd_bin,
-                &[
-                    "agent".to_string(),
-                    "--listen".to_string(),
-                    agent_addr.to_string(),
-                    "--state-path".to_string(),
-                    state_path.display().to_string(),
-                    "--join-token-path".to_string(),
-                    token_path.display().to_string(),
-                    "--signal-url".to_string(),
-                    signal_url.clone(),
-                    "--stun-server".to_string(),
-                    stun_addr.to_string(),
-                    "--runtime-backend".to_string(),
-                    "dry-run".to_string(),
-                    "--skip-runtime-preflight".to_string(),
-                    "--apply-peer-map".to_string(),
-                    "--peer-map-poll-interval-seconds".to_string(),
-                    "1".to_string(),
-                    "--heartbeat-interval-seconds".to_string(),
-                    "1".to_string(),
-                    "--signal-registration-interval-seconds".to_string(),
-                    "1".to_string(),
-                    "--signal-path-interval-seconds".to_string(),
-                    "1".to_string(),
-                ],
+                &agent_args,
                 "agent",
                 &runtime_dir,
             )?);
@@ -4644,7 +4659,7 @@ mod tests {
             DaemonLoadOptions {
                 control_plane_processes: 2,
                 agent_processes: 2,
-                keep_runtime_dir: false,
+                keep_runtime_dir: true,
                 http_readiness_timeout: Duration::from_secs(5),
                 agent_readiness_timeout: Duration::from_secs(15),
                 relay_options: RelayLoadOptions {
@@ -4663,8 +4678,23 @@ mod tests {
         assert_eq!(report.peer_map_requests, 6);
         assert_eq!(report.peer_map_edges_seen, 2);
         assert_eq!(report.daemon_processes, 7);
-        assert!(report.daemon_runtime_dir.is_none());
-        assert!(report.daemon_runtime_manifest.is_none());
+        let runtime_dir = report
+            .daemon_runtime_dir
+            .clone()
+            .context("daemon transport report did not retain runtime dir")?;
+        let manifest_path = report
+            .daemon_runtime_manifest
+            .clone()
+            .context("daemon transport report did not retain runtime manifest")?;
+        assert_eq!(manifest_path, daemon_runtime_manifest_path(&runtime_dir));
+        let manifest: DaemonRuntimeManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        assert_eq!(manifest.phase, DaemonRuntimePhase::Completed);
+        assert_eq!(manifest.children.len(), report.daemon_processes);
+        assert!(manifest
+            .children
+            .iter()
+            .all(|child| child.state == DaemonRuntimeManifestChildState::Exited));
         assert_eq!(report.daemon_control_plane_peer_map_endpoints, 2);
         assert_eq!(report.daemon_control_plane_peer_map_edges_min, 2);
         assert_eq!(report.daemon_control_plane_peer_map_edges_max, 2);
@@ -4719,6 +4749,8 @@ mod tests {
         assert!(report
             .relay_admission_failures_by_reason_reported
             .is_empty());
+        report.validate_success()?;
+        std::fs::remove_dir_all(runtime_dir)?;
         Ok(())
     }
 

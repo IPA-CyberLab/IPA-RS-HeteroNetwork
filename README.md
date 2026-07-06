@@ -101,6 +101,7 @@ cargo run -p ipars-load -- --transport http --scenario ten
 cargo run -p ipars-load -- --transport relay-udp --scenario ten --relay-packets-per-session 16 --relay-payload-bytes 1200
 cargo build -p ipars-daemon
 cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin target/debug/iparsd --daemon-agent-processes 3 --daemon-control-plane-processes 2 --daemon-agent-readiness-timeout-seconds 30
+IPARS_TEST_IPARSD_BIN="$(pwd)/target/debug/iparsd" cargo test -p ipars-load load_harness_can_drive_daemon_processes_when_binary_is_provided -- --nocapture
 ```
 
 The in-process eBPF packet-flow detector uses a separately built BPF object. Build it with a nightly Rust toolchain, `rust-src`, and `bpf-linker`:
