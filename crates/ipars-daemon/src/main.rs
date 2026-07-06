@@ -4662,10 +4662,11 @@ async fn run_agent(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    validate_agent_runtime_config(&args)?;
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
-    let relay_capability_reporter = agent_relay_capability_reporter(&args);
+    let relay_capability_reporter = agent_relay_capability_reporter(&args)?;
     let relay_capability = relay_capability_reporter
         .as_ref()
         .map(|reporter| reporter.advertised.clone());
@@ -7964,16 +7965,21 @@ struct RelayCapabilityReporter {
     status_url: Option<String>,
 }
 
-fn agent_relay_capability_reporter(args: &AgentArgs) -> Option<RelayCapabilityReporter> {
-    let advertised = agent_relay_capability(args)?;
+fn agent_relay_capability_reporter(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<RelayCapabilityReporter>> {
+    validate_agent_relay_capability_config(args)?;
+    let Some(advertised) = agent_relay_capability(args) else {
+        return Ok(None);
+    };
     let status_url = args
         .relay_status_url
         .clone()
         .or_else(|| args.relay_admission_url.clone());
-    Some(RelayCapabilityReporter {
+    Ok(Some(RelayCapabilityReporter {
         advertised,
         status_url,
-    })
+    }))
 }
 
 async fn heartbeat_relay_capability(
@@ -11646,7 +11652,7 @@ mod tests {
                 Some("http://relay-a:9580")
             );
             let reporter =
-                agent_relay_capability_reporter(&args).context("expected relay reporter")?;
+                agent_relay_capability_reporter(&args)?.context("expected relay reporter")?;
             assert_eq!(reporter.status_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.relay_admission_bearer_token.as_deref(),
@@ -11730,6 +11736,32 @@ mod tests {
             "http://relay-a:9580",
         ]);
         assert!(missing_endpoint.is_err());
+    }
+
+    #[test]
+    fn agent_relay_capability_reporter_validates_advertisement_config() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        let error = match agent_relay_capability_reporter(&args) {
+            Ok(_) => anyhow::bail!("unexpected valid relay capability reporter"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--relay-admission-url"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
     }
 
     #[test]
