@@ -2961,10 +2961,20 @@ fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
 }
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
-    let mut environment = vec![InstallEnvironment {
-        name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
-        value: "true".to_string(),
-    }];
+    let mut environment = vec![
+        InstallEnvironment {
+            name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+            value: "true".to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+            value: "true".to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+            value: "60".to_string(),
+        },
+    ];
     if args.docker_discover_networks {
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
@@ -6272,6 +6282,14 @@ mod tests {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
         assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            Some("true")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            Some("60")
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
             Some("compose-default")
         );
@@ -6449,6 +6467,11 @@ mod tests {
         assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+        assert!(compose
+            .contains("IPARS_DOCKER_EXPOSE_HOST_ROUTES=${IPARS_DOCKER_EXPOSE_HOST_ROUTES:-true}"));
+        assert!(compose.contains(
+            "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS=${IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:-60}"
+        ));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
         assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
         assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
