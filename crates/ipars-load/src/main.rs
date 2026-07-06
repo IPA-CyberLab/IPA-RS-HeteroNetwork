@@ -688,6 +688,7 @@ impl LoadReport {
             )
         })?;
         let mut exited_roles = Vec::new();
+        let mut running_roles = Vec::new();
         for child in &manifest.children {
             let Some(log_path) = &child.log_path else {
                 bail!(
@@ -767,6 +768,7 @@ impl LoadReport {
                             child.role
                         );
                     }
+                    running_roles.push(child.role.clone());
                 }
                 DaemonRuntimeManifestChildState::Exited => {
                     if child.exit_status.is_none() {
@@ -780,18 +782,18 @@ impl LoadReport {
             }
         }
         exited_roles.sort();
-        let expected_exited_roles = if self.daemon_control_plane_processes > 1
-            && self.daemon_control_plane_failover_checked
-        {
-            vec!["control-plane-0".to_string()]
-        } else {
-            Vec::new()
-        };
-        if exited_roles != expected_exited_roles {
+        running_roles.sort();
+        if !running_roles.is_empty() {
             bail!(
-                "daemon load scenario retained manifest exited roles {:?}, expected {:?}",
-                exited_roles,
-                expected_exited_roles
+                "daemon load scenario retained manifest still has running child roles {:?}; expected completed manifest after child shutdown",
+                running_roles
+            );
+        }
+        if exited_roles.len() != self.daemon_processes {
+            bail!(
+                "daemon load scenario retained manifest exited {} child processes, expected {}",
+                exited_roles.len(),
+                self.daemon_processes
             );
         }
 
@@ -1486,7 +1488,7 @@ async fn run_daemon_scenario(
         )?;
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
     }
-    services.write_manifest(DaemonRuntimePhase::Completed)?;
+    let completed_manifest_path = services.stop_all_for_completed_manifest()?;
 
     Ok(LoadReport {
         transport: TransportMode::Daemon,
@@ -1532,7 +1534,7 @@ async fn run_daemon_scenario(
         daemon_runtime_dir: options
             .keep_runtime_dir
             .then(|| services.runtime_dir.clone()),
-        daemon_runtime_manifest: options.keep_runtime_dir.then(|| services.manifest_path()),
+        daemon_runtime_manifest: options.keep_runtime_dir.then_some(completed_manifest_path),
         daemon_agent_processes: agent_processes,
         daemon_control_plane_processes: services.control_plane_urls.len(),
         daemon_control_plane_metrics_endpoints: control_summary.endpoint_count,
@@ -2299,13 +2301,14 @@ impl DaemonProcessGroup {
         Ok((stopped_role, survivor_urls))
     }
 
-    fn manifest_path(&self) -> PathBuf {
-        daemon_runtime_manifest_path(&self.runtime_dir)
-    }
-
     fn write_manifest(&self, phase: DaemonRuntimePhase) -> anyhow::Result<PathBuf> {
         self.manifest_seed
             .write(phase, &self.agent_urls, &self.children)
+    }
+
+    fn stop_all_for_completed_manifest(&mut self) -> anyhow::Result<PathBuf> {
+        stop_daemon_children(&mut self.children)?;
+        self.write_manifest(DaemonRuntimePhase::Completed)
     }
 }
 
@@ -2408,9 +2411,54 @@ fn spawn_iparsd(
 
 fn kill_daemon_children(children: &mut [DaemonChild]) {
     for daemon_child in children {
+        if daemon_child.last_exit.is_some() {
+            continue;
+        }
         let _ = daemon_child.child.kill();
-        let _ = daemon_child.child.wait();
+        if let Ok(status) = daemon_child.child.wait() {
+            daemon_child.last_exit = Some(DaemonChildExit {
+                status: status.to_string(),
+                code: status.code(),
+            });
+        }
     }
+}
+
+fn stop_daemon_children(children: &mut [DaemonChild]) -> anyhow::Result<()> {
+    for daemon_child in children {
+        if daemon_child.last_exit.is_some() {
+            continue;
+        }
+        if let Some(status) = daemon_child.child.try_wait().with_context(|| {
+            format!(
+                "failed to inspect iparsd {} process status before completed manifest",
+                daemon_child.role
+            )
+        })? {
+            daemon_child.last_exit = Some(DaemonChildExit {
+                status: status.to_string(),
+                code: status.code(),
+            });
+            continue;
+        }
+        daemon_child.child.kill().with_context(|| {
+            format!(
+                "failed to stop iparsd {} after daemon load scenario",
+                daemon_child.role
+            )
+        })?;
+        let status = daemon_child.child.wait().with_context(|| {
+            format!(
+                "failed to wait for iparsd {} after daemon load scenario",
+                daemon_child.role
+            )
+        })?;
+        daemon_child.last_exit = Some(DaemonChildExit {
+            status: status.to_string(),
+            code: status.code(),
+        });
+    }
+    Ok(())
 }
 
 fn ensure_daemon_children_running(children: &mut [DaemonChild]) -> anyhow::Result<()> {
@@ -3691,7 +3739,14 @@ mod tests {
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &retained_manifest,
             DaemonRuntimePhase::Completed,
-            &["control-plane-0"],
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
         )?;
         retained_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
         retained_manifest.daemon_runtime_manifest = Some(manifest_path);
@@ -3731,6 +3786,23 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("retained manifest ended"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut running_completed_manifest = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &running_completed_manifest,
+            DaemonRuntimePhase::Completed,
+            &["control-plane-0"],
+        )?;
+        running_completed_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
+        running_completed_manifest.daemon_runtime_manifest = Some(manifest_path);
+        let error = match running_completed_manifest.validate_success() {
+            Ok(_) => {
+                bail!("completed retained manifest with running children should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("still has running child roles"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut missing_failover = daemon_report.clone();
@@ -3998,6 +4070,45 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("control-plane-0"));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_completed_manifest_records_stopped_children_and_final_logs() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("completed-stop");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut group = synthetic_daemon_group(runtime_dir.clone(), true);
+        group.agent_urls = vec!["http://127.0.0.1:31006".to_string()];
+        group.children.push(synthetic_sleep_child(
+            "agent",
+            runtime_dir.join("0000-agent.log"),
+        )?);
+
+        let manifest_path = group.stop_all_for_completed_manifest()?;
+        let contents = std::fs::read_to_string(&manifest_path)?;
+        let manifest: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
+
+        assert_eq!(manifest.phase, DaemonRuntimePhase::Completed);
+        assert_eq!(manifest.children.len(), 1);
+        assert_eq!(manifest.children[0].role, "agent");
+        assert_eq!(
+            manifest.children[0].state,
+            DaemonRuntimeManifestChildState::Exited
+        );
+        assert!(group.children[0].last_exit.is_some());
+        let log_path = manifest.children[0]
+            .log_path
+            .as_ref()
+            .context("completed manifest child log path missing")?;
+        let diagnostics =
+            daemon_log_diagnostics(log_path).context("completed manifest log missing")?;
+        assert_eq!(manifest.children[0].log_bytes, Some(diagnostics.bytes));
+        assert_eq!(
+            manifest.children[0].log_tail_sha256.as_deref(),
+            Some(diagnostics.tail_sha256.as_str())
+        );
+        drop(group);
+        std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
     }
 
