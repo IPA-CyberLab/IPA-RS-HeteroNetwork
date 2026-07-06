@@ -3088,7 +3088,57 @@ fn write_daemon_join_token<Token: Serialize>(
                 )
             })?;
     }
+    validate_daemon_join_token_file(runtime_dir, &token_path)?;
     Ok(token_path)
+}
+
+fn validate_daemon_join_token_file(runtime_dir: &Path, token_path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(token_path).with_context(|| {
+        format!(
+            "daemon join token {} is not accessible after creation",
+            token_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "daemon join token {} must be a regular file",
+            token_path.display()
+        );
+    }
+    let canonical_runtime_dir = runtime_dir.canonicalize().with_context(|| {
+        format!(
+            "daemon join token runtime directory {} cannot be canonicalized",
+            runtime_dir.display()
+        )
+    })?;
+    let canonical_token_path = token_path.canonicalize().with_context(|| {
+        format!(
+            "daemon join token {} cannot be canonicalized",
+            token_path.display()
+        )
+    })?;
+    if !canonical_token_path.starts_with(&canonical_runtime_dir) {
+        bail!(
+            "daemon join token {} is outside runtime directory {}",
+            canonical_token_path.display(),
+            canonical_runtime_dir.display()
+        );
+    }
+    if metadata.len() == 0 {
+        bail!("daemon join token {} is empty", token_path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!(
+                "daemon join token {} permissions are {mode:o}; expected 600",
+                token_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn daemon_runtime_dir() -> anyhow::Result<PathBuf> {
@@ -5360,11 +5410,50 @@ mod tests {
         let contents = std::fs::read_to_string(&token_path)?;
         assert!(contents.contains("\"sensitive\""));
         assert!(contents.ends_with('\n'));
+        let metadata = std::fs::symlink_metadata(&token_path)?;
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        validate_daemon_join_token_file(&runtime_dir, &token_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&token_path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_join_token_file_validation_rejects_unsafe_paths() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("token-validation");
+        std::fs::create_dir_all(&runtime_dir)?;
+
+        let directory_token_path = runtime_dir.join("agent-0000.join-token.json");
+        std::fs::create_dir_all(&directory_token_path)?;
+        let error = match validate_daemon_join_token_file(&runtime_dir, &directory_token_path) {
+            Ok(_) => bail!("directory join token path should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("regular file"));
+        std::fs::remove_dir_all(&directory_token_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let world_readable_token_path = runtime_dir.join("agent-0001.join-token.json");
+            std::fs::write(&world_readable_token_path, "{}\n")?;
+            std::fs::set_permissions(
+                &world_readable_token_path,
+                std::fs::Permissions::from_mode(0o644),
+            )?;
+            let error =
+                match validate_daemon_join_token_file(&runtime_dir, &world_readable_token_path) {
+                    Ok(_) => bail!("world-readable join token path should fail validation"),
+                    Err(error) => error.to_string(),
+                };
+            assert!(error.contains("permissions"));
         }
 
         std::fs::remove_dir_all(&runtime_dir)?;

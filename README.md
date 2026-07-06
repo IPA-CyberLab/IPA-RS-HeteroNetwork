@@ -77,8 +77,9 @@ relay payload size, daemon agent process count, daemon control-plane process cou
 HTTP/agent readiness timeouts are validated before a run starts so load plans do not silently clamp
 invalid inputs. Daemon transport can spawn
 multiple control-plane processes against the same SQLite store, writes signed agent join tokens into
-private runtime files using the selected scenario's relay/route-provider distribution for the
-launched agent prefix and all runtime control-plane bootstrap URLs, and passes
+post-write validated owner-only regular private runtime files using the selected scenario's
+relay/route-provider distribution for the launched agent prefix and all runtime control-plane
+bootstrap URLs, and passes
 `--join-token-path` so token material is not exposed through child process argv. Daemon transport
 probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
 min/max plus full source/target edge consistency, then stops one control-plane process when
