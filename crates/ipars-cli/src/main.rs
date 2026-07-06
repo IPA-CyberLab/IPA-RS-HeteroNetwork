@@ -8252,6 +8252,39 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_validates_http_endpoint_urls() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateHttpEndpointURL\""));
+        assert!(helpers.contains("must be an absolute HTTP(S) URL with a host"));
+        assert!(helpers.contains("must not include userinfo"));
+        assert!(helpers.contains("port must be between 1 and 65535"));
+        assert!(helpers.contains("host must not be an unspecified address"));
+        assert!(helpers.contains("host must not be a multicast address"));
+        assert!(helpers.contains("host must not be a broadcast address"));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.controlPlaneUrl\""
+        ));
+        assert!(daemonset
+            .contains("ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.signalUrl\""));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
+        ));
+        assert!(!daemonset.contains("$clusterUrlPattern"));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_uses_relay_advertisement_instead_of_static_relay_endpoint(
     ) -> anyhow::Result<()> {
         let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))

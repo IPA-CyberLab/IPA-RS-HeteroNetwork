@@ -143,6 +143,60 @@
 {{- include "ipars.validateUsableServiceIPAddress" . -}}
 {{- end -}}
 
+{{- define "ipars.validateHttpEndpointURL" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- if not (regexMatch "^https?://[^/[:space:]?#]+[^[:space:]]*$" $value) -}}
+{{- fail (printf "%s must be an absolute HTTP(S) URL with a host" $path) -}}
+{{- end -}}
+{{- $authorityWithScheme := regexFind "^https?://[^/[:space:]?#]+" $value -}}
+{{- $authority := trimPrefix "https://" (trimPrefix "http://" $authorityWithScheme) -}}
+{{- if contains "@" $authority -}}
+{{- fail (printf "%s must not include userinfo" $path) -}}
+{{- end -}}
+{{- if hasPrefix "[" $authority -}}
+{{- if not (regexMatch "^\\[[0-9A-Fa-f:.]+\\](:[0-9]+)?$" $authority) -}}
+{{- fail (printf "%s host must be a bracketed IPv6 address with an optional numeric port" $path) -}}
+{{- end -}}
+{{- if regexMatch ":[0-9]+$" $authority -}}
+{{- $port := int (trimPrefix ":" (regexFind ":[0-9]+$" $authority)) -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "%s port must be between 1 and 65535" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $authority)) -}}
+{{- if regexMatch "^[0:]+$" $host -}}
+{{- fail (printf "%s host must not be an unspecified address" $path) -}}
+{{- end -}}
+{{- if regexMatch "^[Ff][Ff]" $host -}}
+{{- fail (printf "%s host must not be a multicast address" $path) -}}
+{{- end -}}
+{{- else -}}
+{{- if not (regexMatch "^[^:]+(:[0-9]+)?$" $authority) -}}
+{{- fail (printf "%s host must include an optional numeric port only" $path) -}}
+{{- end -}}
+{{- if regexMatch ":[0-9]+$" $authority -}}
+{{- $port := int (trimPrefix ":" (regexFind ":[0-9]+$" $authority)) -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "%s port must be between 1 and 65535" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $host := regexFind "^[^:]+" $authority -}}
+{{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- if regexMatch (printf "^%s\\.%s\\.%s\\.%s$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $host -}}
+{{- if eq $host "0.0.0.0" -}}
+{{- fail (printf "%s host must not be an unspecified address" $path) -}}
+{{- end -}}
+{{- if regexMatch "^(22[4-9]|23[0-9])\\." $host -}}
+{{- fail (printf "%s host must not be a multicast address" $path) -}}
+{{- end -}}
+{{- if eq $host "255.255.255.255" -}}
+{{- fail (printf "%s host must not be a broadcast address" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateSocketAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}

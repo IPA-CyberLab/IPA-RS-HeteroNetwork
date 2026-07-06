@@ -19,7 +19,6 @@
 {{- if and (ne $relayAdmissionBearerTokenSecretKey "") (or (gt (len $relayAdmissionBearerTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" $relayAdmissionBearerTokenSecretKey))) -}}
 {{- fail "agent.relayAdmissionBearerTokenSecret.key must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
-{{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
 {{- $imageRepository := printf "%v" .Values.image.repository -}}
 {{- $imageTag := printf "%v" .Values.image.tag -}}
 {{- $imagePullPolicy := printf "%v" .Values.image.pullPolicy -}}
@@ -365,12 +364,8 @@
 {{- if and (or (eq $agentRolloutMaxUnavailable "0") (eq $agentRolloutMaxUnavailable "0%")) (or (eq $agentRolloutMaxSurge "") (eq $agentRolloutMaxSurge "0") (eq $agentRolloutMaxSurge "0%")) -}}
 {{- fail "agent.rollout.maxUnavailable cannot be zero when agent.rollout.maxSurge is zero or unset" -}}
 {{- end -}}
-{{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
-{{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
-{{- if not (regexMatch $clusterUrlPattern .Values.cluster.signalUrl) -}}
-{{- fail "cluster.signalUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.controlPlaneUrl" "value" .Values.cluster.controlPlaneUrl) -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.signalUrl" "value" .Values.cluster.signalUrl) -}}
 {{- if .Values.cluster.stunEndpoint -}}
 {{- include "ipars.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
 {{- end -}}
@@ -382,11 +377,9 @@
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- if not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.admissionUrl) -}}
-{{- fail "agent.relayAdvertisement.admissionUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
-{{- if and .Values.agent.relayAdvertisement.statusUrl (not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.statusUrl)) -}}
-{{- fail "agent.relayAdvertisement.statusUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
+{{- if .Values.agent.relayAdvertisement.statusUrl -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
 {{- end -}}
 {{- if not (gt (int .Values.agent.relayAdvertisement.maxSessions) 0) -}}
 {{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
