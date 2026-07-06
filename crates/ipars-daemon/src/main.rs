@@ -8042,6 +8042,17 @@ async fn negotiate_signal_paths(
                     );
                     record = fallback;
                     path_selection = StableSignalPathSelection::Candidate;
+                } else {
+                    record = unreachable_path_record(
+                        &record,
+                        "direct_nat_traversal_failed",
+                        chrono::Utc::now(),
+                    );
+                    path_selection = StableSignalPathSelection::Candidate;
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        "direct NAT traversal setup failed and no relay fallback candidate was available; marking path unreachable"
+                    );
                 }
             }
         }
@@ -19946,6 +19957,101 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         signal_task.abort();
         control_plane_task.abort();
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_marks_nat_traversal_unreachable_without_relay_fallback(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: peer.endpoint_candidates.clone(),
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("unreachable path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Unreachable);
+        assert_eq!(record.selected_candidate, None);
+        assert_eq!(record.relay_node, None);
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 0);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
+
+        signal_task.abort();
+        control_plane_task.abort();
         Ok(())
     }
 
