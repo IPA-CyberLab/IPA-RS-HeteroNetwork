@@ -131,6 +131,7 @@ const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+const MAX_EBPF_TRACEPOINT_ID_BYTES: usize = 64;
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
     "/sys/kernel/tracing/events",
     "/sys/kernel/debug/tracing/events",
@@ -2481,7 +2482,10 @@ fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
                     tracepoint_id.display()
                 );
             }
-            Ok(metadata) if metadata.is_file() => return Ok(()),
+            Ok(metadata) if metadata.is_file() => {
+                validate_ebpf_tracepoint_id_file(attachment, &tracepoint_id)?;
+                return Ok(());
+            }
             Ok(_) => {
                 anyhow::bail!(
                     "eBPF tracepoint `{}/{}` for program `{}` has non-file id path {}",
@@ -2512,6 +2516,81 @@ fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
         attachment.program,
         checked.join(", ")
     )
+}
+
+fn validate_ebpf_tracepoint_id_file(
+    attachment: &EbpfTracepointAttachSpec,
+    path: &Path,
+) -> anyhow::Result<u64> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open eBPF tracepoint `{}/{}` id for program `{}` at {}",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_EBPF_TRACEPOINT_ID_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed to read eBPF tracepoint `{}/{}` id for program `{}` at {}",
+                attachment.category,
+                attachment.name,
+                attachment.program,
+                path.display()
+            )
+        })?;
+    if bytes.len() > MAX_EBPF_TRACEPOINT_ID_BYTES {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} exceeds {MAX_EBPF_TRACEPOINT_ID_BYTES} bytes",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    let contents = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is not UTF-8",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    let value = contents.trim();
+    if value.is_empty() {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is empty",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    let id = value.parse::<u64>().with_context(|| {
+        format!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is not numeric: {value}",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    if id == 0 {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} must be greater than zero",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    Ok(id)
 }
 
 fn ensure_ipv4_forwarding_if_known() -> anyhow::Result<()> {
@@ -16784,6 +16863,36 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let tracepoint_id = tracepoint_dir.join("id");
         std::fs::write(&tracepoint_id, b"123\n")?;
         ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots)?;
+
+        std::fs::write(&tracepoint_id, b"")?;
+        let empty_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful empty tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(empty_id_error.to_string().contains("is empty"));
+
+        std::fs::write(&tracepoint_id, b"abc\n")?;
+        let non_numeric_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful non-numeric tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(format!("{non_numeric_id_error:#}").contains("is not numeric"));
+
+        std::fs::write(&tracepoint_id, b"0\n")?;
+        let zero_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful zero tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(zero_id_error
+            .to_string()
+            .contains("must be greater than zero"));
+
+        std::fs::write(&tracepoint_id, vec![b'1'; MAX_EBPF_TRACEPOINT_ID_BYTES + 1])?;
+        let oversized_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful oversized tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(oversized_id_error.to_string().contains("exceeds"));
 
         #[cfg(unix)]
         {
