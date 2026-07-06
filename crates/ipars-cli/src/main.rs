@@ -4545,6 +4545,9 @@ fn validate_kubernetes_restricted_cidrs(
             anyhow::bail!("{flag} must not include {reason} CIDR {cidr}; {guidance}");
         }
         let canonical = cidr.trunc();
+        if cidr != &canonical {
+            anyhow::bail!("{flag} must use canonical CIDR {canonical}, not {cidr}");
+        }
         if !seen.insert(canonical) {
             anyhow::bail!("{flag} must not repeat {duplicate_label} {canonical}");
         }
@@ -8137,6 +8140,7 @@ mod tests {
 
         assert!(helpers.contains("ipars.validateRestrictedCidr"));
         assert!(helpers.contains("must not be an unrestricted CIDR"));
+        assert!(helpers.contains("must be a canonical IPv4 CIDR"));
         assert!(helpers.contains("must not include unspecified CIDRs"));
         assert!(helpers.contains("must not include loopback CIDRs"));
         assert!(helpers.contains("must not include link-local CIDRs"));
@@ -10913,6 +10917,19 @@ mod tests {
             "--agent-api-network-policy-cidr must not include loopback CIDR 127.0.0.0/8"
         ));
 
+        let mut noncanonical_agent_policy = base_k8s_install_args();
+        noncanonical_agent_policy.enable_network_policy = true;
+        noncanonical_agent_policy.network_policy_acknowledge_host_network = true;
+        noncanonical_agent_policy.expose_agent_api = true;
+        noncanonical_agent_policy.agent_api_network_policy_cidrs = vec!["10.0.0.1/8".parse()?];
+        let error = match k8s_install_plan(noncanonical_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject non-canonical CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must use canonical CIDR 10.0.0.0/8, not 10.0.0.1/8"
+        ));
+
         let mut unrestricted_relay_policy = base_k8s_install_args();
         unrestricted_relay_policy.enable_network_policy = true;
         unrestricted_relay_policy.network_policy_acknowledge_host_network = true;
@@ -11858,6 +11875,20 @@ mod tests {
         };
         assert!(error.contains(
             "--agent-api-allow-source-cidr must not include link-local CIDR 169.254.0.0/16"
+        ));
+
+        let mut noncanonical_agent_source_range = base_k8s_install_args();
+        noncanonical_agent_source_range.expose_agent_api = true;
+        noncanonical_agent_source_range.allow_public_service_exposure = true;
+        noncanonical_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        noncanonical_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["198.51.100.1/24".parse()?];
+        let error = match k8s_install_plan(noncanonical_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject non-canonical CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must use canonical CIDR 198.51.100.0/24, not 198.51.100.1/24"
         ));
 
         let mut duplicate_agent_source_range = base_k8s_install_args();

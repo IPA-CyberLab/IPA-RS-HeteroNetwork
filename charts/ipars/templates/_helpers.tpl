@@ -67,6 +67,9 @@
 {{- $size := int (index $blockSizes $prefix) -}}
 {{- $start := mul (div $ip $size) $size -}}
 {{- $end := add $start (sub $size 1) -}}
+{{- if ne $ip $start -}}
+{{- fail (printf "%s entry %q must be a canonical IPv4 CIDR" $path $value) -}}
+{{- end -}}
 {{- if and (le $start 16777215) (le 0 $end) -}}
 {{- fail (printf "%s entry %q must not include unspecified CIDRs" $path $value) -}}
 {{- end -}}
