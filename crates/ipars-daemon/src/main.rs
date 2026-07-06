@@ -111,6 +111,10 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const MAX_PACKET_FLOW_EBPF_ATTACH_SPECS: usize = 32;
+const MAX_PACKET_FLOW_READ_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
+const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
+const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
@@ -1302,45 +1306,52 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     }
     validate_packet_flow_detector_specific_args(args)?;
     if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_bytes > 0,
-            "--packet-flow-procfs-max-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_line_bytes > 0,
-            "--packet-flow-procfs-max-line-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_flows > 0,
-            "--packet-flow-procfs-max-flows must be greater than zero"
-        );
+        validate_bounded_u64(
+            args.packet_flow_procfs_max_bytes,
+            "--packet-flow-procfs-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_line_bytes,
+            "--packet-flow-procfs-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_flows,
+            "--packet-flow-procfs-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if matches!(
         args.packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     ) {
-        anyhow::ensure!(
-            args.packet_flow_netlink_max_flows > 0,
-            "--packet-flow-netlink-max-flows must be greater than zero"
-        );
+        validate_bounded_usize(
+            args.packet_flow_netlink_max_flows,
+            "--packet-flow-netlink-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if args.packet_flow_detector == PacketFlowDetector::EbpfJsonl {
         anyhow::ensure!(
             args.packet_flow_ebpf_event_path.is_some(),
             "--packet-flow-ebpf-event-path is required when --packet-flow-detector ebpf-jsonl is set"
         );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_bytes > 0,
-            "--packet-flow-ebpf-event-max-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_line_bytes > 0,
-            "--packet-flow-ebpf-event-max-line-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_flows > 0,
-            "--packet-flow-ebpf-event-max-flows must be greater than zero"
-        );
+        validate_bounded_u64(
+            args.packet_flow_ebpf_event_max_bytes,
+            "--packet-flow-ebpf-event-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_line_bytes,
+            "--packet-flow-ebpf-event-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_flows,
+            "--packet-flow-ebpf-event-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
         anyhow::ensure!(
@@ -1356,10 +1367,11 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
         );
         validate_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
-        anyhow::ensure!(
-            args.packet_flow_ebpf_ringbuf_max_events > 0,
-            "--packet-flow-ebpf-ringbuf-max-events must be greater than zero"
-        );
+        validate_bounded_usize(
+            args.packet_flow_ebpf_ringbuf_max_events,
+            "--packet-flow-ebpf-ringbuf-max-events",
+            MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE,
+        )?;
     }
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
@@ -1634,6 +1646,26 @@ fn validate_percent(value: u8, name: &str) -> anyhow::Result<()> {
 fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_bounded_u64(value: u64, name: &str, max: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{name} must not exceed {max}");
+    }
+    Ok(())
+}
+
+fn validate_bounded_usize(value: usize, name: &str, max: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{name} must not exceed {max}");
     }
     Ok(())
 }
@@ -12607,6 +12639,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_procfs_packet_flow_limits_must_be_bounded() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--packet-flow-procfs-max-bytes",
+                (MAX_PACKET_FLOW_READ_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-procfs-max-bytes must not exceed {MAX_PACKET_FLOW_READ_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-procfs-max-line-bytes",
+                (MAX_PACKET_FLOW_LINE_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-procfs-max-line-bytes must not exceed {MAX_PACKET_FLOW_LINE_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-procfs-max-flows",
+                (MAX_PACKET_FLOW_RECORDS + 1).to_string(),
+                format!("--packet-flow-procfs-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"),
+            ),
+        ];
+        for (flag, value, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "proc-net-conntrack",
+                flag,
+                value.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packet_flow_detector_specific_options_require_matching_detector() -> anyhow::Result<()> {
         for (argv, expected) in [
             (
@@ -12829,6 +12909,58 @@ mod tests {
                 };
                 assert!(
                     error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_ebpf_jsonl_packet_flow_limits_must_be_bounded() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--packet-flow-ebpf-event-max-bytes",
+                (MAX_PACKET_FLOW_READ_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-bytes must not exceed {MAX_PACKET_FLOW_READ_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-ebpf-event-max-line-bytes",
+                (MAX_PACKET_FLOW_LINE_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-line-bytes must not exceed {MAX_PACKET_FLOW_LINE_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-ebpf-event-max-flows",
+                (MAX_PACKET_FLOW_RECORDS + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"
+                ),
+            ),
+        ];
+        for (flag, value, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "ebpf-jsonl",
+                "--packet-flow-ebpf-event-path",
+                "/run/ipars/ebpf-flows.jsonl",
+                flag,
+                value.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
                     "{flag} should fail with {expected}, got {error}"
                 );
             } else {
@@ -13122,6 +13254,32 @@ mod tests {
         } else {
             anyhow::bail!("expected agent command");
         }
+
+        let too_many_ringbuf_events =
+            (MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE + 1).to_string();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+            "--packet-flow-ebpf-ringbuf-max-events",
+            too_many_ringbuf_events.as_str(),
+        ])?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid eBPF ringbuf config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-ebpf-ringbuf-max-events must not exceed {MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
         Ok(())
     }
 
@@ -13144,6 +13302,36 @@ mod tests {
                 assert!(error
                     .to_string()
                     .contains("--packet-flow-netlink-max-flows must be greater than zero"));
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_netlink_packet_flow_limit_must_be_bounded() -> anyhow::Result<()> {
+        let too_many_flows = (MAX_PACKET_FLOW_RECORDS + 1).to_string();
+        let expected =
+            format!("--packet-flow-netlink-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}");
+        for detector in ["conntrack-netlink", "conntrack-netlink-events"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                detector,
+                "--packet-flow-netlink-max-flows",
+                too_many_flows.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
+                    "{detector} should fail with {expected}, got {error}"
+                );
             } else {
                 anyhow::bail!("expected agent command");
             }
