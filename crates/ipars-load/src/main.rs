@@ -919,6 +919,7 @@ impl LoadReport {
                         log_path.display()
                     )
                 })?;
+            validate_daemon_child_log_file_name(&child.role, log_file_name)?;
             expected_runtime_entries.insert(log_file_name.to_string());
             let log_diagnostics = daemon_log_diagnostics(log_path).with_context(|| {
                 format!(
@@ -3152,10 +3153,8 @@ fn daemon_log_diagnostics(path: &Path) -> Option<DaemonLogDiagnostics> {
     })
 }
 
-fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
-    let serial = DAEMON_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let sanitized_role = role
-        .chars()
+fn sanitized_daemon_child_role(role: &str) -> String {
+    role.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
                 ch
@@ -3163,7 +3162,31 @@ fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
                 '_'
             }
         })
-        .collect::<String>();
+        .collect()
+}
+
+fn validate_daemon_child_log_file_name(
+    child_role: &str,
+    log_file_name: &str,
+) -> anyhow::Result<()> {
+    let sanitized_role = sanitized_daemon_child_role(child_role);
+    let expected_suffix = format!("-{sanitized_role}.log");
+    let Some(serial_prefix) = log_file_name.strip_suffix(&expected_suffix) else {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} log file name {log_file_name} does not match child role"
+        );
+    };
+    if serial_prefix.is_empty() || !serial_prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} log file name {log_file_name} has invalid serial prefix"
+        );
+    }
+    Ok(())
+}
+
+fn daemon_child_log_path(runtime_dir: &Path, role: &str) -> PathBuf {
+    let serial = DAEMON_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sanitized_role = sanitized_daemon_child_role(role);
     runtime_dir.join(format!("{serial:04}-{sanitized_role}.log"))
 }
 
@@ -4555,6 +4578,46 @@ mod tests {
         assert!(error.contains("duplicated"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut role_mismatched_child_log_path = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &role_mismatched_child_log_path,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        role_mismatched_child_log_path.daemon_runtime_dir = Some(runtime_dir.clone());
+        role_mismatched_child_log_path.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            let first_log_path = manifest.children[0].log_path.clone();
+            let first_log_bytes = manifest.children[0].log_bytes;
+            let first_log_tail_sha256 = manifest.children[0].log_tail_sha256.clone();
+            let second_log_path = manifest.children[1].log_path.clone();
+            let second_log_bytes = manifest.children[1].log_bytes;
+            let second_log_tail_sha256 = manifest.children[1].log_tail_sha256.clone();
+
+            manifest.children[0].log_path = second_log_path;
+            manifest.children[0].log_bytes = second_log_bytes;
+            manifest.children[0].log_tail_sha256 = second_log_tail_sha256;
+            manifest.children[1].log_path = first_log_path;
+            manifest.children[1].log_bytes = first_log_bytes;
+            manifest.children[1].log_tail_sha256 = first_log_tail_sha256;
+        })?;
+        let error = match role_mismatched_child_log_path.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with role-mismatched child logs should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("log file name"));
+        assert!(error.contains("child role"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut empty_child_log = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &empty_child_log,
@@ -4960,6 +5023,11 @@ mod tests {
         )?;
         mismatched_child_roles.daemon_runtime_dir = Some(runtime_dir.clone());
         mismatched_child_roles.daemon_runtime_manifest = Some(manifest_path.clone());
+        let relabeled_relay_log_path = runtime_dir.join("0003-agent.log");
+        std::fs::rename(
+            runtime_dir.join("0003-relay.log"),
+            &relabeled_relay_log_path,
+        )?;
         mutate_retained_daemon_manifest(&manifest_path, |manifest| {
             if let Some(relay) = manifest
                 .children
@@ -4967,6 +5035,7 @@ mod tests {
                 .find(|child| child.role == "relay")
             {
                 relay.role = "agent".to_string();
+                relay.log_path = Some(relabeled_relay_log_path);
             }
         })?;
         let error = match mismatched_child_roles.validate_success() {
