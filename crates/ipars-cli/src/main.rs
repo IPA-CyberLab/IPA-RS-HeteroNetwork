@@ -16,9 +16,9 @@ use ipars_types::api::{
     RevokeTokenResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
-    EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathMetrics,
-    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
+    CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
+    NodeId, PathMetrics, PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1105,7 +1105,32 @@ fn validate_http_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
         anyhow::bail!("{flag} must include a host");
     }
     validate_literal_bootstrap_socket(&parsed, flag)?;
+    if !http_url_is_usable_endpoint(url) {
+        anyhow::bail!(
+            "{flag} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast HTTP bootstrap endpoint"
+        );
+    }
     Ok(())
+}
+
+fn normalize_http_api_base_url(base_url: &str, name: &str) -> anyhow::Result<String> {
+    let parsed =
+        reqwest::Url::parse(base_url).with_context(|| format!("{name} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{name} must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{name} must include a host");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{name} must not include a query or fragment");
+    }
+    if !http_url_is_usable_endpoint(base_url) {
+        anyhow::bail!(
+            "{name} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        );
+    }
+    Ok(base_url.trim_end_matches('/').to_string())
 }
 
 fn validate_udp_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
@@ -1227,8 +1252,9 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
         cluster_id: ClusterId::from_string(args.cluster_id),
         nonce: args.nonce,
     };
+    let url = control_plane_token_revoke_url(&args.control_plane_url)?;
     reqwest::Client::new()
-        .post(control_plane_token_revoke_url(&args.control_plane_url))
+        .post(&url)
         .json(&request)
         .send()
         .await
@@ -1407,7 +1433,7 @@ async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<
 where
     T: DeserializeOwned,
 {
-    let url = api_url(base_url, path);
+    let url = api_url(base_url, path, label)?;
     reqwest::Client::new()
         .get(&url)
         .send()
@@ -1430,7 +1456,7 @@ where
     Request: Serialize + ?Sized,
     Response: DeserializeOwned,
 {
-    let url = api_url(base_url, path);
+    let url = api_url(base_url, path, label)?;
     reqwest::Client::new()
         .post(&url)
         .json(request)
@@ -1444,12 +1470,9 @@ where
         .with_context(|| format!("failed to decode {label} response from {url}"))
 }
 
-fn api_url(base_url: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+fn api_url(base_url: &str, path: &str, label: &str) -> anyhow::Result<String> {
+    let base_url = normalize_http_api_base_url(base_url, &format!("{label} URL"))?;
+    Ok(format!("{}/{}", base_url, path.trim_start_matches('/')))
 }
 
 fn parse_path_state(value: &str) -> Result<PathState, String> {
@@ -2352,31 +2375,35 @@ fn control_plane_join_urls(
     token: &SignedJoinToken,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url
-        .map(|url| vec![url.to_string()])
-        .unwrap_or_else(|| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "control-plane URL")
+    } else {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
                 .map(|endpoint| endpoint.url.clone())
-                .collect()
-        });
+                .collect(),
+            "control-plane bootstrap URL",
+        )
+    };
     if base_urls.is_empty() {
         anyhow::bail!("join token does not contain a control-plane bootstrap URL");
     }
-    Ok(base_urls
+    base_urls
         .into_iter()
-        .map(|base_url| format!("{}/v1/join", base_url.trim_end_matches('/')))
-        .collect())
+        .map(|base_url| {
+            normalize_http_api_base_url(&base_url, name)
+                .map(|base_url| format!("{base_url}/v1/join"))
+        })
+        .collect()
 }
 
-fn control_plane_token_revoke_url(control_plane_url: &str) -> String {
-    format!(
-        "{}/v1/tokens/revoke",
-        control_plane_url.trim_end_matches('/')
-    )
+fn control_plane_token_revoke_url(control_plane_url: &str) -> anyhow::Result<String> {
+    let control_plane_url = normalize_http_api_base_url(control_plane_url, "control-plane URL")?;
+    Ok(format!("{control_plane_url}/v1/tokens/revoke"))
 }
 
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
@@ -4818,11 +4845,40 @@ mod tests {
     }
 
     #[test]
-    fn token_revoke_url_trims_control_plane_base_url() {
+    fn join_urls_reject_unusable_control_plane_endpoints() {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "http://0.0.0.0:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+        let error = match control_plane_join_urls(&token, None) {
+            Ok(_) => panic!("unusable token control-plane bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane bootstrap URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+
+        let token = token_with_bootstrap(Vec::new());
+        let error = match control_plane_join_url(&token, Some("udp://127.0.0.1:8443")) {
+            Ok(_) => panic!("non-HTTP control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("must use http or https"));
+    }
+
+    #[test]
+    fn token_revoke_url_trims_control_plane_base_url() -> anyhow::Result<()> {
         assert_eq!(
-            control_plane_token_revoke_url("http://127.0.0.1:8443/"),
+            control_plane_token_revoke_url("http://127.0.0.1:8443/")?,
             "http://127.0.0.1:8443/v1/tokens/revoke"
         );
+        let error = match control_plane_token_revoke_url("http://0.0.0.0:8443") {
+            Ok(_) => anyhow::bail!("unusable control-plane revoke URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
     }
 
     #[test]
@@ -5077,6 +5133,17 @@ mod tests {
         assert!(error.contains("--signal-bootstrap"));
         assert!(error.contains("usable nonzero"));
 
+        let http_domain_zero_port = TokenCreateArgs {
+            control_plane_bootstrap_endpoints: vec!["https://control.example:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_domain_zero_port) else {
+            anyhow::bail!("port-zero domain control-plane bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--control-plane-bootstrap"));
+        assert!(error.contains("nonzero port"));
+
         let udp_multicast = TokenCreateArgs {
             stun_bootstrap_endpoints: vec!["udp://224.0.0.1:3478".to_string()],
             ..token_args()
@@ -5288,11 +5355,29 @@ mod tests {
     }
 
     #[test]
-    fn api_url_trims_base_and_path_slashes() {
+    fn api_url_trims_base_and_path_slashes() -> anyhow::Result<()> {
         assert_eq!(
-            api_url("http://127.0.0.1:9780/", "/v1/status"),
+            api_url("http://127.0.0.1:9780/", "/v1/status", "agent status")?,
             "http://127.0.0.1:9780/v1/status"
         );
+        let error = match api_url("http://0.0.0.0:9780", "/v1/status", "agent status") {
+            Ok(_) => anyhow::bail!("unusable API base URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent status URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        let error = match api_url(
+            "http://127.0.0.1:9780?debug=true",
+            "/v1/status",
+            "agent status",
+        ) {
+            Ok(_) => anyhow::bail!("query-bearing API base URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must not include a query or fragment"));
+        Ok(())
     }
 
     #[test]
