@@ -3323,26 +3323,141 @@ pub mod api {
         mysql_initial_handshake_payload(payload) || mysql_command_packet_payload(payload)
     }
 
+    const MYSQL_MAX_PACKET_PAYLOAD_LEN: usize = 16_777_215;
+    const MYSQL_MAX_PACKET_SEQUENCE_ID: u8 = 64;
+
     fn mysql_initial_handshake_payload(payload: &[u8]) -> bool {
-        payload.len() >= 5 && payload[3] == 0 && payload[4] == 10
+        const HANDSHAKE_V10_MIN_PAYLOAD_LEN: usize = 17;
+
+        if payload.len() < 5 || payload.get(3) != Some(&0) {
+            return false;
+        }
+        let Some(payload_len) = mysql_packet_payload_len(payload, 0) else {
+            return false;
+        };
+        if payload_len < HANDSHAKE_V10_MIN_PAYLOAD_LEN {
+            return false;
+        }
+        let Some(packet_end) = 4_usize.checked_add(payload_len) else {
+            return false;
+        };
+        if payload.len() > packet_end {
+            return false;
+        }
+        let Some(body) = mysql_observed_packet_body(payload, 0, payload_len) else {
+            return false;
+        };
+        mysql_handshake_v10_payload_prefix(body, payload_len)
     }
 
     fn mysql_command_packet_payload(payload: &[u8]) -> bool {
-        if payload.len() < 5 {
-            return false;
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            match mysql_command_packet(payload, offset) {
+                Some(MysqlCommandPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MysqlCommandPacketParse::IncompleteBeforeCommand) => {
+                    return packet_count > 0;
+                }
+                Some(MysqlCommandPacketParse::IncompleteAfterCommand) => {
+                    return true;
+                }
+                None => return false,
+            }
         }
-        let Some(payload_len) = read_u24_le(payload, 0) else {
+        packet_count > 0
+    }
+
+    enum MysqlCommandPacketParse {
+        Complete(usize),
+        IncompleteBeforeCommand,
+        IncompleteAfterCommand,
+    }
+
+    fn mysql_command_packet(payload: &[u8], offset: usize) -> Option<MysqlCommandPacketParse> {
+        if payload.len().saturating_sub(offset) < 4 {
+            return Some(MysqlCommandPacketParse::IncompleteBeforeCommand);
+        }
+        let payload_len = mysql_packet_payload_len(payload, offset)?;
+        let sequence_id = *payload.get(offset.checked_add(3)?)?;
+        if sequence_id > MYSQL_MAX_PACKET_SEQUENCE_ID {
+            return None;
+        }
+        let body_offset = offset.checked_add(4)?;
+        if payload.len() <= body_offset {
+            return Some(MysqlCommandPacketParse::IncompleteBeforeCommand);
+        }
+        let packet_end = body_offset.checked_add(payload_len)?;
+        let body_end = payload.len().min(packet_end);
+        let body = payload.get(body_offset..body_end)?;
+        if !mysql_command_packet_body(payload_len, body) {
+            return None;
+        }
+        if payload.len() < packet_end {
+            Some(MysqlCommandPacketParse::IncompleteAfterCommand)
+        } else {
+            Some(MysqlCommandPacketParse::Complete(packet_end))
+        }
+    }
+
+    fn mysql_packet_payload_len(payload: &[u8], offset: usize) -> Option<usize> {
+        let payload_len = read_u24_le(payload, offset)?;
+        (1..=MYSQL_MAX_PACKET_PAYLOAD_LEN)
+            .contains(&payload_len)
+            .then_some(payload_len)
+    }
+
+    fn mysql_observed_packet_body(
+        payload: &[u8],
+        offset: usize,
+        payload_len: usize,
+    ) -> Option<&[u8]> {
+        let body_offset = offset.checked_add(4)?;
+        if payload.len() <= body_offset {
+            return None;
+        }
+        let packet_end = body_offset.checked_add(payload_len)?;
+        payload.get(body_offset..payload.len().min(packet_end))
+    }
+
+    fn mysql_handshake_v10_payload_prefix(body: &[u8], payload_len: usize) -> bool {
+        if body.first() != Some(&10) {
             return false;
         };
-        if !(1..=16_777_215).contains(&payload_len) || payload[3] > 64 {
+        let version = &body[1..];
+        if version.is_empty() {
             return false;
         }
-        let observed_body = &payload[4..];
-        if observed_body.is_empty() {
+        let Some(version_end) = version.iter().position(|byte| *byte == 0) else {
+            return version.iter().all(mysql_server_version_byte);
+        };
+        if version_end == 0 || !version[..version_end].iter().all(mysql_server_version_byte) {
             return false;
         }
-        let body_len = payload_len.min(observed_body.len());
-        let body = &observed_body[..body_len];
+        let post_version = 1 + version_end + 1;
+        let Some(filler_offset) = post_version
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(8))
+        else {
+            return false;
+        };
+        if payload_len <= filler_offset {
+            return false;
+        }
+        body.get(filler_offset).is_none_or(|filler| *filler == 0)
+    }
+
+    fn mysql_server_version_byte(byte: &u8) -> bool {
+        matches!(*byte, 0x20..=0x7e)
+    }
+
+    fn mysql_command_packet_body(payload_len: usize, body: &[u8]) -> bool {
         let Some((&command, args)) = body.split_first() else {
             return false;
         };
@@ -3365,6 +3480,12 @@ pub mod api {
     fn mysql_sql_command_arg(args: &[u8]) -> bool {
         let statement = trim_ascii_space(args);
         if statement.is_empty() {
+            return false;
+        }
+        if !statement
+            .iter()
+            .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\t' | b'\n' | b'\r'))
+        {
             return false;
         }
         let keywords: [&[u8]; 29] = [
@@ -6072,6 +6193,25 @@ mod tests {
             payload
         }
 
+        fn mysql_handshake_packet(server_version: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(10);
+            body.extend_from_slice(server_version);
+            body.push(0);
+            body.extend_from_slice(&1_u32.to_le_bytes());
+            body.extend_from_slice(b"abcdefgh");
+            body.push(0);
+            body.extend_from_slice(&0xffff_u16.to_le_bytes());
+            body.push(45);
+            body.extend_from_slice(&2_u16.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes());
+            body.push(21);
+            body.extend_from_slice(&[0; 10]);
+            body.extend_from_slice(b"ijklmnopqrst");
+            body.push(0);
+            mysql_packet(0, &body)
+        }
+
         fn mqtt_connect_packet(
             protocol_level: u8,
             connect_flags: u8,
@@ -6823,12 +6963,44 @@ mod tests {
             api::AgentPacketFlowApplication::Mysql
         );
         assert_eq!(
+            observation_for_payload(&mysql_handshake_packet(b"8.0.36")).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mut invalid_mysql_handshake_filler = mysql_handshake_packet(b"8.0.36");
+        invalid_mysql_handshake_filler[4 + 1 + b"8.0.36".len() + 1 + 4 + 8] = 1;
+        assert_eq!(
+            observation_for_payload(&invalid_mysql_handshake_filler).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 0, 65, 10]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(&mysql_packet(
                 0,
                 &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']
             ))
             .application(),
             api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(
+                &[
+                    mysql_packet(0, &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']),
+                    mysql_packet(0, &[0x0e]),
+                ]
+                .concat()
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mut mysql_query_with_trailing_junk =
+            mysql_packet(0, &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']);
+        mysql_query_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mysql_query_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&mysql_packet(
@@ -6843,6 +7015,10 @@ mod tests {
             api::AgentPacketFlowApplication::Mysql
         );
         assert_eq!(
+            observation_for_payload(&mysql_packet(65, &[0x0e])).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(&mysql_packet(0, &[0x03])).application(),
             api::AgentPacketFlowApplication::Unknown
         );
@@ -6850,6 +7026,14 @@ mod tests {
             observation_for_payload(&mysql_packet(
                 0,
                 &[0x03, b'n', b'o', b't', b's', b'q', b'l']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', 0]
             ))
             .application(),
             api::AgentPacketFlowApplication::Unknown
