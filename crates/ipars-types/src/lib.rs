@@ -2806,23 +2806,105 @@ pub mod api {
         if payload.len() < 7 || payload[0] != 0x30 {
             return false;
         }
-        let Some((sequence_len, mut offset)) = ber_length(payload, 1) else {
+        let Some((sequence_len, sequence_content_offset)) = ber_length(payload, 1) else {
             return false;
         };
-        if !(1..=16_777_216).contains(&sequence_len) || payload.get(offset) != Some(&0x02) {
+        if !(5..=16_777_216).contains(&sequence_len)
+            || payload.get(sequence_content_offset) != Some(&0x02)
+        {
             return false;
         }
-        let Some((message_id_len, message_id_offset)) = ber_length(payload, offset + 1) else {
+        let Some(sequence_end) = sequence_content_offset.checked_add(sequence_len) else {
             return false;
         };
-        if !(1..=4).contains(&message_id_len) {
+        let Some((message_id_len, message_id_offset)) =
+            ber_length(payload, sequence_content_offset + 1)
+        else {
+            return false;
+        };
+        if !(1..=4).contains(&message_id_len)
+            || !ldap_message_id_payload(payload, message_id_offset, message_id_len)
+        {
             return false;
         }
         let Some(protocol_op_offset) = message_id_offset.checked_add(message_id_len) else {
             return false;
         };
-        offset = protocol_op_offset;
-        matches!(payload.get(offset), Some(0x42 | 0x4a | 0x50 | 0x60..=0x79))
+        if protocol_op_offset >= sequence_end {
+            return false;
+        }
+        let Some(&protocol_op_tag) = payload.get(protocol_op_offset) else {
+            return false;
+        };
+        if !ldap_protocol_op_tag(protocol_op_tag) {
+            return false;
+        }
+        let Some((protocol_op_len, protocol_op_content_offset)) =
+            ber_length(payload, protocol_op_offset + 1)
+        else {
+            return false;
+        };
+        if !ldap_protocol_op_length(protocol_op_tag, protocol_op_len) {
+            return false;
+        }
+        let Some(protocol_op_end) = protocol_op_content_offset.checked_add(protocol_op_len) else {
+            return false;
+        };
+        if protocol_op_end > sequence_end {
+            return false;
+        }
+        if protocol_op_end < sequence_end {
+            payload
+                .get(protocol_op_end)
+                .is_none_or(|next_tag| *next_tag == 0xa0)
+        } else {
+            true
+        }
+    }
+
+    fn ldap_message_id_payload(payload: &[u8], offset: usize, len: usize) -> bool {
+        let Some(value) = payload.get(offset..offset.saturating_add(len)) else {
+            return false;
+        };
+        if value.is_empty() || value[0] & 0x80 != 0 {
+            return false;
+        }
+        !(len > 1 && value[0] == 0 && value[1] & 0x80 == 0)
+    }
+
+    fn ldap_protocol_op_tag(tag: u8) -> bool {
+        matches!(
+            tag,
+            0x42 | 0x4a
+                | 0x50
+                | 0x60
+                | 0x61
+                | 0x63
+                | 0x64
+                | 0x65
+                | 0x66
+                | 0x67
+                | 0x68
+                | 0x69
+                | 0x6b
+                | 0x6c
+                | 0x6d
+                | 0x6e
+                | 0x6f
+                | 0x73
+                | 0x77
+                | 0x78
+                | 0x79
+        )
+    }
+
+    fn ldap_protocol_op_length(tag: u8, len: usize) -> bool {
+        match tag {
+            0x42 => len == 0,
+            0x4a => (1..=65_535).contains(&len),
+            0x50 => (1..=4).contains(&len),
+            _ => (1..=16_777_216).contains(&len),
+        }
     }
 
     fn ber_length(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
@@ -5668,6 +5750,44 @@ mod tests {
             ])
             .application(),
             api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x42, 0x00]).application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x06, 0x50, 0x01, 0x05])
+                .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x09, 0x02, 0x01, 0x01, 0x42, 0x00, 0xa0, 0x02, 0x30, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x62, 0x01, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x02, 0x00, 0x01, 0x42, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x09, 0x02, 0x01, 0x01, 0x42, 0x00, 0x30, 0x02, 0x30, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
