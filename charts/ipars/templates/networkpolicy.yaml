@@ -23,6 +23,12 @@
 {{- if and $relayNetworkPolicyEnabled (not (and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled)) -}}
 {{- fail "networkPolicy.relay.enabled requires agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
+{{- if and (not $agentApiNetworkPolicyEnabled) (gt (len .Values.networkPolicy.agentApi.allowedCidrs) 0) -}}
+{{- fail "networkPolicy.agentApi.allowedCidrs require networkPolicy.enabled=true and networkPolicy.agentApi.enabled=true" -}}
+{{- end -}}
+{{- if and (not $relayNetworkPolicyEnabled) (gt (len .Values.networkPolicy.relay.allowedCidrs) 0) -}}
+{{- fail "networkPolicy.relay.allowedCidrs require networkPolicy.enabled=true and networkPolicy.relay.enabled=true" -}}
+{{- end -}}
 {{- if and $agentApiNetworkPolicyEnabled (eq (len .Values.networkPolicy.agentApi.allowedCidrs) 0) -}}
 {{- fail "networkPolicy.agentApi.allowedCidrs must contain at least one CIDR" -}}
 {{- end -}}

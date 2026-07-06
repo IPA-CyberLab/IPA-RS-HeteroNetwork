@@ -8554,6 +8554,12 @@ mod tests {
         assert!(network_policy_template.contains(
             "networkPolicy.acknowledgeHostNetwork=true only applies when agent.hostNetwork=true"
         ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.agentApi.allowedCidrs require networkPolicy.enabled=true and networkPolicy.agentApi.enabled=true"
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.relay.allowedCidrs require networkPolicy.enabled=true and networkPolicy.relay.enabled=true"
+        ));
         assert!(network_policy_template
             .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
         assert!(network_policy_template.contains("port: {{ .Values.agent.apiService.targetPort }}"));
