@@ -15,7 +15,7 @@ use ipars_types::api::{
     AgentStunProbeRequest, AgentStunProbeResponse, AgentWireGuardKeyRotationRequest,
     AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{NodeId, PathMetricsValidationError, PathState};
+use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
 use serde::{Deserialize, Serialize};
 
 macro_rules! prometheus_line {
@@ -188,12 +188,38 @@ async fn path_probe(
     Json(request): Json<AgentPathProbeRequest>,
 ) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
     request.metrics.validate()?;
+    validate_path_probe_selected_candidate(&request)?;
     let recorded_at = chrono::Utc::now();
     let path = state.runtime.record_path_probe(request, recorded_at).await;
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPathProbeResponse { path, recorded_at }),
     ))
+}
+
+fn validate_path_probe_selected_candidate(request: &AgentPathProbeRequest) -> Result<(), ApiError> {
+    let Some(candidate) = request.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    if candidate.node_id != request.peer {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate belongs to node {} instead of path peer {}",
+            candidate.node_id, request.peer
+        )));
+    }
+    if let Err(reason) = candidate.validate_kind_address() {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate {:?} at {} is invalid: {reason}",
+            candidate.kind, candidate.addr
+        )));
+    }
+    if !endpoint_addr_is_usable(candidate.addr) {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate {:?} at {} is unusable",
+            candidate.kind, candidate.addr
+        )));
+    }
+    Ok(())
 }
 
 async fn stun_probe(
@@ -1060,8 +1086,9 @@ mod tests {
         RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
-        ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
-        PathState, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+        CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
+        NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role,
+        Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -1758,6 +1785,60 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("latency_ms"));
+        assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_unusable_path_probe_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let metrics_runtime = Arc::clone(&runtime);
+        let app = router(AgentHttpState::new(runtime));
+        let peer = NodeId::from_string("peer-probed");
+        let request = AgentPathProbeRequest {
+            peer: peer.clone(),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(EndpointCandidate {
+                node_id: peer,
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: "203.0.113.10:0".parse()?,
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }),
+            relay_node: None,
+            metrics: PathMetrics::default(),
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("selected candidate"));
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is unusable"));
         assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
         Ok(())
     }

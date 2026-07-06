@@ -941,6 +941,15 @@ where
                         ),
                     });
                 }
+                if !endpoint_addr_is_usable(candidate.addr) {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} is unusable",
+                            candidate.kind, candidate.addr
+                        ),
+                    });
+                }
             }
         }
         if request.node_signature.is_none() {
@@ -3246,6 +3255,58 @@ mod tests {
             ControlPlaneError::NodeUpdateRejected { .. }
         ));
         assert!(error.to_string().contains("IPv6 candidates must use"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_unusable_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(candidate_at(
+            "node-b",
+            std::net::SocketAddr::from(([203, 0, 113, 10], 0)),
+        ));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("selected candidate"));
+        assert!(error.to_string().contains("is unusable"));
         Ok(())
     }
 

@@ -16,9 +16,9 @@ use ipars_types::api::{
     RevokeTokenResponse,
 };
 use ipars_types::{
-    BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
-    EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathMetrics, PathState, Role, Route,
-    SignedJoinToken, Tag, TokenPolicy,
+    endpoint_addr_is_usable, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
+    EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathMetrics,
+    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1328,7 +1328,7 @@ fn path_probe_candidate(
         return Ok(None);
     };
 
-    Ok(Some(EndpointCandidate {
+    let candidate = EndpointCandidate {
         node_id: NodeId::from_string(args.peer.clone()),
         kind: args
             .candidate_kind
@@ -1340,7 +1340,22 @@ fn path_probe_candidate(
         source: args
             .candidate_source
             .unwrap_or(CandidateSource::ControlPlane),
-    }))
+    };
+    if let Err(reason) = candidate.validate_kind_address() {
+        anyhow::bail!(
+            "selected candidate {:?} at {} is invalid: {reason}",
+            candidate.kind,
+            candidate.addr
+        );
+    }
+    if !endpoint_addr_is_usable(candidate.addr) {
+        anyhow::bail!(
+            "selected candidate {:?} at {} is unusable",
+            candidate.kind,
+            candidate.addr
+        );
+    }
+    Ok(Some(candidate))
 }
 
 async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<T>
@@ -5328,6 +5343,67 @@ mod tests {
         assert!(error
             .to_string()
             .contains("candidate metadata requires --candidate-addr"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_invalid_candidate_kind_address() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_IPV6",
+            "--candidate-kind",
+            "ipv6",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("invalid candidate kind/address should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("IPv6 candidates must use an IPv6 socket address"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_unusable_candidate_address() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--candidate-addr",
+            "203.0.113.10:0",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("unusable candidate address should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("selected candidate"));
+        assert!(error.to_string().contains("is unusable"));
         Ok(())
     }
 
