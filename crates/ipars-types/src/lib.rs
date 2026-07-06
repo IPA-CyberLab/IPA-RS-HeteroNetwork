@@ -1742,6 +1742,24 @@ pub mod api {
     }
 
     impl AgentPacketFlowObservation {
+        pub fn validate_transport_metadata(&self) -> Result<(), String> {
+            if self.protocol != Some(TransportProtocol::Tcp) && self.tcp_state.is_some() {
+                return Err("packet-flow TCP state requires TCP protocol".to_string());
+            }
+
+            let protocol_has_ports = matches!(
+                self.protocol,
+                Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+            );
+            if !protocol_has_ports
+                && (self.source_port.is_some() || self.destination_port.is_some())
+            {
+                return Err("packet-flow port metadata requires TCP or UDP protocol".to_string());
+            }
+
+            Ok(())
+        }
+
         pub fn classification(&self) -> AgentPacketFlowClassification {
             if self
                 .conntrack_status
@@ -3363,6 +3381,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("packet-flow conntrack_status exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_observation_transport_metadata_is_consistent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let udp_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","destination_port":53}"#)?;
+        udp_with_port.validate_transport_metadata()?;
+
+        let tcp_with_state: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","tcp_state":"established"}"#)?;
+        tcp_with_state.validate_transport_metadata()?;
+
+        let udp_with_tcp_state: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","tcp_state":"established"}"#)?;
+        let error = match udp_with_tcp_state.validate_transport_metadata() {
+            Ok(()) => return Err("UDP observation with TCP state should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("TCP state requires TCP protocol"));
+
+        let icmp_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"icmp","destination_port":8}"#)?;
+        let error = match icmp_with_port.validate_transport_metadata() {
+            Ok(()) => return Err("ICMP observation with port metadata should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("port metadata requires TCP or UDP protocol"));
         Ok(())
     }
 

@@ -9462,6 +9462,11 @@ fn parse_ebpf_jsonl_packet_flow_line(
     );
     let event: EbpfJsonlPacketFlowEvent =
         serde_json::from_slice(line).context("failed to parse eBPF packet-flow JSON event")?;
+    event
+        .observation
+        .validate_transport_metadata()
+        .map_err(anyhow::Error::msg)
+        .context("invalid eBPF packet-flow JSON event metadata")?;
     Ok(PacketFlowRecord {
         destination: event.destination,
         observation: event.observation,
@@ -12133,6 +12138,27 @@ mod tests {
         assert!(error.chain().any(|cause| cause
             .to_string()
             .contains("packet-flow conntrack_status exceeds")));
+
+        let inconsistent_transport_line =
+            br#"{"destination":"100.64.0.13","protocol":"icmp","destination_port":8}
+"#;
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            inconsistent_transport_line,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => {
+                anyhow::bail!("inconsistent eBPF JSONL packet-flow metadata should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("port metadata requires TCP or UDP protocol")));
         Ok(())
     }
 

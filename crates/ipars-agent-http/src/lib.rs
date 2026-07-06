@@ -16,7 +16,7 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathMetricsValidationError, PathState};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -249,6 +249,9 @@ async fn packet_flow(
 ) -> Result<(StatusCode, Json<AgentPacketFlowResponse>), ApiError> {
     let recorded_at = chrono::Utc::now();
     let observation = request.observation;
+    observation
+        .validate_transport_metadata()
+        .map_err(ApiError::BadRequest)?;
     let matched = state
         .runtime
         .record_packet_flow_observation(
@@ -716,7 +719,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -734,9 +737,8 @@ mod tests {
     use ipars_types::api::{
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
         AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-        AgentPacketFlowTcpState, AgentWireGuardKeyRotationRequest,
-        AgentWireGuardKeyRotationResponse, PeerMap, RelayMap, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse,
+        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap, RelayMap,
+        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -1389,7 +1391,7 @@ mod tests {
                             application: Some(AgentPacketFlowApplication::WireGuard),
                             payload_prefix: Vec::new(),
                             conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
-                            tcp_state: Some(AgentPacketFlowTcpState::Established),
+                            tcp_state: None,
                         },
                     })?))?,
             )
@@ -1416,10 +1418,7 @@ mod tests {
             packet_flow.observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]
         );
-        assert_eq!(
-            packet_flow.observation.tcp_state,
-            Some(AgentPacketFlowTcpState::Established)
-        );
+        assert_eq!(packet_flow.observation.tcp_state, None);
         let matched = packet_flow
             .matched
             .ok_or_else(|| std::io::Error::other("route should match peer"))?;
@@ -1428,6 +1427,36 @@ mod tests {
         assert_eq!(matched.route, Some(route));
         assert!(matched.pinned);
         assert!(runtime.should_connect_peer(&peer_record).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_inconsistent_packet_flow_transport_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"100.64.0.11","protocol":"udp","tcp_state":"established"}"#,
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: ErrorResponse = serde_json::from_slice(&body)?;
+        assert!(error
+            .error
+            .contains("packet-flow TCP state requires TCP protocol"));
         Ok(())
     }
 }
