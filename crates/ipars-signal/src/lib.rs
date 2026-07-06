@@ -1503,6 +1503,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_ignores_relay_with_unusable_admission_url() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut relay = relay();
+        if let Some(capability) = relay.relay_capability.as_mut() {
+            capability.admission_url = Some("http://0.0.0.0:9580".to_string());
+        }
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_uses_relay_when_nat_classification_prefers_relay() -> Result<(), SignalError>
     {
         let registry = SignalRegistry::new(ClusterPolicy::default());

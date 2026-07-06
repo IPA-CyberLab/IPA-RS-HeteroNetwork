@@ -1535,7 +1535,10 @@ fn validate_relay_capability_shape(capability: &RelayCapability) -> Result<(), S
         .as_deref()
         .ok_or_else(|| "relay admission URL is required".to_string())?;
     if !relay_admission_url_is_usable(admission_url) {
-        return Err("relay admission URL must be an absolute HTTP(S) URL with a host".to_string());
+        return Err(
+            "relay admission URL must be an absolute HTTP(S) URL with a usable endpoint"
+                .to_string(),
+        );
     }
     if capability.max_sessions == 0 {
         return Err("relay max_sessions must be greater than zero".to_string());
@@ -2518,6 +2521,23 @@ mod tests {
         bad_admission_url.admission_url = Some("udp://203.0.113.10:9580".to_string());
         let mut request = registration_request("node-b");
         request.relay_capability = Some(bad_admission_url);
+        let error = match plane
+            .register_with_claims(relay_claims.clone(), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
+
+        let mut unusable_admission_url = relay_capability();
+        unusable_admission_url.admission_url = Some("http://0.0.0.0:9580".to_string());
+        let mut request = registration_request("node-c");
+        request.relay_capability = Some(unusable_admission_url);
         let error = match plane.register_with_claims(relay_claims, request).await {
             Ok(_) => return Err("unexpected successful relay registration".into()),
             Err(error) => error,
@@ -4068,7 +4088,7 @@ mod tests {
             .await?;
 
         let mut bad_admission_url = relay_capability();
-        bad_admission_url.admission_url = Some("udp://203.0.113.10:9580".to_string());
+        bad_admission_url.admission_url = Some("http://0.0.0.0:9580".to_string());
         let result = plane
             .heartbeat(signed_heartbeat(
                 "node-a",

@@ -197,12 +197,33 @@ pub fn endpoint_addr_is_usable(addr: SocketAddr) -> bool {
     }
 }
 
-pub fn relay_admission_url_is_usable(value: &str) -> bool {
+pub fn http_url_is_usable_endpoint(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
     };
 
-    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    if port == 0 {
+        return false;
+    }
+
+    match host {
+        url::Host::Domain(_) => true,
+        url::Host::Ipv4(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V4(ip), port)),
+        url::Host::Ipv6(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V6(ip), port)),
+    }
+}
+
+pub fn relay_admission_url_is_usable(value: &str) -> bool {
+    http_url_is_usable_endpoint(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3343,6 +3364,35 @@ mod tests {
         ];
         for addr in usable {
             assert!(endpoint_addr_is_usable(addr), "{addr} should be usable");
+        }
+    }
+
+    #[test]
+    fn relay_admission_url_usability_rejects_unusable_numeric_endpoints() {
+        for url in [
+            "http://relay.example:9580",
+            "https://relay.example",
+            "http://203.0.113.10:9580",
+            "https://[2001:db8::10]",
+            "http://127.0.0.1:9580",
+        ] {
+            assert!(relay_admission_url_is_usable(url), "{url} should be usable");
+        }
+
+        for url in [
+            "relay.example:9580",
+            "udp://relay.example:9580",
+            "http://relay.example:0",
+            "http://0.0.0.0:9580",
+            "http://224.0.0.1:9580",
+            "http://255.255.255.255:9580",
+            "http://[::]:9580",
+            "http://[ff02::1]:9580",
+        ] {
+            assert!(
+                !relay_admission_url_is_usable(url),
+                "{url} should be unusable"
+            );
         }
     }
 

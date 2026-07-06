@@ -70,10 +70,10 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy,
-    EndpointCandidate, HealthState, KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord,
-    PathMetrics, PathRecord, PathScore, PathState, RelayCapability, Route, SignedJoinToken,
-    TokenLedgerMetrics, TransportProtocol,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpointKind,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
+    NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
+    Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -1556,6 +1556,11 @@ fn validate_http_url(value: &str, name: &str) -> anyhow::Result<()> {
     }
     if url.host_str().is_none() {
         anyhow::bail!("{name} must include a host");
+    }
+    if !http_url_is_usable_endpoint(value) {
+        anyhow::bail!(
+            "{name} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        );
     }
     Ok(())
 }
@@ -11845,6 +11850,28 @@ mod tests {
             anyhow::bail!("expected agent command");
         }
 
+        let unusable_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_admission_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-admission-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         let invalid_status_url = Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -11866,6 +11893,30 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-status-url must use http or https"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_status_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-status-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_status_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-status-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
         } else {
             anyhow::bail!("expected agent command");
         }
@@ -16772,6 +16823,27 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected relay command");
         }
 
+        let unusable_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Relay(args) = unusable_admission_url.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--admission-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let zero_sessions = Cli::try_parse_from([
             "iparsd",
             "relay",
@@ -18834,6 +18906,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn control_plane_base_url_override_rejects_unusable_numeric_host() -> anyhow::Result<()> {
+        let error = match control_plane_base_url(None, Some("http://0.0.0.0:8443")) {
+            Ok(_) => anyhow::bail!("unusable control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
+    }
+
+    #[test]
     fn signal_base_url_uses_token_bootstrap() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
             BootstrapEndpoint {
@@ -18904,6 +18987,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(error
             .to_string()
             .contains("signal URL must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_override_rejects_unusable_numeric_host() -> anyhow::Result<()> {
+        let error = match signal_base_url(None, Some("http://0.0.0.0:9443")) {
+            Ok(_) => anyhow::bail!("unusable signal override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("signal URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
         Ok(())
     }
 
