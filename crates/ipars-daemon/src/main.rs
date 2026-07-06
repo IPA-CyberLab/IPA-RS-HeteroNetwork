@@ -3648,8 +3648,12 @@ struct AgentOtelMetrics {
     forwarder_outbound_packets: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
+    forwarder_outbound_dropped_non_wireguard_packets: Counter<u64>,
+    forwarder_outbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
     forwarder_inbound_packets: Counter<u64>,
     forwarder_inbound_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_non_wireguard_packets: Counter<u64>,
+    forwarder_inbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
 }
 
 impl AgentOtelMetrics {
@@ -3780,6 +3784,19 @@ impl AgentOtelMetrics {
                 .with_description("Relay forwarder framed datagram bytes sent to relay.")
                 .with_unit("By")
                 .build(),
+            forwarder_outbound_dropped_non_wireguard_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.non_wireguard.packets")
+                .with_description(
+                    "Relay forwarder local packets dropped before relay because they were not WireGuard datagrams.",
+                )
+                .build(),
+            forwarder_outbound_dropped_non_wireguard_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.non_wireguard.payload.bytes")
+                .with_description(
+                    "Relay forwarder local payload bytes dropped before relay because they were not WireGuard datagrams.",
+                )
+                .with_unit("By")
+                .build(),
             forwarder_inbound_packets: meter
                 .u64_counter("ipars.agent.relay.forwarder.inbound.packets")
                 .with_description(
@@ -3789,6 +3806,19 @@ impl AgentOtelMetrics {
             forwarder_inbound_payload_bytes: meter
                 .u64_counter("ipars.agent.relay.forwarder.inbound.payload.bytes")
                 .with_description("Relay forwarder opaque payload bytes received from relay.")
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_non_wireguard_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.non_wireguard.packets")
+                .with_description(
+                    "Relay forwarder relay packets dropped before local WireGuard because they were not WireGuard datagrams.",
+                )
+                .build(),
+            forwarder_inbound_dropped_non_wireguard_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.non_wireguard.payload.bytes")
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped before local WireGuard because they were not WireGuard datagrams.",
+                )
                 .with_unit("By")
                 .build(),
         }
@@ -3997,10 +4027,24 @@ impl AgentOtelMetrics {
                 .add(forwarder.outbound_payload_bytes, &attrs);
             self.forwarder_outbound_datagram_bytes
                 .add(forwarder.outbound_datagram_bytes, &attrs);
+            self.forwarder_outbound_dropped_non_wireguard_packets
+                .add(forwarder.outbound_dropped_non_wireguard_packets, &attrs);
+            self.forwarder_outbound_dropped_non_wireguard_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_non_wireguard_payload_bytes,
+                    &attrs,
+                );
             self.forwarder_inbound_packets
                 .add(forwarder.inbound_packets, &attrs);
             self.forwarder_inbound_payload_bytes
                 .add(forwarder.inbound_payload_bytes, &attrs);
+            self.forwarder_inbound_dropped_non_wireguard_packets
+                .add(forwarder.inbound_dropped_non_wireguard_packets, &attrs);
+            self.forwarder_inbound_dropped_non_wireguard_payload_bytes
+                .add(
+                    forwarder.inbound_dropped_non_wireguard_payload_bytes,
+                    &attrs,
+                );
         }
     }
 }
@@ -4045,6 +4089,14 @@ fn agent_forwarder_delta(
             current.outbound_datagram_bytes,
             previous.map(|previous| previous.outbound_datagram_bytes),
         ),
+        outbound_dropped_non_wireguard_packets: counter_delta(
+            current.outbound_dropped_non_wireguard_packets,
+            previous.map(|previous| previous.outbound_dropped_non_wireguard_packets),
+        ),
+        outbound_dropped_non_wireguard_payload_bytes: counter_delta(
+            current.outbound_dropped_non_wireguard_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_non_wireguard_payload_bytes),
+        ),
         inbound_packets: counter_delta(
             current.inbound_packets,
             previous.map(|previous| previous.inbound_packets),
@@ -4052,6 +4104,14 @@ fn agent_forwarder_delta(
         inbound_payload_bytes: counter_delta(
             current.inbound_payload_bytes,
             previous.map(|previous| previous.inbound_payload_bytes),
+        ),
+        inbound_dropped_non_wireguard_packets: counter_delta(
+            current.inbound_dropped_non_wireguard_packets,
+            previous.map(|previous| previous.inbound_dropped_non_wireguard_packets),
+        ),
+        inbound_dropped_non_wireguard_payload_bytes: counter_delta(
+            current.inbound_dropped_non_wireguard_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_non_wireguard_payload_bytes),
         ),
         last_forwarded_at: current.last_forwarded_at,
     }
@@ -4061,8 +4121,12 @@ fn has_agent_forwarder_delta(delta: &AgentRelayForwarderMetrics) -> bool {
     delta.outbound_packets > 0
         || delta.outbound_payload_bytes > 0
         || delta.outbound_datagram_bytes > 0
+        || delta.outbound_dropped_non_wireguard_packets > 0
+        || delta.outbound_dropped_non_wireguard_payload_bytes > 0
         || delta.inbound_packets > 0
         || delta.inbound_payload_bytes > 0
+        || delta.inbound_dropped_non_wireguard_packets > 0
+        || delta.inbound_dropped_non_wireguard_payload_bytes > 0
 }
 
 fn start_agent_otel_metrics_export(
@@ -10634,38 +10698,62 @@ mod tests {
             outbound_packets,
             outbound_payload_bytes,
             outbound_datagram_bytes,
+            outbound_dropped_non_wireguard_packets: 0,
+            outbound_dropped_non_wireguard_payload_bytes: 0,
             inbound_packets,
             inbound_payload_bytes,
+            inbound_dropped_non_wireguard_packets: 0,
+            inbound_dropped_non_wireguard_payload_bytes: 0,
             last_forwarded_at: None,
         }
     }
 
     #[test]
     fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
-        let current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let mut current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        current.outbound_dropped_non_wireguard_packets = 2;
+        current.outbound_dropped_non_wireguard_payload_bytes = 42;
+        current.inbound_dropped_non_wireguard_packets = 1;
+        current.inbound_dropped_non_wireguard_payload_bytes = 24;
 
         let delta = agent_forwarder_delta(&current, None);
 
         assert_eq!(delta.outbound_packets, 5);
         assert_eq!(delta.outbound_payload_bytes, 500);
         assert_eq!(delta.outbound_datagram_bytes, 620);
+        assert_eq!(delta.outbound_dropped_non_wireguard_packets, 2);
+        assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 42);
         assert_eq!(delta.inbound_packets, 3);
         assert_eq!(delta.inbound_payload_bytes, 300);
+        assert_eq!(delta.inbound_dropped_non_wireguard_packets, 1);
+        assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 24);
         assert!(has_agent_forwarder_delta(&delta));
     }
 
     #[test]
     fn agent_otel_delta_records_only_forwarder_increments_since_previous_snapshot() {
-        let previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
-        let current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
+        let mut previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        previous.outbound_dropped_non_wireguard_packets = 2;
+        previous.outbound_dropped_non_wireguard_payload_bytes = 100;
+        previous.inbound_dropped_non_wireguard_packets = 1;
+        previous.inbound_dropped_non_wireguard_payload_bytes = 50;
+        let mut current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
+        current.outbound_dropped_non_wireguard_packets = 5;
+        current.outbound_dropped_non_wireguard_payload_bytes = 140;
+        current.inbound_dropped_non_wireguard_packets = 3;
+        current.inbound_dropped_non_wireguard_payload_bytes = 90;
 
         let delta = agent_forwarder_delta(&current, Some(&previous));
 
         assert_eq!(delta.outbound_packets, 4);
         assert_eq!(delta.outbound_payload_bytes, 350);
         assert_eq!(delta.outbound_datagram_bytes, 430);
+        assert_eq!(delta.outbound_dropped_non_wireguard_packets, 3);
+        assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 40);
         assert_eq!(delta.inbound_packets, 4);
         assert_eq!(delta.inbound_payload_bytes, 400);
+        assert_eq!(delta.inbound_dropped_non_wireguard_packets, 2);
+        assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 40);
         assert!(has_agent_forwarder_delta(&delta));
     }
 

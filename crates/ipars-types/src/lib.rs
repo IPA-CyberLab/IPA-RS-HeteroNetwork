@@ -2486,10 +2486,10 @@ pub mod api {
     }
 
     fn wireguard_payload(payload: &[u8]) -> bool {
-        if payload.len() < 4 {
+        if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
             return false;
         }
-        match u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) {
+        match payload[0] {
             1 => payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
             2 => payload.len() >= 92,
             3 => payload.len() >= 64,
@@ -2790,8 +2790,16 @@ pub mod api {
         pub outbound_packets: u64,
         pub outbound_payload_bytes: u64,
         pub outbound_datagram_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_non_wireguard_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_non_wireguard_payload_bytes: u64,
         pub inbound_packets: u64,
         pub inbound_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_non_wireguard_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_non_wireguard_payload_bytes: u64,
         pub last_forwarded_at: Option<DateTime<Utc>>,
     }
 
@@ -3565,6 +3573,12 @@ mod tests {
         assert_eq!(
             observation_for_udp_payload(&wireguard_message(2, 92)).application(),
             api::AgentPacketFlowApplication::WireGuard
+        );
+        let mut wireguard_with_nonzero_reserved = wireguard_message(2, 92);
+        wireguard_with_nonzero_reserved[1] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_with_nonzero_reserved).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_udp_payload(&wireguard_message(3, 64)).application(),

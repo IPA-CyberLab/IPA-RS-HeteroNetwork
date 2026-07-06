@@ -407,6 +407,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total Relay forwarder local packets dropped before relay because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total Relay forwarder local payload bytes dropped before relay because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarder_inbound_packets_total Relay forwarder packets received from relay and sent to local WireGuard."
     );
     prometheus_line!(
@@ -420,6 +436,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     prometheus_line!(
         &mut body,
         "# TYPE ipars_agent_relay_forwarder_inbound_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total Relay forwarder relay packets dropped before local WireGuard because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total Relay forwarder relay payload bytes dropped before local WireGuard because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total counter"
     );
     for forwarder in &metrics.relay_forwarders {
         let peer = prometheus_label(forwarder.peer.as_str());
@@ -441,6 +473,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         );
         prometheus_line!(
             &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_non_wireguard_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_non_wireguard_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
             "ipars_agent_relay_forwarder_inbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.inbound_packets
         );
@@ -448,6 +490,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
             &mut body,
             "ipars_agent_relay_forwarder_inbound_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.inbound_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_non_wireguard_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_non_wireguard_payload_bytes
         );
     }
     prometheus_line!(
@@ -1131,6 +1183,10 @@ mod tests {
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
         assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total"));
         assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
         assert!(body.contains("ipars_agent_relay_admission_success_total"));
         assert!(body.contains("ipars_agent_relay_admission_failures_total"));

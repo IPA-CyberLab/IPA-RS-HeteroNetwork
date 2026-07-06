@@ -454,8 +454,12 @@ pub struct RelayForwarderStats {
     outbound_packets: AtomicU64,
     outbound_payload_bytes: AtomicU64,
     outbound_datagram_bytes: AtomicU64,
+    outbound_dropped_non_wireguard_packets: AtomicU64,
+    outbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     inbound_packets: AtomicU64,
     inbound_payload_bytes: AtomicU64,
+    inbound_dropped_non_wireguard_packets: AtomicU64,
+    inbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     last_forwarded_unix_millis: AtomicI64,
 }
 
@@ -474,8 +478,12 @@ impl RelayForwarderStats {
             outbound_packets: AtomicU64::new(0),
             outbound_payload_bytes: AtomicU64::new(0),
             outbound_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_non_wireguard_packets: AtomicU64::new(0),
+            outbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             inbound_packets: AtomicU64::new(0),
             inbound_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_non_wireguard_packets: AtomicU64::new(0),
+            inbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             last_forwarded_unix_millis: AtomicI64::new(-1),
         }
     }
@@ -493,11 +501,25 @@ impl RelayForwarderStats {
         self.record_forwarded_at();
     }
 
+    pub fn record_outbound_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_non_wireguard_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_non_wireguard_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
     pub fn record_inbound(&self, payload_bytes: usize) {
         self.inbound_packets.fetch_add(1, Ordering::Relaxed);
         self.inbound_payload_bytes
             .fetch_add(payload_bytes as u64, Ordering::Relaxed);
         self.record_forwarded_at();
+    }
+
+    pub fn record_inbound_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_non_wireguard_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_non_wireguard_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> AgentRelayForwarderMetrics {
@@ -510,8 +532,20 @@ impl RelayForwarderStats {
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             outbound_payload_bytes: self.outbound_payload_bytes.load(Ordering::Relaxed),
             outbound_datagram_bytes: self.outbound_datagram_bytes.load(Ordering::Relaxed),
+            outbound_dropped_non_wireguard_packets: self
+                .outbound_dropped_non_wireguard_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_non_wireguard_payload_bytes: self
+                .outbound_dropped_non_wireguard_payload_bytes
+                .load(Ordering::Relaxed),
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             inbound_payload_bytes: self.inbound_payload_bytes.load(Ordering::Relaxed),
+            inbound_dropped_non_wireguard_packets: self
+                .inbound_dropped_non_wireguard_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_non_wireguard_payload_bytes: self
+                .inbound_dropped_non_wireguard_payload_bytes
+                .load(Ordering::Relaxed),
             last_forwarded_at: (last_forwarded_unix_millis >= 0)
                 .then(|| DateTime::<Utc>::from_timestamp_millis(last_forwarded_unix_millis))
                 .flatten(),
@@ -568,6 +602,12 @@ impl UdpRelayFrameForwarder {
         socket: &tokio::net::UdpSocket,
         payload: &[u8],
     ) -> Result<usize, AgentError> {
+        if !wireguard_datagram_payload(payload) {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_outbound_drop(payload.len());
+            }
+            return Ok(0);
+        }
         let datagram = self.encode_outbound(payload)?;
         let bytes_sent = socket
             .send_to(&datagram, self.session.relay_endpoint)
@@ -584,6 +624,12 @@ impl UdpRelayFrameForwarder {
         payload: &[u8],
     ) -> Result<usize, AgentError> {
         self.ensure_session_active()?;
+        if !wireguard_datagram_payload(payload) {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_inbound_drop(payload.len());
+            }
+            return Ok(0);
+        }
         let bytes_sent = socket.send_to(payload, self.wireguard_endpoint).await?;
         if let Some(metrics) = &self.metrics {
             metrics.record_inbound(payload.len());
@@ -624,6 +670,19 @@ impl UdpRelayFrameForwarder {
             )));
         }
         Ok(())
+    }
+}
+
+fn wireguard_datagram_payload(payload: &[u8]) -> bool {
+    if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
+        return false;
+    }
+    match payload[0] {
+        1 => payload.len() == 148,
+        2 => payload.len() == 92,
+        3 => payload.len() == 64,
+        4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
+        _ => false,
     }
 }
 
@@ -2921,6 +2980,12 @@ mod tests {
         }
     }
 
+    fn wireguard_transport_payload(fill: u8) -> Vec<u8> {
+        let mut payload = vec![fill; 32];
+        payload[..4].copy_from_slice(&4_u32.to_le_bytes());
+        payload
+    }
+
     #[derive(Debug, Clone)]
     struct RecordingPeerMapSink {
         summary: PeerMapApplySummary,
@@ -3530,8 +3595,9 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let relay_task = tokio::spawn(relay.serve(service.table(), shutdown_rx));
 
+        let outbound_payload = wireguard_transport_payload(0xa1);
         forwarder
-            .send_to_relay(&left_socket, b"opaque-wireguard-packet")
+            .send_to_relay(&left_socket, &outbound_payload)
             .await?;
         let mut buffer = [0_u8; 128];
         let (len, _peer) = tokio::time::timeout(
@@ -3540,7 +3606,7 @@ mod tests {
         )
         .await??;
 
-        assert_eq!(&buffer[..len], b"opaque-wireguard-packet");
+        assert_eq!(&buffer[..len], outbound_payload.as_slice());
         shutdown_tx.send(true)?;
         relay_task.await??;
         Ok(())
@@ -3606,20 +3672,45 @@ mod tests {
         let forwarder_task = tokio::spawn(forwarder.serve(forwarder_socket, forwarder_shutdown_rx));
 
         wireguard_socket
-            .send_to(b"opaque-wireguard-outbound", forwarder_addr)
+            .send_to(b"not-wireguard", forwarder_addr)
             .await?;
         let mut buffer = [0_u8; 128];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let outbound_payload = wireguard_transport_payload(0xb1);
+        wireguard_socket
+            .send_to(&outbound_payload, forwarder_addr)
+            .await?;
         let (len, _peer) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             peer_socket.recv_from(&mut buffer),
         )
         .await??;
-        assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
+        assert_eq!(&buffer[..len], outbound_payload.as_slice());
 
         let datagram = encode_relay_datagram(
             &admission.session_id,
             &admission.session_token,
-            b"opaque-wireguard-inbound",
+            b"not-wireguard-inbound",
+        )?;
+        peer_socket.send_to(&datagram, relay_addr).await?;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wireguard_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let inbound_payload = wireguard_transport_payload(0xc1);
+        let datagram = encode_relay_datagram(
+            &admission.session_id,
+            &admission.session_token,
+            &inbound_payload,
         )?;
         peer_socket.send_to(&datagram, relay_addr).await?;
         let (len, _peer) = tokio::time::timeout(
@@ -3627,18 +3718,22 @@ mod tests {
             wireguard_socket.recv_from(&mut buffer),
         )
         .await??;
-        assert_eq!(&buffer[..len], b"opaque-wireguard-inbound");
+        assert_eq!(&buffer[..len], inbound_payload.as_slice());
         let stats = stats.snapshot();
         assert_eq!(stats.outbound_packets, 1);
-        assert_eq!(
-            stats.outbound_payload_bytes,
-            b"opaque-wireguard-outbound".len() as u64
-        );
+        assert_eq!(stats.outbound_payload_bytes, outbound_payload.len() as u64);
         assert!(stats.outbound_datagram_bytes > stats.outbound_payload_bytes);
-        assert_eq!(stats.inbound_packets, 1);
+        assert_eq!(stats.outbound_dropped_non_wireguard_packets, 1);
         assert_eq!(
-            stats.inbound_payload_bytes,
-            b"opaque-wireguard-inbound".len() as u64
+            stats.outbound_dropped_non_wireguard_payload_bytes,
+            b"not-wireguard".len() as u64
+        );
+        assert_eq!(stats.inbound_packets, 1);
+        assert_eq!(stats.inbound_payload_bytes, inbound_payload.len() as u64);
+        assert_eq!(stats.inbound_dropped_non_wireguard_packets, 1);
+        assert_eq!(
+            stats.inbound_dropped_non_wireguard_payload_bytes,
+            b"not-wireguard-inbound".len() as u64
         );
         assert!(stats.last_forwarded_at.is_some());
 
