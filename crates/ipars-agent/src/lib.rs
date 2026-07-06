@@ -22,8 +22,9 @@ use ipars_types::api::{
     AgentManagedProcessState, AgentManagedProcessStatus, AgentMetricsResponse,
     AgentPacketFlowApplication, AgentPacketFlowApplicationCount, AgentPacketFlowClassification,
     AgentPacketFlowClassificationCount, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
-    AgentPacketFlowMatch, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-    AgentPathProbeRequest, AgentRelayAdmissionFailureReason, AgentRelayAdmissionFailureReasonCount,
+    AgentPacketFlowDuplicateSource, AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch,
+    AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPathProbeRequest,
+    AgentRelayAdmissionFailureReason, AgentRelayAdmissionFailureReasonCount,
     AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
     RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
 };
@@ -394,6 +395,12 @@ pub struct AgentRuntime {
     packet_flow_match_count: AtomicU64,
     packet_flow_unmatched_count: AtomicU64,
     packet_flow_filtered_count: AtomicU64,
+    packet_flow_duplicate_suppression_count: AtomicU64,
+    packet_flow_duplicate_suppression_proc_net_conntrack_count: AtomicU64,
+    packet_flow_duplicate_suppression_conntrack_netlink_count: AtomicU64,
+    packet_flow_duplicate_suppression_conntrack_netlink_events_count: AtomicU64,
+    packet_flow_duplicate_suppression_ebpf_jsonl_count: AtomicU64,
+    packet_flow_duplicate_suppression_ebpf_ringbuf_count: AtomicU64,
     packet_flow_filtered_unspecified_count: AtomicU64,
     packet_flow_filtered_loopback_count: AtomicU64,
     packet_flow_filtered_multicast_count: AtomicU64,
@@ -966,6 +973,12 @@ impl AgentRuntime {
             packet_flow_match_count: AtomicU64::new(0),
             packet_flow_unmatched_count: AtomicU64::new(0),
             packet_flow_filtered_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_proc_net_conntrack_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_conntrack_netlink_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_conntrack_netlink_events_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_ebpf_jsonl_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_ebpf_ringbuf_count: AtomicU64::new(0),
             packet_flow_filtered_unspecified_count: AtomicU64::new(0),
             packet_flow_filtered_loopback_count: AtomicU64::new(0),
             packet_flow_filtered_multicast_count: AtomicU64::new(0),
@@ -1238,6 +1251,11 @@ impl AgentRuntime {
             packet_flow_unmatched_count: self.packet_flow_unmatched_count.load(Ordering::Relaxed),
             packet_flow_filtered_count: self.packet_flow_filtered_count.load(Ordering::Relaxed),
             packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
+            packet_flow_duplicate_suppression_count: self
+                .packet_flow_duplicate_suppression_count
+                .load(Ordering::Relaxed),
+            packet_flow_duplicate_suppression_counts: self
+                .packet_flow_duplicate_suppression_counts(),
             packet_flow_classification_counts: self.packet_flow_classification_counts(),
             packet_flow_application_counts: self.packet_flow_application_counts(),
             userspace_wireguard_process,
@@ -1521,6 +1539,20 @@ impl AgentRuntime {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_packet_flow_duplicate_suppression(
+        &self,
+        source: AgentPacketFlowDuplicateSource,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.packet_flow_duplicate_suppression_count
+            .fetch_add(count, Ordering::Relaxed);
+        self.packet_flow_duplicate_suppression_counter(source)
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     fn packet_flow_filtered_reason_counts(&self) -> Vec<AgentPacketFlowDropReasonCount> {
         AgentPacketFlowDropReason::ALL
             .into_iter()
@@ -1545,6 +1577,41 @@ impl AgentRuntime {
             }
             AgentPacketFlowDropReason::InconsistentTransportMetadata => {
                 &self.packet_flow_filtered_inconsistent_transport_metadata_count
+            }
+        }
+    }
+
+    fn packet_flow_duplicate_suppression_counts(&self) -> Vec<AgentPacketFlowDuplicateSourceCount> {
+        AgentPacketFlowDuplicateSource::ALL
+            .into_iter()
+            .map(|source| AgentPacketFlowDuplicateSourceCount {
+                source,
+                count: self
+                    .packet_flow_duplicate_suppression_counter(source)
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn packet_flow_duplicate_suppression_counter(
+        &self,
+        source: AgentPacketFlowDuplicateSource,
+    ) -> &AtomicU64 {
+        match source {
+            AgentPacketFlowDuplicateSource::ProcNetConntrack => {
+                &self.packet_flow_duplicate_suppression_proc_net_conntrack_count
+            }
+            AgentPacketFlowDuplicateSource::ConntrackNetlink => {
+                &self.packet_flow_duplicate_suppression_conntrack_netlink_count
+            }
+            AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents => {
+                &self.packet_flow_duplicate_suppression_conntrack_netlink_events_count
+            }
+            AgentPacketFlowDuplicateSource::EbpfJsonl => {
+                &self.packet_flow_duplicate_suppression_ebpf_jsonl_count
+            }
+            AgentPacketFlowDuplicateSource::EbpfRingbuf => {
+                &self.packet_flow_duplicate_suppression_ebpf_ringbuf_count
             }
         }
     }
@@ -5133,6 +5200,16 @@ mod tests {
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::ProcNetConntrack,
+            2,
+        );
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::EbpfRingbuf,
+            3,
+        );
+        runtime
+            .record_packet_flow_duplicate_suppression(AgentPacketFlowDuplicateSource::EbpfJsonl, 0);
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.lazy_connect.observed_peer_vpn_ip_count, 3);
         assert_eq!(metrics.lazy_connect.observed_route_peer_count, 2);
@@ -5189,6 +5266,27 @@ mod tests {
             1
         );
         assert_eq!(metrics.packet_flow_filtered_count, 5);
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 5);
+        let duplicate_suppression_count = |source| {
+            metrics
+                .packet_flow_duplicate_suppression_counts
+                .iter()
+                .find(|entry| entry.source == source)
+                .map(|entry| entry.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::ProcNetConntrack),
+            2
+        );
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            3
+        );
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::EbpfJsonl),
+            0
+        );
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts

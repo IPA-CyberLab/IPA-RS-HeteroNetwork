@@ -879,6 +879,35 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_packet_flow_duplicate_suppressions_total Duplicate packet-flow observations suppressed before lazy-connect resolution."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_duplicate_suppressions_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_duplicate_suppressions_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_duplicate_suppression_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_duplicate_suppressions_by_source_total Duplicate packet-flow observations suppressed before lazy-connect resolution, by detector source."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_duplicate_suppressions_by_source_total counter"
+    );
+    for source_count in &metrics.packet_flow_duplicate_suppression_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{node_id}\",source=\"{}\"}} {}",
+            source_count.source.as_str(),
+            source_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before or after lazy-connect resolution, by reason."
     );
     prometheus_line!(
@@ -1025,10 +1054,10 @@ mod tests {
     use ipars_agent::{AgentNodeState, AgentRuntime, FileAgentStateStore, RelayForwarderStats};
     use ipars_types::api::{
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
-        AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-        AgentRelayAdmissionFailureReason, AgentWireGuardKeyRotationRequest,
-        AgentWireGuardKeyRotationResponse, PeerMap, RelayMap, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse,
+        AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowMatchKind,
+        AgentPacketFlowObservation, AgentRelayAdmissionFailureReason,
+        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap, RelayMap,
+        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -1326,6 +1355,10 @@ mod tests {
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
         runtime
             .record_packet_flow_filtered(AgentPacketFlowDropReason::InconsistentTransportMetadata);
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::ConntrackNetlink,
+            2,
+        );
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -1438,6 +1471,14 @@ mod tests {
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
         assert_eq!(metrics.packet_flow_filtered_count, 4);
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 2);
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(
+                |entry| entry.source == AgentPacketFlowDuplicateSource::ConntrackNetlink
+                    && entry.count == 2
+            ));
         assert!(metrics
             .packet_flow_classification_counts
             .iter()
@@ -1534,11 +1575,16 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_observations_total"));
         assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
         assert!(body.contains("ipars_agent_packet_flow_filtered_total"));
+        assert!(body.contains("ipars_agent_packet_flow_duplicate_suppressions_total"));
+        assert!(body.contains("ipars_agent_packet_flow_duplicate_suppressions_by_source_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
         assert!(body.contains(
             &format!("ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"rejected\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{prometheus_node_id}\",source=\"conntrack-netlink\"}} 2")
         ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")

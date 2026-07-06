@@ -48,13 +48,13 @@ use ipars_stun::BindingStunServer;
 use ipars_types::api::{
     AgentManagedProcessState, AgentMetricsResponse, AgentPacketFlowApplication,
     AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
-    AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason,
-    AgentRelayForwarderMetrics, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentPacketFlowDuplicateSource, AgentPacketFlowObservation, AgentPacketFlowTcpState,
+    AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, NatTraversalStrategyCount,
+    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -3578,6 +3578,8 @@ struct AgentOtelSnapshot {
     packet_flow_unmatched_count: u64,
     packet_flow_filtered_count: u64,
     packet_flow_filtered_reason_counts: BTreeMap<AgentPacketFlowDropReason, u64>,
+    packet_flow_duplicate_suppression_count: u64,
+    packet_flow_duplicate_suppression_counts: BTreeMap<AgentPacketFlowDuplicateSource, u64>,
     packet_flow_classification_counts: BTreeMap<AgentPacketFlowClassification, u64>,
     packet_flow_application_counts: BTreeMap<AgentPacketFlowApplication, u64>,
 }
@@ -3614,6 +3616,13 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                 .packet_flow_filtered_reason_counts
                 .iter()
                 .map(|entry| (entry.reason, entry.count))
+                .collect(),
+            packet_flow_duplicate_suppression_count: metrics
+                .packet_flow_duplicate_suppression_count,
+            packet_flow_duplicate_suppression_counts: metrics
+                .packet_flow_duplicate_suppression_counts
+                .iter()
+                .map(|entry| (entry.source, entry.count))
                 .collect(),
             packet_flow_classification_counts: metrics
                 .packet_flow_classification_counts
@@ -3654,6 +3663,8 @@ struct AgentOtelMetrics {
     packet_flow_unmatched: Counter<u64>,
     packet_flow_filtered: Counter<u64>,
     packet_flow_filtered_by_reason: Counter<u64>,
+    packet_flow_duplicate_suppressions: Counter<u64>,
+    packet_flow_duplicate_suppressions_by_source: Counter<u64>,
     packet_flow_classified_by_lifecycle: Counter<u64>,
     packet_flow_classified_by_application: Counter<u64>,
     forwarder_outbound_packets: Counter<u64>,
@@ -3788,6 +3799,18 @@ impl AgentOtelMetrics {
                 .u64_counter("ipars.agent.packet_flow.filtered.by_reason")
                 .with_description(
                     "Packet-flow observations filtered before or after lazy-connect resolution, by reason.",
+                )
+                .build(),
+            packet_flow_duplicate_suppressions: meter
+                .u64_counter("ipars.agent.packet_flow.duplicate_suppressions")
+                .with_description(
+                    "Duplicate packet-flow observations suppressed before lazy-connect resolution.",
+                )
+                .build(),
+            packet_flow_duplicate_suppressions_by_source: meter
+                .u64_counter("ipars.agent.packet_flow.duplicate_suppressions.by_source")
+                .with_description(
+                    "Duplicate packet-flow observations suppressed before lazy-connect resolution, by detector source.",
                 )
                 .build(),
             packet_flow_classified_by_lifecycle: meter
@@ -4141,6 +4164,31 @@ impl AgentOtelMetrics {
                     KeyValue::new("reason", reason_count.reason.as_str()),
                 ];
                 self.packet_flow_filtered_by_reason.add(delta, &attrs);
+            }
+        }
+        let packet_flow_duplicate_suppression_delta = counter_delta(
+            metrics.packet_flow_duplicate_suppression_count,
+            previous.map(|previous| previous.packet_flow_duplicate_suppression_count),
+        );
+        if packet_flow_duplicate_suppression_delta > 0 {
+            self.packet_flow_duplicate_suppressions
+                .add(packet_flow_duplicate_suppression_delta, &node_attrs);
+        }
+        for source_count in &metrics.packet_flow_duplicate_suppression_counts {
+            let previous_count = previous.and_then(|previous| {
+                previous
+                    .packet_flow_duplicate_suppression_counts
+                    .get(&source_count.source)
+                    .copied()
+            });
+            let delta = counter_delta(source_count.count, previous_count);
+            if delta > 0 {
+                let attrs = [
+                    KeyValue::new("node_id", node_id.clone()),
+                    KeyValue::new("source", source_count.source.as_str()),
+                ];
+                self.packet_flow_duplicate_suppressions_by_source
+                    .add(delta, &attrs);
             }
         }
         for classification_count in &metrics.packet_flow_classification_counts {
@@ -8434,7 +8482,11 @@ fn start_proc_net_conntrack_packet_flow_detector(
             match read_conntrack_packet_flows(&paths, limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "proc-net-conntrack");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::ProcNetConntrack,
+                    );
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -8472,7 +8524,11 @@ fn start_conntrack_netlink_packet_flow_detector(
             match read_conntrack_netlink_packet_flows(limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "conntrack-netlink");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::ConntrackNetlink,
+                    );
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -8550,7 +8606,11 @@ fn start_ebpf_jsonl_packet_flow_detector(
             match read_ebpf_jsonl_packet_flows(&event_path, &mut cursor, limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "ebpf-jsonl");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::EbpfJsonl,
+                    );
                     let matched_count =
                         record_packet_flow_observations(runtime.as_ref(), flows, pin, "ebpf-jsonl")
                             .await;
@@ -8624,7 +8684,11 @@ async fn run_ebpf_ringbuf_packet_flow_detector_once(
         let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
         guard.clear_ready();
         let (flows, duplicate_count) = deduper.retain_new(flows);
-        log_packet_flow_duplicates(duplicate_count, "ebpf-ringbuf");
+        record_packet_flow_duplicate_suppressions(
+            runtime,
+            duplicate_count,
+            AgentPacketFlowDuplicateSource::EbpfRingbuf,
+        );
         let matched_count =
             record_packet_flow_observations(runtime, flows, pin, "ebpf-ringbuf").await;
         if matched_count > 0 {
@@ -8710,11 +8774,16 @@ fn packet_flow_dedup_ttl(seconds: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
-fn log_packet_flow_duplicates(duplicate_count: usize, source: &'static str) {
+fn record_packet_flow_duplicate_suppressions(
+    runtime: &AgentRuntime,
+    duplicate_count: usize,
+    source: AgentPacketFlowDuplicateSource,
+) {
     if duplicate_count > 0 {
+        runtime.record_packet_flow_duplicate_suppression(source, duplicate_count as u64);
         tracing::debug!(
             suppressed = duplicate_count,
-            source,
+            source = source.as_str(),
             "suppressed duplicate packet-flow observations"
         );
     }
@@ -8807,7 +8876,11 @@ async fn run_conntrack_netlink_event_detector_once(
         {
             recorded_any = true;
             let (flows, duplicate_count) = deduper.retain_new(flows);
-            log_packet_flow_duplicates(duplicate_count, "conntrack-netlink-events");
+            record_packet_flow_duplicate_suppressions(
+                runtime,
+                duplicate_count,
+                AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
+            );
             let matched_count =
                 record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events")
                     .await;
@@ -10407,9 +10480,9 @@ mod tests {
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
         AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
-        AgentPacketFlowDropReasonCount, AgentRelayAdmissionFailureReasonCount,
-        AgentRelayForwarderMetrics, LazyConnectMetrics, PathStateCount, RelayAdmissionResponse,
-        RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSourceCount,
+        AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
+        PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -11342,6 +11415,11 @@ mod tests {
                 reason: AgentPacketFlowDropReason::Multicast,
                 count: 3,
             }],
+            packet_flow_duplicate_suppression_count: 5,
+            packet_flow_duplicate_suppression_counts: vec![AgentPacketFlowDuplicateSourceCount {
+                source: AgentPacketFlowDuplicateSource::EbpfRingbuf,
+                count: 5,
+            }],
             packet_flow_classification_counts: vec![AgentPacketFlowClassificationCount {
                 classification: AgentPacketFlowClassification::Established,
                 count: 2,
@@ -11360,6 +11438,12 @@ mod tests {
                 .relay_admission_failure_reason_counts
                 .get(&AgentRelayAdmissionFailureReason::Rejected),
             Some(&1)
+        );
+        assert_eq!(
+            previous
+                .packet_flow_duplicate_suppression_counts
+                .get(&AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            Some(&5)
         );
         assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
     }
@@ -13213,6 +13297,42 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(retained.len(), 1);
         assert_eq!(duplicates, 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_duplicate_suppression_records_agent_metrics() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+
+        record_packet_flow_duplicate_suppressions(
+            &runtime,
+            3,
+            AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
+        );
+        record_packet_flow_duplicate_suppressions(
+            &runtime,
+            0,
+            AgentPacketFlowDuplicateSource::EbpfJsonl,
+        );
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 3);
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(|entry| {
+                entry.source == AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents
+                    && entry.count == 3
+            }));
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(
+                |entry| entry.source == AgentPacketFlowDuplicateSource::EbpfJsonl
+                    && entry.count == 0
+            ));
     }
 
     #[tokio::test]

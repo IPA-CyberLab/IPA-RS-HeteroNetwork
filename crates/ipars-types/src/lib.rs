@@ -2948,6 +2948,42 @@ pub mod api {
         pub count: u64,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AgentPacketFlowDuplicateSource {
+        ProcNetConntrack,
+        ConntrackNetlink,
+        ConntrackNetlinkEvents,
+        EbpfJsonl,
+        EbpfRingbuf,
+    }
+
+    impl AgentPacketFlowDuplicateSource {
+        pub const ALL: [Self; 5] = [
+            Self::ProcNetConntrack,
+            Self::ConntrackNetlink,
+            Self::ConntrackNetlinkEvents,
+            Self::EbpfJsonl,
+            Self::EbpfRingbuf,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::ProcNetConntrack => "proc-net-conntrack",
+                Self::ConntrackNetlink => "conntrack-netlink",
+                Self::ConntrackNetlinkEvents => "conntrack-netlink-events",
+                Self::EbpfJsonl => "ebpf-jsonl",
+                Self::EbpfRingbuf => "ebpf-ringbuf",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowDuplicateSourceCount {
+        pub source: AgentPacketFlowDuplicateSource,
+        pub count: u64,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowClassificationCount {
         pub classification: AgentPacketFlowClassification,
@@ -2983,6 +3019,10 @@ pub mod api {
         pub packet_flow_unmatched_count: u64,
         pub packet_flow_filtered_count: u64,
         pub packet_flow_filtered_reason_counts: Vec<AgentPacketFlowDropReasonCount>,
+        #[serde(default)]
+        pub packet_flow_duplicate_suppression_count: u64,
+        #[serde(default)]
+        pub packet_flow_duplicate_suppression_counts: Vec<AgentPacketFlowDuplicateSourceCount>,
         #[serde(default)]
         pub packet_flow_classification_counts: Vec<AgentPacketFlowClassificationCount>,
         #[serde(default)]
