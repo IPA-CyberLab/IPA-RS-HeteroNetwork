@@ -43,6 +43,7 @@ static DAEMON_MANIFEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
+const DAEMON_JOIN_TOKEN_FILE_SUFFIX: &str = ".join-token.json";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 const MAX_DAEMON_READINESS_TIMEOUT_SECONDS: u64 = 3_600;
@@ -837,6 +838,7 @@ impl LoadReport {
                 runtime_dir.display()
             )
         })?;
+        validate_daemon_retained_runtime_has_no_join_tokens(runtime_dir)?;
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         for child in &manifest.children {
@@ -1079,6 +1081,34 @@ fn validate_daemon_retained_path_mode(
     #[cfg(not(unix))]
     {
         let _ = (path, metadata, expected_mode, label);
+    }
+    Ok(())
+}
+
+fn validate_daemon_retained_runtime_has_no_join_tokens(runtime_dir: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(runtime_dir).with_context(|| {
+        format!(
+            "daemon load scenario retained runtime directory {} cannot be scanned",
+            runtime_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "daemon load scenario retained runtime directory {} contains unreadable entry",
+                runtime_dir.display()
+            )
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(DAEMON_JOIN_TOKEN_FILE_SUFFIX))
+        {
+            bail!(
+                "daemon load scenario retained runtime directory {} still contains join token file {} after agent startup",
+                runtime_dir.display(),
+                entry.path().display()
+            );
+        }
     }
     Ok(())
 }
@@ -2519,6 +2549,7 @@ impl DaemonProcessGroup {
                 &control_plane_urls,
             )?)?;
             let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
+            startup.record_join_token_path(token_path.clone());
             let mut agent_args = vec![
                 "agent".to_string(),
                 "--listen".to_string(),
@@ -2616,6 +2647,7 @@ impl DaemonProcessGroup {
             options.agent_readiness_timeout,
         )
         .await?;
+        startup.remove_join_token_files()?;
         manifest_seed.write(
             DaemonRuntimePhase::StartupReady,
             &agent_urls,
@@ -2744,6 +2776,7 @@ impl Drop for DaemonProcessGroup {
 struct DaemonStartupGuard {
     runtime_dir: PathBuf,
     children: Vec<DaemonChild>,
+    join_token_paths: Vec<PathBuf>,
     active: bool,
     keep_runtime_dir: bool,
 }
@@ -2753,13 +2786,23 @@ impl DaemonStartupGuard {
         Self {
             runtime_dir,
             children: Vec::new(),
+            join_token_paths: Vec::new(),
             active: true,
             keep_runtime_dir,
         }
     }
 
+    fn record_join_token_path(&mut self, path: PathBuf) {
+        self.join_token_paths.push(path);
+    }
+
+    fn remove_join_token_files(&mut self) -> anyhow::Result<()> {
+        remove_daemon_join_token_files(&mut self.join_token_paths)
+    }
+
     fn finish(mut self) -> Vec<DaemonChild> {
         self.active = false;
+        self.join_token_paths.clear();
         std::mem::take(&mut self.children)
     }
 }
@@ -2767,6 +2810,7 @@ impl DaemonStartupGuard {
 impl Drop for DaemonStartupGuard {
     fn drop(&mut self) {
         if self.active {
+            let _ = remove_daemon_join_token_files(&mut self.join_token_paths);
             kill_daemon_children(&mut self.children);
             if !self.keep_runtime_dir {
                 let _ = std::fs::remove_dir_all(&self.runtime_dir);
@@ -3131,7 +3175,7 @@ fn write_daemon_join_token<Token: Serialize>(
     agent_index: usize,
     token: &Token,
 ) -> anyhow::Result<PathBuf> {
-    let token_path = runtime_dir.join(format!("agent-{agent_index:04}.join-token.json"));
+    let token_path = daemon_join_token_path(runtime_dir, agent_index);
     let token_json = serde_json::to_vec(token).context("failed to serialize daemon join token")?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -3169,6 +3213,28 @@ fn write_daemon_join_token<Token: Serialize>(
     }
     validate_daemon_join_token_file(runtime_dir, &token_path)?;
     Ok(token_path)
+}
+
+fn daemon_join_token_path(runtime_dir: &Path, agent_index: usize) -> PathBuf {
+    runtime_dir.join(format!(
+        "agent-{agent_index:04}{DAEMON_JOIN_TOKEN_FILE_SUFFIX}"
+    ))
+}
+
+fn remove_daemon_join_token_files(token_paths: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for token_path in token_paths.drain(..) {
+        match std::fs::remove_file(&token_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                bail!(
+                    "failed to remove daemon join token {} after agent startup: {error}",
+                    token_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_daemon_join_token_file(runtime_dir: &Path, token_path: &Path) -> anyhow::Result<()> {
@@ -4390,6 +4456,32 @@ mod tests {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
 
+        let mut retained_join_token = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &retained_join_token,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        retained_join_token.daemon_runtime_dir = Some(runtime_dir.clone());
+        retained_join_token.daemon_runtime_manifest = Some(manifest_path);
+        std::fs::write(
+            daemon_join_token_path(&runtime_dir, 0),
+            "{\"token\":\"left-behind\"}\n",
+        )?;
+        let error = match retained_join_token.validate_success() {
+            Ok(_) => bail!("retained runtime with leftover join token should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("join token"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut stale_generated_timestamp = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &stale_generated_timestamp,
@@ -5122,6 +5214,41 @@ mod tests {
         }
         assert!(retained_dir.exists());
         std::fs::remove_dir_all(&retained_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_startup_guard_removes_join_tokens_before_retaining_runtime_dir() -> anyhow::Result<()>
+    {
+        let runtime_dir = synthetic_runtime_dir("startup-token-cleanup");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let token_path = write_daemon_join_token(
+            &runtime_dir,
+            0,
+            &serde_json::json!({ "token": "startup-secret" }),
+        )?;
+        {
+            let mut guard = DaemonStartupGuard::new(runtime_dir.clone(), true);
+            guard.record_join_token_path(token_path.clone());
+        }
+
+        assert!(runtime_dir.exists());
+        assert!(!token_path.exists());
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_join_token_removal_ignores_already_removed_files() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("token-removal");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let token_path = daemon_join_token_path(&runtime_dir, 0);
+        let mut paths = vec![token_path];
+
+        remove_daemon_join_token_files(&mut paths)?;
+
+        assert!(paths.is_empty());
+        std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
     }
 
