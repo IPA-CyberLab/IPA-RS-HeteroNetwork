@@ -191,6 +191,13 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateOptionalBoolean" -}}
+{{- $path := .path -}}
+{{- if and (not (kindIs "bool" .value)) (ne (printf "%v" .value) "") -}}
+{{- fail (printf "%s must be true, false, or empty" $path) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateHttpEndpointURL" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}

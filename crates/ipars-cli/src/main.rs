@@ -8656,15 +8656,25 @@ mod tests {
         let rbac_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/rbac.yaml")
             .canonicalize()?;
+        let service_account_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/serviceaccount.yaml")
+            .canonicalize()?;
+        let pdb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/poddisruptionbudget.yaml")
+            .canonicalize()?;
         let helpers = std::fs::read_to_string(helpers_path)?;
         let service_template = std::fs::read_to_string(service_template_path)?;
         let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
         let daemonset = std::fs::read_to_string(daemonset_path)?;
         let rbac = std::fs::read_to_string(rbac_path)?;
+        let service_account = std::fs::read_to_string(service_account_path)?;
+        let pdb = std::fs::read_to_string(pdb_path)?;
 
         assert!(helpers.contains("define \"ipars.validateBoolean\""));
+        assert!(helpers.contains("define \"ipars.validateOptionalBoolean\""));
         assert!(helpers.contains("kindIs \"bool\" .value"));
         assert!(helpers.contains("%s must be true or false"));
+        assert!(helpers.contains("%s must be true, false, or empty"));
         for path in [
             "agent.apiService.enabled",
             "agent.apiService.exposureAcknowledged",
@@ -8686,10 +8696,29 @@ mod tests {
             );
         }
         for path in [
+            "rbac.create",
+            "serviceAccount.create",
+            "agent.hostNetwork",
+            "agent.automountServiceAccountToken",
+            "agent.privileged",
+            "agent.securityContext.allowPrivilegeEscalation",
+            "agent.securityContext.readOnlyRootFilesystem",
+            "agent.peerMap.enabled",
+            "agent.relayForwarder.enabled",
+            "agent.probes.liveness.enabled",
+            "agent.probes.readiness.enabled",
+        ] {
+            assert!(
+                daemonset.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a DaemonSet boolean"
+            );
+        }
+        for path in [
             "networkPolicy.enabled",
             "networkPolicy.acknowledgeHostNetwork",
             "networkPolicy.agentApi.enabled",
             "networkPolicy.relay.enabled",
+            "agent.hostNetwork",
         ] {
             assert!(
                 network_policy_template.contains(&format!("\"path\" \"{path}\"")),
@@ -8708,6 +8737,8 @@ mod tests {
         }
         assert!(rbac.contains("\"path\" \"rbac.create\""));
         assert!(rbac.contains("\"path\" \"serviceExposure.discoverServices\""));
+        assert!(service_account.contains("\"path\" \"serviceAccount.create\""));
+        assert!(pdb.contains("\"path\" \"agent.podDisruptionBudget.enabled\""));
         Ok(())
     }
 

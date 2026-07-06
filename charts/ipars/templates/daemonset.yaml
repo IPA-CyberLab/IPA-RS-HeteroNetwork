@@ -39,11 +39,20 @@
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
+{{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceAccount.create" "value" .Values.serviceAccount.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.automountServiceAccountToken" "value" .Values.agent.automountServiceAccountToken) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.privileged" "value" .Values.agent.privileged) -}}
+{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
+{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
 {{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayForwarder.enabled" "value" .Values.agent.relayForwarder.enabled) -}}
 {{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
 {{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
 {{- $agentRelayForwarderCrashWindowSeconds := printf "%v" .Values.agent.relayForwarder.crashWindowSeconds -}}
@@ -54,6 +63,8 @@
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
 {{- $agentLivenessProbeEnabled := printf "%v" .Values.agent.probes.liveness.enabled -}}
 {{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
 {{- $absolutePathPattern := "^/[A-Za-z0-9._/@%+=:,/-]+$" -}}
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}

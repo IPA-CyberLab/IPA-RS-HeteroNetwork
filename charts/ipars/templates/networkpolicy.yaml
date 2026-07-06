@@ -5,6 +5,7 @@
 {{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
 {{- $networkPolicyEnabled := .Values.networkPolicy.enabled -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentApiNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.agentApi.enabled -}}

@@ -1,21 +1,19 @@
-{{- $pdbEnabled := printf "%v" .Values.agent.podDisruptionBudget.enabled -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.podDisruptionBudget.enabled" "value" .Values.agent.podDisruptionBudget.enabled) -}}
+{{- $pdbEnabled := .Values.agent.podDisruptionBudget.enabled -}}
 {{- $pdbMinAvailable := printf "%v" .Values.agent.podDisruptionBudget.minAvailable -}}
 {{- $pdbMaxUnavailable := printf "%v" .Values.agent.podDisruptionBudget.maxUnavailable -}}
-{{- if not (or (eq $pdbEnabled "true") (eq $pdbEnabled "false")) -}}
-{{- fail "agent.podDisruptionBudget.enabled must be true or false" -}}
-{{- end -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.minAvailable" "value" $pdbMinAvailable) -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.maxUnavailable" "value" $pdbMaxUnavailable) -}}
 {{- if and (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "") -}}
 {{- fail "agent.podDisruptionBudget.minAvailable and agent.podDisruptionBudget.maxUnavailable are mutually exclusive" -}}
 {{- end -}}
-{{- if and (eq $pdbEnabled "false") (or (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "")) -}}
+{{- if and (not $pdbEnabled) (or (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "")) -}}
 {{- fail "agent.podDisruptionBudget minAvailable or maxUnavailable requires agent.podDisruptionBudget.enabled=true" -}}
 {{- end -}}
-{{- if and (eq $pdbEnabled "true") (eq $pdbMinAvailable "") (eq $pdbMaxUnavailable "") -}}
+{{- if and $pdbEnabled (eq $pdbMinAvailable "") (eq $pdbMaxUnavailable "") -}}
 {{- fail "agent.podDisruptionBudget.enabled=true requires minAvailable or maxUnavailable" -}}
 {{- end -}}
-{{- if eq $pdbEnabled "true" }}
+{{- if $pdbEnabled }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
