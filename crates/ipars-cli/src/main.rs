@@ -8587,6 +8587,42 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_bounds_daemon_numeric_values_before_int_conversion() -> anyhow::Result<()> {
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
+        for path in [
+            "agent.relayAdvertisement.maxSessions",
+            "agent.relayAdvertisement.maxMbps",
+            "serviceExposure.routeIntervalSeconds",
+        ] {
+            assert!(
+                daemonset.contains(&format!(
+                    "ipars.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as a bounded integer before int conversion"
+            );
+        }
+        assert!(daemonset.contains(
+            "\"agent.relayAdvertisement.maxSessions\" \"value\" $relayAdvertisementMaxSessions \"max\" 4294967295"
+        ));
+        assert!(daemonset.contains(
+            "\"agent.relayAdvertisement.maxMbps\" \"value\" $relayAdvertisementMaxMbps \"max\" 4294967295"
+        ));
+        assert!(daemonset.contains(
+            "\"serviceExposure.routeIntervalSeconds\" \"value\" $serviceExposureRouteIntervalSeconds \"max\" 9223372036854775807"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_rejects_inconsistent_service_exposure_values() -> anyhow::Result<()> {
         let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/service.yaml")

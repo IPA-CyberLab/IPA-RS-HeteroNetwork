@@ -381,15 +381,21 @@
 {{- if .Values.agent.relayAdvertisement.statusUrl -}}
 {{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
 {{- end -}}
-{{- if not (gt (int .Values.agent.relayAdvertisement.maxSessions) 0) -}}
+{{- $relayAdvertisementMaxSessions := printf "%v" .Values.agent.relayAdvertisement.maxSessions -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxSessions" "value" $relayAdvertisementMaxSessions "max" 4294967295) -}}
+{{- if not (gt (int $relayAdvertisementMaxSessions) 0) -}}
 {{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
 {{- end -}}
-{{- if not (gt (int .Values.agent.relayAdvertisement.maxMbps) 0) -}}
+{{- $relayAdvertisementMaxMbps := printf "%v" .Values.agent.relayAdvertisement.maxMbps -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxMbps" "value" $relayAdvertisementMaxMbps "max" 4294967295) -}}
+{{- if not (gt (int $relayAdvertisementMaxMbps) 0) -}}
 {{- fail "agent.relayAdvertisement.maxMbps must be greater than zero" -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.serviceExposure.enabled -}}
-{{- if not (gt (int .Values.serviceExposure.routeIntervalSeconds) 0) -}}
+{{- $serviceExposureRouteIntervalSeconds := printf "%v" .Values.serviceExposure.routeIntervalSeconds -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "serviceExposure.routeIntervalSeconds" "value" $serviceExposureRouteIntervalSeconds "max" 9223372036854775807) -}}
+{{- if not (gt (int $serviceExposureRouteIntervalSeconds) 0) -}}
 {{- fail "serviceExposure.routeIntervalSeconds must be greater than zero" -}}
 {{- end -}}
 {{- if and (not .Values.serviceExposure.discoverServices) .Values.serviceExposure.namespaces -}}
