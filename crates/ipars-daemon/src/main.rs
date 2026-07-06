@@ -1535,6 +1535,21 @@ fn validate_relay_forwarder_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.relay_forwarder_max_sessions,
             "--relay-forwarder-max-sessions",
         )?;
+        validate_positive_seconds(
+            args.relay_forwarder_restart_backoff_seconds,
+            "--relay-forwarder-restart-backoff-seconds",
+        )?;
+        validate_positive_seconds(
+            args.relay_forwarder_crash_window_seconds,
+            "--relay-forwarder-crash-window-seconds",
+        )?;
+        if args.relay_forwarder_max_crashes_per_window == 0 {
+            anyhow::bail!("--relay-forwarder-max-crashes-per-window must be greater than zero");
+        }
+        validate_positive_seconds(
+            args.relay_forwarder_crash_cooldown_seconds,
+            "--relay-forwarder-crash-cooldown-seconds",
+        )?;
     } else {
         anyhow::ensure!(
             args.relay_forwarder_wireguard_endpoint.is_none(),
@@ -16179,10 +16194,56 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--relay-forwarder-max-sessions must be greater than zero"));
-            return Ok(());
+        } else {
+            anyhow::bail!("expected agent command");
         }
 
-        Err(anyhow::anyhow!("expected agent command"))
+        for (flag, expected) in [
+            (
+                "--relay-forwarder-restart-backoff-seconds",
+                "--relay-forwarder-restart-backoff-seconds must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-crash-window-seconds",
+                "--relay-forwarder-crash-window-seconds must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-max-crashes-per-window",
+                "--relay-forwarder-max-crashes-per-window must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-crash-cooldown-seconds",
+                "--relay-forwarder-crash-cooldown-seconds must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--skip-runtime-preflight",
+                "--relay-forwarder-bind",
+                "127.0.0.1:0",
+                "--relay-forwarder-wireguard-endpoint",
+                "127.0.0.1:51820",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                    Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
