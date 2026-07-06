@@ -14228,7 +14228,7 @@ mod tests {
     fn ebpf_jsonl_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
         let mut cursor = EbpfJsonlReadCursor::default();
         let flows = parse_ebpf_jsonl_packet_flow_bytes(
-            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","application":"postgres","conntrack_status":["assured"]}
+            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","application":"wire_guard","conntrack_status":["assured"]}
 {"destination":"fd00::42","source":"2001:db8::1","protocol":"tcp","source_port":443,"destination_port":51820,"tcp_state":"established"}
 {"destination":"100.64.0.12","protocol":"tcp","payload_prefix":"GET /metrics HTTP/1.1\r\n"}
 "#,
@@ -14250,11 +14250,11 @@ mod tests {
         assert_eq!(flows[0].observation.detector.as_deref(), Some("xdp-flow"));
         assert_eq!(
             flows[0].observation.application,
-            Some(AgentPacketFlowApplication::Postgres)
+            Some(AgentPacketFlowApplication::WireGuard)
         );
         assert_eq!(
             flows[0].observation.application(),
-            AgentPacketFlowApplication::Postgres
+            AgentPacketFlowApplication::WireGuard
         );
         assert_eq!(
             flows[0].observation.conntrack_status,
@@ -14722,7 +14722,7 @@ mod tests {
         };
         assert!(error.chain().any(|cause| cause
             .to_string()
-            .contains("application hint postgres requires TCP or UDP protocol")));
+            .contains("application hint postgres requires TCP protocol")));
         Ok(())
     }
 

@@ -2106,20 +2106,46 @@ pub mod api {
         };
         match application {
             AgentPacketFlowApplication::Unknown => Ok(()),
-            AgentPacketFlowApplication::Icmp if protocol == TransportProtocol::Icmp => Ok(()),
-            AgentPacketFlowApplication::Icmp => {
-                Err("packet-flow application hint icmp requires ICMP protocol".to_string())
-            }
-            AgentPacketFlowApplication::WireGuard if protocol == TransportProtocol::Udp => Ok(()),
+            AgentPacketFlowApplication::Icmp => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "ICMP",
+                |protocol| protocol == TransportProtocol::Icmp,
+            ),
             AgentPacketFlowApplication::WireGuard => {
-                Err("packet-flow application hint wireguard requires UDP protocol".to_string())
+                require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
+                    protocol == TransportProtocol::Udp
+                })
             }
-            application if protocol == TransportProtocol::Icmp => Err(format!(
-                "packet-flow application hint {} requires TCP or UDP protocol",
-                application.as_str()
-            )),
-            _ => Ok(()),
+            AgentPacketFlowApplication::Dns
+            | AgentPacketFlowApplication::Https
+            | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "TCP or UDP",
+                |protocol| matches!(protocol, TransportProtocol::Tcp | TransportProtocol::Udp),
+            ),
+            _ => {
+                require_packet_flow_application_protocol(protocol, application, "TCP", |protocol| {
+                    protocol == TransportProtocol::Tcp
+                })
+            }
         }
+    }
+
+    fn require_packet_flow_application_protocol(
+        protocol: TransportProtocol,
+        application: AgentPacketFlowApplication,
+        required: &'static str,
+        is_allowed: impl FnOnce(TransportProtocol) -> bool,
+    ) -> Result<(), String> {
+        if is_allowed(protocol) {
+            return Ok(());
+        }
+        Err(format!(
+            "packet-flow application hint {} requires {required} protocol",
+            application.as_str()
+        ))
     }
 
     fn validate_packet_flow_source(source: IpAddr) -> Result<(), String> {
@@ -8675,6 +8701,22 @@ mod tests {
             serde_json::from_str(r#"{"protocol":"udp","application":"wire_guard"}"#)?;
         udp_wireguard_hint.validate_transport_metadata()?;
 
+        let udp_dns_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"dns"}"#)?;
+        udp_dns_hint.validate_transport_metadata()?;
+
+        let tcp_dns_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"dns"}"#)?;
+        tcp_dns_hint.validate_transport_metadata()?;
+
+        let udp_https_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
+        udp_https_hint.validate_transport_metadata()?;
+
+        let udp_memcached_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"memcached"}"#)?;
+        udp_memcached_hint.validate_transport_metadata()?;
+
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
         let error = match tcp_wireguard_hint.validate_transport_metadata() {
@@ -8691,13 +8733,21 @@ mod tests {
         };
         assert!(error.contains("application hint icmp requires ICMP protocol"));
 
+        let udp_postgres_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"postgres"}"#)?;
+        let error = match udp_postgres_hint.validate_transport_metadata() {
+            Ok(()) => return Err("UDP TCP-only service application hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint postgres requires TCP protocol"));
+
         let icmp_postgres_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"icmp","application":"postgres"}"#)?;
         let error = match icmp_postgres_hint.validate_transport_metadata() {
             Ok(()) => return Err("ICMP service application hint should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("application hint postgres requires TCP or UDP protocol"));
+        assert!(error.contains("application hint postgres requires TCP protocol"));
 
         let any_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"any"}"#)?;
