@@ -36,6 +36,9 @@
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
+{{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
+{{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
 {{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
 {{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
 {{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
@@ -64,6 +67,9 @@
 {{- end -}}
 {{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
 {{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- if or (lt $agentApiTargetPort 1) (gt $agentApiTargetPort 65535) -}}
+{{- fail "agent.apiService.targetPort must be between 1 and 65535" -}}
 {{- end -}}
 {{- if not (or (eq $agentRelayForwarderEnabled "true") (eq $agentRelayForwarderEnabled "false")) -}}
 {{- fail "agent.relayForwarder.enabled must be true or false" -}}
@@ -559,7 +565,7 @@ spec:
           args:
             - agent
             - --listen
-            - 0.0.0.0:9780
+            - {{ printf "0.0.0.0:%d" $agentApiTargetPort | quote }}
             - --state-path
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
             - --wireguard-interface
@@ -732,7 +738,7 @@ spec:
           livenessProbe:
             httpGet:
               path: {{ .Values.agent.probes.liveness.path | quote }}
-              port: 9780
+              port: {{ $agentApiTargetPort }}
             initialDelaySeconds: {{ int .Values.agent.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ int .Values.agent.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ int .Values.agent.probes.liveness.timeoutSeconds }}
@@ -742,7 +748,7 @@ spec:
           readinessProbe:
             httpGet:
               path: {{ .Values.agent.probes.readiness.path | quote }}
-              port: 9780
+              port: {{ $agentApiTargetPort }}
             initialDelaySeconds: {{ int .Values.agent.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ int .Values.agent.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ int .Values.agent.probes.readiness.timeoutSeconds }}

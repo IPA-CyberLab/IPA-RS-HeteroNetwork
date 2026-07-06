@@ -109,6 +109,7 @@ agent:
     appProtocol: http
     publishNotReadyAddresses: false
     port: 9780
+    targetPort: 9780
     nodePort: 0
   relayForwarder:
     enabled: false

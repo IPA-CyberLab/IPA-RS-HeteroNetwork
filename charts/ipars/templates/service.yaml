@@ -14,6 +14,9 @@
 {{- $agentApiPortValue := printf "%v" .Values.agent.apiService.port -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.port" "value" $agentApiPortValue "max" 65535) -}}
 {{- $agentApiPort := int $agentApiPortValue -}}
+{{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
+{{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
 {{- $agentApiClusterIP := .Values.agent.apiService.clusterIP -}}
 {{- $agentApiClusterIPs := .Values.agent.apiService.clusterIPs -}}
 {{- $agentApiNodePortValue := printf "%v" .Values.agent.apiService.nodePort -}}
@@ -87,6 +90,9 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (or (lt $agentApiPort 1) (gt $agentApiPort 65535)) -}}
 {{- fail "agent.apiService.port must be between 1 and 65535" -}}
+{{- end -}}
+{{- if or (lt $agentApiTargetPort 1) (gt $agentApiTargetPort 65535) -}}
+{{- fail "agent.apiService.targetPort must be between 1 and 65535" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiClusterIP "") -}}
 {{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.apiService.clusterIP" "value" $agentApiClusterIP) -}}
@@ -585,7 +591,7 @@ spec:
       appProtocol: {{ .Values.agent.apiService.appProtocol | quote }}
       {{- end }}
       port: {{ .Values.agent.apiService.port }}
-      targetPort: 9780
+      targetPort: {{ .Values.agent.apiService.targetPort }}
       {{- if and $agentApiExternal (ne $agentApiNodePort 0) }}
       nodePort: {{ $agentApiNodePort }}
       {{- end }}

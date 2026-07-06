@@ -499,6 +499,8 @@ struct K8sInstallArgs {
     agent_api_secondary_cluster_ip: Option<IpAddr>,
     #[arg(long = "agent-api-port", value_parser = parse_kubernetes_service_port, requires = "expose_agent_api")]
     agent_api_port: Option<u16>,
+    #[arg(long = "agent-api-target-port", value_parser = parse_kubernetes_service_port)]
+    agent_api_target_port: Option<u16>,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
     #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
@@ -1820,6 +1822,16 @@ fn parse_kubernetes_service_port(value: &str) -> Result<u16, String> {
         Err(format!(
             "Service port must be between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}; got {value}"
         ))
+    }
+}
+
+fn validate_kubernetes_service_port_value(port: u16, flag: &str) -> anyhow::Result<()> {
+    if (KUBERNETES_SERVICE_PORT_MIN..=KUBERNETES_SERVICE_PORT_MAX).contains(&port) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{flag} must be between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}"
+        );
     }
 }
 
@@ -3361,6 +3373,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 &args.relay_network_policy_cidrs,
             );
         }
+    }
+    if let Some(port) = args.agent_api_target_port {
+        helm_command.push_str(&format!(" --set agent.apiService.targetPort={port}"));
     }
     if args.expose_agent_api {
         helm_command.push_str(" --set agent.apiService.enabled=true");
@@ -5044,6 +5059,19 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         k8s_agent_api_cluster_external_traffic_policy_ack_applies(args);
     let relay_cluster_external_traffic_policy_ack =
         k8s_relay_cluster_external_traffic_policy_ack_applies(args);
+
+    for (port, flag) in [
+        (args.agent_api_port, "--agent-api-port"),
+        (args.agent_api_target_port, "--agent-api-target-port"),
+        (args.relay_udp_port, "--relay-udp-port"),
+        (args.relay_udp_target_port, "--relay-udp-target-port"),
+        (args.relay_http_port, "--relay-http-port"),
+        (args.relay_http_target_port, "--relay-http-target-port"),
+    ] {
+        if let Some(port) = port {
+            validate_kubernetes_service_port_value(port, flag)?;
+        }
+    }
 
     if args.agent_api_cluster_ip.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-cluster-ip requires --expose-agent-api");
@@ -8022,6 +8050,7 @@ mod tests {
             agent_api_cluster_ip: Some("10.96.0.40".parse()?),
             agent_api_secondary_cluster_ip: Some("2001:db8::40".parse()?),
             agent_api_port: Some(9781),
+            agent_api_target_port: Some(9790),
             agent_api_node_port: Some(31080),
             agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
             agent_api_publish_not_ready_addresses: true,
@@ -8120,6 +8149,7 @@ mod tests {
             plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
         );
         assert!(plan.commands[2].contains("--set agent.apiService.port=9781"));
+        assert!(plan.commands[2].contains("--set agent.apiService.targetPort=9790"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
@@ -8586,7 +8616,14 @@ mod tests {
         assert!(daemonset.contains("- name: host-netns"));
         assert!(daemonset.contains("mountPath: /var/run/netns"));
         assert!(daemonset.contains("path: /var/run/netns"));
-        assert_eq!(daemonset.matches("port: 9780").count(), 2);
+        assert!(daemonset.contains("\"path\" \"agent.apiService.targetPort\""));
+        assert!(daemonset.contains("printf \"0.0.0.0:%d\" $agentApiTargetPort"));
+        assert_eq!(
+            daemonset.matches("port: {{ $agentApiTargetPort }}").count(),
+            2
+        );
+        assert!(!daemonset.contains("port: 9780"));
+        assert!(!daemonset.contains("0.0.0.0:9780"));
         assert!(!daemonset.contains("cluster.relayEndpoint"));
         assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
         Ok(())
@@ -8838,6 +8875,7 @@ mod tests {
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
         for path in [
             "agent.apiService.port",
+            "agent.apiService.targetPort",
             "agent.apiService.nodePort",
             "agent.apiService.healthCheckNodePort",
             "agent.apiService.sessionAffinityTimeoutSeconds",
@@ -8875,6 +8913,8 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs"
         ));
+        assert!(service_template.contains("targetPort: {{ .Values.agent.apiService.targetPort }}"));
+        assert!(!service_template.contains("targetPort: 9780"));
         assert!(
             service_template.contains("targetPort: {{ .Values.agent.relayService.udpTargetPort }}")
         );
@@ -9031,6 +9071,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -9093,6 +9134,19 @@ mod tests {
             relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
             relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_api_target_port_without_service_exposure() -> anyhow::Result<()>
+    {
+        let mut args = base_k8s_install_args();
+        args.agent_api_target_port = Some(9790);
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.apiService.targetPort=9790"));
+        assert!(!helm.contains("--set agent.apiService.enabled=true"));
+        Ok(())
     }
 
     #[test]
@@ -10066,6 +10120,8 @@ mod tests {
             "LoadBalancer",
             "--agent-api-port",
             "9781",
+            "--agent-api-target-port",
+            "9790",
             "--agent-api-node-port",
             "31080",
             "--agent-api-load-balancer-class",
@@ -10276,6 +10332,7 @@ mod tests {
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
             assert_eq!(args.agent_api_port, Some(9781));
+            assert_eq!(args.agent_api_target_port, Some(9790));
             assert_eq!(args.agent_api_node_port, Some(31080));
             assert_eq!(
                 args.agent_api_load_balancer_class.as_deref(),
@@ -10451,6 +10508,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -10595,6 +10653,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -11894,6 +11953,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12025,6 +12085,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12245,6 +12306,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12381,6 +12443,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
@@ -12512,6 +12575,7 @@ mod tests {
             agent_api_cluster_ip: None,
             agent_api_secondary_cluster_ip: None,
             agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
             agent_api_app_protocol: None,
             agent_api_publish_not_ready_addresses: false,
