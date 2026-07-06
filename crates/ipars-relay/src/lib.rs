@@ -493,6 +493,9 @@ fn validate_relay_frame_sizes(
     session_token_len: usize,
     ciphertext_payload_len: usize,
 ) -> Result<(), RelayError> {
+    if session_id_len == 0 || session_token_len == 0 || ciphertext_payload_len == 0 {
+        return Err(RelayError::MalformedFrame);
+    }
     if session_id_len > MAX_RELAY_SESSION_ID_BYTES
         || session_token_len > MAX_RELAY_SESSION_TOKEN_BYTES
         || ciphertext_payload_len > MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES
@@ -1049,6 +1052,44 @@ mod tests {
             RelayDataplaneDropReason::FrameTooLarge.as_str(),
             "frame_too_large"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_empty_direct_frames_and_records_drop_reason() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            SocketAddr::from(([10, 0, 0, 1], 10000)),
+            SocketAddr::from(([10, 0, 0, 2], 10000)),
+            "relay-secret".to_string(),
+        )?;
+
+        let error = table.forward_target(&RelayFrame {
+            session_id: credentials.session_id,
+            session_token: credentials.session_token,
+            source: left,
+            destination: right,
+            ciphertext_payload: Vec::new(),
+        });
+
+        assert!(matches!(error, Err(RelayError::MalformedFrame)));
+        let metrics = table.dataplane_metrics();
+        assert_eq!(metrics.datagrams_received, 1);
+        assert_eq!(metrics.datagrams_forwarded, 0);
+        assert_eq!(metrics.datagrams_dropped, 1);
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&1)
+        );
+        assert_eq!(metrics.payload_bytes_forwarded, 0);
         Ok(())
     }
 
