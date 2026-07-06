@@ -11460,9 +11460,15 @@ mod tests {
         valid.network_policy_acknowledge_host_network = true;
         valid.expose_agent_api = true;
         valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_port = Some(9781);
+        valid.agent_api_target_port = Some(9790);
         valid.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_udp_port = Some(51821);
+        valid.relay_udp_target_port = Some(51820);
+        valid.relay_http_port = Some(9581);
+        valid.relay_http_target_port = Some(9580);
         valid.relay_network_policy_cidrs = vec!["203.0.113.0/24".parse()?];
         valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
         valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
@@ -11473,9 +11479,19 @@ mod tests {
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
+        assert!(plan.commands[2].contains("--set agent.apiService.port=9781"));
+        assert!(plan.commands[2].contains("--set agent.apiService.targetPort=9790"));
         assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("listener ports")));
 
         let parsed = Cli::try_parse_from([
             "ipars",
