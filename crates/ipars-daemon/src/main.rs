@@ -8741,18 +8741,32 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        let left = left.relay_capability.as_ref();
-        let right = right.relay_capability.as_ref();
-        left.map(|capability| capability.active_sessions)
-            .cmp(&right.map(|capability| capability.active_sessions))
-            .then_with(|| {
-                right
-                    .map(|capability| capability.max_mbps)
-                    .cmp(&left.map(|capability| capability.max_mbps))
-            })
-    });
+    candidates.sort_by(relay_candidate_ordering);
     candidates
+}
+
+fn relay_candidate_ordering(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
+    match (
+        left.relay_capability.as_ref(),
+        right.relay_capability.as_ref(),
+    ) {
+        (Some(left), Some(right)) => relay_utilization_ordering(left, right)
+            .then_with(|| right.available_capacity().cmp(&left.available_capacity()))
+            .then_with(|| right.max_mbps.cmp(&left.max_mbps))
+            .then_with(|| left.active_sessions.cmp(&right.active_sessions)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn relay_utilization_ordering(
+    left: &RelayCapability,
+    right: &RelayCapability,
+) -> std::cmp::Ordering {
+    let left_numerator = u64::from(left.active_sessions) * u64::from(right.max_sessions);
+    let right_numerator = u64::from(right.active_sessions) * u64::from(left.max_sessions);
+    left_numerator.cmp(&right_numerator)
 }
 
 async fn promote_active_relay_candidate(
@@ -18885,6 +18899,47 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(
             selected.map(|relay| relay.node_id),
             Some(NodeId::from_string("relay-high"))
+        );
+    }
+
+    #[test]
+    fn selected_relay_candidates_prefer_lower_utilization_over_raw_session_count() {
+        let mut nearly_full_small = node_record("relay-nearly-full-small");
+        nearly_full_small.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 9,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut lightly_loaded_large = node_record("relay-lightly-loaded-large");
+        lightly_loaded_large.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some("http://203.0.113.32:9580".to_string()),
+            max_sessions: 1000,
+            active_sessions: 20,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![nearly_full_small, lightly_loaded_large],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let selected = selected_relay_candidates(&response).into_iter().next();
+
+        assert_eq!(
+            selected.map(|relay| relay.node_id),
+            Some(NodeId::from_string("relay-lightly-loaded-large"))
         );
     }
 
