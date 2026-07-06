@@ -92,7 +92,7 @@ failed control-plane failover, all-unreachable path negotiation, relay-candidate
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
 readiness-timeout, endpoint, child-role, or child exit-status/code skew, file-backed log diagnostic
-mismatch, retained file permission/owner drift, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
+mismatch, retained file permission/owner drift across logs, manifests, and store artifacts, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
 records per-child log byte counts plus redacted log-tail hashes in an owner-only atomically replaced
 runtime manifest, and reports log tails

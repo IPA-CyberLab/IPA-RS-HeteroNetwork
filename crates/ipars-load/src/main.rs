@@ -839,7 +839,6 @@ impl LoadReport {
                 runtime_dir.display()
             )
         })?;
-        validate_daemon_retained_runtime_has_no_transient_files(runtime_dir)?;
         let mut exited_roles = Vec::new();
         let mut running_roles = Vec::new();
         for child in &manifest.children {
@@ -975,6 +974,7 @@ impl LoadReport {
                 expected_roles
             );
         }
+        validate_daemon_retained_runtime_has_no_transient_files(runtime_dir)?;
 
         Ok(())
     }
@@ -1125,6 +1125,20 @@ fn validate_daemon_retained_runtime_has_no_transient_files(
                 entry.path().display()
             );
         }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "daemon load scenario retained runtime entry {} is not accessible",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "daemon load scenario retained runtime entry {} is not a regular file",
+                path.display()
+            );
+        }
+        validate_daemon_retained_path_mode(&path, &metadata, 0o600, "retained runtime entry")?;
     }
     Ok(())
 }
@@ -2780,6 +2794,7 @@ impl DaemonProcessGroup {
     fn stop_all_for_completed_manifest(&mut self) -> anyhow::Result<PathBuf> {
         stop_daemon_children(&mut self.children)?;
         remove_daemon_agent_state_files(&mut self.agent_state_paths)?;
+        secure_daemon_retained_runtime_file_modes(&self.runtime_dir)?;
         self.write_manifest(DaemonRuntimePhase::Completed)
     }
 }
@@ -2787,6 +2802,8 @@ impl DaemonProcessGroup {
 impl Drop for DaemonProcessGroup {
     fn drop(&mut self) {
         kill_daemon_children(&mut self.children);
+        let _ = remove_daemon_agent_state_files(&mut self.agent_state_paths);
+        let _ = secure_daemon_retained_runtime_file_modes(&self.runtime_dir);
         if !self.keep_runtime_dir {
             let _ = std::fs::remove_dir_all(&self.runtime_dir);
         }
@@ -2842,6 +2859,7 @@ impl Drop for DaemonStartupGuard {
             kill_daemon_children(&mut self.children);
             let _ = remove_daemon_join_token_files(&mut self.join_token_paths);
             let _ = remove_daemon_agent_state_files(&mut self.agent_state_paths);
+            let _ = secure_daemon_retained_runtime_file_modes(&self.runtime_dir);
             if !self.keep_runtime_dir {
                 let _ = std::fs::remove_dir_all(&self.runtime_dir);
             }
@@ -3353,6 +3371,59 @@ fn secure_daemon_runtime_dir(path: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to secure daemon runtime dir {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn secure_daemon_retained_runtime_file_modes(runtime_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for entry in std::fs::read_dir(runtime_dir).with_context(|| {
+            format!(
+                "failed to scan daemon runtime dir {} for retained file hardening",
+                runtime_dir.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to inspect daemon runtime dir {} while hardening retained files",
+                    runtime_dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+                format!(
+                    "failed to inspect retained daemon runtime entry {}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "retained daemon runtime entry {} must not be a symlink",
+                    path.display()
+                );
+            }
+            if !metadata.is_file() {
+                bail!(
+                    "retained daemon runtime entry {} must be a regular file",
+                    path.display()
+                );
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_context(
+                || {
+                    format!(
+                        "failed to secure retained daemon runtime entry {}",
+                        path.display()
+                    )
+                },
+            )?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_dir;
     }
     Ok(())
 }
@@ -4506,6 +4577,32 @@ mod tests {
             assert!(error.contains("owner uid"));
             assert!(error.contains("retained runtime directory"));
             std::fs::remove_dir_all(&runtime_dir)?;
+
+            let mut world_readable_runtime_entry = daemon_report.clone();
+            let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+                &world_readable_runtime_entry,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+            world_readable_runtime_entry.daemon_runtime_dir = Some(runtime_dir.clone());
+            world_readable_runtime_entry.daemon_runtime_manifest = Some(manifest_path);
+            let sqlite_path = runtime_dir.join("control-plane.sqlite");
+            std::fs::write(&sqlite_path, "sqlite diagnostic")?;
+            std::fs::set_permissions(&sqlite_path, std::fs::Permissions::from_mode(0o644))?;
+            let error = match world_readable_runtime_entry.validate_success() {
+                Ok(_) => bail!("world-readable retained runtime entry should fail validation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("retained runtime entry"));
+            assert!(error.contains("permissions"));
+            std::fs::remove_dir_all(&runtime_dir)?;
         }
 
         let mut retained_join_token = daemon_report.clone();
@@ -5258,6 +5355,43 @@ mod tests {
 
         assert!(manifest_path.exists());
         assert!(!state_path.exists());
+        drop(group);
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_completed_manifest_secures_retained_runtime_files() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("completed-retained-file-mode");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let sqlite_path = runtime_dir.join("control-plane.sqlite");
+        std::fs::write(&sqlite_path, "sqlite diagnostic")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sqlite_path, std::fs::Permissions::from_mode(0o644))?;
+        }
+        let mut group = synthetic_daemon_group(runtime_dir.clone(), true);
+        group.agent_urls = vec!["http://127.0.0.1:31006".to_string()];
+        group.children.push(synthetic_sleep_child(
+            "agent",
+            runtime_dir.join("0000-agent.log"),
+        )?);
+
+        let manifest_path = group.stop_all_for_completed_manifest()?;
+
+        assert!(manifest_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sqlite_mode = std::fs::metadata(&sqlite_path)?.permissions().mode() & 0o777;
+            let log_mode = std::fs::metadata(runtime_dir.join("0000-agent.log"))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(sqlite_mode, 0o600);
+            assert_eq!(log_mode, 0o600);
+        }
         drop(group);
         std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
