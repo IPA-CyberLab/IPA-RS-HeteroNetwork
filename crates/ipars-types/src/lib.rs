@@ -1712,6 +1712,7 @@ pub mod api {
     }
 
     pub const PACKET_FLOW_DETECTOR_MAX_BYTES: usize = 64;
+    pub const PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS: usize = 8;
     pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1734,7 +1735,7 @@ pub mod api {
             deserialize_with = "deserialize_packet_flow_payload_prefix"
         )]
         pub payload_prefix: Vec<u8>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_packet_flow_conntrack_status")]
         pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
         #[serde(default)]
         pub tcp_state: Option<AgentPacketFlowTcpState>,
@@ -1964,6 +1965,29 @@ pub mod api {
             )));
         }
         Ok(Some(detector))
+    }
+
+    fn deserialize_packet_flow_conntrack_status<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<AgentPacketFlowConntrackStatus>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some(mut statuses) =
+            <Option<Vec<AgentPacketFlowConntrackStatus>> as serde::Deserialize>::deserialize(
+                deserializer,
+            )?
+        else {
+            return Ok(Vec::new());
+        };
+        if statuses.len() > PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS {
+            return Err(serde::de::Error::custom(format!(
+                "packet-flow conntrack_status exceeds {PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS} flags"
+            )));
+        }
+        statuses.sort();
+        statuses.dedup();
+        Ok(statuses)
     }
 
     fn deserialize_packet_flow_payload_prefix<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -3312,6 +3336,33 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("packet-flow detector exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_conntrack_status_deserialization_is_bounded_and_normalized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"conntrack_status":["assured","unreplied","assured"]}"#)?;
+        assert_eq!(
+            parsed.conntrack_status,
+            vec![
+                api::AgentPacketFlowConntrackStatus::Unreplied,
+                api::AgentPacketFlowConntrackStatus::Assured,
+            ]
+        );
+
+        let oversized_statuses =
+            ["\"assured\""; api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"conntrack_status":[{oversized_statuses}]}}"#
+        )) {
+            Ok(_) => return Err("oversized conntrack_status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow conntrack_status exceeds"));
         Ok(())
     }
 

@@ -11965,6 +11965,27 @@ mod tests {
         assert!(error
             .chain()
             .any(|cause| cause.to_string().contains("packet-flow detector exceeds")));
+
+        let oversized_statuses =
+            ["\"assured\""; ipars_types::api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");
+        let oversized_status_line =
+            format!(r#"{{"destination":"100.64.0.13","conntrack_status":[{oversized_statuses}]}}"#)
+                + "\n";
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            oversized_status_line.as_bytes(),
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized eBPF JSONL conntrack_status should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow conntrack_status exceeds")));
         Ok(())
     }
 
