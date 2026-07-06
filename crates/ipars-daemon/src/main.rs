@@ -8792,6 +8792,8 @@ const IPCTNL_MSG_CT_GET: u16 = 1;
 const NFNETLINK_V0: u8 = 0;
 const CTA_TUPLE_ORIG: u16 = 1;
 const CTA_TUPLE_REPLY: u16 = 2;
+const CTA_STATUS: u16 = 3;
+const CTA_PROTOINFO: u16 = 4;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
 const CTA_IP_V4_SRC: u16 = 1;
@@ -8801,7 +8803,22 @@ const CTA_IP_V6_DST: u16 = 4;
 const CTA_PROTO_NUM: u16 = 1;
 const CTA_PROTO_SRC_PORT: u16 = 2;
 const CTA_PROTO_DST_PORT: u16 = 3;
+const CTA_PROTOINFO_TCP: u16 = 1;
+const CTA_PROTOINFO_TCP_STATE: u16 = 1;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+const IPS_SEEN_REPLY: u32 = 1 << 1;
+const IPS_ASSURED: u32 = 1 << 2;
+const TCP_CONNTRACK_NONE: u8 = 0;
+const TCP_CONNTRACK_SYN_SENT: u8 = 1;
+const TCP_CONNTRACK_SYN_RECV: u8 = 2;
+const TCP_CONNTRACK_ESTABLISHED: u8 = 3;
+const TCP_CONNTRACK_FIN_WAIT: u8 = 4;
+const TCP_CONNTRACK_CLOSE_WAIT: u8 = 5;
+const TCP_CONNTRACK_LAST_ACK: u8 = 6;
+const TCP_CONNTRACK_TIME_WAIT: u8 = 7;
+const TCP_CONNTRACK_CLOSE: u8 = 8;
+const TCP_CONNTRACK_LISTEN: u8 = 9;
+const TCP_CONNTRACK_SYN_SENT2: u8 = 10;
 
 fn conntrack_netlink_event_group_mask() -> u32 {
     netlink_group_mask(NFNLGRP_CONNTRACK_NEW) | netlink_group_mask(NFNLGRP_CONNTRACK_UPDATE)
@@ -8919,11 +8936,30 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
     if payload.len() < NFGENMSG_LEN {
         anyhow::bail!("truncated conntrack netlink nfgenmsg payload");
     }
+    let attributes = netlink_attributes(&payload[NFGENMSG_LEN..])?;
+    let mut conntrack_status = Vec::new();
+    let mut tcp_state = None;
+    for attribute in &attributes {
+        match attribute.kind {
+            CTA_STATUS => {
+                conntrack_status = parse_conntrack_netlink_status(attribute.value)?;
+            }
+            CTA_PROTOINFO => {
+                tcp_state = parse_conntrack_protoinfo_tcp_state(attribute.value)?;
+            }
+            _ => {}
+        }
+    }
+
     let mut flows = Vec::new();
-    for attribute in netlink_attributes(&payload[NFGENMSG_LEN..])? {
+    for attribute in attributes {
         match attribute.kind {
             CTA_TUPLE_ORIG | CTA_TUPLE_REPLY => {
-                if let Some(flow) = parse_conntrack_tuple_packet_flow(attribute.value)? {
+                if let Some(flow) = parse_conntrack_tuple_packet_flow(
+                    attribute.value,
+                    &conntrack_status,
+                    tcp_state,
+                )? {
                     flows.push(flow);
                 }
             }
@@ -8933,8 +8969,74 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
     Ok(flows)
 }
 
-fn parse_conntrack_tuple_packet_flow(payload: &[u8]) -> anyhow::Result<Option<PacketFlowRecord>> {
-    let mut tuple = ConntrackTupleFields::default();
+fn parse_conntrack_netlink_status(
+    payload: &[u8],
+) -> anyhow::Result<Vec<AgentPacketFlowConntrackStatus>> {
+    anyhow::ensure!(
+        payload.len() == 4,
+        "invalid conntrack netlink status attribute length: {}",
+        payload.len()
+    );
+    let bits = u32::from_be_bytes(payload.try_into()?);
+    let mut status = Vec::new();
+    if bits & IPS_SEEN_REPLY == 0 {
+        status.push(AgentPacketFlowConntrackStatus::Unreplied);
+    }
+    if bits & IPS_ASSURED != 0 {
+        status.push(AgentPacketFlowConntrackStatus::Assured);
+    }
+    Ok(status)
+}
+
+fn parse_conntrack_protoinfo_tcp_state(
+    payload: &[u8],
+) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
+    for attribute in netlink_attributes(payload)? {
+        if attribute.kind != CTA_PROTOINFO_TCP {
+            continue;
+        }
+        for tcp_attribute in netlink_attributes(attribute.value)? {
+            if tcp_attribute.kind != CTA_PROTOINFO_TCP_STATE {
+                continue;
+            }
+            anyhow::ensure!(
+                tcp_attribute.value.len() == 1,
+                "invalid conntrack netlink TCP state attribute length: {}",
+                tcp_attribute.value.len()
+            );
+            return Ok(conntrack_tcp_state(tcp_attribute.value[0]));
+        }
+    }
+    Ok(None)
+}
+
+fn conntrack_tcp_state(value: u8) -> Option<AgentPacketFlowTcpState> {
+    match value {
+        TCP_CONNTRACK_NONE => None,
+        TCP_CONNTRACK_SYN_SENT => Some(AgentPacketFlowTcpState::SynSent),
+        TCP_CONNTRACK_SYN_RECV => Some(AgentPacketFlowTcpState::SynRecv),
+        TCP_CONNTRACK_ESTABLISHED => Some(AgentPacketFlowTcpState::Established),
+        TCP_CONNTRACK_FIN_WAIT => Some(AgentPacketFlowTcpState::FinWait),
+        TCP_CONNTRACK_CLOSE_WAIT => Some(AgentPacketFlowTcpState::CloseWait),
+        TCP_CONNTRACK_LAST_ACK => Some(AgentPacketFlowTcpState::LastAck),
+        TCP_CONNTRACK_TIME_WAIT => Some(AgentPacketFlowTcpState::TimeWait),
+        TCP_CONNTRACK_CLOSE => Some(AgentPacketFlowTcpState::Close),
+        TCP_CONNTRACK_LISTEN => Some(AgentPacketFlowTcpState::Listen),
+        TCP_CONNTRACK_SYN_SENT2 => Some(AgentPacketFlowTcpState::SynSent2),
+        _ => None,
+    }
+}
+
+fn parse_conntrack_tuple_packet_flow(
+    payload: &[u8],
+    conntrack_status: &[AgentPacketFlowConntrackStatus],
+    tcp_state: Option<AgentPacketFlowTcpState>,
+) -> anyhow::Result<Option<PacketFlowRecord>> {
+    let mut tuple = ConntrackTupleFields {
+        conntrack_status: conntrack_status.to_vec(),
+        tcp_state,
+        ..Default::default()
+    };
     for attribute in netlink_attributes(payload)? {
         match attribute.kind {
             CTA_TUPLE_IP => parse_conntrack_ip_tuple(attribute.value, &mut tuple)?,
@@ -12227,6 +12329,29 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn conntrack_netlink_lifecycle_metadata_parsers_classify_status_and_tcp_state(
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            parse_conntrack_netlink_status(&0_u32.to_be_bytes())?,
+            vec![AgentPacketFlowConntrackStatus::Unreplied]
+        );
+        assert_eq!(
+            parse_conntrack_netlink_status(&(IPS_SEEN_REPLY | IPS_ASSURED).to_be_bytes())?,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+
+        let protoinfo = test_nla(
+            CTA_PROTOINFO_TCP | TEST_NLA_F_NESTED,
+            &test_nla(CTA_PROTOINFO_TCP_STATE, &[TCP_CONNTRACK_CLOSE_WAIT]),
+        );
+        assert_eq!(
+            parse_conntrack_protoinfo_tcp_state(&protoinfo)?,
+            Some(AgentPacketFlowTcpState::CloseWait)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn conntrack_netlink_parser_extracts_orig_and_reply_flow_metadata() -> anyhow::Result<()> {
         let ipv4_source = Ipv4Addr::new(192, 0, 2, 10);
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
@@ -12246,7 +12371,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 test_nla(
                     CTA_TUPLE_PROTO | TEST_NLA_F_NESTED,
                     &[
-                        test_nla(CTA_PROTO_NUM, &[17]),
+                        test_nla(CTA_PROTO_NUM, &[6]),
                         test_nla(CTA_PROTO_SRC_PORT, &50_000_u16.to_be_bytes()),
                         test_nla(CTA_PROTO_DST_PORT, &51_820_u16.to_be_bytes()),
                     ]
@@ -12278,7 +12403,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ]
             .concat(),
         );
+        let status = test_nla(CTA_STATUS, &(IPS_SEEN_REPLY | IPS_ASSURED).to_be_bytes());
+        let protoinfo = test_nla(
+            CTA_PROTOINFO | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_PROTOINFO_TCP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_PROTOINFO_TCP_STATE, &[TCP_CONNTRACK_ESTABLISHED]),
+            ),
+        );
         let mut payload = vec![0, NFNETLINK_V0, 0, 0];
+        payload.extend(status);
+        payload.extend(protoinfo);
         payload.extend(orig_tuple);
         payload.extend(reply_tuple);
 
@@ -12309,9 +12444,30 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .find(|flow| flow.destination == IpAddr::from(ipv4_destination))
             .context("missing orig flow")?;
         assert_eq!(orig.observation.source, Some(IpAddr::from(ipv4_source)));
-        assert_eq!(orig.observation.protocol, Some(TransportProtocol::Udp));
+        assert_eq!(orig.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(orig.observation.source_port, Some(50_000));
         assert_eq!(orig.observation.destination_port, Some(51_820));
+        assert_eq!(
+            orig.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            orig.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
+        let reply = result
+            .flows
+            .iter()
+            .find(|flow| flow.destination == IpAddr::from(ipv6_destination))
+            .context("missing reply flow")?;
+        assert_eq!(
+            reply.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            reply.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
         Ok(())
     }
 
