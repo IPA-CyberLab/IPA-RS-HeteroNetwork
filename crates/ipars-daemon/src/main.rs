@@ -8211,6 +8211,7 @@ fn relay_admission_request(
 fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr> {
     candidates
         .iter()
+        .filter(|candidate| relay_session_endpoint_is_usable(candidate.addr))
         .filter_map(|candidate| {
             relay_session_endpoint_rank(candidate).map(|rank| (rank, candidate))
         })
@@ -8221,6 +8222,17 @@ fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr
                 .then_with(|| right.priority.cmp(&left.priority))
         })
         .map(|(_, candidate)| candidate.addr)
+}
+
+fn relay_session_endpoint_is_usable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return false;
+    }
+
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_broadcast(),
+        IpAddr::V6(_) => true,
+    }
 }
 
 fn relay_session_endpoint_rank(candidate: &EndpointCandidate) -> Option<u8> {
@@ -10535,6 +10547,22 @@ mod tests {
                 51820,
             ),
             ..candidate(node_id, EndpointCandidateKind::Ipv6, cost)
+        }
+    }
+
+    fn agent_status(
+        node_id: &str,
+        candidates: Vec<EndpointCandidate>,
+    ) -> ipars_types::api::AgentStatusResponse {
+        ipars_types::api::AgentStatusResponse {
+            node_id: NodeId::from_string(node_id),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wg-{node_id}"),
+            candidate_count: candidates.len(),
+            candidates,
+            nat_classification: None,
+            userspace_wireguard_process: None,
+            state_updated_at: Utc::now(),
         }
     }
 
@@ -16770,6 +16798,94 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 right_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
             })
         );
+    }
+
+    #[test]
+    fn relay_admission_request_ignores_unusable_session_endpoints() {
+        let local = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let status = agent_status(
+            "local",
+            vec![
+                EndpointCandidate {
+                    addr: SocketAddr::from(([0, 0, 0, 0], 40000)),
+                    ..candidate("local", EndpointCandidateKind::StunReflexive, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([224, 0, 0, 1], 40000)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+                },
+            ],
+        );
+        let mut peer_record = node_record("peer-a");
+        peer_record.endpoint_candidates = vec![
+            EndpointCandidate {
+                addr: SocketAddr::from(([255, 255, 255, 255], 40000)),
+                ..candidate("peer-a", EndpointCandidateKind::StunReflexive, 1)
+            },
+            EndpointCandidate {
+                addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 40000),
+                ..candidate("peer-a", EndpointCandidateKind::Ipv6, 1)
+            },
+            EndpointCandidate {
+                addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+                ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)
+            },
+        ];
+
+        let request = relay_admission_request(&status, &peer_record);
+
+        assert_eq!(
+            request,
+            Some(RelayAdmissionRequest {
+                left: local,
+                right: peer,
+                left_addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                right_addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+            })
+        );
+    }
+
+    #[test]
+    fn relay_admission_request_requires_usable_session_endpoints() {
+        let status = agent_status(
+            "local",
+            vec![
+                EndpointCandidate {
+                    addr: SocketAddr::from(([0, 0, 0, 0], 40000)),
+                    ..candidate("local", EndpointCandidateKind::StunReflexive, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([203, 0, 113, 10], 0)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 1)
+                },
+            ],
+        );
+        let mut peer_record = node_record("peer-a");
+        peer_record.endpoint_candidates = vec![EndpointCandidate {
+            addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+            ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)
+        }];
+
+        assert_eq!(relay_admission_request(&status, &peer_record), None);
+
+        let status = agent_status(
+            "local",
+            vec![EndpointCandidate {
+                addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+            }],
+        );
+        peer_record.endpoint_candidates = vec![EndpointCandidate {
+            addr: SocketAddr::from(([224, 0, 0, 1], 40000)),
+            ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 1)
+        }];
+
+        assert_eq!(relay_admission_request(&status, &peer_record), None);
     }
 
     #[test]
