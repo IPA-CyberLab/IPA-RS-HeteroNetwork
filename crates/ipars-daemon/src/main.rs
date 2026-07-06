@@ -37,9 +37,11 @@ use ipars_relay::{
 };
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
+    checked_docker_route_plan, checked_kubernetes_route_plan, kubernetes_route_plan,
+    DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
     LinuxNetlinkRouteManager, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
-    NamespacedLinuxRouteCommandRunner, RouteManager, TimedSystemRouteCommandRunner,
+    NamespacedLinuxRouteCommandRunner, RouteManager, RouteManagerError, RoutePlan,
+    TimedSystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
@@ -6293,24 +6295,31 @@ async fn run_docker_route_loop<M>(manager: M, source: DockerRouteSource, interva
 where
     M: RouteManager + 'static,
 {
+    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
-            Ok(intent) => match manager.apply_docker_intent(intent.clone()).await {
-                Ok(plan) => tracing::info!(
-                    route_source = source.source_label(),
-                    container_namespace = %intent.container_namespace,
-                    host_interface = %intent.host_interface,
-                    routes = plan.routes.len(),
-                    policy_rules = plan.policy_rules.len(),
-                    "applied Docker overlay routes"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    route_source = source.source_label(),
-                    container_namespace = %intent.container_namespace,
-                    "failed to apply Docker overlay routes; will retry"
-                ),
-            },
+            Ok(intent) => {
+                let result = match checked_docker_route_plan(intent.clone()) {
+                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(plan) => tracing::info!(
+                        route_source = source.source_label(),
+                        container_namespace = %intent.container_namespace,
+                        host_interface = %intent.host_interface,
+                        routes = plan.routes.len(),
+                        policy_rules = plan.policy_rules.len(),
+                        "applied Docker overlay routes"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        route_source = source.source_label(),
+                        container_namespace = %intent.container_namespace,
+                        "failed to apply Docker overlay routes; will retry"
+                    ),
+                }
+            }
             Err(error) => tracing::warn!(
                 %error,
                 route_source = source.source_label(),
@@ -6318,6 +6327,82 @@ where
             ),
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+async fn apply_managed_route_plan<M>(
+    manager: &M,
+    applied_plan: &mut Option<RoutePlan>,
+    plan: RoutePlan,
+) -> Result<RoutePlan, RouteManagerError>
+where
+    M: RouteManager + ?Sized,
+{
+    if let Some(previous) = applied_plan.as_ref().cloned() {
+        let stale = stale_managed_route_plan(&previous, &plan);
+        if !stale.routes.is_empty() || !stale.policy_rules.is_empty() {
+            manager.remove_routes(stale).await?;
+            *applied_plan = Some(retained_managed_route_plan(&previous, &plan));
+        }
+    }
+    manager.apply_routes(plan.clone()).await?;
+    *applied_plan = Some(plan.clone());
+    Ok(plan)
+}
+
+fn stale_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
+    if previous.interface != current.interface {
+        return previous.clone();
+    }
+    RoutePlan {
+        interface: previous.interface.clone(),
+        routes: previous
+            .routes
+            .iter()
+            .filter(|route| {
+                !current
+                    .routes
+                    .iter()
+                    .any(|current| current.cidr == route.cidr)
+            })
+            .cloned()
+            .collect(),
+        policy_rules: previous
+            .policy_rules
+            .iter()
+            .filter(|rule| !current.policy_rules.contains(rule))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn retained_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
+    if previous.interface != current.interface {
+        return RoutePlan {
+            interface: current.interface.clone(),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+    }
+    RoutePlan {
+        interface: previous.interface.clone(),
+        routes: previous
+            .routes
+            .iter()
+            .filter(|route| {
+                current
+                    .routes
+                    .iter()
+                    .any(|current| current.cidr == route.cidr)
+            })
+            .cloned()
+            .collect(),
+        policy_rules: previous
+            .policy_rules
+            .iter()
+            .filter(|rule| current.policy_rules.contains(rule))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -6751,24 +6836,31 @@ async fn run_kubernetes_underlay_route_loop<M>(
 ) where
     M: RouteManager + 'static,
 {
+    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
-            Ok(intent) => match manager.apply_kubernetes_intent(intent.clone()).await {
-                Ok(plan) => tracing::info!(
-                    route_source = source.source_label(),
-                    node_name = %intent.node_name,
-                    route_provider = %intent.route_provider,
-                    routes = plan.routes.len(),
-                    policy_rules = plan.policy_rules.len(),
-                    "applied Kubernetes underlay routes"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    route_source = source.source_label(),
-                    node_name = %intent.node_name,
-                    "failed to apply Kubernetes underlay routes; will retry"
-                ),
-            },
+            Ok(intent) => {
+                let result = match checked_kubernetes_route_plan(intent.clone()) {
+                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(plan) => tracing::info!(
+                        route_source = source.source_label(),
+                        node_name = %intent.node_name,
+                        route_provider = %intent.route_provider,
+                        routes = plan.routes.len(),
+                        policy_rules = plan.policy_rules.len(),
+                        "applied Kubernetes underlay routes"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        route_source = source.source_label(),
+                        node_name = %intent.node_name,
+                        "failed to apply Kubernetes underlay routes; will retry"
+                    ),
+                }
+            }
             Err(error) => tracing::warn!(
                 %error,
                 route_source = source.source_label(),
@@ -10891,8 +10983,10 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
+    use ipars_route_manager::PolicyRule;
     use ipars_types::api::{
         AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
         AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSourceCount,
@@ -10980,6 +11074,79 @@ mod tests {
         }
     }
 
+    fn test_route_plan(
+        interface: &str,
+        cidrs: &[&str],
+        priorities: &[u32],
+    ) -> anyhow::Result<RoutePlan> {
+        Ok(RoutePlan {
+            interface: interface.to_string(),
+            routes: cidrs
+                .iter()
+                .enumerate()
+                .map(|(index, cidr)| {
+                    Ok(Route {
+                        id: format!("test-route-{index}"),
+                        cidr: cidr
+                            .parse()
+                            .with_context(|| format!("test route CIDR {cidr} should parse"))?,
+                        advertised_by: NodeId::from_string("route-provider"),
+                        via: Some(NodeId::from_string("route-provider")),
+                        metric: 50,
+                        tags: Default::default(),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            policy_rules: priorities
+                .iter()
+                .map(|priority| PolicyRule {
+                    table: 10_064,
+                    priority: *priority,
+                    from: None,
+                    to: None,
+                    fwmark: None,
+                })
+                .collect(),
+        })
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingManagedRouteManager {
+        applied: tokio::sync::RwLock<Vec<RoutePlan>>,
+        removed: tokio::sync::RwLock<Vec<RoutePlan>>,
+    }
+
+    #[async_trait]
+    impl RouteManager for RecordingManagedRouteManager {
+        async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.applied.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.removed.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn apply_docker_intent(
+            &self,
+            _intent: DockerNetworkIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "docker intent is not used by daemon route reconciliation tests".to_string(),
+            ))
+        }
+
+        async fn apply_kubernetes_intent(
+            &self,
+            _intent: KubernetesUnderlayIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "kubernetes intent is not used by daemon route reconciliation tests".to_string(),
+            ))
+        }
+    }
+
     fn test_relay_capability(max_sessions: u32, active_sessions: u32) -> RelayCapability {
         RelayCapability {
             enabled_by_policy: true,
@@ -11057,6 +11224,96 @@ mod tests {
         let addr = listener.local_addr()?;
         drop(listener);
         Ok(format!("http://{addr}"))
+    }
+
+    #[test]
+    fn stale_managed_route_plan_tracks_dropped_routes_and_rules() -> anyhow::Result<()> {
+        let previous = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
+
+        let stale = stale_managed_route_plan(&previous, &current);
+
+        assert_eq!(stale.interface, "ipars0");
+        assert_eq!(stale.routes.len(), 1);
+        assert_eq!(
+            stale.routes[0].cidr,
+            "10.10.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert_eq!(stale.policy_rules.len(), 1);
+        assert_eq!(stale.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_managed_route_plan_removes_all_previous_routes_on_interface_change(
+    ) -> anyhow::Result<()> {
+        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
+        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
+
+        assert_eq!(stale_managed_route_plan(&previous, &current), previous);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_managed_route_plan_keeps_only_routes_still_present_by_cidr() -> anyhow::Result<()> {
+        let previous = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
+
+        let retained = retained_managed_route_plan(&previous, &current);
+
+        assert_eq!(retained.interface, "ipars0");
+        assert_eq!(retained.routes.len(), 1);
+        assert_eq!(
+            retained.routes[0].cidr,
+            "10.11.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert_eq!(retained.policy_rules.len(), 1);
+        assert_eq!(retained.policy_rules[0].priority, 10_051);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_managed_route_plan_clears_state_on_interface_change() -> anyhow::Result<()> {
+        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
+        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
+
+        let retained = retained_managed_route_plan(&previous, &current);
+
+        assert_eq!(retained.interface, "ipars1");
+        assert!(retained.routes.is_empty());
+        assert!(retained.policy_rules.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_route_plan_reconciles_removed_routes_before_apply() -> anyhow::Result<()> {
+        let manager = RecordingManagedRouteManager::default();
+        let mut applied_plan = None;
+        let first = test_route_plan("ipars0", &["10.10.0.0/16", "10.11.0.0/16"], &[10_050])?;
+        let second = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_050])?;
+
+        apply_managed_route_plan(&manager, &mut applied_plan, first.clone()).await?;
+        apply_managed_route_plan(&manager, &mut applied_plan, second.clone()).await?;
+
+        assert_eq!(applied_plan, Some(second.clone()));
+        assert_eq!(manager.applied.read().await.as_slice(), &[first, second]);
+        let removed = manager.removed.read().await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].routes.len(), 1);
+        assert_eq!(
+            removed[0].routes[0].cidr,
+            "10.10.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert!(removed[0].policy_rules.is_empty());
+        Ok(())
     }
 
     #[test]
