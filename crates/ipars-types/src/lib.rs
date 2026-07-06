@@ -1826,11 +1826,42 @@ pub mod api {
 
     impl AgentPacketFlowObservation {
         pub fn validate_transport_metadata(&self) -> Result<(), String> {
+            if self
+                .detector
+                .as_ref()
+                .is_some_and(|detector| detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES)
+            {
+                return Err(format!(
+                    "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
+                ));
+            }
+            if self.payload_prefix.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+                return Err(format!(
+                    "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                ));
+            }
+            if self.conntrack_status.len() > PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS {
+                return Err(format!(
+                    "packet-flow conntrack_status exceeds {PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS} flags"
+                ));
+            }
+            if self
+                .conntrack_status
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            {
+                return Err(
+                    "packet-flow conntrack_status must be sorted and deduplicated".to_string(),
+                );
+            }
             if self.protocol == Some(TransportProtocol::Any) {
                 return Err(
                     "packet-flow protocol must be a concrete transport protocol, not any"
                         .to_string(),
                 );
+            }
+            if self.source_port == Some(0) || self.destination_port == Some(0) {
+                return Err("packet-flow port metadata must use nonzero ports".to_string());
             }
             if self.protocol != Some(TransportProtocol::Tcp) && self.tcp_state.is_some() {
                 return Err("packet-flow TCP state requires TCP protocol".to_string());
@@ -8432,11 +8463,83 @@ mod tests {
     }
 
     #[test]
+    fn packet_flow_observation_validation_rechecks_direct_bounds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let oversized_detector = api::AgentPacketFlowObservation {
+            detector: Some("x".repeat(api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1)),
+            ..Default::default()
+        };
+        let error = match oversized_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector exceeds"));
+
+        let oversized_payload = api::AgentPacketFlowObservation {
+            payload_prefix: vec![0; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
+            ..Default::default()
+        };
+        let error = match oversized_payload.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized payload prefix should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow payload_prefix exceeds"));
+
+        let oversized_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured;
+                api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1
+            ],
+            ..Default::default()
+        };
+        let error = match oversized_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow conntrack_status exceeds"));
+
+        let duplicated_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured,
+                api::AgentPacketFlowConntrackStatus::Assured,
+            ],
+            ..Default::default()
+        };
+        let error = match duplicated_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct duplicate conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("sorted and deduplicated"));
+
+        let reversed_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured,
+                api::AgentPacketFlowConntrackStatus::Unreplied,
+            ],
+            ..Default::default()
+        };
+        let error = match reversed_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct unsorted conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("sorted and deduplicated"));
+        Ok(())
+    }
+
+    #[test]
     fn packet_flow_observation_transport_metadata_is_consistent(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let udp_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","destination_port":53}"#)?;
         udp_with_port.validate_transport_metadata()?;
+
+        let tcp_with_zero_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","destination_port":0}"#)?;
+        let error = match tcp_with_zero_port.validate_transport_metadata() {
+            Ok(()) => return Err("TCP observation with zero port should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("nonzero ports"));
 
         let tcp_with_state: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","tcp_state":"established"}"#)?;
