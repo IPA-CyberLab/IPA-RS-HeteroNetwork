@@ -16,10 +16,10 @@ use ipars_types::api::{
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate,
-    HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState,
-    RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus,
-    TransportProtocol, VpnIp,
+    endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
+    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
+    NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -564,7 +564,8 @@ where
             }
         }
 
-        let relay_capability = relay_capability_allowed(request.relay_capability.clone(), &claims)?;
+        let relay_capability =
+            relay_capability_allowed(&request.node_id, request.relay_capability.clone(), &claims)?;
         let now = Utc::now();
         let node = self
             .insert_node_with_fresh_vpn_ip(claims, request, relay_capability, now)
@@ -725,6 +726,7 @@ where
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
+        let request_node_id = request.node_id.clone();
         let relay_capability = request
             .relay_capability
             .map(|mut relay_capability| {
@@ -732,6 +734,12 @@ where
                     return Err(ControlPlaneError::RelayDenied);
                 }
                 relay_capability.enabled_by_policy = true;
+                validate_relay_capability_shape(&relay_capability).map_err(|reason| {
+                    ControlPlaneError::NodeUpdateRejected {
+                        node_id: request_node_id.clone(),
+                        reason,
+                    }
+                })?;
                 Ok(relay_capability)
             })
             .transpose()?;
@@ -1494,6 +1502,7 @@ fn route_allowed_by_policy(route: &Route, policy: &ipars_types::TokenPolicy) -> 
 }
 
 fn relay_capability_allowed(
+    node_id: &NodeId,
     relay_capability: Option<RelayCapability>,
     claims: &JoinTokenClaims,
 ) -> Result<Option<RelayCapability>, ControlPlaneError> {
@@ -1503,9 +1512,44 @@ fn relay_capability_allowed(
                 return Err(ControlPlaneError::RelayDenied);
             }
             capability.enabled_by_policy = true;
+            validate_relay_capability_shape(&capability).map_err(|reason| {
+                ControlPlaneError::NodeRegistrationRejected {
+                    node_id: node_id.clone(),
+                    reason,
+                }
+            })?;
             Ok(capability)
         })
         .transpose()
+}
+
+fn validate_relay_capability_shape(capability: &RelayCapability) -> Result<(), String> {
+    let endpoint = capability
+        .public_endpoint
+        .ok_or_else(|| "relay public endpoint is required".to_string())?;
+    if !endpoint_addr_is_usable(endpoint) {
+        return Err("relay public endpoint must be a usable nonzero socket address".to_string());
+    }
+    let admission_url = capability
+        .admission_url
+        .as_deref()
+        .ok_or_else(|| "relay admission URL is required".to_string())?;
+    if !relay_admission_url_is_usable(admission_url) {
+        return Err("relay admission URL must be an absolute HTTP(S) URL with a host".to_string());
+    }
+    if capability.max_sessions == 0 {
+        return Err("relay max_sessions must be greater than zero".to_string());
+    }
+    if capability.active_sessions > capability.max_sessions {
+        return Err("relay active_sessions must be less than or equal to max_sessions".to_string());
+    }
+    if capability.max_mbps == 0 {
+        return Err("relay max_mbps must be greater than zero".to_string());
+    }
+    if !capability.e2e_only {
+        return Err("relay capability must advertise e2e_only=true".to_string());
+    }
+    Ok(())
 }
 
 fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), ControlPlaneError> {
@@ -2051,16 +2095,6 @@ mod tests {
         assert!(relay_registration.relay_map.relays.is_empty());
         assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
 
-        let mut invalid_relay_capability = relay_capability();
-        invalid_relay_capability.admission_url = Some("udp://203.0.113.11:9580".to_string());
-        let mut invalid_relay_claims = claims(cluster_id.clone());
-        invalid_relay_claims.policy.allow_relay = true;
-        let mut invalid_relay_request = registration_request("relay-b");
-        invalid_relay_request.relay_capability = Some(invalid_relay_capability.clone());
-        plane
-            .register_with_claims(invalid_relay_claims, invalid_relay_request)
-            .await?;
-
         plane
             .heartbeat(signed_heartbeat(
                 "relay-a",
@@ -2075,28 +2109,6 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
-                    routes: None,
-                    path_state: Vec::new(),
-                    node_signature: None,
-                },
-            ))
-            .await?;
-        assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
-
-        plane
-            .heartbeat(signed_heartbeat(
-                "relay-b",
-                HeartbeatRequest {
-                    node_id: node_id("relay-b"),
-                    health: NodeHealth {
-                        state: HealthState::Healthy,
-                        last_seen_at: Utc::now(),
-                        latency_ms: Some(1.0),
-                        relay_load: Some(0.10),
-                        message: None,
-                    },
-                    candidates: Vec::new(),
-                    relay_capability: Some(invalid_relay_capability),
                     routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
@@ -2470,6 +2482,51 @@ mod tests {
         };
 
         assert!(matches!(error, ControlPlaneError::RelayDenied));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_relay_capability_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+
+        let mut bad_endpoint = relay_capability();
+        bad_endpoint.public_endpoint = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 51820)));
+        let mut request = registration_request("node-a");
+        request.relay_capability = Some(bad_endpoint);
+        let error = match plane
+            .register_with_claims(relay_claims.clone(), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay public endpoint"));
+
+        let mut bad_admission_url = relay_capability();
+        bad_admission_url.admission_url = Some("udp://203.0.113.10:9580".to_string());
+        let mut request = registration_request("node-b");
+        request.relay_capability = Some(bad_admission_url);
+        let error = match plane.register_with_claims(relay_claims, request).await {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
         Ok(())
     }
 
@@ -3991,6 +4048,62 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ControlPlaneError::RelayDenied)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_relay_capability_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allow_relay = true;
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let mut bad_admission_url = relay_capability();
+        bad_admission_url.admission_url = Some("udp://203.0.113.10:9580".to_string());
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(bad_admission_url),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful relay heartbeat".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
+        let node = store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
+        assert!(node.relay_capability.is_none());
         Ok(())
     }
 
