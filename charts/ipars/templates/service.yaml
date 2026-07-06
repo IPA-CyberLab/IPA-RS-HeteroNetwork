@@ -10,6 +10,19 @@
 {{- $relaySessionAffinityValid := or (eq .Values.agent.relayService.sessionAffinity "") (eq .Values.agent.relayService.sessionAffinity "None") (eq .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.exposureAcknowledged" "value" .Values.agent.apiService.exposureAcknowledged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allowUnrestrictedLoadBalancer" "value" .Values.agent.apiService.allowUnrestrictedLoadBalancer) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allowClusterExternalTrafficPolicy" "value" .Values.agent.apiService.allowClusterExternalTrafficPolicy) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allocateLoadBalancerNodePorts" "value" .Values.agent.apiService.allocateLoadBalancerNodePorts) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.publishNotReadyAddresses" "value" .Values.agent.apiService.publishNotReadyAddresses) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.exposureAcknowledged" "value" .Values.agent.relayService.exposureAcknowledged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allowUnrestrictedLoadBalancer" "value" .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allowClusterExternalTrafficPolicy" "value" .Values.agent.relayService.allowClusterExternalTrafficPolicy) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allocateLoadBalancerNodePorts" "value" .Values.agent.relayService.allocateLoadBalancerNodePorts) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.publishNotReadyAddresses" "value" .Values.agent.relayService.publishNotReadyAddresses) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
 {{- $agentApiPortValue := printf "%v" .Values.agent.apiService.port -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.port" "value" $agentApiPortValue "max" 65535) -}}

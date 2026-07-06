@@ -1,3 +1,10 @@
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.acknowledgeHostNetwork" "value" .Values.networkPolicy.acknowledgeHostNetwork) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.agentApi.enabled" "value" .Values.networkPolicy.agentApi.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.relay.enabled" "value" .Values.networkPolicy.relay.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- $networkPolicyEnabled := .Values.networkPolicy.enabled -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentApiNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.agentApi.enabled -}}

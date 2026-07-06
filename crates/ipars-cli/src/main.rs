@@ -8640,6 +8640,78 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_validates_exposure_booleans() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let network_policy_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/networkpolicy.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let rbac_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/rbac.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+        let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let rbac = std::fs::read_to_string(rbac_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateBoolean\""));
+        assert!(helpers.contains("kindIs \"bool\" .value"));
+        assert!(helpers.contains("%s must be true or false"));
+        for path in [
+            "agent.apiService.enabled",
+            "agent.apiService.exposureAcknowledged",
+            "agent.apiService.allowUnrestrictedLoadBalancer",
+            "agent.apiService.allowClusterExternalTrafficPolicy",
+            "agent.apiService.allocateLoadBalancerNodePorts",
+            "agent.apiService.publishNotReadyAddresses",
+            "agent.relayService.enabled",
+            "agent.relayService.exposureAcknowledged",
+            "agent.relayService.allowUnrestrictedLoadBalancer",
+            "agent.relayService.allowClusterExternalTrafficPolicy",
+            "agent.relayService.allocateLoadBalancerNodePorts",
+            "agent.relayService.publishNotReadyAddresses",
+            "agent.relayAdvertisement.enabled",
+        ] {
+            assert!(
+                service_template.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a Service exposure boolean"
+            );
+        }
+        for path in [
+            "networkPolicy.enabled",
+            "networkPolicy.acknowledgeHostNetwork",
+            "networkPolicy.agentApi.enabled",
+            "networkPolicy.relay.enabled",
+        ] {
+            assert!(
+                network_policy_template.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a NetworkPolicy boolean"
+            );
+        }
+        for path in [
+            "serviceExposure.enabled",
+            "serviceExposure.discoverServices",
+            "serviceExposure.discoverApiServer",
+        ] {
+            assert!(
+                daemonset.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a Service exposure route boolean"
+            );
+        }
+        assert!(rbac.contains("\"path\" \"rbac.create\""));
+        assert!(rbac.contains("\"path\" \"serviceExposure.discoverServices\""));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")

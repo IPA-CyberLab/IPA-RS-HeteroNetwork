@@ -184,6 +184,13 @@
 {{- include "ipars.validateUsableServiceIPAddress" . -}}
 {{- end -}}
 
+{{- define "ipars.validateBoolean" -}}
+{{- $path := .path -}}
+{{- if not (kindIs "bool" .value) -}}
+{{- fail (printf "%s must be true or false" $path) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateHttpEndpointURL" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}

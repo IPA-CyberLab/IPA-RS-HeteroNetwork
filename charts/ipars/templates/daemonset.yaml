@@ -39,6 +39,10 @@
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
 {{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
 {{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
 {{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
