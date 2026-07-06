@@ -82,6 +82,9 @@ relay/route-provider distribution for the launched agent prefix and all runtime 
 bootstrap URLs, and passes
 `--join-token-path` so token material is not exposed through child process argv, then scrubs those
 token files after agent readiness and agent state files after child shutdown. Daemon transport
+revalidates each scrubbed secret path as a runtime-local regular non-symlink file with the expected
+join-token or agent-state suffix before removal, leaving failed cleanup targets tracked for
+diagnostics. Daemon transport
 probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
 min/max plus full source/target edge consistency, then stops one control-plane process when
 redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps,

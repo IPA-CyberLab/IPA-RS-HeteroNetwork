@@ -3764,7 +3764,7 @@ impl DaemonProcessGroup {
         measurement: DaemonRuntimeManifestMeasurement,
     ) -> anyhow::Result<PathBuf> {
         stop_daemon_children(&mut self.children)?;
-        remove_daemon_agent_state_files(&mut self.agent_state_paths)?;
+        remove_daemon_agent_state_files(&self.runtime_dir, &mut self.agent_state_paths)?;
         secure_daemon_retained_runtime_file_modes(&self.runtime_dir)?;
         self.manifest_seed.write_with_measurement(
             DaemonRuntimePhase::Completed,
@@ -3778,7 +3778,7 @@ impl DaemonProcessGroup {
 impl Drop for DaemonProcessGroup {
     fn drop(&mut self) {
         kill_daemon_children(&mut self.children);
-        let _ = remove_daemon_agent_state_files(&mut self.agent_state_paths);
+        let _ = remove_daemon_agent_state_files(&self.runtime_dir, &mut self.agent_state_paths);
         let _ = secure_daemon_retained_runtime_file_modes(&self.runtime_dir);
         if !self.keep_runtime_dir {
             let _ = std::fs::remove_dir_all(&self.runtime_dir);
@@ -3816,7 +3816,7 @@ impl DaemonStartupGuard {
     }
 
     fn remove_join_token_files(&mut self) -> anyhow::Result<()> {
-        remove_daemon_join_token_files(&mut self.join_token_paths)
+        remove_daemon_join_token_files(&self.runtime_dir, &mut self.join_token_paths)
     }
 
     fn finish(mut self) -> (Vec<DaemonChild>, Vec<PathBuf>) {
@@ -3833,8 +3833,8 @@ impl Drop for DaemonStartupGuard {
     fn drop(&mut self) {
         if self.active {
             kill_daemon_children(&mut self.children);
-            let _ = remove_daemon_join_token_files(&mut self.join_token_paths);
-            let _ = remove_daemon_agent_state_files(&mut self.agent_state_paths);
+            let _ = remove_daemon_join_token_files(&self.runtime_dir, &mut self.join_token_paths);
+            let _ = remove_daemon_agent_state_files(&self.runtime_dir, &mut self.agent_state_paths);
             let _ = secure_daemon_retained_runtime_file_modes(&self.runtime_dir);
             if !self.keep_runtime_dir {
                 let _ = std::fs::remove_dir_all(&self.runtime_dir);
@@ -4281,32 +4281,149 @@ fn daemon_agent_state_path(runtime_dir: &Path, agent_index: usize) -> PathBuf {
     ))
 }
 
-fn remove_daemon_join_token_files(token_paths: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    remove_daemon_runtime_files(token_paths, "join token", "after agent startup")
+fn remove_daemon_join_token_files(
+    runtime_dir: &Path,
+    token_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    remove_daemon_runtime_files(
+        runtime_dir,
+        token_paths,
+        "join token",
+        DAEMON_JOIN_TOKEN_FILE_SUFFIX,
+        "after agent startup",
+    )
 }
 
-fn remove_daemon_agent_state_files(state_paths: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    remove_daemon_runtime_files(state_paths, "agent state", "after child shutdown")
+fn remove_daemon_agent_state_files(
+    runtime_dir: &Path,
+    state_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    remove_daemon_runtime_files(
+        runtime_dir,
+        state_paths,
+        "agent state",
+        DAEMON_AGENT_STATE_FILE_SUFFIX,
+        "after child shutdown",
+    )
 }
 
 fn remove_daemon_runtime_files(
+    runtime_dir: &Path,
     paths: &mut Vec<PathBuf>,
     label: &str,
+    expected_suffix: &str,
     context: &str,
 ) -> anyhow::Result<()> {
-    for path in paths.drain(..) {
+    let canonical_runtime_dir =
+        canonical_daemon_runtime_dir_for_cleanup(runtime_dir, label, context)?;
+    let mut pending = std::mem::take(paths).into_iter();
+    while let Some(path) = pending.next() {
+        match daemon_runtime_cleanup_path_exists(
+            &canonical_runtime_dir,
+            &path,
+            label,
+            expected_suffix,
+            context,
+        ) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                paths.push(path);
+                paths.extend(pending);
+                return Err(error);
+            }
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
+                let path_display = path.display().to_string();
+                paths.push(path);
+                paths.extend(pending);
                 bail!(
                     "failed to remove daemon {label} {} {context}: {error}",
-                    path.display()
+                    path_display
                 );
             }
         }
     }
     Ok(())
+}
+
+fn canonical_daemon_runtime_dir_for_cleanup(
+    runtime_dir: &Path,
+    label: &str,
+    context: &str,
+) -> anyhow::Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(runtime_dir).with_context(|| {
+        format!(
+            "failed to inspect daemon {label} runtime directory {} {context}",
+            runtime_dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "daemon {label} runtime directory {} must be a real directory {context}",
+            runtime_dir.display()
+        );
+    }
+    runtime_dir.canonicalize().with_context(|| {
+        format!(
+            "daemon {label} runtime directory {} cannot be canonicalized {context}",
+            runtime_dir.display()
+        )
+    })
+}
+
+fn daemon_runtime_cleanup_path_exists(
+    canonical_runtime_dir: &Path,
+    path: &Path,
+    label: &str,
+    expected_suffix: &str,
+    context: &str,
+) -> anyhow::Result<bool> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        bail!(
+            "daemon {label} cleanup path {} must have a UTF-8 file name {context}",
+            path.display()
+        );
+    };
+    if !file_name.ends_with(expected_suffix) {
+        bail!(
+            "daemon {label} cleanup path {} has unexpected file name; expected suffix {expected_suffix} {context}",
+            path.display()
+        );
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            bail!(
+                "failed to inspect daemon {label} cleanup path {} {context}: {error}",
+                path.display()
+            );
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "daemon {label} cleanup path {} must be a regular file {context}",
+            path.display()
+        );
+    }
+    let canonical_path = path.canonicalize().with_context(|| {
+        format!(
+            "daemon {label} cleanup path {} cannot be canonicalized {context}",
+            path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(canonical_runtime_dir) {
+        bail!(
+            "daemon {label} cleanup path {} is outside runtime directory {} {context}",
+            canonical_path.display(),
+            canonical_runtime_dir.display()
+        );
+    }
+    Ok(true)
 }
 
 fn validate_daemon_join_token_file(runtime_dir: &Path, token_path: &Path) -> anyhow::Result<()> {
@@ -7212,7 +7329,7 @@ mod tests {
         let token_path = daemon_join_token_path(&runtime_dir, 0);
         let mut paths = vec![token_path];
 
-        remove_daemon_join_token_files(&mut paths)?;
+        remove_daemon_join_token_files(&runtime_dir, &mut paths)?;
 
         assert!(paths.is_empty());
         std::fs::remove_dir_all(&runtime_dir)?;
@@ -7226,9 +7343,52 @@ mod tests {
         let state_path = daemon_agent_state_path(&runtime_dir, 0);
         let mut paths = vec![state_path];
 
-        remove_daemon_agent_state_files(&mut paths)?;
+        remove_daemon_agent_state_files(&runtime_dir, &mut paths)?;
 
         assert!(paths.is_empty());
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_runtime_secret_cleanup_rejects_paths_outside_runtime_dir() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("token-cleanup-runtime");
+        let outside_dir = synthetic_runtime_dir("token-cleanup-outside");
+        std::fs::create_dir_all(&runtime_dir)?;
+        std::fs::create_dir_all(&outside_dir)?;
+        let outside_token_path = outside_dir.join("agent-0000.join-token.json");
+        std::fs::write(&outside_token_path, "{\"token\":\"outside\"}\n")?;
+        let mut paths = vec![outside_token_path.clone()];
+
+        let error = match remove_daemon_join_token_files(&runtime_dir, &mut paths) {
+            Ok(_) => bail!("outside join token cleanup path should fail validation"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("outside runtime directory"));
+        assert!(outside_token_path.exists());
+        assert_eq!(paths, vec![outside_token_path]);
+        std::fs::remove_dir_all(&runtime_dir)?;
+        std::fs::remove_dir_all(&outside_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_runtime_secret_cleanup_rejects_unexpected_suffix() -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("token-cleanup-suffix");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let wrong_path = runtime_dir.join("agent-0000.state.json");
+        std::fs::write(&wrong_path, "{\"identity_private_key\":\"still-secret\"}\n")?;
+        let mut paths = vec![wrong_path.clone()];
+
+        let error = match remove_daemon_join_token_files(&runtime_dir, &mut paths) {
+            Ok(_) => bail!("unexpected join token cleanup suffix should fail validation"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("unexpected file name"));
+        assert!(wrong_path.exists());
+        assert_eq!(paths, vec![wrong_path]);
         std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
     }
