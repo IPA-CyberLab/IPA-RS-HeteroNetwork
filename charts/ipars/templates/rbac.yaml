@@ -1,7 +1,8 @@
 {{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
 {{- $rbacCreate := .Values.rbac.create -}}
-{{- if and $rbacCreate .Values.serviceExposure.discoverServices -}}
+{{- if and $rbacCreate .Values.serviceExposure.enabled .Values.serviceExposure.discoverServices -}}
 {{- $name := include "ipars.fullname" . -}}
 {{- $serviceAccountName := include "ipars.serviceAccountName" . -}}
 {{- $serviceAccountNamespace := .Release.Namespace -}}

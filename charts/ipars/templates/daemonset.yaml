@@ -54,6 +54,20 @@
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
 {{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
+{{- if not .Values.serviceExposure.enabled -}}
+{{- if .Values.serviceExposure.discoverServices -}}
+{{- fail "serviceExposure.discoverServices requires serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.namespaces -}}
+{{- fail "serviceExposure.namespaces requires serviceExposure.enabled=true and serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.serviceLabelSelector -}}
+{{- fail "serviceExposure.serviceLabelSelector requires serviceExposure.enabled=true and serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.routeProviderNodeId -}}
+{{- fail "serviceExposure.routeProviderNodeId requires serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- end -}}
 {{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayForwarder.enabled" "value" .Values.agent.relayForwarder.enabled) -}}
 {{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}

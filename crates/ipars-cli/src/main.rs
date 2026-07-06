@@ -8736,7 +8736,11 @@ mod tests {
             );
         }
         assert!(rbac.contains("\"path\" \"rbac.create\""));
+        assert!(rbac.contains("\"path\" \"serviceExposure.enabled\""));
         assert!(rbac.contains("\"path\" \"serviceExposure.discoverServices\""));
+        assert!(rbac.contains(
+            "and $rbacCreate .Values.serviceExposure.enabled .Values.serviceExposure.discoverServices"
+        ));
         assert!(service_account.contains("\"path\" \"serviceAccount.create\""));
         assert!(pdb.contains("\"path\" \"agent.podDisruptionBudget.enabled\""));
         Ok(())
@@ -9122,6 +9126,16 @@ mod tests {
         assert!(daemonset.contains(
             "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs"
         ));
+        assert!(daemonset
+            .contains("serviceExposure.discoverServices requires serviceExposure.enabled=true"));
+        assert!(daemonset.contains(
+            "serviceExposure.namespaces requires serviceExposure.enabled=true and serviceExposure.discoverServices=true"
+        ));
+        assert!(daemonset.contains(
+            "serviceExposure.serviceLabelSelector requires serviceExposure.enabled=true and serviceExposure.discoverServices=true"
+        ));
+        assert!(daemonset
+            .contains("serviceExposure.routeProviderNodeId requires serviceExposure.enabled=true"));
         assert!(values.contains("peerMap:"));
         assert!(values.contains("enabled: true"));
         assert!(values.contains("pollIntervalSeconds: 30"));
