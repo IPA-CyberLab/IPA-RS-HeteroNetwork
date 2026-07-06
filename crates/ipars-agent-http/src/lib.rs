@@ -351,6 +351,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_admission_failures_by_reason_total Relay admission candidate failures by agent-observed reason."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_admission_failures_by_reason_total counter"
+    );
+    for reason_count in &metrics.relay_admission_failure_reason_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{node_id}\",reason=\"{}\"}} {}",
+            reason_count.reason.as_str(),
+            reason_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarders Number of supervised relay forwarder endpoints."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_relay_forwarders gauge");
@@ -1010,8 +1026,9 @@ mod tests {
     use ipars_types::api::{
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
         AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap, RelayMap,
-        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        AgentRelayAdmissionFailureReason, AgentWireGuardKeyRotationRequest,
+        AgentWireGuardKeyRotationResponse, PeerMap, RelayMap, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -1286,6 +1303,7 @@ mod tests {
             .await;
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_success();
+        runtime.record_relay_admission_failure_reason(AgentRelayAdmissionFailureReason::Rejected);
         runtime
             .record_userspace_wireguard_process_status(
                 AgentManagedProcessState::Ready,
@@ -1391,7 +1409,13 @@ mod tests {
         );
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 1);
-        assert_eq!(metrics.relay_admission_failure_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert!(metrics
+            .relay_admission_failure_reason_counts
+            .iter()
+            .any(|entry| {
+                entry.reason == AgentRelayAdmissionFailureReason::Rejected && entry.count == 1
+            }));
         assert_eq!(
             metrics
                 .userspace_wireguard_process
@@ -1495,6 +1519,7 @@ mod tests {
         assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
         assert!(body.contains("ipars_agent_relay_admission_success_total"));
         assert!(body.contains("ipars_agent_relay_admission_failures_total"));
+        assert!(body.contains("ipars_agent_relay_admission_failures_by_reason_total"));
         assert!(body.contains("ipars_agent_userspace_wireguard_process_state"));
         assert!(body.contains("state=\"ready\"} 1"));
         assert!(body.contains("state=\"disabled\"} 0"));
@@ -1512,6 +1537,9 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(
+            &format!("ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"rejected\"}} 1")
+        ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")
         ));

@@ -23,8 +23,9 @@ use ipars_types::api::{
     AgentPacketFlowApplication, AgentPacketFlowApplicationCount, AgentPacketFlowClassification,
     AgentPacketFlowClassificationCount, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
     AgentPacketFlowMatch, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-    AgentPathProbeRequest, AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics,
-    PathStateCount, PeerMap, RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
+    AgentPathProbeRequest, AgentRelayAdmissionFailureReason, AgentRelayAdmissionFailureReasonCount,
+    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
+    RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
@@ -386,6 +387,7 @@ pub struct AgentRuntime {
     relay_admission_attempt_count: AtomicU64,
     relay_admission_success_count: AtomicU64,
     relay_admission_failure_count: AtomicU64,
+    relay_admission_failure_reason_counters: AgentRelayAdmissionFailureReasonCounters,
     path_probe_record_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
@@ -432,6 +434,43 @@ pub struct AgentRuntime {
     packet_flow_application_elasticsearch_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
     packet_flow_application_icmp_count: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct AgentRelayAdmissionFailureReasonCounters {
+    no_endpoint_candidate: AtomicU64,
+    invalid_relay_candidate: AtomicU64,
+    unavailable: AtomicU64,
+    rejected: AtomicU64,
+    invalid_response: AtomicU64,
+}
+
+impl AgentRelayAdmissionFailureReasonCounters {
+    fn record(&self, reason: AgentRelayAdmissionFailureReason) {
+        self.counter(reason).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Vec<AgentRelayAdmissionFailureReasonCount> {
+        AgentRelayAdmissionFailureReason::ALL
+            .into_iter()
+            .filter_map(|reason| {
+                let count = self.counter(reason).load(Ordering::Relaxed);
+                (count > 0).then_some(AgentRelayAdmissionFailureReasonCount { reason, count })
+            })
+            .collect()
+    }
+
+    fn counter(&self, reason: AgentRelayAdmissionFailureReason) -> &AtomicU64 {
+        match reason {
+            AgentRelayAdmissionFailureReason::NoEndpointCandidate => &self.no_endpoint_candidate,
+            AgentRelayAdmissionFailureReason::InvalidRelayCandidate => {
+                &self.invalid_relay_candidate
+            }
+            AgentRelayAdmissionFailureReason::Unavailable => &self.unavailable,
+            AgentRelayAdmissionFailureReason::Rejected => &self.rejected,
+            AgentRelayAdmissionFailureReason::InvalidResponse => &self.invalid_response,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -919,6 +958,8 @@ impl AgentRuntime {
             relay_admission_attempt_count: AtomicU64::new(0),
             relay_admission_success_count: AtomicU64::new(0),
             relay_admission_failure_count: AtomicU64::new(0),
+            relay_admission_failure_reason_counters:
+                AgentRelayAdmissionFailureReasonCounters::default(),
             path_probe_record_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
@@ -1174,6 +1215,9 @@ impl AgentRuntime {
             relay_admission_failure_count: self
                 .relay_admission_failure_count
                 .load(Ordering::Relaxed),
+            relay_admission_failure_reason_counts: self
+                .relay_admission_failure_reason_counters
+                .snapshot(),
             relay_forwarder_count: relay_forwarders.len(),
             relay_forwarders: relay_forwarder_metrics
                 .values()
@@ -1271,8 +1315,13 @@ impl AgentRuntime {
     }
 
     pub fn record_relay_admission_failure(&self) {
+        self.record_relay_admission_failure_reason(AgentRelayAdmissionFailureReason::Unavailable);
+    }
+
+    pub fn record_relay_admission_failure_reason(&self, reason: AgentRelayAdmissionFailureReason) {
         self.relay_admission_failure_count
             .fetch_add(1, Ordering::Relaxed);
+        self.relay_admission_failure_reason_counters.record(reason);
     }
 
     pub async fn relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
@@ -3440,12 +3489,20 @@ mod tests {
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_success();
-        runtime.record_relay_admission_failure();
+        runtime.record_relay_admission_failure_reason(
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+        );
 
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_eq!(metrics.relay_admission_failure_reason_counts.len(), 1);
+        assert_eq!(
+            metrics.relay_admission_failure_reason_counts[0].reason,
+            AgentRelayAdmissionFailureReason::InvalidResponse
+        );
+        assert_eq!(metrics.relay_admission_failure_reason_counts[0].count, 1);
     }
 
     #[tokio::test]

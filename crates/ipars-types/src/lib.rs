@@ -2858,6 +2858,42 @@ pub mod api {
         pub observed_route_count: usize,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentRelayAdmissionFailureReason {
+        NoEndpointCandidate,
+        InvalidRelayCandidate,
+        Unavailable,
+        Rejected,
+        InvalidResponse,
+    }
+
+    impl AgentRelayAdmissionFailureReason {
+        pub const ALL: [Self; 5] = [
+            Self::NoEndpointCandidate,
+            Self::InvalidRelayCandidate,
+            Self::Unavailable,
+            Self::Rejected,
+            Self::InvalidResponse,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::NoEndpointCandidate => "no_endpoint_candidate",
+                Self::InvalidRelayCandidate => "invalid_relay_candidate",
+                Self::Unavailable => "unavailable",
+                Self::Rejected => "rejected",
+                Self::InvalidResponse => "invalid_response",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentRelayAdmissionFailureReasonCount {
+        pub reason: AgentRelayAdmissionFailureReason,
+        pub count: u64,
+    }
+
     #[derive(
         Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
     )]
@@ -2933,6 +2969,8 @@ pub mod api {
         pub relay_admission_attempt_count: u64,
         pub relay_admission_success_count: u64,
         pub relay_admission_failure_count: u64,
+        #[serde(default)]
+        pub relay_admission_failure_reason_counts: Vec<AgentRelayAdmissionFailureReasonCount>,
         pub relay_forwarder_count: usize,
         pub relay_forwarders: Vec<AgentRelayForwarderMetrics>,
         pub path_change_event_count: usize,

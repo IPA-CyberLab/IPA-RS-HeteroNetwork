@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{Read, SeekFrom};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -47,12 +48,13 @@ use ipars_stun::BindingStunServer;
 use ipars_types::api::{
     AgentManagedProcessState, AgentMetricsResponse, AgentPacketFlowApplication,
     AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
-    AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayForwarderMetrics,
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AgentPacketFlowObservation, AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason,
+    AgentRelayForwarderMetrics, ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -3568,6 +3570,7 @@ struct AgentOtelSnapshot {
     relay_admission_attempt_count: u64,
     relay_admission_success_count: u64,
     relay_admission_failure_count: u64,
+    relay_admission_failure_reason_counts: BTreeMap<AgentRelayAdmissionFailureReason, u64>,
     path_probe_record_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
@@ -3596,6 +3599,11 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
             relay_admission_attempt_count: metrics.relay_admission_attempt_count,
             relay_admission_success_count: metrics.relay_admission_success_count,
             relay_admission_failure_count: metrics.relay_admission_failure_count,
+            relay_admission_failure_reason_counts: metrics
+                .relay_admission_failure_reason_counts
+                .iter()
+                .map(|entry| (entry.reason, entry.count))
+                .collect(),
             path_probe_record_count: metrics.path_probe_record_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
@@ -3638,6 +3646,7 @@ struct AgentOtelMetrics {
     relay_admission_attempts: Counter<u64>,
     relay_admission_success: Counter<u64>,
     relay_admission_failures: Counter<u64>,
+    relay_admission_failures_by_reason: Counter<u64>,
     path_probe_records: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
@@ -3742,6 +3751,12 @@ impl AgentOtelMetrics {
             relay_admission_failures: meter
                 .u64_counter("ipars.agent.relay.admission.failures")
                 .with_description("Relay admission candidate attempts rejected or unreachable.")
+                .build(),
+            relay_admission_failures_by_reason: meter
+                .u64_counter("ipars.agent.relay.admission.failures.by_reason")
+                .with_description(
+                    "Relay admission candidate failures by agent-observed reason.",
+                )
                 .build(),
             path_probe_records: meter
                 .u64_counter("ipars.agent.path_probe.records")
@@ -4047,6 +4062,22 @@ impl AgentOtelMetrics {
         if relay_admission_failure_delta > 0 {
             self.relay_admission_failures
                 .add(relay_admission_failure_delta, &node_attrs);
+        }
+        for reason_count in &metrics.relay_admission_failure_reason_counts {
+            let previous_count = previous.and_then(|previous| {
+                previous
+                    .relay_admission_failure_reason_counts
+                    .get(&reason_count.reason)
+                    .copied()
+            });
+            let delta = counter_delta(reason_count.count, previous_count);
+            if delta > 0 {
+                let attrs = [
+                    KeyValue::new("node_id", node_id.clone()),
+                    KeyValue::new("reason", reason_count.reason.as_str()),
+                ];
+                self.relay_admission_failures_by_reason.add(delta, &attrs);
+            }
         }
 
         let path_probe_delta = counter_delta(
@@ -7917,29 +7948,82 @@ async fn active_relay_session(runtime: &AgentRuntime, peer: &NodeId) -> Option<R
     runtime.active_relay_session(peer, chrono::Utc::now()).await
 }
 
+#[derive(Debug)]
+enum AgentRelayAdmissionError {
+    NoEndpointCandidate,
+    InvalidRelayCandidate(anyhow::Error),
+    Unavailable(anyhow::Error),
+    Rejected(anyhow::Error),
+    InvalidResponse(anyhow::Error),
+}
+
+impl AgentRelayAdmissionError {
+    fn reason(&self) -> AgentRelayAdmissionFailureReason {
+        match self {
+            Self::NoEndpointCandidate => AgentRelayAdmissionFailureReason::NoEndpointCandidate,
+            Self::InvalidRelayCandidate(_) => {
+                AgentRelayAdmissionFailureReason::InvalidRelayCandidate
+            }
+            Self::Unavailable(_) => AgentRelayAdmissionFailureReason::Unavailable,
+            Self::Rejected(_) => AgentRelayAdmissionFailureReason::Rejected,
+            Self::InvalidResponse(_) => AgentRelayAdmissionFailureReason::InvalidResponse,
+        }
+    }
+}
+
+impl fmt::Display for AgentRelayAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoEndpointCandidate => {
+                write!(formatter, "relay session requires endpoint candidates")
+            }
+            Self::InvalidRelayCandidate(error) => {
+                write!(formatter, "invalid relay candidate: {error:#}")
+            }
+            Self::Unavailable(error) => {
+                write!(
+                    formatter,
+                    "failed to send relay admission request: {error:#}"
+                )
+            }
+            Self::Rejected(error) => {
+                write!(formatter, "relay rejected admission request: {error:#}")
+            }
+            Self::InvalidResponse(error) => {
+                write!(formatter, "invalid relay admission response: {error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentRelayAdmissionError {}
+
 async fn admit_relay_session(
     client: &reqwest::Client,
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
     relay: &NodeRecord,
     relay_admission_bearer_token: Option<&str>,
-) -> anyhow::Result<RelaySessionState> {
+) -> Result<RelaySessionState, AgentRelayAdmissionError> {
     let request = relay_admission_request(status, peer)
-        .context("relay session requires endpoint candidates")?;
-    let relay_endpoint = relay_public_endpoint(relay)?;
-    let mut request_builder = client.post(relay_admission_url(relay)?).json(&request);
+        .ok_or(AgentRelayAdmissionError::NoEndpointCandidate)?;
+    let relay_endpoint =
+        relay_public_endpoint(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
+    let admission_url =
+        relay_admission_url(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
+    let mut request_builder = client.post(admission_url).json(&request);
     if let Some(token) = relay_admission_bearer_token {
         request_builder = request_builder.bearer_auth(token);
     }
     let response = request_builder
         .send()
         .await
-        .context("failed to send relay admission request")?
+        .map_err(|error| AgentRelayAdmissionError::Unavailable(anyhow::Error::new(error)))?
         .error_for_status()
-        .context("relay rejected admission request")?
+        .map_err(|error| AgentRelayAdmissionError::Rejected(anyhow::Error::new(error)))?
         .json::<RelayAdmissionResponse>()
         .await
-        .context("failed to decode relay admission response")?;
+        .map_err(|error| AgentRelayAdmissionError::InvalidResponse(anyhow::Error::new(error)))?;
 
     relay_session_state_from_admission(
         peer,
@@ -7949,6 +8033,7 @@ async fn admit_relay_session(
         relay_endpoint,
         chrono::Utc::now(),
     )
+    .map_err(AgentRelayAdmissionError::InvalidResponse)
 }
 
 async fn admit_relay_session_from_candidates(
@@ -7968,7 +8053,7 @@ async fn admit_relay_session_from_candidates(
                 return Ok(session);
             }
             Err(error) => {
-                runtime.record_relay_admission_failure();
+                runtime.record_relay_admission_failure_reason(error.reason());
                 errors.push(format!("{}: {error:#}", relay.node_id));
                 tracing::warn!(
                     relay = %relay.node_id,
@@ -10322,8 +10407,9 @@ mod tests {
     use ipars_agent::AgentNodeState;
     use ipars_types::api::{
         AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
-        AgentPacketFlowDropReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
-        PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentPacketFlowDropReasonCount, AgentRelayAdmissionFailureReasonCount,
+        AgentRelayForwarderMetrics, LazyConnectMetrics, PathStateCount, RelayAdmissionResponse,
+        RelayDataplaneDropReason, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -10445,6 +10531,21 @@ mod tests {
                 .context("test HTTP service failed")
         });
         Ok((format!("http://{addr}"), task))
+    }
+
+    fn assert_agent_relay_admission_failure_reason(
+        metrics: &AgentMetricsResponse,
+        reason: AgentRelayAdmissionFailureReason,
+        count: u64,
+    ) {
+        assert!(
+            metrics
+                .relay_admission_failure_reason_counts
+                .iter()
+                .any(|entry| entry.reason == reason && entry.count == count),
+            "missing relay admission failure reason {reason:?}={count}: {:?}",
+            metrics.relay_admission_failure_reason_counts
+        );
     }
 
     async fn unused_http_base_url() -> anyhow::Result<String> {
@@ -11213,6 +11314,10 @@ mod tests {
             relay_admission_attempt_count: 3,
             relay_admission_success_count: 2,
             relay_admission_failure_count: 1,
+            relay_admission_failure_reason_counts: vec![AgentRelayAdmissionFailureReasonCount {
+                reason: AgentRelayAdmissionFailureReason::Rejected,
+                count: 1,
+            }],
             relay_forwarder_count: 1,
             relay_forwarders: vec![forwarder],
             path_change_event_count: 1,
@@ -11250,6 +11355,12 @@ mod tests {
         };
         let previous = AgentOtelSnapshot::from(&metrics);
 
+        assert_eq!(
+            previous
+                .relay_admission_failure_reason_counts
+                .get(&AgentRelayAdmissionFailureReason::Rejected),
+            Some(&1)
+        );
         assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
     }
 
@@ -16666,6 +16777,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
         relay_task.abort();
         Ok(())
     }
@@ -16784,6 +16900,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+            1,
+        );
         bad_task.abort();
         good_task.abort();
         Ok(())
@@ -17012,6 +17133,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
 
         signal_task.abort();
         control_plane_task.abort();
@@ -17118,6 +17244,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 0);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
 
         signal_task.abort();
         control_plane_task.abort();
@@ -17235,6 +17366,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 0);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
 
         signal_task.abort();
         control_plane_task.abort();
