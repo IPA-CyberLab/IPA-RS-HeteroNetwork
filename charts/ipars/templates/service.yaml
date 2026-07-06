@@ -11,51 +11,55 @@
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
-{{- $agentApiPort := int .Values.agent.apiService.port -}}
+{{- $agentApiPortValue := printf "%v" .Values.agent.apiService.port -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.port" "value" $agentApiPortValue "max" 65535) -}}
+{{- $agentApiPort := int $agentApiPortValue -}}
 {{- $agentApiClusterIP := .Values.agent.apiService.clusterIP -}}
 {{- $agentApiClusterIPs := .Values.agent.apiService.clusterIPs -}}
-{{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
+{{- $agentApiNodePortValue := printf "%v" .Values.agent.apiService.nodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.nodePort" "value" $agentApiNodePortValue "max" 32767) -}}
+{{- $agentApiNodePort := int $agentApiNodePortValue -}}
 {{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
 {{- $agentApiLoadBalancerIP := .Values.agent.apiService.loadBalancerIP -}}
 {{- $agentApiExternalIPs := .Values.agent.apiService.externalIPs -}}
 {{- $agentApiLoadBalancerSourceRanges := .Values.agent.apiService.loadBalancerSourceRanges -}}
-{{- $agentApiHealthCheckNodePort := int .Values.agent.apiService.healthCheckNodePort -}}
+{{- $agentApiHealthCheckNodePortValue := printf "%v" .Values.agent.apiService.healthCheckNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.healthCheckNodePort" "value" $agentApiHealthCheckNodePortValue "max" 32767) -}}
+{{- $agentApiHealthCheckNodePort := int $agentApiHealthCheckNodePortValue -}}
 {{- $agentApiAllocateLoadBalancerNodePorts := .Values.agent.apiService.allocateLoadBalancerNodePorts -}}
 {{- $agentApiIpFamilyPolicy := .Values.agent.apiService.ipFamilyPolicy -}}
 {{- $agentApiIpFamilies := .Values.agent.apiService.ipFamilies -}}
 {{- $agentApiIpFamilyPolicyDual := or (eq $agentApiIpFamilyPolicy "PreferDualStack") (eq $agentApiIpFamilyPolicy "RequireDualStack") -}}
 {{- $agentApiSessionAffinityTimeoutValue := printf "%v" .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
-{{- if eq $agentApiSessionAffinityTimeoutValue "" -}}
-{{- fail "agent.apiService.sessionAffinityTimeoutSeconds must be a non-negative integer" -}}
-{{- end -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.apiService.sessionAffinityTimeoutSeconds" "value" $agentApiSessionAffinityTimeoutValue) -}}
-{{- if or (gt (len $agentApiSessionAffinityTimeoutValue) 5) (and (eq (len $agentApiSessionAffinityTimeoutValue) 5) (gt $agentApiSessionAffinityTimeoutValue "86400")) -}}
-{{- fail "agent.apiService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
-{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.sessionAffinityTimeoutSeconds" "value" $agentApiSessionAffinityTimeoutValue "max" 86400) -}}
 {{- $agentApiSessionAffinityTimeoutSeconds := int $agentApiSessionAffinityTimeoutValue -}}
-{{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
-{{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
+{{- $relayUdpPortValue := printf "%v" .Values.agent.relayService.udpPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpPort" "value" $relayUdpPortValue "max" 65535) -}}
+{{- $relayUdpPort := int $relayUdpPortValue -}}
+{{- $relayHttpPortValue := printf "%v" .Values.agent.relayService.httpPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpPort" "value" $relayHttpPortValue "max" 65535) -}}
+{{- $relayHttpPort := int $relayHttpPortValue -}}
 {{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
 {{- $relayClusterIPs := .Values.agent.relayService.clusterIPs -}}
-{{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
-{{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
+{{- $relayUdpNodePortValue := printf "%v" .Values.agent.relayService.udpNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpNodePort" "value" $relayUdpNodePortValue "max" 32767) -}}
+{{- $relayUdpNodePort := int $relayUdpNodePortValue -}}
+{{- $relayHttpNodePortValue := printf "%v" .Values.agent.relayService.httpNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpNodePort" "value" $relayHttpNodePortValue "max" 32767) -}}
+{{- $relayHttpNodePort := int $relayHttpNodePortValue -}}
 {{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
 {{- $relayLoadBalancerIP := .Values.agent.relayService.loadBalancerIP -}}
 {{- $relayExternalIPs := .Values.agent.relayService.externalIPs -}}
 {{- $relayLoadBalancerSourceRanges := .Values.agent.relayService.loadBalancerSourceRanges -}}
-{{- $relayHealthCheckNodePort := int .Values.agent.relayService.healthCheckNodePort -}}
+{{- $relayHealthCheckNodePortValue := printf "%v" .Values.agent.relayService.healthCheckNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.healthCheckNodePort" "value" $relayHealthCheckNodePortValue "max" 32767) -}}
+{{- $relayHealthCheckNodePort := int $relayHealthCheckNodePortValue -}}
 {{- $relayAllocateLoadBalancerNodePorts := .Values.agent.relayService.allocateLoadBalancerNodePorts -}}
 {{- $relayIpFamilyPolicy := .Values.agent.relayService.ipFamilyPolicy -}}
 {{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
 {{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
 {{- $relaySessionAffinityTimeoutValue := printf "%v" .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
-{{- if eq $relaySessionAffinityTimeoutValue "" -}}
-{{- fail "agent.relayService.sessionAffinityTimeoutSeconds must be a non-negative integer" -}}
-{{- end -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayService.sessionAffinityTimeoutSeconds" "value" $relaySessionAffinityTimeoutValue) -}}
-{{- if or (gt (len $relaySessionAffinityTimeoutValue) 5) (and (eq (len $relaySessionAffinityTimeoutValue) 5) (gt $relaySessionAffinityTimeoutValue "86400")) -}}
-{{- fail "agent.relayService.sessionAffinityTimeoutSeconds must be 0 or between 1 and 86400" -}}
-{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.sessionAffinityTimeoutSeconds" "value" $relaySessionAffinityTimeoutValue "max" 86400) -}}
 {{- $relaySessionAffinityTimeoutSeconds := int $relaySessionAffinityTimeoutValue -}}
 {{- $agentApiClusterIPSet := dict -}}
 {{- $agentApiExternalIPSet := dict -}}

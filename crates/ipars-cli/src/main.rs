@@ -8591,7 +8591,11 @@ mod tests {
         let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/service.yaml")
             .canonicalize()?;
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
         let service_template = std::fs::read_to_string(service_template_path)?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
 
         assert!(service_template.contains(
             "agent.apiService exposure-specific values require agent.apiService.enabled=true"
@@ -8627,22 +8631,27 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
         ));
-        assert!(service_template.contains(
-            "$agentApiSessionAffinityTimeoutValue := printf \"%v\" .Values.agent.apiService.sessionAffinityTimeoutSeconds"
-        ));
-        assert!(service_template.contains(
-            "$relaySessionAffinityTimeoutValue := printf \"%v\" .Values.agent.relayService.sessionAffinityTimeoutSeconds"
-        ));
-        assert!(service_template.contains(
-            "ipars.validateNonNegativeInteger\" (dict \"path\" \"agent.apiService.sessionAffinityTimeoutSeconds\""
-        ));
-        assert!(service_template.contains(
-            "ipars.validateNonNegativeInteger\" (dict \"path\" \"agent.relayService.sessionAffinityTimeoutSeconds\""
-        ));
-        assert!(service_template.contains("gt (len $agentApiSessionAffinityTimeoutValue) 5"));
-        assert!(service_template.contains("gt $agentApiSessionAffinityTimeoutValue \"86400\""));
-        assert!(service_template.contains("gt (len $relaySessionAffinityTimeoutValue) 5"));
-        assert!(service_template.contains("gt $relaySessionAffinityTimeoutValue \"86400\""));
+        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
+        assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
+        for path in [
+            "agent.apiService.port",
+            "agent.apiService.nodePort",
+            "agent.apiService.healthCheckNodePort",
+            "agent.apiService.sessionAffinityTimeoutSeconds",
+            "agent.relayService.udpPort",
+            "agent.relayService.httpPort",
+            "agent.relayService.udpNodePort",
+            "agent.relayService.httpNodePort",
+            "agent.relayService.healthCheckNodePort",
+            "agent.relayService.sessionAffinityTimeoutSeconds",
+        ] {
+            assert!(
+                service_template.contains(&format!(
+                    "ipars.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as a bounded integer before int conversion"
+            );
+        }
         assert!(service_template.contains(
             "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs"
         ));

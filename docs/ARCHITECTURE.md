@@ -180,6 +180,8 @@ The chart can also render optional Services for the agent HTTP API and colocated
 
 Fixed Kubernetes ClusterIPs, LoadBalancer IPs, and externalIPs are rejected when they are unspecified, loopback, link-local, multicast, or broadcast addresses. Duplicate fixed ClusterIPs and externalIPs are rejected within and across the rendered agent/relay Services in both `ipars k8s install` and direct Helm values rendering. LoadBalancer source ranges and NetworkPolicy CIDR allowlists reject all-source, loopback, link-local, multicast, broadcast, non-canonical IPv4, and repeated entries so operators cannot bypass the explicit unrestricted LoadBalancer acknowledgement by supplying `0.0.0.0/0`, `::/0`, or unsafe ranges as allowlist entries, and repeated allowlist entries cannot hide accidental chart value duplication.
 
+Direct Helm values for agent and relay Service ports, NodePorts, LoadBalancer health-check NodePorts, and session-affinity timeouts are validated as bounded non-negative integers before template `int` conversion, preventing string, fractional, or oversized numeric values from being silently coerced during rendering.
+
 CNI-owned pod networking remains the responsibility of the cluster CNI.
 
 ## API Schema
