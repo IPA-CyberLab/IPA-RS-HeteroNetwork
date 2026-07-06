@@ -1826,14 +1826,8 @@ pub mod api {
 
     impl AgentPacketFlowObservation {
         pub fn validate_transport_metadata(&self) -> Result<(), String> {
-            if self
-                .detector
-                .as_ref()
-                .is_some_and(|detector| detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES)
-            {
-                return Err(format!(
-                    "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
-                ));
+            if let Some(detector) = self.detector.as_deref() {
+                validate_packet_flow_detector(detector)?;
             }
             if self.payload_prefix.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
                 return Err(format!(
@@ -2105,12 +2099,23 @@ pub mod api {
         let Some(detector) = detector else {
             return Ok(None);
         };
-        if detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES {
-            return Err(serde::de::Error::custom(format!(
-                "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
-            )));
-        }
+        validate_packet_flow_detector(&detector).map_err(serde::de::Error::custom)?;
         Ok(Some(detector))
+    }
+
+    fn validate_packet_flow_detector(detector: &str) -> Result<(), String> {
+        if detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES {
+            return Err(format!(
+                "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
+            ));
+        }
+        if detector.trim().is_empty() {
+            return Err("packet-flow detector must not be empty".to_string());
+        }
+        if detector.chars().any(char::is_control) {
+            return Err("packet-flow detector must not contain control characters".to_string());
+        }
+        Ok(())
     }
 
     fn deserialize_packet_flow_conntrack_status<'de, D>(
@@ -8419,7 +8424,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_flow_detector_deserialization_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    fn packet_flow_detector_deserialization_is_bounded_and_printable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let parsed: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"detector":"ebpf-jsonl"}"#)?;
         assert_eq!(parsed.detector.as_deref(), Some("ebpf-jsonl"));
@@ -8432,6 +8438,25 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("packet-flow detector exceeds"));
+
+        let error =
+            match serde_json::from_str::<api::AgentPacketFlowObservation>(r#"{"detector":""}"#) {
+                Ok(_) => return Err("empty detector should be rejected".into()),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("packet-flow detector must not be empty"));
+
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(
+            "{\"detector\":\"ebpf-jsonl\\nspoof\"}",
+        ) {
+            Ok(_) => return Err("detector with control characters should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow detector must not contain control characters"));
         Ok(())
     }
 
@@ -8474,6 +8499,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("packet-flow detector exceeds"));
+
+        let empty_detector = api::AgentPacketFlowObservation {
+            detector: Some(" ".to_string()),
+            ..Default::default()
+        };
+        let error = match empty_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct empty detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector must not be empty"));
+
+        let control_detector = api::AgentPacketFlowObservation {
+            detector: Some("proc\nconntrack".to_string()),
+            ..Default::default()
+        };
+        let error = match control_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct detector control characters should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector must not contain control characters"));
 
         let oversized_payload = api::AgentPacketFlowObservation {
             payload_prefix: vec![0; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],

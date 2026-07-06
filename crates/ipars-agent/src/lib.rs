@@ -6309,7 +6309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packet_flow_observation_rejects_unbounded_direct_metadata(
+    async fn packet_flow_observation_rejects_unbounded_or_invalid_direct_metadata(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -6327,27 +6327,32 @@ mod tests {
             .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
             .await;
 
-        let matched = runtime
-            .record_packet_flow_observation(
-                peer.vpn_ip.0,
-                AgentPacketFlowObservation {
-                    protocol: Some(TransportProtocol::Tcp),
-                    destination_port: Some(443),
-                    payload_prefix: vec![0; PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
-                    ..Default::default()
-                },
-                Utc::now(),
-                true,
-            )
-            .await;
+        for observation in [
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                payload_prefix: vec![0; PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
+                ..Default::default()
+            },
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                detector: Some("sidecar\nspoof".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let matched = runtime
+                .record_packet_flow_observation(peer.vpn_ip.0, observation, Utc::now(), true)
+                .await;
 
-        assert!(matched.is_none());
-        assert!(!runtime.should_connect_peer(&peer).await);
+            assert!(matched.is_none());
+            assert!(!runtime.should_connect_peer(&peer).await);
+        }
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.packet_flow_observation_count, 0);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
-        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(metrics.packet_flow_filtered_count, 2);
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -6356,7 +6361,7 @@ mod tests {
                     entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
                 })
                 .map(|entry| entry.count),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             metrics

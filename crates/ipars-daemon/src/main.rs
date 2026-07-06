@@ -14599,6 +14599,38 @@ mod tests {
             .chain()
             .any(|cause| cause.to_string().contains("packet-flow detector exceeds")));
 
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"detector\":\"\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("empty eBPF JSONL detector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow detector must not be empty")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"detector\":\"ebpf-jsonl\\nspoof\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("eBPF JSONL detector control characters should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow detector must not contain control characters")));
+
         let oversized_statuses =
             ["\"assured\""; ipars_types::api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");
         let oversized_status_line =

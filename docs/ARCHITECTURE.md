@@ -105,7 +105,7 @@ Elasticsearch transport frames are also recognized from bounded TCP payload pref
 
 TLS ClientHello SNI names are parsed when they fit in the bounded payload prefix, allowing Kubernetes API, etcd, Prometheus, OpenTelemetry/OTLP, and Elasticsearch endpoints to be classified ahead of the generic HTTPS fallback.
 
-Packet-flow runtime ingestion treats inconsistent or unbounded transport metadata as a filtered observation with the `inconsistent_transport_metadata` reason before it can activate a peer, pin a path, or increment lifecycle/application classification metrics. This keeps direct API and detector-call paths aligned with the stricter HTTP and JSONL input validation, including detector/payload-prefix/conntrack-status bounds, conntrack normalization, and zero-port rejection.
+Packet-flow runtime ingestion treats inconsistent or unbounded transport metadata as a filtered observation with the `inconsistent_transport_metadata` reason before it can activate a peer, pin a path, or increment lifecycle/application classification metrics. This keeps direct API and detector-call paths aligned with the stricter HTTP and JSONL input validation, including non-empty control-character-free detector labels, detector/payload-prefix/conntrack-status bounds, conntrack normalization, and zero-port rejection.
 
 ## NAT Traversal
 
