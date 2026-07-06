@@ -103,6 +103,7 @@ const CAP_SYS_ADMIN_BIT: u8 = 21;
 const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -6699,20 +6700,8 @@ impl KubernetesApiRouteDiscovery {
             std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
             std::env::var_os("KUBERNETES_SERVICE_PORT").as_deref(),
         )?;
-        let token = std::fs::read_to_string(&args.kubernetes_service_account_token_path)
-            .with_context(|| {
-                format!(
-                    "failed to read Kubernetes service account token from {}",
-                    args.kubernetes_service_account_token_path.display()
-                )
-            })?;
-        let token = token.trim();
-        if token.is_empty() {
-            anyhow::bail!(
-                "Kubernetes service account token at {} is empty",
-                args.kubernetes_service_account_token_path.display()
-            );
-        }
+        let token =
+            read_kubernetes_service_account_token(&args.kubernetes_service_account_token_path)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -6886,6 +6875,59 @@ fn kubernetes_api_base_url(
 fn default_kubernetes_service_account_ca_cert() -> Option<PathBuf> {
     let path = PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
     path.exists().then_some(path)
+}
+
+fn read_kubernetes_service_account_token(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Kubernetes service account token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    ensure_kubernetes_service_account_token_size(metadata.len(), path)?;
+
+    let mut token = String::new();
+    let mut reader = file
+        .by_ref()
+        .take(MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES + 1);
+    reader.read_to_string(&mut token).with_context(|| {
+        format!(
+            "failed to read Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    ensure_kubernetes_service_account_token_size(token.len() as u64, path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "Kubernetes service account token at {} is empty",
+            path.display()
+        );
+    }
+    Ok(token.to_string())
+}
+
+fn ensure_kubernetes_service_account_token_size(size: u64, path: &Path) -> anyhow::Result<()> {
+    if size > MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES {
+        anyhow::bail!(
+            "Kubernetes service account token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn kubernetes_service_route_cidrs(
@@ -17946,6 +17988,48 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "fd00::20/128".parse::<ipnet::IpNet>()?,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_service_account_token_reader_validates_input() -> anyhow::Result<()> {
+        let base = unique_test_dir("kubernetes-service-account-token")?;
+        let token_path = base.join("token");
+        std::fs::write(&token_path, " bearer-token\n")?;
+        assert_eq!(
+            read_kubernetes_service_account_token(&token_path)?,
+            "bearer-token"
+        );
+
+        let directory = base.join("token-dir");
+        std::fs::create_dir(&directory)?;
+        let directory_error = match read_kubernetes_service_account_token(&directory) {
+            Ok(_) => anyhow::bail!("directory service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(directory_error.contains("must resolve to a regular file"));
+
+        let empty_path = base.join("empty-token");
+        std::fs::write(&empty_path, " \n")?;
+        let empty_error = match read_kubernetes_service_account_token(&empty_path) {
+            Ok(_) => anyhow::bail!("empty service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(empty_error.contains("Kubernetes service account token at"));
+        assert!(empty_error.contains("is empty"));
+
+        let oversized_path = base.join("oversized-token");
+        std::fs::write(
+            &oversized_path,
+            "x".repeat(MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES as usize + 1),
+        )?;
+        let oversized_error = match read_kubernetes_service_account_token(&oversized_path) {
+            Ok(_) => anyhow::bail!("oversized service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(oversized_error.contains("exceeds maximum size"));
+
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 
