@@ -3083,7 +3083,7 @@ pub mod api {
             .iter()
             .position(|byte| byte.is_ascii_whitespace())
             .unwrap_or(line.len());
-        redis_known_inline_command(&line[..command_end])
+        redis_known_inline_command(&line[..command_end], trim_ascii_space(&line[command_end..]))
     }
 
     fn redis_bulk_string(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
@@ -3173,11 +3173,14 @@ pub mod api {
             .any(|known| command.eq_ignore_ascii_case(known))
     }
 
-    fn redis_known_inline_command(command: &[u8]) -> bool {
-        let commands: [&[u8]; 24] = [
+    fn redis_known_inline_command(command: &[u8], args: &[u8]) -> bool {
+        if command.eq_ignore_ascii_case(b"INFO") {
+            return args.is_empty() || redis_inline_argument(args);
+        }
+
+        let commands: [&[u8]; 23] = [
             b"HELLO",
             b"CLIENT",
-            b"INFO",
             b"COMMAND",
             b"SUBSCRIBE",
             b"UNSUBSCRIBE",
@@ -3203,6 +3206,14 @@ pub mod api {
         commands
             .iter()
             .any(|known| command.eq_ignore_ascii_case(known))
+    }
+
+    fn redis_inline_argument(argument: &[u8]) -> bool {
+        !argument.is_empty()
+            && argument.len() <= 64
+            && argument
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
     }
 
     fn memcached_payload(payload: &[u8]) -> bool {
@@ -3370,12 +3381,126 @@ pub mod api {
     }
 
     fn nats_payload(payload: &[u8]) -> bool {
-        let commands: [&[u8]; 8] = [
-            b"INFO", b"CONNECT", b"PUB", b"HPUB", b"SUB", b"UNSUB", b"MSG", b"HMSG",
-        ];
-        commands
-            .iter()
-            .any(|command| starts_ascii_word(payload, command))
+        let Some(line) = nats_control_line(payload) else {
+            return false;
+        };
+        let fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let Some(command) = fields.first() else {
+            return false;
+        };
+
+        if command.eq_ignore_ascii_case(b"INFO") || command.eq_ignore_ascii_case(b"CONNECT") {
+            return nats_json_object_after_command(line, command.len());
+        }
+        if command.eq_ignore_ascii_case(b"PING") || command.eq_ignore_ascii_case(b"PONG") {
+            return fields.len() == 1;
+        }
+        if command.eq_ignore_ascii_case(b"+OK") {
+            return fields.len() == 1;
+        }
+        if command.eq_ignore_ascii_case(b"-ERR") {
+            return fields.len() >= 2;
+        }
+        if command.eq_ignore_ascii_case(b"PUB") {
+            return (fields.len() == 3 || fields.len() == 4)
+                && nats_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 3 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 1]);
+        }
+        if command.eq_ignore_ascii_case(b"HPUB") {
+            return (fields.len() == 4 || fields.len() == 5)
+                && nats_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(3))
+                    .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 2])
+                && nats_decimal(fields[fields.len() - 1]);
+        }
+        if command.eq_ignore_ascii_case(b"SUB") {
+            return (fields.len() == 3 || fields.len() == 4)
+                && nats_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 3 || nats_queue_group(field))
+                && nats_sid(fields[fields.len() - 1]);
+        }
+        if command.eq_ignore_ascii_case(b"UNSUB") {
+            return (fields.len() == 2 || fields.len() == 3)
+                && nats_sid(fields[1])
+                && (fields.len() == 2 || nats_decimal(fields[2]));
+        }
+        if command.eq_ignore_ascii_case(b"MSG") {
+            return (fields.len() == 4 || fields.len() == 5)
+                && nats_subject(fields[1])
+                && nats_sid(fields[2])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 1]);
+        }
+        if command.eq_ignore_ascii_case(b"HMSG") {
+            return (fields.len() == 5 || fields.len() == 6)
+                && nats_subject(fields[1])
+                && nats_sid(fields[2])
+                && fields
+                    .get(fields.len().saturating_sub(3))
+                    .is_some_and(|field| fields.len() == 5 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 2])
+                && nats_decimal(fields[fields.len() - 1]);
+        }
+        false
+    }
+
+    fn nats_control_line(payload: &[u8]) -> Option<&[u8]> {
+        let newline = payload.iter().position(|byte| *byte == b'\n')?;
+        let line = payload.get(..newline)?;
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        (!line.is_empty()
+            && line
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t'))
+        .then_some(line)
+    }
+
+    fn nats_json_object_after_command(line: &[u8], command_len: usize) -> bool {
+        let Some(rest) = line.get(command_len..) else {
+            return false;
+        };
+        let json = trim_ascii_space(rest);
+        json.len() >= 2 && json.first() == Some(&b'{') && json.last() == Some(&b'}')
+    }
+
+    fn nats_subject(field: &[u8]) -> bool {
+        nats_token(field) && !field.starts_with(b".") && !field.ends_with(b".")
+    }
+
+    fn nats_reply_subject(field: &[u8]) -> bool {
+        nats_subject(field)
+    }
+
+    fn nats_queue_group(field: &[u8]) -> bool {
+        nats_token(field)
+    }
+
+    fn nats_sid(field: &[u8]) -> bool {
+        nats_token(field)
+    }
+
+    fn nats_token(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.len() <= 1024
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+    }
+
+    fn nats_decimal(field: &[u8]) -> bool {
+        !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
     }
 
     fn mqtt_payload(payload: &[u8]) -> bool {
@@ -3515,18 +3640,6 @@ pub mod api {
         let version_id = u32::from_be_bytes([payload[15], payload[16], payload[17], payload[18]]);
 
         (13..=128 * 1024 * 1024).contains(&message_len) && status & !0x0f == 0 && version_id != 0
-    }
-
-    fn starts_ascii_word(payload: &[u8], word: &[u8]) -> bool {
-        let Some(head) = payload.get(..word.len()) else {
-            return false;
-        };
-        if !head.eq_ignore_ascii_case(word) {
-            return false;
-        }
-        payload
-            .get(word.len())
-            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
     }
 
     fn starts_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
@@ -4910,6 +5023,10 @@ mod tests {
             api::AgentPacketFlowApplication::Redis
         );
         assert_eq!(
+            observation_for_payload(b"INFO memory\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
             observation_for_payload(b"*1\r\n$6\r\nNOTGET\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
@@ -4969,6 +5086,34 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"CONNECT {\"verbose\":false}\r\n").application(),
             api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"INFO {\"server_id\":\"n1\"}\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created reply.inbox 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events.* workers sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT not-json\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created nope\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT {\"verbose\":false}").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
