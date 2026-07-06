@@ -31,7 +31,7 @@ use ipars_control_plane::{
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_crypto::IdentityKeyPair;
-use ipars_relay::{RelayAdmissionRateLimit, RelayService, UdpRelay};
+use ipars_relay::{encode_relay_datagram, RelayAdmissionRateLimit, RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
     kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
@@ -7939,12 +7939,14 @@ async fn admit_relay_session(
         .await
         .context("failed to decode relay admission response")?;
 
-    Ok(relay_session_state_from_admission(
+    relay_session_state_from_admission(
         peer,
         relay,
+        &request,
         response,
         relay_endpoint,
-    ))
+        chrono::Utc::now(),
+    )
 }
 
 async fn admit_relay_session_from_candidates(
@@ -7985,10 +7987,13 @@ async fn admit_relay_session_from_candidates(
 fn relay_session_state_from_admission(
     peer: &NodeRecord,
     relay: &NodeRecord,
+    request: &RelayAdmissionRequest,
     response: RelayAdmissionResponse,
     relay_endpoint: SocketAddr,
-) -> RelaySessionState {
-    RelaySessionState {
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RelaySessionState> {
+    validate_relay_admission_response(peer, request, &response, now)?;
+    Ok(RelaySessionState {
         peer: peer.node_id.clone(),
         relay_node: relay.node_id.clone(),
         relay_endpoint,
@@ -7997,7 +8002,49 @@ fn relay_session_state_from_admission(
         session_id: response.session_id,
         session_token: response.session_token,
         expires_at: response.expires_at,
+    })
+}
+
+fn validate_relay_admission_response(
+    peer: &NodeRecord,
+    request: &RelayAdmissionRequest,
+    response: &RelayAdmissionResponse,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    if response.left != request.left || response.right != request.right {
+        anyhow::bail!(
+            "relay admission response node pair mismatch: expected {} -> {}, got {} -> {}",
+            request.left,
+            request.right,
+            response.left,
+            response.right
+        );
     }
+    if response.right != peer.node_id {
+        anyhow::bail!(
+            "relay admission response target mismatch: expected peer {}, got {}",
+            peer.node_id,
+            response.right
+        );
+    }
+    if response.left_addr != request.left_addr || response.right_addr != request.right_addr {
+        anyhow::bail!(
+            "relay admission response endpoint mismatch: expected {} -> {}, got {} -> {}",
+            request.left_addr,
+            request.right_addr,
+            response.left_addr,
+            response.right_addr
+        );
+    }
+    if response.expires_at <= now {
+        anyhow::bail!(
+            "relay admission response already expired at {}",
+            response.expires_at
+        );
+    }
+    encode_relay_datagram(&response.session_id, &response.session_token, &[0])
+        .context("relay admission response returned invalid session credential")?;
+    Ok(())
 }
 
 fn relay_admission_request(
@@ -11632,26 +11679,126 @@ mod tests {
     }
 
     #[test]
-    fn relay_session_state_uses_advertised_relay_node() {
+    fn relay_session_state_uses_advertised_relay_node() -> anyhow::Result<()> {
         let peer = node_record("node-b");
         let relay = node_record("relay-advertised");
         let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
-        let response = RelayAdmissionResponse {
-            relay_node: NodeId::from_string("relay-daemon-local-name"),
-            session_id: "node-a:node-b".to_string(),
-            session_token: "relay-secret".to_string(),
-            expires_at: Utc::now() + ChronoDuration::seconds(300),
+        let request = RelayAdmissionRequest {
             left: NodeId::from_string("node-a"),
             right: peer.node_id.clone(),
             left_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
             right_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
         };
+        let now = Utc::now();
+        let response = RelayAdmissionResponse {
+            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            session_id: "node-a:node-b".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: now + ChronoDuration::seconds(300),
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+        };
 
-        let session = relay_session_state_from_admission(&peer, &relay, response, relay_endpoint);
+        let session = relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            response,
+            relay_endpoint,
+            now,
+        )?;
 
         assert_eq!(session.peer, NodeId::from_string("node-b"));
         assert_eq!(session.relay_node, NodeId::from_string("relay-advertised"));
         assert_eq!(session.relay_endpoint, relay_endpoint);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_session_state_rejects_inconsistent_admission_response() -> anyhow::Result<()> {
+        let peer = node_record("node-b");
+        let relay = node_record("relay-a");
+        let request = RelayAdmissionRequest {
+            left: NodeId::from_string("node-a"),
+            right: peer.node_id.clone(),
+            left_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+            right_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
+        };
+        let now = Utc::now();
+        let valid_response = RelayAdmissionResponse {
+            relay_node: relay.node_id.clone(),
+            session_id: "node-a:node-b".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: now + ChronoDuration::seconds(300),
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+        };
+        let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
+
+        let mut wrong_pair = valid_response.clone();
+        wrong_pair.right = NodeId::from_string("node-c");
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_pair,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong node pair should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("node pair mismatch"));
+
+        let mut wrong_endpoint = valid_response.clone();
+        wrong_endpoint.right_addr = SocketAddr::from(([203, 0, 113, 99], 51_820));
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_endpoint,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong endpoint should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("endpoint mismatch"));
+
+        let mut expired = valid_response.clone();
+        expired.expires_at = now - ChronoDuration::seconds(1);
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            expired,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("expired credential should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already expired"));
+
+        let mut invalid_credential = valid_response;
+        invalid_credential.session_token.clear();
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            invalid_credential,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("invalid credential should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid session credential"));
+        Ok(())
     }
 
     #[test]
@@ -16492,6 +16639,122 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_admission_fails_over_after_invalid_response() -> anyhow::Result<()> {
+        async fn relay_admission_invalid_pair(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-bad"),
+                session_id: "session-bad".to_string(),
+                session_token: "token-bad".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: NodeId::from_string("wrong-peer"),
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-good"),
+                session_id: "session-good".to_string(),
+                session_token: "token-good".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let (bad_base, bad_task) = spawn_test_http_service(Router::new().route(
+            "/v1/sessions",
+            axum::routing::post(relay_admission_invalid_pair),
+        ))
+        .await?;
+        let (good_base, good_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay_bad = node_record("relay-bad");
+        relay_bad.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(bad_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut relay_good = node_record("relay-good");
+        relay_good.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(good_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let local = NodeId::from_string("local");
+        let status = ipars_types::api::AgentStatusResponse {
+            node_id: local.clone(),
+            identity_public_key: "identity-local".to_string(),
+            wireguard_public_key: "wg-local".to_string(),
+            candidate_count: 1,
+            candidates: vec![EndpointCandidate {
+                node_id: local,
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }],
+            nat_classification: None,
+            userspace_wireguard_process: None,
+            state_updated_at: Utc::now(),
+        };
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![EndpointCandidate {
+            node_id: peer.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }];
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        let session = admit_relay_session_from_candidates(
+            &reqwest::Client::new(),
+            &runtime,
+            &status,
+            &peer,
+            &[relay_bad, relay_good],
+            None,
+        )
+        .await?;
+
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        assert_eq!(session.session_id, "session-good");
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        bad_task.abort();
+        good_task.abort();
         Ok(())
     }
 
