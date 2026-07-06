@@ -766,47 +766,116 @@ async fn run_route_command_output(
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedRouteCommandOutput, RouteManagerError> {
-    tokio::time::timeout(
-        timeout,
-        collect_bounded_route_command_output(command, output_max_bytes),
-    )
-    .await
-    .map_err(|_| {
-        RouteManagerError::Backend(format!(
-            "{command_label} timed out after {}",
-            command_timeout_label(timeout)
-        ))
-    })?
-    .map_err(RouteManagerError::Io)
+    collect_bounded_route_command_output(command, timeout, output_max_bytes, command_label).await
 }
 
 async fn collect_bounded_route_command_output(
     command: LinuxRouteCommand,
+    timeout: Duration,
     output_max_bytes: usize,
-) -> io::Result<BoundedRouteCommandOutput> {
-    let mut child = Command::new(&command.program)
+    command_label: &str,
+) -> Result<BoundedRouteCommandOutput, RouteManagerError> {
+    let mut child_command = Command::new(&command.program);
+    child_command
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    configure_route_command_process_group(&mut child_command);
+
+    let mut child = child_command.spawn().map_err(RouteManagerError::Io)?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+        .ok_or_else(|| RouteManagerError::Io(io::Error::other("child stdout was not piped")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+        .ok_or_else(|| RouteManagerError::Io(io::Error::other("child stderr was not piped")))?;
 
-    let (status, _stdout, stderr) = tokio::try_join!(
-        child.wait(),
-        read_limited_route_command_output(stdout, output_max_bytes),
-        read_limited_route_command_output(stderr, output_max_bytes)
-    )?;
+    let stdout_task = tokio::spawn(read_limited_route_command_output(stdout, output_max_bytes));
+    let stderr_task = tokio::spawn(read_limited_route_command_output(stderr, output_max_bytes));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(RouteManagerError::Io(error));
+        }
+        Err(_) => {
+            let kill_error = kill_timed_out_route_child(&mut child);
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let mut message = format!(
+                "{command_label} timed out after {}",
+                command_timeout_label(timeout)
+            );
+            if let Some(error) = kill_error {
+                message.push_str(&format!("; failed to kill timed-out child: {error}"));
+            }
+            return Err(RouteManagerError::Backend(message));
+        }
+    };
+
+    let _stdout = collect_route_command_output_task(stdout_task).await?;
+    let stderr = collect_route_command_output_task(stderr_task).await?;
 
     Ok(BoundedRouteCommandOutput { status, stderr })
+}
+
+fn configure_route_command_process_group(_command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        _command.process_group(0);
+    }
+}
+
+fn kill_timed_out_route_child(child: &mut tokio::process::Child) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id() {
+        match kill_route_process_group(pid) {
+            Ok(()) => return None,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => return None,
+            Err(group_error) => {
+                return match child.start_kill() {
+                    Ok(()) => Some(format!(
+                        "process group {pid}: {group_error}; direct child kill succeeded"
+                    )),
+                    Err(child_error) => Some(format!(
+                        "process group {pid}: {group_error}; direct child: {child_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    child.start_kill().err().map(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn kill_route_process_group(pid: u32) -> io::Result<()> {
+    let pgid: i32 = i32::try_from(pid)
+        .map_err(|_| io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error as i32))
+}
+
+async fn collect_route_command_output_task(
+    task: tokio::task::JoinHandle<io::Result<LimitedRouteCommandOutput>>,
+) -> Result<LimitedRouteCommandOutput, RouteManagerError> {
+    match task.await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(RouteManagerError::Io(error)),
+        Err(error) => Err(RouteManagerError::Backend(format!(
+            "route command output reader failed: {error}"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -1449,6 +1518,51 @@ mod tests {
         assert!(error.to_string().contains("timed out after 10ms"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_times_out_and_reaps_child(
+    ) -> Result<(), RouteManagerError> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-route-command-timeout-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let grandchild_pid_path = temp_dir.join("grandchild.pid");
+        let script = format!(
+            "printf '%s\\n' $$ > {}; sleep 60 & printf '%s\\n' $! > {}; wait",
+            pid_path.display(),
+            grandchild_pid_path.display()
+        );
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(100));
+        let error = match runner
+            .run(LinuxRouteCommand::new("sh", ["-c", &script]))
+            .await
+        {
+            Ok(()) => panic!("command should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("timed out after 100ms"));
+        let pid = wait_for_route_command_pid_file(&pid_path, Duration::from_secs(1)).await?;
+        let grandchild_pid =
+            wait_for_route_command_pid_file(&grandchild_pid_path, Duration::from_secs(1)).await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "timed-out route command child process {pid} was left running"
+        );
+        assert!(
+            wait_for_process_absent(grandchild_pid, Duration::from_secs(2)).await,
+            "timed-out route command grandchild process {grandchild_pid} was left running"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_system_route_command_runner_truncates_failure_stderr() {
@@ -1473,6 +1587,50 @@ mod tests {
         assert!(stderr.contains("0123456789abcdef"));
         assert!(!stderr.contains("EXTRA"));
         assert!(stderr.contains("stderr truncated after 16 bytes"));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_route_command_pid_file(
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<u32, RouteManagerError> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        return contents.parse::<u32>().map_err(|error| {
+                            RouteManagerError::Backend(format!(
+                                "failed to parse route command child pid: {error}"
+                            ))
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RouteManagerError::Io(error)),
+            }
+            if started.elapsed() >= timeout {
+                return Err(RouteManagerError::Backend(format!(
+                    "timed out waiting for route command child pid file {}",
+                    path.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        let process_path = std::path::Path::new("/proc").join(pid.to_string());
+        while started.elapsed() < timeout {
+            if !process_path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !process_path.exists()
     }
 
     fn route_plan() -> Result<RoutePlan, Box<dyn std::error::Error>> {
