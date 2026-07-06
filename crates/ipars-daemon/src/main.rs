@@ -31,7 +31,9 @@ use ipars_control_plane::{
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_crypto::IdentityKeyPair;
-use ipars_relay::{encode_relay_datagram, RelayAdmissionRateLimit, RelayService, UdpRelay};
+use ipars_relay::{
+    encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
+};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
     kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
@@ -8036,6 +8038,14 @@ fn validate_relay_admission_response(
             response.right_addr
         );
     }
+    let expected_session_id = RelaySessionId::new(&request.left, &request.right);
+    if response.session_id != expected_session_id.as_str() {
+        anyhow::bail!(
+            "relay admission response session id mismatch: expected {}, got {}",
+            expected_session_id.as_str(),
+            response.session_id
+        );
+    }
     if response.expires_at <= now {
         anyhow::bail!(
             "relay admission response already expired at {}",
@@ -11768,6 +11778,21 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("endpoint mismatch"));
+
+        let mut wrong_session_id = valid_response.clone();
+        wrong_session_id.session_id = "node-a:node-c".to_string();
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_session_id,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong session id should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("session id mismatch"));
 
         let mut expired = valid_response.clone();
         expired.expires_at = now - ChronoDuration::seconds(1);
@@ -16526,9 +16551,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-good"),
-                session_id: "session-a".to_string(),
+                session_id,
                 session_token: "token-a".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -16644,16 +16672,16 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
     #[tokio::test]
     async fn relay_admission_fails_over_after_invalid_response() -> anyhow::Result<()> {
-        async fn relay_admission_invalid_pair(
+        async fn relay_admission_invalid_session_id(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-bad"),
-                session_id: "session-bad".to_string(),
+                session_id: "wrong-session".to_string(),
                 session_token: "token-bad".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
-                right: NodeId::from_string("wrong-peer"),
+                right: request.right,
                 left_addr: request.left_addr,
                 right_addr: request.right_addr,
             })
@@ -16662,9 +16690,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-good"),
-                session_id: "session-good".to_string(),
+                session_id,
                 session_token: "token-good".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -16676,7 +16707,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let (bad_base, bad_task) = spawn_test_http_service(Router::new().route(
             "/v1/sessions",
-            axum::routing::post(relay_admission_invalid_pair),
+            axum::routing::post(relay_admission_invalid_session_id),
         ))
         .await?;
         let (good_base, good_task) = spawn_test_http_service(
@@ -16748,7 +16779,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         .await?;
 
         assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
-        assert_eq!(session.session_id, "session-good");
+        assert_eq!(session.session_id, "local:peer-a");
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
@@ -16771,9 +16802,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             {
                 return Err(axum::http::StatusCode::UNAUTHORIZED);
             }
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             Ok(axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-secure"),
-                session_id: "session-secure".to_string(),
+                session_id,
                 session_token: "token-secure".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -16842,7 +16876,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         .await?;
 
         assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
-        assert_eq!(accepted.session_id, "session-secure");
+        assert_eq!(accepted.session_id, "local:peer-a");
         relay_task.abort();
         Ok(())
     }
@@ -16853,9 +16887,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-good"),
-                session_id: "session-good".to_string(),
+                session_id,
                 session_token: "token-good".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -17210,9 +17247,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-a"),
-                session_id: "session-a".to_string(),
+                session_id,
                 session_token: "token-a".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
