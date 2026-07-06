@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -477,6 +477,11 @@ fn validate_relay_session_admission(
     if admission.left == admission.right || admission.left_addr == admission.right_addr {
         return Err(RelayError::AdmissionDenied);
     }
+    if !relay_session_addr_is_usable(admission.left_addr)
+        || !relay_session_addr_is_usable(admission.right_addr)
+    {
+        return Err(RelayError::AdmissionDenied);
+    }
     if session_id.as_str().len() > MAX_RELAY_SESSION_ID_BYTES {
         return Err(RelayError::AdmissionDenied);
     }
@@ -486,6 +491,16 @@ fn validate_relay_session_admission(
         return Err(RelayError::InvalidSessionCredential);
     }
     Ok(())
+}
+
+fn relay_session_addr_is_usable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_broadcast(),
+        IpAddr::V6(_) => true,
+    }
 }
 
 fn validate_relay_frame_sizes(
@@ -933,6 +948,39 @@ mod tests {
             "relay-secret".to_string(),
         );
         assert!(matches!(same_endpoint, Err(RelayError::AdmissionDenied)));
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_unusable_session_endpoint_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("node-a");
+        let right = NodeId::from_string("node-b");
+        let valid_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+
+        for addr in [
+            SocketAddr::from(([0, 0, 0, 0], 10000)),
+            SocketAddr::from(([10, 0, 0, 1], 0)),
+            SocketAddr::from(([224, 0, 0, 1], 10000)),
+            SocketAddr::from(([255, 255, 255, 255], 10000)),
+            SocketAddr::from(([0xff02, 0, 0, 0, 0, 0, 0, 1], 10000)),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 10000)),
+        ] {
+            let rejected = table.admit_with_token(
+                &capability,
+                left.clone(),
+                right.clone(),
+                addr,
+                valid_addr,
+                "relay-secret".to_string(),
+            );
+            assert!(
+                matches!(rejected, Err(RelayError::AdmissionDenied)),
+                "{addr} should be denied"
+            );
+        }
         assert_eq!(table.session_count(), 0);
         Ok(())
     }
@@ -1434,6 +1482,37 @@ mod tests {
                 left: NodeId::from_string("left"),
                 right: NodeId::from_string("left"),
                 left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_unusable_endpoint_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([0, 0, 0, 0], 10000)),
                 right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
             })
             .await;
