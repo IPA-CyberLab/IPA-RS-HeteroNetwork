@@ -25,6 +25,7 @@ use serde::Serialize;
 
 const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
 const MAX_JOIN_TOKEN_TAGS: usize = 64;
+const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
 const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
@@ -2219,6 +2220,36 @@ fn validate_join_token_ttl(ttl_seconds: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_join_token_allowed_routes(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    if cidrs.len() > MAX_JOIN_TOKEN_ALLOWED_ROUTES {
+        anyhow::bail!("{flag} may be repeated at most {MAX_JOIN_TOKEN_ALLOWED_ROUTES} times");
+    }
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} join-token allowed route {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical join-token allowed route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat join-token allowed route {route}");
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping join-token allowed routes {overlap} and {route}"
+            );
+        }
+        routes.push(route);
+    }
+    Ok(())
+}
+
 fn helm_set_key(key: &str) -> String {
     let mut escaped = String::with_capacity(key.len());
     for value in key.chars() {
@@ -2346,6 +2377,7 @@ fn claims(
     for tag in &tags {
         validate_token_identifier(tag, "--tag")?;
     }
+    validate_join_token_allowed_routes("--allowed-route", &policy_input.allowed_routes)?;
     let now = Utc::now();
     let ttl = Duration::seconds(ttl_seconds);
     let tag_set = tags
@@ -4994,6 +5026,9 @@ mod tests {
         let too_many_tags = (0..=MAX_JOIN_TOKEN_TAGS)
             .map(|index| format!("tag-{index}"))
             .collect::<Vec<_>>();
+        let too_many_routes = (0..=MAX_JOIN_TOKEN_ALLOWED_ROUTES)
+            .map(|index| format!("10.0.{}.{}/32", index / 256, index % 256).parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?;
         let cases = vec![
             (
                 TokenCreateArgs {
@@ -5044,6 +5079,51 @@ mod tests {
                 },
                 format!("join token TTL must not exceed {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"),
             ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec!["0.0.0.0/0".parse()?],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not include unrestricted join-token allowed route 0.0.0.0/0"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec!["10.42.0.1/24".parse()?],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must use canonical join-token allowed route 10.42.0.0/24, not 10.42.0.1/24"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec![
+                        "10.42.0.0/16".parse()?,
+                        "10.42.0.0/16".parse()?,
+                    ],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not repeat join-token allowed route 10.42.0.0/16"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec![
+                        "10.42.0.0/16".parse()?,
+                        "10.42.1.0/24".parse()?,
+                    ],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not include overlapping join-token allowed routes 10.42.0.0/16 and 10.42.1.0/24"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: too_many_routes,
+                    ..token_args(&issuer)
+                },
+                format!("--allowed-route may be repeated at most {MAX_JOIN_TOKEN_ALLOWED_ROUTES} times"),
+            ),
         ];
 
         for (args, expected) in cases {
@@ -5071,6 +5151,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--role must contain only ASCII letters"));
+
+        let error = match init(InitArgs {
+            allowed_routes: vec!["0.0.0.0/0".parse()?],
+            ..valid_init_args()
+        }) {
+            Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--allowed-route must not include unrestricted"));
         Ok(())
     }
 
