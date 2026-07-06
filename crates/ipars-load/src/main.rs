@@ -337,6 +337,16 @@ impl LoadReport {
                 if !self.daemon_control_plane_metrics_consistent {
                     bail!("daemon load scenario control-plane metrics are inconsistent");
                 }
+                if self.daemon_control_plane_relay_candidates_min != self.relay_count
+                    || self.daemon_control_plane_relay_candidates_max != self.relay_count
+                {
+                    bail!(
+                        "daemon load scenario relay candidate mismatch: min/max={}/{}, expected {}",
+                        self.daemon_control_plane_relay_candidates_min,
+                        self.daemon_control_plane_relay_candidates_max,
+                        self.relay_count
+                    );
+                }
                 if self.daemon_control_plane_peer_map_endpoints
                     != self.daemon_control_plane_processes
                 {
@@ -3750,6 +3760,14 @@ mod tests {
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
 
+        let mut missing_daemon_relay_candidate = daemon_report.clone();
+        missing_daemon_relay_candidate.daemon_control_plane_relay_candidates_min = 0;
+        let error = match missing_daemon_relay_candidate.validate_success() {
+            Ok(_) => bail!("daemon report with missing relay candidate should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay candidate mismatch"));
+
         let mut retained_manifest = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &retained_manifest,
@@ -4818,6 +4836,8 @@ mod tests {
         report.daemon_control_plane_failover_peer_map_edges_min = expected_peer_edges;
         report.daemon_control_plane_failover_peer_map_edges_max = expected_peer_edges;
         report.daemon_control_plane_failover_peer_maps_consistent = true;
+        report.daemon_control_plane_relay_candidates_min = report.relay_count;
+        report.daemon_control_plane_relay_candidates_max = report.relay_count;
         report.daemon_control_plane_healthy_nodes = report.node_count;
         report.daemon_control_plane_healthy_nodes_min = report.node_count;
         report.daemon_control_plane_healthy_nodes_max = report.node_count;
