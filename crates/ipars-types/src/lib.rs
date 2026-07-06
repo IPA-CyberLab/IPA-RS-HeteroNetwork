@@ -2749,24 +2749,103 @@ pub mod api {
     }
 
     fn quic_long_header_payload(payload: &[u8]) -> bool {
-        if payload.len() < 7 || payload[0] & 0xc0 != 0xc0 {
+        if payload.len() < 7 || payload[0] & 0x80 == 0 {
             return false;
         }
-        let version = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        let Some(version) = read_u32_be(payload, 1) else {
+            return false;
+        };
         if version == 0 {
             return false;
         }
-        let dcid_len = payload[5] as usize;
-        let Some(scid_len_index) = 6_usize.checked_add(dcid_len) else {
+        if version != 1 {
+            return payload[0] & 0x40 != 0 && quic_connection_id_lengths(payload, 255).is_some();
+        }
+        if payload[0] & 0x40 == 0 {
+            return false;
+        }
+        let Some((payload_offset, _dcid_len, _scid_len)) = quic_connection_id_lengths(payload, 20)
+        else {
             return false;
         };
-        let Some(scid_len) = payload.get(scid_len_index).map(|len| *len as usize) else {
+        let packet_number_len = (payload[0] & 0x03) as usize + 1;
+        match (payload[0] & 0x30) >> 4 {
+            0 => quic_initial_packet_payload(payload, payload_offset, packet_number_len),
+            1 | 2 => quic_length_packet_payload(payload, payload_offset, packet_number_len),
+            3 => quic_retry_packet_payload(payload, payload_offset),
+            _ => false,
+        }
+    }
+
+    fn quic_connection_id_lengths(payload: &[u8], max_len: usize) -> Option<(usize, usize, usize)> {
+        let dcid_len = *payload.get(5)? as usize;
+        if dcid_len > max_len {
+            return None;
+        }
+        let scid_len_index = 6_usize.checked_add(dcid_len)?;
+        let scid_len = *payload.get(scid_len_index)? as usize;
+        if scid_len > max_len {
+            return None;
+        }
+        let payload_offset = scid_len_index.checked_add(1)?.checked_add(scid_len)?;
+        (payload.len() >= payload_offset).then_some((payload_offset, dcid_len, scid_len))
+    }
+
+    fn quic_initial_packet_payload(
+        payload: &[u8],
+        offset: usize,
+        packet_number_len: usize,
+    ) -> bool {
+        let Some((token_len, token_offset)) = read_quic_varint(payload, offset) else {
             return false;
         };
-        scid_len_index
+        let Some(length_offset) = token_offset.checked_add(token_len as usize) else {
+            return false;
+        };
+        if length_offset > payload.len() {
+            return false;
+        }
+        quic_length_packet_payload(payload, length_offset, packet_number_len)
+    }
+
+    fn quic_length_packet_payload(payload: &[u8], offset: usize, packet_number_len: usize) -> bool {
+        let Some((declared_len, packet_number_offset)) = read_quic_varint(payload, offset) else {
+            return false;
+        };
+        let Some(packet_payload_min_len) = packet_number_len.checked_add(1) else {
+            return false;
+        };
+        if declared_len < packet_payload_min_len as u64 {
+            return false;
+        }
+        packet_number_offset
+            .checked_add(packet_payload_min_len)
+            .is_some_and(|end| payload.len() >= end)
+    }
+
+    fn quic_retry_packet_payload(payload: &[u8], offset: usize) -> bool {
+        let Some(&odcid_len) = payload.get(offset) else {
+            return false;
+        };
+        if odcid_len > 20 {
+            return false;
+        }
+        offset
             .checked_add(1)
-            .and_then(|offset| offset.checked_add(scid_len))
+            .and_then(|offset| offset.checked_add(odcid_len as usize))
+            .and_then(|offset| offset.checked_add(16))
             .is_some_and(|minimum_len| payload.len() >= minimum_len)
+    }
+
+    fn read_quic_varint(payload: &[u8], offset: usize) -> Option<(u64, usize)> {
+        let first = *payload.get(offset)?;
+        let len = 1_usize << ((first >> 6) as usize);
+        let bytes = payload.get(offset..offset.checked_add(len)?)?;
+        let mut value = (bytes[0] & 0x3f) as u64;
+        for byte in &bytes[1..] {
+            value = value.checked_shl(8)?.checked_add(*byte as u64)?;
+        }
+        Some((value, offset + len))
     }
 
     fn wireguard_payload(payload: &[u8]) -> bool {
@@ -5739,11 +5818,84 @@ mod tests {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(443),
             payload_prefix: vec![
-                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0,
+                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 5, 0, 0, 0, 1, 6,
             ],
             ..Default::default()
         };
         assert_eq!(quic.application(), api::AgentPacketFlowApplication::Https);
+        let quic_zero_rtt = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xd3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_zero_rtt.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let quic_handshake = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xe3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_handshake.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let mut quic_retry_payload = vec![
+            0xf0, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 8, 8, 7, 6, 5, 4, 3, 2,
+            1,
+        ];
+        quic_retry_payload.extend_from_slice(&[0xaa; 16]);
+        let quic_retry = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: quic_retry_payload,
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_retry.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let invalid_quic_fixed_bit = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0x83, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_fixed_bit.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_quic_cid_len = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![0xc3, 0x00, 0x00, 0x00, 0x01, 21],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_cid_len.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_quic_declared_len = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 4, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_declared_len.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let non_quic_udp_443 = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(443),
