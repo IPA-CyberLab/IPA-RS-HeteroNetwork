@@ -31,6 +31,11 @@ const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
+const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
+const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
+const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
+const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
+const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -588,6 +593,30 @@ struct K8sInstallArgs {
     relay_admission_url: Option<String>,
     #[arg(long, requires = "expose_relay")]
     relay_status_url: Option<String>,
+    #[arg(long = "relay-forwarder-endpoint")]
+    relay_forwarder_endpoint: Option<String>,
+    #[arg(
+        long = "relay-forwarder-bind",
+        requires = "relay_forwarder_wireguard_endpoint"
+    )]
+    relay_forwarder_bind: Option<String>,
+    #[arg(
+        long = "relay-forwarder-wireguard-endpoint",
+        requires = "relay_forwarder_bind"
+    )]
+    relay_forwarder_wireguard_endpoint: Option<String>,
+    #[arg(long = "relay-forwarder-netns", requires = "relay_forwarder_bind")]
+    relay_forwarder_netns: Option<String>,
+    #[arg(long = "relay-forwarder-max-sessions", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_SESSIONS)]
+    relay_forwarder_max_sessions: usize,
+    #[arg(long = "relay-forwarder-restart-backoff-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS)]
+    relay_forwarder_restart_backoff_seconds: u64,
+    #[arg(long = "relay-forwarder-crash-window-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS)]
+    relay_forwarder_crash_window_seconds: u64,
+    #[arg(long = "relay-forwarder-max-crashes-per-window", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW)]
+    relay_forwarder_max_crashes_per_window: u32,
+    #[arg(long = "relay-forwarder-crash-cooldown-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS)]
+    relay_forwarder_crash_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3099,6 +3128,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_image_pull_secrets(&args)?;
     validate_k8s_relay_admission_bearer_token_secret(&args)?;
     validate_k8s_relay_advertisement(&args)?;
+    validate_k8s_relay_forwarder(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_security_context(&args)?;
@@ -3119,6 +3149,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     append_k8s_image_values(&mut helm_command, &args);
     append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
+    append_k8s_relay_forwarder_values(&mut helm_command, &args);
     append_k8s_agent_pod_values(&mut helm_command, &args);
     append_k8s_relay_admission_bearer_token_values(&mut helm_command, &args);
     if args.enable_network_policy {
@@ -3594,6 +3625,49 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
     }
 }
 
+fn append_k8s_relay_forwarder_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.relay_forwarder_endpoint.is_none() && args.relay_forwarder_bind.is_none() {
+        return;
+    }
+    command.push_str(" --set agent.relayForwarder.enabled=true");
+    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+        append_helm_set_string(command, "agent.relayForwarder.endpoint", endpoint);
+    }
+    if let Some(bind) = args.relay_forwarder_bind.as_deref() {
+        append_helm_set_string(command, "agent.relayForwarder.bind", bind);
+        if let Some(wireguard_endpoint) = args.relay_forwarder_wireguard_endpoint.as_deref() {
+            append_helm_set_string(
+                command,
+                "agent.relayForwarder.wireguardEndpoint",
+                wireguard_endpoint,
+            );
+        }
+        if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+            append_helm_set_string(command, "agent.relayForwarder.netns", namespace);
+        }
+        command.push_str(&format!(
+            " --set agent.relayForwarder.maxSessions={}",
+            args.relay_forwarder_max_sessions
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.restartBackoffSeconds={}",
+            args.relay_forwarder_restart_backoff_seconds
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.crashWindowSeconds={}",
+            args.relay_forwarder_crash_window_seconds
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.maxCrashesPerWindow={}",
+            args.relay_forwarder_max_crashes_per_window
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.crashCooldownSeconds={}",
+            args.relay_forwarder_crash_cooldown_seconds
+        ));
+    }
+}
+
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_agent_peer_map {
         command.push_str(" --set agent.peerMap.enabled=false");
@@ -3910,6 +3984,116 @@ fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()>
     Ok(())
 }
 
+fn validate_k8s_relay_forwarder(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if args.relay_forwarder_endpoint.is_none() && args.relay_forwarder_bind.is_none() {
+        if args.relay_forwarder_wireguard_endpoint.is_some() {
+            anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_netns.is_some() {
+            anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+            anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_restart_backoff_seconds
+            != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS
+        {
+            anyhow::bail!(
+                "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
+            );
+        }
+        if args.relay_forwarder_crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS
+        {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_max_crashes_per_window
+            != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW
+        {
+            anyhow::bail!(
+                "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
+            );
+        }
+        if args.relay_forwarder_crash_cooldown_seconds
+            != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS
+        {
+            anyhow::bail!(
+                "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+        validate_relay_public_endpoint_arg(endpoint, "--relay-forwarder-endpoint")?;
+    }
+    if let Some(bind) = args.relay_forwarder_bind.as_deref() {
+        validate_relay_forwarder_bind_arg(bind, "--relay-forwarder-bind")?;
+
+        let wireguard_endpoint = args.relay_forwarder_wireguard_endpoint.as_deref().context(
+            "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
+        )?;
+        validate_relay_public_endpoint_arg(
+            wireguard_endpoint,
+            "--relay-forwarder-wireguard-endpoint",
+        )?;
+
+        if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+            validate_linux_namespace_name(namespace)?;
+        }
+        if args.relay_forwarder_max_sessions == 0 {
+            anyhow::bail!("--relay-forwarder-max-sessions must be greater than zero");
+        }
+        if args.relay_forwarder_restart_backoff_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-restart-backoff-seconds must be greater than zero");
+        }
+        if args.relay_forwarder_crash_window_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds must be greater than zero");
+        }
+        if args.relay_forwarder_max_crashes_per_window == 0 {
+            anyhow::bail!("--relay-forwarder-max-crashes-per-window must be greater than zero");
+        }
+        if args.relay_forwarder_crash_cooldown_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-crash-cooldown-seconds must be greater than zero");
+        }
+    } else {
+        if args.relay_forwarder_wireguard_endpoint.is_some() {
+            anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_netns.is_some() {
+            anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+            anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_restart_backoff_seconds
+            != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS
+        {
+            anyhow::bail!(
+                "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
+            );
+        }
+        if args.relay_forwarder_crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS
+        {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
+        }
+        if args.relay_forwarder_max_crashes_per_window
+            != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW
+        {
+            anyhow::bail!(
+                "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
+            );
+        }
+        if args.relay_forwarder_crash_cooldown_seconds
+            != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS
+        {
+            anyhow::bail!(
+                "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_relay_public_endpoint_arg(value: &str, flag: &str) -> anyhow::Result<()> {
     let endpoint = value.parse::<SocketAddr>().with_context(|| {
         format!("{flag} must be an IPv4 host:port or [IPv6]:port socket address")
@@ -3918,6 +4102,22 @@ fn validate_relay_public_endpoint_arg(value: &str, flag: &str) -> anyhow::Result
         anyhow::bail!(
             "{flag} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
         );
+    }
+    Ok(())
+}
+
+fn validate_relay_forwarder_bind_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let endpoint = value.parse::<SocketAddr>().with_context(|| {
+        format!("{flag} must be an IPv4 host:port or [IPv6]:port bind socket address")
+    })?;
+    if endpoint.port() == 0 {
+        anyhow::bail!("{flag} must use a nonzero port");
+    }
+    if endpoint.ip().is_multicast() {
+        anyhow::bail!("{flag} must not use a multicast bind address");
+    }
+    if endpoint.ip() == IpAddr::V4(Ipv4Addr::BROADCAST) {
+        anyhow::bail!("{flag} must not use a broadcast bind address");
     }
     Ok(())
 }
@@ -7190,6 +7390,15 @@ mod tests {
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            relay_forwarder_netns: Some("relay-fw".to_string()),
+            relay_forwarder_max_sessions: 7,
+            relay_forwarder_restart_backoff_seconds: 11,
+            relay_forwarder_crash_window_seconds: 22,
+            relay_forwarder_max_crashes_per_window: 4,
+            relay_forwarder_crash_cooldown_seconds: 33,
         })?;
 
         assert_eq!(plan.platform, "kubernetes-helm");
@@ -7311,6 +7520,19 @@ mod tests {
         assert!(plan.commands[2].contains(
             "--set-string 'agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public'"
         ));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.enabled=true"));
+        assert!(
+            plan.commands[2].contains("--set-string agent.relayForwarder.endpoint=127.0.0.1:45182")
+        );
+        assert!(plan.commands[2].contains("--set-string agent.relayForwarder.bind=0.0.0.0:45182"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820"));
+        assert!(plan.commands[2].contains("--set-string agent.relayForwarder.netns=relay-fw"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.maxSessions=7"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.restartBackoffSeconds=11"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.crashWindowSeconds=22"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.maxCrashesPerWindow=4"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.crashCooldownSeconds=33"));
         assert!(plan
             .security
             .iter()
@@ -7398,6 +7620,54 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_relay_forwarder_settings() -> anyhow::Result<()> {
+        let mut endpoint_only = base_k8s_install_args();
+        endpoint_only.relay_forwarder_endpoint = Some("127.0.0.1:45182".to_string());
+        let plan = k8s_install_plan(endpoint_only)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.relayForwarder.enabled=true"));
+        assert!(helm.contains("--set-string agent.relayForwarder.endpoint=127.0.0.1:45182"));
+        assert!(!helm.contains("agent.relayForwarder.bind"));
+        assert!(!helm.contains("agent.relayForwarder.maxSessions"));
+
+        let mut invalid_endpoint = base_k8s_install_args();
+        invalid_endpoint.relay_forwarder_endpoint = Some("0.0.0.0:45182".to_string());
+        let error = match k8s_install_plan(invalid_endpoint) {
+            Ok(_) => panic!("unusable relay forwarder endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-endpoint"));
+
+        let mut missing_wireguard_endpoint = base_k8s_install_args();
+        missing_wireguard_endpoint.relay_forwarder_bind = Some("0.0.0.0:45182".to_string());
+        let error = match k8s_install_plan(missing_wireguard_endpoint) {
+            Ok(_) => panic!("relay forwarder bind without WireGuard endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-wireguard-endpoint is required"));
+
+        let mut invalid_bind = base_k8s_install_args();
+        invalid_bind.relay_forwarder_bind = Some("239.1.1.1:45182".to_string());
+        invalid_bind.relay_forwarder_wireguard_endpoint = Some("127.0.0.1:51820".to_string());
+        let error = match k8s_install_plan(invalid_bind) {
+            Ok(_) => panic!("multicast relay forwarder bind should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("multicast bind address"));
+
+        let mut inactive_capacity = base_k8s_install_args();
+        inactive_capacity.relay_forwarder_endpoint = Some("127.0.0.1:45182".to_string());
+        inactive_capacity.relay_forwarder_max_sessions = 7;
+        let error = match k8s_install_plan(inactive_capacity) {
+            Ok(_) => panic!("supervisor capacity without bind should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-max-sessions requires --relay-forwarder-bind"));
+
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_load_balancer_source_ranges() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")
@@ -7449,7 +7719,9 @@ mod tests {
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(helpers.contains("define \"ipars.validateSocketAddress\""));
+        assert!(helpers.contains("define \"ipars.validateBindSocketAddress\""));
         assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port socket address"));
+        assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port bind socket address"));
         assert!(helpers.contains("must not use an unspecified address"));
         assert!(helpers.contains("must not use a multicast address"));
         assert!(helpers.contains("must not use a broadcast address"));
@@ -7458,6 +7730,13 @@ mod tests {
         assert!(daemonset.contains(
             "ipars.validateSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
         ));
+        assert!(daemonset.contains(
+            "ipars.validateBindSocketAddress\" (dict \"path\" \"agent.relayForwarder.bind\""
+        ));
+        assert!(daemonset.contains("{{- if .Values.agent.relayForwarder.bind }}"));
+        assert!(daemonset.contains("- --relay-forwarder-bind"));
+        assert!(daemonset.contains("- --relay-forwarder-wireguard-endpoint"));
+        assert!(daemonset.contains("- --relay-forwarder-max-sessions"));
         assert!(!daemonset.contains("cluster.relayEndpoint"));
         assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
         Ok(())
@@ -7715,6 +7994,16 @@ mod tests {
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }
     }
 
@@ -9067,6 +9356,16 @@ mod tests {
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
     }
@@ -9196,6 +9495,16 @@ mod tests {
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
     }
@@ -10343,6 +10652,16 @@ mod tests {
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(without_ack.is_err());
 
@@ -10459,6 +10778,16 @@ mod tests {
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
         assert!(acknowledged.commands[2]
             .contains("--set agent.apiService.allowClusterExternalTrafficPolicy=true"));
@@ -10582,6 +10911,16 @@ mod tests {
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
         Ok(())
@@ -10703,6 +11042,16 @@ mod tests {
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(without_ranges.is_err());
 
@@ -10819,6 +11168,16 @@ mod tests {
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
         assert!(unrestricted.commands[2]
             .contains("--set agent.apiService.allowUnrestrictedLoadBalancer=true"));

@@ -36,6 +36,12 @@
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
+{{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
+{{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
+{{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
+{{- $agentRelayForwarderCrashWindowSeconds := printf "%v" .Values.agent.relayForwarder.crashWindowSeconds -}}
+{{- $agentRelayForwarderMaxCrashesPerWindow := printf "%v" .Values.agent.relayForwarder.maxCrashesPerWindow -}}
+{{- $agentRelayForwarderCrashCooldownSeconds := printf "%v" .Values.agent.relayForwarder.crashCooldownSeconds -}}
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
@@ -58,6 +64,88 @@
 {{- end -}}
 {{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
 {{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- if not (or (eq $agentRelayForwarderEnabled "true") (eq $agentRelayForwarderEnabled "false")) -}}
+{{- fail "agent.relayForwarder.enabled must be true or false" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow) -}}
+{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds) -}}
+{{- if eq $agentRelayForwarderEnabled "true" -}}
+{{- if not (or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind) -}}
+{{- fail "agent.relayForwarder.enabled=true requires agent.relayForwarder.endpoint or agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.endpoint -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.endpoint" "value" .Values.agent.relayForwarder.endpoint) -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.bind -}}
+{{- if not .Values.agent.relayForwarder.wireguardEndpoint -}}
+{{- fail "agent.relayForwarder.wireguardEndpoint is required when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind) -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.wireguardEndpoint" "value" .Values.agent.relayForwarder.wireguardEndpoint) -}}
+{{- if and .Values.agent.relayForwarder.netns (or (gt (len .Values.agent.relayForwarder.netns) 64) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.relayForwarder.netns))) -}}
+{{- fail "agent.relayForwarder.netns must be a Linux network namespace name of 1-64 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderMaxSessions) 1 -}}
+{{- fail "agent.relayForwarder.maxSessions must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderRestartBackoffSeconds) 1 -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderCrashWindowSeconds) 1 -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderMaxCrashesPerWindow) 1 -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderCrashCooldownSeconds) 1 -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- else -}}
+{{- if .Values.agent.relayForwarder.wireguardEndpoint -}}
+{{- fail "agent.relayForwarder.wireguardEndpoint requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.netns -}}
+{{- fail "agent.relayForwarder.netns requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxSessions "1024" -}}
+{{- fail "agent.relayForwarder.maxSessions requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderRestartBackoffSeconds "5" -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashWindowSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxCrashesPerWindow "3" -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashCooldownSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind .Values.agent.relayForwarder.wireguardEndpoint .Values.agent.relayForwarder.netns -}}
+{{- fail "agent.relayForwarder endpoint, bind, wireguardEndpoint, and netns require agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxSessions "1024" -}}
+{{- fail "agent.relayForwarder.maxSessions requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderRestartBackoffSeconds "5" -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashWindowSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxCrashesPerWindow "3" -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashCooldownSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
 {{- end -}}
 {{- if or (eq $imageRepository "") (gt (len $imageRepository) 255) (not (regexMatch "^([a-z0-9]|[a-z0-9][a-z0-9._:/-]*[a-z0-9])$" $imageRepository)) (contains "@" $imageRepository) (contains "//" $imageRepository) (contains ":" (regexFind "[^/]+$" $imageRepository)) -}}
 {{- fail "image.repository must be a lowercase image repository path without tag or digest" -}}
@@ -477,6 +565,32 @@ spec:
             - --apply-peer-map
             - --peer-map-poll-interval-seconds
             - {{ $agentPeerMapPollIntervalSeconds | quote }}
+            {{- end }}
+            {{- if eq $agentRelayForwarderEnabled "true" }}
+            {{- if .Values.agent.relayForwarder.endpoint }}
+            - --relay-forwarder-endpoint
+            - {{ .Values.agent.relayForwarder.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.agent.relayForwarder.bind }}
+            - --relay-forwarder-bind
+            - {{ .Values.agent.relayForwarder.bind | quote }}
+            - --relay-forwarder-wireguard-endpoint
+            - {{ .Values.agent.relayForwarder.wireguardEndpoint | quote }}
+            {{- if .Values.agent.relayForwarder.netns }}
+            - --relay-forwarder-netns
+            - {{ .Values.agent.relayForwarder.netns | quote }}
+            {{- end }}
+            - --relay-forwarder-max-sessions
+            - {{ $agentRelayForwarderMaxSessions | quote }}
+            - --relay-forwarder-restart-backoff-seconds
+            - {{ $agentRelayForwarderRestartBackoffSeconds | quote }}
+            - --relay-forwarder-crash-window-seconds
+            - {{ $agentRelayForwarderCrashWindowSeconds | quote }}
+            - --relay-forwarder-max-crashes-per-window
+            - {{ $agentRelayForwarderMaxCrashesPerWindow | quote }}
+            - --relay-forwarder-crash-cooldown-seconds
+            - {{ $agentRelayForwarderCrashCooldownSeconds | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.agent.relayAdvertisement.enabled }}
             - --relay-public-endpoint

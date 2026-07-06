@@ -152,6 +152,35 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateBindSocketAddress" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- $ipv4Socket := regexMatch (printf "^%s\\.%s\\.%s\\.%s:[0-9]+$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $value -}}
+{{- $ipv6Socket := regexMatch "^\\[[0-9A-Fa-f:.]+\\]:[0-9]+$" $value -}}
+{{- if not (or $ipv4Socket $ipv6Socket) -}}
+{{- fail (printf "%s value %q must be an IPv4 host:port or [IPv6]:port bind socket address" $path $value) -}}
+{{- end -}}
+{{- $port := int (regexFind "[0-9]+$" $value) -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "%s port must be between 1 and 65535" $path) -}}
+{{- end -}}
+{{- if $ipv4Socket -}}
+{{- $host := regexFind "^[^:]+" $value -}}
+{{- if regexMatch "^(22[4-9]|23[0-9])\\." $host -}}
+{{- fail (printf "%s value %q must not use a multicast bind address" $path $value) -}}
+{{- end -}}
+{{- if eq $host "255.255.255.255" -}}
+{{- fail (printf "%s value %q must not use a broadcast bind address" $path $value) -}}
+{{- end -}}
+{{- else if $ipv6Socket -}}
+{{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $value)) -}}
+{{- if regexMatch "^[Ff][Ff]" $host -}}
+{{- fail (printf "%s value %q must not use a multicast bind address" $path $value) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateLabelKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}

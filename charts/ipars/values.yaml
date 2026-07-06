@@ -111,8 +111,15 @@ agent:
     port: 9780
     nodePort: 0
   relayForwarder:
+    enabled: false
+    endpoint: ""
+    bind: ""
+    wireguardEndpoint: ""
     maxSessions: 1024
     restartBackoffSeconds: 5
+    crashWindowSeconds: 60
+    maxCrashesPerWindow: 3
+    crashCooldownSeconds: 60
     netns: ""
   relayAdmissionBearerTokenSecret:
     name: ""
