@@ -287,7 +287,7 @@ struct PathProbeArgs {
 
 #[derive(Debug, Subcommand)]
 enum DockerCommand {
-    Install(DockerInstallArgs),
+    Install(Box<DockerInstallArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,6 +335,30 @@ struct DockerInstallArgs {
         default_value_t = 5
     )]
     userspace_wireguard_shutdown_timeout_seconds: u64,
+    #[arg(long = "relay-forwarder-endpoint")]
+    relay_forwarder_endpoint: Option<String>,
+    #[arg(
+        long = "relay-forwarder-bind",
+        requires = "relay_forwarder_wireguard_endpoint"
+    )]
+    relay_forwarder_bind: Option<String>,
+    #[arg(
+        long = "relay-forwarder-wireguard-endpoint",
+        requires = "relay_forwarder_bind"
+    )]
+    relay_forwarder_wireguard_endpoint: Option<String>,
+    #[arg(long = "relay-forwarder-netns", requires = "relay_forwarder_bind")]
+    relay_forwarder_netns: Option<String>,
+    #[arg(long = "relay-forwarder-max-sessions", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_SESSIONS)]
+    relay_forwarder_max_sessions: usize,
+    #[arg(long = "relay-forwarder-restart-backoff-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS)]
+    relay_forwarder_restart_backoff_seconds: u64,
+    #[arg(long = "relay-forwarder-crash-window-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS)]
+    relay_forwarder_crash_window_seconds: u64,
+    #[arg(long = "relay-forwarder-max-crashes-per-window", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW)]
+    relay_forwarder_max_crashes_per_window: u32,
+    #[arg(long = "relay-forwarder-crash-cooldown-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS)]
+    relay_forwarder_crash_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -625,6 +649,53 @@ struct KeyValueArg {
     value: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RelayForwarderInstallSettings<'a> {
+    endpoint: Option<&'a str>,
+    bind: Option<&'a str>,
+    wireguard_endpoint: Option<&'a str>,
+    netns: Option<&'a str>,
+    max_sessions: usize,
+    restart_backoff_seconds: u64,
+    crash_window_seconds: u64,
+    max_crashes_per_window: u32,
+    crash_cooldown_seconds: u64,
+}
+
+impl<'a> RelayForwarderInstallSettings<'a> {
+    fn from_docker(args: &'a DockerInstallArgs) -> Self {
+        Self {
+            endpoint: args.relay_forwarder_endpoint.as_deref(),
+            bind: args.relay_forwarder_bind.as_deref(),
+            wireguard_endpoint: args.relay_forwarder_wireguard_endpoint.as_deref(),
+            netns: args.relay_forwarder_netns.as_deref(),
+            max_sessions: args.relay_forwarder_max_sessions,
+            restart_backoff_seconds: args.relay_forwarder_restart_backoff_seconds,
+            crash_window_seconds: args.relay_forwarder_crash_window_seconds,
+            max_crashes_per_window: args.relay_forwarder_max_crashes_per_window,
+            crash_cooldown_seconds: args.relay_forwarder_crash_cooldown_seconds,
+        }
+    }
+
+    fn from_k8s(args: &'a K8sInstallArgs) -> Self {
+        Self {
+            endpoint: args.relay_forwarder_endpoint.as_deref(),
+            bind: args.relay_forwarder_bind.as_deref(),
+            wireguard_endpoint: args.relay_forwarder_wireguard_endpoint.as_deref(),
+            netns: args.relay_forwarder_netns.as_deref(),
+            max_sessions: args.relay_forwarder_max_sessions,
+            restart_backoff_seconds: args.relay_forwarder_restart_backoff_seconds,
+            crash_window_seconds: args.relay_forwarder_crash_window_seconds,
+            max_crashes_per_window: args.relay_forwarder_max_crashes_per_window,
+            crash_cooldown_seconds: args.relay_forwarder_crash_cooldown_seconds,
+        }
+    }
+
+    fn active(self) -> bool {
+        self.endpoint.is_some() || self.bind.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KubernetesTolerationArg {
     key: Option<String>,
@@ -702,7 +773,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Docker {
             command: DockerCommand::Install(args),
-        } => print_json(&docker_install_plan(args)?)?,
+        } => print_json(&docker_install_plan(*args)?)?,
         Command::K8s {
             command: K8sCommand::Install(args),
         } => print_json(&k8s_install_plan(*args)?)?,
@@ -2659,6 +2730,16 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites
             .push("Docker API access from the agent for bridge-network IPAM discovery".to_string());
     }
+    if args.relay_forwarder_bind.is_some() {
+        prerequisites.push(
+            "A reachable local WireGuard UDP endpoint for relay forwarder proxying".to_string(),
+        );
+    }
+    if args.relay_forwarder_netns.is_some() {
+        prerequisites.push(
+            "CAP_SYS_ADMIN and a host /var/run/netns bind mount for relay forwarder namespace placement".to_string(),
+        );
+    }
     let mut notes = vec![
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
@@ -2666,6 +2747,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
     if args.docker_discover_networks {
@@ -2679,6 +2761,9 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         }
     } else {
         notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
+    }
+    if args.relay_forwarder_netns.is_some() {
+        notes.push("Relay forwarder namespace placement keeps the base Compose service least-privileged; add CAP_SYS_ADMIN and bind-mount the host /var/run/netns directory when enabling IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string());
     }
 
     let mut commands = Vec::new();
@@ -2733,6 +2818,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         "--docker-route-interval-seconds",
     )?;
     validate_docker_userspace_wireguard_args(args)?;
+    validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
@@ -3093,6 +3179,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
                 .to_string(),
         });
     }
+    append_docker_relay_forwarder_environment(&mut environment, args);
     let container_namespace = args
         .docker_container_namespace
         .clone()
@@ -3121,6 +3208,57 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         });
     }
     environment
+}
+
+fn append_docker_relay_forwarder_environment(
+    environment: &mut Vec<InstallEnvironment>,
+    args: &DockerInstallArgs,
+) {
+    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
+            value: endpoint.to_string(),
+        });
+    }
+    let Some(bind) = args.relay_forwarder_bind.as_deref() else {
+        return;
+    };
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_BIND".to_string(),
+        value: bind.to_string(),
+    });
+    if let Some(wireguard_endpoint) = args.relay_forwarder_wireguard_endpoint.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
+            value: wireguard_endpoint.to_string(),
+        });
+    }
+    if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+            value: namespace.to_string(),
+        });
+    }
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
+        value: args.relay_forwarder_max_sessions.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
+        value: args.relay_forwarder_restart_backoff_seconds.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
+        value: args.relay_forwarder_crash_window_seconds.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
+        value: args.relay_forwarder_max_crashes_per_window.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
+        value: args.relay_forwarder_crash_cooldown_seconds.to_string(),
+    });
 }
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
@@ -3985,37 +4123,36 @@ fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()>
 }
 
 fn validate_k8s_relay_forwarder(args: &K8sInstallArgs) -> anyhow::Result<()> {
-    if args.relay_forwarder_endpoint.is_none() && args.relay_forwarder_bind.is_none() {
-        if args.relay_forwarder_wireguard_endpoint.is_some() {
+    validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_k8s(args))
+}
+
+fn validate_relay_forwarder_install_settings(
+    settings: RelayForwarderInstallSettings<'_>,
+) -> anyhow::Result<()> {
+    if !settings.active() {
+        if settings.wireguard_endpoint.is_some() {
             anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_netns.is_some() {
+        if settings.netns.is_some() {
             anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+        if settings.max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
             anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_restart_backoff_seconds
-            != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS
-        {
+        if settings.restart_backoff_seconds != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS {
             anyhow::bail!(
                 "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
             );
         }
-        if args.relay_forwarder_crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS
-        {
+        if settings.crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS {
             anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_max_crashes_per_window
-            != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW
-        {
+        if settings.max_crashes_per_window != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW {
             anyhow::bail!(
                 "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
             );
         }
-        if args.relay_forwarder_crash_cooldown_seconds
-            != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS
-        {
+        if settings.crash_cooldown_seconds != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS {
             anyhow::bail!(
                 "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
             );
@@ -4023,13 +4160,13 @@ fn validate_k8s_relay_forwarder(args: &K8sInstallArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+    if let Some(endpoint) = settings.endpoint {
         validate_relay_public_endpoint_arg(endpoint, "--relay-forwarder-endpoint")?;
     }
-    if let Some(bind) = args.relay_forwarder_bind.as_deref() {
+    if let Some(bind) = settings.bind {
         validate_relay_forwarder_bind_arg(bind, "--relay-forwarder-bind")?;
 
-        let wireguard_endpoint = args.relay_forwarder_wireguard_endpoint.as_deref().context(
+        let wireguard_endpoint = settings.wireguard_endpoint.context(
             "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
         )?;
         validate_relay_public_endpoint_arg(
@@ -4037,55 +4174,48 @@ fn validate_k8s_relay_forwarder(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--relay-forwarder-wireguard-endpoint",
         )?;
 
-        if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+        if let Some(namespace) = settings.netns {
             validate_linux_namespace_name(namespace)?;
         }
-        if args.relay_forwarder_max_sessions == 0 {
+        if settings.max_sessions == 0 {
             anyhow::bail!("--relay-forwarder-max-sessions must be greater than zero");
         }
-        if args.relay_forwarder_restart_backoff_seconds == 0 {
+        if settings.restart_backoff_seconds == 0 {
             anyhow::bail!("--relay-forwarder-restart-backoff-seconds must be greater than zero");
         }
-        if args.relay_forwarder_crash_window_seconds == 0 {
+        if settings.crash_window_seconds == 0 {
             anyhow::bail!("--relay-forwarder-crash-window-seconds must be greater than zero");
         }
-        if args.relay_forwarder_max_crashes_per_window == 0 {
+        if settings.max_crashes_per_window == 0 {
             anyhow::bail!("--relay-forwarder-max-crashes-per-window must be greater than zero");
         }
-        if args.relay_forwarder_crash_cooldown_seconds == 0 {
+        if settings.crash_cooldown_seconds == 0 {
             anyhow::bail!("--relay-forwarder-crash-cooldown-seconds must be greater than zero");
         }
     } else {
-        if args.relay_forwarder_wireguard_endpoint.is_some() {
+        if settings.wireguard_endpoint.is_some() {
             anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_netns.is_some() {
+        if settings.netns.is_some() {
             anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+        if settings.max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
             anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_restart_backoff_seconds
-            != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS
-        {
+        if settings.restart_backoff_seconds != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS {
             anyhow::bail!(
                 "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
             );
         }
-        if args.relay_forwarder_crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS
-        {
+        if settings.crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS {
             anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
         }
-        if args.relay_forwarder_max_crashes_per_window
-            != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW
-        {
+        if settings.max_crashes_per_window != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW {
             anyhow::bail!(
                 "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
             );
         }
-        if args.relay_forwarder_crash_cooldown_seconds
-            != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS
-        {
+        if settings.crash_cooldown_seconds != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS {
             anyhow::bail!(
                 "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
             );
@@ -6563,6 +6693,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }
     }
 
@@ -6585,6 +6725,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert_eq!(plan.platform, "docker-compose");
@@ -6649,6 +6799,10 @@ mod tests {
                 && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
                 && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
         }));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_*")));
         Ok(())
     }
 
@@ -6671,6 +6825,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert_eq!(
@@ -6729,6 +6893,124 @@ mod tests {
     }
 
     #[test]
+    fn docker_install_plan_wires_and_validates_relay_forwarder_settings() -> anyhow::Result<()> {
+        let endpoint_only = docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"),
+            Some("127.0.0.1:45182")
+        );
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            None
+        );
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            None
+        );
+
+        let plan = docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            relay_forwarder_netns: Some("relay-fw".to_string()),
+            relay_forwarder_max_sessions: 7,
+            relay_forwarder_restart_backoff_seconds: 11,
+            relay_forwarder_crash_window_seconds: 22,
+            relay_forwarder_max_crashes_per_window: 4,
+            relay_forwarder_crash_cooldown_seconds: 33,
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            Some("0.0.0.0:45182")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"),
+            Some("127.0.0.1:51820")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_NETNS"),
+            Some("relay-fw")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            Some("7")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS"),
+            Some("11")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"),
+            Some("22")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"),
+            Some("4")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"),
+            Some("33")
+        );
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("CAP_SYS_ADMIN")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS")));
+
+        let invalid_endpoint = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("0.0.0.0:45182".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("unusable relay forwarder endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_endpoint
+            .to_string()
+            .contains("--relay-forwarder-endpoint"));
+
+        let missing_wireguard_endpoint = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relay forwarder bind without WireGuard endpoint should fail"),
+            Err(error) => error,
+        };
+        assert!(missing_wireguard_endpoint
+            .to_string()
+            .contains("--relay-forwarder-wireguard-endpoint is required"));
+
+        let invalid_bind = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_bind: Some("239.1.1.1:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("multicast relay forwarder bind should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_bind.to_string().contains("multicast bind address"));
+
+        let inactive_capacity = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_max_sessions: 7,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("forwarder capacity without bind should be rejected"),
+            Err(error) => error,
+        };
+        assert!(inactive_capacity
+            .to_string()
+            .contains("--relay-forwarder-max-sessions requires --relay-forwarder-bind"));
+        Ok(())
+    }
+
+    #[test]
     fn docker_install_plan_exports_rootless_multi_network_settings() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
@@ -6747,6 +7029,16 @@ mod tests {
             userspace_wireguard_args: vec!["ipars0".to_string()],
             userspace_wireguard_ready_timeout_seconds: 30,
             userspace_wireguard_shutdown_timeout_seconds: 20,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert!(plan
@@ -6864,6 +7156,16 @@ mod tests {
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_BIND"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS=${IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS:-1024}"
+        ));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"));
         assert!(compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
@@ -6889,6 +7191,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert_eq!(
@@ -6923,6 +7235,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("ambiguous Docker install settings should be rejected"),
             Err(error) => error,
@@ -6948,6 +7270,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("unused Docker network filter should be rejected"),
             Err(error) => error,
@@ -6973,6 +7305,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker network filter should be rejected"),
             Err(error) => error,
@@ -6998,6 +7340,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker host interface should be rejected"),
             Err(error) => error,
@@ -7023,6 +7375,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker container namespace should be rejected"),
             Err(error) => error,
@@ -7060,6 +7422,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 0,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("zero userspace WireGuard ready timeout should be rejected"),
             Err(error) => error,
@@ -7085,6 +7457,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 0,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("zero userspace WireGuard shutdown timeout should be rejected"),
             Err(error) => error,
@@ -7110,6 +7492,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 3601,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => {
                 anyhow::bail!("oversized userspace WireGuard ready timeout should be rejected")
@@ -7137,6 +7529,16 @@ mod tests {
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 3601,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => {
                 anyhow::bail!("oversized userspace WireGuard shutdown timeout should be rejected")
