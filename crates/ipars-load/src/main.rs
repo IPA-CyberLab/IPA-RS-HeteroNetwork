@@ -897,15 +897,21 @@ impl LoadReport {
                     running_roles.push(child.role.clone());
                 }
                 DaemonRuntimeManifestChildState::Exited => {
-                    if child.exit_status.is_none() {
+                    let Some(exit_status) = child.exit_status.as_deref() else {
                         bail!(
                             "daemon load scenario retained manifest exited child {} is missing exit status",
                             child.role
                         );
-                    }
+                    };
                     if let Some(exit_code) = child.exit_code {
                         bail!(
                             "daemon load scenario retained manifest exited child {} recorded numeric exit code {exit_code}; expected harness-controlled shutdown",
+                            child.role
+                        );
+                    }
+                    if !exit_status.starts_with("signal:") {
+                        bail!(
+                            "daemon load scenario retained manifest exited child {} recorded non-signal exit status {exit_status}; expected harness-controlled shutdown",
                             child.role
                         );
                     }
@@ -4290,6 +4296,40 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("numeric exit code"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut nonsignal_child_exit_status = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &nonsignal_child_exit_status,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        nonsignal_child_exit_status.daemon_runtime_dir = Some(runtime_dir.clone());
+        nonsignal_child_exit_status.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                agent.exit_status = Some("exit status: 0".to_string());
+                agent.exit_code = None;
+            }
+        })?;
+        let error = match nonsignal_child_exit_status.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with non-signal child exit status should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("non-signal exit status"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut duplicated_manifest_endpoint = daemon_report.clone();
