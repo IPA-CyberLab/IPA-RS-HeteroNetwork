@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -4649,6 +4649,45 @@ fn validate_kubernetes_service_cluster_ips(
     Ok(())
 }
 
+fn validate_kubernetes_service_cluster_ip_disjoint(
+    left_flag_prefix: &str,
+    left_cluster_ip: Option<IpAddr>,
+    left_secondary_cluster_ip: Option<IpAddr>,
+    right_flag_prefix: &str,
+    right_cluster_ip: Option<IpAddr>,
+    right_secondary_cluster_ip: Option<IpAddr>,
+) -> anyhow::Result<()> {
+    let mut left_ips = BTreeMap::new();
+    if let Some(ip) = left_cluster_ip {
+        left_ips.insert(ip, format!("--{left_flag_prefix}-cluster-ip"));
+    }
+    if let Some(ip) = left_secondary_cluster_ip {
+        left_ips.insert(ip, format!("--{left_flag_prefix}-secondary-cluster-ip"));
+    }
+
+    for (ip, right_flag) in [
+        (
+            right_cluster_ip,
+            format!("--{right_flag_prefix}-cluster-ip"),
+        ),
+        (
+            right_secondary_cluster_ip,
+            format!("--{right_flag_prefix}-secondary-cluster-ip"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(ip, flag)| ip.map(|ip| (ip, flag)))
+    {
+        if let Some(left_flag) = left_ips.get(&ip) {
+            anyhow::bail!(
+                "{right_flag} must not reuse Kubernetes Service clusterIP {ip} already assigned by {left_flag}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_kubernetes_session_affinity_options(
     flag_prefix: &str,
     affinity: Option<&str>,
@@ -5064,6 +5103,14 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         args.relay_secondary_cluster_ip,
         args.relay_ip_family_policy.as_deref(),
         &args.relay_ip_families,
+    )?;
+    validate_kubernetes_service_cluster_ip_disjoint(
+        "agent-api",
+        args.agent_api_cluster_ip,
+        args.agent_api_secondary_cluster_ip,
+        "relay",
+        args.relay_cluster_ip,
+        args.relay_secondary_cluster_ip,
     )?;
     validate_kubernetes_session_affinity_options(
         "agent-api",
@@ -7825,7 +7872,7 @@ mod tests {
             }],
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
-            relay_cluster_ip: Some("2001:db8::40".parse()?),
+            relay_cluster_ip: Some("2001:db8::41".parse()?),
             relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
@@ -7933,9 +7980,9 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
-        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::40"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::41"));
         assert!(plan.commands[2]
-            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::40'"));
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::41'"));
         assert!(
             plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
         );
@@ -8402,6 +8449,12 @@ mod tests {
         ));
         assert!(service_template.contains(
             "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.clusterIP %q must not reuse agent.apiService clusterIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs"
         ));
         Ok(())
     }
@@ -11101,7 +11154,7 @@ mod tests {
         valid.agent_api_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
-        valid.relay_cluster_ip = Some("2001:db8::40".parse()?);
+        valid.relay_cluster_ip = Some("2001:db8::41".parse()?);
         valid.relay_secondary_cluster_ip = Some("10.96.0.41".parse()?);
         valid.relay_ip_family_policy = Some("PreferDualStack".to_string());
         valid.relay_ip_families = vec!["IPv6".to_string(), "IPv4".to_string()];
@@ -11116,9 +11169,9 @@ mod tests {
         assert!(
             plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
         );
-        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::40"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::41"));
         assert!(plan.commands[2]
-            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::40'"));
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::41'"));
         assert!(
             plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
         );
@@ -11174,6 +11227,52 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-cluster-ip requires --expose-relay"));
+
+        let mut duplicate_cross_service_primary = base_k8s_install_args();
+        duplicate_cross_service_primary.expose_agent_api = true;
+        duplicate_cross_service_primary.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_primary.expose_relay = true;
+        duplicate_cross_service_primary.relay_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_primary.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_primary.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_primary) {
+            Ok(_) => panic!("agent and relay primary clusterIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-cluster-ip must not reuse Kubernetes Service clusterIP 10.96.0.40 already assigned by --agent-api-cluster-ip"
+        ));
+
+        let mut duplicate_cross_service_secondary = base_k8s_install_args();
+        duplicate_cross_service_secondary.expose_agent_api = true;
+        duplicate_cross_service_secondary.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_secondary.agent_api_secondary_cluster_ip =
+            Some("2001:db8::40".parse()?);
+        duplicate_cross_service_secondary.agent_api_ip_family_policy =
+            Some("RequireDualStack".to_string());
+        duplicate_cross_service_secondary.agent_api_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        duplicate_cross_service_secondary.expose_relay = true;
+        duplicate_cross_service_secondary.relay_cluster_ip = Some("10.96.0.41".parse()?);
+        duplicate_cross_service_secondary.relay_secondary_cluster_ip =
+            Some("2001:db8::40".parse()?);
+        duplicate_cross_service_secondary.relay_ip_family_policy =
+            Some("PreferDualStack".to_string());
+        duplicate_cross_service_secondary.relay_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        duplicate_cross_service_secondary.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_secondary.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_secondary) {
+            Ok(_) => panic!("agent and relay secondary clusterIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-secondary-cluster-ip must not reuse Kubernetes Service clusterIP 2001:db8::40 already assigned by --agent-api-secondary-cluster-ip"
+        ));
 
         let mut missing_primary = base_k8s_install_args();
         missing_primary.expose_agent_api = true;

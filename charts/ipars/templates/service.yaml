@@ -41,6 +41,7 @@
 {{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
 {{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
 {{- $relaySessionAffinityTimeoutSeconds := int .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
+{{- $agentApiClusterIPSet := dict -}}
 {{- $agentApiExternalIPSet := dict -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
@@ -94,6 +95,14 @@
 {{- if ne (index $agentApiIpFamilies 1) (ternary "IPv6" "IPv4" (contains ":" $agentApiSecondaryClusterIP)) -}}
 {{- fail "agent.apiService.clusterIPs[1] family must match agent.apiService.ipFamilies[1]" -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiClusterIP "") -}}
+{{- $_ := set $agentApiClusterIPSet $agentApiClusterIP true -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiClusterIPs -}}
+{{- range $ip := $agentApiClusterIPs -}}
+{{- $_ := set $agentApiClusterIPSet (printf "%v" $ip) true -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (not $agentApiExternal) -}}
@@ -198,6 +207,9 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayClusterIP "") -}}
 {{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}
+{{- if hasKey $agentApiClusterIPSet $relayClusterIP -}}
+{{- fail (printf "agent.relayService.clusterIP %q must not reuse agent.apiService clusterIPs" $relayClusterIP) -}}
+{{- end -}}
 {{- if and $relayIpFamilies (ne (index $relayIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP))) -}}
 {{- fail "agent.relayService.clusterIP family must match the first agent.relayService.ipFamilies value" -}}
 {{- end -}}
@@ -210,7 +222,11 @@
 {{- fail "agent.relayService.clusterIPs accepts at most two values" -}}
 {{- end -}}
 {{- range $ip := $relayClusterIPs -}}
+{{- $ipValue := printf "%v" $ip -}}
 {{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIPs" "value" $ip) -}}
+{{- if hasKey $agentApiClusterIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs" $ipValue) -}}
+{{- end -}}
 {{- end -}}
 {{- if ne (printf "%v" (index $relayClusterIPs 0)) $relayClusterIP -}}
 {{- fail "agent.relayService.clusterIPs[0] must match agent.relayService.clusterIP" -}}

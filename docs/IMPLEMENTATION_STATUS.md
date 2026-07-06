@@ -4,7 +4,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Implemented In This Baseline
 
-- Kubernetes Service exposure hardening rejects unspecified, loopback, link-local, multicast, and broadcast fixed LoadBalancer IP or externalIP values, rejects duplicate externalIPs within and across rendered agent/relay Services, rejects unrestricted all-source, unsafe, and non-canonical IPv4 CIDRs in LoadBalancer source ranges and NetworkPolicy allowlists, rejects duplicate source-range and NetworkPolicy allowlist CIDRs, scopes hostNetwork NetworkPolicy acknowledgement to enabled NetworkPolicies on host-networked agents, and has `ipars k8s install` emit chart exposure acknowledgement for `ClusterIP` Services that intentionally set externalIPs.
+- Kubernetes Service exposure hardening rejects unspecified, loopback, link-local, multicast, and broadcast fixed ClusterIP, LoadBalancer IP, or externalIP values, rejects duplicate fixed ClusterIPs and externalIPs within and across rendered agent/relay Services, rejects unrestricted all-source, unsafe, and non-canonical IPv4 CIDRs in LoadBalancer source ranges and NetworkPolicy allowlists, rejects duplicate source-range and NetworkPolicy allowlist CIDRs, scopes hostNetwork NetworkPolicy acknowledgement to enabled NetworkPolicies on host-networked agents, and has `ipars k8s install` emit chart exposure acknowledgement for `ClusterIP` Services that intentionally set externalIPs.
 - Rust workspace with dedicated crates for types, crypto, control plane, signal, relay, STUN, agent, route manager, and CLI.
 - Typed models for node, peer/path state, relay capability, token, policy, ACL, route, and health.
 - Ed25519 signed join token creation and verification.
