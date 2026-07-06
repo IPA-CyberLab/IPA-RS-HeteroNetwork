@@ -1567,10 +1567,14 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     let applies_wireguard_with_netlink =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::KernelNetlink;
     let starts_userspace_wireguard = args.userspace_wireguard_command.is_some();
+    let uses_namespaced_userspace_wireguard_commands = args.linux_netns.is_some()
+        && (applies_wireguard_with_userspace_command || starts_userspace_wireguard);
     let ipv4_forwarding = agent_routes_may_forward_ipv4(args);
     let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
-        ip_command: applies_routes_with_command || applies_wireguard_with_command,
+        ip_command: applies_routes_with_command
+            || applies_wireguard_with_command
+            || uses_namespaced_userspace_wireguard_commands,
         wg_command: applies_wireguard_with_command
             || applies_wireguard_with_userspace_command
             || starts_userspace_wireguard,
@@ -1586,11 +1590,13 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
             || (applies_wireguard && !applies_wireguard_with_userspace_command)
             || netfilter_netlink,
         cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
-        cap_sys_admin: (args.linux_netns.is_some() && (applies_routes || applies_wireguard))
+        cap_sys_admin: (args.linux_netns.is_some()
+            && (applies_routes || applies_wireguard || starts_userspace_wireguard))
             || relay_forwarder_netns,
         cap_perfmon: ebpf_ringbuf,
         cap_bpf: ebpf_ringbuf,
-        linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        linux_netns: args.linux_netns.is_some()
+            && (applies_routes || applies_wireguard || starts_userspace_wireguard),
         relay_forwarder_netns,
     }
 }
@@ -13890,6 +13896,119 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_requires_ip_for_namespaced_userspace_wireguard_backend(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-command",
+            "--route-backend",
+            "kernel-netlink",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(!needs.userspace_wireguard_command);
+            assert!(needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(needs.cap_sys_admin);
+            assert!(needs.linux_netns);
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful namespaced userspace preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("missing required Linux runtime command `ip`"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_checks_namespace_for_managed_userspace_wireguard_process(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.userspace_wireguard_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(needs.cap_sys_admin);
+            assert!(needs.linux_netns);
+
+            let base = unique_test_dir("namespaced-userspace-preflight")?;
+            let bin = base.join("bin");
+            std::fs::create_dir(&bin)?;
+            for program in ["ip", "wg", "wireguard-go"] {
+                let path = bin.join(program);
+                std::fs::write(&path, b"#!/bin/sh\n")?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.cap_sys_admin = preflight_fail_cap_sys_admin;
+            let cap_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(bin.as_os_str()),
+                checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful namespaced userspace CAP preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(cap_error.to_string().contains("blocked test CAP_SYS_ADMIN"));
+
+            let mut namespace_checks = test_preflight_checks(preflight_noop_netlink);
+            namespace_checks.linux_netns = preflight_fail_linux_netns;
+            let namespace_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(bin.as_os_str()),
+                namespace_checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful namespaced userspace namespace preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(namespace_error
+                .to_string()
+                .contains("blocked test netns node-a"));
+            let _ = std::fs::remove_dir_all(&base);
             return Ok(());
         }
 
