@@ -685,22 +685,52 @@ impl LoadReport {
         if !manifest.keep_runtime_dir {
             bail!("daemon load scenario retained manifest did not record keep_runtime_dir=true");
         }
+        if manifest.updated_at < manifest.started_at {
+            bail!(
+                "daemon load scenario retained manifest timestamp order is invalid: started_at={}, updated_at={}",
+                manifest.started_at,
+                manifest.updated_at
+            );
+        }
+        if manifest.generated_at != manifest.updated_at {
+            bail!(
+                "daemon load scenario retained manifest generated_at {} does not match updated_at {}",
+                manifest.generated_at,
+                manifest.updated_at
+            );
+        }
 
         let workload = manifest.workload;
+        let expected_scenario = Scenario::from_name(self.scenario);
+        if workload.scenario_node_count != expected_scenario.node_count
+            || workload.scenario_relay_node_count != expected_scenario.relay_count
+            || workload.scenario_route_provider_count != expected_scenario.route_provider_count
+            || workload.scenario_active_pair_count != expected_scenario.active_pair_count
+        {
+            bail!(
+                "daemon load scenario retained manifest scenario workload does not match {:?}: nodes={}/{}, relays={}/{}, route_providers={}/{}, active_pairs={}/{}",
+                self.scenario,
+                workload.scenario_node_count,
+                expected_scenario.node_count,
+                workload.scenario_relay_node_count,
+                expected_scenario.relay_count,
+                workload.scenario_route_provider_count,
+                expected_scenario.route_provider_count,
+                workload.scenario_active_pair_count,
+                expected_scenario.active_pair_count
+            );
+        }
         if workload.daemon_agent_processes != self.daemon_agent_processes
             || workload.daemon_control_plane_processes != self.daemon_control_plane_processes
-            || workload.scenario_active_pair_count != self.active_pair_count
             || workload.relay_packets_per_session != self.relay_packets_per_session
             || workload.relay_payload_bytes != self.relay_payload_bytes_per_packet
         {
             bail!(
-                "daemon load scenario retained manifest workload does not match report: agents={}/{}, control_planes={}/{}, active_pairs={}/{}, relay_packets={}/{}, relay_payload={}/{}",
+                "daemon load scenario retained manifest daemon workload does not match report: agents={}/{}, control_planes={}/{}, relay_packets={}/{}, relay_payload={}/{}",
                 workload.daemon_agent_processes,
                 self.daemon_agent_processes,
                 workload.daemon_control_plane_processes,
                 self.daemon_control_plane_processes,
-                workload.scenario_active_pair_count,
-                self.active_pair_count,
                 workload.relay_packets_per_session,
                 self.relay_packets_per_session,
                 workload.relay_payload_bytes,
@@ -3963,6 +3993,60 @@ mod tests {
         assert!(error.contains("log diagnostics mismatch"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut stale_generated_timestamp = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &stale_generated_timestamp,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        stale_generated_timestamp.daemon_runtime_dir = Some(runtime_dir.clone());
+        stale_generated_timestamp.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.generated_at = manifest.updated_at - chrono::Duration::seconds(1);
+        })?;
+        let error = match stale_generated_timestamp.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with stale generated timestamp should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("generated_at"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut mismatched_scenario_workload = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_scenario_workload,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_scenario_workload.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_scenario_workload.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.workload.scenario_node_count += 1;
+        })?;
+        let error = match mismatched_scenario_workload.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched scenario workload should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("scenario workload"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut incomplete_retained_manifest_fields = daemon_report.clone();
         incomplete_retained_manifest_fields.daemon_runtime_dir =
             Some(synthetic_runtime_dir("manifest-missing-path"));
@@ -5359,6 +5443,18 @@ mod tests {
         };
         let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest)?;
         Ok((runtime_dir, manifest_path))
+    }
+
+    fn mutate_retained_daemon_manifest(
+        manifest_path: &Path,
+        mutate: impl FnOnce(&mut DaemonRuntimeManifest),
+    ) -> anyhow::Result<()> {
+        let mut manifest: DaemonRuntimeManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path)?)?;
+        mutate(&mut manifest);
+        let runtime_dir = manifest.runtime_dir.clone();
+        write_daemon_runtime_manifest(&runtime_dir, manifest)?;
+        Ok(())
     }
 
     fn synthetic_manifest_child(
