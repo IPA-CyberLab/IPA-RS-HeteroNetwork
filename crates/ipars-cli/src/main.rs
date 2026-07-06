@@ -23,6 +23,10 @@ use ipars_types::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
+const MAX_JOIN_TOKEN_TAGS: usize = 64;
+const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
 #[command(about = "IPA-RS-HeteroNetwork P2P VPN control CLI")]
@@ -688,7 +692,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
             allowed_routes: args.allowed_routes.clone(),
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
-    );
+    )?;
     let token = identity.sign_join_token(claims)?;
     let daemon_specs = init_daemon_specs(
         &args,
@@ -1033,7 +1037,7 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
             allowed_routes: args.allowed_routes,
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
-    ))?;
+    )?)?;
     Ok(token)
 }
 
@@ -1248,6 +1252,8 @@ fn write_issuer_private_key(path: &Path, key: &IdentityKeyPair) -> anyhow::Resul
 }
 
 async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenResponse> {
+    validate_token_identifier(&args.cluster_id, "--cluster-id")?;
+    validate_token_identifier(&args.nonce, "--nonce")?;
     let request = RevokeTokenRequest {
         cluster_id: ClusterId::from_string(args.cluster_id),
         nonce: args.nonce,
@@ -2187,6 +2193,32 @@ fn validate_container_image_tag(value: &str, label: &str) -> Result<(), String> 
     Ok(())
 }
 
+fn validate_token_identifier(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_TOKEN_IDENTIFIER_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("{label} must contain only ASCII letters, digits, '_', '.' or '-'");
+    }
+    Ok(())
+}
+
+fn validate_join_token_ttl(ttl_seconds: i64) -> anyhow::Result<()> {
+    if ttl_seconds <= 0 {
+        anyhow::bail!("join token TTL must be greater than zero seconds");
+    }
+    if ttl_seconds > MAX_JOIN_TOKEN_TTL_SECONDS {
+        anyhow::bail!("join token TTL must not exceed {MAX_JOIN_TOKEN_TTL_SECONDS} seconds");
+    }
+    Ok(())
+}
+
 fn helm_set_key(key: &str) -> String {
     let mut escaped = String::with_capacity(key.len());
     for value in key.chars() {
@@ -2302,8 +2334,20 @@ fn claims(
     ttl_seconds: i64,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
     policy_input: TokenPolicyInput,
-) -> JoinTokenClaims {
+) -> anyhow::Result<JoinTokenClaims> {
+    validate_token_identifier(cluster_id.as_str(), "--cluster-id")?;
+    validate_token_identifier(issuer.node_id.as_str(), "issuer node ID")?;
+    validate_token_identifier(issuer.key_id.as_str(), "--issuer-key-id")?;
+    validate_token_identifier(&role, "--role")?;
+    validate_join_token_ttl(ttl_seconds)?;
+    if tags.len() > MAX_JOIN_TOKEN_TAGS {
+        anyhow::bail!("--tag may be repeated at most {MAX_JOIN_TOKEN_TAGS} times");
+    }
+    for tag in &tags {
+        validate_token_identifier(tag, "--tag")?;
+    }
     let now = Utc::now();
+    let ttl = Duration::seconds(ttl_seconds);
     let tag_set = tags
         .into_iter()
         .map(Tag::from_string)
@@ -2316,10 +2360,10 @@ fn claims(
         ..TokenPolicy::default()
     };
 
-    JoinTokenClaims {
+    Ok(JoinTokenClaims {
         cluster_id,
         bootstrap_endpoints,
-        expires_at: now + Duration::seconds(ttl_seconds),
+        expires_at: now + ttl,
         not_before: now - Duration::seconds(5),
         role: Role::from_string(role),
         tags: tag_set,
@@ -2327,7 +2371,7 @@ fn claims(
         key_id: issuer.key_id,
         policy,
         nonce: format!("nonce-{}", now.timestamp_nanos_opt().unwrap_or_default()),
-    }
+    })
 }
 
 fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
@@ -4728,8 +4772,8 @@ mod tests {
 
     use super::*;
 
-    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
-        SignedJoinToken {
+    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> anyhow::Result<SignedJoinToken> {
+        Ok(SignedJoinToken {
             claims: claims(
                 ClusterId::from_string("cluster-a"),
                 TokenIssuer {
@@ -4745,9 +4789,9 @@ mod tests {
                     allowed_routes: Vec::new(),
                     max_token_uses: Some(1),
                 },
-            ),
+            )?,
             signature: "signature".to_string(),
-        }
+        })
     }
 
     fn valid_init_args() -> InitArgs {
@@ -4789,7 +4833,7 @@ mod tests {
                 url: "https://203.0.113.10:8443/".to_string(),
                 kind: BootstrapEndpointKind::ControlPlane,
             },
-        ]);
+        ])?;
 
         assert_eq!(
             control_plane_join_url(&token, None)?,
@@ -4813,7 +4857,7 @@ mod tests {
                 url: "https://203.0.113.11:8443".to_string(),
                 kind: BootstrapEndpointKind::ControlPlane,
             },
-        ]);
+        ])?;
 
         assert_eq!(
             control_plane_join_urls(&token, None)?,
@@ -4827,7 +4871,7 @@ mod tests {
 
     #[test]
     fn join_url_override_takes_precedence() -> anyhow::Result<()> {
-        let token = token_with_bootstrap(Vec::new());
+        let token = token_with_bootstrap(Vec::new())?;
 
         assert_eq!(
             control_plane_join_url(&token, Some("http://127.0.0.1:8443"))?,
@@ -4837,19 +4881,20 @@ mod tests {
     }
 
     #[test]
-    fn join_url_requires_control_plane_endpoint() {
-        let token = token_with_bootstrap(Vec::new());
+    fn join_url_requires_control_plane_endpoint() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(Vec::new())?;
         let result = control_plane_join_url(&token, None);
 
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn join_urls_reject_unusable_control_plane_endpoints() {
+    fn join_urls_reject_unusable_control_plane_endpoints() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![BootstrapEndpoint {
             url: "http://0.0.0.0:8443".to_string(),
             kind: BootstrapEndpointKind::ControlPlane,
-        }]);
+        }])?;
         let error = match control_plane_join_urls(&token, None) {
             Ok(_) => panic!("unusable token control-plane bootstrap should be rejected"),
             Err(error) => error,
@@ -4857,13 +4902,14 @@ mod tests {
         assert!(error.to_string().contains("control-plane bootstrap URL"));
         assert!(error.to_string().contains("usable non-unspecified"));
 
-        let token = token_with_bootstrap(Vec::new());
+        let token = token_with_bootstrap(Vec::new())?;
         let error = match control_plane_join_url(&token, Some("udp://127.0.0.1:8443")) {
             Ok(_) => panic!("non-HTTP control-plane override should be rejected"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("control-plane URL"));
         assert!(error.to_string().contains("must use http or https"));
+        Ok(())
     }
 
     #[test]
@@ -4917,6 +4963,114 @@ mod tests {
             Utc::now(),
             &ClusterId::from_string("cluster-a"),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_rejects_invalid_claim_inputs() -> anyhow::Result<()> {
+        fn token_args(issuer: &IdentityKeyPair) -> TokenCreateArgs {
+            TokenCreateArgs {
+                cluster_id: Some("cluster-a".to_string()),
+                issuer_key_id: "root".to_string(),
+                issuer_private_key_b64: Some(issuer.signing_key_b64()),
+                issuer_private_key_path: None,
+                role: "edge".to_string(),
+                tags: Vec::new(),
+                allowed_routes: Vec::new(),
+                ttl_seconds: 300,
+                bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+                control_plane_bootstrap_endpoints: Vec::new(),
+                signal_bootstrap_endpoints: Vec::new(),
+                stun_bootstrap_endpoints: Vec::new(),
+                relay_bootstrap_endpoints: Vec::new(),
+                allow_relay: false,
+                max_uses: Some(1),
+                unlimited_uses: false,
+            }
+        }
+
+        let issuer = IdentityKeyPair::generate();
+        let oversized_identifier = "x".repeat(MAX_TOKEN_IDENTIFIER_BYTES + 1);
+        let too_many_tags = (0..=MAX_JOIN_TOKEN_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        let cases = vec![
+            (
+                TokenCreateArgs {
+                    cluster_id: Some("bad/cluster".to_string()),
+                    ..token_args(&issuer)
+                },
+                "--cluster-id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    issuer_key_id: oversized_identifier,
+                    ..token_args(&issuer)
+                },
+                format!("--issuer-key-id exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes"),
+            ),
+            (
+                TokenCreateArgs {
+                    role: "edge role".to_string(),
+                    ..token_args(&issuer)
+                },
+                "--role must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    tags: vec!["edge/tag".to_string()],
+                    ..token_args(&issuer)
+                },
+                "--tag must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    tags: too_many_tags,
+                    ..token_args(&issuer)
+                },
+                format!("--tag may be repeated at most {MAX_JOIN_TOKEN_TAGS} times"),
+            ),
+            (
+                TokenCreateArgs {
+                    ttl_seconds: 0,
+                    ..token_args(&issuer)
+                },
+                "join token TTL must be greater than zero seconds".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    ttl_seconds: MAX_JOIN_TOKEN_TTL_SECONDS + 1,
+                    ..token_args(&issuer)
+                },
+                format!("join token TTL must not exceed {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let error = match create_token(args) {
+                Ok(token) => anyhow::bail!("unexpected valid token: {token:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(&expected),
+                "expected {expected}, got {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn init_rejects_invalid_default_token_claim_inputs() -> anyhow::Result<()> {
+        let error = match init(InitArgs {
+            default_role: "edge role".to_string(),
+            ..valid_init_args()
+        }) {
+            Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--role must contain only ASCII letters"));
         Ok(())
     }
 
