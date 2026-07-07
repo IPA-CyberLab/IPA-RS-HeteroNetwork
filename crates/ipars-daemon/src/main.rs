@@ -2402,7 +2402,7 @@ fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::
 
 #[cfg(unix)]
 fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = path
         .symlink_metadata()
@@ -2413,6 +2413,8 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
         "{label} at {} expected an executable regular file",
         path.display()
     );
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    ensure_runtime_path_owner_trusted(label, "at", path, metadata.uid(), effective_uid)?;
     anyhow::ensure!(
         mode & 0o022 == 0,
         "{label} at {} must not be group- or world-writable",
@@ -2427,7 +2429,7 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
     let parent_metadata = parent
         .metadata()
         .with_context(|| format!("failed to inspect parent directory {}", parent.display()))?;
-    ensure_runtime_parent_directory_safe(label, parent, &parent_metadata, true)?;
+    ensure_runtime_parent_directory_safe(label, parent, &parent_metadata, true, effective_uid)?;
     let mut ancestor = parent.parent();
     while let Some(directory) = ancestor {
         let metadata = directory.metadata().with_context(|| {
@@ -2436,7 +2438,7 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
                 directory.display()
             )
         })?;
-        ensure_runtime_parent_directory_safe(label, directory, &metadata, false)?;
+        ensure_runtime_parent_directory_safe(label, directory, &metadata, false, effective_uid)?;
         ancestor = directory.parent();
     }
     Ok(())
@@ -2448,8 +2450,9 @@ fn ensure_runtime_parent_directory_safe(
     directory: &Path,
     metadata: &std::fs::Metadata,
     immediate_parent: bool,
+    effective_uid: u32,
 ) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let relationship = if immediate_parent {
         "parent"
@@ -2461,6 +2464,13 @@ fn ensure_runtime_parent_directory_safe(
         "{label} {relationship} {} must be a directory",
         directory.display()
     );
+    ensure_runtime_path_owner_trusted(
+        label,
+        relationship,
+        directory,
+        metadata.uid(),
+        effective_uid,
+    )?;
     let mode = metadata.permissions().mode();
     if immediate_parent {
         anyhow::ensure!(
@@ -2475,6 +2485,22 @@ fn ensure_runtime_parent_directory_safe(
             directory.display()
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_runtime_path_owner_trusted(
+    label: &str,
+    relationship: &str,
+    path: &Path,
+    owner_uid: u32,
+    effective_uid: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        owner_uid == 0 || owner_uid == effective_uid,
+        "{label} {relationship} {} must be owned by root or the current effective user",
+        path.display()
+    );
     Ok(())
 }
 
@@ -17106,6 +17132,41 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(userspace_ancestor_error.to_string().contains("ancestor"));
 
         let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_rejects_untrusted_path_owners() -> anyhow::Result<()> {
+        let path = Path::new("/opt/ipars/bin/ip");
+        ensure_runtime_path_owner_trusted(
+            "required Linux runtime command `ip`",
+            "at",
+            path,
+            0,
+            1000,
+        )?;
+        ensure_runtime_path_owner_trusted(
+            "required Linux runtime command `ip`",
+            "parent",
+            path,
+            1000,
+            1000,
+        )?;
+
+        let error = match ensure_runtime_path_owner_trusted(
+            "required Linux runtime command `ip`",
+            "ancestor",
+            path,
+            1001,
+            1000,
+        ) {
+            Ok(()) => anyhow::bail!("unexpected successful untrusted owner preflight"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must be owned by root or the current effective user"));
         Ok(())
     }
 
