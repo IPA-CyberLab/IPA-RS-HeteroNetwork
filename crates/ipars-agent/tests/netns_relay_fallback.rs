@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{Duration as ChronoDuration, Utc};
 use ipars_agent::{RelayForwarderStats, RelaySessionState, UdpRelayFrameForwarder};
 use ipars_relay::{encode_relay_datagram, RelayTable, UdpRelay};
+use ipars_types::api::{RelayDataplaneDropReason, RelayDataplaneMetrics};
 use ipars_types::{NodeId, RelayCapability};
 use tokio::sync::RwLock;
 
@@ -99,9 +100,11 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
     let relay_ready = temp_file(format!("ipars-rf-relay-ready-{suffix}"));
     let peer_ready = temp_file(format!("ipars-rf-peer-ready-{suffix}"));
     let relay_stop = temp_file(format!("ipars-rf-relay-stop-{suffix}"));
+    let relay_metrics = temp_file(format!("ipars-rf-relay-metrics-{suffix}.json"));
     let relay_ready_str = relay_ready.to_string_lossy().into_owned();
     let peer_ready_str = peer_ready.to_string_lossy().into_owned();
     let relay_stop_str = relay_stop.to_string_lossy().into_owned();
+    let relay_metrics_str = relay_metrics.to_string_lossy().into_owned();
 
     let relay = spawn_child(
         &relay_namespace,
@@ -113,6 +116,7 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
             ("IPARS_RELAY_RIGHT_ADDR", "10.241.0.5:43000"),
             ("IPARS_RELAY_READY_FILE", relay_ready_str.as_str()),
             ("IPARS_RELAY_STOP_FILE", relay_stop_str.as_str()),
+            ("IPARS_RELAY_METRICS_FILE", relay_metrics_str.as_str()),
         ],
     )?;
     wait_for_file(&relay_ready)?;
@@ -150,10 +154,24 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
     assert_success("relay", relay_output)?;
     assert_success("peer", peer_output)?;
     assert_success("forwarder", forwarder_output)?;
+    let relay_metrics_snapshot: RelayDataplaneMetrics =
+        serde_json::from_slice(&fs::read(&relay_metrics)?)?;
+    assert_eq!(relay_metrics_snapshot.datagrams_received, 3);
+    assert_eq!(relay_metrics_snapshot.datagrams_forwarded, 2);
+    assert_eq!(relay_metrics_snapshot.datagrams_dropped, 1);
+    assert_eq!(
+        relay_metrics_snapshot
+            .drops_by_reason
+            .get(&RelayDataplaneDropReason::InvalidSessionCredential)
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
 
     let _ = fs::remove_file(relay_ready);
     let _ = fs::remove_file(peer_ready);
     let _ = fs::remove_file(relay_stop);
+    let _ = fs::remove_file(relay_metrics);
     Ok(())
 }
 
@@ -173,6 +191,9 @@ async fn run_relay() -> Result<(), Box<dyn std::error::Error>> {
     let right_addr = required_env("IPARS_RELAY_RIGHT_ADDR")?.parse::<SocketAddr>()?;
     let ready_file = PathBuf::from(required_env("IPARS_RELAY_READY_FILE")?);
     let stop_file = PathBuf::from(required_env("IPARS_RELAY_STOP_FILE")?);
+    let metrics_file = std::env::var("IPARS_RELAY_METRICS_FILE")
+        .ok()
+        .map(PathBuf::from);
 
     let relay = UdpRelay::bind(bind).await?;
     let mut table = RelayTable::default();
@@ -206,12 +227,17 @@ async fn run_relay() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     fs::write(&ready_file, b"ready")?;
+    let table_metrics = table.clone();
     let result =
         tokio::time::timeout(Duration::from_secs(10), relay.serve(table, shutdown_rx)).await;
     watcher.abort();
     match result {
         Ok(result) => result?,
         Err(_) => return Err("timed out waiting for relay stop file".into()),
+    }
+    if let Some(metrics_file) = metrics_file {
+        let metrics = table_metrics.read().await.dataplane_metrics();
+        fs::write(metrics_file, serde_json::to_vec(&metrics)?)?;
     }
     Ok(())
 }
