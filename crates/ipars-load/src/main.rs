@@ -1117,12 +1117,26 @@ impl LoadReport {
         }
         validate_daemon_manifest_socket_addr(manifest.relay_udp_addr, "relay UDP address")?;
         validate_daemon_manifest_socket_addr(manifest.stun_addr, "STUN address")?;
-        if manifest.relay_udp_addr == manifest.stun_addr {
-            bail!(
-                "daemon load scenario retained manifest reuses UDP socket {} for relay and STUN",
-                manifest.relay_udp_addr
-            );
-        }
+        validate_daemon_manifest_socket_addr(
+            manifest.stun_alternate_addr,
+            "STUN alternate address",
+        )?;
+        let mut seen_udp_endpoints = BTreeMap::new();
+        validate_daemon_manifest_unique_udp_endpoint(
+            manifest.relay_udp_addr,
+            "relay UDP address",
+            &mut seen_udp_endpoints,
+        )?;
+        validate_daemon_manifest_unique_udp_endpoint(
+            manifest.stun_addr,
+            "STUN address",
+            &mut seen_udp_endpoints,
+        )?;
+        validate_daemon_manifest_unique_udp_endpoint(
+            manifest.stun_alternate_addr,
+            "STUN alternate address",
+            &mut seen_udp_endpoints,
+        )?;
         if manifest.children.len() != self.daemon_processes {
             bail!(
                 "daemon load scenario retained manifest recorded {} child processes, expected {}",
@@ -1444,6 +1458,19 @@ fn validate_daemon_manifest_ip_addr(ip: IpAddr, label: &str) -> anyhow::Result<(
     };
     if unusable {
         bail!("daemon load scenario retained manifest {label} uses unusable IP address {ip}");
+    }
+    Ok(())
+}
+
+fn validate_daemon_manifest_unique_udp_endpoint(
+    addr: SocketAddr,
+    label: &'static str,
+    seen_udp_endpoints: &mut BTreeMap<SocketAddr, &'static str>,
+) -> anyhow::Result<()> {
+    if let Some(existing_label) = seen_udp_endpoints.insert(addr, label) {
+        bail!(
+            "daemon load scenario retained manifest duplicate UDP endpoint {addr} for {existing_label} and {label}"
+        );
     }
     Ok(())
 }
@@ -3220,6 +3247,7 @@ struct DaemonRuntimeManifest {
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_addr: SocketAddr,
+    stun_alternate_addr: SocketAddr,
     agent_urls: Vec<String>,
     keep_runtime_dir: bool,
     started_at: chrono::DateTime<Utc>,
@@ -3300,6 +3328,7 @@ struct DaemonRuntimeManifestSeed {
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_addr: SocketAddr,
+    stun_alternate_addr: SocketAddr,
     keep_runtime_dir: bool,
     started_at: chrono::DateTime<Utc>,
 }
@@ -3336,6 +3365,7 @@ impl DaemonRuntimeManifestSeed {
                 relay_http_url: self.relay_http_url.clone(),
                 relay_udp_addr: self.relay_udp_addr,
                 stun_addr: self.stun_addr,
+                stun_alternate_addr: self.stun_alternate_addr,
                 agent_urls: agent_urls.to_vec(),
                 keep_runtime_dir: self.keep_runtime_dir,
                 started_at: self.started_at,
@@ -3408,6 +3438,7 @@ impl DaemonProcessGroup {
         let relay_http_addr = reserve_tcp_addr().await?;
         let relay_udp_addr = reserve_udp_addr().await?;
         let stun_addr = reserve_udp_addr().await?;
+        let stun_alternate_addr = reserve_udp_addr().await?;
         let control_plane_urls = control_addrs
             .iter()
             .map(|addr| format!("http://{addr}"))
@@ -3439,6 +3470,7 @@ impl DaemonProcessGroup {
             relay_http_url: relay_http_url.clone(),
             relay_udp_addr,
             stun_addr,
+            stun_alternate_addr,
             keep_runtime_dir: options.keep_runtime_dir,
             started_at: Utc::now(),
         };
@@ -3533,13 +3565,10 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.children,
         )?;
+        let stun_args = daemon_stun_args(stun_addr, stun_alternate_addr);
         startup.children.push(spawn_iparsd(
             &manifest_seed.iparsd_binary.path,
-            &[
-                "stun".to_string(),
-                "--listen".to_string(),
-                stun_addr.to_string(),
-            ],
+            &stun_args,
             "stun",
             &runtime_dir,
         )?);
@@ -3879,6 +3908,16 @@ impl Drop for DaemonStartupGuard {
             }
         }
     }
+}
+
+fn daemon_stun_args(stun_addr: SocketAddr, stun_alternate_addr: SocketAddr) -> Vec<String> {
+    vec![
+        "stun".to_string(),
+        "--listen".to_string(),
+        stun_addr.to_string(),
+        "--alternate-listen".to_string(),
+        stun_alternate_addr.to_string(),
+    ]
 }
 
 struct DaemonChild {
@@ -6228,6 +6267,10 @@ mod tests {
         let retained_contents = std::fs::read_to_string(&retained_manifest_path)?;
         assert!(!retained_contents.contains(DAEMON_JOIN_TOKEN_FILE_SUFFIX));
         let retained_decoded: DaemonRuntimeManifest = serde_json::from_str(&retained_contents)?;
+        assert_ne!(
+            retained_decoded.stun_addr,
+            retained_decoded.stun_alternate_addr
+        );
         assert!(retained_decoded.children.iter().all(|child| {
             child.state == DaemonRuntimeManifestChildState::Exited
                 && child.exited_at.is_some()
@@ -7327,6 +7370,34 @@ mod tests {
         assert!(error.contains("duplicate HTTP endpoint"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut duplicated_manifest_udp_endpoint = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &duplicated_manifest_udp_endpoint,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        duplicated_manifest_udp_endpoint.daemon_runtime_dir = Some(runtime_dir.clone());
+        duplicated_manifest_udp_endpoint.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.stun_alternate_addr = manifest.stun_addr;
+        })?;
+        let error = match duplicated_manifest_udp_endpoint.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with duplicate STUN UDP endpoints should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate UDP endpoint"));
+        assert!(error.contains("STUN alternate address"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut unusable_manifest_socket = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &unusable_manifest_socket,
@@ -7916,6 +7987,25 @@ mod tests {
 
         std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn daemon_stun_args_enable_rfc5780_alternate_listener() {
+        let stun_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34_780);
+        let stun_alternate_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34_781);
+
+        let args = daemon_stun_args(stun_addr, stun_alternate_addr);
+
+        assert_eq!(
+            args,
+            vec![
+                "stun".to_string(),
+                "--listen".to_string(),
+                "127.0.0.1:34780".to_string(),
+                "--alternate-listen".to_string(),
+                "127.0.0.1:34781".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -9215,6 +9305,7 @@ mod tests {
             relay_http_url: "http://127.0.0.1:31003".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
+            stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31007),
             keep_runtime_dir: true,
             started_at: Utc::now(),
         }
@@ -9236,6 +9327,7 @@ mod tests {
             relay_http_url: "http://127.0.0.1:31003".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
+            stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31007),
             agent_urls: vec!["http://127.0.0.1:31006".to_string()],
             keep_runtime_dir: true,
             started_at: now,
@@ -9373,6 +9465,7 @@ mod tests {
             relay_http_url: "http://127.0.0.1:32001".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_002),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_003),
+            stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_004),
             agent_urls: (0..report.daemon_agent_processes)
                 .map(|index| format!("http://127.0.0.1:33{index:03}"))
                 .collect(),
