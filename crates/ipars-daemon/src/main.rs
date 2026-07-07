@@ -20043,11 +20043,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             let routes = agent_requested_routes(&args, node_id.clone()).await?;
 
             assert_eq!(routes.len(), 2);
-            assert_eq!(routes[0].id, "k8s-0");
+            assert_eq!(routes[0].id, "k8s-v4-10-0-0-1-32");
             assert_eq!(routes[0].cidr, "10.0.0.1/32".parse::<ipnet::IpNet>()?);
             assert_eq!(routes[0].advertised_by, node_id);
             assert_eq!(routes[0].via, Some(NodeId::from_string("route-provider-a")));
-            assert_eq!(routes[1].id, "k8s-1");
+            assert_eq!(routes[1].id, "k8s-v4-10-96-0-0-12");
             assert_eq!(routes[1].cidr, "10.96.0.0/12".parse::<ipnet::IpNet>()?);
             return Ok(());
         }

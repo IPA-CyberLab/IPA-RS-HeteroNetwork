@@ -761,22 +761,24 @@ fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
 }
 
 pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
-    let mut routes = Vec::new();
-    for (index, cidr) in intent
+    let mut cidrs = intent
         .api_server_cidrs
         .into_iter()
         .chain(intent.service_cidrs)
-        .enumerate()
-    {
-        routes.push(Route {
-            id: format!("k8s-{index}"),
+        .collect::<Vec<_>>();
+    cidrs.sort();
+
+    let routes = cidrs
+        .into_iter()
+        .map(|cidr| Route {
+            id: kubernetes_route_id(&cidr),
             cidr,
             advertised_by: intent.route_provider.clone(),
             via: Some(intent.route_provider.clone()),
             metric: 50,
             tags: Default::default(),
-        });
-    }
+        })
+        .collect();
 
     RoutePlan {
         interface: intent.overlay_interface,
@@ -788,6 +790,37 @@ pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
             to: None,
             fwmark: None,
         }],
+    }
+}
+
+fn kubernetes_route_id(cidr: &IpNet) -> String {
+    match cidr {
+        IpNet::V4(network) => {
+            let octets = network.network().octets();
+            format!(
+                "k8s-v4-{}-{}-{}-{}-{}",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                network.prefix_len()
+            )
+        }
+        IpNet::V6(network) => {
+            let segments = network.network().segments();
+            format!(
+                "k8s-v6-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{}",
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                segments[4],
+                segments[5],
+                segments[6],
+                segments[7],
+                network.prefix_len()
+            )
+        }
     }
 }
 
@@ -2357,15 +2390,47 @@ mod tests {
 
         assert_eq!(plan.interface, "ipars0");
         assert_eq!(plan.routes.len(), 2);
-        assert_eq!(plan.routes[0].id, "k8s-0");
+        assert_eq!(plan.routes[0].id, "k8s-v4-10-0-0-1-32");
         assert_eq!(plan.routes[0].cidr, "10.0.0.1/32".parse::<IpNet>()?);
         assert_eq!(
             plan.routes[0].via,
             Some(NodeId::from_string("route-provider-a"))
         );
-        assert_eq!(plan.routes[1].id, "k8s-1");
+        assert_eq!(plan.routes[1].id, "k8s-v4-10-96-0-0-12");
         assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
         assert_eq!(plan.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_route_plan_uses_stable_cidr_derived_ids() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = kubernetes_route_plan(KubernetesUnderlayIntent {
+            node_name: "worker-a".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            api_server_cidrs: vec!["fd00:96::1/128".parse()?, "10.0.0.1/32".parse()?],
+            service_cidrs: vec!["10.96.0.0/12".parse()?],
+            route_provider: NodeId::from_string("route-provider-a"),
+        });
+
+        assert_eq!(
+            plan.routes
+                .iter()
+                .map(|route| route.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "k8s-v4-10-0-0-1-32",
+                "k8s-v4-10-96-0-0-12",
+                "k8s-v6-fd00-96-0-0-0-0-0-1-128",
+            ]
+        );
+        assert_eq!(plan.routes[0].cidr, "10.0.0.1/32".parse::<IpNet>()?);
+        assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        assert_eq!(plan.routes[2].cidr, "fd00:96::1/128".parse::<IpNet>()?);
+        assert!(plan.routes.iter().all(|route| {
+            route.advertised_by == NodeId::from_string("route-provider-a")
+                && route.via == Some(NodeId::from_string("route-provider-a"))
+        }));
         Ok(())
     }
 
@@ -2384,8 +2449,10 @@ mod tests {
             .await?;
 
         assert_eq!(plan.routes.len(), 2);
-        assert_eq!(plan.routes[0].cidr, "10.96.0.1/32".parse::<IpNet>()?);
-        assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        assert_eq!(plan.routes[0].id, "k8s-v4-10-96-0-0-12");
+        assert_eq!(plan.routes[0].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        assert_eq!(plan.routes[1].id, "k8s-v4-10-96-0-1-32");
+        assert_eq!(plan.routes[1].cidr, "10.96.0.1/32".parse::<IpNet>()?);
         Ok(())
     }
 
