@@ -538,6 +538,7 @@ pub struct AgentRuntime {
     packet_flow_application_vxlan_count: AtomicU64,
     packet_flow_application_geneve_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
+    packet_flow_application_openvpn_count: AtomicU64,
     packet_flow_application_icmp_count: AtomicU64,
 }
 
@@ -1181,6 +1182,7 @@ impl AgentRuntime {
             packet_flow_application_vxlan_count: AtomicU64::new(0),
             packet_flow_application_geneve_count: AtomicU64::new(0),
             packet_flow_application_wireguard_count: AtomicU64::new(0),
+            packet_flow_application_openvpn_count: AtomicU64::new(0),
             packet_flow_application_icmp_count: AtomicU64::new(0),
         }
     }
@@ -1954,6 +1956,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Vxlan => &self.packet_flow_application_vxlan_count,
             AgentPacketFlowApplication::Geneve => &self.packet_flow_application_geneve_count,
             AgentPacketFlowApplication::WireGuard => &self.packet_flow_application_wireguard_count,
+            AgentPacketFlowApplication::OpenVpn => &self.packet_flow_application_openvpn_count,
             AgentPacketFlowApplication::Icmp => &self.packet_flow_application_icmp_count,
         }
     }
@@ -6280,6 +6283,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(geneve_match.peer, peer_b_id);
+        let openvpn_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 77)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(1194),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(openvpn_match.peer, peer_b_id);
         let ike_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 61)),
@@ -6991,8 +7008,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 55);
-        assert_eq!(metrics.packet_flow_match_count, 53);
+        assert_eq!(metrics.packet_flow_observation_count, 56);
+        assert_eq!(metrics.packet_flow_match_count, 54);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -7004,7 +7021,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            53
+            54
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -7030,6 +7047,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Gre), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Vxlan), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Geneve), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::OpenVpn), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
         assert_eq!(
             application_count(AgentPacketFlowApplication::IparsControlPlane),

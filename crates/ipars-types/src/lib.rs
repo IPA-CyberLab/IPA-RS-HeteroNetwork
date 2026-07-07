@@ -1809,11 +1809,13 @@ pub mod api {
         Vxlan,
         Geneve,
         WireGuard,
+        #[serde(alias = "openvpn")]
+        OpenVpn,
         Icmp,
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 70] = [
+        pub const ALL: [Self; 71] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1883,6 +1885,7 @@ pub mod api {
             Self::Vxlan,
             Self::Geneve,
             Self::WireGuard,
+            Self::OpenVpn,
             Self::Icmp,
         ];
 
@@ -1957,6 +1960,7 @@ pub mod api {
                 Self::Vxlan => "vxlan",
                 Self::Geneve => "geneve",
                 Self::WireGuard => "wireguard",
+                Self::OpenVpn => "openvpn",
                 Self::Icmp => "icmp",
             }
         }
@@ -2120,6 +2124,14 @@ pub mod api {
             }
             if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
                 return AgentPacketFlowApplication::WireGuard;
+            }
+            if self.involves_port(1194)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::OpenVpn;
             }
             if self.involves_port(8443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::IparsControlPlane;
@@ -2692,6 +2704,7 @@ pub mod api {
             | AgentPacketFlowApplication::Ntp
             | AgentPacketFlowApplication::Radius
             | AgentPacketFlowApplication::Memcached
+            | AgentPacketFlowApplication::OpenVpn
             | AgentPacketFlowApplication::IparsRelay => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3941,6 +3954,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Bgp);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"openvpn")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ovpn")
+        {
+            return Some(AgentPacketFlowApplication::OpenVpn);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -4240,6 +4258,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"bgp") || protocol.eq_ignore_ascii_case(b"bgp4") {
             return Some(AgentPacketFlowApplication::Bgp);
+        }
+        if protocol.eq_ignore_ascii_case(b"openvpn") || protocol.eq_ignore_ascii_case(b"ovpn") {
+            return Some(AgentPacketFlowApplication::OpenVpn);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -9912,6 +9933,26 @@ mod tests {
         };
         assert_eq!(rsync.application(), api::AgentPacketFlowApplication::Rsync);
 
+        let openvpn_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1194),
+            ..Default::default()
+        };
+        assert_eq!(
+            openvpn_udp.application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+
+        let openvpn_tcp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1194),
+            ..Default::default()
+        };
+        assert_eq!(
+            openvpn_tcp.application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+
         let smtp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(587),
@@ -11839,6 +11880,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Bgp,
             ),
             (
+                "openvpn-access.vpn.svc",
+                api::AgentPacketFlowApplication::OpenVpn,
+            ),
+            (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
@@ -12014,6 +12059,10 @@ mod tests {
             (
                 &[b"bgp".as_slice()][..],
                 api::AgentPacketFlowApplication::Bgp,
+            ),
+            (
+                &[b"openvpn".as_slice()][..],
+                api::AgentPacketFlowApplication::OpenVpn,
             ),
         ] {
             assert_eq!(
@@ -13721,6 +13770,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint geneve requires UDP protocol"));
+
+        let udp_openvpn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"openvpn"}"#)?;
+        udp_openvpn_hint.validate_transport_metadata()?;
+
+        let tcp_openvpn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"open_vpn"}"#)?;
+        tcp_openvpn_hint.validate_transport_metadata()?;
+
+        let gre_openvpn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"openvpn"}"#)?;
+        let error = match gre_openvpn_hint.validate_transport_metadata() {
+            Ok(()) => return Err("GRE OpenVPN hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint openvpn requires TCP or UDP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
