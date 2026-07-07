@@ -47,6 +47,9 @@ const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
 const DAEMON_CONTROL_PLANE_SQLITE_FILE: &str = "control-plane.sqlite";
 const DAEMON_JOIN_TOKEN_FILE_SUFFIX: &str = ".join-token.json";
 const DAEMON_AGENT_STATE_FILE_SUFFIX: &str = ".state.json";
+const DAEMON_REDACTED_ARG: &str = "<redacted>";
+const MAX_DAEMON_REDACTED_ARG_BYTES: usize = 4096;
+const MAX_DAEMON_REDACTED_ARG_COUNT: usize = 256;
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 const MAX_DAEMON_READINESS_TIMEOUT_SECONDS: u64 = 3_600;
@@ -1141,6 +1144,7 @@ impl LoadReport {
         let mut previous_log_serial = None;
         for child in &manifest.children {
             child_roles.push(child.role.clone());
+            validate_daemon_manifest_child_command(child, &manifest.iparsd_binary.path)?;
             let Some(log_path) = &child.log_path else {
                 bail!(
                     "daemon load scenario retained manifest child {} is missing log path",
@@ -3257,6 +3261,8 @@ struct DaemonBinaryIdentity {
 struct DaemonRuntimeManifestChild {
     role: String,
     pid: Option<u32>,
+    redacted_argv: Vec<String>,
+    redacted_argv_sha256: String,
     log_path: Option<PathBuf>,
     log_bytes: Option<u64>,
     log_tail_sha256: Option<String>,
@@ -3348,6 +3354,8 @@ impl DaemonRuntimeManifestChild {
         Self {
             role: child.role.clone(),
             pid: Some(child.child.id()),
+            redacted_argv: child.redacted_argv.clone(),
+            redacted_argv_sha256: child.redacted_argv_sha256.clone(),
             log_path: child.log_path.clone(),
             log_bytes: diagnostics.as_ref().map(|diagnostics| diagnostics.bytes),
             log_tail_sha256: diagnostics.map(|diagnostics| diagnostics.tail_sha256),
@@ -3856,6 +3864,8 @@ impl Drop for DaemonStartupGuard {
 struct DaemonChild {
     role: String,
     child: Child,
+    redacted_argv: Vec<String>,
+    redacted_argv_sha256: String,
     log_path: Option<PathBuf>,
     last_exit: Option<DaemonChildExit>,
 }
@@ -3873,6 +3883,8 @@ fn spawn_iparsd(
     runtime_dir: &Path,
 ) -> anyhow::Result<DaemonChild> {
     let log_path = daemon_child_log_path(runtime_dir, role);
+    let redacted_argv = redacted_daemon_argv(iparsd_bin, args);
+    let redacted_argv_sha256 = daemon_argv_sha256(&redacted_argv);
     let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -3902,6 +3914,8 @@ fn spawn_iparsd(
     Ok(DaemonChild {
         role: role.to_string(),
         child,
+        redacted_argv,
+        redacted_argv_sha256,
         log_path: Some(log_path),
         last_exit: None,
     })
@@ -4205,6 +4219,180 @@ fn validate_daemon_manifest_iparsd_binary(identity: &DaemonBinaryIdentity) -> an
         );
     }
     Ok(())
+}
+
+fn validate_daemon_manifest_child_command(
+    child: &DaemonRuntimeManifestChild,
+    iparsd_binary: &Path,
+) -> anyhow::Result<()> {
+    if child.redacted_argv.is_empty() {
+        bail!(
+            "daemon load scenario retained manifest child {} is missing redacted argv",
+            child.role
+        );
+    }
+    if child.redacted_argv.len() > MAX_DAEMON_REDACTED_ARG_COUNT {
+        bail!(
+            "daemon load scenario retained manifest child {} recorded {} argv entries, max {}",
+            child.role,
+            child.redacted_argv.len(),
+            MAX_DAEMON_REDACTED_ARG_COUNT
+        );
+    }
+    let expected_binary = iparsd_binary.display().to_string();
+    if child.redacted_argv.first() != Some(&expected_binary) {
+        bail!(
+            "daemon load scenario retained manifest child {} argv binary {:?} does not match manifest iparsd binary {}",
+            child.role,
+            child.redacted_argv.first(),
+            expected_binary
+        );
+    }
+    let expected_subcommand = expected_daemon_subcommand_for_child_role(&child.role)?;
+    if child.redacted_argv.get(1).map(String::as_str) != Some(expected_subcommand) {
+        bail!(
+            "daemon load scenario retained manifest child {} argv subcommand {:?} does not match expected {}",
+            child.role,
+            child.redacted_argv.get(1),
+            expected_subcommand
+        );
+    }
+    for argument in &child.redacted_argv {
+        validate_daemon_redacted_arg_text(&child.role, argument)?;
+    }
+    validate_redacted_daemon_argv_secrets(&child.role, &child.redacted_argv)?;
+    let expected_sha256 = daemon_argv_sha256(&child.redacted_argv);
+    if child.redacted_argv_sha256 != expected_sha256 {
+        bail!(
+            "daemon load scenario retained manifest child {} redacted argv hash mismatch: {}/{}",
+            child.role,
+            child.redacted_argv_sha256,
+            expected_sha256
+        );
+    }
+    Ok(())
+}
+
+fn expected_daemon_subcommand_for_child_role(role: &str) -> anyhow::Result<&'static str> {
+    if role.starts_with("control-plane-") {
+        return Ok("control-plane");
+    }
+    match role {
+        "signal" => Ok("signal"),
+        "relay" => Ok("relay"),
+        "stun" => Ok("stun"),
+        "agent" => Ok("agent"),
+        _ => bail!(
+            "daemon load scenario retained manifest child role {role} has no expected iparsd subcommand"
+        ),
+    }
+}
+
+fn validate_daemon_redacted_arg_text(child_role: &str, argument: &str) -> anyhow::Result<()> {
+    if argument.is_empty() {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} contains an empty argv entry"
+        );
+    }
+    if argument.len() > MAX_DAEMON_REDACTED_ARG_BYTES {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} argv entry is {} bytes, max {}",
+            argument.len(),
+            MAX_DAEMON_REDACTED_ARG_BYTES
+        );
+    }
+    if argument
+        .chars()
+        .any(|ch| ch == '\0' || (ch.is_control() && ch != '\t'))
+    {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} argv entry contains control characters"
+        );
+    }
+    Ok(())
+}
+
+fn validate_redacted_daemon_argv_secrets(child_role: &str, argv: &[String]) -> anyhow::Result<()> {
+    let mut redact_next_for: Option<&str> = None;
+    for argument in argv.iter().skip(1) {
+        if let Some(flag) = redact_next_for.take() {
+            if argument != DAEMON_REDACTED_ARG {
+                bail!(
+                    "daemon load scenario retained manifest child {child_role} argv flag {flag} did not redact its value"
+                );
+            }
+            continue;
+        }
+        if let Some((flag, value)) = argument.split_once('=') {
+            if is_sensitive_daemon_arg_name(flag) && value != DAEMON_REDACTED_ARG {
+                bail!(
+                    "daemon load scenario retained manifest child {child_role} argv flag {flag} did not redact its inline value"
+                );
+            }
+            continue;
+        }
+        if is_sensitive_daemon_arg_name(argument) {
+            redact_next_for = Some(argument);
+        }
+    }
+    if let Some(flag) = redact_next_for {
+        bail!(
+            "daemon load scenario retained manifest child {child_role} argv flag {flag} is missing its redacted value"
+        );
+    }
+    Ok(())
+}
+
+fn redacted_daemon_argv(iparsd_bin: &Path, args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(iparsd_bin.display().to_string());
+    let mut redact_next = false;
+    for argument in args {
+        if redact_next {
+            argv.push(DAEMON_REDACTED_ARG.to_string());
+            redact_next = false;
+            continue;
+        }
+        if let Some((flag, _value)) = argument.split_once('=') {
+            if is_sensitive_daemon_arg_name(flag) {
+                argv.push(format!("{flag}={DAEMON_REDACTED_ARG}"));
+            } else {
+                argv.push(argument.clone());
+            }
+            continue;
+        }
+        if is_sensitive_daemon_arg_name(argument) {
+            argv.push(argument.clone());
+            redact_next = true;
+        } else {
+            argv.push(argument.clone());
+        }
+    }
+    argv
+}
+
+fn is_sensitive_daemon_arg_name(argument: &str) -> bool {
+    let name = argument
+        .trim_start_matches('-')
+        .split_once('=')
+        .map_or(argument.trim_start_matches('-'), |(name, _value)| name)
+        .to_ascii_lowercase();
+    name.contains("token")
+        || name.contains("private-key")
+        || name.contains("bearer")
+        || name.contains("password")
+        || name.contains("secret")
+        || name == "database-url"
+        || name.ends_with("-database-url")
+}
+
+fn daemon_argv_sha256(argv: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for argument in argv {
+        hasher.update((argument.len() as u64).to_le_bytes());
+        hasher.update(argument.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn daemon_file_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
@@ -5925,8 +6113,24 @@ mod tests {
                 ],
             )?;
         retained_manifest.daemon_runtime_dir = Some(retained_runtime_dir.clone());
-        retained_manifest.daemon_runtime_manifest = Some(retained_manifest_path);
+        retained_manifest.daemon_runtime_manifest = Some(retained_manifest_path.clone());
         retained_manifest.validate_success()?;
+        let retained_contents = std::fs::read_to_string(&retained_manifest_path)?;
+        assert!(!retained_contents.contains(DAEMON_JOIN_TOKEN_FILE_SUFFIX));
+        let retained_decoded: DaemonRuntimeManifest = serde_json::from_str(&retained_contents)?;
+        let agent_command = retained_decoded
+            .children
+            .iter()
+            .find(|child| child.role == "agent")
+            .context("synthetic retained manifest did not include an agent child")?;
+        assert!(agent_command
+            .redacted_argv
+            .windows(2)
+            .any(|window| window[0] == "--join-token-path" && window[1] == DAEMON_REDACTED_ARG));
+        assert_eq!(
+            agent_command.redacted_argv_sha256,
+            daemon_argv_sha256(&agent_command.redacted_argv)
+        );
 
         let mut mismatched_iparsd_binary_digest = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
@@ -5977,6 +6181,70 @@ mod tests {
         };
         assert!(error.contains("iparsd binary path"));
         assert!(error.contains("not absolute"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut unredacted_child_secret = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &unredacted_child_secret,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        unredacted_child_secret.daemon_runtime_dir = Some(runtime_dir.clone());
+        unredacted_child_secret.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(agent) = manifest
+                .children
+                .iter_mut()
+                .find(|child| child.role == "agent")
+            {
+                if let Some(index) = agent
+                    .redacted_argv
+                    .iter()
+                    .position(|argument| argument == "--join-token-path")
+                {
+                    agent.redacted_argv[index + 1] =
+                        "/tmp/ipars-load-agent-0000.join-token.json".to_string();
+                    agent.redacted_argv_sha256 = daemon_argv_sha256(&agent.redacted_argv);
+                }
+            }
+        })?;
+        let error = match unredacted_child_secret.validate_success() {
+            Ok(_) => bail!("retained manifest with unredacted child argv should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("did not redact"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut mismatched_child_argv_hash = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_child_argv_hash,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_child_argv_hash.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_child_argv_hash.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[0].redacted_argv_sha256 = "0".repeat(64);
+        })?;
+        let error = match mismatched_child_argv_hash.validate_success() {
+            Ok(_) => bail!("retained manifest with mismatched child argv hash should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("redacted argv hash mismatch"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         std::fs::write(
@@ -6167,10 +6435,16 @@ mod tests {
             .context("renamed signal log was unreadable")?;
         mutate_retained_daemon_manifest(&manifest_path, |manifest| {
             manifest.children[2].role = "relay".to_string();
+            manifest.children[2].redacted_argv = synthetic_child_redacted_argv("relay");
+            manifest.children[2].redacted_argv_sha256 =
+                synthetic_child_redacted_argv_sha256("relay");
             manifest.children[2].log_path = Some(relay_log_path);
             manifest.children[2].log_bytes = Some(relay_log_diagnostics.bytes);
             manifest.children[2].log_tail_sha256 = Some(relay_log_diagnostics.tail_sha256);
             manifest.children[3].role = "signal".to_string();
+            manifest.children[3].redacted_argv = synthetic_child_redacted_argv("signal");
+            manifest.children[3].redacted_argv_sha256 =
+                synthetic_child_redacted_argv_sha256("signal");
             manifest.children[3].log_path = Some(signal_log_path);
             manifest.children[3].log_bytes = Some(signal_log_diagnostics.bytes);
             manifest.children[3].log_tail_sha256 = Some(signal_log_diagnostics.tail_sha256);
@@ -6680,6 +6954,8 @@ mod tests {
                 .find(|child| child.role == "relay")
             {
                 relay.role = "agent".to_string();
+                relay.redacted_argv = synthetic_child_redacted_argv("agent");
+                relay.redacted_argv_sha256 = synthetic_child_redacted_argv_sha256("agent");
                 relay.log_path = Some(relabeled_relay_log_path);
             }
         })?;
@@ -7422,6 +7698,8 @@ mod tests {
         group.children.push(DaemonChild {
             role: "agent".to_string(),
             child,
+            redacted_argv: synthetic_child_redacted_argv("agent"),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256("agent"),
             log_path: Some(log_path),
             last_exit: None,
         });
@@ -7646,6 +7924,14 @@ mod tests {
         assert_eq!(decoded.children.len(), 1);
         assert_eq!(decoded.children[0].role, "control-plane-0");
         assert_eq!(decoded.children[0].pid, Some(4242));
+        assert_eq!(
+            decoded.children[0].redacted_argv,
+            synthetic_child_redacted_argv("control-plane-0")
+        );
+        assert_eq!(
+            decoded.children[0].redacted_argv_sha256,
+            synthetic_child_redacted_argv_sha256("control-plane-0")
+        );
         assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
         assert_eq!(
             decoded.children[0].log_bytes,
@@ -7699,6 +7985,8 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "signal".to_string(),
             child,
+            redacted_argv: synthetic_child_redacted_argv("signal"),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256("signal"),
             log_path: Some(log_path.clone()),
             last_exit: None,
         }];
@@ -7721,6 +8009,14 @@ mod tests {
         assert_eq!(updated.children.len(), 1);
         assert_eq!(updated.children[0].role, "signal");
         assert_eq!(updated.children[0].pid, Some(pid));
+        assert_eq!(
+            updated.children[0].redacted_argv,
+            synthetic_child_redacted_argv("signal")
+        );
+        assert_eq!(
+            updated.children[0].redacted_argv_sha256,
+            synthetic_child_redacted_argv_sha256("signal")
+        );
         assert_eq!(updated.children[0].log_path.as_ref(), Some(&log_path));
         assert_eq!(
             updated.children[0].log_bytes,
@@ -7763,6 +8059,8 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "agent".to_string(),
             child,
+            redacted_argv: synthetic_child_redacted_argv("agent"),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256("agent"),
             log_path: Some(log_path.clone()),
             last_exit: Some(DaemonChildExit {
                 status: "exit status: 11".to_string(),
@@ -7787,6 +8085,14 @@ mod tests {
         assert_eq!(decoded.children.len(), 1);
         assert_eq!(decoded.children[0].role, "agent");
         assert_eq!(decoded.children[0].pid, Some(pid));
+        assert_eq!(
+            decoded.children[0].redacted_argv,
+            synthetic_child_redacted_argv("agent")
+        );
+        assert_eq!(
+            decoded.children[0].redacted_argv_sha256,
+            synthetic_child_redacted_argv_sha256("agent")
+        );
         assert_eq!(decoded.children[0].log_path.as_ref(), Some(&log_path));
         assert_eq!(
             decoded.children[0].log_bytes,
@@ -7964,6 +8270,8 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "synthetic".to_string(),
             child,
+            redacted_argv: synthetic_child_redacted_argv("synthetic"),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256("synthetic"),
             log_path: Some(log_path.clone()),
             last_exit: None,
         }];
@@ -8045,6 +8353,50 @@ mod tests {
         let _ = child.child.kill();
         let _ = child.child.wait();
         std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_command_redaction_covers_secret_like_arguments() -> anyhow::Result<()> {
+        let argv = redacted_daemon_argv(
+            Path::new("/opt/ipars/bin/iparsd"),
+            &[
+                "agent".to_string(),
+                "--join-token".to_string(),
+                "signed-token-material".to_string(),
+                "--database-url=postgres://user:password@example.internal/ipars".to_string(),
+                "--relay-admission-bearer-token".to_string(),
+                "relay-secret".to_string(),
+                "--issuer-public-key".to_string(),
+                "public-key-material".to_string(),
+            ],
+        );
+
+        assert!(argv.contains(&DAEMON_REDACTED_ARG.to_string()));
+        assert!(argv.contains(&format!("--database-url={DAEMON_REDACTED_ARG}")));
+        assert!(!argv
+            .iter()
+            .any(|argument| argument.contains("signed-token")));
+        assert!(!argv.iter().any(|argument| argument.contains("password")));
+        assert!(!argv
+            .iter()
+            .any(|argument| argument.contains("relay-secret")));
+        assert!(argv
+            .iter()
+            .any(|argument| argument == "public-key-material"));
+        let child = DaemonRuntimeManifestChild {
+            role: "agent".to_string(),
+            pid: Some(42),
+            redacted_argv_sha256: daemon_argv_sha256(&argv),
+            redacted_argv: argv,
+            log_path: None,
+            log_bytes: None,
+            log_tail_sha256: None,
+            state: DaemonRuntimeManifestChildState::Running,
+            exit_status: None,
+            exit_code: None,
+        };
+        validate_daemon_manifest_child_command(&child, Path::new("/opt/ipars/bin/iparsd"))?;
         Ok(())
     }
 
@@ -8595,6 +8947,8 @@ mod tests {
         Ok(DaemonChild {
             role: role.to_string(),
             child,
+            redacted_argv: synthetic_child_redacted_argv(role),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256(role),
             log_path: Some(log_path),
             last_exit: None,
         })
@@ -8618,6 +8972,32 @@ mod tests {
                 }
             })
             .clone()
+    }
+
+    fn synthetic_child_redacted_argv(role: &str) -> Vec<String> {
+        let binary = synthetic_daemon_binary_identity()
+            .path
+            .display()
+            .to_string();
+        let subcommand = if role.starts_with("control-plane-") {
+            "control-plane"
+        } else {
+            role
+        };
+        let mut argv = vec![binary, subcommand.to_string()];
+        if role == "agent" {
+            argv.extend([
+                "--join-token-path".to_string(),
+                DAEMON_REDACTED_ARG.to_string(),
+                "--state-path".to_string(),
+                "/tmp/ipars-load-agent.state.json".to_string(),
+            ]);
+        }
+        argv
+    }
+
+    fn synthetic_child_redacted_argv_sha256(role: &str) -> String {
+        daemon_argv_sha256(&synthetic_child_redacted_argv(role))
     }
 
     fn synthetic_daemon_group(runtime_dir: PathBuf, keep_runtime_dir: bool) -> DaemonProcessGroup {
@@ -8675,6 +9055,8 @@ mod tests {
             children: vec![DaemonRuntimeManifestChild {
                 role: "control-plane-0".to_string(),
                 pid: Some(4242),
+                redacted_argv: synthetic_child_redacted_argv("control-plane-0"),
+                redacted_argv_sha256: synthetic_child_redacted_argv_sha256("control-plane-0"),
                 log_path: Some(log_path),
                 log_bytes: log_diagnostics
                     .as_ref()
@@ -8842,6 +9224,8 @@ mod tests {
         Ok(DaemonRuntimeManifestChild {
             role: role.to_string(),
             pid: Some(40_000 + index as u32),
+            redacted_argv: synthetic_child_redacted_argv(role),
+            redacted_argv_sha256: synthetic_child_redacted_argv_sha256(role),
             log_path: Some(log_path),
             log_bytes: Some(log_diagnostics.bytes),
             log_tail_sha256: Some(log_diagnostics.tail_sha256),
