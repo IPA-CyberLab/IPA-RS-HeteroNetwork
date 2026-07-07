@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
+    Route, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -158,6 +158,25 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(())
     }
 
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -243,6 +262,37 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_string(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
 
@@ -528,6 +578,25 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         Ok(())
     }
 
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut node = self
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -613,6 +682,37 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES ($1, $2, $3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_value(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
 
@@ -925,11 +1025,20 @@ mod tests {
             updated_at: Utc::now(),
             pinned: false,
         };
+        let remote_reported_path = PathRecord {
+            key: PeerPathKey::new(remote.node_id.clone(), local.node_id.clone()),
+            ..path.clone()
+        };
         store.upsert_path(path).await?;
+        store.upsert_path(remote_reported_path).await?;
 
         assert_eq!(store.get_node(&local.node_id).await?, Some(local.clone()));
         assert_eq!(store.list_nodes().await?.len(), 2);
-        assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 1);
+        assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 2);
+        store.replace_node_paths(&local.node_id, Vec::new()).await?;
+        let remaining_paths = store.list_paths_for(&local.node_id).await?;
+        assert_eq!(remaining_paths.len(), 1);
+        assert_eq!(remaining_paths[0].key.local, remote.node_id);
         store
             .update_node_candidates(&local.node_id, vec![candidate(local.node_id.as_str())])
             .await?;
@@ -953,6 +1062,36 @@ mod tests {
                 .relay_capability
                 .map(|capability| capability.active_sessions),
             Some(7)
+        );
+        store
+            .update_node_relay_capability(&local.node_id, None)
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .relay_capability,
+            None
+        );
+        let advertised_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        };
+        store
+            .update_node_routes(&local.node_id, vec![advertised_route.clone()])
+            .await?;
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .routes,
+            vec![advertised_route]
         );
         let rotated = store
             .rotate_node_wireguard_public_key(

@@ -1,13 +1,28 @@
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.acknowledgeHostNetwork" "value" .Values.networkPolicy.acknowledgeHostNetwork) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.agentApi.enabled" "value" .Values.networkPolicy.agentApi.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.relay.enabled" "value" .Values.networkPolicy.relay.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
 {{- $networkPolicyEnabled := .Values.networkPolicy.enabled -}}
+{{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentApiNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.agentApi.enabled -}}
 {{- $relayNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.relay.enabled -}}
 {{- if and (not $networkPolicyEnabled) (or .Values.networkPolicy.agentApi.enabled .Values.networkPolicy.relay.enabled) -}}
 {{- fail "networkPolicy.agentApi.enabled and networkPolicy.relay.enabled require networkPolicy.enabled=true" -}}
 {{- end -}}
+{{- if and (not $networkPolicyEnabled) .Values.networkPolicy.acknowledgeHostNetwork -}}
+{{- fail "networkPolicy.acknowledgeHostNetwork=true requires networkPolicy.enabled=true" -}}
+{{- end -}}
 {{- if and $networkPolicyEnabled (not (or .Values.networkPolicy.agentApi.enabled .Values.networkPolicy.relay.enabled)) -}}
 {{- fail "networkPolicy.enabled=true requires networkPolicy.agentApi.enabled=true or networkPolicy.relay.enabled=true" -}}
 {{- end -}}
-{{- if and $networkPolicyEnabled .Values.agent.hostNetwork (not .Values.networkPolicy.acknowledgeHostNetwork) -}}
+{{- if and $networkPolicyEnabled (ne $agentHostNetwork "true") .Values.networkPolicy.acknowledgeHostNetwork -}}
+{{- fail "networkPolicy.acknowledgeHostNetwork=true only applies when agent.hostNetwork=true" -}}
+{{- end -}}
+{{- if and $networkPolicyEnabled (eq $agentHostNetwork "true") (not .Values.networkPolicy.acknowledgeHostNetwork) -}}
 {{- fail "networkPolicy with agent.hostNetwork=true requires networkPolicy.acknowledgeHostNetwork=true because enforcement is CNI-dependent for host-networked pods" -}}
 {{- end -}}
 {{- if and $agentApiNetworkPolicyEnabled (not .Values.agent.apiService.enabled) -}}
@@ -16,6 +31,12 @@
 {{- if and $relayNetworkPolicyEnabled (not (and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled)) -}}
 {{- fail "networkPolicy.relay.enabled requires agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
+{{- if and (not $agentApiNetworkPolicyEnabled) (gt (len .Values.networkPolicy.agentApi.allowedCidrs) 0) -}}
+{{- fail "networkPolicy.agentApi.allowedCidrs require networkPolicy.enabled=true and networkPolicy.agentApi.enabled=true" -}}
+{{- end -}}
+{{- if and (not $relayNetworkPolicyEnabled) (gt (len .Values.networkPolicy.relay.allowedCidrs) 0) -}}
+{{- fail "networkPolicy.relay.allowedCidrs require networkPolicy.enabled=true and networkPolicy.relay.enabled=true" -}}
+{{- end -}}
 {{- if and $agentApiNetworkPolicyEnabled (eq (len .Values.networkPolicy.agentApi.allowedCidrs) 0) -}}
 {{- fail "networkPolicy.agentApi.allowedCidrs must contain at least one CIDR" -}}
 {{- end -}}
@@ -23,20 +44,28 @@
 {{- fail "networkPolicy.relay.allowedCidrs must contain at least one CIDR" -}}
 {{- end -}}
 {{- if $agentApiNetworkPolicyEnabled -}}
-{{- range .Values.networkPolicy.agentApi.allowedCidrs -}}
-{{- include "ipars.validateCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" .) -}}
+{{- $agentApiNetworkPolicyCidrSet := dict -}}
+{{- range $cidr := .Values.networkPolicy.agentApi.allowedCidrs -}}
+{{- $cidrValue := printf "%v" $cidr -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue) -}}
+{{- if hasKey $agentApiNetworkPolicyCidrSet $cidrValue -}}
+{{- fail (printf "networkPolicy.agentApi.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiNetworkPolicyCidrSet $cidrValue true -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "ipars.fullname" . }}-agent-api
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: agent
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress
   ingress:
@@ -47,26 +76,34 @@ spec:
 {{- end }}
       ports:
         - protocol: TCP
-          port: 9780
+          port: {{ .Values.agent.apiService.targetPort }}
 {{- end }}
 {{- if and $agentApiNetworkPolicyEnabled $relayNetworkPolicyEnabled }}
 ---
 {{- end }}
 {{- if $relayNetworkPolicyEnabled -}}
-{{- range .Values.networkPolicy.relay.allowedCidrs -}}
-{{- include "ipars.validateCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" .) -}}
+{{- $relayNetworkPolicyCidrSet := dict -}}
+{{- range $cidr := .Values.networkPolicy.relay.allowedCidrs -}}
+{{- $cidrValue := printf "%v" $cidr -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue) -}}
+{{- if hasKey $relayNetworkPolicyCidrSet $cidrValue -}}
+{{- fail (printf "networkPolicy.relay.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
+{{- end -}}
+{{- $_ := set $relayNetworkPolicyCidrSet $cidrValue true -}}
 {{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "ipars.fullname" . }}-relay
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: relay
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress
   ingress:
@@ -77,7 +114,7 @@ spec:
 {{- end }}
       ports:
         - protocol: UDP
-          port: {{ .Values.agent.relayService.udpPort }}
+          port: {{ .Values.agent.relayService.udpTargetPort }}
         - protocol: TCP
-          port: {{ .Values.agent.relayService.httpPort }}
+          port: {{ .Values.agent.relayService.httpTargetPort }}
 {{- end }}

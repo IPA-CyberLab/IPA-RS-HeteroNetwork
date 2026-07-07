@@ -1,27 +1,202 @@
+{{- include "ipars.validateChartMetadata" . -}}
 {{- if or (eq .Values.agent.joinTokenSecretName "") (gt (len .Values.agent.joinTokenSecretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.joinTokenSecretName)) -}}
 {{- fail "agent.joinTokenSecretName must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
 {{- if or (eq .Values.agent.joinTokenSecretKey "") (gt (len .Values.agent.joinTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.joinTokenSecretKey)) -}}
 {{- fail "agent.joinTokenSecretKey must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
-{{- $clusterUrlPattern := "^https?://[^/[:space:]][^[:space:]]*$" -}}
-{{- $hostPortPattern := "^([^[:space:]:]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$" -}}
+{{- $relayAdmissionBearerTokenSecretName := .Values.agent.relayAdmissionBearerTokenSecret.name -}}
+{{- $relayAdmissionBearerTokenSecretKey := .Values.agent.relayAdmissionBearerTokenSecret.key -}}
+{{- if and (eq $relayAdmissionBearerTokenSecretName "") (ne $relayAdmissionBearerTokenSecretKey "") -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.key requires agent.relayAdmissionBearerTokenSecret.name" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretName "") (eq $relayAdmissionBearerTokenSecretKey "") -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.name requires agent.relayAdmissionBearerTokenSecret.key" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretName "") (or (gt (len $relayAdmissionBearerTokenSecretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $relayAdmissionBearerTokenSecretName))) -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.name must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- if and (ne $relayAdmissionBearerTokenSecretKey "") (or (gt (len $relayAdmissionBearerTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" $relayAdmissionBearerTokenSecretKey))) -}}
+{{- fail "agent.relayAdmissionBearerTokenSecret.key must contain only ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- $imageRepository := printf "%v" .Values.image.repository -}}
+{{- $imageTag := printf "%v" .Values.image.tag -}}
+{{- $imagePullPolicy := printf "%v" .Values.image.pullPolicy -}}
 {{- $rbacCreate := printf "%v" .Values.rbac.create -}}
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
+{{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
 {{- $agentAllowPrivilegeEscalation := printf "%v" .Values.agent.securityContext.allowPrivilegeEscalation -}}
+{{- $agentReadOnlyRootFilesystem := printf "%v" .Values.agent.securityContext.readOnlyRootFilesystem -}}
+{{- $agentSeccompProfileType := .Values.agent.securityContext.seccompProfile.type -}}
+{{- $agentSeccompLocalhostProfile := .Values.agent.securityContext.seccompProfile.localhostProfile -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
+{{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
+{{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
+{{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
+{{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
+{{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
+{{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceAccount.create" "value" .Values.serviceAccount.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.automountServiceAccountToken" "value" .Values.agent.automountServiceAccountToken) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.privileged" "value" .Values.agent.privileged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.routeProvider" "value" .Values.agent.routeProvider) -}}
+{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
+{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- if hasKey .Values.serviceExposure "apiServer" -}}
+{{- fail "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs" -}}
+{{- end -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
+{{- if not .Values.serviceExposure.enabled -}}
+{{- if .Values.serviceExposure.discoverServices -}}
+{{- fail "serviceExposure.discoverServices requires serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.namespaces -}}
+{{- fail "serviceExposure.namespaces requires serviceExposure.enabled=true and serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.serviceLabelSelector -}}
+{{- fail "serviceExposure.serviceLabelSelector requires serviceExposure.enabled=true and serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- if .Values.serviceExposure.routeProviderNodeId -}}
+{{- fail "serviceExposure.routeProviderNodeId requires serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- end -}}
+{{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayForwarder.enabled" "value" .Values.agent.relayForwarder.enabled) -}}
+{{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
+{{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
+{{- $agentRelayForwarderCrashWindowSeconds := printf "%v" .Values.agent.relayForwarder.crashWindowSeconds -}}
+{{- $agentRelayForwarderMaxCrashesPerWindow := printf "%v" .Values.agent.relayForwarder.maxCrashesPerWindow -}}
+{{- $agentRelayForwarderCrashCooldownSeconds := printf "%v" .Values.agent.relayForwarder.crashCooldownSeconds -}}
 {{- $agentStateHostPath := .Values.agent.state.hostPath -}}
 {{- $agentStateHostPathType := .Values.agent.state.hostPathType -}}
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
 {{- $agentLivenessProbeEnabled := printf "%v" .Values.agent.probes.liveness.enabled -}}
 {{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
 {{- $absolutePathPattern := "^/[A-Za-z0-9._/@%+=:,/-]+$" -}}
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if not (or (eq $agentRouteBackend "command") (eq $agentRouteBackend "kernel-netlink")) -}}
+{{- fail "agent.routeBackend must be command or kernel-netlink" -}}
+{{- end -}}
+{{- if not (or (eq $agentPeerMapEnabled "true") (eq $agentPeerMapEnabled "false")) -}}
+{{- fail "agent.peerMap.enabled must be true or false" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds "max" 9223372036854775807) -}}
+{{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentPeerMapPollIntervalSeconds) 1) -}}
+{{- fail "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true" -}}
+{{- end -}}
+{{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
+{{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
+{{- end -}}
+{{- if or (lt $agentApiTargetPort 1) (gt $agentApiTargetPort 65535) -}}
+{{- fail "agent.apiService.targetPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if not (or (eq $agentRelayForwarderEnabled "true") (eq $agentRelayForwarderEnabled "false")) -}}
+{{- fail "agent.relayForwarder.enabled must be true or false" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds "max" 9223372036854775807) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow "max" 4294967295) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds "max" 9223372036854775807) -}}
+{{- if eq $agentRelayForwarderEnabled "true" -}}
+{{- if not (or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind) -}}
+{{- fail "agent.relayForwarder.enabled=true requires agent.relayForwarder.endpoint or agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.endpoint -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.endpoint" "value" .Values.agent.relayForwarder.endpoint) -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.bind -}}
+{{- if not .Values.agent.relayForwarder.wireguardEndpoint -}}
+{{- fail "agent.relayForwarder.wireguardEndpoint is required when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind) -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.wireguardEndpoint" "value" .Values.agent.relayForwarder.wireguardEndpoint) -}}
+{{- if and .Values.agent.relayForwarder.netns (or (gt (len .Values.agent.relayForwarder.netns) 64) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.relayForwarder.netns))) -}}
+{{- fail "agent.relayForwarder.netns must be a Linux network namespace name of 1-64 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderMaxSessions) 1 -}}
+{{- fail "agent.relayForwarder.maxSessions must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderRestartBackoffSeconds) 1 -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderCrashWindowSeconds) 1 -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderMaxCrashesPerWindow) 1 -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- if lt (int $agentRelayForwarderCrashCooldownSeconds) 1 -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds must be greater than zero when agent.relayForwarder.bind is set" -}}
+{{- end -}}
+{{- else -}}
+{{- if .Values.agent.relayForwarder.wireguardEndpoint -}}
+{{- fail "agent.relayForwarder.wireguardEndpoint requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if .Values.agent.relayForwarder.netns -}}
+{{- fail "agent.relayForwarder.netns requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxSessions "1024" -}}
+{{- fail "agent.relayForwarder.maxSessions requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderRestartBackoffSeconds "5" -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashWindowSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxCrashesPerWindow "3" -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashCooldownSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds requires agent.relayForwarder.bind" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind .Values.agent.relayForwarder.wireguardEndpoint .Values.agent.relayForwarder.netns -}}
+{{- fail "agent.relayForwarder endpoint, bind, wireguardEndpoint, and netns require agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxSessions "1024" -}}
+{{- fail "agent.relayForwarder.maxSessions requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderRestartBackoffSeconds "5" -}}
+{{- fail "agent.relayForwarder.restartBackoffSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashWindowSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashWindowSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderMaxCrashesPerWindow "3" -}}
+{{- fail "agent.relayForwarder.maxCrashesPerWindow requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- if ne $agentRelayForwarderCrashCooldownSeconds "60" -}}
+{{- fail "agent.relayForwarder.crashCooldownSeconds requires agent.relayForwarder.enabled=true" -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq $imageRepository "") (gt (len $imageRepository) 255) (not (regexMatch "^([a-z0-9]|[a-z0-9][a-z0-9._:/-]*[a-z0-9])$" $imageRepository)) (contains "@" $imageRepository) (contains "//" $imageRepository) (contains ":" (regexFind "[^/]+$" $imageRepository)) -}}
+{{- fail "image.repository must be a lowercase image repository path without tag or digest" -}}
+{{- end -}}
+{{- if and (contains ":" $imageRepository) (not (regexMatch "^[a-z0-9.-]+:[0-9]+/" $imageRepository)) -}}
+{{- fail "image.repository registry port must be numeric and appear before the first '/'" -}}
+{{- end -}}
+{{- if or (eq $imageTag "") (gt (len $imageTag) 128) (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" $imageTag)) -}}
+{{- fail "image.tag must be an image tag of 1-128 ASCII letters, digits, '_', '.', or '-'" -}}
+{{- end -}}
+{{- if not (or (eq $imagePullPolicy "Always") (eq $imagePullPolicy "IfNotPresent") (eq $imagePullPolicy "Never")) -}}
+{{- fail "image.pullPolicy must be Always, IfNotPresent, or Never" -}}
 {{- end -}}
 {{- $imagePullSecrets := dict -}}
 {{- range .Values.imagePullSecrets -}}
@@ -40,14 +215,18 @@
 {{- if not (or (eq $serviceAccountCreate "true") (eq $serviceAccountCreate "false")) -}}
 {{- fail "serviceAccount.create must be true or false" -}}
 {{- end -}}
+{{- if not (or (eq $agentHostNetwork "true") (eq $agentHostNetwork "false")) -}}
+{{- fail "agent.hostNetwork must be true or false" -}}
+{{- end -}}
 {{- if and .Values.serviceAccount.name (or (gt (len .Values.serviceAccount.name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.serviceAccount.name))) -}}
 {{- fail "serviceAccount.name must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
 {{- if and (eq $serviceAccountCreate "false") .Values.serviceAccount.annotations -}}
 {{- fail "serviceAccount.annotations require serviceAccount.create=true" -}}
 {{- end -}}
-{{- range $key, $_ := .Values.serviceAccount.annotations -}}
+{{- range $key, $value := .Values.serviceAccount.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "serviceAccount.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "serviceAccount.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
@@ -58,11 +237,29 @@
 {{- if not (or (eq $agentAllowPrivilegeEscalation "") (eq $agentAllowPrivilegeEscalation "true") (eq $agentAllowPrivilegeEscalation "false")) -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation must be true, false, or empty" -}}
 {{- end -}}
+{{- if not (or (eq $agentReadOnlyRootFilesystem "") (eq $agentReadOnlyRootFilesystem "true") (eq $agentReadOnlyRootFilesystem "false")) -}}
+{{- fail "agent.securityContext.readOnlyRootFilesystem must be true, false, or empty" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompProfileType "") (not (or (eq $agentSeccompProfileType "RuntimeDefault") (eq $agentSeccompProfileType "Localhost") (eq $agentSeccompProfileType "Unconfined"))) -}}
+{{- fail "agent.securityContext.seccompProfile.type must be RuntimeDefault, Localhost, Unconfined, or empty" -}}
+{{- end -}}
+{{- if and (eq $agentSeccompProfileType "Localhost") (eq $agentSeccompLocalhostProfile "") -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile is required when seccompProfile.type=Localhost" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompProfileType "Localhost") (ne $agentSeccompLocalhostProfile "") -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile requires seccompProfile.type=Localhost" -}}
+{{- end -}}
+{{- if and (ne $agentSeccompLocalhostProfile "") (or (gt (len $agentSeccompLocalhostProfile) 255) (regexMatch "^/" $agentSeccompLocalhostProfile) (regexMatch "/$" $agentSeccompLocalhostProfile) (regexMatch "(^|/)[.][.]($|/)" $agentSeccompLocalhostProfile) (regexMatch "//" $agentSeccompLocalhostProfile) (not (regexMatch "^[A-Za-z0-9._/@%+=:,-]+$" $agentSeccompLocalhostProfile))) -}}
+{{- fail "agent.securityContext.seccompProfile.localhostProfile must be a relative path without '..' segments, empty segments, or unsafe characters" -}}
+{{- end -}}
 {{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
 {{- end -}}
 {{- if not (or (eq $agentDnsPolicy "ClusterFirstWithHostNet") (eq $agentDnsPolicy "ClusterFirst") (eq $agentDnsPolicy "Default") (eq $agentDnsPolicy "None")) -}}
 {{- fail "agent.dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None" -}}
+{{- end -}}
+{{- if and (eq $agentHostNetwork "false") (eq $agentDnsPolicy "ClusterFirstWithHostNet") -}}
+{{- fail "agent.dnsPolicy=ClusterFirstWithHostNet requires agent.hostNetwork=true" -}}
 {{- end -}}
 {{- if or (eq $agentStateHostPath "") (gt (len $agentStateHostPath) 4096) (not (regexMatch $absolutePathPattern $agentStateHostPath)) (regexMatch "(^|/)[.][.]($|/)" $agentStateHostPath) (regexMatch "/$" $agentStateHostPath) -}}
 {{- fail "agent.state.hostPath must be an absolute host path without '..' segments or trailing '/'" -}}
@@ -88,10 +285,10 @@
 {{- $periodSeconds := printf "%v" $probe.periodSeconds -}}
 {{- $timeoutSeconds := printf "%v" $probe.timeoutSeconds -}}
 {{- $failureThreshold := printf "%v" $probe.failureThreshold -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds "max" 2147483647) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold "max" 2147483647) -}}
 {{- if lt (int $periodSeconds) 1 -}}
 {{- fail (printf "agent.probes.%s.periodSeconds must be greater than zero" $probeName) -}}
 {{- end -}}
@@ -112,8 +309,9 @@
 {{- include "ipars.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
 {{- include "ipars.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
 {{- end -}}
-{{- range $key, $_ := .Values.agent.podAnnotations -}}
+{{- range $key, $value := .Values.agent.podAnnotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.podAnnotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.podAnnotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- range $key, $value := .Values.agent.nodeSelector -}}
 {{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
@@ -145,7 +343,7 @@
 {{- end -}}
 {{- if hasKey $toleration "tolerationSeconds" -}}
 {{- $tolerationSeconds := printf "%v" $toleration.tolerationSeconds -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
 {{- if ne $tolerationEffect "NoExecute" -}}
 {{- fail (printf "%s.tolerationSeconds requires effect NoExecute" $path) -}}
 {{- end -}}
@@ -183,6 +381,9 @@
 {{- if and (eq $agentAllowPrivilegeEscalation "false") (or (hasKey $agentCapabilityAdds "SYS_ADMIN") (hasKey $agentCapabilityAdds "CAP_SYS_ADMIN")) -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used when SYS_ADMIN is added" -}}
 {{- end -}}
+{{- if and .Values.agent.relayForwarder.netns (eq $agentPrivileged "false") (not (or (hasKey $agentCapabilityAdds "ALL") (hasKey $agentCapabilityAdds "SYS_ADMIN") (hasKey $agentCapabilityAdds "CAP_SYS_ADMIN"))) -}}
+{{- fail "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" -}}
+{{- end -}}
 {{- $agentRolloutUpdateStrategy := .Values.agent.rollout.updateStrategy -}}
 {{- $agentRolloutMaxUnavailable := printf "%v" .Values.agent.rollout.maxUnavailable -}}
 {{- $agentRolloutMaxSurge := printf "%v" .Values.agent.rollout.maxSurge -}}
@@ -197,57 +398,43 @@
 {{- end -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxUnavailable" "value" $agentRolloutMaxUnavailable) -}}
 {{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxSurge" "value" $agentRolloutMaxSurge) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds) -}}
-{{- include "ipars.validateNonNegativeInteger" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit) -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds "max" 2147483647) -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit "max" 2147483647) -}}
 {{- if and (or (eq $agentRolloutMaxUnavailable "0") (eq $agentRolloutMaxUnavailable "0%")) (or (eq $agentRolloutMaxSurge "") (eq $agentRolloutMaxSurge "0") (eq $agentRolloutMaxSurge "0%")) -}}
 {{- fail "agent.rollout.maxUnavailable cannot be zero when agent.rollout.maxSurge is zero or unset" -}}
 {{- end -}}
-{{- if not (regexMatch $clusterUrlPattern .Values.cluster.controlPlaneUrl) -}}
-{{- fail "cluster.controlPlaneUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
-{{- if not (regexMatch $clusterUrlPattern .Values.cluster.signalUrl) -}}
-{{- fail "cluster.signalUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
-{{- if and .Values.cluster.stunEndpoint (not (regexMatch $hostPortPattern .Values.cluster.stunEndpoint)) -}}
-{{- fail "cluster.stunEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if and .Values.cluster.stunEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.stunEndpoint)) 65535)) -}}
-{{- fail "cluster.stunEndpoint port must be between 1 and 65535" -}}
-{{- end -}}
-{{- if and .Values.cluster.relayEndpoint (not (regexMatch $hostPortPattern .Values.cluster.relayEndpoint)) -}}
-{{- fail "cluster.relayEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if and .Values.cluster.relayEndpoint (or (lt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.cluster.relayEndpoint)) 65535)) -}}
-{{- fail "cluster.relayEndpoint port must be between 1 and 65535" -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.controlPlaneUrl" "value" .Values.cluster.controlPlaneUrl) -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.signalUrl" "value" .Values.cluster.signalUrl) -}}
+{{- if .Values.cluster.stunEndpoint -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
 {{- end -}}
 {{- if .Values.agent.relayAdvertisement.enabled -}}
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- if not (regexMatch $hostPortPattern .Values.agent.relayAdvertisement.publicEndpoint) -}}
-{{- fail "agent.relayAdvertisement.publicEndpoint must be host:port or [ipv6]:port" -}}
-{{- end -}}
-{{- if or (lt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 1) (gt (int (regexFind "[0-9]+$" .Values.agent.relayAdvertisement.publicEndpoint)) 65535) -}}
-{{- fail "agent.relayAdvertisement.publicEndpoint port must be between 1 and 65535" -}}
-{{- end -}}
+{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- if not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.admissionUrl) -}}
-{{- fail "agent.relayAdvertisement.admissionUrl must be an absolute HTTP(S) URL with a host" -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
+{{- if .Values.agent.relayAdvertisement.statusUrl -}}
+{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
 {{- end -}}
-{{- if and .Values.agent.relayAdvertisement.statusUrl (not (regexMatch "^https?://[^/[:space:]][^[:space:]]*$" .Values.agent.relayAdvertisement.statusUrl)) -}}
-{{- fail "agent.relayAdvertisement.statusUrl must be an absolute HTTP(S) URL with a host" -}}
-{{- end -}}
-{{- if not (gt (int .Values.agent.relayAdvertisement.maxSessions) 0) -}}
+{{- $relayAdvertisementMaxSessions := printf "%v" .Values.agent.relayAdvertisement.maxSessions -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxSessions" "value" $relayAdvertisementMaxSessions "max" 4294967295) -}}
+{{- if not (gt (int $relayAdvertisementMaxSessions) 0) -}}
 {{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
 {{- end -}}
-{{- if not (gt (int .Values.agent.relayAdvertisement.maxMbps) 0) -}}
+{{- $relayAdvertisementMaxMbps := printf "%v" .Values.agent.relayAdvertisement.maxMbps -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxMbps" "value" $relayAdvertisementMaxMbps "max" 4294967295) -}}
+{{- if not (gt (int $relayAdvertisementMaxMbps) 0) -}}
 {{- fail "agent.relayAdvertisement.maxMbps must be greater than zero" -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.serviceExposure.enabled -}}
-{{- if not (gt (int .Values.serviceExposure.routeIntervalSeconds) 0) -}}
+{{- $serviceExposureRouteIntervalSeconds := printf "%v" .Values.serviceExposure.routeIntervalSeconds -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "serviceExposure.routeIntervalSeconds" "value" $serviceExposureRouteIntervalSeconds "max" 9223372036854775807) -}}
+{{- if not (gt (int $serviceExposureRouteIntervalSeconds) 0) -}}
 {{- fail "serviceExposure.routeIntervalSeconds must be greater than zero" -}}
 {{- end -}}
 {{- if and (not .Values.serviceExposure.discoverServices) .Values.serviceExposure.namespaces -}}
@@ -258,6 +445,23 @@
 {{- end -}}
 {{- if and (eq $agentAutomountServiceAccountToken "false") .Values.serviceExposure.discoverServices -}}
 {{- fail "agent.automountServiceAccountToken=false cannot be used with serviceExposure.discoverServices=true" -}}
+{{- end -}}
+{{- $serviceExposureRouteCidrs := dict -}}
+{{- range .Values.serviceExposure.apiServerCidrs -}}
+{{- $cidr := printf "%v" . -}}
+{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.apiServerCidrs" "value" $cidr) -}}
+{{- if hasKey $serviceExposureRouteCidrs $cidr -}}
+{{- fail (printf "serviceExposure.apiServerCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
+{{- end -}}
+{{- $_ := set $serviceExposureRouteCidrs $cidr true -}}
+{{- end -}}
+{{- range .Values.serviceExposure.serviceCidrs -}}
+{{- $cidr := printf "%v" . -}}
+{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.serviceCidrs" "value" $cidr) -}}
+{{- if hasKey $serviceExposureRouteCidrs $cidr -}}
+{{- fail (printf "serviceExposure.serviceCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
+{{- end -}}
+{{- $_ := set $serviceExposureRouteCidrs $cidr true -}}
 {{- end -}}
 {{- $serviceExposureNamespaces := dict -}}
 {{- range .Values.serviceExposure.namespaces -}}
@@ -275,13 +479,18 @@
 {{- if and .Values.serviceExposure.serviceLabelSelector (regexMatch "[[:cntrl:]]" .Values.serviceExposure.serviceLabelSelector) -}}
 {{- fail "serviceExposure.serviceLabelSelector must not contain control characters" -}}
 {{- end -}}
+{{- $serviceExposureRouteProviderNodeId := printf "%v" .Values.serviceExposure.routeProviderNodeId -}}
+{{- if and (ne $serviceExposureRouteProviderNodeId "") (or (gt (len $serviceExposureRouteProviderNodeId) 255) (not (regexMatch "^[A-Za-z0-9._-]+$" $serviceExposureRouteProviderNodeId))) -}}
+{{- fail "serviceExposure.routeProviderNodeId must contain only ASCII letters, digits, '_', '.' or '-' and must not exceed 255 bytes" -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ include "ipars.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
 spec:
   {{- if ne $agentMinReadySeconds "" }}
   minReadySeconds: {{ int $agentMinReadySeconds }}
@@ -304,11 +513,13 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "ipars.name" . }}
+        app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
         {{- range $key, $value := .Values.agent.podLabels }}
         {{ $key }}: {{ $value | quote }}
         {{- end }}
@@ -327,7 +538,7 @@ spec:
         - name: {{ . | quote }}
         {{- end }}
       {{- end }}
-      hostNetwork: {{ .Values.agent.hostNetwork }}
+      hostNetwork: {{ $agentHostNetwork }}
       dnsPolicy: {{ $agentDnsPolicy | quote }}
       {{- if ne $agentTerminationGracePeriodSeconds "" }}
       terminationGracePeriodSeconds: {{ int $agentTerminationGracePeriodSeconds }}
@@ -364,8 +575,8 @@ spec:
       {{- end }}
       initContainers:
         - name: prepare-agent-state
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
           command:
             - /bin/sh
             - -ec
@@ -387,20 +598,51 @@ spec:
               mountPath: {{ $agentStateMountPath | quote }}
       containers:
         - name: agent
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
           command:
             - /usr/local/bin/iparsd
           args:
             - agent
             - --listen
-            - 0.0.0.0:9780
+            - {{ printf "0.0.0.0:%d" $agentApiTargetPort | quote }}
             - --state-path
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
             - --wireguard-interface
             - {{ .Values.agent.interfaceName | quote }}
             - --join-token-path
             - {{ printf "%s/token/%s" $agentStateMountPath .Values.agent.joinTokenSecretKey | quote }}
+            {{- if eq $agentPeerMapEnabled "true" }}
+            - --apply-peer-map
+            - --peer-map-poll-interval-seconds
+            - {{ $agentPeerMapPollIntervalSeconds | quote }}
+            {{- end }}
+            {{- if eq $agentRelayForwarderEnabled "true" }}
+            {{- if .Values.agent.relayForwarder.endpoint }}
+            - --relay-forwarder-endpoint
+            - {{ .Values.agent.relayForwarder.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.agent.relayForwarder.bind }}
+            - --relay-forwarder-bind
+            - {{ .Values.agent.relayForwarder.bind | quote }}
+            - --relay-forwarder-wireguard-endpoint
+            - {{ .Values.agent.relayForwarder.wireguardEndpoint | quote }}
+            {{- if .Values.agent.relayForwarder.netns }}
+            - --relay-forwarder-netns
+            - {{ .Values.agent.relayForwarder.netns | quote }}
+            {{- end }}
+            - --relay-forwarder-max-sessions
+            - {{ $agentRelayForwarderMaxSessions | quote }}
+            - --relay-forwarder-restart-backoff-seconds
+            - {{ $agentRelayForwarderRestartBackoffSeconds | quote }}
+            - --relay-forwarder-crash-window-seconds
+            - {{ $agentRelayForwarderCrashWindowSeconds | quote }}
+            - --relay-forwarder-max-crashes-per-window
+            - {{ $agentRelayForwarderMaxCrashesPerWindow | quote }}
+            - --relay-forwarder-crash-cooldown-seconds
+            - {{ $agentRelayForwarderCrashCooldownSeconds | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.agent.relayAdvertisement.enabled }}
             - --relay-public-endpoint
             - {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
@@ -422,6 +664,10 @@ spec:
             {{- if .Values.cluster.stunEndpoint }}
             - --stun-server
             - {{ .Values.cluster.stunEndpoint | quote }}
+            {{- end }}
+            {{- if or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled }}
+            - --route-backend
+            - {{ $agentRouteBackend | quote }}
             {{- end }}
             {{- if .Values.serviceExposure.enabled }}
             - --apply-kubernetes-underlay
@@ -466,8 +712,13 @@ spec:
               value: {{ .Values.cluster.signalUrl | quote }}
             - name: IPARS_STUN_ENDPOINT
               value: {{ .Values.cluster.stunEndpoint | quote }}
-            - name: IPARS_RELAY_ENDPOINT
-              value: {{ .Values.cluster.relayEndpoint | quote }}
+            {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
+            - name: IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $relayAdmissionBearerTokenSecretName | quote }}
+                  key: {{ $relayAdmissionBearerTokenSecretKey | quote }}
+            {{- end }}
             - name: IPARS_AGENT_WIREGUARD_INTERFACE
               value: {{ .Values.agent.interfaceName | quote }}
             - name: IPARS_ROUTE_PROVIDER
@@ -476,6 +727,16 @@ spec:
             privileged: {{ $agentPrivileged }}
             {{- if ne $agentAllowPrivilegeEscalation "" }}
             allowPrivilegeEscalation: {{ $agentAllowPrivilegeEscalation }}
+            {{- end }}
+            {{- if ne $agentReadOnlyRootFilesystem "" }}
+            readOnlyRootFilesystem: {{ $agentReadOnlyRootFilesystem }}
+            {{- end }}
+            {{- if ne $agentSeccompProfileType "" }}
+            seccompProfile:
+              type: {{ $agentSeccompProfileType | quote }}
+              {{- if eq $agentSeccompProfileType "Localhost" }}
+              localhostProfile: {{ $agentSeccompLocalhostProfile | quote }}
+              {{- end }}
             {{- end }}
             {{- if or .Values.agent.securityContext.capabilities.add .Values.agent.securityContext.capabilities.drop }}
             capabilities:
@@ -517,7 +778,7 @@ spec:
           livenessProbe:
             httpGet:
               path: {{ .Values.agent.probes.liveness.path | quote }}
-              port: 9780
+              port: {{ $agentApiTargetPort }}
             initialDelaySeconds: {{ int .Values.agent.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ int .Values.agent.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ int .Values.agent.probes.liveness.timeoutSeconds }}
@@ -527,7 +788,7 @@ spec:
           readinessProbe:
             httpGet:
               path: {{ .Values.agent.probes.readiness.path | quote }}
-              port: 9780
+              port: {{ $agentApiTargetPort }}
             initialDelaySeconds: {{ int .Values.agent.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ int .Values.agent.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ int .Values.agent.probes.readiness.timeoutSeconds }}
@@ -541,6 +802,11 @@ spec:
             - name: join-token
               mountPath: {{ printf "%s/token" $agentStateMountPath | quote }}
               readOnly: true
+            {{- if .Values.agent.relayForwarder.netns }}
+            - name: host-netns
+              mountPath: /var/run/netns
+              readOnly: true
+            {{- end }}
       volumes:
         - name: agent-state
           hostPath:
@@ -556,3 +822,9 @@ spec:
             items:
               - key: {{ .Values.agent.joinTokenSecretKey | quote }}
                 path: {{ .Values.agent.joinTokenSecretKey | quote }}
+        {{- if .Values.agent.relayForwarder.netns }}
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: Directory
+        {{- end }}

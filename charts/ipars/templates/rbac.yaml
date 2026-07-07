@@ -1,5 +1,9 @@
-{{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
-{{- if and $rbacCreate .Values.serviceExposure.discoverServices -}}
+{{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
+{{- $root := . -}}
+{{- $rbacCreate := .Values.rbac.create -}}
+{{- if and $rbacCreate .Values.serviceExposure.enabled .Values.serviceExposure.discoverServices -}}
 {{- $name := include "ipars.fullname" . -}}
 {{- $serviceAccountName := include "ipars.serviceAccountName" . -}}
 {{- $serviceAccountNamespace := .Release.Namespace -}}
@@ -13,6 +17,9 @@ kind: Role
 metadata:
   name: {{ $name }}
   namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -23,6 +30,9 @@ kind: RoleBinding
 metadata:
   name: {{ $name }}
   namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -37,6 +47,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -46,6 +59,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

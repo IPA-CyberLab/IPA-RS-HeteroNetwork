@@ -19,17 +19,20 @@ use ipars_route_manager::{
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentManagedProcessStatus,
     AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
     AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
-    AgentPacketFlowDropReasonCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayForwarderMetrics,
-    AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
+    AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSource,
+    AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
+    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayAdmissionFailureReason,
+    AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, AgentStatusResponse,
+    LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind, PathRecord,
-    PathScore, PathState, Role, Route, Tag, VpnIp,
+    endpoint_addr_is_usable, CandidateSource, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, NatClassification, NatProbeObservation, NodeId, NodeRecord,
+    PathChangeEvent, PathChangeKind, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,7 +53,14 @@ use rtnetlink::{LinkUnspec, LinkWireguard};
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MAX_LINUX_COMMAND_PROGRAM_BYTES: usize = 4096;
+const MAX_LINUX_COMMAND_ARGS: usize = 1024;
+const MAX_LINUX_COMMAND_ARG_BYTES: usize = 128 * 1024;
+const MAX_LINUX_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
+const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -380,21 +390,31 @@ pub struct AgentRuntime {
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
+    userspace_wireguard_process: tokio::sync::RwLock<Option<AgentManagedProcessStatus>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
     relay_admission_attempt_count: AtomicU64,
     relay_admission_success_count: AtomicU64,
     relay_admission_failure_count: AtomicU64,
+    relay_admission_failure_reason_counters: AgentRelayAdmissionFailureReasonCounters,
     path_probe_record_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
     packet_flow_unmatched_count: AtomicU64,
     packet_flow_filtered_count: AtomicU64,
+    packet_flow_duplicate_suppression_count: AtomicU64,
+    packet_flow_duplicate_suppression_proc_net_conntrack_count: AtomicU64,
+    packet_flow_duplicate_suppression_conntrack_netlink_count: AtomicU64,
+    packet_flow_duplicate_suppression_conntrack_netlink_events_count: AtomicU64,
+    packet_flow_duplicate_suppression_ebpf_jsonl_count: AtomicU64,
+    packet_flow_duplicate_suppression_ebpf_ringbuf_count: AtomicU64,
     packet_flow_filtered_unspecified_count: AtomicU64,
     packet_flow_filtered_loopback_count: AtomicU64,
     packet_flow_filtered_multicast_count: AtomicU64,
     packet_flow_filtered_broadcast_count: AtomicU64,
     packet_flow_filtered_link_local_count: AtomicU64,
+    packet_flow_filtered_no_overlay_match_count: AtomicU64,
+    packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64,
     packet_flow_classification_unknown_count: AtomicU64,
     packet_flow_classification_opening_count: AtomicU64,
     packet_flow_classification_unreplied_count: AtomicU64,
@@ -407,13 +427,29 @@ pub struct AgentRuntime {
     packet_flow_application_http_count: AtomicU64,
     packet_flow_application_https_count: AtomicU64,
     packet_flow_application_ssh_count: AtomicU64,
+    packet_flow_application_ldap_count: AtomicU64,
+    packet_flow_application_smb_count: AtomicU64,
+    packet_flow_application_rdp_count: AtomicU64,
     packet_flow_application_kubernetes_api_count: AtomicU64,
     packet_flow_application_etcd_count: AtomicU64,
+    packet_flow_application_zookeeper_count: AtomicU64,
+    packet_flow_application_consul_count: AtomicU64,
+    packet_flow_application_vault_count: AtomicU64,
+    packet_flow_application_nomad_count: AtomicU64,
     packet_flow_application_postgres_count: AtomicU64,
     packet_flow_application_mysql_count: AtomicU64,
+    packet_flow_application_mssql_count: AtomicU64,
+    packet_flow_application_oracle_count: AtomicU64,
+    packet_flow_application_clickhouse_count: AtomicU64,
     packet_flow_application_redis_count: AtomicU64,
+    packet_flow_application_memcached_count: AtomicU64,
     packet_flow_application_prometheus_count: AtomicU64,
     packet_flow_application_opentelemetry_count: AtomicU64,
+    packet_flow_application_jaeger_count: AtomicU64,
+    packet_flow_application_loki_count: AtomicU64,
+    packet_flow_application_tempo_count: AtomicU64,
+    packet_flow_application_zipkin_count: AtomicU64,
+    packet_flow_application_grpc_count: AtomicU64,
     packet_flow_application_kafka_count: AtomicU64,
     packet_flow_application_nats_count: AtomicU64,
     packet_flow_application_mqtt_count: AtomicU64,
@@ -423,6 +459,43 @@ pub struct AgentRuntime {
     packet_flow_application_elasticsearch_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
     packet_flow_application_icmp_count: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct AgentRelayAdmissionFailureReasonCounters {
+    no_endpoint_candidate: AtomicU64,
+    invalid_relay_candidate: AtomicU64,
+    unavailable: AtomicU64,
+    rejected: AtomicU64,
+    invalid_response: AtomicU64,
+}
+
+impl AgentRelayAdmissionFailureReasonCounters {
+    fn record(&self, reason: AgentRelayAdmissionFailureReason) {
+        self.counter(reason).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Vec<AgentRelayAdmissionFailureReasonCount> {
+        AgentRelayAdmissionFailureReason::ALL
+            .into_iter()
+            .filter_map(|reason| {
+                let count = self.counter(reason).load(Ordering::Relaxed);
+                (count > 0).then_some(AgentRelayAdmissionFailureReasonCount { reason, count })
+            })
+            .collect()
+    }
+
+    fn counter(&self, reason: AgentRelayAdmissionFailureReason) -> &AtomicU64 {
+        match reason {
+            AgentRelayAdmissionFailureReason::NoEndpointCandidate => &self.no_endpoint_candidate,
+            AgentRelayAdmissionFailureReason::InvalidRelayCandidate => {
+                &self.invalid_relay_candidate
+            }
+            AgentRelayAdmissionFailureReason::Unavailable => &self.unavailable,
+            AgentRelayAdmissionFailureReason::Rejected => &self.rejected,
+            AgentRelayAdmissionFailureReason::InvalidResponse => &self.invalid_response,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,11 +516,32 @@ pub struct RelayForwarderStats {
     relay_node: NodeId,
     relay_endpoint: SocketAddr,
     local_endpoint: SocketAddr,
+    socket_receive_errors: AtomicU64,
     outbound_packets: AtomicU64,
     outbound_payload_bytes: AtomicU64,
     outbound_datagram_bytes: AtomicU64,
+    outbound_dropped_unexpected_source_packets: AtomicU64,
+    outbound_dropped_unexpected_source_payload_bytes: AtomicU64,
+    outbound_dropped_expired_session_packets: AtomicU64,
+    outbound_dropped_expired_session_payload_bytes: AtomicU64,
+    outbound_dropped_oversized_packets: AtomicU64,
+    outbound_dropped_oversized_payload_bytes: AtomicU64,
+    outbound_dropped_oversized_datagram_bytes: AtomicU64,
+    outbound_dropped_socket_error_packets: AtomicU64,
+    outbound_dropped_socket_error_payload_bytes: AtomicU64,
+    outbound_dropped_socket_error_datagram_bytes: AtomicU64,
+    outbound_dropped_non_wireguard_packets: AtomicU64,
+    outbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     inbound_packets: AtomicU64,
     inbound_payload_bytes: AtomicU64,
+    inbound_dropped_expired_session_packets: AtomicU64,
+    inbound_dropped_expired_session_payload_bytes: AtomicU64,
+    inbound_dropped_oversized_packets: AtomicU64,
+    inbound_dropped_oversized_payload_bytes: AtomicU64,
+    inbound_dropped_socket_error_packets: AtomicU64,
+    inbound_dropped_socket_error_payload_bytes: AtomicU64,
+    inbound_dropped_non_wireguard_packets: AtomicU64,
+    inbound_dropped_non_wireguard_payload_bytes: AtomicU64,
     last_forwarded_unix_millis: AtomicI64,
 }
 
@@ -463,17 +557,42 @@ impl RelayForwarderStats {
             relay_node,
             relay_endpoint,
             local_endpoint,
+            socket_receive_errors: AtomicU64::new(0),
             outbound_packets: AtomicU64::new(0),
             outbound_payload_bytes: AtomicU64::new(0),
             outbound_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_unexpected_source_packets: AtomicU64::new(0),
+            outbound_dropped_unexpected_source_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_expired_session_packets: AtomicU64::new(0),
+            outbound_dropped_expired_session_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_oversized_packets: AtomicU64::new(0),
+            outbound_dropped_oversized_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_oversized_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_socket_error_packets: AtomicU64::new(0),
+            outbound_dropped_socket_error_payload_bytes: AtomicU64::new(0),
+            outbound_dropped_socket_error_datagram_bytes: AtomicU64::new(0),
+            outbound_dropped_non_wireguard_packets: AtomicU64::new(0),
+            outbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             inbound_packets: AtomicU64::new(0),
             inbound_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_expired_session_packets: AtomicU64::new(0),
+            inbound_dropped_expired_session_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_oversized_packets: AtomicU64::new(0),
+            inbound_dropped_oversized_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_socket_error_packets: AtomicU64::new(0),
+            inbound_dropped_socket_error_payload_bytes: AtomicU64::new(0),
+            inbound_dropped_non_wireguard_packets: AtomicU64::new(0),
+            inbound_dropped_non_wireguard_payload_bytes: AtomicU64::new(0),
             last_forwarded_unix_millis: AtomicI64::new(-1),
         }
     }
 
     pub fn peer(&self) -> &NodeId {
         &self.peer
+    }
+
+    pub fn record_socket_receive_error(&self) {
+        self.socket_receive_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_outbound(&self, payload_bytes: usize, datagram_bytes: usize) {
@@ -485,11 +604,78 @@ impl RelayForwarderStats {
         self.record_forwarded_at();
     }
 
+    pub fn record_outbound_unexpected_source_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_unexpected_source_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_unexpected_source_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_outbound_expired_session_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_expired_session_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_expired_session_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_outbound_oversized_drop(&self, payload_bytes: usize, datagram_bytes: usize) {
+        self.outbound_dropped_oversized_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_oversized_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.outbound_dropped_oversized_datagram_bytes
+            .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_outbound_socket_error_drop(&self, payload_bytes: usize, datagram_bytes: usize) {
+        self.outbound_dropped_socket_error_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_socket_error_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.outbound_dropped_socket_error_datagram_bytes
+            .fetch_add(datagram_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_outbound_drop(&self, payload_bytes: usize) {
+        self.outbound_dropped_non_wireguard_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.outbound_dropped_non_wireguard_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
     pub fn record_inbound(&self, payload_bytes: usize) {
         self.inbound_packets.fetch_add(1, Ordering::Relaxed);
         self.inbound_payload_bytes
             .fetch_add(payload_bytes as u64, Ordering::Relaxed);
         self.record_forwarded_at();
+    }
+
+    pub fn record_inbound_expired_session_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_expired_session_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_expired_session_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_inbound_oversized_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_oversized_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_oversized_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_inbound_socket_error_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_socket_error_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_socket_error_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_inbound_drop(&self, payload_bytes: usize) {
+        self.inbound_dropped_non_wireguard_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.inbound_dropped_non_wireguard_payload_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> AgentRelayForwarderMetrics {
@@ -499,11 +685,72 @@ impl RelayForwarderStats {
             relay_node: self.relay_node.clone(),
             relay_endpoint: self.relay_endpoint,
             local_endpoint: self.local_endpoint,
+            socket_receive_errors: self.socket_receive_errors.load(Ordering::Relaxed),
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             outbound_payload_bytes: self.outbound_payload_bytes.load(Ordering::Relaxed),
             outbound_datagram_bytes: self.outbound_datagram_bytes.load(Ordering::Relaxed),
+            outbound_dropped_unexpected_source_packets: self
+                .outbound_dropped_unexpected_source_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_unexpected_source_payload_bytes: self
+                .outbound_dropped_unexpected_source_payload_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_expired_session_packets: self
+                .outbound_dropped_expired_session_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_expired_session_payload_bytes: self
+                .outbound_dropped_expired_session_payload_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_oversized_packets: self
+                .outbound_dropped_oversized_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_oversized_payload_bytes: self
+                .outbound_dropped_oversized_payload_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_oversized_datagram_bytes: self
+                .outbound_dropped_oversized_datagram_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_packets: self
+                .outbound_dropped_socket_error_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_payload_bytes: self
+                .outbound_dropped_socket_error_payload_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_socket_error_datagram_bytes: self
+                .outbound_dropped_socket_error_datagram_bytes
+                .load(Ordering::Relaxed),
+            outbound_dropped_non_wireguard_packets: self
+                .outbound_dropped_non_wireguard_packets
+                .load(Ordering::Relaxed),
+            outbound_dropped_non_wireguard_payload_bytes: self
+                .outbound_dropped_non_wireguard_payload_bytes
+                .load(Ordering::Relaxed),
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             inbound_payload_bytes: self.inbound_payload_bytes.load(Ordering::Relaxed),
+            inbound_dropped_expired_session_packets: self
+                .inbound_dropped_expired_session_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_expired_session_payload_bytes: self
+                .inbound_dropped_expired_session_payload_bytes
+                .load(Ordering::Relaxed),
+            inbound_dropped_oversized_packets: self
+                .inbound_dropped_oversized_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_oversized_payload_bytes: self
+                .inbound_dropped_oversized_payload_bytes
+                .load(Ordering::Relaxed),
+            inbound_dropped_socket_error_packets: self
+                .inbound_dropped_socket_error_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_socket_error_payload_bytes: self
+                .inbound_dropped_socket_error_payload_bytes
+                .load(Ordering::Relaxed),
+            inbound_dropped_non_wireguard_packets: self
+                .inbound_dropped_non_wireguard_packets
+                .load(Ordering::Relaxed),
+            inbound_dropped_non_wireguard_payload_bytes: self
+                .inbound_dropped_non_wireguard_payload_bytes
+                .load(Ordering::Relaxed),
             last_forwarded_at: (last_forwarded_unix_millis >= 0)
                 .then(|| DateTime::<Utc>::from_timestamp_millis(last_forwarded_unix_millis))
                 .flatten(),
@@ -563,10 +810,34 @@ impl UdpRelayFrameForwarder {
         socket: &tokio::net::UdpSocket,
         payload: &[u8],
     ) -> Result<usize, AgentError> {
+        if !self.session_active() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_outbound_expired_session_drop(payload.len());
+            }
+            return Ok(0);
+        }
+        if !wireguard_datagram_payload(payload) {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_outbound_drop(payload.len());
+            }
+            return Ok(0);
+        }
         let datagram = self.encode_outbound(payload)?;
-        let bytes_sent = socket
-            .send_to(&datagram, self.session.relay_endpoint)
-            .await?;
+        if datagram.len() > MAX_FORWARDER_UDP_PAYLOAD_BYTES {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_outbound_oversized_drop(payload.len(), datagram.len());
+            }
+            return Ok(0);
+        }
+        let bytes_sent = match socket.send_to(&datagram, self.session.relay_endpoint).await {
+            Ok(bytes_sent) => bytes_sent,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_outbound_socket_error_drop(payload.len(), datagram.len());
+                }
+                return Ok(0);
+            }
+        };
         if let Some(metrics) = &self.metrics {
             metrics.record_outbound(payload.len(), datagram.len());
         }
@@ -578,8 +849,33 @@ impl UdpRelayFrameForwarder {
         socket: &tokio::net::UdpSocket,
         payload: &[u8],
     ) -> Result<usize, AgentError> {
-        self.ensure_session_active()?;
-        let bytes_sent = socket.send_to(payload, self.wireguard_endpoint).await?;
+        if !self.session_active() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_inbound_expired_session_drop(payload.len());
+            }
+            return Ok(0);
+        }
+        if !wireguard_datagram_payload(payload) {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_inbound_drop(payload.len());
+            }
+            return Ok(0);
+        }
+        if payload.len() > MAX_FORWARDER_UDP_PAYLOAD_BYTES {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_inbound_oversized_drop(payload.len());
+            }
+            return Ok(0);
+        }
+        let bytes_sent = match socket.send_to(payload, self.wireguard_endpoint).await {
+            Ok(bytes_sent) => bytes_sent,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_inbound_socket_error_drop(payload.len());
+                }
+                return Ok(0);
+            }
+        };
         if let Some(metrics) = &self.metrics {
             metrics.record_inbound(payload.len());
         }
@@ -600,19 +896,36 @@ impl UdpRelayFrameForwarder {
                     }
                 }
                 packet = socket.recv_from(&mut buffer) => {
-                    let (len, peer) = packet?;
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) if recoverable_udp_recv_error(&error) => {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_socket_receive_error();
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     if peer == self.session.relay_endpoint {
                         self.forward_to_wireguard(&socket, &buffer[..len]).await?;
-                    } else {
+                    } else if wireguard_sender_matches_configured(self.wireguard_endpoint, peer) {
                         self.send_to_relay(&socket, &buffer[..len]).await?;
+                    } else {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_outbound_unexpected_source_drop(len);
+                        }
                     }
                 }
             }
         }
     }
 
+    fn session_active(&self) -> bool {
+        Utc::now() < self.session.expires_at
+    }
+
     fn ensure_session_active(&self) -> Result<(), AgentError> {
-        if Utc::now() >= self.session.expires_at {
+        if !self.session_active() {
             return Err(AgentError::RelaySession(format!(
                 "relay session {} expired at {}",
                 self.session.session_id, self.session.expires_at
@@ -639,6 +952,41 @@ fn relay_session_local_node(session_id: &str, peer: &NodeId) -> Result<NodeId, A
     }
 }
 
+fn recoverable_udp_recv_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn wireguard_sender_matches_configured(configured: SocketAddr, observed: SocketAddr) -> bool {
+    if configured.port() != observed.port() {
+        return false;
+    }
+    match (configured.ip(), observed.ip()) {
+        (IpAddr::V4(configured), IpAddr::V4(observed)) => {
+            configured.is_unspecified() || configured == observed
+        }
+        (IpAddr::V6(configured), IpAddr::V6(observed)) => {
+            configured.is_unspecified() || configured == observed
+        }
+        _ => false,
+    }
+}
+
+fn wireguard_datagram_payload(payload: &[u8]) -> bool {
+    if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
+        return false;
+    }
+    match payload[0] {
+        1 => payload.len() == 148,
+        2 => payload.len() == 92,
+        3 => payload.len() == 64,
+        4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
+        _ => false,
+    }
+}
+
 impl AgentRuntime {
     pub fn new(state: AgentNodeState, policy: ClusterPolicy) -> Self {
         Self {
@@ -650,21 +998,32 @@ impl AgentRuntime {
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
+            userspace_wireguard_process: tokio::sync::RwLock::new(None),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
             relay_admission_attempt_count: AtomicU64::new(0),
             relay_admission_success_count: AtomicU64::new(0),
             relay_admission_failure_count: AtomicU64::new(0),
+            relay_admission_failure_reason_counters:
+                AgentRelayAdmissionFailureReasonCounters::default(),
             path_probe_record_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
             packet_flow_unmatched_count: AtomicU64::new(0),
             packet_flow_filtered_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_proc_net_conntrack_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_conntrack_netlink_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_conntrack_netlink_events_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_ebpf_jsonl_count: AtomicU64::new(0),
+            packet_flow_duplicate_suppression_ebpf_ringbuf_count: AtomicU64::new(0),
             packet_flow_filtered_unspecified_count: AtomicU64::new(0),
             packet_flow_filtered_loopback_count: AtomicU64::new(0),
             packet_flow_filtered_multicast_count: AtomicU64::new(0),
             packet_flow_filtered_broadcast_count: AtomicU64::new(0),
             packet_flow_filtered_link_local_count: AtomicU64::new(0),
+            packet_flow_filtered_no_overlay_match_count: AtomicU64::new(0),
+            packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64::new(0),
             packet_flow_classification_unknown_count: AtomicU64::new(0),
             packet_flow_classification_opening_count: AtomicU64::new(0),
             packet_flow_classification_unreplied_count: AtomicU64::new(0),
@@ -677,13 +1036,29 @@ impl AgentRuntime {
             packet_flow_application_http_count: AtomicU64::new(0),
             packet_flow_application_https_count: AtomicU64::new(0),
             packet_flow_application_ssh_count: AtomicU64::new(0),
+            packet_flow_application_ldap_count: AtomicU64::new(0),
+            packet_flow_application_smb_count: AtomicU64::new(0),
+            packet_flow_application_rdp_count: AtomicU64::new(0),
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
             packet_flow_application_etcd_count: AtomicU64::new(0),
+            packet_flow_application_zookeeper_count: AtomicU64::new(0),
+            packet_flow_application_consul_count: AtomicU64::new(0),
+            packet_flow_application_vault_count: AtomicU64::new(0),
+            packet_flow_application_nomad_count: AtomicU64::new(0),
             packet_flow_application_postgres_count: AtomicU64::new(0),
             packet_flow_application_mysql_count: AtomicU64::new(0),
+            packet_flow_application_mssql_count: AtomicU64::new(0),
+            packet_flow_application_oracle_count: AtomicU64::new(0),
+            packet_flow_application_clickhouse_count: AtomicU64::new(0),
             packet_flow_application_redis_count: AtomicU64::new(0),
+            packet_flow_application_memcached_count: AtomicU64::new(0),
             packet_flow_application_prometheus_count: AtomicU64::new(0),
             packet_flow_application_opentelemetry_count: AtomicU64::new(0),
+            packet_flow_application_jaeger_count: AtomicU64::new(0),
+            packet_flow_application_loki_count: AtomicU64::new(0),
+            packet_flow_application_tempo_count: AtomicU64::new(0),
+            packet_flow_application_zipkin_count: AtomicU64::new(0),
+            packet_flow_application_grpc_count: AtomicU64::new(0),
             packet_flow_application_kafka_count: AtomicU64::new(0),
             packet_flow_application_nats_count: AtomicU64::new(0),
             packet_flow_application_mqtt_count: AtomicU64::new(0),
@@ -708,6 +1083,26 @@ impl AgentRuntime {
             Ok(mut current) => *current = state,
             Err(poisoned) => *poisoned.into_inner() = state,
         }
+    }
+
+    pub async fn record_userspace_wireguard_process_status(
+        &self,
+        state: AgentManagedProcessState,
+        pid: Option<u32>,
+        exit_status: Option<String>,
+        message: Option<String>,
+    ) {
+        *self.userspace_wireguard_process.write().await = Some(AgentManagedProcessStatus {
+            state,
+            pid,
+            exit_status,
+            message,
+            updated_at: Utc::now(),
+        });
+    }
+
+    pub async fn userspace_wireguard_process_status(&self) -> Option<AgentManagedProcessStatus> {
+        self.userspace_wireguard_process.read().await.clone()
     }
 
     pub fn wireguard_key_rotation_request(
@@ -752,6 +1147,7 @@ impl AgentRuntime {
         let state = self.state();
         let candidates = self.candidates.read().await.clone();
         let nat_classification = self.nat_classification.read().await.clone();
+        let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         AgentStatusResponse {
             node_id: state.node_id,
             identity_public_key: state.identity_public_key_b64,
@@ -759,8 +1155,13 @@ impl AgentRuntime {
             candidate_count: candidates.len(),
             candidates,
             nat_classification,
+            userspace_wireguard_process,
             state_updated_at: state.updated_at,
         }
+    }
+
+    pub async fn replace_candidates(&self, candidates: Vec<EndpointCandidate>) {
+        *self.candidates.write().await = candidates;
     }
 
     pub async fn probe_stun(
@@ -847,11 +1248,13 @@ impl AgentRuntime {
     }
 
     pub async fn metrics(&self) -> AgentMetricsResponse {
+        self.purge_expired_relay_sessions(Utc::now()).await;
         let candidates = self.candidates.read().await;
         let path_state = self.path_state.read().await;
         let relay_sessions = self.relay_sessions.read().await;
         let relay_forwarders = self.relay_forwarder_endpoints.read().await;
         let relay_forwarder_metrics = self.relay_forwarder_metrics.read().await;
+        let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         let path_change_events = self.path_change_events.read().await;
         let lazy_connect = self.lazy_connect.read().await;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
@@ -874,15 +1277,21 @@ impl AgentRuntime {
             relay_admission_failure_count: self
                 .relay_admission_failure_count
                 .load(Ordering::Relaxed),
+            relay_admission_failure_reason_counts: self
+                .relay_admission_failure_reason_counters
+                .snapshot(),
             relay_forwarder_count: relay_forwarders.len(),
             relay_forwarders: relay_forwarder_metrics
                 .values()
                 .map(|metrics| metrics.snapshot())
                 .collect(),
             path_change_event_count: path_change_events.len(),
-            path_state_counts: path_state_counts
+            path_state_counts: PATH_STATE_METRIC_ORDER
                 .into_iter()
-                .map(|(state, count)| PathStateCount { state, count })
+                .map(|state| PathStateCount {
+                    state,
+                    count: *path_state_counts.get(&state).unwrap_or(&0),
+                })
                 .collect(),
             lazy_connect: lazy_connect.metrics(),
             path_probe_record_count: self.path_probe_record_count.load(Ordering::Relaxed),
@@ -894,8 +1303,14 @@ impl AgentRuntime {
             packet_flow_unmatched_count: self.packet_flow_unmatched_count.load(Ordering::Relaxed),
             packet_flow_filtered_count: self.packet_flow_filtered_count.load(Ordering::Relaxed),
             packet_flow_filtered_reason_counts: self.packet_flow_filtered_reason_counts(),
+            packet_flow_duplicate_suppression_count: self
+                .packet_flow_duplicate_suppression_count
+                .load(Ordering::Relaxed),
+            packet_flow_duplicate_suppression_counts: self
+                .packet_flow_duplicate_suppression_counts(),
             packet_flow_classification_counts: self.packet_flow_classification_counts(),
             packet_flow_application_counts: self.packet_flow_application_counts(),
+            userspace_wireguard_process,
             generated_at: Utc::now(),
         }
     }
@@ -933,6 +1348,8 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) {
+        let remote = record.key.remote.clone();
+        let selected_state = record.selected_state;
         let previous = self.path_state.write().await.insert(
             (record.key.local.clone(), record.key.remote.clone()),
             record.clone(),
@@ -949,6 +1366,9 @@ impl AgentRuntime {
                 events.pop_front();
             }
             events.push_back(event);
+        }
+        if selected_state != PathState::Relay {
+            self.remove_relay_session(&remote).await;
         }
     }
 
@@ -970,20 +1390,71 @@ impl AgentRuntime {
     }
 
     pub fn record_relay_admission_failure(&self) {
+        self.record_relay_admission_failure_reason(AgentRelayAdmissionFailureReason::Unavailable);
+    }
+
+    pub fn record_relay_admission_failure_reason(&self, reason: AgentRelayAdmissionFailureReason) {
         self.relay_admission_failure_count
             .fetch_add(1, Ordering::Relaxed);
+        self.relay_admission_failure_reason_counters.record(reason);
     }
 
     pub async fn relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
-        self.relay_sessions.read().await.get(peer).cloned()
+        self.active_relay_session(peer, Utc::now()).await
     }
 
     pub async fn relay_sessions(&self) -> Vec<RelaySessionState> {
+        self.purge_expired_relay_sessions(Utc::now()).await;
         self.relay_sessions.read().await.values().cloned().collect()
     }
 
+    pub async fn active_relay_session(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+    ) -> Option<RelaySessionState> {
+        let expired = {
+            let mut relay_sessions = self.relay_sessions.write().await;
+            match relay_sessions.get(peer) {
+                Some(session) if session.expires_at > now => return Some(session.clone()),
+                Some(_) => relay_sessions.remove(peer),
+                None => None,
+            }
+        };
+        if expired.is_some() {
+            self.remove_relay_forwarder_endpoint(peer).await;
+        }
+        None
+    }
+
+    pub async fn purge_expired_relay_sessions(&self, now: DateTime<Utc>) -> Vec<RelaySessionState> {
+        let expired = {
+            let mut relay_sessions = self.relay_sessions.write().await;
+            let expired_peers = relay_sessions
+                .iter()
+                .filter(|(_, session)| session.expires_at <= now)
+                .map(|(peer, _)| peer.clone())
+                .collect::<Vec<_>>();
+            expired_peers
+                .into_iter()
+                .filter_map(|peer| relay_sessions.remove(&peer))
+                .collect::<Vec<_>>()
+        };
+        if !expired.is_empty() {
+            let mut relay_forwarder_endpoints = self.relay_forwarder_endpoints.write().await;
+            let mut relay_forwarder_metrics = self.relay_forwarder_metrics.write().await;
+            for session in &expired {
+                relay_forwarder_endpoints.remove(&session.peer);
+                relay_forwarder_metrics.remove(&session.peer);
+            }
+        }
+        expired
+    }
+
     pub async fn remove_relay_session(&self, peer: &NodeId) -> Option<RelaySessionState> {
-        self.relay_sessions.write().await.remove(peer)
+        let removed = self.relay_sessions.write().await.remove(peer);
+        self.remove_relay_forwarder_endpoint(peer).await;
+        removed
     }
 
     pub async fn upsert_relay_forwarder_endpoint(&self, peer: NodeId, endpoint: SocketAddr) {
@@ -1026,12 +1497,10 @@ impl AgentRuntime {
     ) -> bool {
         let renew_before = chrono::Duration::from_std(renew_before)
             .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX));
-        self.relay_sessions
-            .read()
+        self.active_relay_session(peer, now)
             .await
-            .get(peer)
             .map(|session| {
-                &session.relay_node != relay_node || now + renew_before >= session.expires_at
+                session.relay_node != *relay_node || now + renew_before >= session.expires_at
             })
             .unwrap_or(true)
     }
@@ -1047,10 +1516,7 @@ impl AgentRuntime {
             return None;
         }
 
-        let session = self.relay_session(peer).await?;
-        if now >= session.expires_at {
-            return None;
-        }
+        let session = self.active_relay_session(peer, now).await?;
         if path.relay_node.as_ref() != Some(&session.relay_node) {
             return None;
         }
@@ -1097,6 +1563,16 @@ impl AgentRuntime {
         at: DateTime<Utc>,
         pin: bool,
     ) -> Option<AgentPacketFlowMatch> {
+        if observation.validate_transport_metadata().is_err() {
+            self.record_packet_flow_filtered(
+                AgentPacketFlowDropReason::InconsistentTransportMetadata,
+            );
+            return None;
+        }
+        if let Some(reason) = packet_flow_destination_drop_reason(destination) {
+            self.record_packet_flow_filtered(reason);
+            return None;
+        }
         self.packet_flow_observation_count
             .fetch_add(1, Ordering::Relaxed);
         self.packet_flow_classification_counter(observation.classification())
@@ -1107,6 +1583,7 @@ impl AgentRuntime {
         let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
             self.packet_flow_unmatched_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.record_packet_flow_filtered(AgentPacketFlowDropReason::NoOverlayMatch);
             return None;
         };
         lazy_connect.record_activity(matched.peer.clone(), at);
@@ -1123,6 +1600,20 @@ impl AgentRuntime {
             .fetch_add(1, Ordering::Relaxed);
         self.packet_flow_filtered_counter(reason)
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_packet_flow_duplicate_suppression(
+        &self,
+        source: AgentPacketFlowDuplicateSource,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.packet_flow_duplicate_suppression_count
+            .fetch_add(count, Ordering::Relaxed);
+        self.packet_flow_duplicate_suppression_counter(source)
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     fn packet_flow_filtered_reason_counts(&self) -> Vec<AgentPacketFlowDropReasonCount> {
@@ -1144,6 +1635,47 @@ impl AgentRuntime {
             AgentPacketFlowDropReason::Multicast => &self.packet_flow_filtered_multicast_count,
             AgentPacketFlowDropReason::Broadcast => &self.packet_flow_filtered_broadcast_count,
             AgentPacketFlowDropReason::LinkLocal => &self.packet_flow_filtered_link_local_count,
+            AgentPacketFlowDropReason::NoOverlayMatch => {
+                &self.packet_flow_filtered_no_overlay_match_count
+            }
+            AgentPacketFlowDropReason::InconsistentTransportMetadata => {
+                &self.packet_flow_filtered_inconsistent_transport_metadata_count
+            }
+        }
+    }
+
+    fn packet_flow_duplicate_suppression_counts(&self) -> Vec<AgentPacketFlowDuplicateSourceCount> {
+        AgentPacketFlowDuplicateSource::ALL
+            .into_iter()
+            .map(|source| AgentPacketFlowDuplicateSourceCount {
+                source,
+                count: self
+                    .packet_flow_duplicate_suppression_counter(source)
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn packet_flow_duplicate_suppression_counter(
+        &self,
+        source: AgentPacketFlowDuplicateSource,
+    ) -> &AtomicU64 {
+        match source {
+            AgentPacketFlowDuplicateSource::ProcNetConntrack => {
+                &self.packet_flow_duplicate_suppression_proc_net_conntrack_count
+            }
+            AgentPacketFlowDuplicateSource::ConntrackNetlink => {
+                &self.packet_flow_duplicate_suppression_conntrack_netlink_count
+            }
+            AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents => {
+                &self.packet_flow_duplicate_suppression_conntrack_netlink_events_count
+            }
+            AgentPacketFlowDuplicateSource::EbpfJsonl => {
+                &self.packet_flow_duplicate_suppression_ebpf_jsonl_count
+            }
+            AgentPacketFlowDuplicateSource::EbpfRingbuf => {
+                &self.packet_flow_duplicate_suppression_ebpf_ringbuf_count
+            }
         }
     }
 
@@ -1208,19 +1740,37 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Http => &self.packet_flow_application_http_count,
             AgentPacketFlowApplication::Https => &self.packet_flow_application_https_count,
             AgentPacketFlowApplication::Ssh => &self.packet_flow_application_ssh_count,
+            AgentPacketFlowApplication::Ldap => &self.packet_flow_application_ldap_count,
+            AgentPacketFlowApplication::Smb => &self.packet_flow_application_smb_count,
+            AgentPacketFlowApplication::Rdp => &self.packet_flow_application_rdp_count,
             AgentPacketFlowApplication::KubernetesApi => {
                 &self.packet_flow_application_kubernetes_api_count
             }
             AgentPacketFlowApplication::Etcd => &self.packet_flow_application_etcd_count,
+            AgentPacketFlowApplication::ZooKeeper => &self.packet_flow_application_zookeeper_count,
+            AgentPacketFlowApplication::Consul => &self.packet_flow_application_consul_count,
+            AgentPacketFlowApplication::Vault => &self.packet_flow_application_vault_count,
+            AgentPacketFlowApplication::Nomad => &self.packet_flow_application_nomad_count,
             AgentPacketFlowApplication::Postgres => &self.packet_flow_application_postgres_count,
             AgentPacketFlowApplication::Mysql => &self.packet_flow_application_mysql_count,
+            AgentPacketFlowApplication::MsSql => &self.packet_flow_application_mssql_count,
+            AgentPacketFlowApplication::Oracle => &self.packet_flow_application_oracle_count,
+            AgentPacketFlowApplication::ClickHouse => {
+                &self.packet_flow_application_clickhouse_count
+            }
             AgentPacketFlowApplication::Redis => &self.packet_flow_application_redis_count,
+            AgentPacketFlowApplication::Memcached => &self.packet_flow_application_memcached_count,
             AgentPacketFlowApplication::Prometheus => {
                 &self.packet_flow_application_prometheus_count
             }
             AgentPacketFlowApplication::OpenTelemetry => {
                 &self.packet_flow_application_opentelemetry_count
             }
+            AgentPacketFlowApplication::Jaeger => &self.packet_flow_application_jaeger_count,
+            AgentPacketFlowApplication::Loki => &self.packet_flow_application_loki_count,
+            AgentPacketFlowApplication::Tempo => &self.packet_flow_application_tempo_count,
+            AgentPacketFlowApplication::Zipkin => &self.packet_flow_application_zipkin_count,
+            AgentPacketFlowApplication::Grpc => &self.packet_flow_application_grpc_count,
             AgentPacketFlowApplication::Kafka => &self.packet_flow_application_kafka_count,
             AgentPacketFlowApplication::Nats => &self.packet_flow_application_nats_count,
             AgentPacketFlowApplication::Mqtt => &self.packet_flow_application_mqtt_count,
@@ -1480,6 +2030,8 @@ async fn run_system_command(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<(), AgentError> {
+    validate_system_command_runtime_bounds(timeout, output_max_bytes)?;
+    validate_linux_command(&command)?;
     let command_label = command_label(&command.program, &command.args);
     let output = run_command_output(command, timeout, output_max_bytes, &command_label).await?;
     if output.status.success() {
@@ -1492,53 +2044,198 @@ async fn run_system_command(
     )))
 }
 
+fn validate_system_command_runtime_bounds(
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<(), AgentError> {
+    if timeout.is_zero() {
+        return Err(AgentError::WireGuard(
+            "invalid linux command runtime bounds: timeout must be greater than zero".to_string(),
+        ));
+    }
+    if timeout > MAX_SYSTEM_COMMAND_TIMEOUT {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command runtime bounds: timeout must not exceed {}s",
+            MAX_SYSTEM_COMMAND_TIMEOUT.as_secs()
+        )));
+    }
+    if output_max_bytes == 0 {
+        return Err(AgentError::WireGuard(
+            "invalid linux command runtime bounds: output_max_bytes must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if output_max_bytes > MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command runtime bounds: output_max_bytes must not exceed {MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_linux_command(command: &LinuxCommand) -> Result<(), AgentError> {
+    if command.program.is_empty() {
+        return Err(AgentError::WireGuard(
+            "invalid linux command: program cannot be empty".to_string(),
+        ));
+    }
+    if command.program.len() > MAX_LINUX_COMMAND_PROGRAM_BYTES {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command: program exceeds {MAX_LINUX_COMMAND_PROGRAM_BYTES} bytes"
+        )));
+    }
+    if command.program.as_bytes().contains(&0) {
+        return Err(AgentError::WireGuard(
+            "invalid linux command: program must not contain NUL bytes".to_string(),
+        ));
+    }
+    if command.args.len() > MAX_LINUX_COMMAND_ARGS {
+        return Err(AgentError::WireGuard(format!(
+            "invalid linux command: too many arguments: {} > {MAX_LINUX_COMMAND_ARGS}",
+            command.args.len()
+        )));
+    }
+
+    let mut total_bytes = command.program.len();
+    for (index, arg) in command.args.iter().enumerate() {
+        if arg.len() > MAX_LINUX_COMMAND_ARG_BYTES {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command: argument {index} exceeds {MAX_LINUX_COMMAND_ARG_BYTES} bytes"
+            )));
+        }
+        if arg.as_bytes().contains(&0) {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command: argument {index} must not contain NUL bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(arg.len());
+        if total_bytes > MAX_LINUX_COMMAND_ARGV_BYTES {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command: argv exceeds {MAX_LINUX_COMMAND_ARGV_BYTES} bytes"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_command_output(
     command: LinuxCommand,
     timeout: Duration,
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedCommandOutput, AgentError> {
-    tokio::time::timeout(
-        timeout,
-        collect_bounded_command_output(command, output_max_bytes),
-    )
-    .await
-    .map_err(|_| {
-        AgentError::WireGuard(format!(
-            "{command_label} timed out after {}",
-            command_timeout_label(timeout)
-        ))
-    })?
-    .map_err(AgentError::Io)
+    collect_bounded_command_output(command, timeout, output_max_bytes, command_label).await
 }
 
 async fn collect_bounded_command_output(
     command: LinuxCommand,
+    timeout: Duration,
     output_max_bytes: usize,
-) -> std::io::Result<BoundedCommandOutput> {
-    let mut child = Command::new(&command.program)
+    command_label: &str,
+) -> Result<BoundedCommandOutput, AgentError> {
+    let mut child_command = Command::new(&command.program);
+    child_command
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    configure_command_process_group(&mut child_command);
+
+    let mut child = child_command.spawn().map_err(AgentError::Io)?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
+        .ok_or_else(|| AgentError::Io(std::io::Error::other("child stdout was not piped")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+        .ok_or_else(|| AgentError::Io(std::io::Error::other("child stderr was not piped")))?;
 
-    let (status, _stdout, stderr) = tokio::try_join!(
-        child.wait(),
-        read_limited_command_output(stdout, output_max_bytes),
-        read_limited_command_output(stderr, output_max_bytes)
-    )?;
+    let stdout_task = tokio::spawn(read_limited_command_output(stdout, output_max_bytes));
+    let stderr_task = tokio::spawn(read_limited_command_output(stderr, output_max_bytes));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(AgentError::Io(error));
+        }
+        Err(_) => {
+            let kill_error = kill_timed_out_child(&mut child);
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let mut message = format!(
+                "{command_label} timed out after {}",
+                command_timeout_label(timeout)
+            );
+            if let Some(error) = kill_error {
+                message.push_str(&format!("; failed to kill timed-out child: {error}"));
+            }
+            return Err(AgentError::WireGuard(message));
+        }
+    };
+
+    let _stdout = collect_command_output_task(stdout_task).await?;
+    let stderr = collect_command_output_task(stderr_task).await?;
 
     Ok(BoundedCommandOutput { status, stderr })
+}
+
+fn configure_command_process_group(_command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        _command.process_group(0);
+    }
+}
+
+fn kill_timed_out_child(child: &mut tokio::process::Child) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id() {
+        match kill_process_group(pid) {
+            Ok(()) => return None,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => return None,
+            Err(group_error) => {
+                return match child.start_kill() {
+                    Ok(()) => Some(format!(
+                        "process group {pid}: {group_error}; direct child kill succeeded"
+                    )),
+                    Err(child_error) => Some(format!(
+                        "process group {pid}: {group_error}; direct child: {child_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    child.start_kill().err().map(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    let pgid: i32 = pid
+        .try_into()
+        .map_err(|_| std::io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+}
+
+async fn collect_command_output_task(
+    task: tokio::task::JoinHandle<std::io::Result<LimitedCommandOutput>>,
+) -> Result<LimitedCommandOutput, AgentError> {
+    match task.await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(AgentError::Io(error)),
+        Err(error) => Err(AgentError::WireGuard(format!(
+            "command output reader task failed: {error}"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -1696,25 +2393,7 @@ where
     }
 
     fn upsert_command(&self, config: &WireGuardPeerConfig) -> LinuxCommand {
-        let mut args = vec![
-            "set".to_string(),
-            self.interface.clone(),
-            "peer".to_string(),
-            config.public_key.clone(),
-        ];
-        if !config.allowed_ips.is_empty() {
-            args.push("allowed-ips".to_string());
-            args.push(config.allowed_ips.join(","));
-        }
-        if let Some(endpoint) = &config.endpoint {
-            args.push("endpoint".to_string());
-            args.push(endpoint.clone());
-        }
-        if let Some(keepalive) = config.persistent_keepalive_seconds {
-            args.push("persistent-keepalive".to_string());
-            args.push(keepalive.to_string());
-        }
-        LinuxCommand::new("wg", args)
+        wireguard_upsert_peer_command(&self.interface, config)
     }
 }
 
@@ -1741,20 +2420,95 @@ where
             .cloned()
             .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
         self.runner
-            .run(LinuxCommand::new(
-                "wg",
-                [
-                    "set",
-                    self.interface.as_str(),
-                    "peer",
-                    public_key.as_str(),
-                    "remove",
-                ],
-            ))
+            .run(wireguard_remove_peer_command(&self.interface, &public_key))
             .await?;
         self.peer_public_keys.write().await.remove(peer);
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub struct UserspaceWireGuardBackend<R> {
+    interface: String,
+    runner: R,
+    peer_public_keys: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
+}
+
+impl<R> UserspaceWireGuardBackend<R>
+where
+    R: LinuxCommandRunner,
+{
+    pub fn new(interface: impl Into<String>, runner: R) -> Self {
+        Self {
+            interface: interface.into(),
+            runner,
+            peer_public_keys: tokio::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn ensure_interface(&self) -> Result<(), AgentError> {
+        self.runner
+            .run(LinuxCommand::new("wg", ["show", self.interface.as_str()]))
+            .await
+    }
+}
+
+#[async_trait]
+impl<R> WireGuardBackend for UserspaceWireGuardBackend<R>
+where
+    R: LinuxCommandRunner,
+{
+    async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_upsert_peer_command(&self.interface, &config))
+            .await?;
+        self.peer_public_keys
+            .write()
+            .await
+            .insert(config.peer, config.public_key);
+        Ok(())
+    }
+
+    async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError> {
+        let public_key = self
+            .peer_public_keys
+            .read()
+            .await
+            .get(peer)
+            .cloned()
+            .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        self.runner
+            .run(wireguard_remove_peer_command(&self.interface, &public_key))
+            .await?;
+        self.peer_public_keys.write().await.remove(peer);
+        Ok(())
+    }
+}
+
+fn wireguard_upsert_peer_command(interface: &str, config: &WireGuardPeerConfig) -> LinuxCommand {
+    let mut args = vec![
+        "set".to_string(),
+        interface.to_string(),
+        "peer".to_string(),
+        config.public_key.clone(),
+    ];
+    if !config.allowed_ips.is_empty() {
+        args.push("allowed-ips".to_string());
+        args.push(config.allowed_ips.join(","));
+    }
+    if let Some(endpoint) = &config.endpoint {
+        args.push("endpoint".to_string());
+        args.push(endpoint.clone());
+    }
+    if let Some(keepalive) = config.persistent_keepalive_seconds {
+        args.push("persistent-keepalive".to_string());
+        args.push(keepalive.to_string());
+    }
+    LinuxCommand::new("wg", args)
+}
+
+fn wireguard_remove_peer_command(interface: &str, public_key: &str) -> LinuxCommand {
+    LinuxCommand::new("wg", ["set", interface, "peer", public_key, "remove"])
 }
 
 #[derive(Debug)]
@@ -2124,7 +2878,8 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
             PathState::Unreachable => Ok(None),
             _ => Ok(path
                 .selected_candidate
-                .map(|candidate| candidate.addr.to_string())
+                .as_ref()
+                .and_then(|candidate| wireguard_endpoint_for_candidate(candidate, &peer.node_id))
                 .or_else(|| preferred_endpoint(peer))),
         }
     }
@@ -2135,6 +2890,7 @@ pub struct PeerMapApplySummary {
     pub peers_applied: usize,
     pub peers_removed: usize,
     pub routes_applied: usize,
+    pub routes_removed: usize,
 }
 
 #[derive(Debug)]
@@ -2145,6 +2901,7 @@ pub struct PeerMapApplier<W, R> {
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
     lazy_runtime: Option<Arc<AgentRuntime>>,
     applied_peers: tokio::sync::RwLock<BTreeSet<NodeId>>,
+    applied_routes: tokio::sync::RwLock<BTreeMap<NodeId, Vec<Route>>>,
 }
 
 impl<W, R> PeerMapApplier<W, R>
@@ -2160,6 +2917,7 @@ where
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
             lazy_runtime: None,
             applied_peers: tokio::sync::RwLock::new(BTreeSet::new()),
+            applied_routes: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -2207,17 +2965,38 @@ where
         peers_to_remove.extend(stale_peers);
 
         let mut peers_removed = 0;
+        let mut routes_removed = 0;
         for peer in peers_to_remove {
             let was_applied = self.applied_peers.read().await.contains(&peer);
             if !was_applied {
                 continue;
             }
+            let routes_to_remove = self
+                .applied_routes
+                .read()
+                .await
+                .get(&peer)
+                .cloned()
+                .unwrap_or_default();
+            if !routes_to_remove.is_empty() {
+                self.route_manager
+                    .remove_routes(RoutePlan {
+                        interface: self.interface.clone(),
+                        routes: routes_to_remove.clone(),
+                        policy_rules: Vec::new(),
+                    })
+                    .await?;
+                routes_removed += routes_to_remove.len();
+                self.applied_routes.write().await.remove(&peer);
+            }
             self.wireguard.remove_peer(&peer).await?;
             self.applied_peers.write().await.remove(&peer);
+            self.applied_routes.write().await.remove(&peer);
             peers_removed += 1;
         }
 
         let mut routes = Vec::new();
+        let mut peer_routes = BTreeMap::new();
         let mut peers_applied = 0;
 
         for peer in peer_map.peers {
@@ -2244,8 +3023,33 @@ where
                 .insert(peer.node_id.clone());
             peers_applied += 1;
 
-            routes.push(peer_host_route(&peer)?);
-            routes.extend(peer.routes);
+            let desired_routes = peer_routes_for_record(&peer)?;
+            let routes_to_remove = self
+                .applied_routes
+                .read()
+                .await
+                .get(&peer.node_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|route| !desired_routes.contains(route))
+                .collect::<Vec<_>>();
+            if !routes_to_remove.is_empty() {
+                self.route_manager
+                    .remove_routes(RoutePlan {
+                        interface: self.interface.clone(),
+                        routes: routes_to_remove.clone(),
+                        policy_rules: Vec::new(),
+                    })
+                    .await?;
+                routes_removed += routes_to_remove.len();
+                if let Some(applied) = self.applied_routes.write().await.get_mut(&peer.node_id) {
+                    applied.retain(|route| !routes_to_remove.contains(route));
+                }
+            }
+
+            routes.extend(desired_routes.iter().cloned());
+            peer_routes.insert(peer.node_id.clone(), desired_routes);
         }
 
         let routes_applied = routes.len();
@@ -2257,12 +3061,17 @@ where
                     policy_rules: Vec::new(),
                 })
                 .await?;
+            let mut applied_routes = self.applied_routes.write().await;
+            for (peer, routes) in peer_routes {
+                applied_routes.insert(peer, routes);
+            }
         }
 
         Ok(PeerMapApplySummary {
             peers_applied,
             peers_removed,
             routes_applied,
+            routes_removed,
         })
     }
 }
@@ -2328,17 +3137,51 @@ fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
     })
 }
 
+fn peer_routes_for_record(peer: &NodeRecord) -> Result<Vec<Route>, AgentError> {
+    let mut routes = vec![peer_host_route(peer)?];
+    routes.extend(peer_owned_advertised_routes(peer).cloned());
+    Ok(routes)
+}
+
+fn peer_owned_advertised_routes(peer: &NodeRecord) -> impl Iterator<Item = &Route> {
+    peer.routes
+        .iter()
+        .filter(|route| route.advertised_by == peer.node_id)
+}
+
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
     peer.endpoint_candidates
         .iter()
-        .filter_map(|candidate| candidate_kind_rank(candidate.kind).map(|rank| (rank, candidate)))
-        .min_by(|(left_rank, left), (right_rank, right)| {
+        .filter_map(|candidate| ranked_wireguard_endpoint_for_candidate(candidate, &peer.node_id))
+        .min_by(|(left_rank, left, _), (right_rank, right, _)| {
             left_rank
                 .cmp(right_rank)
                 .then_with(|| left.cost.cmp(&right.cost))
                 .then_with(|| right.priority.cmp(&left.priority))
         })
-        .map(|(_, candidate)| candidate.addr.to_string())
+        .map(|(_, _, endpoint)| endpoint)
+}
+
+fn wireguard_endpoint_for_candidate(
+    candidate: &EndpointCandidate,
+    peer_id: &NodeId,
+) -> Option<String> {
+    ranked_wireguard_endpoint_for_candidate(candidate, peer_id).map(|(_, _, endpoint)| endpoint)
+}
+
+fn ranked_wireguard_endpoint_for_candidate<'a>(
+    candidate: &'a EndpointCandidate,
+    peer_id: &NodeId,
+) -> Option<(u8, &'a EndpointCandidate, String)> {
+    let rank = candidate_kind_rank(candidate.kind)?;
+    if &candidate.node_id != peer_id
+        || candidate.validate_kind_address().is_err()
+        || !endpoint_addr_is_usable(candidate.addr)
+    {
+        return None;
+    }
+
+    Some((rank, candidate, candidate.addr.to_string()))
 }
 
 fn candidate_kind_rank(kind: EndpointCandidateKind) -> Option<u8> {
@@ -2392,16 +3235,15 @@ impl LazyConnectManager {
         self.remove_observed_peer(&peer.node_id);
         self.peer_vpn_ips
             .insert(peer.vpn_ip.0, peer.node_id.clone());
-        let routes = peer
-            .routes
-            .iter()
+        let routes = peer_owned_advertised_routes(peer)
             .map(|route| route.cidr)
             .collect::<Vec<_>>();
+        let has_owned_routes = !routes.is_empty();
         if !routes.is_empty() {
             self.advertised_routes.insert(peer.node_id.clone(), routes);
         }
 
-        if self.is_pinned_by_policy(&peer.role, &peer.tags) || !peer.routes.is_empty() {
+        if self.is_pinned_by_policy(&peer.role, &peer.tags) || has_owned_routes {
             self.pin_peer(peer.node_id.clone());
         }
     }
@@ -2482,6 +3324,15 @@ impl LazyConnectManager {
 #[derive(Debug, Clone)]
 pub struct PathSelector;
 
+const DIRECT_PROMOTION_SCORE_MARGIN: f32 = 5.0;
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
+
 impl PathSelector {
     pub fn best_path(paths: &[PathRecord]) -> Option<PathRecord> {
         paths
@@ -2494,7 +3345,7 @@ impl PathSelector {
     pub fn should_promote(current: &PathRecord, candidate: &PathRecord) -> bool {
         candidate.selected_state.is_direct()
             && current.selected_state == PathState::Relay
-            && candidate.score.value > current.score.value
+            && candidate.score.value >= current.score.value + DIRECT_PROMOTION_SCORE_MARGIN
     }
 }
 
@@ -2508,6 +3359,8 @@ fn compare_score(left: &PathScore, right: &PathScore) -> std::cmp::Ordering {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
 
     use chrono::Duration as ChronoDuration;
     use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
@@ -2517,6 +3370,7 @@ mod tests {
     use ipars_stun::{BindingStunServer, Rfc5780StunServer};
     use ipars_types::api::{
         AgentPacketFlowConntrackStatus, AgentPacketFlowTcpState, RelayAdmissionRequest,
+        PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
     };
     use ipars_types::{
         CandidateSource, ClusterId, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy,
@@ -2631,14 +3485,126 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn timed_system_command_runner_times_out() {
-        let runner = TimedSystemCommandRunner::new(Duration::from_millis(10));
-        let error = match runner.run(LinuxCommand::new("sh", ["-c", "sleep 1"])).await {
+    async fn timed_system_command_runner_rejects_invalid_command_vectors() {
+        let runner = TimedSystemCommandRunner::new(Duration::from_secs(1));
+
+        let error = match runner.run(LinuxCommand::new("", ["show"])).await {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("program cannot be empty"));
+
+        let error = match runner
+            .run(LinuxCommand::new("wg", ["show\0bad".to_string()]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("argument 0 must not contain NUL bytes"));
+
+        let error = match runner
+            .run(LinuxCommand::new(
+                "wg",
+                std::iter::repeat_n("show", MAX_LINUX_COMMAND_ARGS + 1),
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("too many arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_rejects_invalid_runtime_bounds() {
+        let error = match TimedSystemCommandRunner::new(Duration::ZERO)
+            .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("timeout must be greater than zero"));
+
+        let error = match TimedSystemCommandRunner::new(
+            MAX_SYSTEM_COMMAND_TIMEOUT + Duration::from_secs(1),
+        )
+        .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timeout must not exceed 3600s"));
+
+        let error = match TimedSystemCommandRunner::with_output_max_bytes(Duration::from_secs(1), 0)
+            .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must be greater than zero"));
+
+        let error = match TimedSystemCommandRunner::with_output_max_bytes(
+            Duration::from_secs(1),
+            MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES + 1,
+        )
+        .run(LinuxCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must not exceed 1048576"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_system_command_runner_times_out_and_reaps_child() -> Result<(), AgentError> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-agent-command-timeout-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let grandchild_pid_path = temp_dir.join("grandchild.pid");
+        let script = format!(
+            "printf '%s\\n' $$ > {}; sleep 60 & printf '%s\\n' $! > {}; wait",
+            pid_path.display(),
+            grandchild_pid_path.display()
+        );
+        let runner = TimedSystemCommandRunner::new(Duration::from_millis(100));
+        let error = match runner.run(LinuxCommand::new("sh", ["-c", &script])).await {
             Ok(()) => panic!("command should time out"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("timed out after 10ms"));
+        assert!(error.to_string().contains("timed out after 100ms"));
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(1)).await?;
+        let grandchild_pid =
+            wait_for_pid_file(&grandchild_pid_path, Duration::from_secs(1)).await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "timed-out command child process {pid} was left running"
+        );
+        assert!(
+            wait_for_process_absent(grandchild_pid, Duration::from_secs(2)).await,
+            "timed-out command grandchild process {grandchild_pid} was left running"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2681,6 +3647,45 @@ mod tests {
                 ],
             ))
             .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid_file(path: &Path, timeout: Duration) -> Result<u32, AgentError> {
+        let started = Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        return contents.parse::<u32>().map_err(|error| {
+                            AgentError::WireGuard(format!("failed to parse child pid: {error}"))
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(AgentError::Io(error)),
+            }
+            if started.elapsed() >= timeout {
+                return Err(AgentError::WireGuard(format!(
+                    "timed out waiting for child pid file {}",
+                    path.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let process_path = Path::new("/proc").join(pid.to_string());
+        while started.elapsed() < timeout {
+            if !process_path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !process_path.exists()
     }
 
     #[derive(Debug, Default)]
@@ -2774,6 +3779,53 @@ mod tests {
         }
     }
 
+    fn wireguard_transport_payload_with_len(len: usize, fill: u8) -> Vec<u8> {
+        assert!(len >= 32);
+        assert!(len.is_multiple_of(16));
+        let mut payload = vec![fill; len];
+        payload[..4].copy_from_slice(&4_u32.to_le_bytes());
+        payload
+    }
+
+    fn wireguard_transport_payload(fill: u8) -> Vec<u8> {
+        wireguard_transport_payload_with_len(32, fill)
+    }
+
+    fn oversized_wireguard_transport_payload(fill: u8) -> Vec<u8> {
+        let len = ((MAX_FORWARDER_UDP_PAYLOAD_BYTES / 16) + 1) * 16;
+        wireguard_transport_payload_with_len(len, fill)
+    }
+
+    #[test]
+    fn relay_forwarder_sender_match_allows_unspecified_wireguard_address() {
+        let observed_v4 = SocketAddr::from(([127, 0, 0, 1], 51_820));
+        let observed_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 51_820));
+        assert!(wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_820)),
+            observed_v4
+        ));
+        assert!(wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 51_820)),
+            observed_v6
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_821)),
+            observed_v4
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0], 51_820)),
+            observed_v6
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 51_820)),
+            observed_v4
+        ));
+        assert!(!wireguard_sender_matches_configured(
+            SocketAddr::from(([127, 0, 0, 2], 51_820)),
+            observed_v4
+        ));
+    }
+
     #[derive(Debug, Clone)]
     struct RecordingPeerMapSink {
         summary: PeerMapApplySummary,
@@ -2816,18 +3868,89 @@ mod tests {
     }
 
     #[test]
-    fn lazy_manager_does_not_auto_pin_relay_candidates() -> Result<(), Box<dyn std::error::Error>> {
+    fn lazy_manager_pins_default_important_peer_classes() {
         let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let mut control_plane = peer_record(
+            NodeId::from_string("control-plane-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
+            "wg-control-plane",
+            Vec::new(),
+            Vec::new(),
+        );
+        control_plane.role = Role::control_plane();
+        let mut route_provider = peer_record(
+            NodeId::from_string("route-provider-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 21)),
+            "wg-route-provider",
+            Vec::new(),
+            Vec::new(),
+        );
+        route_provider.tags.insert(Tag::route_provider());
+        let mut kubernetes_control_plane = peer_record(
+            NodeId::from_string("kubernetes-control-plane-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 22)),
+            "wg-kubernetes-control-plane",
+            Vec::new(),
+            Vec::new(),
+        );
+        kubernetes_control_plane
+            .tags
+            .insert(Tag::kubernetes_control_plane());
         let mut relay = peer_record(
             NodeId::from_string("relay-a"),
-            "100.64.0.10".parse()?,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 23)),
             "wg-relay",
             Vec::new(),
             Vec::new(),
         );
-        relay.relay_capability = Some(ipars_types::RelayCapability {
+        relay.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
-            public_endpoint: Some("203.0.113.10:51820".parse()?),
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 3478))),
+            admission_url: Some("https://relay-a.example.test/v1/sessions".to_string()),
+            max_sessions: 100,
+            active_sessions: 10,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let ordinary = peer_record(
+            NodeId::from_string("ordinary-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 24)),
+            "wg-ordinary",
+            Vec::new(),
+            Vec::new(),
+        );
+
+        for peer in [
+            &control_plane,
+            &route_provider,
+            &kubernetes_control_plane,
+            &relay,
+            &ordinary,
+        ] {
+            manager.observe_peer(peer);
+        }
+
+        assert!(manager.should_connect_peer(&control_plane));
+        assert!(manager.should_connect_peer(&route_provider));
+        assert!(manager.should_connect_peer(&kubernetes_control_plane));
+        assert!(!manager.should_connect_peer(&relay));
+        assert!(!manager.should_connect_peer(&ordinary));
+        assert_eq!(manager.metrics().pinned_peer_count, 3);
+    }
+
+    #[test]
+    fn lazy_manager_does_not_auto_pin_relay_candidates() {
+        let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let mut relay = peer_record(
+            NodeId::from_string("relay-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-relay",
+            Vec::new(),
+            Vec::new(),
+        );
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
             admission_url: Some("http://203.0.113.10:9580".to_string()),
             max_sessions: 1024,
             active_sessions: 0,
@@ -2840,7 +3963,6 @@ mod tests {
         assert!(!manager.should_connect_peer(&relay));
         assert_eq!(manager.metrics().observed_peer_vpn_ip_count, 1);
         assert_eq!(manager.metrics().pinned_peer_count, 0);
-        Ok(())
     }
 
     #[test]
@@ -2852,9 +3974,126 @@ mod tests {
     }
 
     #[test]
+    fn selector_keeps_relay_when_direct_score_gain_is_too_small() {
+        let relay = path("peer-a", PathState::Relay, 70.0);
+        let direct = path("peer-a", PathState::DirectNatTraversal, 74.9);
+
+        assert!(!PathSelector::should_promote(&relay, &direct));
+    }
+
+    #[test]
     fn score_helper_keeps_metrics_type_in_scope() {
         let score = PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0);
         assert!(score.value > 0.0);
+    }
+
+    #[test]
+    fn preferred_endpoint_skips_invalid_or_unusable_direct_candidates() {
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-a",
+            vec![
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::Ipv6,
+                    addr: SocketAddr::from(([198, 51, 100, 10], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: NodeId::from_string("wrong-owner"),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 11], 0)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                },
+                EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::StunReflexive,
+                    addr: SocketAddr::from(([198, 51, 100, 20], 51820)),
+                    observed_at: Utc::now(),
+                    priority: 10,
+                    cost: 50,
+                    source: CandidateSource::StunProbe,
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            preferred_endpoint(&peer).as_deref(),
+            Some("198.51.100.20:51820")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_endpoint_resolver_falls_back_when_selected_candidate_is_unusable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: Some(EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([203, 0, 113, 10], 0)),
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::ControlPlane,
+                }),
+                relay_node: None,
+                score: PathScore {
+                    value: 100.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await;
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            "wg-peer-a",
+            vec![EndpointCandidate {
+                node_id: NodeId::from_string("peer-a"),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+
+        let endpoint = RuntimePeerEndpointResolver::new(runtime)
+            .endpoint_for_peer(&peer)
+            .await?;
+
+        assert_eq!(endpoint.as_deref(), Some("203.0.113.20:51820"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -2870,6 +4109,52 @@ mod tests {
         runtime.upsert_path_state(latest.clone()).await;
 
         assert_eq!(runtime.path_state().await, vec![latest]);
+    }
+
+    #[tokio::test]
+    async fn runtime_direct_path_state_clears_relay_session_and_forwarder_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local, peer.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore {
+                    value: 110.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await;
+
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
     #[tokio::test]
@@ -2903,10 +4188,28 @@ mod tests {
         assert!(metrics.relay_forwarders.is_empty());
         assert_eq!(
             metrics.path_state_counts,
-            vec![PathStateCount {
-                state: PathState::DirectPublic,
-                count: 1,
-            }]
+            vec![
+                PathStateCount {
+                    state: PathState::DirectPublic,
+                    count: 1,
+                },
+                PathStateCount {
+                    state: PathState::DirectIpv6,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::DirectNatTraversal,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::Relay,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::Unreachable,
+                    count: 0,
+                },
+            ]
         );
     }
 
@@ -2967,6 +4270,11 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "jitter_ms=5.0"));
+        assert!(path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "stability=0.80"));
         assert_eq!(runtime.metrics().await.path_probe_record_count, 1);
         assert!(runtime.should_connect_peer(&peer).await);
         assert_eq!(
@@ -2985,12 +4293,20 @@ mod tests {
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_success();
-        runtime.record_relay_admission_failure();
+        runtime.record_relay_admission_failure_reason(
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+        );
 
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_eq!(metrics.relay_admission_failure_reason_counts.len(), 1);
+        assert_eq!(
+            metrics.relay_admission_failure_reason_counts[0].reason,
+            AgentRelayAdmissionFailureReason::InvalidResponse
+        );
+        assert_eq!(metrics.relay_admission_failure_reason_counts[0].count, 1);
     }
 
     #[tokio::test]
@@ -3018,6 +4334,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_purges_expired_relay_sessions_and_forwarder_state() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        let active_peer = NodeId::from_string("peer-active");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: active_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 21], 40000)),
+                session_id: "session-active".to_string(),
+                session_token: "secret-active".to_string(),
+                expires_at: now + ChronoDuration::seconds(60),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                active_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50001)),
+            )
+            .await;
+
+        let removed = runtime.purge_expired_relay_sessions(now).await;
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].peer, expired_peer);
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+        assert!(runtime.relay_session(&active_peer).await.is_some());
+        assert_eq!(
+            runtime.relay_forwarder_endpoint(&active_peer).await,
+            Some(SocketAddr::from(([127, 0, 0, 1], 50001)))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_metrics_exclude_expired_relay_sessions() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        let metrics = runtime.metrics().await;
+
+        assert_eq!(metrics.relay_session_count, 0);
+        assert_eq!(metrics.relay_forwarder_count, 0);
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_active_relay_session_removes_expired_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(runtime.active_relay_session(&peer, now).await.is_none());
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_relay_session_accessor_excludes_expired_sessions() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let expired_peer = NodeId::from_string("peer-expired");
+        let active_peer = NodeId::from_string("peer-active");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: expired_peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        let active_session = RelaySessionState {
+            peer: active_peer.clone(),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+            admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+            admitted_peer_addr: SocketAddr::from(([198, 51, 100, 21], 40000)),
+            session_id: "session-active".to_string(),
+            session_token: "secret-active".to_string(),
+            expires_at: now + ChronoDuration::seconds(60),
+        };
+        runtime.upsert_relay_session(active_session.clone()).await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                expired_peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(runtime.relay_session(&expired_peer).await.is_none());
+        assert!(runtime
+            .relay_forwarder_endpoint(&expired_peer)
+            .await
+            .is_none());
+        assert_eq!(runtime.relay_sessions().await, vec![active_session.clone()]);
+        assert_eq!(
+            runtime.relay_session(&active_peer).await,
+            Some(active_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_renewal_check_purges_expired_relay_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-expired".to_string(),
+                session_token: "secret-expired".to_string(),
+                expires_at: now - ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
+            .await;
+
+        assert!(
+            runtime
+                .relay_session_needs_renewal(
+                    &peer,
+                    &NodeId::from_string("relay-a"),
+                    now,
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        );
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_relay_forwarder_endpoint_uses_supplied_time_for_expiry() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let now = Utc::now();
+        let local_id = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        let relay_node = NodeId::from_string("relay-a");
+        let forwarder_endpoint = SocketAddr::from(([127, 0, 0, 1], 50000));
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(relay_node.clone()),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: now,
+                pinned: false,
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node,
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 20], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "secret-a".to_string(),
+                expires_at: now + ChronoDuration::seconds(1),
+            })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(peer.clone(), forwarder_endpoint)
+            .await;
+
+        assert_eq!(
+            runtime
+                .relay_forwarder_endpoint_for_peer(&peer, now, None)
+                .await,
+            Some(forwarder_endpoint)
+        );
+        assert_eq!(
+            runtime
+                .relay_forwarder_endpoint_for_peer(&peer, now + ChronoDuration::seconds(2), None)
+                .await,
+            None
+        );
+        assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
     async fn runtime_renews_relay_sessions_before_expiry_or_relay_change() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -3036,6 +4633,12 @@ mod tests {
                 session_token: "secret".to_string(),
                 expires_at: now + ChronoDuration::seconds(120),
             })
+            .await;
+        runtime
+            .upsert_relay_forwarder_endpoint(
+                peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 50000)),
+            )
             .await;
 
         assert!(
@@ -3070,6 +4673,7 @@ mod tests {
         );
         assert!(runtime.remove_relay_session(&peer).await.is_some());
         assert!(runtime.relay_session(&peer).await.is_none());
+        assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
     #[tokio::test]
@@ -3117,8 +4721,9 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let relay_task = tokio::spawn(relay.serve(service.table(), shutdown_rx));
 
+        let outbound_payload = wireguard_transport_payload(0xa1);
         forwarder
-            .send_to_relay(&left_socket, b"opaque-wireguard-packet")
+            .send_to_relay(&left_socket, &outbound_payload)
             .await?;
         let mut buffer = [0_u8; 128];
         let (len, _peer) = tokio::time::timeout(
@@ -3127,10 +4732,257 @@ mod tests {
         )
         .await??;
 
-        assert_eq!(&buffer[..len], b"opaque-wireguard-packet");
+        assert_eq!(&buffer[..len], outbound_payload.as_slice());
         shutdown_tx.send(true)?;
         relay_task.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_drops_expired_session_datagrams_without_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let wireguard_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_addr = relay_receiver.local_addr()?;
+        let wireguard_addr = wireguard_receiver.local_addr()?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            relay_addr,
+            forwarder_socket.local_addr()?,
+        ));
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: relay_addr,
+                admitted_local_addr: forwarder_socket.local_addr()?,
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_000)),
+                session_id: "expired-session".to_string(),
+                session_token: "expired-token".to_string(),
+                expires_at: Utc::now() - ChronoDuration::seconds(1),
+            },
+            wireguard_addr,
+        )
+        .with_metrics(stats.clone());
+
+        let outbound_payload = wireguard_transport_payload(0xe1);
+        assert_eq!(
+            forwarder
+                .send_to_relay(&forwarder_socket, &outbound_payload)
+                .await?,
+            0
+        );
+        let inbound_payload = wireguard_transport_payload(0xe2);
+        assert_eq!(
+            forwarder
+                .forward_to_wireguard(&forwarder_socket, &inbound_payload)
+                .await?,
+            0
+        );
+        let mut buffer = [0_u8; 128];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            relay_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wireguard_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.outbound_packets, 0);
+        assert_eq!(snapshot.inbound_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_expired_session_packets, 1);
+        assert_eq!(
+            snapshot.outbound_dropped_expired_session_payload_bytes,
+            outbound_payload.len() as u64
+        );
+        assert_eq!(snapshot.inbound_dropped_expired_session_packets, 1);
+        assert_eq!(
+            snapshot.inbound_dropped_expired_session_payload_bytes,
+            inbound_payload.len() as u64
+        );
+        assert!(snapshot.last_forwarded_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_drops_oversized_datagrams_without_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let wireguard_receiver =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_addr = relay_receiver.local_addr()?;
+        let wireguard_addr = wireguard_receiver.local_addr()?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            relay_addr,
+            forwarder_socket.local_addr()?,
+        ));
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: relay_addr,
+                admitted_local_addr: forwarder_socket.local_addr()?,
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_001)),
+                session_id: "left:right".to_string(),
+                session_token: "active-token".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            },
+            wireguard_addr,
+        )
+        .with_metrics(stats.clone());
+
+        let outbound_payload = oversized_wireguard_transport_payload(0xe3);
+        let outbound_datagram_bytes = forwarder.encode_outbound(&outbound_payload)?.len();
+        assert!(outbound_datagram_bytes > MAX_FORWARDER_UDP_PAYLOAD_BYTES);
+        assert_eq!(
+            forwarder
+                .send_to_relay(&forwarder_socket, &outbound_payload)
+                .await?,
+            0
+        );
+        let inbound_payload = oversized_wireguard_transport_payload(0xe4);
+        assert_eq!(
+            forwarder
+                .forward_to_wireguard(&forwarder_socket, &inbound_payload)
+                .await?,
+            0
+        );
+        let mut buffer = [0_u8; 128];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            relay_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wireguard_receiver.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.outbound_packets, 0);
+        assert_eq!(snapshot.inbound_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_oversized_packets, 1);
+        assert_eq!(
+            snapshot.outbound_dropped_oversized_payload_bytes,
+            outbound_payload.len() as u64
+        );
+        assert_eq!(
+            snapshot.outbound_dropped_oversized_datagram_bytes,
+            outbound_datagram_bytes as u64
+        );
+        assert_eq!(snapshot.inbound_dropped_oversized_packets, 1);
+        assert_eq!(
+            snapshot.inbound_dropped_oversized_payload_bytes,
+            inbound_payload.len() as u64
+        );
+        assert!(snapshot.last_forwarded_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_frame_forwarder_records_socket_errors_without_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let forwarder_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let stats = Arc::new(RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            forwarder_socket.local_addr()?,
+        ));
+        let forwarder = UdpRelayFrameForwarder::new(
+            RelaySessionState {
+                peer: NodeId::from_string("right"),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
+                admitted_local_addr: forwarder_socket.local_addr()?,
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_002)),
+                session_id: "left:right".to_string(),
+                session_token: "active-token".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            },
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .with_metrics(stats.clone());
+
+        let outbound_payload = wireguard_transport_payload(0xe5);
+        let outbound_datagram_bytes = forwarder.encode_outbound(&outbound_payload)?.len();
+        assert_eq!(
+            forwarder
+                .send_to_relay(&forwarder_socket, &outbound_payload)
+                .await?,
+            0
+        );
+        let inbound_payload = wireguard_transport_payload(0xe6);
+        assert_eq!(
+            forwarder
+                .forward_to_wireguard(&forwarder_socket, &inbound_payload)
+                .await?,
+            0
+        );
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.outbound_packets, 0);
+        assert_eq!(snapshot.inbound_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_socket_error_packets, 1);
+        assert_eq!(
+            snapshot.outbound_dropped_socket_error_payload_bytes,
+            outbound_payload.len() as u64
+        );
+        assert_eq!(
+            snapshot.outbound_dropped_socket_error_datagram_bytes,
+            outbound_datagram_bytes as u64
+        );
+        assert_eq!(snapshot.inbound_dropped_socket_error_packets, 1);
+        assert_eq!(
+            snapshot.inbound_dropped_socket_error_payload_bytes,
+            inbound_payload.len() as u64
+        );
+        assert!(snapshot.last_forwarded_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn relay_frame_forwarder_counts_recoverable_receive_errors() {
+        let stats = RelayForwarderStats::new(
+            NodeId::from_string("right"),
+            NodeId::from_string("relay-a"),
+            SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            SocketAddr::from(([127, 0, 0, 1], 52_000)),
+        );
+
+        assert!(recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!recoverable_udp_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+
+        stats.record_socket_receive_error();
+        stats.record_socket_receive_error();
+        assert_eq!(stats.snapshot().socket_receive_errors, 2);
     }
 
     #[tokio::test]
@@ -3144,6 +4996,8 @@ mod tests {
         let wireguard_socket =
             tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let wireguard_addr = wireguard_socket.local_addr()?;
+        let unexpected_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let peer_socket =
             tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let peer_addr = peer_socket.local_addr()?;
@@ -3193,20 +5047,56 @@ mod tests {
         let forwarder_task = tokio::spawn(forwarder.serve(forwarder_socket, forwarder_shutdown_rx));
 
         wireguard_socket
-            .send_to(b"opaque-wireguard-outbound", forwarder_addr)
+            .send_to(b"not-wireguard", forwarder_addr)
             .await?;
         let mut buffer = [0_u8; 128];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let unexpected_source_payload = wireguard_transport_payload(0xd1);
+        unexpected_socket
+            .send_to(&unexpected_source_payload, forwarder_addr)
+            .await?;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let outbound_payload = wireguard_transport_payload(0xb1);
+        wireguard_socket
+            .send_to(&outbound_payload, forwarder_addr)
+            .await?;
         let (len, _peer) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             peer_socket.recv_from(&mut buffer),
         )
         .await??;
-        assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
+        assert_eq!(&buffer[..len], outbound_payload.as_slice());
 
         let datagram = encode_relay_datagram(
             &admission.session_id,
             &admission.session_token,
-            b"opaque-wireguard-inbound",
+            b"not-wireguard-inbound",
+        )?;
+        peer_socket.send_to(&datagram, relay_addr).await?;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wireguard_socket.recv_from(&mut buffer)
+        )
+        .await
+        .is_err());
+
+        let inbound_payload = wireguard_transport_payload(0xc1);
+        let datagram = encode_relay_datagram(
+            &admission.session_id,
+            &admission.session_token,
+            &inbound_payload,
         )?;
         peer_socket.send_to(&datagram, relay_addr).await?;
         let (len, _peer) = tokio::time::timeout(
@@ -3214,18 +5104,27 @@ mod tests {
             wireguard_socket.recv_from(&mut buffer),
         )
         .await??;
-        assert_eq!(&buffer[..len], b"opaque-wireguard-inbound");
+        assert_eq!(&buffer[..len], inbound_payload.as_slice());
         let stats = stats.snapshot();
         assert_eq!(stats.outbound_packets, 1);
-        assert_eq!(
-            stats.outbound_payload_bytes,
-            b"opaque-wireguard-outbound".len() as u64
-        );
+        assert_eq!(stats.outbound_payload_bytes, outbound_payload.len() as u64);
         assert!(stats.outbound_datagram_bytes > stats.outbound_payload_bytes);
-        assert_eq!(stats.inbound_packets, 1);
+        assert_eq!(stats.outbound_dropped_unexpected_source_packets, 1);
         assert_eq!(
-            stats.inbound_payload_bytes,
-            b"opaque-wireguard-inbound".len() as u64
+            stats.outbound_dropped_unexpected_source_payload_bytes,
+            unexpected_source_payload.len() as u64
+        );
+        assert_eq!(stats.outbound_dropped_non_wireguard_packets, 1);
+        assert_eq!(
+            stats.outbound_dropped_non_wireguard_payload_bytes,
+            b"not-wireguard".len() as u64
+        );
+        assert_eq!(stats.inbound_packets, 1);
+        assert_eq!(stats.inbound_payload_bytes, inbound_payload.len() as u64);
+        assert_eq!(stats.inbound_dropped_non_wireguard_packets, 1);
+        assert_eq!(
+            stats.inbound_dropped_non_wireguard_payload_bytes,
+            b"not-wireguard-inbound".len() as u64
         );
         assert!(stats.last_forwarded_at.is_some());
 
@@ -3336,6 +5235,50 @@ mod tests {
         assert_eq!(
             runner.commands().await,
             vec![
+                LinuxCommand::new(
+                    "wg",
+                    [
+                        "set",
+                        "ipars0",
+                        "peer",
+                        "peer-public",
+                        "allowed-ips",
+                        "100.64.0.2/32",
+                        "endpoint",
+                        "203.0.113.10:51820",
+                        "persistent-keepalive",
+                        "25",
+                    ],
+                ),
+                LinuxCommand::new("wg", ["set", "ipars0", "peer", "peer-public", "remove"],),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_backend_skips_kernel_interface_creation() -> Result<(), AgentError>
+    {
+        let runner = RecordingRunner::default();
+        let backend = UserspaceWireGuardBackend::new("ipars0", runner.clone());
+        let peer = NodeId::from_string("node-a");
+
+        backend.ensure_interface().await?;
+        backend
+            .upsert_peer(WireGuardPeerConfig {
+                peer: peer.clone(),
+                public_key: "peer-public".to_string(),
+                endpoint: Some("203.0.113.10:51820".to_string()),
+                allowed_ips: vec!["100.64.0.2/32".to_string()],
+                persistent_keepalive_seconds: Some(25),
+            })
+            .await?;
+        backend.remove_peer(&peer).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new("wg", ["show", "ipars0"]),
                 LinuxCommand::new(
                     "wg",
                     [
@@ -3545,6 +5488,7 @@ mod tests {
                 peers_applied: 1,
                 peers_removed: 0,
                 routes_applied: 2,
+                routes_removed: 0,
             }
         );
 
@@ -3568,6 +5512,181 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_ignores_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-owner");
+        let foreign_id = NodeId::from_string("foreign-owner");
+        let foreign_route = Route {
+            id: "foreign-route".to_string(),
+            cidr: "10.99.0.0/16".parse()?,
+            advertised_by: foreign_id,
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 22)),
+            "wg-peer-owner",
+            Vec::new(),
+            vec![foreign_route],
+        );
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 0,
+                routes_applied: 1,
+                routes_removed: 0,
+            }
+        );
+        let applied = applier.route_manager.applied.read().await;
+        let plan = applied
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing route plan".to_string()))?;
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].cidr, "100.64.0.22/32".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_routes_for_stale_peer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-stale");
+        let advertised_route = Route {
+            id: "advertised-stale".to_string(),
+            cidr: "10.11.0.0/16".parse()?,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)),
+            "wg-peer-stale",
+            Vec::new(),
+            vec![advertised_route.clone()],
+        );
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 0,
+                peers_removed: 1,
+                routes_applied: 0,
+                routes_removed: 2,
+            }
+        );
+        assert!(!applier.wireguard.peers.read().await.contains_key(&peer_id));
+        let removed = applier.route_manager.removed.read().await;
+        let plan = removed
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing remove route plan".to_string()))?;
+        assert_eq!(plan.interface, "ipars0");
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].cidr, "100.64.0.3/32".parse()?);
+        assert_eq!(plan.routes[1], advertised_route);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_dropped_advertised_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let peer_id = NodeId::from_string("peer-routes");
+        let advertised_route = Route {
+            id: "advertised-routes".to_string(),
+            cidr: "10.12.0.0/16".parse()?,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+        let peer_with_route = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)),
+            "wg-peer-routes",
+            Vec::new(),
+            vec![advertised_route.clone()],
+        );
+        let peer_without_route = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)),
+            "wg-peer-routes",
+            Vec::new(),
+            Vec::new(),
+        );
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_with_route],
+                generated_at: Utc::now(),
+            })
+            .await?;
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_without_route],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            summary,
+            PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 0,
+                routes_applied: 1,
+                routes_removed: 1,
+            }
+        );
+        let removed = applier.route_manager.removed.read().await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].routes, vec![advertised_route]);
         Ok(())
     }
 
@@ -3717,6 +5836,7 @@ mod tests {
                 peers_applied: 2,
                 peers_removed: 0,
                 routes_applied: 2,
+                routes_removed: 0,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
@@ -3740,6 +5860,7 @@ mod tests {
                 peers_applied: 1,
                 peers_removed: 1,
                 routes_applied: 1,
+                routes_removed: 1,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
@@ -3868,6 +5989,104 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(postgres_match.peer, peer_b_id);
+        let zookeeper_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 38)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(2181),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(zookeeper_match.peer, peer_b_id);
+        let consul_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 39)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(8500),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(consul_match.peer, peer_b_id);
+        let vault_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 40)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(8200),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(vault_match.peer, peer_b_id);
+        let nomad_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 41)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(4646),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(nomad_match.peer, peer_b_id);
+        let mssql_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 36)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(1433),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(mssql_match.peer, peer_b_id);
+        let oracle_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 37)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(1521),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(oracle_match.peer, peer_b_id);
+        let clickhouse_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 46)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(9000),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(clickhouse_match.peer, peer_b_id);
         let prometheus_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 27)),
@@ -3882,6 +6101,62 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(prometheus_match.peer, peer_b_id);
+        let jaeger_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 42)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(14268),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(jaeger_match.peer, peer_b_id);
+        let loki_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 43)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(3100),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(loki_match.peer, peer_b_id);
+        let tempo_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 44)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(3200),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(tempo_match.peer, peer_b_id);
+        let zipkin_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 45)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(9411),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(zipkin_match.peer, peer_b_id);
         let kafka_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 28)),
@@ -3896,17 +6171,129 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(kafka_match.peer, peer_b_id);
+        let memcached_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 30)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(11211),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(memcached_match.peer, peer_b_id);
+        let grpc_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 31)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(50051),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(grpc_match.peer, peer_b_id);
+        let ldap_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 32)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(389),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(ldap_match.peer, peer_b_id);
+        let smb_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 33)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(445),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(smb_match.peer, peer_b_id);
+        let rdp_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 34)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(3389),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(rdp_match.peer, peer_b_id);
+        let hinted_postgres_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 29)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(443),
+                    application: Some(AgentPacketFlowApplication::Postgres),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(hinted_postgres_match.peer, peer_b_id);
+        let elasticsearch_transport_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 35)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: vec![
+                        b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0, 122, 18, 99, 0,
+                        0, 0, 0,
+                    ],
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(elasticsearch_transport_match.peer, peer_b_id);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::ProcNetConntrack,
+            2,
+        );
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::EbpfRingbuf,
+            3,
+        );
+        runtime
+            .record_packet_flow_duplicate_suppression(AgentPacketFlowDuplicateSource::EbpfJsonl, 0);
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.lazy_connect.observed_peer_vpn_ip_count, 3);
         assert_eq!(metrics.lazy_connect.observed_route_peer_count, 2);
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 7);
-        assert_eq!(metrics.packet_flow_match_count, 5);
+        assert_eq!(metrics.packet_flow_observation_count, 25);
+        assert_eq!(metrics.packet_flow_match_count, 23);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -3918,7 +6305,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            5
+            23
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -3942,10 +6329,51 @@ mod tests {
             application_count(AgentPacketFlowApplication::KubernetesApi),
             1
         );
-        assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::ZooKeeper), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Consul), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Vault), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Nomad), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::MsSql), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Oracle), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::ClickHouse), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Prometheus), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Jaeger), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Loki), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Tempo), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Zipkin), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Kafka), 1);
-        assert_eq!(metrics.packet_flow_filtered_count, 3);
+        assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Grpc), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Rdp), 1);
+        assert_eq!(
+            application_count(AgentPacketFlowApplication::Elasticsearch),
+            1
+        );
+        assert_eq!(metrics.packet_flow_filtered_count, 5);
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 5);
+        let duplicate_suppression_count = |source| {
+            metrics
+                .packet_flow_duplicate_suppression_counts
+                .iter()
+                .find(|entry| entry.source == source)
+                .map(|entry| entry.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::ProcNetConntrack),
+            2
+        );
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            3
+        );
+        assert_eq!(
+            duplicate_suppression_count(AgentPacketFlowDuplicateSource::EbpfJsonl),
+            0
+        );
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -3962,8 +6390,315 @@ mod tests {
                 .map(|entry| entry.count),
             Some(1)
         );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(2)
+        );
         assert_eq!(metrics.path_probe_record_count, 0);
         assert_eq!(metrics.peer_activity_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_ignores_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-route");
+        let foreign_id = NodeId::from_string("foreign-route-owner");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 40)),
+            "wg-peer-route",
+            Vec::new(),
+            vec![Route {
+                id: "foreign-route".to_string(),
+                cidr: "10.88.0.0/16".parse()?,
+                advertised_by: foreign_id,
+                via: None,
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(443),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_rejects_inconsistent_transport_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        for observation in [
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Icmp),
+                destination_port: Some(8),
+                ..Default::default()
+            },
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Icmp),
+                application: Some(AgentPacketFlowApplication::Postgres),
+                ..Default::default()
+            },
+        ] {
+            let matched = runtime
+                .record_packet_flow_observation(peer.vpn_ip.0, observation, Utc::now(), true)
+                .await;
+
+            assert!(matched.is_none());
+            assert!(!runtime.should_connect_peer(&peer).await);
+        }
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                })
+                .map(|entry| entry.count),
+            Some(2)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_classification_counts
+                .iter()
+                .find(|entry| entry.classification == AgentPacketFlowClassification::Unknown)
+                .map(|entry| entry.count),
+            Some(0)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_application_counts
+                .iter()
+                .find(|entry| entry.application == AgentPacketFlowApplication::Unknown)
+                .map(|entry| entry.count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_rejects_any_protocol() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                peer.vpn_ip.0,
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Any),
+                    ..Default::default()
+                },
+                Utc::now(),
+                true,
+            )
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                })
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_rejects_unbounded_or_invalid_direct_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        for observation in [
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                payload_prefix: vec![0; PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
+                ..Default::default()
+            },
+            AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                detector: Some("sidecar\nspoof".to_string()),
+                ..Default::default()
+            },
+            AgentPacketFlowObservation {
+                source: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                ..Default::default()
+            },
+        ] {
+            let matched = runtime
+                .record_packet_flow_observation(peer.vpn_ip.0, observation, Utc::now(), true)
+                .await;
+
+            assert!(matched.is_none());
+            assert!(!runtime.should_connect_peer(&peer).await);
+        }
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 3);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                })
+                .map(|entry| entry.count),
+            Some(3)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_application_counts
+                .iter()
+                .find(|entry| entry.application == AgentPacketFlowApplication::Https)
+                .map(|entry| entry.count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_observation_filters_unusable_destinations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_activity(IpAddr::V4(Ipv4Addr::LOCALHOST), Utc::now(), true)
+            .await;
+
+        assert!(matched.is_none());
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Loopback)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(0)
+        );
         Ok(())
     }
 
@@ -3980,6 +6715,7 @@ mod tests {
             peers_applied: 3,
             peers_removed: 0,
             routes_applied: 5,
+            routes_removed: 0,
         });
         let sync = PeerMapSync::new(node_id.clone(), source.clone(), sink.clone());
 
@@ -3991,6 +6727,7 @@ mod tests {
                 peers_applied: 3,
                 peers_removed: 0,
                 routes_applied: 5,
+                routes_removed: 0,
             }
         );
         assert_eq!(source.requests.read().await.as_slice(), &[node_id]);
@@ -4164,6 +6901,30 @@ mod tests {
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(runtime.status().await.candidate_count, 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_can_replace_endpoint_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id;
+        let candidate = EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+
+        runtime.replace_candidates(vec![candidate.clone()]).await;
+
+        let status = runtime.status().await;
+        assert_eq!(status.candidate_count, 1);
+        assert_eq!(status.candidates, vec![candidate]);
     }
 
     #[tokio::test]

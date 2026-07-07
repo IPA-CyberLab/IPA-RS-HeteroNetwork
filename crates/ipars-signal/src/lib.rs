@@ -8,12 +8,20 @@ use ipars_types::api::{
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
-    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathScore, PathState,
-    PeerPathKey,
+    endpoint_addr_is_usable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
+    NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, TransportProtocol,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
+
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
 
 #[derive(Debug, Error)]
 pub enum SignalError {
@@ -23,6 +31,13 @@ pub enum SignalError {
     CandidateOwnerMismatch {
         node_id: NodeId,
         candidate_node_id: NodeId,
+    },
+    #[error("candidate {kind:?} at {addr} for node {node_id} is invalid: {reason}")]
+    CandidateInvalid {
+        node_id: NodeId,
+        kind: EndpointCandidateKind,
+        addr: std::net::SocketAddr,
+        reason: &'static str,
     },
 }
 
@@ -34,13 +49,20 @@ pub struct SignalRegistry {
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     node_upserts: AtomicU64,
     path_negotiations: AtomicU64,
+    path_acl_denials: AtomicU64,
+    relay_candidate_acl_denials: AtomicU64,
     direct_public_negotiations: AtomicU64,
     direct_ipv6_negotiations: AtomicU64,
     direct_nat_traversal_negotiations: AtomicU64,
     relay_negotiations: AtomicU64,
     unreachable_negotiations: AtomicU64,
     hole_punch_plans: AtomicU64,
+    hole_punch_acl_denials: AtomicU64,
     hole_punch_nat_suppressions: AtomicU64,
+    hole_punch_nat_suppression_direct_candidate: AtomicU64,
+    hole_punch_nat_suppression_coordinated_hole_punch: AtomicU64,
+    hole_punch_nat_suppression_relay_preferred: AtomicU64,
+    hole_punch_nat_suppression_insufficient_data: AtomicU64,
 }
 
 impl SignalRegistry {
@@ -52,13 +74,20 @@ impl SignalRegistry {
             health: RwLock::new(BTreeMap::new()),
             node_upserts: AtomicU64::new(0),
             path_negotiations: AtomicU64::new(0),
+            path_acl_denials: AtomicU64::new(0),
+            relay_candidate_acl_denials: AtomicU64::new(0),
             direct_public_negotiations: AtomicU64::new(0),
             direct_ipv6_negotiations: AtomicU64::new(0),
             direct_nat_traversal_negotiations: AtomicU64::new(0),
             relay_negotiations: AtomicU64::new(0),
             unreachable_negotiations: AtomicU64::new(0),
             hole_punch_plans: AtomicU64::new(0),
+            hole_punch_acl_denials: AtomicU64::new(0),
             hole_punch_nat_suppressions: AtomicU64::new(0),
+            hole_punch_nat_suppression_direct_candidate: AtomicU64::new(0),
+            hole_punch_nat_suppression_coordinated_hole_punch: AtomicU64::new(0),
+            hole_punch_nat_suppression_relay_preferred: AtomicU64::new(0),
+            hole_punch_nat_suppression_insufficient_data: AtomicU64::new(0),
         }
     }
 
@@ -80,11 +109,12 @@ impl SignalRegistry {
 
     pub async fn upsert_node_with_nat_and_health(
         &self,
-        node: NodeRecord,
+        mut node: NodeRecord,
         nat_classification: Option<NatClassification>,
         health: Option<NodeHealth>,
     ) -> Result<SignalNodeUpsertResponse, SignalError> {
-        validate_endpoint_candidate_owners(&node.node_id, &node.endpoint_candidates)?;
+        validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates)?;
+        normalize_relay_capability(&mut node);
         let registered_at = Utc::now();
         match nat_classification {
             Some(classification) => {
@@ -128,15 +158,22 @@ impl SignalRegistry {
         mut request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
-        self.get_node(&request.source)
+        let source_node = self
+            .get_node(&request.source)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
-        validate_endpoint_candidate_owners(&request.source, &request.source_candidates)?;
+        validate_endpoint_candidates(&request.source, &request.source_candidates)?;
         let now = Utc::now();
         let target = self
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
+        if !acl_allows_peer(&source_node, &target, &self.coordinator.policy) {
+            self.path_acl_denials.fetch_add(1, Ordering::Relaxed);
+            let response = acl_denied_signal_path_response(request);
+            self.record_path_negotiation_state(response.preferred_state);
+            return Ok(response);
+        }
         let nat_classifications = self.nat_classifications.read().await;
         let source_nat_classification = fresh_stored_nat_classification(
             nat_classifications.get(&request.source),
@@ -158,7 +195,23 @@ impl SignalRegistry {
         if let Some(source_nat_classification) = source_nat_classification {
             request.source_nat_classification = Some(source_nat_classification);
         }
-        let relays = self.relay_candidates().await;
+        let mut relay_acl_denials = 0;
+        let relays = self
+            .relay_candidates()
+            .await
+            .into_iter()
+            .filter(|relay| {
+                let allowed = acl_allows_peer(&source_node, relay, &self.coordinator.policy);
+                if !allowed {
+                    relay_acl_denials += 1;
+                }
+                allowed
+            })
+            .collect::<Vec<_>>();
+        if relay_acl_denials > 0 {
+            self.relay_candidate_acl_denials
+                .fetch_add(relay_acl_denials, Ordering::Relaxed);
+        }
         let response = self.coordinator.negotiate(
             request,
             &target,
@@ -184,6 +237,16 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
         let now = Utc::now();
+        if !acl_allows_peer(&source_node, &target_node, &self.coordinator.policy) {
+            self.hole_punch_acl_denials.fetch_add(1, Ordering::Relaxed);
+            return Ok(SignalHolePunchPlanResponse {
+                key: PeerPathKey::new(source, target),
+                source_reflexive: None,
+                target_reflexive: None,
+                start_after_millis: 0,
+                expires_at: now,
+            });
+        }
         let nat_classifications = self.nat_classifications.read().await;
         let source_nat_classification = nat_classifications
             .get(&source)
@@ -215,6 +278,10 @@ impl SignalRegistry {
         ) {
             self.hole_punch_nat_suppressions
                 .fetch_add(1, Ordering::Relaxed);
+            self.record_hole_punch_nat_suppression_strategies(
+                source_nat_classification.as_ref(),
+                target_nat_classification.as_ref(),
+            );
         }
         let plan = self.coordinator.punch_plan(
             &source_node.endpoint_candidates,
@@ -333,11 +400,18 @@ impl SignalRegistry {
             stale_endpoint_candidate_count,
             node_upsert_count: self.node_upserts.load(Ordering::Relaxed),
             path_negotiation_count: self.path_negotiations.load(Ordering::Relaxed),
+            path_acl_denied_count: self.path_acl_denials.load(Ordering::Relaxed),
+            relay_candidate_acl_denied_count: self
+                .relay_candidate_acl_denials
+                .load(Ordering::Relaxed),
             path_negotiation_state_counts: self.path_negotiation_state_counts(),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
+            hole_punch_acl_denied_count: self.hole_punch_acl_denials.load(Ordering::Relaxed),
             hole_punch_nat_suppressed_count: self
                 .hole_punch_nat_suppressions
                 .load(Ordering::Relaxed),
+            hole_punch_nat_suppressed_strategy_counts: self
+                .hole_punch_nat_suppression_strategy_counts(),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
             nat_classification_ttl_seconds,
@@ -358,36 +432,88 @@ impl SignalRegistry {
     }
 
     fn path_negotiation_state_counts(&self) -> Vec<PathStateCount> {
-        [
-            (
-                PathState::DirectPublic,
-                self.direct_public_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::DirectIpv6,
-                self.direct_ipv6_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::DirectNatTraversal,
-                self.direct_nat_traversal_negotiations
-                    .load(Ordering::Relaxed),
-            ),
-            (
-                PathState::Relay,
-                self.relay_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::Unreachable,
-                self.unreachable_negotiations.load(Ordering::Relaxed),
-            ),
-        ]
-        .into_iter()
-        .map(|(state, count)| PathStateCount {
-            state,
-            count: count as usize,
-        })
-        .collect()
+        PATH_STATE_METRIC_ORDER
+            .into_iter()
+            .map(|state| {
+                let count = match state {
+                    PathState::DirectPublic => {
+                        self.direct_public_negotiations.load(Ordering::Relaxed)
+                    }
+                    PathState::DirectIpv6 => self.direct_ipv6_negotiations.load(Ordering::Relaxed),
+                    PathState::DirectNatTraversal => self
+                        .direct_nat_traversal_negotiations
+                        .load(Ordering::Relaxed),
+                    PathState::Relay => self.relay_negotiations.load(Ordering::Relaxed),
+                    PathState::Unreachable => self.unreachable_negotiations.load(Ordering::Relaxed),
+                };
+                PathStateCount {
+                    state,
+                    count: count as usize,
+                }
+            })
+            .collect()
     }
+
+    fn record_hole_punch_nat_suppression_strategies(
+        &self,
+        source: Option<&NatClassification>,
+        target: Option<&NatClassification>,
+    ) {
+        for strategy in [source, target].into_iter().filter_map(|classification| {
+            nat_classification_hole_punch_suppression_strategy(
+                classification,
+                self.coordinator
+                    .policy
+                    .nat_classification_min_confidence_percent,
+            )
+        }) {
+            self.hole_punch_nat_suppression_strategy_counter(strategy)
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn hole_punch_nat_suppression_strategy_counter(
+        &self,
+        strategy: NatTraversalStrategy,
+    ) -> &AtomicU64 {
+        match strategy {
+            NatTraversalStrategy::DirectCandidate => {
+                &self.hole_punch_nat_suppression_direct_candidate
+            }
+            NatTraversalStrategy::CoordinatedHolePunch => {
+                &self.hole_punch_nat_suppression_coordinated_hole_punch
+            }
+            NatTraversalStrategy::RelayPreferred => {
+                &self.hole_punch_nat_suppression_relay_preferred
+            }
+            NatTraversalStrategy::InsufficientData => {
+                &self.hole_punch_nat_suppression_insufficient_data
+            }
+        }
+    }
+
+    fn hole_punch_nat_suppression_strategy_counts(&self) -> Vec<NatTraversalStrategyCount> {
+        NatTraversalStrategy::ALL
+            .into_iter()
+            .map(|strategy| NatTraversalStrategyCount {
+                strategy,
+                count: self
+                    .hole_punch_nat_suppression_strategy_counter(strategy)
+                    .load(Ordering::Relaxed) as usize,
+            })
+            .collect()
+    }
+}
+
+fn normalize_relay_capability(node: &mut NodeRecord) {
+    if node
+        .relay_capability
+        .as_ref()
+        .is_some_and(|capability| capability.can_admit())
+    {
+        return;
+    }
+    node.relay_capability = None;
 }
 
 fn nat_classification_strategy_counts(
@@ -444,8 +570,9 @@ impl SignalCoordinator {
             &target_candidates,
             target_nat_classification,
         );
-        let relay_candidates = relays
+        let mut relay_candidates = relays
             .iter()
+            .filter(|relay| relay.node_id != request.source && relay.node_id != request.target)
             .filter(|relay| {
                 relay
                     .relay_capability
@@ -455,6 +582,7 @@ impl SignalCoordinator {
             })
             .cloned()
             .collect::<Vec<_>>();
+        relay_candidates.sort_by(compare_relay_candidates);
 
         let usable_state = if preferred_state == PathState::Unreachable
             && self.policy.allow_relay_fallback
@@ -478,13 +606,14 @@ impl SignalCoordinator {
                 }),
             ..PathMetrics::default()
         };
+        let cost = path_candidate_cost(usable_state, &source_candidates, &target_candidates);
 
         SignalPathResponse {
             key: PeerPathKey::new(request.source, request.target),
             target_candidates,
             relay_candidates,
             preferred_state: usable_state,
-            score: PathScore::calculate(usable_state, &metrics, true, 0),
+            score: PathScore::calculate(usable_state, &metrics, true, cost),
         }
     }
 
@@ -575,7 +704,7 @@ impl SignalCoordinator {
     }
 }
 
-fn validate_endpoint_candidate_owners(
+fn validate_endpoint_candidates(
     node_id: &NodeId,
     candidates: &[EndpointCandidate],
 ) -> Result<(), SignalError> {
@@ -586,6 +715,19 @@ fn validate_endpoint_candidate_owners(
         return Err(SignalError::CandidateOwnerMismatch {
             node_id: node_id.clone(),
             candidate_node_id: candidate.node_id.clone(),
+        });
+    }
+    if let Some((candidate, reason)) = candidates.iter().find_map(|candidate| {
+        candidate
+            .validate_kind_address()
+            .err()
+            .map(|reason| (candidate, reason))
+    }) {
+        return Err(SignalError::CandidateInvalid {
+            node_id: node_id.clone(),
+            kind: candidate.kind,
+            addr: candidate.addr,
+            reason,
         });
     }
     Ok(())
@@ -629,6 +771,7 @@ fn fresh_endpoint_candidates(
     candidates
         .iter()
         .filter(|candidate| endpoint_candidate_is_fresh(candidate, now, ttl_seconds))
+        .filter(|candidate| endpoint_addr_is_usable(candidate.addr))
         .cloned()
         .collect()
 }
@@ -642,6 +785,53 @@ fn endpoint_candidate_is_fresh(
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
+}
+
+fn acl_denied_signal_path_response(request: SignalPathRequest) -> SignalPathResponse {
+    SignalPathResponse {
+        key: PeerPathKey::new(request.source, request.target),
+        target_candidates: Vec::new(),
+        relay_candidates: Vec::new(),
+        preferred_state: PathState::Unreachable,
+        score: PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), false, 0),
+    }
+}
+
+fn acl_allows_peer(source: &NodeRecord, target: &NodeRecord, policy: &ClusterPolicy) -> bool {
+    if policy.acl_rules.is_empty() {
+        return true;
+    }
+
+    let mut allowed = None;
+    for rule in &policy.acl_rules {
+        if !acl_rule_matches_peer(rule, source, target) {
+            continue;
+        }
+        match rule.action {
+            AclAction::Deny => return false,
+            AclAction::Allow => allowed = Some(true),
+        }
+    }
+    allowed.unwrap_or(false)
+}
+
+fn acl_rule_matches_peer(rule: &AclRule, source: &NodeRecord, target: &NodeRecord) -> bool {
+    if rule.protocol != TransportProtocol::Any {
+        return false;
+    }
+    if !rule.from_roles.is_empty() && !rule.from_roles.contains(&source.role) {
+        return false;
+    }
+    if !rule.to_roles.is_empty() && !rule.to_roles.contains(&target.role) {
+        return false;
+    }
+    if !rule.from_tags.is_empty() && rule.from_tags.is_disjoint(&source.tags) {
+        return false;
+    }
+    if !rule.to_tags.is_empty() && rule.to_tags.is_disjoint(&target.tags) {
+        return false;
+    }
+    rule.routes.is_empty()
 }
 
 fn nat_classifications_allow_hole_punch(
@@ -668,6 +858,18 @@ fn nat_classification_allows_hole_punch(
             classification.strategy,
             NatTraversalStrategy::DirectCandidate | NatTraversalStrategy::CoordinatedHolePunch
         ),
+    }
+}
+
+fn nat_classification_hole_punch_suppression_strategy(
+    classification: Option<&NatClassification>,
+    min_confidence_percent: u8,
+) -> Option<NatTraversalStrategy> {
+    let classification = classification?;
+    if nat_classification_allows_hole_punch(Some(classification), min_confidence_percent) {
+        None
+    } else {
+        Some(classification.strategy)
     }
 }
 
@@ -705,6 +907,72 @@ fn relay_health_allows(
     health_report_is_fresh(health, now, ttl_seconds)
 }
 
+fn compare_relay_candidates(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
+    match (
+        left.relay_capability.as_ref(),
+        right.relay_capability.as_ref(),
+    ) {
+        (Some(left_capability), Some(right_capability)) => {
+            compare_relay_load(left_capability, right_capability)
+                .then_with(|| {
+                    right_capability
+                        .available_capacity()
+                        .cmp(&left_capability.available_capacity())
+                })
+                .then_with(|| right_capability.max_mbps.cmp(&left_capability.max_mbps))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.node_id.cmp(&right.node_id),
+    }
+}
+
+fn compare_relay_load(
+    left: &ipars_types::RelayCapability,
+    right: &ipars_types::RelayCapability,
+) -> std::cmp::Ordering {
+    let left_denominator = left.max_sessions.max(1) as u64;
+    let right_denominator = right.max_sessions.max(1) as u64;
+    let left_scaled = left.active_sessions as u64 * right_denominator;
+    let right_scaled = right.active_sessions as u64 * left_denominator;
+    left_scaled.cmp(&right_scaled)
+}
+
+fn path_candidate_cost(
+    state: PathState,
+    source_candidates: &[EndpointCandidate],
+    target_candidates: &[EndpointCandidate],
+) -> u32 {
+    match state {
+        PathState::DirectIpv6 => {
+            endpoint_kind_min_cost(source_candidates, EndpointCandidateKind::Ipv6).saturating_add(
+                endpoint_kind_min_cost(target_candidates, EndpointCandidateKind::Ipv6),
+            )
+        }
+        PathState::DirectPublic => {
+            endpoint_kind_min_cost(target_candidates, EndpointCandidateKind::PublicUdp)
+        }
+        PathState::DirectNatTraversal => {
+            endpoint_kind_min_cost(source_candidates, EndpointCandidateKind::StunReflexive)
+                .saturating_add(endpoint_kind_min_cost(
+                    target_candidates,
+                    EndpointCandidateKind::StunReflexive,
+                ))
+        }
+        PathState::Relay | PathState::Unreachable => 0,
+    }
+}
+
+fn endpoint_kind_min_cost(candidates: &[EndpointCandidate], kind: EndpointCandidateKind) -> u32 {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.kind == kind)
+        .map(|candidate| candidate.cost)
+        .min()
+        .unwrap_or(0)
+}
+
 fn health_report_is_fresh(
     health: &NodeHealth,
     now: chrono::DateTime<Utc>,
@@ -727,11 +995,11 @@ pub struct HolePunchPlan {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use ipars_types::{
         CandidateSource, ClusterId, HealthState, NatMappingBehavior, NodeHealth, NodeId,
-        RelayCapability, Role, TokenPolicy, VpnIp,
+        RelayCapability, Role, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -746,6 +1014,43 @@ mod tests {
             cost: 10,
             source: CandidateSource::StunProbe,
         }
+    }
+
+    fn candidate_at(kind: EndpointCandidateKind, addr: SocketAddr) -> EndpointCandidate {
+        EndpointCandidate {
+            addr,
+            ..candidate(kind)
+        }
+    }
+
+    fn candidate_with_cost(kind: EndpointCandidateKind, cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            cost,
+            ..candidate(kind)
+        }
+    }
+
+    fn ipv6_candidate() -> EndpointCandidate {
+        EndpointCandidate {
+            addr: SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+            ..candidate(EndpointCandidateKind::Ipv6)
+        }
+    }
+
+    fn ipv6_candidate_with_cost(cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            cost,
+            ..ipv6_candidate()
+        }
+    }
+
+    fn stale_ipv6_candidate() -> EndpointCandidate {
+        let mut candidate = ipv6_candidate();
+        candidate.observed_at = Utc::now() - chrono::Duration::seconds(121);
+        candidate
     }
 
     fn stale_candidate(kind: EndpointCandidateKind) -> EndpointCandidate {
@@ -783,6 +1088,18 @@ mod tests {
         node_record("node-b", candidates)
     }
 
+    fn relay_capability() -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
+            admission_url: Some("http://203.0.113.20:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
     fn relay() -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string("relay-a"),
@@ -793,18 +1110,58 @@ mod tests {
             role: Role::from_string("relay"),
             tags: BTreeSet::new(),
             endpoint_candidates: Vec::new(),
-            relay_capability: Some(RelayCapability {
-                enabled_by_policy: true,
-                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 20], 51820))),
-                admission_url: Some("http://203.0.113.20:9580".to_string()),
-                max_sessions: 10,
-                active_sessions: 0,
-                max_mbps: 1000,
-                e2e_only: true,
-            }),
+            relay_capability: Some(relay_capability()),
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
+        }
+    }
+
+    fn relay_with_capacity(
+        node_id: &str,
+        max_sessions: u32,
+        active_sessions: u32,
+        max_mbps: u32,
+    ) -> NodeRecord {
+        let mut relay = relay();
+        relay.node_id = NodeId::from_string(node_id);
+        relay.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+            100,
+            64,
+            0,
+            node_id.bytes().fold(10u8, u8::wrapping_add),
+        )));
+        let mut capability = relay_capability();
+        capability.max_sessions = max_sessions;
+        capability.active_sessions = active_sessions;
+        capability.max_mbps = max_mbps;
+        relay.relay_capability = Some(capability);
+        relay
+    }
+
+    fn deny_to_tag_acl(id: &str, tag: &str) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::from([Tag::from_string(tag)]),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Deny,
+        }
+    }
+
+    fn allow_peer_acl(id: &str) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
         }
     }
 
@@ -838,6 +1195,155 @@ mod tests {
     }
 
     #[test]
+    fn direct_public_score_uses_lowest_target_public_candidate_cost() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_with_cost(EndpointCandidateKind::PublicUdp, 50),
+                candidate_with_cost(EndpointCandidateKind::PublicUdp, 7),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=7"));
+    }
+
+    #[test]
+    fn direct_ipv6_is_preferred_when_both_nodes_have_ipv6_candidates() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate(),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectIpv6);
+    }
+
+    #[test]
+    fn direct_ipv6_score_uses_lowest_source_and_target_ipv6_candidate_costs() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate_with_cost(40), ipv6_candidate_with_cost(3)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate_with_cost(50),
+                ipv6_candidate_with_cost(9),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectIpv6);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=12"));
+    }
+
+    #[test]
+    fn direct_public_is_used_when_ipv6_direct_is_disabled() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy {
+            allow_ipv6_direct: false,
+            ..ClusterPolicy::default()
+        });
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate(),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "state=DirectPublic"));
+    }
+
+    #[test]
+    fn nat_traversal_is_not_used_when_policy_disables_it() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy {
+            allow_nat_traversal: false,
+            ..ClusterPolicy::default()
+        });
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![candidate(EndpointCandidateKind::StunReflexive)]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
+    fn stale_ipv6_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![stale_ipv6_candidate()]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
     fn stale_public_candidate_is_not_used_for_direct_path() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
         let response = coordinator.negotiate(
@@ -849,6 +1355,79 @@ mod tests {
                 desired_routes: Vec::new(),
             },
             &target(vec![stale_candidate(EndpointCandidateKind::PublicUdp)]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
+    fn unusable_public_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([0, 0, 0, 0], 51820)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([203, 0, 113, 10], 0)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([224, 0, 0, 1], 51820)),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::PublicUdp,
+                    SocketAddr::from(([255, 255, 255, 255], 51820)),
+                ),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+    }
+
+    #[test]
+    fn unusable_ipv6_candidate_is_not_used_for_direct_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 51820),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+                ),
+                candidate_at(
+                    EndpointCandidateKind::Ipv6,
+                    SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                        51820,
+                    ),
+                ),
+            ]),
             None,
             &[],
         );
@@ -874,6 +1453,71 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
+    fn nat_traversal_score_uses_lowest_source_and_target_reflexive_candidate_costs() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![
+                    candidate_with_cost(EndpointCandidateKind::StunReflexive, 80),
+                    candidate_with_cost(EndpointCandidateKind::StunReflexive, 4),
+                ],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_with_cost(EndpointCandidateKind::StunReflexive, 70),
+                candidate_with_cost(EndpointCandidateKind::StunReflexive, 6),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=10"));
+    }
+
+    #[test]
+    fn unusable_reflexive_candidate_is_not_used_for_nat_traversal_or_punch_plan() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let unusable_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([0, 0, 0, 0], 40000)),
+        );
+        let usable_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([198, 51, 100, 20], 40000)),
+        );
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![unusable_reflexive.clone()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![usable_reflexive.clone()]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+
+        let plan = coordinator.punch_plan(&[unusable_reflexive], None, &[usable_reflexive], None);
+
+        assert!(plan.source_reflexive.is_none());
+        assert_eq!(
+            plan.target_reflexive.map(|candidate| candidate.addr),
+            Some(SocketAddr::from(([198, 51, 100, 20], 40000)))
+        );
     }
 
     #[test]
@@ -917,12 +1561,266 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn relay_candidates_are_sorted_by_load_capacity_and_bandwidth() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(Vec::new()),
+            None,
+            &[
+                relay_with_capacity("relay-busy", 10, 8, 10_000),
+                relay_with_capacity("relay-less-bandwidth", 10, 1, 1_000),
+                relay_with_capacity("relay-more-capacity", 20, 2, 500),
+                relay_with_capacity("relay-more-bandwidth", 10, 1, 2_000),
+            ],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "relay-more-capacity",
+                "relay-more-bandwidth",
+                "relay-less-bandwidth",
+                "relay-busy",
+            ]
+        );
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_load=0.10"));
+    }
+
+    #[tokio::test]
+    async fn registry_does_not_use_relay_fallback_when_policy_disables_it(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            allow_relay_fallback: false,
+            ..ClusterPolicy::default()
+        });
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert_eq!(response.relay_candidates.len(), 1);
+        let metrics = registry.metrics().await;
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        assert_eq!(signal_path_state_count(&metrics, PathState::Relay), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_excludes_path_endpoints_from_relay_candidates() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut source_relay = source(Vec::new());
+        source_relay.relay_capability = Some(relay_capability());
+        let mut target_relay = target(Vec::new());
+        target_relay.relay_capability = Some(relay_capability());
+        registry
+            .upsert_node_with_nat_and_health(source_relay, None, Some(healthy_health()))
+            .await?;
+        registry
+            .upsert_node_with_nat_and_health(target_relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![NodeId::from_string("relay-a")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_applies_acl_to_path_negotiation() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-blocked", "blocked"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut blocked_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        blocked_target.tags.insert(Tag::from_string("blocked"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(blocked_target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: blocked_target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+        assert!(response.relay_candidates.is_empty());
+        assert_eq!(response.score.reasons, vec!["policy_denied".to_string()]);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 1);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 0);
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_filters_relay_candidates_by_acl() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-hidden-relay", "relay-hidden"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        let mut hidden_relay = relay();
+        hidden_relay.tags.insert(Tag::from_string("relay-hidden"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        registry
+            .upsert_node_with_nat_and_health(hidden_relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 0);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 1);
+
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![NodeId::from_string("relay-a")]
+        );
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn registry_ignores_relay_without_admission_url() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
         let mut relay = relay();
         if let Some(capability) = relay.relay_capability.as_mut() {
             capability.admission_url = None;
+        }
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.relay_candidates.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_ignores_relay_with_unusable_admission_url() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut relay = relay();
+        if let Some(capability) = relay.relay_capability.as_mut() {
+            capability.admission_url = Some("http://0.0.0.0:9580".to_string());
         }
         registry.upsert_node(source(Vec::new())).await?;
         registry.upsert_node(target(Vec::new())).await?;
@@ -971,6 +1869,41 @@ mod tests {
 
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_uses_nat_traversal_for_address_dependent_nat() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let nat = address_dependent_hole_punch_nat();
+        registry.upsert_node(source.clone()).await?;
+        registry
+            .upsert_node_with_nat(target.clone(), Some(nat.clone()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: Some(nat),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        assert!(response.relay_candidates.is_empty());
+        let metrics = registry.metrics().await;
+        assert_eq!(
+            signal_path_state_count(&metrics, PathState::DirectNatTraversal),
+            1
+        );
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::CoordinatedHolePunch),
+            1
+        );
         Ok(())
     }
 
@@ -1120,6 +2053,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_clears_non_admissible_relay_capability_on_upsert() -> Result<(), SignalError>
+    {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut invalid_capabilities = Vec::new();
+
+        let mut policy_disabled = relay_capability();
+        policy_disabled.enabled_by_policy = false;
+        invalid_capabilities.push(policy_disabled);
+
+        let mut missing_public_endpoint = relay_capability();
+        missing_public_endpoint.public_endpoint = None;
+        invalid_capabilities.push(missing_public_endpoint);
+
+        let mut unusable_public_endpoint = relay_capability();
+        unusable_public_endpoint.public_endpoint = Some(SocketAddr::from(([0, 0, 0, 0], 51820)));
+        invalid_capabilities.push(unusable_public_endpoint);
+
+        let mut missing_admission_url = relay_capability();
+        missing_admission_url.admission_url = None;
+        invalid_capabilities.push(missing_admission_url);
+
+        let mut invalid_admission_url = relay_capability();
+        invalid_admission_url.admission_url = Some("udp://203.0.113.20:9580".to_string());
+        invalid_capabilities.push(invalid_admission_url);
+
+        let mut full_capacity = relay_capability();
+        full_capacity.active_sessions = full_capacity.max_sessions;
+        invalid_capabilities.push(full_capacity);
+
+        let mut zero_bandwidth = relay_capability();
+        zero_bandwidth.max_mbps = 0;
+        invalid_capabilities.push(zero_bandwidth);
+
+        let mut decrypting_relay = relay_capability();
+        decrypting_relay.e2e_only = false;
+        invalid_capabilities.push(decrypting_relay);
+
+        for capability in invalid_capabilities {
+            let mut relay = relay();
+            relay.relay_capability = Some(capability);
+
+            let response = registry
+                .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+                .await?;
+
+            assert!(response.node.relay_capability.is_none());
+            let stored = match registry.get_node(&NodeId::from_string("relay-a")).await {
+                Some(node) => node,
+                None => panic!("relay node should be stored"),
+            };
+            assert!(stored.relay_capability.is_none());
+            assert!(registry.relay_candidates().await.is_empty());
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_metrics_report_signal_state() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy {
             relay_health_ttl_seconds: 30,
@@ -1188,6 +2179,20 @@ mod tests {
         assert_eq!(signal_path_state_count(&stale_metrics, PathState::Relay), 0);
         assert_eq!(stale_metrics.hole_punch_plan_count, 1);
         assert_eq!(stale_metrics.hole_punch_nat_suppressed_count, 1);
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &stale_metrics,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            1
+        );
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &stale_metrics,
+                NatTraversalStrategy::CoordinatedHolePunch,
+            ),
+            0
+        );
         assert_eq!(stale_metrics.relay_health_ttl_seconds, 30);
         assert_eq!(stale_metrics.endpoint_candidate_ttl_seconds, 30);
         assert_eq!(stale_metrics.nat_classification_ttl_seconds, 300);
@@ -1247,6 +2252,40 @@ mod tests {
         assert_eq!(plan.start_after_millis, 50);
         let metrics = registry.metrics().await;
         assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_applies_acl_to_hole_punch_plans() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_to_tag_acl("deny-blocked", "blocked"),
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut blocked_target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        blocked_target.tags.insert(Tag::from_string("blocked"));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(blocked_target.clone()).await?;
+
+        let plan = registry
+            .hole_punch_plan(source.node_id.clone(), blocked_target.node_id.clone())
+            .await?;
+
+        assert_eq!(
+            plan.key,
+            PeerPathKey::new(source.node_id, blocked_target.node_id)
+        );
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
+        assert_eq!(plan.start_after_millis, 0);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         Ok(())
     }
@@ -1362,6 +2401,42 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn registry_rejects_ipv6_candidates_with_ipv4_addresses() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let invalid_node = source(vec![candidate(EndpointCandidateKind::Ipv6)]);
+
+        assert!(matches!(
+            registry.upsert_node(invalid_node).await,
+            Err(SignalError::CandidateInvalid {
+                kind: EndpointCandidateKind::Ipv6,
+                ..
+            })
+        ));
+
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id,
+                    target: target.node_id,
+                    source_candidates: vec![candidate(EndpointCandidateKind::Ipv6)],
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                })
+                .await,
+            Err(SignalError::CandidateInvalid {
+                kind: EndpointCandidateKind::Ipv6,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
     fn coordinated_hole_punch_nat(confidence: f32) -> NatClassification {
         NatClassification {
             local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
@@ -1372,6 +2447,20 @@ mod tests {
             filtering_observations: Vec::new(),
             strategy: NatTraversalStrategy::CoordinatedHolePunch,
             confidence,
+            assessed_at: Utc::now(),
+        }
+    }
+
+    fn address_dependent_hole_punch_nat() -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::AddressDependent,
+            filtering_behavior: ipars_types::NatFilteringBehavior::AddressDependent,
+            observed_endpoint: None,
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::CoordinatedHolePunch,
+            confidence: 0.85,
             assessed_at: Utc::now(),
         }
     }
@@ -1395,6 +2484,18 @@ mod tests {
             .path_negotiation_state_counts
             .iter()
             .find(|entry| entry.state == state)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
+    fn signal_hole_punch_nat_suppression_strategy_count(
+        metrics: &SignalMetricsResponse,
+        strategy: NatTraversalStrategy,
+    ) -> usize {
+        metrics
+            .hole_punch_nat_suppressed_strategy_counts
+            .iter()
+            .find(|entry| entry.strategy == strategy)
             .map(|entry| entry.count)
             .unwrap_or(0)
     }

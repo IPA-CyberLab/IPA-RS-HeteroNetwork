@@ -11,19 +11,28 @@ use ipars_crypto::{
     CryptoError,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
+    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
-    AclAction, AclRule, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims,
-    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
+    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
+    NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
 use thiserror::Error;
 use tokio::sync::RwLock;
+
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -103,6 +112,11 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         relay_capability: Option<RelayCapability>,
     ) -> Result<(), ControlPlaneError>;
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError>;
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -116,6 +130,11 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
 }
 
@@ -198,6 +217,19 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(())
     }
 
+    async fn update_node_routes(
+        &self,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.routes = routes;
+        Ok(())
+    }
+
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -238,6 +270,17 @@ impl ControlPlaneStore for InMemoryStore {
         } else {
             paths.push(path);
         }
+        Ok(())
+    }
+
+    async fn replace_node_paths(
+        &self,
+        node_id: &NodeId,
+        replacement_paths: Vec<PathRecord>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut paths = self.paths.write().await;
+        paths.retain(|path| &path.key.local != node_id);
+        paths.extend(replacement_paths);
         Ok(())
     }
 
@@ -529,7 +572,8 @@ where
             }
         }
 
-        let relay_capability = relay_capability_allowed(request.relay_capability.clone(), &claims)?;
+        let relay_capability =
+            relay_capability_allowed(&request.node_id, request.relay_capability.clone(), &claims)?;
         let now = Utc::now();
         let node = match self
             .insert_node_with_fresh_vpn_ip(
@@ -655,6 +699,64 @@ where
         Ok(self.filtered_peer_map_for_node(&source, &peers, Utc::now()))
     }
 
+    pub async fn paths_for(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ControlPlanePathsResponse, ControlPlaneError> {
+        let source = self
+            .store
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let peers = self.store.list_nodes().await?;
+        let peers_by_id = peers
+            .iter()
+            .map(|peer| (peer.node_id.clone(), peer))
+            .collect::<BTreeMap<_, _>>();
+        let now = Utc::now();
+        let mut stale_path_count = 0;
+        let paths = self
+            .store
+            .list_paths_for(node_id)
+            .await?
+            .into_iter()
+            .filter_map(|path| {
+                let peer_id = if path.key.local == source.node_id {
+                    &path.key.remote
+                } else if path.key.remote == source.node_id {
+                    &path.key.local
+                } else {
+                    return None;
+                };
+                let visible = peers_by_id.get(peer_id).is_some_and(|peer| {
+                    acl_filter_peer(&source, peer, &self.config.cluster_policy).is_some()
+                });
+                if !visible {
+                    return None;
+                }
+                if path_is_fresh(
+                    &path,
+                    now,
+                    self.config.cluster_policy.path_state_ttl_seconds,
+                ) {
+                    Some(path)
+                } else {
+                    stale_path_count += 1;
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ControlPlanePathsResponse {
+            cluster_id: self.config.cluster_id.clone(),
+            node_id: node_id.clone(),
+            paths,
+            stale_path_count,
+            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            generated_at: now,
+        })
+    }
+
     pub async fn heartbeat(
         &self,
         mut request: HeartbeatRequest,
@@ -667,27 +769,59 @@ where
         let previous_health = self.store.get_health(&request.node_id).await?;
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
+        self.validate_heartbeat_path_relay_shape(&request)?;
+        if request
+            .path_state
+            .iter()
+            .any(|path| path.selected_state == PathState::Relay)
+        {
+            let nodes = self.store.list_nodes().await?;
+            let health_by_node = self.health_by_node(&nodes).await?;
+            self.validate_heartbeat_path_relay_eligibility(
+                &request,
+                &node,
+                &nodes,
+                &health_by_node,
+                now,
+            )?;
+        }
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
+        let request_node_id = request.node_id.clone();
+        let relay_capability = request
+            .relay_capability
+            .map(|mut relay_capability| {
+                if !node.token_policy.allow_relay {
+                    return Err(ControlPlaneError::RelayDenied);
+                }
+                relay_capability.enabled_by_policy = true;
+                validate_relay_capability_shape(&relay_capability).map_err(|reason| {
+                    ControlPlaneError::NodeUpdateRejected {
+                        node_id: request_node_id.clone(),
+                        reason,
+                    }
+                })?;
+                Ok(relay_capability)
+            })
+            .transpose()?;
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
-        if let Some(mut relay_capability) = request.relay_capability {
-            if !node.token_policy.allow_relay {
-                return Err(ControlPlaneError::RelayDenied);
-            }
-            relay_capability.enabled_by_policy = true;
+        self.store
+            .update_node_relay_capability(&request.node_id, relay_capability)
+            .await?;
+        if let Some(routes) = request.routes {
             self.store
-                .update_node_relay_capability(&request.node_id, Some(relay_capability))
+                .update_node_routes(&request.node_id, routes)
                 .await?;
         }
         self.store
             .upsert_health(request.node_id.clone(), request.health)
             .await?;
-        for path in request.path_state {
-            self.store.upsert_path(path).await?;
-        }
+        self.store
+            .replace_node_paths(&request.node_id, request.path_state)
+            .await?;
 
         Ok(HeartbeatResponse {
             accepted: true,
@@ -808,18 +942,85 @@ where
                 ),
             });
         }
-        if let Some(path) = request
-            .path_state
-            .iter()
-            .find(|path| path.key.local != request.node_id && path.key.remote != request.node_id)
-        {
+        if let Some((candidate, reason)) = request.candidates.iter().find_map(|candidate| {
+            candidate
+                .validate_kind_address()
+                .err()
+                .map(|reason| (candidate, reason))
+        }) {
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: request.node_id.clone(),
                 reason: format!(
-                    "path {} -> {} does not include reporting node",
-                    path.key.local, path.key.remote
+                    "candidate {:?} at {} is invalid: {reason}",
+                    candidate.kind, candidate.addr
                 ),
             });
+        }
+        if let Some(routes) = request.routes.as_ref() {
+            for route in routes {
+                if route.advertised_by != request.node_id {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "route {} is advertised by node {} instead of {}",
+                            route.id, route.advertised_by, request.node_id
+                        ),
+                    });
+                }
+                if !route_allowed_by_policy(route, &node.token_policy) {
+                    return Err(ControlPlaneError::RouteDenied(route.id.clone()));
+                }
+            }
+        }
+        for path in &request.path_state {
+            if path.key.local != request.node_id {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} is not owned by reporting node {}",
+                        path.key.local, path.key.remote, request.node_id
+                    ),
+                });
+            }
+            if path.key.remote == request.node_id {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} points back to the reporting node",
+                        path.key.local, path.key.remote
+                    ),
+                });
+            }
+            let peer = &path.key.remote;
+            if let Some(candidate) = &path.selected_candidate {
+                if &candidate.node_id != peer {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate belongs to node {} instead of path peer {}",
+                            candidate.node_id, peer
+                        ),
+                    });
+                }
+                if let Err(reason) = candidate.validate_kind_address() {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} is invalid: {reason}",
+                            candidate.kind, candidate.addr
+                        ),
+                    });
+                }
+                if !endpoint_addr_is_usable(candidate.addr) {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} is unusable",
+                            candidate.kind, candidate.addr
+                        ),
+                    });
+                }
+            }
         }
         if request.node_signature.is_none() {
             if self.config.require_heartbeat_signature {
@@ -858,6 +1059,94 @@ where
                         "signed_at {signed_at} is not newer than last accepted heartbeat {}",
                         previous_health.last_seen_at
                     ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_heartbeat_path_relay_shape(
+        &self,
+        request: &HeartbeatRequest,
+    ) -> Result<(), ControlPlaneError> {
+        for path in &request.path_state {
+            match (path.selected_state, path.relay_node.as_ref()) {
+                (PathState::Relay, Some(relay_node))
+                    if relay_node == &path.key.local || relay_node == &path.key.remote =>
+                {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "relay path {} -> {} uses endpoint {relay_node} as relay",
+                            path.key.local, path.key.remote
+                        ),
+                    });
+                }
+                (PathState::Relay, Some(_)) => {}
+                (PathState::Relay, None) => {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "relay path {} -> {} is missing relay node",
+                            path.key.local, path.key.remote
+                        ),
+                    });
+                }
+                (_, Some(relay_node)) => {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "non-relay path {} -> {} carries relay node {relay_node}",
+                            path.key.local, path.key.remote
+                        ),
+                    });
+                }
+                (_, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_heartbeat_path_relay_eligibility(
+        &self,
+        request: &HeartbeatRequest,
+        reporter: &NodeRecord,
+        nodes: &[NodeRecord],
+        health_by_node: &BTreeMap<NodeId, NodeHealth>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        for path in &request.path_state {
+            if path.selected_state != PathState::Relay {
+                continue;
+            }
+            let Some(relay_node) = path.relay_node.as_ref() else {
+                continue;
+            };
+            let Some(relay) = nodes_by_id.get(relay_node) else {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!("relay node {relay_node} is not registered"),
+                });
+            };
+            if !relay_candidate_allowed(
+                relay,
+                health_by_node.get(relay_node),
+                now,
+                &self.config.cluster_policy,
+            ) {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!("relay node {relay_node} is not an eligible relay candidate"),
+                });
+            }
+            if acl_filter_peer(reporter, relay, &self.config.cluster_policy).is_none() {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!("relay node {relay_node} is not visible to reporting node"),
                 });
             }
         }
@@ -916,10 +1205,16 @@ where
             }
         }
 
+        let mut stale_path_count = 0;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in paths.values() {
+            if !path_is_fresh(path, now, self.config.cluster_policy.path_state_ttl_seconds) {
+                stale_path_count += 1;
+                continue;
+            }
             *path_state_counts.entry(path.selected_state).or_default() += 1;
         }
+        let path_count = paths.len().saturating_sub(stale_path_count);
 
         Ok(ControlPlaneMetricsResponse {
             cluster_id: self.config.cluster_id.clone(),
@@ -944,16 +1239,21 @@ where
             peer_map_route_candidate_count: peer_map_metrics.route_candidates,
             peer_map_route_visible_count: peer_map_metrics.visible_routes,
             peer_map_route_acl_denied_count: peer_map_metrics.acl_denied_routes,
-            path_count: paths.len(),
-            path_state_counts: path_state_counts
+            stale_path_count,
+            path_count,
+            path_state_counts: PATH_STATE_METRIC_ORDER
                 .into_iter()
-                .map(|(state, count)| PathStateCount { state, count })
+                .map(|state| PathStateCount {
+                    state,
+                    count: *path_state_counts.get(&state).unwrap_or(&0),
+                })
                 .collect(),
             endpoint_candidate_ttl_seconds: self
                 .config
                 .cluster_policy
                 .endpoint_candidate_ttl_seconds,
-            generated_at: Utc::now(),
+            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            generated_at: now,
         })
     }
 
@@ -983,7 +1283,7 @@ where
                 .filter(|peer| peer.node_id != source.node_id)
                 .filter_map(|peer| acl_filter_peer(source, peer, &self.config.cluster_policy))
                 .map(|peer| {
-                    filter_stale_endpoint_candidates(
+                    filter_served_endpoint_candidates(
                         peer,
                         generated_at,
                         &self.config.cluster_policy,
@@ -1021,7 +1321,7 @@ where
                     }
                 })
                 .map(|peer| {
-                    filter_stale_endpoint_candidates(
+                    filter_served_endpoint_candidates(
                         peer,
                         generated_at,
                         &self.config.cluster_policy,
@@ -1082,13 +1382,14 @@ fn peer_map_visibility_metrics(
     metrics
 }
 
-fn filter_stale_endpoint_candidates(
+fn filter_served_endpoint_candidates(
     mut node: NodeRecord,
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> NodeRecord {
     node.endpoint_candidates.retain(|candidate| {
         endpoint_candidate_is_fresh(candidate, now, policy.endpoint_candidate_ttl_seconds)
+            && endpoint_addr_is_usable(candidate.addr)
     });
     node
 }
@@ -1099,6 +1400,13 @@ fn endpoint_candidate_is_fresh(
     ttl_seconds: u64,
 ) -> bool {
     match now.signed_duration_since(candidate.observed_at).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
+}
+
+fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64) -> bool {
+    match now.signed_duration_since(path.updated_at).to_std() {
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
@@ -1248,14 +1556,18 @@ fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
-    claims
-        .policy
+    route_allowed_by_policy(route, &claims.policy)
+}
+
+fn route_allowed_by_policy(route: &Route, policy: &ipars_types::TokenPolicy) -> bool {
+    policy
         .allowed_routes
         .iter()
         .any(|allowed_route| allowed_route.contains(&route.cidr))
 }
 
 fn relay_capability_allowed(
+    node_id: &NodeId,
     relay_capability: Option<RelayCapability>,
     claims: &JoinTokenClaims,
 ) -> Result<Option<RelayCapability>, ControlPlaneError> {
@@ -1265,9 +1577,47 @@ fn relay_capability_allowed(
                 return Err(ControlPlaneError::RelayDenied);
             }
             capability.enabled_by_policy = true;
+            validate_relay_capability_shape(&capability).map_err(|reason| {
+                ControlPlaneError::NodeRegistrationRejected {
+                    node_id: node_id.clone(),
+                    reason,
+                }
+            })?;
             Ok(capability)
         })
         .transpose()
+}
+
+fn validate_relay_capability_shape(capability: &RelayCapability) -> Result<(), String> {
+    let endpoint = capability
+        .public_endpoint
+        .ok_or_else(|| "relay public endpoint is required".to_string())?;
+    if !endpoint_addr_is_usable(endpoint) {
+        return Err("relay public endpoint must be a usable nonzero socket address".to_string());
+    }
+    let admission_url = capability
+        .admission_url
+        .as_deref()
+        .ok_or_else(|| "relay admission URL is required".to_string())?;
+    if !relay_admission_url_is_usable(admission_url) {
+        return Err(
+            "relay admission URL must be an absolute HTTP(S) URL with a usable endpoint"
+                .to_string(),
+        );
+    }
+    if capability.max_sessions == 0 {
+        return Err("relay max_sessions must be greater than zero".to_string());
+    }
+    if capability.active_sessions > capability.max_sessions {
+        return Err("relay active_sessions must be less than or equal to max_sessions".to_string());
+    }
+    if capability.max_mbps == 0 {
+        return Err("relay max_mbps must be greater than zero".to_string());
+    }
+    if !capability.e2e_only {
+        return Err("relay capability must advertise e2e_only=true".to_string());
+    }
+    Ok(())
 }
 
 fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), ControlPlaneError> {
@@ -1300,6 +1650,20 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
             reason: format!(
                 "candidate belongs to node {} instead of {}",
                 candidate.node_id, request.node_id
+            ),
+        });
+    }
+    if let Some((candidate, reason)) = request.candidates.iter().find_map(|candidate| {
+        candidate
+            .validate_kind_address()
+            .err()
+            .map(|reason| (candidate, reason))
+    }) {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "candidate {:?} at {} is invalid: {reason}",
+                candidate.kind, candidate.addr
             ),
         });
     }
@@ -1584,6 +1948,14 @@ mod tests {
                 .await
         }
 
+        async fn update_node_routes(
+            &self,
+            node_id: &NodeId,
+            routes: Vec<Route>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.update_node_routes(node_id, routes).await
+        }
+
         async fn rotate_node_wireguard_public_key(
             &self,
             node_id: &NodeId,
@@ -1618,6 +1990,14 @@ mod tests {
             self.inner.upsert_path(path).await
         }
 
+        async fn replace_node_paths(
+            &self,
+            node_id: &NodeId,
+            paths: Vec<PathRecord>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.replace_node_paths(node_id, paths).await
+        }
+
         async fn list_paths_for(
             &self,
             node_id: &NodeId,
@@ -1649,6 +2029,20 @@ mod tests {
         }
     }
 
+    fn candidate_at(node_id: &str, addr: std::net::SocketAddr) -> EndpointCandidate {
+        EndpointCandidate {
+            addr,
+            ..candidate(node_id)
+        }
+    }
+
+    fn invalid_ipv6_candidate(node_id: &str) -> EndpointCandidate {
+        EndpointCandidate {
+            kind: EndpointCandidateKind::Ipv6,
+            ..candidate(node_id)
+        }
+    }
+
     fn stale_candidate(node_id: &str) -> EndpointCandidate {
         let mut candidate = candidate(node_id);
         candidate.observed_at = Utc::now() - Duration::seconds(60);
@@ -1669,6 +2063,16 @@ mod tests {
             ),
             updated_at: Utc::now(),
             pinned: false,
+        }
+    }
+
+    fn relay_path(local: &str, remote: &str, relay: Option<&str>) -> PathRecord {
+        PathRecord {
+            selected_state: PathState::Relay,
+            selected_candidate: None,
+            relay_node: relay.map(node_id),
+            score: PathScore::calculate(PathState::Relay, &PathMetrics::default(), true, 0),
+            ..path(local, remote)
         }
     }
 
@@ -1772,7 +2176,8 @@ mod tests {
                         message: None,
                     },
                     candidates: Vec::new(),
-                    relay_capability: None,
+                    relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2026,6 +2431,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_rejects_invalid_candidate_kind_addresses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut request = registration_request("node-a");
+        request.candidates = vec![invalid_ipv6_candidate("node-a")];
+
+        let error = match plane
+            .register_with_claims(claims(cluster_id), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful candidate registration".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registration_rejects_invalid_identity_public_key(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -2184,6 +2617,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_rejects_invalid_relay_capability_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+
+        let mut bad_endpoint = relay_capability();
+        bad_endpoint.public_endpoint = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 51820)));
+        let mut request = registration_request("node-a");
+        request.relay_capability = Some(bad_endpoint);
+        let error = match plane
+            .register_with_claims(relay_claims.clone(), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay public endpoint"));
+
+        let mut bad_admission_url = relay_capability();
+        bad_admission_url.admission_url = Some("udp://203.0.113.10:9580".to_string());
+        let mut request = registration_request("node-b");
+        request.relay_capability = Some(bad_admission_url);
+        let error = match plane
+            .register_with_claims(relay_claims.clone(), request)
+            .await
+        {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
+
+        let mut unusable_admission_url = relay_capability();
+        unusable_admission_url.admission_url = Some("http://0.0.0.0:9580".to_string());
+        let mut request = registration_request("node-c");
+        request.relay_capability = Some(unusable_admission_url);
+        let error = match plane.register_with_claims(relay_claims, request).await {
+            Ok(_) => return Err("unexpected successful relay registration".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeRegistrationRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn peer_map_applies_acl_roles_tags_and_routes() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut config = ControlPlaneConfig::new(
@@ -2262,6 +2757,24 @@ mod tests {
             .peers
             .iter()
             .all(|peer| peer.node_id != node_id("denied")));
+        store.upsert_path(path("source", "allowed")).await?;
+        store.upsert_path(path("source", "denied")).await?;
+        store.upsert_path(path("route-provider", "source")).await?;
+
+        let paths = plane.paths_for(&source.node_id).await?;
+
+        assert_eq!(paths.node_id, source.node_id);
+        assert_eq!(paths.paths.len(), 2);
+        assert!(paths.paths.iter().any(|path| {
+            path.key.local == node_id("source") && path.key.remote == node_id("allowed")
+        }));
+        assert!(paths.paths.iter().any(|path| {
+            path.key.local == node_id("route-provider") && path.key.remote == node_id("source")
+        }));
+        assert!(paths
+            .paths
+            .iter()
+            .all(|path| path.key.remote != node_id("denied")));
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.peer_map_candidate_count, 12);
         assert_eq!(metrics.peer_map_visible_count, 6);
@@ -2338,6 +2851,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_map_filters_unusable_endpoint_candidates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let source = node_record("source");
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![
+            candidate_at("peer-a", std::net::SocketAddr::from(([203, 0, 113, 10], 0))),
+            candidate_at("peer-a", std::net::SocketAddr::from(([0, 0, 0, 0], 51820))),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([224, 0, 0, 1], 51820)),
+            ),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([255, 255, 255, 255], 51820)),
+            ),
+            candidate_at(
+                "peer-a",
+                std::net::SocketAddr::from(([198, 51, 100, 20], 51820)),
+            ),
+        ];
+        let mut relay = node_record("relay-a");
+        relay.endpoint_candidates = vec![
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 51820),
+            ),
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                    51820,
+                ),
+            ),
+            candidate_at(
+                "relay-a",
+                std::net::SocketAddr::from(([198, 51, 100, 30], 51820)),
+            ),
+        ];
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            ..relay_capability()
+        });
+
+        store.insert_node(source.clone()).await?;
+        store.insert_node(peer).await?;
+        store.insert_node(relay).await?;
+        store
+            .upsert_health(
+                node_id("relay-a"),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.10),
+                    message: None,
+                },
+            )
+            .await?;
+
+        let peer_map = plane.peer_map_for(&source.node_id).await?;
+        let peer = peer_map
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == node_id("peer-a"))
+            .ok_or("peer should remain visible with usable candidate")?;
+        assert_eq!(
+            peer.endpoint_candidates
+                .iter()
+                .map(|candidate| candidate.addr)
+                .collect::<Vec<_>>(),
+            vec![std::net::SocketAddr::from(([198, 51, 100, 20], 51820))]
+        );
+
+        let relay_registration = plane
+            .register_with_claims(
+                claims(ClusterId::from_string("cluster-a")),
+                registration_request("node-b"),
+            )
+            .await?;
+        let relay = relay_registration
+            .relay_map
+            .relays
+            .iter()
+            .find(|relay| relay.node_id == node_id("relay-a"))
+            .ok_or("relay should remain visible with usable candidate")?;
+        assert_eq!(
+            relay
+                .endpoint_candidates
+                .iter()
+                .map(|candidate| candidate.addr)
+                .collect::<Vec<_>>(),
+            vec![std::net::SocketAddr::from(([198, 51, 100, 30], 51820))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_status_and_metrics_filter_stale_path_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.path_state_ttl_seconds = 30;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let source = node_record("source");
+        store.insert_node(source.clone()).await?;
+        store.insert_node(node_record("fresh-peer")).await?;
+        store.insert_node(node_record("stale-peer")).await?;
+        store.upsert_path(path("source", "fresh-peer")).await?;
+        let mut stale_path = path("source", "stale-peer");
+        stale_path.updated_at = Utc::now() - Duration::seconds(31);
+        store.upsert_path(stale_path).await?;
+
+        let paths = plane.paths_for(&source.node_id).await?;
+
+        assert_eq!(paths.paths.len(), 1);
+        assert_eq!(paths.paths[0].key.remote, node_id("fresh-peer"));
+        assert_eq!(paths.stale_path_count, 1);
+        assert_eq!(paths.path_state_ttl_seconds, 30);
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.stale_path_count, 1);
+        assert_eq!(metrics.path_state_ttl_seconds, 30);
+        assert_eq!(metrics.path_state_counts.len(), 5);
+        assert_eq!(
+            metrics
+                .path_state_counts
+                .iter()
+                .find(|count| count.state == PathState::DirectNatTraversal)
+                .map(|count| count.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .path_state_counts
+                .iter()
+                .find(|count| count.state == PathState::Relay)
+                .map(|count| count.count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_records_health_candidates_and_paths(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -2367,6 +3033,7 @@ mod tests {
                     health: health.clone(),
                     candidates: vec![candidate("node-a")],
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![path("node-a", "node-b")],
                     node_signature: None,
                 },
@@ -2386,6 +3053,205 @@ mod tests {
         );
         assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
         assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
+
+        let second_reported_at = reported_at + Duration::seconds(1);
+        let second_health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: second_reported_at,
+            latency_ms: Some(9.0),
+            relay_load: None,
+            message: Some("idle".to_string()),
+        };
+        let second_response = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: second_health.clone(),
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                second_reported_at,
+            ))
+            .await?;
+
+        assert!(second_response.accepted);
+        assert_eq!(
+            store.get_health(&node_id("node-a")).await?,
+            Some(second_health)
+        );
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_routes_when_policy_allows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+        let route = route("route-a", "10.42.1.0/24", "node-a")?;
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("routes refreshed".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route.clone()]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert_eq!(
+            store
+                .get_node(&node_id("node-a"))
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+                .routes,
+            vec![route.clone()]
+        );
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(13.0),
+                        relay_load: None,
+                        message: Some("no route update".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert_eq!(
+            store
+                .get_node(&node_id("node-a"))
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+                .routes,
+            vec![route]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_routes_outside_token_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store);
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("bad route".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route("route-denied", "10.43.1.0/24", "node-a")?]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::RouteDenied(route)) if route == "route-denied"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_routes_advertised_by_other_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store);
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("unowned route".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![route("route-unowned", "10.42.1.0/24", "node-b")?]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("route route-unowned is advertised by node")
+        ));
         Ok(())
     }
 
@@ -2415,6 +3281,7 @@ mod tests {
                 },
                 candidates: vec![candidate("node-a")],
                 relay_capability: None,
+                routes: None,
                 path_state: Vec::new(),
                 node_signature: None,
             },
@@ -2458,6 +3325,7 @@ mod tests {
             },
             candidates: Vec::new(),
             relay_capability: None,
+            routes: None,
             path_state: Vec::new(),
             node_signature: None,
         };
@@ -2505,6 +3373,7 @@ mod tests {
                     health: health.clone(),
                     candidates: vec![candidate("node-b")],
                     relay_capability: None,
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2523,6 +3392,7 @@ mod tests {
                     health,
                     candidates: Vec::new(),
                     relay_capability: None,
+                    routes: None,
                     path_state: vec![path("node-b", "node-c")],
                     node_signature: None,
                 },
@@ -2532,6 +3402,643 @@ mod tests {
             result,
             Err(ControlPlaneError::NodeUpdateRejected { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_unowned_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(candidate("node-c"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("selected candidate belongs to node"));
+        assert!(error.to_string().contains("instead of path peer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_invalid_selected_candidate_address(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(invalid_ipv6_candidate("node-b"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_unusable_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(candidate_at(
+            "node-b",
+            std::net::SocketAddr::from(([203, 0, 113, 10], 0)),
+        ));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("selected candidate"));
+        assert!(error.to_string().contains("is unusable"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_without_relay_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", None)],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("is missing relay node"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_with_ineligible_relay_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("is not an eligible relay candidate"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_using_endpoint_as_relay(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("node-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful endpoint relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("uses endpoint"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_relay_path_hidden_by_acl() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![
+            AclRule {
+                id: "deny-relay".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("relay-hidden")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Deny,
+            },
+            AclRule {
+                id: "allow-other-peers".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::new(),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+        ];
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        relay_claims.tags.insert(Tag::from_string("relay-hidden"));
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.1),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful ACL-hidden relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("is not visible"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_records_relay_path_visible_by_acl() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![AclRule {
+            id: "allow-relay".to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::from([Tag::from_string("relay-visible")]),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
+        }];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        relay_claims.tags.insert(Tag::from_string("relay-visible"));
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.1),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let response = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert!(response.accepted);
+        let paths = store.list_paths_for(&node_id("node-a")).await?;
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].relay_node, Some(node_id("relay-a")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_records_relay_path_with_eligible_relay_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.1),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let response = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        assert!(response.accepted);
+        let paths = store.list_paths_for(&node_id("node-a")).await?;
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].selected_state, PathState::Relay);
+        assert_eq!(paths[0].relay_node, Some(node_id("relay-a")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_non_relay_path_with_relay_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.relay_node = Some(node_id("relay-a"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful non-relay path-state update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("non-relay path"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_candidate_kind_addresses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: vec![invalid_ipv6_candidate("node-a")],
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful heartbeat candidate update".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("IPv6 candidates must use"));
         Ok(())
     }
 
@@ -2568,6 +4075,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(heartbeat_relay),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2584,6 +4092,81 @@ mod tests {
         };
         assert!(relay.enabled_by_policy);
         assert_eq!(relay.active_sessions, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_clears_relay_capability_when_not_reported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut relay_claims = claims(cluster_id.clone());
+        relay_claims.policy.allow_relay = true;
+        let mut relay_request = registration_request("relay-a");
+        relay_request.relay_capability = Some(relay_capability());
+        plane
+            .register_with_claims(relay_claims, relay_request)
+            .await?;
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.10),
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(relay_capability()),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 1);
+
+        plane
+            .heartbeat(signed_heartbeat(
+                "relay-a",
+                HeartbeatRequest {
+                    node_id: node_id("relay-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(1.0),
+                        relay_load: None,
+                        message: Some("relay stopped".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await?;
+
+        let relay_node = store
+            .get_node(&node_id("relay-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("relay-a")))?;
+        assert!(relay_node.relay_capability.is_none());
+        assert_eq!(plane.metrics().await?.relay_candidate_count, 0);
+
+        let source_registration = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        assert!(source_registration.relay_map.relays.is_empty());
         Ok(())
     }
 
@@ -2614,6 +4197,7 @@ mod tests {
                     },
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
+                    routes: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -2621,6 +4205,62 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ControlPlaneError::RelayDenied)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_relay_capability_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allow_relay = true;
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let mut bad_admission_url = relay_capability();
+        bad_admission_url.admission_url = Some("http://0.0.0.0:9580".to_string());
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: Some(bad_admission_url),
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error = match result {
+            Ok(_) => return Err("unexpected successful relay heartbeat".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error.to_string().contains("relay admission URL"));
+        let node = store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
+        assert!(node.relay_capability.is_none());
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use chrono::{DateTime, Utc};
 use ipnet::{IpNet, Ipv4Net};
@@ -121,6 +121,14 @@ impl Tag {
         Self(value.into())
     }
 
+    pub fn route_provider() -> Self {
+        Self::from_string("route-provider")
+    }
+
+    pub fn kubernetes_control_plane() -> Self {
+        Self::from_string("kubernetes-control-plane")
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -165,6 +173,57 @@ pub struct EndpointCandidate {
     pub priority: u16,
     pub cost: u32,
     pub source: CandidateSource,
+}
+
+impl EndpointCandidate {
+    pub fn validate_kind_address(&self) -> Result<(), &'static str> {
+        match self.kind {
+            EndpointCandidateKind::Ipv6 if !self.addr.is_ipv6() => {
+                Err("IPv6 candidates must use an IPv6 socket address")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+pub fn endpoint_addr_is_usable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return false;
+    }
+
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_broadcast(),
+        IpAddr::V6(_) => true,
+    }
+}
+
+pub fn http_url_is_usable_endpoint(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    if port == 0 {
+        return false;
+    }
+
+    match host {
+        url::Host::Domain(_) => true,
+        url::Host::Ipv4(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V4(ip), port)),
+        url::Host::Ipv6(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V6(ip), port)),
+    }
+}
+
+pub fn relay_admission_url_is_usable(value: &str) -> bool {
+    http_url_is_usable_endpoint(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +544,75 @@ impl Default for PathMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMetricsValidationError {
+    field: &'static str,
+    message: &'static str,
+}
+
+impl PathMetricsValidationError {
+    fn new(field: &'static str, message: &'static str) -> Self {
+        Self { field, message }
+    }
+
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl Display for PathMetricsValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "path metric {} {}", self.field, self.message)
+    }
+}
+
+impl std::error::Error for PathMetricsValidationError {}
+
+impl PathMetrics {
+    pub fn validate(&self) -> Result<(), PathMetricsValidationError> {
+        validate_optional_non_negative_metric("latency_ms", self.latency_ms)?;
+        validate_optional_non_negative_metric("jitter_ms", self.jitter_ms)?;
+        validate_optional_unit_metric("relay_load", self.relay_load)?;
+        validate_unit_metric("stability", self.stability)?;
+        Ok(())
+    }
+}
+
+fn validate_optional_non_negative_metric(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), PathMetricsValidationError> {
+    if let Some(value) = value {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PathMetricsValidationError::new(
+                field,
+                "must be a finite non-negative value",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_unit_metric(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), PathMetricsValidationError> {
+    if let Some(value) = value {
+        validate_unit_metric(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_unit_metric(field: &'static str, value: f32) -> Result<(), PathMetricsValidationError> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(PathMetricsValidationError::new(
+            field,
+            "must be a finite value between 0 and 1",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathScore {
     pub value: f32,
@@ -515,7 +643,7 @@ impl PathScore {
         let mut reasons = vec![format!("state={state:?}")];
 
         if let Some(latency_ms) = metrics.latency_ms {
-            value -= latency_ms.min(500.0) / 10.0;
+            value -= bounded_metric(latency_ms, 0.0, 500.0, 500.0) / 10.0;
             reasons.push(format!("latency_ms={latency_ms:.1}"));
         }
         if metrics.loss_ppm > 0 {
@@ -523,18 +651,28 @@ impl PathScore {
             reasons.push(format!("loss_ppm={}", metrics.loss_ppm));
         }
         if let Some(jitter_ms) = metrics.jitter_ms {
-            value -= jitter_ms.min(200.0) / 20.0;
+            value -= bounded_metric(jitter_ms, 0.0, 200.0, 200.0) / 20.0;
             reasons.push(format!("jitter_ms={jitter_ms:.1}"));
         }
         if let Some(relay_load) = metrics.relay_load {
-            value -= relay_load.clamp(0.0, 1.0) * 20.0;
+            value -= bounded_metric(relay_load, 0.0, 1.0, 1.0) * 20.0;
             reasons.push(format!("relay_load={relay_load:.2}"));
         }
-        value += metrics.stability.clamp(0.0, 1.0) * 15.0;
+        let stability = bounded_metric(metrics.stability, 0.0, 1.0, 0.0);
+        value += stability * 15.0;
+        reasons.push(format!("stability={stability:.2}"));
         value -= cost.min(10_000) as f32 / 100.0;
         reasons.push(format!("cost={cost}"));
 
         Self { value, reasons }
+    }
+}
+
+fn bounded_metric(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
     }
 }
 
@@ -604,8 +742,11 @@ impl RelayCapability {
 
     pub fn can_admit(&self) -> bool {
         self.enabled_by_policy
-            && self.public_endpoint.is_some()
-            && self.admission_url.is_some()
+            && self.public_endpoint.is_some_and(endpoint_addr_is_usable)
+            && self
+                .admission_url
+                .as_deref()
+                .is_some_and(relay_admission_url_is_usable)
             && self.e2e_only
             && self.available_capacity() > 0
             && self.max_mbps > 0
@@ -643,6 +784,8 @@ pub struct ClusterPolicy {
     pub relay_health_ttl_seconds: u64,
     #[serde(default = "default_endpoint_candidate_ttl_seconds")]
     pub endpoint_candidate_ttl_seconds: u64,
+    #[serde(default = "default_path_state_ttl_seconds")]
+    pub path_state_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_ttl_seconds")]
     pub nat_classification_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_min_confidence_percent")]
@@ -657,6 +800,9 @@ impl Default for ClusterPolicy {
     fn default() -> Self {
         let mut pinned_roles = BTreeSet::new();
         pinned_roles.insert(Role::control_plane());
+        let mut pinned_tags = BTreeSet::new();
+        pinned_tags.insert(Tag::route_provider());
+        pinned_tags.insert(Tag::kubernetes_control_plane());
         Self {
             allow_ipv6_direct: true,
             allow_nat_traversal: true,
@@ -664,11 +810,12 @@ impl Default for ClusterPolicy {
             idle_timeout_seconds: 300,
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
+            path_state_ttl_seconds: default_path_state_ttl_seconds(),
             nat_classification_ttl_seconds: default_nat_classification_ttl_seconds(),
             nat_classification_min_confidence_percent:
                 default_nat_classification_min_confidence_percent(),
             pinned_roles,
-            pinned_tags: BTreeSet::new(),
+            pinned_tags,
             acl_rules: Vec::new(),
         }
     }
@@ -680,6 +827,10 @@ fn default_relay_health_ttl_seconds() -> u64 {
 
 fn default_endpoint_candidate_ttl_seconds() -> u64 {
     120
+}
+
+fn default_path_state_ttl_seconds() -> u64 {
+    600
 }
 
 fn default_nat_classification_ttl_seconds() -> u64 {
@@ -932,6 +1083,18 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlanePathsResponse {
+        pub cluster_id: ClusterId,
+        pub node_id: NodeId,
+        pub paths: Vec<PathRecord>,
+        #[serde(default)]
+        pub stale_path_count: usize,
+        #[serde(default = "super::default_path_state_ttl_seconds")]
+        pub path_state_ttl_seconds: u64,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct NodeRequestSignature {
         pub signed_at: DateTime<Utc>,
         pub signature: String,
@@ -943,6 +1106,8 @@ pub mod api {
         pub health: NodeHealth,
         pub candidates: Vec<EndpointCandidate>,
         pub relay_capability: Option<RelayCapability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routes: Option<Vec<Route>>,
         pub path_state: Vec<PathRecord>,
         pub signed_at: DateTime<Utc>,
     }
@@ -962,6 +1127,8 @@ pub mod api {
         pub candidates: Vec<EndpointCandidate>,
         #[serde(default)]
         pub relay_capability: Option<RelayCapability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routes: Option<Vec<Route>>,
         pub path_state: Vec<PathRecord>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node_signature: Option<NodeRequestSignature>,
@@ -974,6 +1141,7 @@ pub mod api {
                 health: self.health.clone(),
                 candidates: self.candidates.clone(),
                 relay_capability: self.relay_capability.clone(),
+                routes: self.routes.clone(),
                 path_state: self.path_state.clone(),
                 signed_at,
             }
@@ -1078,10 +1246,14 @@ pub mod api {
         pub peer_map_route_visible_count: usize,
         #[serde(default)]
         pub peer_map_route_acl_denied_count: usize,
+        #[serde(default)]
+        pub stale_path_count: usize,
         pub path_count: usize,
         pub path_state_counts: Vec<PathStateCount>,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,
+        #[serde(default = "super::default_path_state_ttl_seconds")]
+        pub path_state_ttl_seconds: u64,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1106,10 +1278,18 @@ pub mod api {
         pub node_upsert_count: u64,
         pub path_negotiation_count: u64,
         #[serde(default)]
+        pub path_acl_denied_count: u64,
+        #[serde(default)]
+        pub relay_candidate_acl_denied_count: u64,
+        #[serde(default)]
         pub path_negotiation_state_counts: Vec<PathStateCount>,
         pub hole_punch_plan_count: u64,
         #[serde(default)]
+        pub hole_punch_acl_denied_count: u64,
+        #[serde(default)]
         pub hole_punch_nat_suppressed_count: u64,
+        #[serde(default)]
+        pub hole_punch_nat_suppressed_strategy_counts: Vec<NatTraversalStrategyCount>,
         pub relay_health_ttl_seconds: u64,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,
@@ -1117,6 +1297,19 @@ pub mod api {
         pub nat_classification_ttl_seconds: u64,
         #[serde(default = "super::default_nat_classification_min_confidence_percent")]
         pub nat_classification_min_confidence_percent: u8,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StunMetricsResponse {
+        pub listen: SocketAddr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub alternate_listen: Option<SocketAddr>,
+        pub binding_request_count: u64,
+        pub binding_response_count: u64,
+        pub invalid_packet_count: u64,
+        pub socket_receive_error_count: u64,
+        pub socket_send_error_count: u64,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1177,6 +1370,17 @@ pub mod api {
     }
 
     impl RelayDataplaneDropReason {
+        pub const ALL: [Self; 8] = [
+            Self::AdmissionDenied,
+            Self::UnknownSession,
+            Self::SessionExpired,
+            Self::InvalidSessionCredential,
+            Self::RateLimited,
+            Self::MalformedFrame,
+            Self::FrameTooLarge,
+            Self::SocketError,
+        ];
+
         pub fn as_str(self) -> &'static str {
             match self {
                 Self::AdmissionDenied => "admission_denied",
@@ -1187,6 +1391,42 @@ pub mod api {
                 Self::MalformedFrame => "malformed_frame",
                 Self::FrameTooLarge => "frame_too_large",
                 Self::SocketError => "socket_error",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RelayAdmissionFailureReason {
+        Unauthorized,
+        AdmissionDenied,
+        NodeSessionLimitExceeded,
+        RateLimited,
+        InvalidSessionCredential,
+        SocketError,
+        InternalError,
+    }
+
+    impl RelayAdmissionFailureReason {
+        pub const ALL: [Self; 7] = [
+            Self::Unauthorized,
+            Self::AdmissionDenied,
+            Self::NodeSessionLimitExceeded,
+            Self::RateLimited,
+            Self::InvalidSessionCredential,
+            Self::SocketError,
+            Self::InternalError,
+        ];
+
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Unauthorized => "unauthorized",
+                Self::AdmissionDenied => "admission_denied",
+                Self::NodeSessionLimitExceeded => "node_session_limit_exceeded",
+                Self::RateLimited => "rate_limited",
+                Self::InvalidSessionCredential => "invalid_session_credential",
+                Self::SocketError => "socket_error",
+                Self::InternalError => "internal_error",
             }
         }
     }
@@ -1233,6 +1473,16 @@ pub mod api {
         pub capability: RelayCapability,
         pub health: HealthState,
         #[serde(default)]
+        pub admission_attempt_count: u64,
+        #[serde(default)]
+        pub admission_success_count: u64,
+        #[serde(default)]
+        pub admission_failure_count: u64,
+        #[serde(default)]
+        pub admission_failures_by_reason: BTreeMap<RelayAdmissionFailureReason, u64>,
+        #[serde(default)]
+        pub max_sessions_per_node: Option<u32>,
+        #[serde(default)]
         pub dataplane: RelayDataplaneMetrics,
     }
 
@@ -1264,6 +1514,8 @@ pub mod api {
         pub candidate_count: usize,
         pub candidates: Vec<EndpointCandidate>,
         pub nat_classification: Option<NatClassification>,
+        #[serde(default)]
+        pub userspace_wireguard_process: Option<AgentManagedProcessStatus>,
         pub state_updated_at: DateTime<Utc>,
     }
 
@@ -1362,15 +1614,19 @@ pub mod api {
         Multicast,
         Broadcast,
         LinkLocal,
+        NoOverlayMatch,
+        InconsistentTransportMetadata,
     }
 
     impl AgentPacketFlowDropReason {
-        pub const ALL: [Self; 5] = [
+        pub const ALL: [Self; 7] = [
             Self::Unspecified,
             Self::Loopback,
             Self::Multicast,
             Self::Broadcast,
             Self::LinkLocal,
+            Self::NoOverlayMatch,
+            Self::InconsistentTransportMetadata,
         ];
 
         pub const fn as_str(self) -> &'static str {
@@ -1380,7 +1636,35 @@ pub mod api {
                 Self::Multicast => "multicast",
                 Self::Broadcast => "broadcast",
                 Self::LinkLocal => "link_local",
+                Self::NoOverlayMatch => "no_overlay_match",
+                Self::InconsistentTransportMetadata => "inconsistent_transport_metadata",
             }
+        }
+    }
+
+    pub fn packet_flow_destination_drop_reason(
+        destination: IpAddr,
+    ) -> Option<AgentPacketFlowDropReason> {
+        if destination.is_unspecified() {
+            return Some(AgentPacketFlowDropReason::Unspecified);
+        }
+        if destination.is_loopback() {
+            return Some(AgentPacketFlowDropReason::Loopback);
+        }
+        if destination.is_multicast() {
+            return Some(AgentPacketFlowDropReason::Multicast);
+        }
+        match destination {
+            IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
+                Some(AgentPacketFlowDropReason::Broadcast)
+            }
+            IpAddr::V4(address) if address.is_link_local() => {
+                Some(AgentPacketFlowDropReason::LinkLocal)
+            }
+            IpAddr::V6(address) if address.is_unicast_link_local() => {
+                Some(AgentPacketFlowDropReason::LinkLocal)
+            }
+            _ => None,
         }
     }
 
@@ -1450,13 +1734,29 @@ pub mod api {
         Http,
         Https,
         Ssh,
+        Ldap,
+        Smb,
+        Rdp,
         KubernetesApi,
         Etcd,
+        ZooKeeper,
+        Consul,
+        Vault,
+        Nomad,
         Postgres,
         Mysql,
+        MsSql,
+        Oracle,
+        ClickHouse,
         Redis,
+        Memcached,
         Prometheus,
         OpenTelemetry,
+        Jaeger,
+        Loki,
+        Tempo,
+        Zipkin,
+        Grpc,
         Kafka,
         Nats,
         Mqtt,
@@ -1469,19 +1769,35 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 21] = [
+        pub const ALL: [Self; 37] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
             Self::Https,
             Self::Ssh,
+            Self::Ldap,
+            Self::Smb,
+            Self::Rdp,
             Self::KubernetesApi,
             Self::Etcd,
+            Self::ZooKeeper,
+            Self::Consul,
+            Self::Vault,
+            Self::Nomad,
             Self::Postgres,
             Self::Mysql,
+            Self::MsSql,
+            Self::Oracle,
+            Self::ClickHouse,
             Self::Redis,
+            Self::Memcached,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Jaeger,
+            Self::Loki,
+            Self::Tempo,
+            Self::Zipkin,
+            Self::Grpc,
             Self::Kafka,
             Self::Nats,
             Self::Mqtt,
@@ -1500,13 +1816,29 @@ pub mod api {
                 Self::Http => "http",
                 Self::Https => "https",
                 Self::Ssh => "ssh",
+                Self::Ldap => "ldap",
+                Self::Smb => "smb",
+                Self::Rdp => "rdp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
+                Self::ZooKeeper => "zookeeper",
+                Self::Consul => "consul",
+                Self::Vault => "vault",
+                Self::Nomad => "nomad",
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
+                Self::MsSql => "mssql",
+                Self::Oracle => "oracle",
+                Self::ClickHouse => "clickhouse",
                 Self::Redis => "redis",
+                Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Jaeger => "jaeger",
+                Self::Loki => "loki",
+                Self::Tempo => "tempo",
+                Self::Zipkin => "zipkin",
+                Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
                 Self::Mqtt => "mqtt",
@@ -1529,6 +1861,10 @@ pub mod api {
         pub observation: AgentPacketFlowObservation,
     }
 
+    pub const PACKET_FLOW_DETECTOR_MAX_BYTES: usize = 64;
+    pub const PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS: usize = 8;
+    pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
+
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowObservation {
         #[serde(default)]
@@ -1539,15 +1875,78 @@ pub mod api {
         pub source_port: Option<u16>,
         #[serde(default)]
         pub destination_port: Option<u16>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_packet_flow_detector")]
         pub detector: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<AgentPacketFlowApplication>,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_packet_flow_payload_prefix"
+        )]
+        pub payload_prefix: Vec<u8>,
+        #[serde(default, deserialize_with = "deserialize_packet_flow_conntrack_status")]
         pub conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
         #[serde(default)]
         pub tcp_state: Option<AgentPacketFlowTcpState>,
     }
 
     impl AgentPacketFlowObservation {
+        pub fn validate_transport_metadata(&self) -> Result<(), String> {
+            if let Some(detector) = self.detector.as_deref() {
+                validate_packet_flow_detector(detector)?;
+            }
+            if let Some(source) = self.source {
+                validate_packet_flow_source(source)?;
+            }
+            if self.payload_prefix.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+                return Err(format!(
+                    "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                ));
+            }
+            if self.conntrack_status.len() > PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS {
+                return Err(format!(
+                    "packet-flow conntrack_status exceeds {PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS} flags"
+                ));
+            }
+            if self
+                .conntrack_status
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            {
+                return Err(
+                    "packet-flow conntrack_status must be sorted and deduplicated".to_string(),
+                );
+            }
+            if self.protocol == Some(TransportProtocol::Any) {
+                return Err(
+                    "packet-flow protocol must be a concrete transport protocol, not any"
+                        .to_string(),
+                );
+            }
+            if let Some(application) = self.application {
+                validate_packet_flow_application_hint(self.protocol, application)?;
+            }
+            if self.source_port == Some(0) || self.destination_port == Some(0) {
+                return Err("packet-flow port metadata must use nonzero ports".to_string());
+            }
+            if self.protocol != Some(TransportProtocol::Tcp) && self.tcp_state.is_some() {
+                return Err("packet-flow TCP state requires TCP protocol".to_string());
+            }
+
+            let protocol_has_ports = matches!(
+                self.protocol,
+                Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+            );
+            if !protocol_has_ports
+                && (self.source_port.is_some() || self.destination_port.is_some())
+            {
+                return Err("packet-flow port metadata requires TCP or UDP protocol".to_string());
+            }
+
+            Ok(())
+        }
+
         pub fn classification(&self) -> AgentPacketFlowClassification {
             if self
                 .conntrack_status
@@ -1580,11 +1979,20 @@ pub mod api {
         }
 
         pub fn application(&self) -> AgentPacketFlowApplication {
+            if let Some(application) = self.application {
+                return application;
+            }
             if self.protocol == Some(TransportProtocol::Icmp) {
                 return AgentPacketFlowApplication::Icmp;
             }
             if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
                 return AgentPacketFlowApplication::WireGuard;
+            }
+            let payload_application = self.payload_prefix_application();
+            if let Some(application) = payload_application {
+                if self.payload_prefix_application_overrides_port(application) {
+                    return application;
+                }
             }
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
@@ -1593,6 +2001,48 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::Etcd;
+            }
+            if (self.involves_port(2181)
+                || self.involves_port(2182)
+                || self.involves_port(2888)
+                || self.involves_port(3888))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::ZooKeeper;
+            }
+            if (self.involves_port(8300)
+                || self.involves_port(8500)
+                || self.involves_port(8501)
+                || self.involves_port(8502))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Consul;
+            }
+            if (self.involves_port(8301) || self.involves_port(8302))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Consul;
+            }
+            if (self.involves_port(8200) || self.involves_port(8201))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Vault;
+            }
+            if (self.involves_port(4646) || self.involves_port(4647))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Nomad;
+            }
+            if self.involves_port(4648)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Nomad;
             }
             if self.involves_port(53)
                 && matches!(
@@ -1611,14 +2061,51 @@ pub mod api {
             if self.involves_port(22) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Ssh;
             }
+            if (self.involves_port(389) || self.involves_port(636))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Ldap;
+            }
+            if self.involves_port(445) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Smb;
+            }
+            if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Rdp;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
             if self.involves_port(3306) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Mysql;
             }
+            if self.involves_port(1433) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::MsSql;
+            }
+            if (self.involves_port(1521) || self.involves_port(2484))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Oracle;
+            }
+            if (self.involves_port(8123)
+                || self.involves_port(9000)
+                || self.involves_port(9009)
+                || self.involves_port(9010)
+                || self.involves_port(9011)
+                || self.involves_port(9440))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::ClickHouse;
+            }
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
+            }
+            if self.involves_port(11211)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Memcached;
             }
             if self.involves_port(9090) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Prometheus;
@@ -1627,6 +2114,34 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
+            }
+            if (self.involves_port(5778)
+                || self.involves_port(14250)
+                || self.involves_port(14268)
+                || self.involves_port(14269)
+                || self.involves_port(16686))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Jaeger;
+            }
+            if (self.involves_port(6831) || self.involves_port(6832))
+                && matches!(self.protocol, None | Some(TransportProtocol::Udp))
+            {
+                return AgentPacketFlowApplication::Jaeger;
+            }
+            if (self.involves_port(3100) || self.involves_port(9095))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Loki;
+            }
+            if self.involves_port(3200) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Tempo;
+            }
+            if self.involves_port(9411) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Zipkin;
+            }
+            if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Grpc;
             }
             if (self.involves_port(9092) || self.involves_port(9093))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
@@ -1657,16 +2172,4638 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Elasticsearch;
             }
+            if let Some(application) = payload_application {
+                return application;
+            }
             AgentPacketFlowApplication::Unknown
         }
 
         fn involves_port(&self, port: u16) -> bool {
             self.source_port == Some(port) || self.destination_port == Some(port)
         }
+
+        fn payload_prefix_application_overrides_port(
+            &self,
+            application: AgentPacketFlowApplication,
+        ) -> bool {
+            !matches!(
+                application,
+                AgentPacketFlowApplication::Http | AgentPacketFlowApplication::Https
+            ) || self.involves_port(80)
+                || self.involves_port(443)
+        }
+
+        fn payload_prefix_application(&self) -> Option<AgentPacketFlowApplication> {
+            if self.payload_prefix.is_empty() {
+                return None;
+            }
+            let payload = self.payload_prefix.as_slice();
+            if dns_payload(payload, self.protocol) {
+                return Some(AgentPacketFlowApplication::Dns);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Udp)
+                && self.involves_port(443)
+                && quic_long_header_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Https);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && wireguard_payload(payload) {
+                return Some(AgentPacketFlowApplication::WireGuard);
+            }
+            if !protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return None;
+            }
+            http_payload_application(payload)
+                .or_else(|| tls_client_hello_application(payload))
+                .or_else(|| {
+                    tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
+                })
+                .or_else(|| ssh_payload(payload).then_some(AgentPacketFlowApplication::Ssh))
+                .or_else(|| ldap_payload(payload).then_some(AgentPacketFlowApplication::Ldap))
+                .or_else(|| smb_payload(payload).then_some(AgentPacketFlowApplication::Smb))
+                .or_else(|| rdp_payload(payload).then_some(AgentPacketFlowApplication::Rdp))
+                .or_else(|| {
+                    zookeeper_payload(payload).then_some(AgentPacketFlowApplication::ZooKeeper)
+                })
+                .or_else(|| {
+                    postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
+                })
+                .or_else(|| mysql_payload(payload).then_some(AgentPacketFlowApplication::Mysql))
+                .or_else(|| mssql_tds_payload(payload).then_some(AgentPacketFlowApplication::MsSql))
+                .or_else(|| {
+                    oracle_tns_payload(payload).then_some(AgentPacketFlowApplication::Oracle)
+                })
+                .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
+                .or_else(|| {
+                    memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
+                })
+                .or_else(|| kafka_payload(payload).then_some(AgentPacketFlowApplication::Kafka))
+                .or_else(|| nats_payload(payload).then_some(AgentPacketFlowApplication::Nats))
+                .or_else(|| mqtt_payload(payload).then_some(AgentPacketFlowApplication::Mqtt))
+                .or_else(|| amqp_payload(payload).then_some(AgentPacketFlowApplication::Amqp))
+                .or_else(|| {
+                    cassandra_payload(payload).then_some(AgentPacketFlowApplication::Cassandra)
+                })
+                .or_else(|| mongodb_payload(payload).then_some(AgentPacketFlowApplication::MongoDb))
+                .or_else(|| {
+                    elasticsearch_transport_payload(payload)
+                        .then_some(AgentPacketFlowApplication::Elasticsearch)
+                })
+        }
     }
 
     fn protocol_is(protocol: Option<TransportProtocol>, expected: TransportProtocol) -> bool {
         protocol.is_none() || protocol == Some(expected)
+    }
+
+    fn validate_packet_flow_application_hint(
+        protocol: Option<TransportProtocol>,
+        application: AgentPacketFlowApplication,
+    ) -> Result<(), String> {
+        let Some(protocol) = protocol else {
+            return Ok(());
+        };
+        match application {
+            AgentPacketFlowApplication::Unknown => Ok(()),
+            AgentPacketFlowApplication::Icmp => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "ICMP",
+                |protocol| protocol == TransportProtocol::Icmp,
+            ),
+            AgentPacketFlowApplication::WireGuard => {
+                require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
+                    protocol == TransportProtocol::Udp
+                })
+            }
+            AgentPacketFlowApplication::Dns
+            | AgentPacketFlowApplication::Https
+            | AgentPacketFlowApplication::Consul
+            | AgentPacketFlowApplication::Nomad
+            | AgentPacketFlowApplication::Jaeger
+            | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "TCP or UDP",
+                |protocol| matches!(protocol, TransportProtocol::Tcp | TransportProtocol::Udp),
+            ),
+            _ => {
+                require_packet_flow_application_protocol(protocol, application, "TCP", |protocol| {
+                    protocol == TransportProtocol::Tcp
+                })
+            }
+        }
+    }
+
+    fn require_packet_flow_application_protocol(
+        protocol: TransportProtocol,
+        application: AgentPacketFlowApplication,
+        required: &'static str,
+        is_allowed: impl FnOnce(TransportProtocol) -> bool,
+    ) -> Result<(), String> {
+        if is_allowed(protocol) {
+            return Ok(());
+        }
+        Err(format!(
+            "packet-flow application hint {} requires {required} protocol",
+            application.as_str()
+        ))
+    }
+
+    fn validate_packet_flow_source(source: IpAddr) -> Result<(), String> {
+        if let Some(reason) = packet_flow_destination_drop_reason(source) {
+            return Err(format!(
+                "packet-flow source must not use {} address",
+                reason.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    fn deserialize_packet_flow_detector<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let detector = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let Some(detector) = detector else {
+            return Ok(None);
+        };
+        validate_packet_flow_detector(&detector).map_err(serde::de::Error::custom)?;
+        Ok(Some(detector))
+    }
+
+    fn validate_packet_flow_detector(detector: &str) -> Result<(), String> {
+        if detector.len() > PACKET_FLOW_DETECTOR_MAX_BYTES {
+            return Err(format!(
+                "packet-flow detector exceeds {PACKET_FLOW_DETECTOR_MAX_BYTES} bytes"
+            ));
+        }
+        if detector.trim().is_empty() {
+            return Err("packet-flow detector must not be empty".to_string());
+        }
+        if detector.chars().any(char::is_control) {
+            return Err("packet-flow detector must not contain control characters".to_string());
+        }
+        Ok(())
+    }
+
+    fn deserialize_packet_flow_conntrack_status<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<AgentPacketFlowConntrackStatus>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some(mut statuses) =
+            <Option<Vec<AgentPacketFlowConntrackStatus>> as serde::Deserialize>::deserialize(
+                deserializer,
+            )?
+        else {
+            return Ok(Vec::new());
+        };
+        if statuses.len() > PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS {
+            return Err(serde::de::Error::custom(format!(
+                "packet-flow conntrack_status exceeds {PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS} flags"
+            )));
+        }
+        statuses.sort();
+        statuses.dedup();
+        Ok(statuses)
+    }
+
+    fn deserialize_packet_flow_payload_prefix<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PayloadPrefixVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PayloadPrefixVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a packet-flow payload prefix string or byte array up to {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                )
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Vec::new())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Vec::new())
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(value.as_bytes())
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(value)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                bounded_packet_flow_payload_prefix(&value)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::new();
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+                        )));
+                    }
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(PayloadPrefixVisitor)
+    }
+
+    fn bounded_packet_flow_payload_prefix<E>(bytes: &[u8]) -> Result<Vec<u8>, E>
+    where
+        E: serde::de::Error,
+    {
+        if bytes.len() > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return Err(E::custom(format!(
+                "packet-flow payload_prefix exceeds {PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    const HTTP_REQUEST_METHODS: [&[u8]; 9] = [
+        b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE", b"CONNECT",
+    ];
+
+    fn http_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if let Some(application) = http_payload_hint_application(payload) {
+            return Some(application);
+        }
+        if let Some(path) = http_request_path(payload) {
+            if loki_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Loki);
+            }
+            if tempo_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Tempo);
+            }
+            if zipkin_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Zipkin);
+            }
+            if path_starts_with_any(path, &[b"/metrics", b"/federate"])
+                || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
+            {
+                return Some(AgentPacketFlowApplication::Prometheus);
+            }
+            if path_starts_with_any(path, &[b"/v1/traces", b"/v1/metrics", b"/v1/logs"]) {
+                return Some(AgentPacketFlowApplication::OpenTelemetry);
+            }
+            if opentelemetry_grpc_path(path) {
+                return Some(AgentPacketFlowApplication::OpenTelemetry);
+            }
+            if jaeger_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Jaeger);
+            }
+            if consul_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Consul);
+            }
+            if vault_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Vault);
+            }
+            if nomad_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Nomad);
+            }
+            if grpc_http_payload(payload) {
+                return Some(AgentPacketFlowApplication::Grpc);
+            }
+            if path_starts_with_any(
+                path,
+                &[
+                    b"/_bulk",
+                    b"/_search",
+                    b"/_msearch",
+                    b"/_cluster",
+                    b"/_cat",
+                    b"/_nodes",
+                ],
+            ) || path_contains_any(path, &[b"/_bulk", b"/_search", b"/_msearch"])
+            {
+                return Some(AgentPacketFlowApplication::Elasticsearch);
+            }
+            return Some(AgentPacketFlowApplication::Http);
+        }
+        if payload.starts_with(b"HTTP/") || payload.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        {
+            return http2_payload_application(payload).or(Some(AgentPacketFlowApplication::Http));
+        }
+        None
+    }
+
+    fn grpc_http_payload(payload: &[u8]) -> bool {
+        contains_ascii_case_insensitive(payload, b"content-type: application/grpc")
+            || contains_ascii_case_insensitive(payload, b"content-type: application/grpc-web")
+    }
+
+    fn http2_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        if !payload.starts_with(HTTP2_PREFACE) {
+            return None;
+        }
+        let frames = payload.get(HTTP2_PREFACE.len()..).unwrap_or_default();
+        http_payload_hint_application(frames)
+    }
+
+    fn http_payload_hint_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if contains_ascii_case_insensitive(payload, b"/opentelemetry.proto.collector.") {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if contains_ascii_case_insensitive(payload, b"/zipkin.proto3.SpanService/Report") {
+            return Some(AgentPacketFlowApplication::Zipkin);
+        }
+        if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
+            return Some(AgentPacketFlowApplication::ClickHouse);
+        }
+        if grpc_http_payload(payload)
+            || contains_ascii_case_insensitive(payload, b"application/grpc")
+        {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        None
+    }
+
+    fn opentelemetry_grpc_path(path: &[u8]) -> bool {
+        path_starts_with_any(
+            path,
+            &[
+                b"/opentelemetry.proto.collector.trace.v1.TraceService/",
+                b"/opentelemetry.proto.collector.metrics.v1.MetricsService/",
+                b"/opentelemetry.proto.collector.logs.v1.LogsService/",
+            ],
+        )
+    }
+
+    fn jaeger_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 6] = [
+            b"/api/archive",
+            b"/api/dependencies",
+            b"/api/operations",
+            b"/api/services",
+            b"/api/traces",
+            b"/jaeger/api/traces",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn loki_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/loki/api/v1")
+    }
+
+    fn tempo_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 5] = [
+            b"/api/v2/traces",
+            b"/api/search",
+            b"/api/metrics/query",
+            b"/api/metrics/query_range",
+            b"/api/echo",
+        ];
+
+        path.starts_with(b"/api/traces/")
+            || PREFIXES
+                .iter()
+                .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn zipkin_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 13] = [
+            b"/zipkin",
+            b"/api/v2/spans",
+            b"/api/v2/services",
+            b"/api/v2/trace",
+            b"/api/v2/dependencies",
+            b"/api/v2/autocompleteTags",
+            b"/api/v1/spans",
+            b"/api/v1/services",
+            b"/api/v1/trace",
+            b"/api/v1/dependencies",
+            b"/config.json",
+            b"/health",
+            b"/info",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn consul_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 19] = [
+            b"/v1/acl",
+            b"/v1/agent",
+            b"/v1/catalog",
+            b"/v1/config",
+            b"/v1/connect",
+            b"/v1/coordinate",
+            b"/v1/discovery-chain",
+            b"/v1/event",
+            b"/v1/exported-services",
+            b"/v1/health",
+            b"/v1/intention",
+            b"/v1/kv",
+            b"/v1/operator",
+            b"/v1/partition",
+            b"/v1/peering",
+            b"/v1/query",
+            b"/v1/session",
+            b"/v1/status",
+            b"/v1/txn",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn nomad_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 24] = [
+            b"/v1/allocation",
+            b"/v1/allocations",
+            b"/v1/alloc",
+            b"/v1/client/allocation",
+            b"/v1/csi",
+            b"/v1/deployment",
+            b"/v1/deployments",
+            b"/v1/evaluation",
+            b"/v1/evaluations",
+            b"/v1/job",
+            b"/v1/jobs",
+            b"/v1/namespace",
+            b"/v1/namespaces",
+            b"/v1/node",
+            b"/v1/nodes",
+            b"/v1/plugin",
+            b"/v1/plugins",
+            b"/v1/quota",
+            b"/v1/quotas",
+            b"/v1/scaling",
+            b"/v1/search",
+            b"/v1/var",
+            b"/v1/variables",
+            b"/v1/volumes",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn vault_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 17] = [
+            b"/v1/auth",
+            b"/v1/aws",
+            b"/v1/azure",
+            b"/v1/cubbyhole",
+            b"/v1/database",
+            b"/v1/gcp",
+            b"/v1/identity",
+            b"/v1/ldap",
+            b"/v1/nomad",
+            b"/v1/pki",
+            b"/v1/rabbitmq",
+            b"/v1/secret",
+            b"/v1/ssh",
+            b"/v1/sys",
+            b"/v1/token",
+            b"/v1/transit",
+            b"/v1/transform",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn dns_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            Some(TransportProtocol::Udp) => dns_message_payload(payload),
+            Some(TransportProtocol::Tcp) => dns_tcp_payload(payload),
+            None => dns_message_payload(payload) || dns_tcp_payload(payload),
+            Some(TransportProtocol::Any | TransportProtocol::Icmp) => false,
+        }
+    }
+
+    fn dns_tcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 14 {
+            return false;
+        }
+        let message_len = u16::from_be_bytes([payload[0], payload[1]]);
+        (12..=4096).contains(&message_len) && dns_message_payload(&payload[2..])
+    }
+
+    fn dns_message_payload(payload: &[u8]) -> bool {
+        if payload.len() < 12 {
+            return false;
+        }
+        let flags = u16::from_be_bytes([payload[2], payload[3]]);
+        let opcode = (flags >> 11) & 0x0f;
+        let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+        if opcode > 5 || qdcount == 0 || flags & 0x0040 != 0 {
+            return false;
+        }
+        dns_question_payload(payload)
+    }
+
+    fn dns_question_payload(payload: &[u8]) -> bool {
+        let mut offset = 12_usize;
+        let mut labels = 0_usize;
+        let mut name_len = 0_usize;
+        loop {
+            let Some(&len) = payload.get(offset) else {
+                return false;
+            };
+            if len & 0xc0 != 0 {
+                return false;
+            }
+            offset += 1;
+            if len == 0 {
+                break;
+            }
+            if len > 63 {
+                return false;
+            }
+            let len = len as usize;
+            let Some(label_end) = offset.checked_add(len) else {
+                return false;
+            };
+            let Some(label) = payload.get(offset..label_end) else {
+                return false;
+            };
+            if !label
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return false;
+            }
+            labels += 1;
+            name_len += len + 1;
+            if labels > 32 || name_len > 255 {
+                return false;
+            }
+            offset = label_end;
+        }
+        if labels == 0 {
+            return false;
+        }
+        let Some(question_end) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(question) = payload.get(offset..question_end) else {
+            return false;
+        };
+        let qtype = u16::from_be_bytes([question[0], question[1]]);
+        let qclass = u16::from_be_bytes([question[2], question[3]]);
+        qtype != 0 && qclass != 0
+    }
+
+    fn tls_handshake_payload(payload: &[u8]) -> bool {
+        if payload.len() < 6 {
+            return false;
+        }
+        let record_len = u16::from_be_bytes([payload[3], payload[4]]);
+        payload[0] == 0x16
+            && payload[1] == 0x03
+            && (0x01..=0x04).contains(&payload[2])
+            && (1..=16_384).contains(&record_len)
+            && matches!(payload[5], 0x01 | 0x02)
+    }
+
+    fn tls_client_hello_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if payload.len() < 9
+            || payload[0] != 0x16
+            || payload[1] != 0x03
+            || !(0x01..=0x04).contains(&payload[2])
+            || payload[5] != 0x01
+        {
+            return None;
+        }
+        let record_len = read_u16_be(payload, 3)? as usize;
+        if !(1..=16_384).contains(&record_len) {
+            return None;
+        }
+        let handshake_len = read_u24_be(payload, 6)?;
+        if handshake_len < 38 || handshake_len.checked_add(4)? > record_len {
+            return None;
+        }
+        let handshake_end = 9_usize.checked_add(handshake_len)?;
+        if handshake_end > payload.len() {
+            return None;
+        }
+
+        let mut offset = 9_usize.checked_add(34)?;
+        let session_id_len = *payload.get(offset)? as usize;
+        offset = offset.checked_add(1)?.checked_add(session_id_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let cipher_suites_len = read_u16_be(payload, offset)? as usize;
+        if cipher_suites_len == 0 || !cipher_suites_len.is_multiple_of(2) {
+            return None;
+        }
+        offset = offset.checked_add(2)?.checked_add(cipher_suites_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let compression_methods_len = *payload.get(offset)? as usize;
+        if compression_methods_len == 0 {
+            return None;
+        }
+        offset = offset
+            .checked_add(1)?
+            .checked_add(compression_methods_len)?;
+        if offset >= handshake_end {
+            return None;
+        }
+
+        let extensions_len = read_u16_be(payload, offset)? as usize;
+        offset = offset.checked_add(2)?;
+        let extensions_end = offset.checked_add(extensions_len)?;
+        if extensions_end != handshake_end {
+            return None;
+        }
+
+        let mut alpn_application = None;
+        while offset.checked_add(4)? <= extensions_end {
+            let extension_type = read_u16_be(payload, offset)?;
+            let extension_len = read_u16_be(payload, offset + 2)? as usize;
+            offset = offset.checked_add(4)?;
+            let extension_end = offset.checked_add(extension_len)?;
+            if extension_end > extensions_end {
+                return None;
+            }
+            let extension = payload.get(offset..extension_end)?;
+            match extension_type {
+                0 => {
+                    if let Some(application) = tls_sni_extension_application(extension) {
+                        return Some(application);
+                    }
+                }
+                16 if alpn_application.is_none() => {
+                    alpn_application = tls_alpn_extension_application(extension);
+                }
+                _ => {}
+            }
+            offset = extension_end;
+        }
+        alpn_application
+    }
+
+    fn tls_sni_extension_application(extension: &[u8]) -> Option<AgentPacketFlowApplication> {
+        let server_name_list_len = read_u16_be(extension, 0)? as usize;
+        let server_name_list_end = 2_usize.checked_add(server_name_list_len)?;
+        if server_name_list_end > extension.len() {
+            return None;
+        }
+
+        let mut offset = 2_usize;
+        while offset < server_name_list_end {
+            let name_type = *extension.get(offset)?;
+            let name_len = read_u16_be(extension, offset + 1)? as usize;
+            let name_offset = offset.checked_add(3)?;
+            let name_end = name_offset.checked_add(name_len)?;
+            if name_end > server_name_list_end {
+                return None;
+            }
+            if name_type == 0 {
+                if let Some(application) =
+                    tls_sni_hostname_application(extension.get(name_offset..name_end)?)
+                {
+                    return Some(application);
+                }
+            }
+            offset = name_end;
+        }
+        None
+    }
+
+    fn tls_sni_hostname_application(hostname: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if !tls_sni_hostname_is_valid(hostname) {
+            return None;
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kubernetes")
+            || tls_sni_hostname_has_label_prefix(hostname, b"kube-apiserver")
+            || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
+        {
+            return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"etcd") {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"zookeeper")
+            || tls_sni_hostname_has_label_prefix(hostname, b"zk")
+        {
+            return Some(AgentPacketFlowApplication::ZooKeeper);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"consul") {
+            return Some(AgentPacketFlowApplication::Consul);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"vault") {
+            return Some(AgentPacketFlowApplication::Vault);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"nomad") {
+            return Some(AgentPacketFlowApplication::Nomad);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"prometheus") {
+            return Some(AgentPacketFlowApplication::Prometheus);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"opentelemetry")
+            || tls_sni_hostname_has_label_prefix(hostname, b"otel")
+            || tls_sni_hostname_has_label_prefix(hostname, b"otlp")
+        {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"jaeger") {
+            return Some(AgentPacketFlowApplication::Jaeger);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"loki") {
+            return Some(AgentPacketFlowApplication::Loki);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"tempo") {
+            return Some(AgentPacketFlowApplication::Tempo);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"zipkin") {
+            return Some(AgentPacketFlowApplication::Zipkin);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
+            return Some(AgentPacketFlowApplication::Kafka);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"nats") {
+            return Some(AgentPacketFlowApplication::Nats);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mqtt")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mosquitto")
+            || tls_sni_hostname_has_label_prefix(hostname, b"emqx")
+        {
+            return Some(AgentPacketFlowApplication::Mqtt);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"amqp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"amqps")
+            || tls_sni_hostname_has_label_prefix(hostname, b"rabbitmq")
+        {
+            return Some(AgentPacketFlowApplication::Amqp);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"cassandra") {
+            return Some(AgentPacketFlowApplication::Cassandra);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mongodb")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mongo")
+        {
+            return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
+            || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
+        {
+            return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"postgres")
+            || tls_sni_hostname_has_label_prefix(hostname, b"postgresql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"pg")
+        {
+            return Some(AgentPacketFlowApplication::Postgres);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mysql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mariadb")
+        {
+            return Some(AgentPacketFlowApplication::Mysql);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mssql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"sqlserver")
+            || tls_sni_hostname_has_label_prefix(hostname, b"sql-server")
+        {
+            return Some(AgentPacketFlowApplication::MsSql);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"oracle")
+            || tls_sni_hostname_has_label_prefix(hostname, b"oracledb")
+            || tls_sni_hostname_has_label_prefix(hostname, b"tns")
+        {
+            return Some(AgentPacketFlowApplication::Oracle);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"clickhouse") {
+            return Some(AgentPacketFlowApplication::ClickHouse);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"redis")
+            || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
+        {
+            return Some(AgentPacketFlowApplication::Redis);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"memcached")
+            || tls_sni_hostname_has_label_prefix(hostname, b"memcache")
+        {
+            return Some(AgentPacketFlowApplication::Memcached);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ldap")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ldaps")
+        {
+            return Some(AgentPacketFlowApplication::Ldap);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
+            return Some(AgentPacketFlowApplication::Smb);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"rdp") {
+            return Some(AgentPacketFlowApplication::Rdp);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ssh") {
+            return Some(AgentPacketFlowApplication::Ssh);
+        }
+        None
+    }
+
+    fn tls_alpn_extension_application(extension: &[u8]) -> Option<AgentPacketFlowApplication> {
+        let protocol_list_len = read_u16_be(extension, 0)? as usize;
+        let protocol_list_end = 2_usize.checked_add(protocol_list_len)?;
+        if protocol_list_end != extension.len() {
+            return None;
+        }
+
+        let mut offset = 2_usize;
+        while offset < protocol_list_end {
+            let protocol_len = *extension.get(offset)? as usize;
+            let protocol_offset = offset.checked_add(1)?;
+            let protocol_end = protocol_offset.checked_add(protocol_len)?;
+            if protocol_len == 0 || protocol_end > protocol_list_end {
+                return None;
+            }
+            if let Some(application) =
+                tls_alpn_protocol_application(extension.get(protocol_offset..protocol_end)?)
+            {
+                return Some(application);
+            }
+            offset = protocol_end;
+        }
+        None
+    }
+
+    fn tls_alpn_protocol_application(protocol: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if protocol.eq_ignore_ascii_case(b"kubernetes")
+            || protocol.eq_ignore_ascii_case(b"kube-apiserver")
+            || protocol.eq_ignore_ascii_case(b"kube-api")
+        {
+            return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if protocol.eq_ignore_ascii_case(b"etcd") {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if protocol.eq_ignore_ascii_case(b"zookeeper")
+            || protocol.eq_ignore_ascii_case(b"zk")
+            || protocol.eq_ignore_ascii_case(b"zab")
+        {
+            return Some(AgentPacketFlowApplication::ZooKeeper);
+        }
+        if protocol.eq_ignore_ascii_case(b"consul")
+            || protocol.eq_ignore_ascii_case(b"consul-rpc")
+            || protocol.eq_ignore_ascii_case(b"consul-grpc")
+        {
+            return Some(AgentPacketFlowApplication::Consul);
+        }
+        if protocol.eq_ignore_ascii_case(b"vault")
+            || protocol.eq_ignore_ascii_case(b"vault-rpc")
+            || protocol.eq_ignore_ascii_case(b"vault-api")
+        {
+            return Some(AgentPacketFlowApplication::Vault);
+        }
+        if protocol.eq_ignore_ascii_case(b"nomad")
+            || protocol.eq_ignore_ascii_case(b"nomad-rpc")
+            || protocol.eq_ignore_ascii_case(b"nomad-serf")
+        {
+            return Some(AgentPacketFlowApplication::Nomad);
+        }
+        if protocol.eq_ignore_ascii_case(b"prometheus") {
+            return Some(AgentPacketFlowApplication::Prometheus);
+        }
+        if protocol.eq_ignore_ascii_case(b"opentelemetry")
+            || protocol.eq_ignore_ascii_case(b"otel")
+            || protocol.eq_ignore_ascii_case(b"otlp")
+            || tls_alpn_protocol_has_token(protocol, b"otlp")
+        {
+            return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if protocol.eq_ignore_ascii_case(b"jaeger")
+            || protocol.eq_ignore_ascii_case(b"jaeger-grpc")
+            || protocol.eq_ignore_ascii_case(b"jaeger-thrift")
+        {
+            return Some(AgentPacketFlowApplication::Jaeger);
+        }
+        if protocol.eq_ignore_ascii_case(b"loki")
+            || protocol.eq_ignore_ascii_case(b"loki-grpc")
+            || protocol.eq_ignore_ascii_case(b"loki-http")
+        {
+            return Some(AgentPacketFlowApplication::Loki);
+        }
+        if protocol.eq_ignore_ascii_case(b"tempo")
+            || protocol.eq_ignore_ascii_case(b"tempo-grpc")
+            || protocol.eq_ignore_ascii_case(b"tempo-http")
+        {
+            return Some(AgentPacketFlowApplication::Tempo);
+        }
+        if protocol.eq_ignore_ascii_case(b"zipkin")
+            || protocol.eq_ignore_ascii_case(b"zipkin-http")
+            || protocol.eq_ignore_ascii_case(b"zipkin-grpc")
+        {
+            return Some(AgentPacketFlowApplication::Zipkin);
+        }
+        if protocol.eq_ignore_ascii_case(b"clickhouse")
+            || protocol.eq_ignore_ascii_case(b"clickhouse-native")
+            || protocol.eq_ignore_ascii_case(b"clickhouse-http")
+        {
+            return Some(AgentPacketFlowApplication::ClickHouse);
+        }
+        if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if protocol.eq_ignore_ascii_case(b"kafka") {
+            return Some(AgentPacketFlowApplication::Kafka);
+        }
+        if protocol.eq_ignore_ascii_case(b"nats") {
+            return Some(AgentPacketFlowApplication::Nats);
+        }
+        if protocol.eq_ignore_ascii_case(b"mqtt")
+            || protocol
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"mqttv"))
+            || tls_alpn_protocol_has_token(protocol, b"mqtt")
+            || protocol.eq_ignore_ascii_case(b"mosquitto")
+            || protocol.eq_ignore_ascii_case(b"emqx")
+        {
+            return Some(AgentPacketFlowApplication::Mqtt);
+        }
+        if protocol.eq_ignore_ascii_case(b"amqp")
+            || protocol.eq_ignore_ascii_case(b"amqp/1.0")
+            || protocol.eq_ignore_ascii_case(b"rabbitmq")
+        {
+            return Some(AgentPacketFlowApplication::Amqp);
+        }
+        if protocol.eq_ignore_ascii_case(b"cassandra") {
+            return Some(AgentPacketFlowApplication::Cassandra);
+        }
+        if protocol.eq_ignore_ascii_case(b"mongodb") || protocol.eq_ignore_ascii_case(b"mongo") {
+            return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"elasticsearch")
+            || protocol.eq_ignore_ascii_case(b"elastic")
+        {
+            return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        if protocol.eq_ignore_ascii_case(b"postgres")
+            || protocol.eq_ignore_ascii_case(b"postgresql")
+            || protocol.eq_ignore_ascii_case(b"pg")
+        {
+            return Some(AgentPacketFlowApplication::Postgres);
+        }
+        if protocol.eq_ignore_ascii_case(b"mysql") || protocol.eq_ignore_ascii_case(b"mariadb") {
+            return Some(AgentPacketFlowApplication::Mysql);
+        }
+        if protocol.eq_ignore_ascii_case(b"mssql")
+            || protocol.eq_ignore_ascii_case(b"sqlserver")
+            || protocol.eq_ignore_ascii_case(b"tds")
+        {
+            return Some(AgentPacketFlowApplication::MsSql);
+        }
+        if protocol.eq_ignore_ascii_case(b"oracle")
+            || protocol.eq_ignore_ascii_case(b"oracle-tns")
+            || protocol.eq_ignore_ascii_case(b"tns")
+        {
+            return Some(AgentPacketFlowApplication::Oracle);
+        }
+        if protocol.eq_ignore_ascii_case(b"redis") || protocol.eq_ignore_ascii_case(b"valkey") {
+            return Some(AgentPacketFlowApplication::Redis);
+        }
+        if protocol.eq_ignore_ascii_case(b"memcached") || protocol.eq_ignore_ascii_case(b"memcache")
+        {
+            return Some(AgentPacketFlowApplication::Memcached);
+        }
+        if protocol.eq_ignore_ascii_case(b"ldap") || protocol.eq_ignore_ascii_case(b"ldaps") {
+            return Some(AgentPacketFlowApplication::Ldap);
+        }
+        if protocol.eq_ignore_ascii_case(b"smb") {
+            return Some(AgentPacketFlowApplication::Smb);
+        }
+        if protocol.eq_ignore_ascii_case(b"rdp") {
+            return Some(AgentPacketFlowApplication::Rdp);
+        }
+        if protocol.eq_ignore_ascii_case(b"ssh") {
+            return Some(AgentPacketFlowApplication::Ssh);
+        }
+        None
+    }
+
+    fn tls_alpn_protocol_has_token(protocol: &[u8], token: &[u8]) -> bool {
+        if token.is_empty() || token.len() > protocol.len() {
+            return false;
+        }
+        for offset in 0..=protocol.len() - token.len() {
+            let token_end = offset + token.len();
+            if !protocol[offset..token_end].eq_ignore_ascii_case(token) {
+                continue;
+            }
+            let previous_is_separator = offset == 0
+                || protocol
+                    .get(offset - 1)
+                    .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+            let next_is_separator = token_end == protocol.len()
+                || protocol
+                    .get(token_end)
+                    .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+            if previous_is_separator && next_is_separator {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn tls_sni_hostname_is_valid(hostname: &[u8]) -> bool {
+        if hostname.is_empty() || hostname.len() > 253 {
+            return false;
+        }
+        let mut previous_dot = true;
+        for byte in hostname {
+            match *byte {
+                b'.' => {
+                    if previous_dot {
+                        return false;
+                    }
+                    previous_dot = true;
+                }
+                byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') => {
+                    previous_dot = false;
+                }
+                _ => return false,
+            }
+        }
+        !previous_dot
+    }
+
+    fn tls_sni_hostname_has_label_prefix(hostname: &[u8], prefix: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        while offset < hostname.len() {
+            let relative_end = hostname[offset..]
+                .iter()
+                .position(|byte| *byte == b'.')
+                .unwrap_or(hostname.len() - offset);
+            let label_end = offset + relative_end;
+            let label = &hostname[offset..label_end];
+            if label.eq_ignore_ascii_case(prefix)
+                || (label.len() > prefix.len()
+                    && label
+                        .get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    && label.get(prefix.len()) == Some(&b'-'))
+            {
+                return true;
+            }
+            offset = label_end.saturating_add(1);
+        }
+        false
+    }
+
+    fn read_u16_be(payload: &[u8], offset: usize) -> Option<u16> {
+        let bytes = payload.get(offset..offset.checked_add(2)?)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u16_le(payload: &[u8], offset: usize) -> Option<u16> {
+        let bytes = payload.get(offset..offset.checked_add(2)?)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u24_be(payload: &[u8], offset: usize) -> Option<usize> {
+        let bytes = payload.get(offset..offset.checked_add(3)?)?;
+        Some(((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize)
+    }
+
+    fn read_u24_le(payload: &[u8], offset: usize) -> Option<usize> {
+        let bytes = payload.get(offset..offset.checked_add(3)?)?;
+        Some((bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16))
+    }
+
+    fn read_u32_be(payload: &[u8], offset: usize) -> Option<u32> {
+        let bytes = payload.get(offset..offset.checked_add(4)?)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u32_le(payload: &[u8], offset: usize) -> Option<u32> {
+        let bytes = payload.get(offset..offset.checked_add(4)?)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn quic_long_header_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] & 0x80 == 0 {
+            return false;
+        }
+        let Some(version) = read_u32_be(payload, 1) else {
+            return false;
+        };
+        if version == 0 {
+            return false;
+        }
+        if version != 1 {
+            return payload[0] & 0x40 != 0 && quic_connection_id_lengths(payload, 255).is_some();
+        }
+        if payload[0] & 0x40 == 0 {
+            return false;
+        }
+        let Some((payload_offset, _dcid_len, _scid_len)) = quic_connection_id_lengths(payload, 20)
+        else {
+            return false;
+        };
+        let packet_number_len = (payload[0] & 0x03) as usize + 1;
+        match (payload[0] & 0x30) >> 4 {
+            0 => quic_initial_packet_payload(payload, payload_offset, packet_number_len),
+            1 | 2 => quic_length_packet_payload(payload, payload_offset, packet_number_len),
+            3 => quic_retry_packet_payload(payload, payload_offset),
+            _ => false,
+        }
+    }
+
+    fn quic_connection_id_lengths(payload: &[u8], max_len: usize) -> Option<(usize, usize, usize)> {
+        let dcid_len = *payload.get(5)? as usize;
+        if dcid_len > max_len {
+            return None;
+        }
+        let scid_len_index = 6_usize.checked_add(dcid_len)?;
+        let scid_len = *payload.get(scid_len_index)? as usize;
+        if scid_len > max_len {
+            return None;
+        }
+        let payload_offset = scid_len_index.checked_add(1)?.checked_add(scid_len)?;
+        (payload.len() >= payload_offset).then_some((payload_offset, dcid_len, scid_len))
+    }
+
+    fn quic_initial_packet_payload(
+        payload: &[u8],
+        offset: usize,
+        packet_number_len: usize,
+    ) -> bool {
+        let Some((token_len, token_offset)) = read_quic_varint(payload, offset) else {
+            return false;
+        };
+        let Some(length_offset) = token_offset.checked_add(token_len as usize) else {
+            return false;
+        };
+        if length_offset > payload.len() {
+            return false;
+        }
+        quic_length_packet_payload(payload, length_offset, packet_number_len)
+    }
+
+    fn quic_length_packet_payload(payload: &[u8], offset: usize, packet_number_len: usize) -> bool {
+        let Some((declared_len, packet_number_offset)) = read_quic_varint(payload, offset) else {
+            return false;
+        };
+        let Some(packet_payload_min_len) = packet_number_len.checked_add(1) else {
+            return false;
+        };
+        if declared_len < packet_payload_min_len as u64 {
+            return false;
+        }
+        packet_number_offset
+            .checked_add(packet_payload_min_len)
+            .is_some_and(|end| payload.len() >= end)
+    }
+
+    fn quic_retry_packet_payload(payload: &[u8], offset: usize) -> bool {
+        let Some(&odcid_len) = payload.get(offset) else {
+            return false;
+        };
+        if odcid_len > 20 {
+            return false;
+        }
+        offset
+            .checked_add(1)
+            .and_then(|offset| offset.checked_add(odcid_len as usize))
+            .and_then(|offset| offset.checked_add(16))
+            .is_some_and(|minimum_len| payload.len() >= minimum_len)
+    }
+
+    fn read_quic_varint(payload: &[u8], offset: usize) -> Option<(u64, usize)> {
+        let first = *payload.get(offset)?;
+        let len = 1_usize << ((first >> 6) as usize);
+        let bytes = payload.get(offset..offset.checked_add(len)?)?;
+        let mut value = (bytes[0] & 0x3f) as u64;
+        for byte in &bytes[1..] {
+            value = value.checked_shl(8)?.checked_add(*byte as u64)?;
+        }
+        Some((value, offset + len))
+    }
+
+    const WIREGUARD_HANDSHAKE_INITIATION_LEN: usize = 148;
+    const WIREGUARD_HANDSHAKE_RESPONSE_LEN: usize = 92;
+    const WIREGUARD_COOKIE_REPLY_LEN: usize = 64;
+    const WIREGUARD_TRANSPORT_KEEPALIVE_LEN: usize = 32;
+
+    fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
+        payload_len == wire_len
+            || (wire_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
+                && payload_len == PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
+    fn wireguard_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
+            return false;
+        }
+        match payload[0] {
+            1 => wireguard_observed_len_matches(payload.len(), WIREGUARD_HANDSHAKE_INITIATION_LEN),
+            2 => payload.len() == WIREGUARD_HANDSHAKE_RESPONSE_LEN,
+            3 => payload.len() == WIREGUARD_COOKIE_REPLY_LEN,
+            4 => {
+                payload.len() >= WIREGUARD_TRANSPORT_KEEPALIVE_LEN
+                    && payload.len().is_multiple_of(16)
+            }
+            _ => false,
+        }
+    }
+
+    fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
+        HTTP_REQUEST_METHODS.iter().find_map(|method| {
+            let method_len = method.len();
+            if payload.get(..method_len)? != *method || payload.get(method_len) != Some(&b' ') {
+                return None;
+            }
+            let rest = payload.get(method_len + 1..)?;
+            let end = rest
+                .iter()
+                .position(|byte| matches!(byte, b' ' | b'\r' | b'\n'))
+                .unwrap_or(rest.len());
+            let tail = rest.get(end..)?;
+            (end > 0 && tail.starts_with(b" HTTP/")).then_some(&rest[..end])
+        })
+    }
+
+    fn ssh_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        while offset < payload.len() {
+            let remaining = &payload[offset..];
+            let line_end = remaining.iter().position(|byte| *byte == b'\n');
+            let (raw_line, complete) = match line_end {
+                Some(line_end) => (&remaining[..line_end], true),
+                None => (remaining, false),
+            };
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line.starts_with(b"SSH-") {
+                let wire_len = raw_line.len() + usize::from(complete);
+                return ssh_identification_line(line, wire_len);
+            }
+            if !complete || raw_line.contains(&0) {
+                return false;
+            }
+            offset = offset.saturating_add(line_end.unwrap_or(remaining.len()) + 1);
+        }
+        false
+    }
+
+    fn ssh_identification_line(line: &[u8], wire_len: usize) -> bool {
+        if wire_len > 255 || line.len() < b"SSH-2.0-a".len() {
+            return false;
+        }
+        let rest = &line[4..];
+        let Some(version_end) = rest.iter().position(|byte| *byte == b'-') else {
+            return false;
+        };
+        let version = &rest[..version_end];
+        if !matches!(version, b"2.0" | b"1.99") {
+            return false;
+        }
+        let software_and_comments = &rest[version_end + 1..];
+        let software_end = software_and_comments
+            .iter()
+            .position(|byte| *byte == b' ')
+            .unwrap_or(software_and_comments.len());
+        let software = &software_and_comments[..software_end];
+        if software.is_empty()
+            || !software
+                .iter()
+                .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'-')
+        {
+            return false;
+        }
+        software_and_comments[software_end..]
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
+    }
+
+    fn ldap_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0x30 {
+            return false;
+        }
+        let Some((sequence_len, sequence_content_offset)) = ber_length(payload, 1) else {
+            return false;
+        };
+        if !(5..=16_777_216).contains(&sequence_len)
+            || payload.get(sequence_content_offset) != Some(&0x02)
+        {
+            return false;
+        }
+        let Some(sequence_end) = sequence_content_offset.checked_add(sequence_len) else {
+            return false;
+        };
+        let Some((message_id_len, message_id_offset)) =
+            ber_length(payload, sequence_content_offset + 1)
+        else {
+            return false;
+        };
+        if !(1..=4).contains(&message_id_len)
+            || !ldap_message_id_payload(payload, message_id_offset, message_id_len)
+        {
+            return false;
+        }
+        let Some(protocol_op_offset) = message_id_offset.checked_add(message_id_len) else {
+            return false;
+        };
+        if protocol_op_offset >= sequence_end {
+            return false;
+        }
+        let Some(&protocol_op_tag) = payload.get(protocol_op_offset) else {
+            return false;
+        };
+        if !ldap_protocol_op_tag(protocol_op_tag) {
+            return false;
+        }
+        let Some((protocol_op_len, protocol_op_content_offset)) =
+            ber_length(payload, protocol_op_offset + 1)
+        else {
+            return false;
+        };
+        if !ldap_protocol_op_length(protocol_op_tag, protocol_op_len) {
+            return false;
+        }
+        let Some(protocol_op_end) = protocol_op_content_offset.checked_add(protocol_op_len) else {
+            return false;
+        };
+        if protocol_op_end > sequence_end {
+            return false;
+        }
+        if protocol_op_end < sequence_end {
+            payload
+                .get(protocol_op_end)
+                .is_none_or(|next_tag| *next_tag == 0xa0)
+        } else {
+            true
+        }
+    }
+
+    fn ldap_message_id_payload(payload: &[u8], offset: usize, len: usize) -> bool {
+        let Some(value) = payload.get(offset..offset.saturating_add(len)) else {
+            return false;
+        };
+        if value.is_empty() || value[0] & 0x80 != 0 {
+            return false;
+        }
+        !(len > 1 && value[0] == 0 && value[1] & 0x80 == 0)
+    }
+
+    fn ldap_protocol_op_tag(tag: u8) -> bool {
+        matches!(
+            tag,
+            0x42 | 0x4a
+                | 0x50
+                | 0x60
+                | 0x61
+                | 0x63
+                | 0x64
+                | 0x65
+                | 0x66
+                | 0x67
+                | 0x68
+                | 0x69
+                | 0x6b
+                | 0x6c
+                | 0x6d
+                | 0x6e
+                | 0x6f
+                | 0x73
+                | 0x77
+                | 0x78
+                | 0x79
+        )
+    }
+
+    fn ldap_protocol_op_length(tag: u8, len: usize) -> bool {
+        match tag {
+            0x42 => len == 0,
+            0x4a => (1..=65_535).contains(&len),
+            0x50 => (1..=4).contains(&len),
+            _ => (1..=16_777_216).contains(&len),
+        }
+    }
+
+    fn ber_length(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        let first = *payload.get(offset)?;
+        if first & 0x80 == 0 {
+            return Some((first as usize, offset + 1));
+        }
+        let length_bytes = (first & 0x7f) as usize;
+        if length_bytes == 0 || length_bytes > 4 {
+            return None;
+        }
+        let mut len = 0_usize;
+        for byte in payload.get(offset + 1..offset + 1 + length_bytes)? {
+            len = len.checked_shl(8)?.checked_add(*byte as usize)?;
+        }
+        Some((len, offset + 1 + length_bytes))
+    }
+
+    fn smb_payload(payload: &[u8]) -> bool {
+        smb_message_payload(payload, 0, None) || smb_direct_tcp_payload(payload)
+    }
+
+    fn smb_direct_tcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 || payload[0] != 0 {
+            return false;
+        }
+        let message_len =
+            ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
+        if !(32..=16_777_215).contains(&message_len) {
+            return false;
+        }
+        if payload.len() > message_len.saturating_add(4) {
+            return false;
+        }
+        smb_message_payload(payload, 4, Some(message_len))
+    }
+
+    fn smb_message_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        let Some(protocol_id) = payload.get(offset..offset.saturating_add(4)) else {
+            return false;
+        };
+        match protocol_id {
+            [0xff, b'S', b'M', b'B'] => smb1_header_payload(payload, offset, declared_len),
+            [0xfe, b'S', b'M', b'B'] => smb2_header_payload(payload, offset, declared_len),
+            _ => false,
+        }
+    }
+
+    fn smb1_header_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        if declared_len.is_some_and(|len| len < 32) {
+            return false;
+        }
+        let Some(command) = payload.get(offset.saturating_add(4)) else {
+            return false;
+        };
+        if !smb1_command(*command) {
+            return false;
+        }
+        payload.len() >= offset.saturating_add(32)
+    }
+
+    fn smb1_command(command: u8) -> bool {
+        matches!(
+            command,
+            0x04 | 0x06
+                | 0x07
+                | 0x08
+                | 0x0a
+                | 0x0b
+                | 0x0c
+                | 0x0d
+                | 0x0e
+                | 0x0f
+                | 0x10
+                | 0x11
+                | 0x12
+                | 0x1a
+                | 0x1d
+                | 0x23
+                | 0x24
+                | 0x25
+                | 0x26
+                | 0x2d
+                | 0x2e
+                | 0x2f
+                | 0x32
+                | 0x33
+                | 0x34
+                | 0x35
+                | 0x70
+                | 0x71
+                | 0x72
+                | 0x73
+                | 0x74
+                | 0x75
+                | 0x80
+                | 0xa0
+                | 0xa2
+                | 0xa4
+                | 0xa5
+                | 0xc0
+                | 0xd8
+        )
+    }
+
+    fn smb2_header_payload(payload: &[u8], offset: usize, declared_len: Option<usize>) -> bool {
+        if declared_len.is_some_and(|len| len < 64) {
+            return false;
+        }
+        let Some(structure_size) = read_u16_le(payload, offset.saturating_add(4)) else {
+            return false;
+        };
+        if structure_size != 64 {
+            return false;
+        }
+        if let Some(command) = read_u16_le(payload, offset.saturating_add(12)) {
+            if command > 0x12 {
+                return false;
+            }
+        }
+        if let Some(flags) = read_u32_le(payload, offset.saturating_add(16)) {
+            let known_flags = 0x0000_007f | 0x1000_0000 | 0x2000_0000;
+            if flags & !known_flags != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn rdp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0x03 || payload[1] != 0x00 {
+            return false;
+        }
+        let length = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+        if !(7..=65_535).contains(&length) || payload.len() > length {
+            return false;
+        }
+        let x224_len = payload[4] as usize;
+        let Some(tpdu_end) = 5_usize.checked_add(x224_len) else {
+            return false;
+        };
+        if x224_len < 2 || tpdu_end > length {
+            return false;
+        }
+        match payload[5] {
+            0xe0 | 0xd0 => rdp_x224_connection_tpdu(payload, x224_len),
+            0xf0 => rdp_x224_data_tpdu(payload, x224_len),
+            _ => false,
+        }
+    }
+
+    fn rdp_x224_connection_tpdu(payload: &[u8], x224_len: usize) -> bool {
+        if x224_len < 6 || payload.len() < 11 {
+            return false;
+        }
+        let dst_ref = u16::from_be_bytes([payload[6], payload[7]]);
+        let src_ref = u16::from_be_bytes([payload[8], payload[9]]);
+        let class_options = payload[10];
+        if payload[5] == 0xe0 && (dst_ref != 0 || src_ref != 0 || class_options != 0) {
+            return false;
+        }
+        class_options & 0x0f == 0
+    }
+
+    fn rdp_x224_data_tpdu(payload: &[u8], x224_len: usize) -> bool {
+        x224_len == 2 && payload.len() >= 7 && payload[6] & 0x7f == 0
+    }
+
+    fn zookeeper_payload(payload: &[u8]) -> bool {
+        zookeeper_four_letter_command(payload) || zookeeper_connect_request(payload)
+    }
+
+    fn zookeeper_four_letter_command(payload: &[u8]) -> bool {
+        let command = match payload {
+            [a, b, c, d] => [*a, *b, *c, *d],
+            [a, b, c, d, b'\n'] => [*a, *b, *c, *d],
+            [a, b, c, d, b'\r', b'\n'] => [*a, *b, *c, *d],
+            _ => return false,
+        };
+        zookeeper_known_four_letter_command(&command)
+    }
+
+    fn zookeeper_known_four_letter_command(command: &[u8; 4]) -> bool {
+        let commands: [&[u8; 4]; 17] = [
+            b"ruok", b"stat", b"srvr", b"mntr", b"conf", b"cons", b"dump", b"envi", b"wchs",
+            b"wchc", b"wchp", b"isro", b"srst", b"crst", b"dirs", b"gtmk", b"stmk",
+        ];
+        commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(*known))
+    }
+
+    fn zookeeper_connect_request(payload: &[u8]) -> bool {
+        if payload.len() < 33 {
+            return false;
+        }
+        let Some(frame_len) = read_u32_be(payload, 0).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(frame_end) = 4_usize.checked_add(frame_len) else {
+            return false;
+        };
+        if !(29..=4096).contains(&frame_len) || payload.len() != frame_end {
+            return false;
+        }
+        let Some(protocol_version) = read_u32_be(payload, 4) else {
+            return false;
+        };
+        if protocol_version != 0 {
+            return false;
+        }
+        let Some(timeout_ms) = read_u32_be(payload, 16) else {
+            return false;
+        };
+        if !(1..=3_600_000).contains(&timeout_ms) {
+            return false;
+        }
+        let Some(passwd_len) = read_u32_be(payload, 28).map(|value| value as usize) else {
+            return false;
+        };
+        if passwd_len > 64 {
+            return false;
+        }
+        let Some(read_only_offset) = 32_usize.checked_add(passwd_len) else {
+            return false;
+        };
+        if read_only_offset.checked_add(1) != Some(frame_end) {
+            return false;
+        }
+        matches!(payload.get(read_only_offset).copied(), Some(0 | 1))
+    }
+
+    fn postgres_payload(payload: &[u8]) -> bool {
+        postgres_startup_payload(payload) || postgres_frontend_message_payload(payload)
+    }
+
+    fn postgres_startup_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let length = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        (8..=10_000).contains(&length) && matches!(code, 196_608 | 80_877_102 | 80_877_103)
+    }
+
+    fn postgres_frontend_message_payload(payload: &[u8]) -> bool {
+        if payload.len() < 5 {
+            return false;
+        }
+        let Some(length) = read_u32_be(payload, 1).map(|length| length as usize) else {
+            return false;
+        };
+        if !(4..=10_000).contains(&length) {
+            return false;
+        }
+        let Some(frame_end) = 1_usize.checked_add(length) else {
+            return false;
+        };
+        let Some(frame) = payload.get(..frame_end) else {
+            return false;
+        };
+        let body = &frame[5..];
+        match payload[0] {
+            b'Q' => postgres_query_message_payload(body),
+            b'P' => postgres_parse_message_payload(body),
+            b'B' => postgres_bind_message_payload(body),
+            b'C' | b'D' => postgres_named_portal_or_statement_payload(body),
+            b'E' => postgres_execute_message_payload(body),
+            b'p' => postgres_password_message_payload(body),
+            b'H' | b'S' | b'X' => body.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn postgres_query_message_payload(body: &[u8]) -> bool {
+        body.len() >= 2 && body.last() == Some(&0) && postgres_nonempty_cstring(body, 0)
+    }
+
+    fn postgres_parse_message_payload(body: &[u8]) -> bool {
+        let Some(after_statement_name) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        let Some(after_query) = postgres_cstring_end(body, after_statement_name) else {
+            return false;
+        };
+        if after_query <= after_statement_name + 1 {
+            return false;
+        }
+        let Some(parameter_count) = read_u16_be(body, after_query).map(|count| count as usize)
+        else {
+            return false;
+        };
+        after_query
+            .checked_add(2)
+            .and_then(|offset| offset.checked_add(parameter_count.checked_mul(4)?))
+            == Some(body.len())
+    }
+
+    fn postgres_bind_message_payload(body: &[u8]) -> bool {
+        let Some(after_portal) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        let Some(after_statement) = postgres_cstring_end(body, after_portal) else {
+            return false;
+        };
+        body.get(after_statement..after_statement.saturating_add(2))
+            .is_some()
+    }
+
+    fn postgres_named_portal_or_statement_payload(body: &[u8]) -> bool {
+        let Some((&kind, name)) = body.split_first() else {
+            return false;
+        };
+        matches!(kind, b'P' | b'S') && postgres_cstring_end(name, 0) == Some(name.len())
+    }
+
+    fn postgres_execute_message_payload(body: &[u8]) -> bool {
+        let Some(after_portal) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        after_portal.checked_add(4) == Some(body.len())
+    }
+
+    fn postgres_password_message_payload(body: &[u8]) -> bool {
+        postgres_nonempty_cstring(body, 0)
+    }
+
+    fn postgres_nonempty_cstring(payload: &[u8], offset: usize) -> bool {
+        postgres_cstring_end(payload, offset).is_some_and(|end| end > offset + 1)
+    }
+
+    fn postgres_cstring_end(payload: &[u8], offset: usize) -> Option<usize> {
+        let tail = payload.get(offset..)?;
+        let terminator = tail.iter().position(|byte| *byte == 0)?;
+        Some(offset + terminator + 1)
+    }
+
+    fn mysql_payload(payload: &[u8]) -> bool {
+        mysql_initial_handshake_payload(payload) || mysql_command_packet_payload(payload)
+    }
+
+    const MYSQL_MAX_PACKET_PAYLOAD_LEN: usize = 16_777_215;
+    const MYSQL_MAX_PACKET_SEQUENCE_ID: u8 = 64;
+
+    fn mysql_initial_handshake_payload(payload: &[u8]) -> bool {
+        const HANDSHAKE_V10_MIN_PAYLOAD_LEN: usize = 17;
+
+        if payload.len() < 5 || payload.get(3) != Some(&0) {
+            return false;
+        }
+        let Some(payload_len) = mysql_packet_payload_len(payload, 0) else {
+            return false;
+        };
+        if payload_len < HANDSHAKE_V10_MIN_PAYLOAD_LEN {
+            return false;
+        }
+        let Some(packet_end) = 4_usize.checked_add(payload_len) else {
+            return false;
+        };
+        if payload.len() > packet_end {
+            return false;
+        }
+        let Some(body) = mysql_observed_packet_body(payload, 0, payload_len) else {
+            return false;
+        };
+        mysql_handshake_v10_payload_prefix(body, payload_len)
+    }
+
+    fn mysql_command_packet_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            match mysql_command_packet(payload, offset) {
+                Some(MysqlCommandPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MysqlCommandPacketParse::IncompleteBeforeCommand) => {
+                    return packet_count > 0;
+                }
+                Some(MysqlCommandPacketParse::IncompleteAfterCommand) => {
+                    return true;
+                }
+                None => return false,
+            }
+        }
+        packet_count > 0
+    }
+
+    enum MysqlCommandPacketParse {
+        Complete(usize),
+        IncompleteBeforeCommand,
+        IncompleteAfterCommand,
+    }
+
+    fn mysql_command_packet(payload: &[u8], offset: usize) -> Option<MysqlCommandPacketParse> {
+        if payload.len().saturating_sub(offset) < 4 {
+            return Some(MysqlCommandPacketParse::IncompleteBeforeCommand);
+        }
+        let payload_len = mysql_packet_payload_len(payload, offset)?;
+        let sequence_id = *payload.get(offset.checked_add(3)?)?;
+        if sequence_id > MYSQL_MAX_PACKET_SEQUENCE_ID {
+            return None;
+        }
+        let body_offset = offset.checked_add(4)?;
+        if payload.len() <= body_offset {
+            return Some(MysqlCommandPacketParse::IncompleteBeforeCommand);
+        }
+        let packet_end = body_offset.checked_add(payload_len)?;
+        let body_end = payload.len().min(packet_end);
+        let body = payload.get(body_offset..body_end)?;
+        if !mysql_command_packet_body(payload_len, body) {
+            return None;
+        }
+        if payload.len() < packet_end {
+            Some(MysqlCommandPacketParse::IncompleteAfterCommand)
+        } else {
+            Some(MysqlCommandPacketParse::Complete(packet_end))
+        }
+    }
+
+    fn mysql_packet_payload_len(payload: &[u8], offset: usize) -> Option<usize> {
+        let payload_len = read_u24_le(payload, offset)?;
+        (1..=MYSQL_MAX_PACKET_PAYLOAD_LEN)
+            .contains(&payload_len)
+            .then_some(payload_len)
+    }
+
+    fn mysql_observed_packet_body(
+        payload: &[u8],
+        offset: usize,
+        payload_len: usize,
+    ) -> Option<&[u8]> {
+        let body_offset = offset.checked_add(4)?;
+        if payload.len() <= body_offset {
+            return None;
+        }
+        let packet_end = body_offset.checked_add(payload_len)?;
+        payload.get(body_offset..payload.len().min(packet_end))
+    }
+
+    fn mysql_handshake_v10_payload_prefix(body: &[u8], payload_len: usize) -> bool {
+        if body.first() != Some(&10) {
+            return false;
+        };
+        let version = &body[1..];
+        if version.is_empty() {
+            return false;
+        }
+        let Some(version_end) = version.iter().position(|byte| *byte == 0) else {
+            return version.iter().all(mysql_server_version_byte);
+        };
+        if version_end == 0 || !version[..version_end].iter().all(mysql_server_version_byte) {
+            return false;
+        }
+        let post_version = 1 + version_end + 1;
+        let Some(filler_offset) = post_version
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(8))
+        else {
+            return false;
+        };
+        if payload_len <= filler_offset {
+            return false;
+        }
+        body.get(filler_offset).is_none_or(|filler| *filler == 0)
+    }
+
+    fn mysql_server_version_byte(byte: &u8) -> bool {
+        matches!(*byte, 0x20..=0x7e)
+    }
+
+    fn mysql_command_packet_body(payload_len: usize, body: &[u8]) -> bool {
+        let Some((&command, args)) = body.split_first() else {
+            return false;
+        };
+        match command {
+            0x01 | 0x09 | 0x0a | 0x0d | 0x0e | 0x0f | 0x10 | 0x1f => payload_len == 1,
+            0x02 | 0x05 | 0x06 | 0x11 => mysql_nonempty_text_arg(args),
+            0x03 | 0x16 => mysql_sql_command_arg(args),
+            0x04 => mysql_nonempty_text_arg(args),
+            0x07 => payload_len == 2 && args.len() == 1,
+            0x08 => payload_len <= 2 && args.len() == payload_len.saturating_sub(1),
+            0x0c | 0x19 | 0x1a => payload_len == 5 && args.len() == 4,
+            0x17 => payload_len >= 10 && args.len() >= 9,
+            0x18 => payload_len >= 7 && args.len() >= 6,
+            0x1b => payload_len == 3 && args.len() == 2,
+            0x1c => payload_len == 9 && args.len() == 8,
+            _ => false,
+        }
+    }
+
+    fn mysql_sql_command_arg(args: &[u8]) -> bool {
+        let statement = trim_ascii_space(args);
+        if statement.is_empty() {
+            return false;
+        }
+        if !statement
+            .iter()
+            .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\t' | b'\n' | b'\r'))
+        {
+            return false;
+        }
+        let keywords: [&[u8]; 29] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"REPLACE",
+            b"CALL",
+            b"SHOW",
+            b"SET",
+            b"USE",
+            b"BEGIN",
+            b"START",
+            b"COMMIT",
+            b"ROLLBACK",
+            b"SAVEPOINT",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"EXPLAIN",
+            b"DESCRIBE",
+            b"DESC",
+            b"WITH",
+            b"ANALYZE",
+            b"OPTIMIZE",
+            b"LOCK",
+            b"UNLOCK",
+            b"GRANT",
+            b"REVOKE",
+            b"DO",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_ascii_keyword(statement, keyword))
+    }
+
+    fn mysql_nonempty_text_arg(args: &[u8]) -> bool {
+        !args.is_empty()
+            && args
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
+    }
+
+    fn mssql_tds_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            if payload.len().saturating_sub(offset) < 8 {
+                return packet_count > 0;
+            }
+            match mssql_tds_packet(payload, offset) {
+                Some(MsSqlTdsPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MsSqlTdsPacketParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        packet_count > 0
+    }
+
+    enum MsSqlTdsPacketParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn mssql_tds_packet(payload: &[u8], offset: usize) -> Option<MsSqlTdsPacketParse> {
+        let packet_type = *payload.get(offset)?;
+        let status = *payload.get(offset.checked_add(1)?)?;
+        let length = read_u16_be(payload, offset.checked_add(2)?)? as usize;
+        let packet_id = *payload.get(offset.checked_add(6)?)?;
+        let window = *payload.get(offset.checked_add(7)?)?;
+        if !mssql_tds_packet_type(packet_type)
+            || !mssql_tds_status(status)
+            || !(8..=65_535).contains(&length)
+            || packet_id > 128
+            || window > 1
+        {
+            return None;
+        }
+        let packet_end = offset.checked_add(length)?;
+        let body_offset = offset.checked_add(8)?;
+        let observed_body_end = payload.len().min(packet_end);
+        let body = payload.get(body_offset..observed_body_end)?;
+        if !mssql_tds_packet_body(packet_type, body, length - 8, payload.len() < packet_end) {
+            return None;
+        }
+        if payload.len() < packet_end {
+            Some(MsSqlTdsPacketParse::Incomplete)
+        } else {
+            Some(MsSqlTdsPacketParse::Complete(packet_end))
+        }
+    }
+
+    fn mssql_tds_packet_type(packet_type: u8) -> bool {
+        matches!(packet_type, 0x01 | 0x10 | 0x12)
+    }
+
+    fn mssql_tds_status(status: u8) -> bool {
+        status & !0x1f == 0
+    }
+
+    fn mssql_tds_packet_body(
+        packet_type: u8,
+        body: &[u8],
+        declared_body_len: usize,
+        incomplete: bool,
+    ) -> bool {
+        match packet_type {
+            0x01 => mssql_sql_batch_body(body, incomplete),
+            0x10 => mssql_login7_body(body, declared_body_len, incomplete),
+            0x12 => mssql_prelogin_body(body, declared_body_len, incomplete),
+            _ => false,
+        }
+    }
+
+    fn mssql_prelogin_body(body: &[u8], declared_body_len: usize, incomplete: bool) -> bool {
+        if declared_body_len < 6 {
+            return false;
+        }
+        let mut offset = 0_usize;
+        let mut seen_tokens = 0_u16;
+        let mut value_ranges = [(0_usize, 0_usize); 16];
+        let mut token_count = 0_usize;
+        loop {
+            let Some(&token) = body.get(offset) else {
+                return incomplete && token_count > 0;
+            };
+            if token == 0xff {
+                let Some(value_table_end) = offset.checked_add(1) else {
+                    return false;
+                };
+                return token_count > 0
+                    && value_ranges[..token_count]
+                        .iter()
+                        .all(|(value_offset, value_len)| {
+                            *value_offset >= value_table_end
+                                && value_offset
+                                    .checked_add(*value_len)
+                                    .is_some_and(|end| end <= declared_body_len)
+                        });
+            }
+            if token > 0x07 {
+                return false;
+            }
+            let token_bit = 1_u16 << u32::from(token);
+            if seen_tokens & token_bit != 0 {
+                return false;
+            }
+            let Some(value_offset_offset) = offset.checked_add(1) else {
+                return false;
+            };
+            let Some(value_offset) =
+                read_u16_be(body, value_offset_offset).map(|value| value as usize)
+            else {
+                return incomplete && token_count > 0;
+            };
+            let Some(value_len_offset) = offset.checked_add(3) else {
+                return false;
+            };
+            let Some(value_len) = read_u16_be(body, value_len_offset).map(|value| value as usize)
+            else {
+                return incomplete && token_count > 0;
+            };
+            if value_offset < 6 || value_offset > declared_body_len {
+                return false;
+            }
+            if value_offset
+                .checked_add(value_len)
+                .is_none_or(|end| end > declared_body_len)
+            {
+                return false;
+            }
+            seen_tokens |= token_bit;
+            value_ranges[token_count] = (value_offset, value_len);
+            token_count += 1;
+            if token_count > 16 {
+                return false;
+            }
+            offset += 5;
+        }
+    }
+
+    fn mssql_login7_body(body: &[u8], declared_body_len: usize, incomplete: bool) -> bool {
+        if declared_body_len < 36 {
+            return false;
+        }
+        if body.len() < 4 {
+            return incomplete;
+        }
+        let Some(login_len) = read_u32_le(body, 0).map(|value| value as usize) else {
+            return false;
+        };
+        login_len == declared_body_len && login_len >= 36 && login_len <= 65_527
+    }
+
+    fn mssql_sql_batch_body(body: &[u8], incomplete: bool) -> bool {
+        if body.is_empty() {
+            return incomplete;
+        }
+        let statement = trim_utf16le_ascii_space(body);
+        if statement.is_empty() {
+            return false;
+        }
+        let keywords: [&[u8]; 31] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"MERGE",
+            b"EXEC",
+            b"EXECUTE",
+            b"DECLARE",
+            b"SET",
+            b"USE",
+            b"BEGIN",
+            b"COMMIT",
+            b"ROLLBACK",
+            b"SAVE",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"WITH",
+            b"GRANT",
+            b"REVOKE",
+            b"BACKUP",
+            b"RESTORE",
+            b"DBCC",
+            b"PRINT",
+            b"RAISERROR",
+            b"THROW",
+            b"WAITFOR",
+            b"IF",
+            b"WHILE",
+            b"OPEN",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_utf16le_ascii_keyword(statement, keyword))
+    }
+
+    fn oracle_tns_payload(payload: &[u8]) -> bool {
+        oracle_tns_connect_packet(payload)
+    }
+
+    fn oracle_tns_connect_packet(payload: &[u8]) -> bool {
+        if payload.len() < 34 {
+            return false;
+        }
+        let Some(packet_len) = read_u16_be(payload, 0).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(packet_checksum) = read_u16_be(payload, 2) else {
+            return false;
+        };
+        let Some(&packet_type) = payload.get(4) else {
+            return false;
+        };
+        let Some(&reserved) = payload.get(5) else {
+            return false;
+        };
+        let Some(header_checksum) = read_u16_be(payload, 6) else {
+            return false;
+        };
+        if !(34..=65_535).contains(&packet_len)
+            || payload.len() > packet_len
+            || packet_checksum != 0
+            || packet_type != 0x01
+            || reserved != 0
+            || header_checksum != 0
+        {
+            return false;
+        }
+        let Some(version) = read_u16_be(payload, 8) else {
+            return false;
+        };
+        let Some(compatible_version) = read_u16_be(payload, 10) else {
+            return false;
+        };
+        if !(0x0100..=0x2000).contains(&version)
+            || !(0x0100..=version).contains(&compatible_version)
+        {
+            return false;
+        }
+        let Some(sdu) = read_u16_be(payload, 14) else {
+            return false;
+        };
+        let Some(tdu) = read_u16_be(payload, 16) else {
+            return false;
+        };
+        let Some(marker) = read_u16_be(payload, 22) else {
+            return false;
+        };
+        if !(512..=65_535).contains(&sdu) || !(512..=65_535).contains(&tdu) || marker != 1 {
+            return false;
+        }
+        let Some(connect_data_len) = read_u16_be(payload, 24).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(connect_data_offset) = read_u16_be(payload, 26).map(|value| value as usize) else {
+            return false;
+        };
+        if connect_data_len == 0
+            || connect_data_offset < 34
+            || connect_data_offset >= packet_len
+            || connect_data_offset
+                .checked_add(connect_data_len)
+                .is_none_or(|end| end > packet_len)
+            || payload.len() <= connect_data_offset
+        {
+            return false;
+        }
+        let connect_data_end = connect_data_offset + connect_data_len;
+        let observed_end = payload.len().min(connect_data_end);
+        let Some(connect_data) = payload.get(connect_data_offset..observed_end) else {
+            return false;
+        };
+        oracle_tns_connect_descriptor(connect_data)
+    }
+
+    fn oracle_tns_connect_descriptor(payload: &[u8]) -> bool {
+        let descriptor = trim_ascii_space(payload);
+        if descriptor.len() < 12 || descriptor.first() != Some(&b'(') {
+            return false;
+        }
+        if !descriptor
+            .iter()
+            .all(|byte| matches!(*byte, b'\t' | b'\n' | b'\r') || (0x20..=0x7e).contains(byte))
+        {
+            return false;
+        }
+        let has_description = ascii_contains_ignore_case(descriptor, b"(DESCRIPTION");
+        let has_connect_data = ascii_contains_ignore_case(descriptor, b"(CONNECT_DATA");
+        let has_service = ascii_contains_ignore_case(descriptor, b"(SERVICE_NAME")
+            || ascii_contains_ignore_case(descriptor, b"(SID")
+            || ascii_contains_ignore_case(descriptor, b"(INSTANCE_NAME");
+        let has_address = ascii_contains_ignore_case(descriptor, b"(ADDRESS")
+            && ascii_contains_ignore_case(descriptor, b"(PROTOCOL=TCP");
+        has_description && (has_connect_data || has_service || has_address)
+    }
+
+    fn redis_payload(payload: &[u8]) -> bool {
+        redis_resp_array_payload(payload) || redis_inline_command_payload(payload)
+    }
+
+    fn redis_resp_array_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut command_count = 0_usize;
+        while offset < payload.len() {
+            match redis_resp_command_array(payload, offset) {
+                Some(RedisRespCommandParse::Complete(next_offset)) => {
+                    command_count += 1;
+                    if command_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(RedisRespCommandParse::IncompleteBeforeCommand) => {
+                    return command_count > 0;
+                }
+                Some(RedisRespCommandParse::IncompleteAfterCommand) => {
+                    return true;
+                }
+                None => return false,
+            }
+        }
+        command_count > 0
+    }
+
+    enum RedisRespCommandParse {
+        Complete(usize),
+        IncompleteBeforeCommand,
+        IncompleteAfterCommand,
+    }
+
+    enum RedisBulkStringParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn redis_resp_command_array(payload: &[u8], offset: usize) -> Option<RedisRespCommandParse> {
+        const MAX_ARRAY_LEN: usize = 1024;
+        const MAX_COMMAND_LEN: usize = 64;
+        const MAX_BULK_STRING_LEN: usize = 512 * 1024 * 1024;
+
+        if payload.get(offset) != Some(&b'*') {
+            return None;
+        }
+        let array_len_offset = offset.checked_add(1)?;
+        let (array_len, mut item_offset) =
+            match redis_decimal_crlf(payload, array_len_offset, 1, MAX_ARRAY_LEN) {
+                Some(header) => header,
+                None if redis_decimal_crlf_incomplete(payload, array_len_offset, MAX_ARRAY_LEN) => {
+                    return Some(RedisRespCommandParse::IncompleteBeforeCommand);
+                }
+                None => return None,
+            };
+        let Some((command, command_offset)) =
+            redis_bulk_string(payload, item_offset, 1, MAX_COMMAND_LEN)
+        else {
+            return match redis_bulk_string_prefix(payload, item_offset, 1, MAX_COMMAND_LEN)? {
+                RedisBulkStringParse::Complete(_) => None,
+                RedisBulkStringParse::Incomplete => {
+                    Some(RedisRespCommandParse::IncompleteBeforeCommand)
+                }
+            };
+        };
+        if !redis_known_command(command) {
+            return None;
+        }
+
+        item_offset = command_offset;
+        for _ in 1..array_len {
+            match redis_bulk_string_prefix(payload, item_offset, 0, MAX_BULK_STRING_LEN)? {
+                RedisBulkStringParse::Complete(next_offset) => {
+                    item_offset = next_offset;
+                }
+                RedisBulkStringParse::Incomplete => {
+                    return Some(RedisRespCommandParse::IncompleteAfterCommand);
+                }
+            }
+        }
+        Some(RedisRespCommandParse::Complete(item_offset))
+    }
+
+    fn redis_inline_command_payload(payload: &[u8]) -> bool {
+        if payload.first() == Some(&b'*') {
+            return false;
+        }
+        let line_end = payload
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(payload.len());
+        let line = trim_ascii_space(&payload[..line_end]);
+        if line.is_empty() {
+            return false;
+        }
+        let command_end = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        redis_known_inline_command(&line[..command_end], trim_ascii_space(&line[command_end..]))
+    }
+
+    fn redis_bulk_string(
+        payload: &[u8],
+        offset: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<(&[u8], usize)> {
+        if payload.get(offset) != Some(&b'$') {
+            return None;
+        }
+        let (len, data_offset) = redis_decimal_crlf(payload, offset.checked_add(1)?, min, max)?;
+        let data_end = data_offset.checked_add(len)?;
+        let crlf_end = data_end.checked_add(2)?;
+        if payload.get(data_end..crlf_end)? != b"\r\n" {
+            return None;
+        }
+        Some((payload.get(data_offset..data_end)?, crlf_end))
+    }
+
+    fn redis_bulk_string_prefix(
+        payload: &[u8],
+        offset: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<RedisBulkStringParse> {
+        if offset >= payload.len() {
+            return Some(RedisBulkStringParse::Incomplete);
+        }
+        if payload.get(offset) != Some(&b'$') {
+            return None;
+        }
+        let len_offset = offset.checked_add(1)?;
+        let (len, data_offset) = match redis_decimal_crlf(payload, len_offset, min, max) {
+            Some(header) => header,
+            None if redis_decimal_crlf_incomplete(payload, len_offset, max) => {
+                return Some(RedisBulkStringParse::Incomplete);
+            }
+            None => return None,
+        };
+        let data_end = data_offset.checked_add(len)?;
+        let crlf_end = data_end.checked_add(2)?;
+        if payload.len() < data_end {
+            return Some(RedisBulkStringParse::Incomplete);
+        }
+        if payload.len() < crlf_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(RedisBulkStringParse::Incomplete),
+                _ => None,
+            };
+        }
+        if payload.get(data_end..crlf_end)? != b"\r\n" {
+            return None;
+        }
+        Some(RedisBulkStringParse::Complete(crlf_end))
+    }
+
+    fn redis_decimal_crlf(
+        payload: &[u8],
+        mut offset: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<(usize, usize)> {
+        let mut value = 0_usize;
+        let mut digits = 0_usize;
+        loop {
+            let byte = *payload.get(offset)?;
+            match byte {
+                b'0'..=b'9' => {
+                    value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+                    digits += 1;
+                    if value > max || digits > 10 {
+                        return None;
+                    }
+                    offset += 1;
+                }
+                b'\r' if payload.get(offset + 1) == Some(&b'\n') => {
+                    return (digits > 0 && value >= min && value <= max)
+                        .then_some((value, offset + 2));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn redis_decimal_crlf_incomplete(payload: &[u8], mut offset: usize, max: usize) -> bool {
+        if offset >= payload.len() {
+            return true;
+        }
+
+        let mut value = 0_usize;
+        let mut digits = 0_usize;
+        loop {
+            let Some(byte) = payload.get(offset) else {
+                return digits > 0;
+            };
+            match *byte {
+                b'0'..=b'9' => {
+                    value = match value
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add((byte - b'0') as usize))
+                    {
+                        Some(value) => value,
+                        None => return false,
+                    };
+                    digits += 1;
+                    if value > max || digits > 10 {
+                        return false;
+                    }
+                    offset += 1;
+                }
+                b'\r' if payload.get(offset + 1).is_none() => return digits > 0,
+                _ => return false,
+            }
+        }
+    }
+
+    fn redis_known_command(command: &[u8]) -> bool {
+        let commands: [&[u8]; 38] = [
+            b"PING",
+            b"ECHO",
+            b"GET",
+            b"SET",
+            b"DEL",
+            b"EXISTS",
+            b"SUBSCRIBE",
+            b"PUBLISH",
+            b"AUTH",
+            b"SELECT",
+            b"HELLO",
+            b"CLIENT",
+            b"EVAL",
+            b"EVALSHA",
+            b"XADD",
+            b"XREAD",
+            b"XGROUP",
+            b"INFO",
+            b"COMMAND",
+            b"ACL",
+            b"CONFIG",
+            b"DBSIZE",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            b"QUIT",
+            b"MONITOR",
+            b"MULTI",
+            b"EXEC",
+            b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
+            b"PSUBSCRIBE",
+            b"PUNSUBSCRIBE",
+            b"ZADD",
+            b"HGET",
+            b"HSET",
+            b"LPUSH",
+            b"RPUSH",
+        ];
+        commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(known))
+    }
+
+    fn redis_known_inline_command(command: &[u8], args: &[u8]) -> bool {
+        if command.eq_ignore_ascii_case(b"INFO") {
+            return args.is_empty() || redis_inline_argument(args);
+        }
+
+        let commands: [&[u8]; 23] = [
+            b"HELLO",
+            b"CLIENT",
+            b"COMMAND",
+            b"SUBSCRIBE",
+            b"UNSUBSCRIBE",
+            b"PSUBSCRIBE",
+            b"PUNSUBSCRIBE",
+            b"PUBLISH",
+            b"EVAL",
+            b"EVALSHA",
+            b"XADD",
+            b"XREAD",
+            b"XGROUP",
+            b"ACL",
+            b"CONFIG",
+            b"DBSIZE",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            b"MONITOR",
+            b"MULTI",
+            b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
+        ];
+        commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(known))
+    }
+
+    fn redis_inline_argument(argument: &[u8]) -> bool {
+        !argument.is_empty()
+            && argument.len() <= 64
+            && argument
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    }
+
+    fn memcached_payload(payload: &[u8]) -> bool {
+        memcached_text_payload(payload) || memcached_binary_payload(payload)
+    }
+
+    fn memcached_text_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut command_count = 0_usize;
+        while offset < payload.len() {
+            match memcached_text_command(payload, offset) {
+                Some(MemcachedTextCommandParse::Complete(next_offset)) => {
+                    command_count += 1;
+                    if command_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MemcachedTextCommandParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        command_count > 0
+    }
+
+    enum MemcachedTextCommandParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum MemcachedTextCommandKind {
+        Storage { bytes: usize },
+        Line,
+    }
+
+    fn memcached_text_command(payload: &[u8], offset: usize) -> Option<MemcachedTextCommandParse> {
+        let tail = payload.get(offset..)?;
+        let line_delimiter = tail.iter().position(|byte| matches!(*byte, b'\r' | b'\n'));
+        let (line, line_end) = match line_delimiter {
+            Some(index) if tail.get(index) == Some(&b'\r') => {
+                if tail.get(index + 1).is_none() {
+                    return Some(MemcachedTextCommandParse::Incomplete);
+                }
+                if tail.get(index + 1) != Some(&b'\n') {
+                    return None;
+                }
+                (tail.get(..index)?, Some(offset + index + 2))
+            }
+            Some(_) => return None,
+            None => (tail, None),
+        };
+        let fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let command = memcached_text_command_kind(&fields)?;
+        let Some(line_end) = line_end else {
+            return Some(MemcachedTextCommandParse::Incomplete);
+        };
+        match command {
+            MemcachedTextCommandKind::Line => Some(MemcachedTextCommandParse::Complete(line_end)),
+            MemcachedTextCommandKind::Storage { bytes } => {
+                let data_end = line_end.checked_add(bytes)?;
+                let frame_end = data_end.checked_add(2)?;
+                if payload.len() < data_end {
+                    return Some(MemcachedTextCommandParse::Incomplete);
+                }
+                if payload.len() < frame_end {
+                    return match payload.get(data_end..) {
+                        Some(b"") | Some(b"\r") => Some(MemcachedTextCommandParse::Incomplete),
+                        _ => None,
+                    };
+                }
+                if payload.get(data_end..frame_end)? != b"\r\n" {
+                    return None;
+                }
+                Some(MemcachedTextCommandParse::Complete(frame_end))
+            }
+        }
+    }
+
+    fn memcached_text_command_kind(fields: &[&[u8]]) -> Option<MemcachedTextCommandKind> {
+        let command = *fields.first()?;
+
+        if command.eq_ignore_ascii_case(b"get") || command.eq_ignore_ascii_case(b"gets") {
+            return (fields.len() >= 2 && fields[1..].iter().all(|field| memcached_key(field)))
+                .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"gat") || command.eq_ignore_ascii_case(b"gats") {
+            return (fields.len() >= 3
+                && memcached_decimal(fields[1])
+                && fields[2..].iter().all(|field| memcached_key(field)))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"set")
+            || command.eq_ignore_ascii_case(b"add")
+            || command.eq_ignore_ascii_case(b"replace")
+            || command.eq_ignore_ascii_case(b"append")
+            || command.eq_ignore_ascii_case(b"prepend")
+        {
+            return memcached_storage_fields(fields, false)
+                .map(|bytes| MemcachedTextCommandKind::Storage { bytes });
+        }
+        if command.eq_ignore_ascii_case(b"cas") {
+            return memcached_storage_fields(fields, true)
+                .map(|bytes| MemcachedTextCommandKind::Storage { bytes });
+        }
+        if command.eq_ignore_ascii_case(b"delete") {
+            return (fields.len() == 2 && memcached_key(fields[1])
+                || fields.len() == 3
+                    && memcached_key(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"incr") || command.eq_ignore_ascii_case(b"decr") {
+            return (fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+                || fields.len() == 4
+                    && memcached_key(fields[1])
+                    && memcached_decimal(fields[2])
+                    && fields[3].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"touch") {
+            return (fields.len() == 3 && memcached_key(fields[1]) && memcached_decimal(fields[2])
+                || fields.len() == 4
+                    && memcached_key(fields[1])
+                    && memcached_decimal(fields[2])
+                    && fields[3].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"stats") {
+            return (fields.len() <= 4
+                && fields
+                    .iter()
+                    .skip(1)
+                    .all(|field| memcached_ascii_argument(field)))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"version") {
+            return (fields.len() == 1).then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"flush_all") {
+            return (fields.len() == 1
+                || fields.len() == 2
+                    && (memcached_decimal(fields[1])
+                        || fields[1].eq_ignore_ascii_case(b"noreply"))
+                || fields.len() == 3
+                    && memcached_decimal(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"verbosity") {
+            return (fields.len() == 2 && memcached_decimal(fields[1])
+                || fields.len() == 3
+                    && memcached_decimal(fields[1])
+                    && fields[2].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"quit") {
+            return (fields.len() == 1
+                || fields.len() == 2 && fields[1].eq_ignore_ascii_case(b"noreply"))
+            .then_some(MemcachedTextCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"slabs") {
+            return memcached_slabs_fields(fields).then_some(MemcachedTextCommandKind::Line);
+        }
+        None
+    }
+
+    fn memcached_storage_fields(fields: &[&[u8]], includes_cas: bool) -> Option<usize> {
+        let required = if includes_cas { 6 } else { 5 };
+        if fields.len() != required
+            && !(fields.len() == required + 1 && fields[required].eq_ignore_ascii_case(b"noreply"))
+        {
+            return None;
+        }
+        let bytes = memcached_decimal_value(fields[4], 1_048_576)?;
+        (memcached_key(fields[1])
+            && memcached_decimal(fields[2])
+            && memcached_decimal(fields[3])
+            && (!includes_cas || memcached_decimal(fields[5])))
+        .then_some(bytes)
+    }
+
+    fn memcached_slabs_fields(fields: &[&[u8]]) -> bool {
+        if fields.len() < 2 {
+            return false;
+        }
+        if fields[1].eq_ignore_ascii_case(b"reassign") {
+            return fields.len() == 4
+                && memcached_decimal(fields[2])
+                && memcached_decimal(fields[3]);
+        }
+        if fields[1].eq_ignore_ascii_case(b"automove") {
+            return fields.len() == 2 || fields.len() == 3 && memcached_decimal(fields[2]);
+        }
+        false
+    }
+
+    fn memcached_key(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.len() <= 250
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(*byte, b' ' | 0x7f))
+    }
+
+    fn memcached_decimal(field: &[u8]) -> bool {
+        !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
+    }
+
+    fn memcached_decimal_value(field: &[u8], max: usize) -> Option<usize> {
+        if field.is_empty() || field.len() > 20 {
+            return None;
+        }
+        let mut value = 0_usize;
+        for byte in field {
+            let digit = byte.checked_sub(b'0')?;
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(digit as usize)?;
+            if value > max {
+                return None;
+            }
+        }
+        Some(value)
+    }
+
+    fn memcached_ascii_argument(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b':' | b'.')
+            })
+    }
+
+    fn memcached_binary_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            match memcached_binary_packet(payload, offset) {
+                Some(MemcachedBinaryPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MemcachedBinaryPacketParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        packet_count > 0
+    }
+
+    enum MemcachedBinaryPacketParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn memcached_binary_packet(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<MemcachedBinaryPacketParse> {
+        let header = payload.get(offset..offset.checked_add(24)?)?;
+        let magic = header[0];
+        if !matches!(magic, 0x80 | 0x81) {
+            return None;
+        }
+        let opcode = header[1];
+        let key_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let extras_len = header[4] as usize;
+        let data_type = header[5];
+        let total_body_len =
+            u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let frame_end = offset.checked_add(24)?.checked_add(total_body_len)?;
+        if data_type != 0
+            || total_body_len > 1_048_576
+            || key_len > 250
+            || extras_len > 32
+            || key_len.checked_add(extras_len)? > total_body_len
+            || !memcached_binary_opcode_shape(magic, opcode, key_len, extras_len, total_body_len)
+        {
+            return None;
+        }
+        if payload.len() < frame_end {
+            Some(MemcachedBinaryPacketParse::Incomplete)
+        } else {
+            Some(MemcachedBinaryPacketParse::Complete(frame_end))
+        }
+    }
+
+    fn memcached_binary_opcode_shape(
+        magic: u8,
+        opcode: u8,
+        key_len: usize,
+        extras_len: usize,
+        total_body_len: usize,
+    ) -> bool {
+        if magic == 0x81 {
+            return opcode <= 0x22;
+        }
+        match opcode {
+            0x00 | 0x09 | 0x0c | 0x0d => {
+                extras_len == 0 && key_len > 0 && total_body_len == key_len
+            }
+            0x01..=0x03 => extras_len == 8 && key_len > 0 && total_body_len >= extras_len + key_len,
+            0x04 => extras_len == 0 && key_len > 0 && total_body_len == key_len,
+            0x05 | 0x06 => {
+                extras_len == 20 && key_len > 0 && total_body_len == extras_len + key_len
+            }
+            0x07 | 0x0a | 0x0b => extras_len == 0 && key_len == 0 && total_body_len == 0,
+            0x08 => key_len == 0 && matches!(extras_len, 0 | 4) && total_body_len == extras_len,
+            0x0e | 0x0f => extras_len == 0 && key_len > 0 && total_body_len >= key_len,
+            0x10 => extras_len == 0 && total_body_len == key_len,
+            0x1c..=0x1e => extras_len == 4 && key_len > 0 && total_body_len == extras_len + key_len,
+            0x20 => extras_len == 0 && key_len == 0 && total_body_len == 0,
+            0x21 | 0x22 => extras_len == 0 && key_len > 0 && total_body_len >= key_len,
+            _ => false,
+        }
+    }
+
+    fn kafka_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            if payload.len().saturating_sub(offset) < 4 {
+                return frame_count > 0;
+            }
+            match kafka_request_frame(payload, offset) {
+                Some(KafkaFrameParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(KafkaFrameParse::Incomplete) => {
+                    return true;
+                }
+                None => return false,
+            }
+        }
+        frame_count > 0
+    }
+
+    enum KafkaFrameParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum KafkaHeaderParse {
+        Complete,
+        Incomplete,
+    }
+
+    enum KafkaVarintParse {
+        Complete(u64, usize),
+        Incomplete,
+    }
+
+    fn kafka_request_frame(payload: &[u8], offset: usize) -> Option<KafkaFrameParse> {
+        let frame_len = read_u32_be(payload, offset)? as usize;
+        let header_offset = offset.checked_add(4)?;
+        let api_key = read_u16_be(payload, header_offset)?;
+        let api_version = read_u16_be(payload, header_offset.checked_add(2)?)?;
+        if !(8..=100_000_000).contains(&frame_len) || api_key > 92 || api_version > 20 {
+            return None;
+        }
+        let frame_end = header_offset.checked_add(frame_len)?;
+        let correlation_id_end = header_offset.checked_add(8)?;
+        if payload.len() < correlation_id_end {
+            return Some(KafkaFrameParse::Incomplete);
+        }
+        if frame_len == 8 {
+            return if payload.len() < frame_end {
+                Some(KafkaFrameParse::Incomplete)
+            } else {
+                Some(KafkaFrameParse::Complete(frame_end))
+            };
+        }
+        let header_tail = payload.get(correlation_id_end..)?;
+        let remaining_frame_len = frame_len - 8;
+        let header_parse = kafka_request_header_payload(header_tail, remaining_frame_len)?;
+        match header_parse {
+            KafkaHeaderParse::Complete => {
+                if payload.len() < frame_end {
+                    Some(KafkaFrameParse::Incomplete)
+                } else {
+                    Some(KafkaFrameParse::Complete(frame_end))
+                }
+            }
+            KafkaHeaderParse::Incomplete => Some(KafkaFrameParse::Incomplete),
+        }
+    }
+
+    fn kafka_request_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        kafka_nullable_client_id_header_payload(payload, remaining_frame_len)
+            .or_else(|| kafka_compact_client_id_header_payload(payload, remaining_frame_len))
+    }
+
+    fn kafka_nullable_client_id_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        if remaining_frame_len < 2 {
+            return None;
+        }
+        if payload.len() < 2 {
+            return Some(KafkaHeaderParse::Incomplete);
+        }
+        let client_id_len = i16::from_be_bytes([payload[0], payload[1]]);
+        if client_id_len == -1 {
+            return Some(KafkaHeaderParse::Complete);
+        }
+        if client_id_len < 0 {
+            return None;
+        };
+        let client_id_len = client_id_len as usize;
+        let header_len = 2_usize.checked_add(client_id_len)?;
+        if client_id_len > 1_024 || header_len > remaining_frame_len {
+            return None;
+        }
+        if payload.len() < header_len {
+            return Some(KafkaHeaderParse::Incomplete);
+        }
+        kafka_client_id_payload(&payload[2..header_len]).then_some(KafkaHeaderParse::Complete)
+    }
+
+    fn kafka_compact_client_id_header_payload(
+        payload: &[u8],
+        remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        let (client_id_len_plus_one, client_id_offset) =
+            match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                KafkaVarintParse::Complete(value, offset) => (value, offset),
+                KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+            };
+        let client_id_remaining = remaining_frame_len.checked_sub(client_id_offset)?;
+        let client_id_len = client_id_len_plus_one.saturating_sub(1) as usize;
+        let client_id_end = client_id_offset.checked_add(client_id_len)?;
+        if client_id_len > 1_024 || client_id_len > client_id_remaining {
+            return None;
+        }
+        if payload.len() < client_id_end {
+            return Some(KafkaHeaderParse::Incomplete);
+        }
+        if !kafka_client_id_payload(&payload[client_id_offset..client_id_end]) {
+            return None;
+        }
+        let tag_payload = payload.get(client_id_end..)?;
+        let tag_count_remaining = remaining_frame_len.checked_sub(client_id_end)?;
+        let (tags_len, tags_len_bytes) =
+            match kafka_unsigned_varint_prefix(tag_payload, tag_count_remaining)? {
+                KafkaVarintParse::Complete(value, offset) => (value, offset),
+                KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+            };
+        if tags_len > 16 || tags_len_bytes > tag_count_remaining {
+            return None;
+        };
+        let tags_len = tags_len as usize;
+        let tag_section_remaining = tag_count_remaining.checked_sub(tags_len_bytes)?;
+        if tags_len == 0 {
+            return Some(KafkaHeaderParse::Complete);
+        }
+        if tags_len.checked_mul(2)? > tag_section_remaining {
+            return None;
+        }
+        kafka_tag_buffer_payload(
+            tag_payload.get(tags_len_bytes..)?,
+            tags_len,
+            tag_section_remaining,
+        )
+    }
+
+    fn kafka_tag_buffer_payload(
+        mut payload: &[u8],
+        tags_len: usize,
+        mut remaining_frame_len: usize,
+    ) -> Option<KafkaHeaderParse> {
+        let mut previous_tag = None;
+        for _ in 0..tags_len {
+            let (tag, tag_len_bytes) =
+                match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                    KafkaVarintParse::Complete(value, offset) => (value, offset),
+                    KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+                };
+            if tag_len_bytes > remaining_frame_len {
+                return None;
+            };
+            if previous_tag.is_some_and(|previous| tag <= previous) || tag > u32::MAX as u64 {
+                return None;
+            }
+            previous_tag = Some(tag);
+            payload = payload.get(tag_len_bytes..)?;
+            remaining_frame_len = remaining_frame_len.checked_sub(tag_len_bytes)?;
+            let (size, size_len_bytes) =
+                match kafka_unsigned_varint_prefix(payload, remaining_frame_len)? {
+                    KafkaVarintParse::Complete(value, offset) => (value, offset),
+                    KafkaVarintParse::Incomplete => return Some(KafkaHeaderParse::Incomplete),
+                };
+            if size_len_bytes > remaining_frame_len {
+                return None;
+            };
+            let size = size as usize;
+            payload = payload.get(size_len_bytes..)?;
+            remaining_frame_len = remaining_frame_len.checked_sub(size_len_bytes)?;
+            if size > remaining_frame_len {
+                return None;
+            }
+            if payload.len() < size {
+                return Some(KafkaHeaderParse::Incomplete);
+            }
+            payload = payload.get(size..)?;
+            remaining_frame_len -= size;
+        }
+        Some(KafkaHeaderParse::Complete)
+    }
+
+    fn kafka_client_id_payload(client_id: &[u8]) -> bool {
+        client_id.is_empty()
+            || (std::str::from_utf8(client_id).is_ok()
+                && client_id
+                    .iter()
+                    .all(|byte| !byte.is_ascii_control() || *byte == b'\t'))
+    }
+
+    fn kafka_unsigned_varint_prefix(
+        payload: &[u8],
+        remaining_len: usize,
+    ) -> Option<KafkaVarintParse> {
+        if remaining_len == 0 {
+            return None;
+        }
+        let available_len = payload.len().min(remaining_len);
+        let available = payload.get(..available_len)?;
+        if let Some((value, offset)) = kafka_unsigned_varint(available) {
+            return Some(KafkaVarintParse::Complete(value, offset));
+        }
+        (payload.len() < remaining_len && kafka_unsigned_varint_incomplete(available))
+            .then_some(KafkaVarintParse::Incomplete)
+    }
+
+    fn kafka_unsigned_varint(payload: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        for (index, byte) in payload.iter().take(10).enumerate() {
+            value |= ((byte & 0x7f) as u64).checked_shl((7 * index) as u32)?;
+            if byte & 0x80 == 0 {
+                return Some((value, index + 1));
+            }
+        }
+        None
+    }
+
+    fn kafka_unsigned_varint_incomplete(payload: &[u8]) -> bool {
+        if payload.is_empty() {
+            return true;
+        }
+        for byte in payload.iter().take(10) {
+            if byte & 0x80 == 0 {
+                return false;
+            }
+        }
+        payload.len() < 10
+    }
+
+    fn nats_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            match nats_frame(payload, offset) {
+                Some(NatsFrameParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(NatsFrameParse::IncompleteBody) => return true,
+                Some(NatsFrameParse::IncompleteLine) => return frame_count > 0,
+                None => return false,
+            }
+        }
+        frame_count > 0
+    }
+
+    enum NatsFrameParse {
+        Complete(usize),
+        IncompleteLine,
+        IncompleteBody,
+    }
+
+    enum NatsLineParse<'a> {
+        Complete { line: &'a [u8], next_offset: usize },
+        Incomplete,
+    }
+
+    enum NatsCommandKind {
+        Line,
+        Payload {
+            bytes: usize,
+        },
+        Headers {
+            header_bytes: usize,
+            total_bytes: usize,
+        },
+    }
+
+    fn nats_frame(payload: &[u8], offset: usize) -> Option<NatsFrameParse> {
+        let NatsLineParse::Complete { line, next_offset } = nats_control_line(payload, offset)?
+        else {
+            return Some(NatsFrameParse::IncompleteLine);
+        };
+        let command = nats_command_kind(line)?;
+        match command {
+            NatsCommandKind::Line => Some(NatsFrameParse::Complete(next_offset)),
+            NatsCommandKind::Payload { bytes } => {
+                nats_payload_body(payload, next_offset, bytes, None)
+            }
+            NatsCommandKind::Headers {
+                header_bytes,
+                total_bytes,
+            } => nats_payload_body(payload, next_offset, total_bytes, Some(header_bytes)),
+        }
+    }
+
+    fn nats_command_kind(line: &[u8]) -> Option<NatsCommandKind> {
+        let fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let command = *fields.first()?;
+
+        if command.eq_ignore_ascii_case(b"INFO") || command.eq_ignore_ascii_case(b"CONNECT") {
+            return nats_json_object_after_command(line, command.len())
+                .then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"PING") || command.eq_ignore_ascii_case(b"PONG") {
+            return (fields.len() == 1).then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"+OK") {
+            return (fields.len() == 1).then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"-ERR") {
+            return (fields.len() >= 2).then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"PUB") {
+            let bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 3 || fields.len() == 4)
+                && nats_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 3 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Payload { bytes });
+        }
+        if command.eq_ignore_ascii_case(b"HPUB") {
+            let header_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(2)], 64 * 1024 * 1024)?;
+            let total_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 4 || fields.len() == 5)
+                && nats_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(3))
+                    .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 2])
+                && nats_decimal(fields[fields.len() - 1])
+                && header_bytes <= total_bytes)
+                .then_some(NatsCommandKind::Headers {
+                    header_bytes,
+                    total_bytes,
+                });
+        }
+        if command.eq_ignore_ascii_case(b"SUB") {
+            return ((fields.len() == 3 || fields.len() == 4)
+                && nats_subscription_subject(fields[1])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 3 || nats_queue_group(field))
+                && nats_sid(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"UNSUB") {
+            return ((fields.len() == 2 || fields.len() == 3)
+                && nats_sid(fields[1])
+                && (fields.len() == 2 || nats_decimal(fields[2])))
+            .then_some(NatsCommandKind::Line);
+        }
+        if command.eq_ignore_ascii_case(b"MSG") {
+            let bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 4 || fields.len() == 5)
+                && nats_subject(fields[1])
+                && nats_sid(fields[2])
+                && fields
+                    .get(fields.len().saturating_sub(2))
+                    .is_some_and(|field| fields.len() == 4 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 1]))
+            .then_some(NatsCommandKind::Payload { bytes });
+        }
+        if command.eq_ignore_ascii_case(b"HMSG") {
+            let header_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(2)], 64 * 1024 * 1024)?;
+            let total_bytes =
+                nats_decimal_value(fields[fields.len().saturating_sub(1)], 64 * 1024 * 1024)?;
+            return ((fields.len() == 5 || fields.len() == 6)
+                && nats_subject(fields[1])
+                && nats_sid(fields[2])
+                && fields
+                    .get(fields.len().saturating_sub(3))
+                    .is_some_and(|field| fields.len() == 5 || nats_reply_subject(field))
+                && nats_decimal(fields[fields.len() - 2])
+                && nats_decimal(fields[fields.len() - 1])
+                && header_bytes <= total_bytes)
+                .then_some(NatsCommandKind::Headers {
+                    header_bytes,
+                    total_bytes,
+                });
+        }
+        None
+    }
+
+    fn nats_control_line(payload: &[u8], offset: usize) -> Option<NatsLineParse<'_>> {
+        let tail = payload.get(offset..)?;
+        let newline = tail.iter().position(|byte| *byte == b'\n');
+        let Some(newline) = newline else {
+            return Some(NatsLineParse::Incomplete);
+        };
+        if newline == 0 || tail.get(newline.saturating_sub(1)) != Some(&b'\r') {
+            return None;
+        }
+        let line = tail.get(..newline - 1)?;
+        (!line.is_empty()
+            && line
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t'))
+        .then_some(NatsLineParse::Complete {
+            line,
+            next_offset: offset + newline + 1,
+        })
+    }
+
+    fn nats_payload_body(
+        payload: &[u8],
+        payload_offset: usize,
+        bytes: usize,
+        header_bytes: Option<usize>,
+    ) -> Option<NatsFrameParse> {
+        let data_end = payload_offset.checked_add(bytes)?;
+        let frame_end = data_end.checked_add(2)?;
+        if let Some(header_bytes) = header_bytes {
+            if header_bytes > bytes {
+                return None;
+            }
+            let header_end = payload_offset.checked_add(header_bytes)?;
+            if payload.len() >= header_end
+                && !nats_header_block(payload.get(payload_offset..header_end)?)
+            {
+                return None;
+            }
+        }
+        if payload.len() < data_end {
+            return Some(NatsFrameParse::IncompleteBody);
+        }
+        if payload.len() < frame_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(NatsFrameParse::IncompleteBody),
+                _ => None,
+            };
+        }
+        (payload.get(data_end..frame_end)? == b"\r\n")
+            .then_some(NatsFrameParse::Complete(frame_end))
+    }
+
+    fn nats_header_block(header: &[u8]) -> bool {
+        header.starts_with(b"NATS/1.0\r\n") && header.ends_with(b"\r\n\r\n")
+    }
+
+    fn nats_json_object_after_command(line: &[u8], command_len: usize) -> bool {
+        let Some(rest) = line.get(command_len..) else {
+            return false;
+        };
+        let json = trim_ascii_space(rest);
+        json.len() >= 2 && json.first() == Some(&b'{') && json.last() == Some(&b'}')
+    }
+
+    fn nats_subject(field: &[u8]) -> bool {
+        nats_subject_tokens(field, false)
+    }
+
+    fn nats_subscription_subject(field: &[u8]) -> bool {
+        nats_subject_tokens(field, true)
+    }
+
+    fn nats_subject_tokens(field: &[u8], allow_wildcards: bool) -> bool {
+        if !nats_token(field) || field.starts_with(b".") || field.ends_with(b".") {
+            return false;
+        }
+        let mut tokens = field.split(|byte| *byte == b'.').peekable();
+        while let Some(token) = tokens.next() {
+            if token.is_empty() {
+                return false;
+            }
+            if token.contains(&b'*') || token.contains(&b'>') {
+                let valid_wildcard = token == b"*" || (token == b">" && tokens.peek().is_none());
+                if !allow_wildcards || !valid_wildcard {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn nats_reply_subject(field: &[u8]) -> bool {
+        nats_subject(field)
+    }
+
+    fn nats_queue_group(field: &[u8]) -> bool {
+        nats_token(field)
+    }
+
+    fn nats_sid(field: &[u8]) -> bool {
+        nats_token(field)
+    }
+
+    fn nats_token(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field.len() <= 1024
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+    }
+
+    fn nats_decimal(field: &[u8]) -> bool {
+        !field.is_empty() && field.len() <= 20 && field.iter().all(u8::is_ascii_digit)
+    }
+
+    fn nats_decimal_value(field: &[u8], max: usize) -> Option<usize> {
+        if field.is_empty() || field.len() > 20 {
+            return None;
+        }
+        let mut value = 0_usize;
+        for byte in field {
+            let digit = byte.checked_sub(b'0')?;
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(digit as usize)?;
+            if value > max {
+                return None;
+            }
+        }
+        Some(value)
+    }
+
+    fn mqtt_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 || payload[0] != 0x10 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        if remaining_len < 10 {
+            return false;
+        }
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end > payload.len() {
+            return false;
+        }
+        let Some(protocol_name_len) = read_u16_be(payload, offset).map(|len| len as usize) else {
+            return false;
+        };
+        offset += 2;
+        let Some(protocol_name_end) = offset.checked_add(protocol_name_len) else {
+            return false;
+        };
+        let Some(variable_header_len) = 2_usize
+            .checked_add(protocol_name_len)
+            .and_then(|len| len.checked_add(4))
+        else {
+            return false;
+        };
+        if remaining_len < variable_header_len {
+            return false;
+        }
+        let Some(protocol_name) = payload.get(offset..protocol_name_end) else {
+            return false;
+        };
+        let Some(&protocol_level) = payload.get(protocol_name_end) else {
+            return false;
+        };
+        let Some(&connect_flags) = payload.get(protocol_name_end + 1) else {
+            return false;
+        };
+        let keepalive_end = protocol_name_end + 4;
+        if payload.get(protocol_name_end + 2..keepalive_end).is_none()
+            || !mqtt_connect_flags(connect_flags)
+            || remaining_end < keepalive_end
+        {
+            return false;
+        }
+
+        let payload_start = if protocol_name == b"MQTT" && protocol_level == 5 {
+            let Some((properties_len, properties_offset)) =
+                mqtt_variable_integer_until(payload, keepalive_end, remaining_end)
+            else {
+                return false;
+            };
+            let Some(payload_start) = properties_offset.checked_add(properties_len) else {
+                return false;
+            };
+            if payload_start > remaining_end {
+                return false;
+            }
+            payload_start
+        } else {
+            keepalive_end
+        };
+
+        let protocol_ok = protocol_name == b"MQTT" && matches!(protocol_level, 4 | 5)
+            || protocol_name == b"MQIsdp" && protocol_level == 3;
+        protocol_ok
+            && mqtt_connect_payload(
+                payload,
+                payload_start,
+                remaining_end,
+                connect_flags,
+                protocol_level,
+            )
+    }
+
+    fn mqtt_variable_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        mqtt_variable_integer_until(payload, offset, payload.len())
+    }
+
+    fn mqtt_variable_integer_until(
+        payload: &[u8],
+        mut offset: usize,
+        limit: usize,
+    ) -> Option<(usize, usize)> {
+        let mut value = 0_usize;
+        let mut multiplier = 1_usize;
+        for _ in 0..4 {
+            if offset >= limit {
+                return None;
+            }
+            let byte = *payload.get(offset)?;
+            value = value.checked_add(((byte & 0x7f) as usize).checked_mul(multiplier)?)?;
+            offset += 1;
+            if byte & 0x80 == 0 {
+                return Some((value, offset));
+            }
+            multiplier = multiplier.checked_mul(128)?;
+        }
+        None
+    }
+
+    fn mqtt_connect_flags(flags: u8) -> bool {
+        let username = flags & 0x80 != 0;
+        let password = flags & 0x40 != 0;
+        let will_retain = flags & 0x20 != 0;
+        let will_qos = (flags >> 3) & 0x03;
+        let will = flags & 0x04 != 0;
+
+        flags & 0x01 == 0
+            && (!password || username)
+            && (will || (!will_retain && will_qos == 0))
+            && will_qos != 0x03
+    }
+
+    fn mqtt_connect_payload(
+        payload: &[u8],
+        payload_start: usize,
+        remaining_end: usize,
+        connect_flags: u8,
+        protocol_level: u8,
+    ) -> bool {
+        let Some((client_id, mut offset)) = mqtt_utf8_field(payload, payload_start, remaining_end)
+        else {
+            return false;
+        };
+        if !mqtt_client_identifier(client_id, connect_flags) {
+            return false;
+        }
+
+        if connect_flags & 0x04 != 0 {
+            if protocol_level == 5 {
+                let Some((will_properties_len, will_properties_offset)) =
+                    mqtt_variable_integer_until(payload, offset, remaining_end)
+                else {
+                    return false;
+                };
+                let Some(will_topic_offset) =
+                    will_properties_offset.checked_add(will_properties_len)
+                else {
+                    return false;
+                };
+                if will_topic_offset > remaining_end {
+                    return false;
+                }
+                offset = will_topic_offset;
+            }
+            let Some((_, will_payload_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            let Some((_, next_offset)) =
+                mqtt_len_prefixed_field(payload, will_payload_offset, remaining_end)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+
+        if connect_flags & 0x80 != 0 {
+            let Some((_, next_offset)) = mqtt_utf8_field(payload, offset, remaining_end) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if connect_flags & 0x40 != 0 {
+            let Some((_, next_offset)) = mqtt_len_prefixed_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+
+        offset == remaining_end
+    }
+
+    fn mqtt_client_identifier(client_id: &[u8], connect_flags: u8) -> bool {
+        let clean_start = connect_flags & 0x02 != 0;
+        (!client_id.is_empty() || clean_start) && mqtt_utf8_string(client_id)
+    }
+
+    fn mqtt_utf8_field(
+        payload: &[u8],
+        offset: usize,
+        remaining_end: usize,
+    ) -> Option<(&[u8], usize)> {
+        let (field, next_offset) = mqtt_len_prefixed_field(payload, offset, remaining_end)?;
+        mqtt_utf8_string(field).then_some((field, next_offset))
+    }
+
+    fn mqtt_len_prefixed_field(
+        payload: &[u8],
+        offset: usize,
+        remaining_end: usize,
+    ) -> Option<(&[u8], usize)> {
+        let len = read_u16_be(payload, offset)? as usize;
+        let start = offset.checked_add(2)?;
+        let end = start.checked_add(len)?;
+        if end > remaining_end {
+            return None;
+        }
+        payload.get(start..end).map(|field| (field, end))
+    }
+
+    fn mqtt_utf8_string(field: &[u8]) -> bool {
+        std::str::from_utf8(field).is_ok()
+            && field
+                .iter()
+                .all(|byte| *byte != 0 && !byte.is_ascii_control())
+    }
+
+    fn amqp_payload(payload: &[u8]) -> bool {
+        amqp_protocol_header_payload(payload) || amqp_frame_payload(payload)
+    }
+
+    fn amqp_protocol_header_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 || payload.get(..4) != Some(b"AMQP") {
+            return false;
+        }
+        matches!(
+            (payload[4], payload[5], payload[6], payload[7]),
+            (0, 0, 9, 1) | (0, 1, 0, 0) | (3, 1, 0, 0)
+        )
+    }
+
+    fn amqp_frame_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let frame_type = payload[0];
+        let channel = u16::from_be_bytes([payload[1], payload[2]]);
+        let frame_size =
+            u32::from_be_bytes([payload[3], payload[4], payload[5], payload[6]]) as usize;
+        let Some(frame_end_offset) = 7_usize.checked_add(frame_size) else {
+            return false;
+        };
+        if frame_end_offset >= payload.len() || payload[frame_end_offset] != 0xce {
+            return false;
+        }
+        match frame_type {
+            1 => (4..=131_072).contains(&frame_size),
+            2 => channel != 0 && (14..=131_072).contains(&frame_size),
+            3 => channel != 0 && frame_size <= 16_777_216,
+            8 => channel == 0 && frame_size == 0,
+            _ => false,
+        }
+    }
+
+    fn cassandra_payload(payload: &[u8]) -> bool {
+        if payload.len() < 9 {
+            return false;
+        }
+        let version_byte = payload[0];
+        let version = version_byte & 0x7f;
+        let flags = payload[1];
+        let opcode = payload[4];
+        let body_len =
+            u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+        let body_prefix = &payload[9..];
+
+        if !matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
+            || !(3..=5).contains(&version)
+            || flags & !0x1f != 0
+            || body_len > 16_777_216
+        {
+            return false;
+        }
+
+        let is_response = version_byte & 0x80 != 0;
+        if is_response {
+            cassandra_response_body(opcode, body_len, body_prefix)
+        } else {
+            cassandra_request_body(version, opcode, body_len, body_prefix)
+        }
+    }
+
+    fn cassandra_request_body(
+        version: u8,
+        opcode: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+    ) -> bool {
+        match opcode {
+            0x01 => cassandra_startup_body(body_len, body_prefix),
+            0x05 => body_len == 0,
+            0x07 => cassandra_cql_query_body(version, body_len, body_prefix, true),
+            0x09 => cassandra_cql_query_body(version, body_len, body_prefix, false),
+            0x0a => cassandra_execute_body(version, body_len, body_prefix),
+            0x0b => cassandra_string_list_body(body_len, body_prefix),
+            0x0d => body_len >= 6 && body_prefix.len() >= 6,
+            0x0f => body_len >= 4 && body_prefix.len() >= 4,
+            _ => false,
+        }
+    }
+
+    fn cassandra_response_body(opcode: u8, body_len: usize, body_prefix: &[u8]) -> bool {
+        match opcode {
+            0x00 => body_len >= 8 && body_prefix.len() >= 8,
+            0x02 => body_len == 0,
+            0x03 => cassandra_string_body(body_len, body_prefix),
+            0x06 => body_len >= 2 && body_prefix.len() >= 2,
+            0x08 => body_len >= 4 && body_prefix.len() >= 4,
+            0x0c => cassandra_string_prefix_body(body_len, body_prefix),
+            0x0e | 0x10 => body_len >= 4 && body_prefix.len() >= 4,
+            _ => false,
+        }
+    }
+
+    fn cassandra_startup_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 64 {
+            return false;
+        }
+
+        let mut offset = 2;
+        let mut has_cql_version = false;
+        for _ in 0..count {
+            let Some((key, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            let Some((value, next_offset)) = cassandra_string_field(body_prefix, next_offset)
+            else {
+                return false;
+            };
+            has_cql_version |= key.eq_ignore_ascii_case(b"CQL_VERSION") && value.starts_with(b"3.");
+            offset = next_offset;
+        }
+        offset == body_len && has_cql_version
+    }
+
+    fn cassandra_cql_query_body(
+        version: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+        has_consistency: bool,
+    ) -> bool {
+        if body_len < 5 || body_prefix.len() < 4 {
+            return false;
+        }
+        let Some(query_len) = read_u32_be(body_prefix, 0).map(|len| len as usize) else {
+            return false;
+        };
+        if query_len == 0 || query_len > 1_048_576 {
+            return false;
+        }
+        let Some(query_end) = 4_usize.checked_add(query_len) else {
+            return false;
+        };
+        let required_len = if has_consistency {
+            cassandra_query_parameter_header_len(version)
+                .and_then(|parameters_len| query_end.checked_add(parameters_len))
+        } else {
+            Some(query_end)
+        };
+        let Some(required_len) = required_len else {
+            return false;
+        };
+        if body_len < required_len || body_prefix.len() < required_len {
+            return false;
+        }
+        if !has_consistency && body_len != required_len {
+            return false;
+        }
+        let query = trim_ascii_space(&body_prefix[4..query_end]);
+        cassandra_cql_statement(query)
+            && (!has_consistency
+                || cassandra_query_parameters(version, body_len, body_prefix, query_end))
+    }
+
+    fn cassandra_cql_statement(query: &[u8]) -> bool {
+        let keywords: [&[u8]; 17] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"BEGIN",
+            b"APPLY",
+            b"USE",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"GRANT",
+            b"REVOKE",
+            b"LIST",
+            b"DESCRIBE",
+            b"DESC",
+            b"UNLOGGED",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_ascii_keyword(query, keyword))
+    }
+
+    fn cassandra_execute_body(version: u8, body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < 2 {
+            return false;
+        }
+        let Some(prepared_id_len) = read_u16_be(body_prefix, 0).map(|len| len as usize) else {
+            return false;
+        };
+        if prepared_id_len == 0 || prepared_id_len > 65_535 {
+            return false;
+        }
+        let Some(required_len) = 2_usize
+            .checked_add(prepared_id_len)
+            .and_then(|len| len.checked_add(cassandra_query_parameter_header_len(version)?))
+        else {
+            return false;
+        };
+        body_len >= required_len
+            && body_prefix.len() >= required_len
+            && cassandra_query_parameters(version, body_len, body_prefix, 2 + prepared_id_len)
+    }
+
+    fn cassandra_query_parameter_header_len(version: u8) -> Option<usize> {
+        match version {
+            3 | 4 => Some(3),
+            5 => Some(6),
+            _ => None,
+        }
+    }
+
+    fn cassandra_query_parameters(
+        version: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+        offset: usize,
+    ) -> bool {
+        let Some(consistency) = read_u16_be(body_prefix, offset) else {
+            return false;
+        };
+        if !cassandra_consistency(consistency) {
+            return false;
+        }
+        let Some(mut offset) = offset.checked_add(2) else {
+            return false;
+        };
+
+        let Some((flags, next_offset)) =
+            cassandra_query_parameter_flags(version, body_prefix, offset)
+        else {
+            return false;
+        };
+        if !cassandra_query_parameter_flags_supported(version, flags) {
+            return false;
+        }
+        offset = next_offset;
+
+        if body_prefix.len() < body_len {
+            return true;
+        }
+
+        if flags & 0x01 != 0 {
+            let Some(count) = read_u16_be(body_prefix, offset).map(|count| count as usize) else {
+                return false;
+            };
+            if count > 1024 {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(2) else {
+                return false;
+            };
+            offset = next_offset;
+            for _ in 0..count {
+                if flags & 0x40 != 0 {
+                    let Some((_name, next_offset)) = cassandra_string_field(body_prefix, offset)
+                    else {
+                        return false;
+                    };
+                    offset = next_offset;
+                }
+                let Some(next_offset) = cassandra_bytes_field(body_prefix, offset, body_len, true)
+                else {
+                    return false;
+                };
+                offset = next_offset;
+            }
+        }
+
+        if flags & 0x04 != 0 {
+            let Some(page_size) = read_u32_be(body_prefix, offset) else {
+                return false;
+            };
+            if page_size == 0 || page_size & 0x8000_0000 != 0 {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(4) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if flags & 0x08 != 0 {
+            let Some(next_offset) = cassandra_bytes_field(body_prefix, offset, body_len, false)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if flags & 0x10 != 0 {
+            let Some(serial_consistency) = read_u16_be(body_prefix, offset) else {
+                return false;
+            };
+            if !matches!(serial_consistency, 0x0008 | 0x0009) {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(2) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if flags & 0x20 != 0 {
+            let Some(timestamp) = body_prefix.get(offset..offset.saturating_add(8)) else {
+                return false;
+            };
+            if timestamp.first().is_some_and(|byte| byte & 0x80 != 0) {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(8) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if version == 5 {
+            if flags & 0x80 != 0 {
+                let Some((_keyspace, next_offset)) = cassandra_string_field(body_prefix, offset)
+                else {
+                    return false;
+                };
+                offset = next_offset;
+            }
+            if flags & 0x100 != 0 {
+                let Some(now) = read_u32_be(body_prefix, offset) else {
+                    return false;
+                };
+                if now & 0x8000_0000 != 0 {
+                    return false;
+                }
+                let Some(next_offset) = offset.checked_add(4) else {
+                    return false;
+                };
+                offset = next_offset;
+            }
+        }
+
+        offset == body_len
+    }
+
+    fn cassandra_query_parameter_flags(
+        version: u8,
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<(u32, usize)> {
+        match version {
+            3 | 4 => payload
+                .get(offset)
+                .and_then(|flags| offset.checked_add(1).map(|next| (*flags as u32, next))),
+            5 => read_u32_be(payload, offset).zip(offset.checked_add(4)),
+            _ => None,
+        }
+    }
+
+    fn cassandra_query_parameter_flags_supported(version: u8, flags: u32) -> bool {
+        let supported = match version {
+            3 | 4 => 0x7f,
+            5 => 0x01ff,
+            _ => return false,
+        };
+        flags & !supported == 0 && (flags & 0x40 == 0 || flags & 0x01 != 0)
+    }
+
+    fn cassandra_consistency(consistency: u16) -> bool {
+        matches!(consistency, 0x0000..=0x000a)
+    }
+
+    fn cassandra_bytes_field(
+        payload: &[u8],
+        offset: usize,
+        body_len: usize,
+        allow_unset: bool,
+    ) -> Option<usize> {
+        let length_bytes = payload.get(offset..offset.checked_add(4)?)?;
+        let len = i32::from_be_bytes(length_bytes.try_into().ok()?);
+        let value_start = offset.checked_add(4)?;
+        if len == -1 || (allow_unset && len == -2) {
+            return Some(value_start);
+        }
+        if len < 0 {
+            return None;
+        }
+        let len = len as usize;
+        if len > 16_777_216 {
+            return None;
+        }
+        let value_end = value_start.checked_add(len)?;
+        if value_end > body_len || value_end > payload.len() {
+            return None;
+        }
+        Some(value_end)
+    }
+
+    fn cassandra_string_list_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 64 {
+            return false;
+        }
+        let mut offset = 2;
+        for _ in 0..count {
+            let Some((_value, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == body_len
+    }
+
+    fn cassandra_string_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_string_field(body_prefix, 0).is_some_and(|(_value, offset)| offset == body_len)
+    }
+
+    fn cassandra_string_prefix_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_string_field(body_prefix, 0).is_some_and(|(_value, offset)| offset <= body_len)
+    }
+
+    fn cassandra_string_field(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        let len = read_u16_be(payload, offset)? as usize;
+        if len == 0 || len > 4096 {
+            return None;
+        }
+        let value_start = offset.checked_add(2)?;
+        let value_end = value_start.checked_add(len)?;
+        let value = payload.get(value_start..value_end)?;
+        if !value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        {
+            return None;
+        }
+        Some((value, value_end))
+    }
+
+    fn mongodb_payload(payload: &[u8]) -> bool {
+        if payload.len() < 16 {
+            return false;
+        }
+        let Some(message_len) = read_u32_le(payload, 0).map(|len| len as usize) else {
+            return false;
+        };
+        let Some(opcode) = read_u32_le(payload, 12) else {
+            return false;
+        };
+        if !(16..=100_000_000).contains(&message_len) {
+            return false;
+        }
+
+        match opcode {
+            1 => mongodb_op_reply_payload(payload, message_len),
+            2012 => mongodb_op_compressed_payload(payload, message_len),
+            2001 => mongodb_op_update_payload(payload, message_len),
+            2002 => mongodb_op_insert_payload(payload, message_len),
+            2004 => mongodb_op_query_payload(payload, message_len),
+            2005 => mongodb_op_get_more_payload(payload, message_len),
+            2006 => mongodb_op_delete_payload(payload, message_len),
+            2007 => mongodb_op_kill_cursors_payload(payload, message_len),
+            2013 => mongodb_op_msg_payload(payload, message_len),
+            _ => false,
+        }
+    }
+
+    fn mongodb_op_reply_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 36 || payload.len() < 36 {
+            return false;
+        }
+        let Some(flags) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        let Some(number_returned) = read_u32_le(payload, 32).map(|count| count as usize) else {
+            return false;
+        };
+        if flags & !0x0f != 0 || number_returned > 1_000_000 {
+            return false;
+        }
+        if number_returned == 0 {
+            return message_len == 36;
+        }
+        let min_documents = if mongodb_full_message_observed(payload, message_len) {
+            number_returned
+        } else {
+            1
+        };
+        mongodb_bson_document_sequence(
+            payload,
+            36,
+            message_len,
+            min_documents,
+            Some(number_returned),
+        )
+    }
+
+    fn mongodb_op_compressed_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 25 || payload.len() < 25 {
+            return false;
+        }
+        let Some(original_opcode) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        let Some(uncompressed_size) = read_u32_le(payload, 20).map(|size| size as usize) else {
+            return false;
+        };
+        let Some(compressor_id) = payload.get(24) else {
+            return false;
+        };
+        mongodb_wire_opcode(original_opcode)
+            && original_opcode != 2012
+            && uncompressed_size <= 100_000_000
+            && matches!(*compressor_id, 0..=3)
+            && (!mongodb_full_message_observed(payload, message_len) || message_len > 25)
+    }
+
+    fn mongodb_op_update_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 35 || payload.len() < 25 || read_u32_le(payload, 16) != Some(0) {
+            return false;
+        }
+        let Some((namespace, flags_offset)) = mongodb_cstring_field(payload, 20, message_len)
+        else {
+            return false;
+        };
+        let Some(flags) = read_u32_le(payload, flags_offset) else {
+            return false;
+        };
+        if !mongodb_collection_namespace(namespace) || flags & !0x03 != 0 {
+            return false;
+        }
+        let selector_offset = flags_offset + 4;
+        mongodb_bson_document_sequence(payload, selector_offset, message_len, 2, Some(2))
+    }
+
+    fn mongodb_op_insert_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 30 || payload.len() < 25 {
+            return false;
+        }
+        let Some(flags) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        let Some((namespace, document_offset)) = mongodb_cstring_field(payload, 20, message_len)
+        else {
+            return false;
+        };
+        flags & !0x01 == 0
+            && mongodb_collection_namespace(namespace)
+            && mongodb_bson_document_sequence(payload, document_offset, message_len, 1, None)
+    }
+
+    fn mongodb_op_query_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 37 || payload.len() < 29 {
+            return false;
+        }
+        let Some(flags) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        let Some((namespace, skip_offset)) = mongodb_cstring_field(payload, 20, message_len) else {
+            return false;
+        };
+        let Some(query_offset) = skip_offset.checked_add(8) else {
+            return false;
+        };
+        flags & !0x7f == 0
+            && mongodb_collection_namespace(namespace)
+            && query_offset <= message_len
+            && payload.len() >= skip_offset.saturating_add(8)
+            && mongodb_bson_document_sequence(payload, query_offset, message_len, 1, Some(2))
+    }
+
+    fn mongodb_op_get_more_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 32 || payload.len() < 28 || read_u32_le(payload, 16) != Some(0) {
+            return false;
+        }
+        let Some((namespace, number_to_return_offset)) =
+            mongodb_cstring_field(payload, 20, message_len)
+        else {
+            return false;
+        };
+        let Some(end) = number_to_return_offset.checked_add(12) else {
+            return false;
+        };
+        mongodb_collection_namespace(namespace) && end == message_len && payload.len() >= end
+    }
+
+    fn mongodb_op_delete_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 35 || payload.len() < 25 || read_u32_le(payload, 16) != Some(0) {
+            return false;
+        }
+        let Some((namespace, flags_offset)) = mongodb_cstring_field(payload, 20, message_len)
+        else {
+            return false;
+        };
+        let Some(flags) = read_u32_le(payload, flags_offset) else {
+            return false;
+        };
+        let selector_offset = flags_offset + 4;
+        flags & !0x01 == 0
+            && mongodb_collection_namespace(namespace)
+            && mongodb_bson_document_sequence(payload, selector_offset, message_len, 1, Some(1))
+    }
+
+    fn mongodb_op_kill_cursors_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 32 || payload.len() < 32 || read_u32_le(payload, 16) != Some(0) {
+            return false;
+        }
+        let Some(cursor_count) = read_u32_le(payload, 20).map(|count| count as usize) else {
+            return false;
+        };
+        if cursor_count == 0 || cursor_count > 10_000 {
+            return false;
+        }
+        let Some(cursor_bytes) = cursor_count.checked_mul(8) else {
+            return false;
+        };
+        let Some(expected_len) = 24_usize.checked_add(cursor_bytes) else {
+            return false;
+        };
+        expected_len == message_len && payload.len() >= expected_len
+    }
+
+    fn mongodb_op_msg_payload(payload: &[u8], message_len: usize) -> bool {
+        if message_len < 26 || payload.len() < 21 {
+            return false;
+        }
+        let Some(flags) = read_u32_le(payload, 16) else {
+            return false;
+        };
+        if flags & 0x0000_fffc != 0 {
+            return false;
+        }
+        let checksum_len = if flags & 0x0000_0001 != 0 { 4 } else { 0 };
+        let Some(section_limit) = message_len.checked_sub(checksum_len) else {
+            return false;
+        };
+        if section_limit <= 20 {
+            return false;
+        }
+        mongodb_op_msg_sections(payload, 20, section_limit)
+    }
+
+    fn mongodb_op_msg_sections(payload: &[u8], mut offset: usize, section_limit: usize) -> bool {
+        let full_message = mongodb_full_message_observed(payload, section_limit);
+        let mut section_count = 0_usize;
+        while offset < section_limit {
+            let Some(next_offset) = mongodb_op_msg_section(payload, offset, section_limit) else {
+                return false;
+            };
+            section_count += 1;
+            if next_offset > payload.len() {
+                return !full_message;
+            }
+            offset = next_offset;
+            if !full_message && offset >= payload.len() {
+                return true;
+            }
+        }
+        section_count > 0 && offset == section_limit
+    }
+
+    fn mongodb_op_msg_section(
+        payload: &[u8],
+        offset: usize,
+        section_limit: usize,
+    ) -> Option<usize> {
+        let section_kind = *payload.get(offset)?;
+        match section_kind {
+            0 => mongodb_bson_document_prefix(payload, offset.checked_add(1)?, section_limit),
+            1 => {
+                let section_size = read_u32_le(payload, offset.checked_add(1)?)? as usize;
+                if !(6..=16_777_216).contains(&section_size) {
+                    return None;
+                }
+                let section_body_offset = offset.checked_add(5)?;
+                let section_end = offset.checked_add(1)?.checked_add(section_size)?;
+                if section_end > section_limit {
+                    return None;
+                }
+                let (identifier, document_offset) =
+                    mongodb_cstring_field(payload, section_body_offset, section_end)?;
+                if !mongodb_sequence_identifier(identifier) {
+                    return None;
+                }
+                mongodb_bson_document_sequence(payload, document_offset, section_end, 0, None)
+                    .then_some(())?;
+                Some(section_end)
+            }
+            _ => None,
+        }
+    }
+
+    fn mongodb_bson_document_prefix(
+        payload: &[u8],
+        offset: usize,
+        message_len: usize,
+    ) -> Option<usize> {
+        let document_len = read_u32_le(payload, offset)? as usize;
+        if !(5..=16_777_216).contains(&document_len) {
+            return None;
+        }
+        let document_end = offset.checked_add(document_len)?;
+        if document_end > message_len {
+            return None;
+        }
+        if payload.len() >= document_end && payload.get(document_end - 1) != Some(&0) {
+            return None;
+        }
+        Some(document_end)
+    }
+
+    fn mongodb_bson_document_sequence(
+        payload: &[u8],
+        mut offset: usize,
+        message_len: usize,
+        min_documents: usize,
+        max_documents: Option<usize>,
+    ) -> bool {
+        if offset > message_len {
+            return false;
+        }
+        let full_message = mongodb_full_message_observed(payload, message_len);
+        let mut document_count = 0_usize;
+        while offset < message_len {
+            if !full_message && payload.len().saturating_sub(offset) < 4 {
+                return document_count >= min_documents
+                    && max_documents.is_none_or(|max| document_count <= max);
+            }
+            if max_documents.is_some_and(|max| document_count >= max) {
+                return false;
+            }
+            let Some(next_offset) = mongodb_bson_document_prefix(payload, offset, message_len)
+            else {
+                return false;
+            };
+            document_count += 1;
+            if next_offset > payload.len() {
+                return !full_message && document_count >= min_documents;
+            }
+            offset = next_offset;
+            if !full_message && offset >= payload.len() {
+                return document_count >= min_documents
+                    && max_documents.is_none_or(|max| document_count <= max);
+            }
+        }
+        document_count >= min_documents
+            && max_documents.is_none_or(|max| document_count <= max)
+            && offset == message_len
+    }
+
+    fn mongodb_cstring_field(
+        payload: &[u8],
+        offset: usize,
+        message_len: usize,
+    ) -> Option<(&[u8], usize)> {
+        let limit = payload.len().min(message_len);
+        let tail = payload.get(offset..limit)?;
+        let terminator = tail.iter().position(|byte| *byte == 0)?;
+        if terminator == 0 || terminator > 512 {
+            return None;
+        }
+        let end = offset.checked_add(terminator)?;
+        Some((payload.get(offset..end)?, end + 1))
+    }
+
+    fn mongodb_collection_namespace(namespace: &[u8]) -> bool {
+        mongodb_ascii_name(namespace)
+            && namespace.contains(&b'.')
+            && !namespace.starts_with(b".")
+            && !namespace.ends_with(b".")
+    }
+
+    fn mongodb_wire_opcode(opcode: u32) -> bool {
+        matches!(
+            opcode,
+            1 | 2001 | 2002 | 2004 | 2005 | 2006 | 2007 | 2012 | 2013
+        )
+    }
+
+    fn mongodb_full_message_observed(payload: &[u8], message_len: usize) -> bool {
+        payload.len() >= message_len
+    }
+
+    fn mongodb_sequence_identifier(identifier: &[u8]) -> bool {
+        mongodb_ascii_name(identifier)
+    }
+
+    fn mongodb_ascii_name(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 512
+            && value.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.' | b'$')
+            })
+    }
+
+    fn elasticsearch_transport_payload(payload: &[u8]) -> bool {
+        const FRAME_PREFIX_LEN: usize = 6;
+        const HEADER_LEN: usize = 17;
+        const HEADER_END: usize = FRAME_PREFIX_LEN + HEADER_LEN;
+        const MAX_MESSAGE_LEN: usize = 128 * 1024 * 1024;
+
+        if payload.len() < HEADER_END || payload.get(..2) != Some(b"ES") {
+            return false;
+        }
+        let Some(message_len) = read_u32_be(payload, 2).map(|len| len as usize) else {
+            return false;
+        };
+        if !(HEADER_LEN..=MAX_MESSAGE_LEN).contains(&message_len) {
+            return false;
+        }
+        let Some(frame_end) = FRAME_PREFIX_LEN.checked_add(message_len) else {
+            return false;
+        };
+        let Some(&status) = payload.get(14) else {
+            return false;
+        };
+        let Some(version_id) = read_u32_be(payload, 15) else {
+            return false;
+        };
+        let Some(variable_header_size) = read_u32_be(payload, 19).map(|len| len as usize) else {
+            return false;
+        };
+        let Some(variable_header_end) = HEADER_END.checked_add(variable_header_size) else {
+            return false;
+        };
+
+        elasticsearch_transport_status(status)
+            && elasticsearch_transport_version_id(version_id)
+            && variable_header_size <= message_len - HEADER_LEN
+            && variable_header_end <= frame_end
+    }
+
+    fn elasticsearch_transport_status(status: u8) -> bool {
+        let response = status & 0x01 != 0;
+        let error = status & 0x02 != 0;
+        status & !0x0f == 0 && (response || !error)
+    }
+
+    fn elasticsearch_transport_version_id(version_id: u32) -> bool {
+        const MIN_VERSION_WITH_VARIABLE_HEADER_SIZE: u32 = 7_06_00_00;
+        const MAX_PLAUSIBLE_VERSION: u32 = 99_99_99_99;
+
+        (MIN_VERSION_WITH_VARIABLE_HEADER_SIZE..=MAX_PLAUSIBLE_VERSION).contains(&version_id)
+    }
+
+    fn starts_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
+        let Some(head) = payload.get(..keyword.len()) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        payload
+            .get(keyword.len())
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+    }
+
+    fn ascii_contains_ignore_case(payload: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && payload
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
+    fn trim_ascii_space(payload: &[u8]) -> &[u8] {
+        let start = payload
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(payload.len());
+        let end = payload
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(start);
+        &payload[start..end]
+    }
+
+    fn trim_utf16le_ascii_space(payload: &[u8]) -> &[u8] {
+        if payload.len() < 2 {
+            return &[];
+        }
+        let mut start = 0_usize;
+        while start + 1 < payload.len()
+            && payload[start + 1] == 0
+            && payload[start].is_ascii_whitespace()
+        {
+            start += 2;
+        }
+        let mut end = payload.len() & !1;
+        while end >= start + 2 && payload[end - 1] == 0 && payload[end - 2].is_ascii_whitespace() {
+            end -= 2;
+        }
+        let candidate = &payload[start..end];
+        if candidate.is_empty()
+            || !candidate.chunks_exact(2).all(|chunk| {
+                chunk[1] == 0 && (!chunk[0].is_ascii_control() || chunk[0].is_ascii_whitespace())
+            })
+        {
+            return &[];
+        }
+        candidate
+    }
+
+    fn starts_utf16le_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
+        let keyword_bytes = keyword.len().checked_mul(2).unwrap_or(usize::MAX);
+        if keyword.is_empty() || payload.len() < keyword_bytes {
+            return false;
+        }
+        for (index, expected) in keyword.iter().enumerate() {
+            let offset = index * 2;
+            let Some((&byte, &zero)) = payload.get(offset).zip(payload.get(offset + 1)) else {
+                return false;
+            };
+            if zero != 0 || !byte.eq_ignore_ascii_case(expected) {
+                return false;
+            }
+        }
+        if payload.len() == keyword_bytes {
+            return true;
+        }
+        let Some((&byte, &zero)) = payload
+            .get(keyword_bytes)
+            .zip(payload.get(keyword_bytes + 1))
+        else {
+            return true;
+        };
+        zero == 0 && !byte.is_ascii_alphanumeric() && byte != b'_'
+    }
+
+    fn path_starts_with_any(path: &[u8], prefixes: &[&[u8]]) -> bool {
+        prefixes.iter().any(|prefix| path.starts_with(prefix))
+    }
+
+    fn path_starts_with_api_prefix(path: &[u8], prefix: &[u8]) -> bool {
+        path.starts_with(prefix) && matches!(path.get(prefix.len()), None | Some(b'/') | Some(b'?'))
+    }
+
+    fn path_contains_any(path: &[u8], needles: &[&[u8]]) -> bool {
+        needles
+            .iter()
+            .any(|needle| path.windows(needle.len()).any(|window| window == *needle))
+    }
+
+    fn contains_ascii_case_insensitive(payload: &[u8], needle: &[u8]) -> bool {
+        payload
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1682,6 +6819,8 @@ pub mod api {
         pub destination: IpAddr,
         pub recorded_at: DateTime<Utc>,
         pub observation: AgentPacketFlowObservation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filtered_reason: Option<AgentPacketFlowDropReason>,
         pub matched: Option<AgentPacketFlowMatch>,
     }
 
@@ -1691,11 +6830,53 @@ pub mod api {
         pub relay_node: NodeId,
         pub relay_endpoint: SocketAddr,
         pub local_endpoint: SocketAddr,
+        #[serde(default)]
+        pub socket_receive_errors: u64,
         pub outbound_packets: u64,
         pub outbound_payload_bytes: u64,
         pub outbound_datagram_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_unexpected_source_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_unexpected_source_payload_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_expired_session_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_expired_session_payload_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_oversized_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_oversized_payload_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_oversized_datagram_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_socket_error_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_socket_error_payload_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_socket_error_datagram_bytes: u64,
+        #[serde(default)]
+        pub outbound_dropped_non_wireguard_packets: u64,
+        #[serde(default)]
+        pub outbound_dropped_non_wireguard_payload_bytes: u64,
         pub inbound_packets: u64,
         pub inbound_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_expired_session_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_expired_session_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_oversized_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_oversized_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_socket_error_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_socket_error_payload_bytes: u64,
+        #[serde(default)]
+        pub inbound_dropped_non_wireguard_packets: u64,
+        #[serde(default)]
+        pub inbound_dropped_non_wireguard_payload_bytes: u64,
         pub last_forwarded_at: Option<DateTime<Utc>>,
     }
 
@@ -1720,9 +6901,129 @@ pub mod api {
         pub observed_route_count: usize,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentRelayAdmissionFailureReason {
+        NoEndpointCandidate,
+        InvalidRelayCandidate,
+        Unavailable,
+        Rejected,
+        InvalidResponse,
+    }
+
+    impl AgentRelayAdmissionFailureReason {
+        pub const ALL: [Self; 5] = [
+            Self::NoEndpointCandidate,
+            Self::InvalidRelayCandidate,
+            Self::Unavailable,
+            Self::Rejected,
+            Self::InvalidResponse,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::NoEndpointCandidate => "no_endpoint_candidate",
+                Self::InvalidRelayCandidate => "invalid_relay_candidate",
+                Self::Unavailable => "unavailable",
+                Self::Rejected => "rejected",
+                Self::InvalidResponse => "invalid_response",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentRelayAdmissionFailureReasonCount {
+        pub reason: AgentRelayAdmissionFailureReason,
+        pub count: u64,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentManagedProcessState {
+        #[default]
+        Disabled,
+        Starting,
+        Ready,
+        Exited,
+        Stopping,
+        Stopped,
+        Failed,
+    }
+
+    impl AgentManagedProcessState {
+        pub const ALL: [Self; 7] = [
+            Self::Disabled,
+            Self::Starting,
+            Self::Ready,
+            Self::Exited,
+            Self::Stopping,
+            Self::Stopped,
+            Self::Failed,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled",
+                Self::Starting => "starting",
+                Self::Ready => "ready",
+                Self::Exited => "exited",
+                Self::Stopping => "stopping",
+                Self::Stopped => "stopped",
+                Self::Failed => "failed",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentManagedProcessStatus {
+        pub state: AgentManagedProcessState,
+        pub pid: Option<u32>,
+        pub exit_status: Option<String>,
+        pub message: Option<String>,
+        pub updated_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowDropReasonCount {
         pub reason: AgentPacketFlowDropReason,
+        pub count: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AgentPacketFlowDuplicateSource {
+        ProcNetConntrack,
+        ConntrackNetlink,
+        ConntrackNetlinkEvents,
+        EbpfJsonl,
+        EbpfRingbuf,
+    }
+
+    impl AgentPacketFlowDuplicateSource {
+        pub const ALL: [Self; 5] = [
+            Self::ProcNetConntrack,
+            Self::ConntrackNetlink,
+            Self::ConntrackNetlinkEvents,
+            Self::EbpfJsonl,
+            Self::EbpfRingbuf,
+        ];
+
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::ProcNetConntrack => "proc-net-conntrack",
+                Self::ConntrackNetlink => "conntrack-netlink",
+                Self::ConntrackNetlinkEvents => "conntrack-netlink-events",
+                Self::EbpfJsonl => "ebpf-jsonl",
+                Self::EbpfRingbuf => "ebpf-ringbuf",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentPacketFlowDuplicateSourceCount {
+        pub source: AgentPacketFlowDuplicateSource,
         pub count: u64,
     }
 
@@ -1747,6 +7048,8 @@ pub mod api {
         pub relay_admission_attempt_count: u64,
         pub relay_admission_success_count: u64,
         pub relay_admission_failure_count: u64,
+        #[serde(default)]
+        pub relay_admission_failure_reason_counts: Vec<AgentRelayAdmissionFailureReasonCount>,
         pub relay_forwarder_count: usize,
         pub relay_forwarders: Vec<AgentRelayForwarderMetrics>,
         pub path_change_event_count: usize,
@@ -1760,9 +7063,15 @@ pub mod api {
         pub packet_flow_filtered_count: u64,
         pub packet_flow_filtered_reason_counts: Vec<AgentPacketFlowDropReasonCount>,
         #[serde(default)]
+        pub packet_flow_duplicate_suppression_count: u64,
+        #[serde(default)]
+        pub packet_flow_duplicate_suppression_counts: Vec<AgentPacketFlowDuplicateSourceCount>,
+        #[serde(default)]
         pub packet_flow_classification_counts: Vec<AgentPacketFlowClassificationCount>,
         #[serde(default)]
         pub packet_flow_application_counts: Vec<AgentPacketFlowApplicationCount>,
+        #[serde(default)]
+        pub userspace_wireguard_process: Option<AgentManagedProcessStatus>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1784,6 +7093,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_candidate_ipv6_kind_requires_ipv6_address() {
+        let mut candidate = EndpointCandidate {
+            node_id: NodeId::from_string("node-a"),
+            kind: EndpointCandidateKind::Ipv6,
+            addr: std::net::SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::InterfaceScan,
+        };
+
+        assert_eq!(
+            candidate.validate_kind_address(),
+            Err("IPv6 candidates must use an IPv6 socket address")
+        );
+        candidate.addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+            51820,
+        );
+        assert_eq!(candidate.validate_kind_address(), Ok(()));
+    }
+
+    #[test]
+    fn endpoint_addr_usability_rejects_unrouteable_session_endpoints() {
+        let unusable = [
+            std::net::SocketAddr::from(([203, 0, 113, 10], 0)),
+            std::net::SocketAddr::from(([0, 0, 0, 0], 51820)),
+            std::net::SocketAddr::from(([224, 0, 0, 1], 51820)),
+            std::net::SocketAddr::from(([255, 255, 255, 255], 51820)),
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 51820),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+        ];
+        for addr in unusable {
+            assert!(!endpoint_addr_is_usable(addr), "{addr} should be unusable");
+        }
+
+        let usable = [
+            std::net::SocketAddr::from(([10, 0, 0, 1], 51820)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 51820)),
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 51820),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+        ];
+        for addr in usable {
+            assert!(endpoint_addr_is_usable(addr), "{addr} should be usable");
+        }
+    }
+
+    #[test]
+    fn relay_admission_url_usability_rejects_unusable_numeric_endpoints() {
+        for url in [
+            "http://relay.example:9580",
+            "https://relay.example",
+            "http://203.0.113.10:9580",
+            "https://[2001:db8::10]",
+            "http://127.0.0.1:9580",
+        ] {
+            assert!(relay_admission_url_is_usable(url), "{url} should be usable");
+        }
+
+        for url in [
+            "relay.example:9580",
+            "udp://relay.example:9580",
+            "http://relay.example:0",
+            "http://0.0.0.0:9580",
+            "http://224.0.0.1:9580",
+            "http://255.255.255.255:9580",
+            "http://[::]:9580",
+            "http://[ff02::1]:9580",
+        ] {
+            assert!(
+                !relay_admission_url_is_usable(url),
+                "{url} should be unusable"
+            );
+        }
+    }
+
+    #[test]
     fn direct_path_scores_above_relay_when_metrics_are_close() {
         let metrics = PathMetrics {
             latency_ms: Some(30.0),
@@ -1796,6 +7188,92 @@ mod tests {
         let relay = PathScore::calculate(PathState::Relay, &metrics, true, 10);
 
         assert!(direct.value > relay.value);
+        assert!(direct
+            .reasons
+            .iter()
+            .any(|reason| reason == "stability=0.90"));
+    }
+
+    #[test]
+    fn agent_status_defaults_missing_userspace_wireguard_process() {
+        let status: api::AgentStatusResponse = match serde_json::from_str(
+            r#"{
+                "node_id": "node-a",
+                "identity_public_key": "identity-a",
+                "wireguard_public_key": "wireguard-a",
+                "candidate_count": 0,
+                "candidates": [],
+                "nat_classification": null,
+                "state_updated_at": "2026-07-05T00:00:00Z"
+            }"#,
+        ) {
+            Ok(status) => status,
+            Err(error) => panic!("legacy status response should decode: {error}"),
+        };
+
+        assert_eq!(status.node_id, NodeId::from_string("node-a"));
+        assert!(status.userspace_wireguard_process.is_none());
+    }
+
+    #[test]
+    fn path_metrics_reject_invalid_probe_values() {
+        let mut metrics = PathMetrics {
+            latency_ms: Some(-1.0),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("negative latency must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "latency_ms");
+
+        metrics = PathMetrics {
+            jitter_ms: Some(-0.1),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("negative jitter must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "jitter_ms");
+
+        metrics = PathMetrics {
+            relay_load: Some(1.1),
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("out-of-range relay load must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "relay_load");
+
+        metrics = PathMetrics {
+            stability: f32::NAN,
+            ..PathMetrics::default()
+        };
+        let error = match metrics.validate() {
+            Ok(()) => panic!("NaN stability must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.field(), "stability");
+    }
+
+    #[test]
+    fn path_score_bounds_invalid_metrics_defensively() {
+        let score = PathScore::calculate(
+            PathState::DirectPublic,
+            &PathMetrics {
+                latency_ms: Some(f32::NAN),
+                loss_ppm: 0,
+                jitter_ms: Some(f32::INFINITY),
+                relay_load: Some(f32::NAN),
+                stability: f32::NAN,
+            },
+            true,
+            0,
+        );
+
+        assert!(score.value.is_finite());
     }
 
     #[test]
@@ -1822,6 +7300,48 @@ mod tests {
 
         assert!(relay.can_admit());
         assert_eq!(relay.available_capacity(), 1);
+    }
+
+    #[test]
+    fn relay_rejects_unusable_public_endpoint() {
+        let mut relay = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 51820))),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+
+        assert!(!relay.can_admit());
+
+        relay.public_endpoint = Some(std::net::SocketAddr::from(([203, 0, 113, 10], 0)));
+
+        assert!(!relay.can_admit());
+    }
+
+    #[test]
+    fn relay_rejects_unusable_admission_url() {
+        let mut relay = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
+            admission_url: Some("relay-a:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        };
+
+        assert!(!relay.can_admit());
+
+        relay.admission_url = Some("udp://203.0.113.10:9580".to_string());
+
+        assert!(!relay.can_admit());
+
+        relay.admission_url = Some("http://".to_string());
+
+        assert!(!relay.can_admit());
     }
 
     #[test]
@@ -1900,12 +7420,93 @@ mod tests {
         };
         assert_eq!(https.application(), api::AgentPacketFlowApplication::Https);
 
+        let ldap = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(389),
+            ..Default::default()
+        };
+        assert_eq!(ldap.application(), api::AgentPacketFlowApplication::Ldap);
+
+        let smb = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(445),
+            ..Default::default()
+        };
+        assert_eq!(smb.application(), api::AgentPacketFlowApplication::Smb);
+
+        let rdp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3389),
+            ..Default::default()
+        };
+        assert_eq!(rdp.application(), api::AgentPacketFlowApplication::Rdp);
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
             ..Default::default()
         };
         assert_eq!(etcd.application(), api::AgentPacketFlowApplication::Etcd);
+
+        let zookeeper = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2181),
+            ..Default::default()
+        };
+        assert_eq!(
+            zookeeper.application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+
+        let consul_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8500),
+            ..Default::default()
+        };
+        assert_eq!(
+            consul_api.application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+
+        let consul_gossip = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(8301),
+            ..Default::default()
+        };
+        assert_eq!(
+            consul_gossip.application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+
+        let vault_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8200),
+            ..Default::default()
+        };
+        assert_eq!(
+            vault_api.application(),
+            api::AgentPacketFlowApplication::Vault
+        );
+
+        let nomad_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(4646),
+            ..Default::default()
+        };
+        assert_eq!(
+            nomad_api.application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+
+        let nomad_serf = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(4648),
+            ..Default::default()
+        };
+        assert_eq!(
+            nomad_serf.application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
 
         let postgres = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
@@ -1924,12 +7525,59 @@ mod tests {
         };
         assert_eq!(mysql.application(), api::AgentPacketFlowApplication::Mysql);
 
+        let mssql = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1433),
+            ..Default::default()
+        };
+        assert_eq!(mssql.application(), api::AgentPacketFlowApplication::MsSql);
+
+        let oracle = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1521),
+            ..Default::default()
+        };
+        assert_eq!(
+            oracle.application(),
+            api::AgentPacketFlowApplication::Oracle
+        );
+
+        let clickhouse_http = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8123),
+            ..Default::default()
+        };
+        assert_eq!(
+            clickhouse_http.application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+
+        let clickhouse_native_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9440),
+            ..Default::default()
+        };
+        assert_eq!(
+            clickhouse_native_tls.application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+
         let redis = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(6379),
             ..Default::default()
         };
         assert_eq!(redis.application(), api::AgentPacketFlowApplication::Redis);
+
+        let memcached = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(11211),
+            ..Default::default()
+        };
+        assert_eq!(
+            memcached.application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
 
         let prometheus = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
@@ -1950,6 +7598,57 @@ mod tests {
             opentelemetry.application(),
             api::AgentPacketFlowApplication::OpenTelemetry
         );
+
+        let jaeger_collector = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(14268),
+            ..Default::default()
+        };
+        assert_eq!(
+            jaeger_collector.application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+
+        let jaeger_agent = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(6831),
+            ..Default::default()
+        };
+        assert_eq!(
+            jaeger_agent.application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+
+        let loki = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3100),
+            ..Default::default()
+        };
+        assert_eq!(loki.application(), api::AgentPacketFlowApplication::Loki);
+
+        let tempo = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3200),
+            ..Default::default()
+        };
+        assert_eq!(tempo.application(), api::AgentPacketFlowApplication::Tempo);
+
+        let zipkin = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9411),
+            ..Default::default()
+        };
+        assert_eq!(
+            zipkin.application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+
+        let grpc = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(50051),
+            ..Default::default()
+        };
+        assert_eq!(grpc.application(), api::AgentPacketFlowApplication::Grpc);
 
         let kafka = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
@@ -2008,6 +7707,2470 @@ mod tests {
             elasticsearch.application(),
             api::AgentPacketFlowApplication::Elasticsearch
         );
+
+        let detector_hint_overrides_port_guess = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            application: Some(api::AgentPacketFlowApplication::Postgres),
+            ..Default::default()
+        };
+        assert_eq!(
+            detector_hint_overrides_port_guess.application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+
+        let specific_payload_overrides_generic_https_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            payload_prefix: b"POST /opentelemetry.proto.collector.trace.v1.TraceService/Export HTTP/1.1\r\ncontent-type: application/grpc\r\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            specific_payload_overrides_generic_https_port.application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+
+        let tls_payload_overrides_generic_http_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(80),
+            payload_prefix: vec![0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00],
+            ..Default::default()
+        };
+        assert_eq!(
+            tls_payload_overrides_generic_http_port.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+
+        let generic_tls_keeps_kubernetes_api_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6443),
+            payload_prefix: vec![0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00],
+            ..Default::default()
+        };
+        assert_eq!(
+            generic_tls_keeps_kubernetes_api_port.application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+    }
+
+    #[test]
+    fn packet_flow_observation_classifies_payload_prefix_application_protocol() {
+        fn tls_client_hello_with_sni(name: &str) -> Vec<u8> {
+            tls_client_hello(Some(name), &[])
+        }
+
+        fn tls_client_hello_with_alpn(protocols: &[&[u8]]) -> Vec<u8> {
+            tls_client_hello(None, protocols)
+        }
+
+        fn tls_client_hello(sni_name: Option<&str>, alpn_protocols: &[&[u8]]) -> Vec<u8> {
+            let mut extensions = Vec::new();
+
+            if let Some(name) = sni_name {
+                let mut server_name = Vec::new();
+                server_name.push(0);
+                server_name.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                server_name.extend_from_slice(name.as_bytes());
+
+                let mut sni = Vec::new();
+                sni.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+                sni.extend_from_slice(&server_name);
+
+                extensions.extend_from_slice(&0_u16.to_be_bytes());
+                extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&sni);
+            }
+
+            if !alpn_protocols.is_empty() {
+                let mut protocol_list = Vec::new();
+                for protocol in alpn_protocols {
+                    protocol_list.push(protocol.len() as u8);
+                    protocol_list.extend_from_slice(protocol);
+                }
+
+                let mut alpn = Vec::new();
+                alpn.extend_from_slice(&(protocol_list.len() as u16).to_be_bytes());
+                alpn.extend_from_slice(&protocol_list);
+
+                extensions.extend_from_slice(&16_u16.to_be_bytes());
+                extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&alpn);
+            }
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]);
+            body.extend_from_slice(&[0; 32]);
+            body.push(0);
+            body.extend_from_slice(&2_u16.to_be_bytes());
+            body.extend_from_slice(&[0x13, 0x01]);
+            body.push(1);
+            body.push(0);
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions);
+
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[0x16, 0x03, 0x03]);
+            payload.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+            payload.push(0x01);
+            let handshake_len = body.len() as u32;
+            payload.extend_from_slice(&[
+                ((handshake_len >> 16) & 0xff) as u8,
+                ((handshake_len >> 8) & 0xff) as u8,
+                (handshake_len & 0xff) as u8,
+            ]);
+            payload.extend_from_slice(&body);
+            payload
+        }
+
+        fn wireguard_message(message_type: u32, len: usize) -> Vec<u8> {
+            let mut payload = vec![0xa5; len];
+            payload[..4].copy_from_slice(&message_type.to_le_bytes());
+            payload
+        }
+
+        fn postgres_frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut payload = vec![tag];
+            let length = (body.len() as u32) + 4;
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn zookeeper_connect_packet(timeout_ms: u32, password: &[u8], read_only: bool) -> Vec<u8> {
+            let frame_len = 29 + password.len();
+            let mut payload = Vec::with_capacity(4 + frame_len);
+            payload.extend_from_slice(&(frame_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(&timeout_ms.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(&(password.len() as u32).to_be_bytes());
+            payload.extend_from_slice(password);
+            payload.push(u8::from(read_only));
+            payload
+        }
+
+        fn mysql_packet(sequence_id: u8, body: &[u8]) -> Vec<u8> {
+            let length = body.len() as u32;
+            let mut payload = vec![
+                (length & 0xff) as u8,
+                ((length >> 8) & 0xff) as u8,
+                ((length >> 16) & 0xff) as u8,
+                sequence_id,
+            ];
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn mysql_handshake_packet(server_version: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(10);
+            body.extend_from_slice(server_version);
+            body.push(0);
+            body.extend_from_slice(&1_u32.to_le_bytes());
+            body.extend_from_slice(b"abcdefgh");
+            body.push(0);
+            body.extend_from_slice(&0xffff_u16.to_le_bytes());
+            body.push(45);
+            body.extend_from_slice(&2_u16.to_le_bytes());
+            body.extend_from_slice(&0_u16.to_le_bytes());
+            body.push(21);
+            body.extend_from_slice(&[0; 10]);
+            body.extend_from_slice(b"ijklmnopqrst");
+            body.push(0);
+            mysql_packet(0, &body)
+        }
+
+        fn mssql_tds_packet(packet_type: u8, body: &[u8]) -> Vec<u8> {
+            let length = 8 + body.len();
+            let mut payload = vec![
+                packet_type,
+                0x01,
+                ((length >> 8) & 0xff) as u8,
+                (length & 0xff) as u8,
+                0,
+                0,
+                1,
+                0,
+            ];
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn utf16le_ascii(value: &[u8]) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(value.len() * 2);
+            for byte in value {
+                payload.push(*byte);
+                payload.push(0);
+            }
+            payload
+        }
+
+        fn oracle_tns_connect_packet(descriptor: &[u8]) -> Vec<u8> {
+            let connect_data_offset = 34_usize;
+            let length = connect_data_offset + descriptor.len();
+            let mut payload = Vec::with_capacity(length);
+            payload.extend_from_slice(&(length as u16).to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.push(0x01);
+            payload.push(0);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&0x0136_u16.to_be_bytes());
+            payload.extend_from_slice(&0x012c_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&8192_u16.to_be_bytes());
+            payload.extend_from_slice(&32767_u16.to_be_bytes());
+            payload.extend_from_slice(&0x7f08_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&1_u16.to_be_bytes());
+            payload.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
+            payload.extend_from_slice(&(connect_data_offset as u16).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.push(0);
+            payload.push(0);
+            payload.extend_from_slice(descriptor);
+            payload
+        }
+
+        fn memcached_binary_request(
+            opcode: u8,
+            key: &[u8],
+            extras: &[u8],
+            value: &[u8],
+        ) -> Vec<u8> {
+            let total_body_len = extras.len() + key.len() + value.len();
+            let mut payload = Vec::with_capacity(24 + total_body_len);
+            payload.push(0x80);
+            payload.push(opcode);
+            payload.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            payload.push(extras.len() as u8);
+            payload.push(0);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&(total_body_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(extras);
+            payload.extend_from_slice(key);
+            payload.extend_from_slice(value);
+            payload
+        }
+
+        fn kafka_request(
+            api_key: u16,
+            api_version: u16,
+            client_id: Option<&[u8]>,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&api_key.to_be_bytes());
+            frame.extend_from_slice(&api_version.to_be_bytes());
+            frame.extend_from_slice(&1_u32.to_be_bytes());
+            match client_id {
+                Some(client_id) => {
+                    frame.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+                    frame.extend_from_slice(client_id);
+                }
+                None => frame.extend_from_slice(&(-1_i16).to_be_bytes()),
+            }
+            frame.extend_from_slice(body);
+            let mut payload = (frame.len() as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&frame);
+            payload
+        }
+
+        fn kafka_flexible_request(
+            api_key: u16,
+            api_version: u16,
+            client_id: Option<&[u8]>,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&api_key.to_be_bytes());
+            frame.extend_from_slice(&api_version.to_be_bytes());
+            frame.extend_from_slice(&1_u32.to_be_bytes());
+            match client_id {
+                Some(client_id) => {
+                    frame.extend_from_slice(&kafka_unsigned_varint(client_id.len() as u64 + 1));
+                    frame.extend_from_slice(client_id);
+                }
+                None => frame.push(0),
+            }
+            frame.push(0);
+            frame.extend_from_slice(body);
+            let mut payload = (frame.len() as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&frame);
+            payload
+        }
+
+        fn kafka_unsigned_varint(mut value: u64) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                encoded.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            encoded
+        }
+
+        fn mqtt_connect_packet(
+            protocol_level: u8,
+            connect_flags: u8,
+            payload_fields: &[Vec<u8>],
+        ) -> Vec<u8> {
+            let mut body = vec![
+                0,
+                4,
+                b'M',
+                b'Q',
+                b'T',
+                b'T',
+                protocol_level,
+                connect_flags,
+                0,
+                60,
+            ];
+            if protocol_level == 5 {
+                body.push(0);
+            }
+            for field in payload_fields {
+                body.extend_from_slice(field);
+            }
+            let mut payload = vec![0x10];
+            payload.extend_from_slice(&mqtt_remaining_length(body.len()));
+            payload.extend_from_slice(&body);
+            payload
+        }
+
+        fn mqtt_field(value: &[u8]) -> Vec<u8> {
+            let mut field = (value.len() as u16).to_be_bytes().to_vec();
+            field.extend_from_slice(value);
+            field
+        }
+
+        fn mqtt_remaining_length(mut value: usize) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            loop {
+                let mut byte = (value % 128) as u8;
+                value /= 128;
+                if value > 0 {
+                    byte |= 0x80;
+                }
+                encoded.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            encoded
+        }
+
+        fn cassandra_request_frame(opcode: u8, body: &[u8]) -> Vec<u8> {
+            let mut payload = vec![0x04, 0, 0, 0, opcode];
+            payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn cassandra_query_frame(
+            query: &[u8],
+            consistency: u16,
+            flags: u8,
+            parameter_tail: &[u8],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(query.len() as u32).to_be_bytes());
+            body.extend_from_slice(query);
+            body.extend_from_slice(&consistency.to_be_bytes());
+            body.push(flags);
+            body.extend_from_slice(parameter_tail);
+            cassandra_request_frame(0x07, &body)
+        }
+
+        fn mongodb_message(opcode: u32, body: &[u8]) -> Vec<u8> {
+            let length = (16 + body.len()) as u32;
+            let mut payload = Vec::with_capacity(length as usize);
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&1_u32.to_le_bytes());
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+            payload.extend_from_slice(&opcode.to_le_bytes());
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn mongodb_empty_document() -> [u8; 5] {
+            [5, 0, 0, 0, 0]
+        }
+
+        fn elasticsearch_transport_frame(
+            status: u8,
+            variable_header: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            elasticsearch_transport_frame_with_version(status, 8_00_00_99, variable_header, body)
+        }
+
+        fn elasticsearch_transport_frame_with_version(
+            status: u8,
+            version_id: u32,
+            variable_header: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            let message_len = 17 + variable_header.len() + body.len();
+            let mut payload = Vec::with_capacity(6 + message_len);
+            payload.extend_from_slice(b"ES");
+            payload.extend_from_slice(&(message_len as u32).to_be_bytes());
+            payload.extend_from_slice(&1_u64.to_be_bytes());
+            payload.push(status);
+            payload.extend_from_slice(&version_id.to_be_bytes());
+            payload.extend_from_slice(&(variable_header.len() as u32).to_be_bytes());
+            payload.extend_from_slice(variable_header);
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
+        let observation_for_udp_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(30123),
+            destination_port: Some(30234),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
+        let dns_query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
+            b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l', b'o', b'c',
+            b'a', b'l', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+
+        let dns_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1053),
+            payload_prefix: dns_query.clone(),
+            ..Default::default()
+        };
+        assert_eq!(dns_udp.application(), api::AgentPacketFlowApplication::Dns);
+        let mut dns_tcp_payload = (dns_query.len() as u16).to_be_bytes().to_vec();
+        dns_tcp_payload.extend_from_slice(&dns_query);
+        assert_eq!(
+            observation_for_payload(&dns_tcp_payload).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let malformed_dns_like = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1053),
+            payload_prefix: vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0xff],
+            ..Default::default()
+        };
+        assert_eq!(
+            malformed_dns_like.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        assert_eq!(
+            observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /metrics HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/traces HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /package.Service/Method HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /opentelemetry.proto.collector.trace.v1.TraceService/Export HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0*application/grpc")
+                .application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"\x00\x00*application/grpc\x00\x00\x00").application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"\x00/opentelemetry.proto.collector.logs.v1.LogsService/Export"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/agent/self HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/catalog/services?dc=dc1 HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/agency HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/sys/health HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Vault
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/transit/encrypt/app HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Vault
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/system HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/jobs HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/allocations?namespace=default HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/jobber HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let kubernetes_sni = tls_client_hello_with_sni("kubernetes.default.svc.cluster.local");
+        assert!(kubernetes_sni.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
+        assert_eq!(
+            observation_for_payload(&kubernetes_sni).application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("etcd-0.kube-system.svc"))
+                .application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni(
+                "prometheus-server.monitoring.svc"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+        let otel_sni = tls_client_hello_with_sni("otel-collector.observability.svc");
+        let otel_on_https_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(443),
+            payload_prefix: otel_sni,
+            ..Default::default()
+        };
+        assert_eq!(
+            otel_on_https_port.application(),
+            api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/traces?service=agent HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/services HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/tracer HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /loki/api/v1/query?query=up HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Loki
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /loki/api/v1/push HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Loki
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /loki/api/v1ish/query HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/traces/f1cfe82a8eef933b HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v2/traces/f1cfe82a8eef933b HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/search?q=%7Bstatus%3Derror%7D HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /api/metrics/query_range?q=%7B%7D%7Crate() HTTP/1.1\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/echo HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /api/v2/spans HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v2/trace/f1cfe82a8eef933b HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /zipkin/ HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /zipkin.proto3.SpanService/Report HTTP/2\r\ncontent-type: application/grpc\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /?query=SELECT%201 HTTP/1.1\r\nHost: clickhouse.example\r\nX-ClickHouse-User: default\r\n\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni(
+                "elasticsearch-master.logging.svc"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        for (hostname, expected) in [
+            (
+                "grpc-api.default.svc",
+                api::AgentPacketFlowApplication::Grpc,
+            ),
+            (
+                "jaeger-collector.observability.svc",
+                api::AgentPacketFlowApplication::Jaeger,
+            ),
+            (
+                "loki-gateway.observability.svc",
+                api::AgentPacketFlowApplication::Loki,
+            ),
+            (
+                "tempo-query-frontend.observability.svc",
+                api::AgentPacketFlowApplication::Tempo,
+            ),
+            (
+                "zipkin-collector.observability.svc",
+                api::AgentPacketFlowApplication::Zipkin,
+            ),
+            (
+                "clickhouse-0.analytics.svc",
+                api::AgentPacketFlowApplication::ClickHouse,
+            ),
+            (
+                "kafka-broker.messaging.svc",
+                api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                "nats-leaf.messaging.svc",
+                api::AgentPacketFlowApplication::Nats,
+            ),
+            ("mqtt-broker.iot.svc", api::AgentPacketFlowApplication::Mqtt),
+            (
+                "rabbitmq.messaging.svc",
+                api::AgentPacketFlowApplication::Amqp,
+            ),
+            (
+                "zookeeper-0.control.svc",
+                api::AgentPacketFlowApplication::ZooKeeper,
+            ),
+            (
+                "consul-server.control.svc",
+                api::AgentPacketFlowApplication::Consul,
+            ),
+            (
+                "vault-active.secrets.svc",
+                api::AgentPacketFlowApplication::Vault,
+            ),
+            (
+                "nomad-server.scheduler.svc",
+                api::AgentPacketFlowApplication::Nomad,
+            ),
+            (
+                "cassandra-seed.db.svc",
+                api::AgentPacketFlowApplication::Cassandra,
+            ),
+            (
+                "mongo-router.db.svc",
+                api::AgentPacketFlowApplication::MongoDb,
+            ),
+            (
+                "postgres-primary.db.svc",
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                "pg-analytics.db.svc",
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                "mysql-primary.db.svc",
+                api::AgentPacketFlowApplication::Mysql,
+            ),
+            (
+                "mariadb-replica.db.svc",
+                api::AgentPacketFlowApplication::Mysql,
+            ),
+            (
+                "mssql-primary.db.svc",
+                api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
+                "sqlserver-primary.db.svc",
+                api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
+                "oracle-listener.db.svc",
+                api::AgentPacketFlowApplication::Oracle,
+            ),
+            (
+                "oracledb-primary.db.svc",
+                api::AgentPacketFlowApplication::Oracle,
+            ),
+            (
+                "redis-cache.cache.svc",
+                api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                "valkey-primary.cache.svc",
+                api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                "memcache-shard.cache.svc",
+                api::AgentPacketFlowApplication::Memcached,
+            ),
+            (
+                "ldaps-directory.identity.svc",
+                api::AgentPacketFlowApplication::Ldap,
+            ),
+            (
+                "smb-files.storage.svc",
+                api::AgentPacketFlowApplication::Smb,
+            ),
+            ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
+            ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_sni(hostname)).application(),
+                expected,
+                "{hostname}"
+            );
+        }
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("notkafka.example.com"))
+                .application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        for (protocols, expected) in [
+            (
+                &[b"grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Grpc,
+            ),
+            (
+                &[b"otlp-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::OpenTelemetry,
+            ),
+            (
+                &[b"jaeger-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Jaeger,
+            ),
+            (
+                &[b"loki-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Loki,
+            ),
+            (
+                &[b"tempo-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Tempo,
+            ),
+            (
+                &[b"zipkin-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Zipkin,
+            ),
+            (
+                &[b"clickhouse-native".as_slice()][..],
+                api::AgentPacketFlowApplication::ClickHouse,
+            ),
+            (
+                &[b"kafka".as_slice()][..],
+                api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                &[b"zookeeper".as_slice()][..],
+                api::AgentPacketFlowApplication::ZooKeeper,
+            ),
+            (
+                &[b"consul-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Consul,
+            ),
+            (
+                &[b"vault".as_slice()][..],
+                api::AgentPacketFlowApplication::Vault,
+            ),
+            (
+                &[b"nomad-rpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Nomad,
+            ),
+            (
+                &[b"nats".as_slice()][..],
+                api::AgentPacketFlowApplication::Nats,
+            ),
+            (
+                &[b"x-amzn-mqtt-ca".as_slice()][..],
+                api::AgentPacketFlowApplication::Mqtt,
+            ),
+            (
+                &[b"amqp/1.0".as_slice()][..],
+                api::AgentPacketFlowApplication::Amqp,
+            ),
+            (
+                &[b"postgresql".as_slice()][..],
+                api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                &[b"mssql".as_slice()][..],
+                api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
+                &[b"oracle-tns".as_slice()][..],
+                api::AgentPacketFlowApplication::Oracle,
+            ),
+            (
+                &[b"valkey".as_slice()][..],
+                api::AgentPacketFlowApplication::Redis,
+            ),
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_alpn(protocols)).application(),
+                expected
+            );
+        }
+        assert_eq!(
+            observation_for_payload(&tls_client_hello(
+                Some("kafka-broker.messaging.svc"),
+                &[b"mqtt".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello(
+                Some("api.example.com"),
+                &[b"amqp".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"h2".as_slice()])).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        for protocols in [
+            &[b"notlp".as_slice()][..],
+            &[b"amqtt".as_slice()][..],
+            &[b"h2".as_slice(), b"http/1.1".as_slice()][..],
+        ] {
+            assert_eq!(
+                observation_for_payload(&tls_client_hello_with_alpn(protocols)).application(),
+                api::AgentPacketFlowApplication::Https
+            );
+        }
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("api.example.com")).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let quic = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(quic.application(), api::AgentPacketFlowApplication::Https);
+        let quic_zero_rtt = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xd3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_zero_rtt.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let quic_handshake = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xe3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_handshake.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let mut quic_retry_payload = vec![
+            0xf0, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 8, 8, 7, 6, 5, 4, 3, 2,
+            1,
+        ];
+        quic_retry_payload.extend_from_slice(&[0xaa; 16]);
+        let quic_retry = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: quic_retry_payload,
+            ..Default::default()
+        };
+        assert_eq!(
+            quic_retry.application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        let invalid_quic_fixed_bit = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0x83, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 5, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_fixed_bit.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_quic_cid_len = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![0xc3, 0x00, 0x00, 0x00, 0x01, 21],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_cid_len.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_quic_declared_len = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: vec![
+                0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 4, 0, 0, 0, 1, 6,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_quic_declared_len.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let non_quic_udp_443 = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(443),
+            payload_prefix: b"not-quic".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            non_quic_udp_443.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 128)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 148)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 149)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(
+                1,
+                api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES - 1
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(1, 64)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 92)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 91)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(2, 93)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut wireguard_with_nonzero_reserved = wireguard_message(2, 92);
+        wireguard_with_nonzero_reserved[1] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_with_nonzero_reserved).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(3, 64)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(3, 65)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 32)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 48)).application(),
+            api::AgentPacketFlowApplication::WireGuard
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 31)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&wireguard_message(4, 33)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&wireguard_message(2, 92)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0\r\n").application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"tcp-wrapper notice\r\nSSH-2.0-OpenSSH_9.0 comment\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0").application(),
+            api::AgentPacketFlowApplication::Ssh
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-3.0-OpenSSH_9.0\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-Open-SSH\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SSH-2.0-OpenSSH_9.0\0\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x42, 0x00]).application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x06, 0x50, 0x01, 0x05])
+                .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x09, 0x02, 0x01, 0x01, 0x42, 0x00, 0xa0, 0x02, 0x30, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Ldap
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x62, 0x01, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x02, 0x00, 0x01, 0x42, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x30, 0x09, 0x02, 0x01, 0x01, 0x42, 0x00, 0x30, 0x02, 0x30, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        let mut smb1_negotiate = vec![0x00, 0x00, 0x00, 0x20, 0xff, b'S', b'M', b'B', 0x72];
+        smb1_negotiate.resize(36, 0);
+        assert_eq!(
+            observation_for_payload(&smb1_negotiate).application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x41, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x00, 0x00, 0x00, 0x40, 0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0xfe, b'S', b'M', b'B', 0x40, 0x00, 0x00, 0x00])
+                .application(),
+            api::AgentPacketFlowApplication::Smb
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x0b, 0x06, 0xd0, 0x12, 0x34, 0x56, 0x78, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x80]).application(),
+            api::AgentPacketFlowApplication::Rdp
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x01, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x06, 0xff, 0xf0, 0x80]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x03, 0x00, 0x00, 0x0b, 0x06, 0xe0, 0x00, 0x01, 0x00, 0x00, 0x00,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x01]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"ruok").application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        assert_eq!(
+            observation_for_payload(b"stat\r\n").application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        assert_eq!(
+            observation_for_payload(b"confused").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let zookeeper_connect = zookeeper_connect_packet(30_000, &[], false);
+        assert_eq!(
+            observation_for_payload(&zookeeper_connect).application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        let invalid_zookeeper_version = {
+            let mut payload = zookeeper_connect.clone();
+            payload[4] = 0xff;
+            payload[5] = 0xff;
+            payload
+        };
+        assert_eq!(
+            observation_for_payload(&invalid_zookeeper_version).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1\0")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let mut parse_body = Vec::new();
+        parse_body.push(0);
+        parse_body.extend_from_slice(b"SELECT $1\0");
+        parse_body.extend_from_slice(&1_u16.to_be_bytes());
+        parse_body.extend_from_slice(&23_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'P', &parse_body)).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'D', b"Sprepared\0")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'S', b"")).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x4a, 0, 0, 0, 10, b'8', b'.', b'0']).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_handshake_packet(b"8.0.36")).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mut invalid_mysql_handshake_filler = mysql_handshake_packet(b"8.0.36");
+        invalid_mysql_handshake_filler[4 + 1 + b"8.0.36".len() + 1 + 4 + 8] = 1;
+        assert_eq!(
+            observation_for_payload(&invalid_mysql_handshake_filler).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 0, 65, 10]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(
+                &[
+                    mysql_packet(0, &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']),
+                    mysql_packet(0, &[0x0e]),
+                ]
+                .concat()
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mut mysql_query_with_trailing_junk =
+            mysql_packet(0, &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1']);
+        mysql_query_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mysql_query_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x16, b'I', b'N', b'S', b'E', b'R', b'T', b' ', b'I', b'N', b'T', b'O']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(0, &[0x0e])).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(65, &[0x0e])).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(0, &[0x03])).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'n', b'o', b't', b's', b'q', b'l']
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_packet(
+                0,
+                &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', 0]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mssql_prelogin = mssql_tds_packet(
+            0x12,
+            &[
+                0x00, 0x00, 0x06, 0x00, 0x06, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        );
+        assert_eq!(
+            observation_for_payload(&mssql_prelogin).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
+        let mssql_sql_batch = mssql_tds_packet(0x01, &utf16le_ascii(b"SELECT 1"));
+        assert_eq!(
+            observation_for_payload(&mssql_sql_batch).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
+        let invalid_mssql_status = vec![
+            0x12, 0xe0, 0x00, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0xff,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            observation_for_payload(&invalid_mssql_status).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let oracle_descriptor =
+            b"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=x)))";
+        let oracle_connect = oracle_tns_connect_packet(oracle_descriptor);
+        assert!(oracle_connect.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
+        assert_eq!(
+            observation_for_payload(&oracle_connect).application(),
+            api::AgentPacketFlowApplication::Oracle
+        );
+        let invalid_oracle_type = {
+            let mut payload = oracle_connect.clone();
+            payload[4] = 0x06;
+            payload
+        };
+        assert_eq!(
+            observation_for_payload(&invalid_oracle_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_oracle_descriptor = oracle_tns_connect_packet(b"(NOT_ORACLE=1)");
+        assert_eq!(
+            observation_for_payload(&invalid_oracle_descriptor).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$4\r\nPING\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nva").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"XADD stream * field value\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"INFO memory\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$6\r\nNOTGET\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*1\r\n$4\r\nPING\r\njunk").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET\r\njunk").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$3\r\nGET\r\n+OK\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SELECT 1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nval").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalue\r\nget another-key\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"get cache-key another-key\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"get cache-key\r\ngets another-key\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"cas cache-key 0 60 5 12345 noreply\r\nvalue\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"incr cache-key 1\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"stats cachedump 1 20\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"settings cache-key 0 60 5\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"getaway cache-key\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"get cache-key\r\njunk").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 5\r\nvalueX\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"set cache-key 0 60 1048577\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(0x00, b"key", b"", b""))
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(
+                0x01,
+                b"key",
+                &[0, 0, 0, 0, 0, 0, 0, 60],
+                b"val"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        let mut partial_memcached_binary =
+            memcached_binary_request(0x01, b"key", &[0, 0, 0, 0, 0, 0, 0, 60], b"value");
+        partial_memcached_binary.truncate(24 + 8 + 3);
+        assert_eq!(
+            observation_for_payload(&partial_memcached_binary).application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        let mut memcached_binary_with_trailing = memcached_binary_request(0x00, b"key", b"", b"");
+        memcached_binary_with_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&memcached_binary_with_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_request(0x00, b"key", &[0, 0, 0, 0], b""))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(3, 9, Some(b"rust-client"), b"body"))
+                .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(18, 3, None, b"body")).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_flexible_request(
+                18,
+                3,
+                Some(b"rust-client"),
+                b"body"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_pipelined = kafka_request(18, 3, None, b"");
+        kafka_pipelined.extend_from_slice(&kafka_request(3, 9, Some(b"rust-client"), b""));
+        assert_eq!(
+            observation_for_payload(&kafka_pipelined).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_partial_body = kafka_request(3, 9, Some(b"rust-client"), b"body");
+        kafka_partial_body.truncate(kafka_partial_body.len() - 2);
+        assert_eq!(
+            observation_for_payload(&kafka_partial_body).application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        let mut kafka_with_trailing_junk = kafka_request(18, 3, None, b"");
+        kafka_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&kafka_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(18, 3, Some(b"bad\0client"), b"")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0, 0, 0, 21, 0, 18, 0, 3, 0, 0, 0, 1, 0, 11, b'r', b'u', b's', b't', b'-', b'c',
+                b'l', b'i', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 7, 0, 4, 0, 9, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 0, 93, 0, 1, 0, 0, 0, 1]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 10, 0, 18, 0, 3, 0, 0, 0, 1, 0, 4]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 10, 0, 18, 0, 3, 0, 0, 0, 1, 0xff, 0xfe])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT {\"verbose\":false}\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"INFO {\"server_id\":\"n1\"}\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created reply.inbox 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhe").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhello\r").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\nPUB events.created reply.inbox 5\r\nhello\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HMSG events.created sid-1 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events.* workers sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events.> workers sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT not-json\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created nope\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\njunk\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created 5\r\nhello!\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 28 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 22 27\r\nNOTNATS\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.* 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events.created reply.* 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PUB events..created 5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events.>.tail sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"SUB events* sid-1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"MSG events.* 1 0\r\n\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT {\"verbose\":false}").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x12, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x00, 0x00,
+                0x05, b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0x82,
+                &[mqtt_field(b"agent"), mqtt_field(b"user")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0xc2,
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_field(b"user"),
+                    mqtt_field(&[0, 1])
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0x06,
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x42, 0x00, 0x3c, 0x00, 0x05,
+                b'a', b'g', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x82, &[mqtt_field(b"agent")]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x06, &[mqtt_field(b"agent")]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_overstated_remaining = mqtt_connect_packet(4, 0x02, &[mqtt_field(b"agent")]);
+        mqtt_overstated_remaining[1] += 1;
+        assert_eq!(
+            observation_for_payload(&mqtt_overstated_remaining).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(4, 0x02, &[mqtt_field(&[0xff])]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"AMQP\0\0\x09\x01").application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[8, 0, 0, 0, 0, 0, 0, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(b"AMQPxxxx").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[8, 0, 1, 0, 0, 0, 0, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[4, 0, 1, 0, 0, 0, 0, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x07, 0, 0, 0, 15, 0, 0, 0, 8, b'S', b'E', b'L', b'E', b'C', b'T',
+                b' ', b'1', 0, 1, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x01, 0, 0, 0, 22, 0, 1, 0, 11, b'C', b'Q', b'L', b'_', b'V', b'E',
+                b'R', b'S', b'I', b'O', b'N', 0, 5, b'3', b'.', b'0', b'.', b'0',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0xe0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x04, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0x04, 0, 0, 0, 0x07, 0, 0, 0, 13, 0, 0, 0, 6, b'n', b'o', b't', b'c', b'q', b'l',
+                0, 1, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_value_parameters = Vec::new();
+        cassandra_value_parameters.extend_from_slice(&1_u16.to_be_bytes());
+        cassandra_value_parameters.extend_from_slice(&4_i32.to_be_bytes());
+        cassandra_value_parameters.extend_from_slice(&1234_i32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(
+                b"SELECT * FROM ks.tbl WHERE id=?",
+                0x0001,
+                0x01,
+                &cassandra_value_parameters
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(b"SELECT 1", 0x00ff, 0, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(b"SELECT 1", 0x0001, 0x80, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(b"SELECT 1", 0x0001, 0x40, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(
+                b"SELECT 1",
+                0x0001,
+                0x10,
+                &0x0008_u16.to_be_bytes()
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(
+                b"SELECT 1",
+                0x0001,
+                0x10,
+                &0x0001_u16.to_be_bytes()
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_query_frame(
+                b"SELECT 1",
+                0x0001,
+                0x04,
+                &0_u32.to_be_bytes()
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let empty_bson = mongodb_empty_document();
+        let mut mongodb_op_msg = Vec::new();
+        mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
+        mongodb_op_msg.push(0);
+        mongodb_op_msg.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &mongodb_op_msg)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut mongodb_op_msg_with_sequence = Vec::new();
+        mongodb_op_msg_with_sequence.extend_from_slice(&0_u32.to_le_bytes());
+        mongodb_op_msg_with_sequence.push(0);
+        mongodb_op_msg_with_sequence.extend_from_slice(&empty_bson);
+        mongodb_op_msg_with_sequence.push(1);
+        let sequence_identifier = b"documents\0";
+        let sequence_size = 4 + sequence_identifier.len() + empty_bson.len();
+        mongodb_op_msg_with_sequence.extend_from_slice(&(sequence_size as u32).to_le_bytes());
+        mongodb_op_msg_with_sequence.extend_from_slice(sequence_identifier);
+        mongodb_op_msg_with_sequence.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &mongodb_op_msg_with_sequence))
+                .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut mongodb_compressed = Vec::new();
+        mongodb_compressed.extend_from_slice(&2013_u32.to_le_bytes());
+        mongodb_compressed.extend_from_slice(&9_u32.to_le_bytes());
+        mongodb_compressed.push(0);
+        mongodb_compressed.extend_from_slice(b"compressed");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2012, &mongodb_compressed)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut mongodb_op_query = Vec::new();
+        mongodb_op_query.extend_from_slice(&0_u32.to_le_bytes());
+        mongodb_op_query.extend_from_slice(b"admin.$cmd\0");
+        mongodb_op_query.extend_from_slice(&0_i32.to_le_bytes());
+        mongodb_op_query.extend_from_slice(&1_i32.to_le_bytes());
+        mongodb_op_query.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &mongodb_op_query)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut mongodb_op_reply = Vec::new();
+        mongodb_op_reply.extend_from_slice(&0_u32.to_le_bytes());
+        mongodb_op_reply.extend_from_slice(&0_u64.to_le_bytes());
+        mongodb_op_reply.extend_from_slice(&0_i32.to_le_bytes());
+        mongodb_op_reply.extend_from_slice(&0_i32.to_le_bytes());
+        assert_eq!(
+            observation_for_payload(&mongodb_message(1, &mongodb_op_reply)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        let mut invalid_mongodb_op_msg_trailing = mongodb_op_msg.clone();
+        invalid_mongodb_op_msg_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &invalid_mongodb_op_msg_trailing))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_query_trailing = mongodb_op_query.clone();
+        invalid_mongodb_query_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &invalid_mongodb_query_trailing))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_reply_count = Vec::new();
+        invalid_mongodb_reply_count.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&0_u64.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&0_i32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&2_i32.to_le_bytes());
+        invalid_mongodb_reply_count.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(1, &invalid_mongodb_reply_count))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_compressed = Vec::new();
+        invalid_mongodb_compressed.extend_from_slice(&2012_u32.to_le_bytes());
+        invalid_mongodb_compressed.extend_from_slice(&9_u32.to_le_bytes());
+        invalid_mongodb_compressed.push(4);
+        invalid_mongodb_compressed.extend_from_slice(b"compressed");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2012, &invalid_mongodb_compressed))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0, 0, 0, 0, 0, 3, 5, 0, 0, 0,
+                0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_op_msg = Vec::new();
+        invalid_mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_mongodb_op_msg.push(0);
+        invalid_mongodb_op_msg.extend_from_slice(&6_u32.to_le_bytes());
+        invalid_mongodb_op_msg.push(0);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2013, &invalid_mongodb_op_msg)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_query = Vec::new();
+        invalid_mongodb_query.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_mongodb_query.extend_from_slice(b"admin\0");
+        invalid_mongodb_query.extend_from_slice(&0_i32.to_le_bytes());
+        invalid_mongodb_query.extend_from_slice(&1_i32.to_le_bytes());
+        invalid_mongodb_query.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &invalid_mongodb_query)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame(0x08, b"", b"")).application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame(0x09, b"vh", b"body"))
+                .application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        let mut elasticsearch_with_trailing_frame =
+            elasticsearch_transport_frame(0x08, b"", b"body");
+        elasticsearch_with_trailing_frame
+            .extend_from_slice(&elasticsearch_transport_frame(0x09, b"vh", b"body"));
+        assert_eq!(
+            observation_for_payload(&elasticsearch_with_trailing_frame).application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x40, 0, 0, 0, 1, 0, 0, 0, 0,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame(0x02, b"", b"")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                b'E', b'S', 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 8, 0, 0, 99, 0, 0, 0, 1,
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&elasticsearch_transport_frame_with_version(
+                0x08, 1, b"", b""
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+    }
+
+    #[test]
+    fn packet_flow_payload_prefix_deserialization_is_bounded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"payload_prefix":"GET / HTTP/1.1\r\n"}"#)?;
+        assert_eq!(parsed.payload_prefix, b"GET / HTTP/1.1\r\n");
+
+        let oversized_payload = vec!["1"; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1].join(",");
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"payload_prefix":[{oversized_payload}]}}"#
+        )) {
+            Ok(_) => return Err("oversized payload_prefix should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow payload_prefix exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_detector_deserialization_is_bounded_and_printable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"detector":"ebpf-jsonl"}"#)?;
+        assert_eq!(parsed.detector.as_deref(), Some("ebpf-jsonl"));
+
+        let oversized_detector = "x".repeat(api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1);
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"detector":"{oversized_detector}"}}"#
+        )) {
+            Ok(_) => return Err("oversized detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("packet-flow detector exceeds"));
+
+        let error =
+            match serde_json::from_str::<api::AgentPacketFlowObservation>(r#"{"detector":""}"#) {
+                Ok(_) => return Err("empty detector should be rejected".into()),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("packet-flow detector must not be empty"));
+
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(
+            "{\"detector\":\"ebpf-jsonl\\nspoof\"}",
+        ) {
+            Ok(_) => return Err("detector with control characters should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow detector must not contain control characters"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_conntrack_status_deserialization_is_bounded_and_normalized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parsed: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"conntrack_status":["assured","unreplied","assured"]}"#)?;
+        assert_eq!(
+            parsed.conntrack_status,
+            vec![
+                api::AgentPacketFlowConntrackStatus::Unreplied,
+                api::AgentPacketFlowConntrackStatus::Assured,
+            ]
+        );
+
+        let oversized_statuses =
+            ["\"assured\""; api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
+            r#"{{"conntrack_status":[{oversized_statuses}]}}"#
+        )) {
+            Ok(_) => return Err("oversized conntrack_status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow conntrack_status exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_observation_validation_rechecks_direct_bounds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let oversized_detector = api::AgentPacketFlowObservation {
+            detector: Some("x".repeat(api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1)),
+            ..Default::default()
+        };
+        let error = match oversized_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector exceeds"));
+
+        let empty_detector = api::AgentPacketFlowObservation {
+            detector: Some(" ".to_string()),
+            ..Default::default()
+        };
+        let error = match empty_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct empty detector should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector must not be empty"));
+
+        let control_detector = api::AgentPacketFlowObservation {
+            detector: Some("proc\nconntrack".to_string()),
+            ..Default::default()
+        };
+        let error = match control_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct detector control characters should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow detector must not contain control characters"));
+
+        let oversized_payload = api::AgentPacketFlowObservation {
+            payload_prefix: vec![0; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
+            ..Default::default()
+        };
+        let error = match oversized_payload.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized payload prefix should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow payload_prefix exceeds"));
+
+        let oversized_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured;
+                api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1
+            ],
+            ..Default::default()
+        };
+        let error = match oversized_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct oversized conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("packet-flow conntrack_status exceeds"));
+
+        let duplicated_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured,
+                api::AgentPacketFlowConntrackStatus::Assured,
+            ],
+            ..Default::default()
+        };
+        let error = match duplicated_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct duplicate conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("sorted and deduplicated"));
+
+        let reversed_status = api::AgentPacketFlowObservation {
+            conntrack_status: vec![
+                api::AgentPacketFlowConntrackStatus::Assured,
+                api::AgentPacketFlowConntrackStatus::Unreplied,
+            ],
+            ..Default::default()
+        };
+        let error = match reversed_status.validate_transport_metadata() {
+            Ok(()) => return Err("direct unsorted conntrack status should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("sorted and deduplicated"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_observation_transport_metadata_is_consistent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let udp_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","destination_port":53}"#)?;
+        udp_with_port.validate_transport_metadata()?;
+
+        let usable_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"192.0.2.10"}"#)?;
+        usable_source.validate_transport_metadata()?;
+
+        let unspecified_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"0.0.0.0"}"#)?;
+        let error = match unspecified_source.validate_transport_metadata() {
+            Ok(()) => return Err("unspecified packet-flow source should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("source must not use unspecified address"));
+
+        let link_local_source: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"source":"fe80::1"}"#)?;
+        let error = match link_local_source.validate_transport_metadata() {
+            Ok(()) => return Err("link-local packet-flow source should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("source must not use link_local address"));
+
+        let tcp_with_zero_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","destination_port":0}"#)?;
+        let error = match tcp_with_zero_port.validate_transport_metadata() {
+            Ok(()) => return Err("TCP observation with zero port should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("nonzero ports"));
+
+        let tcp_with_state: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","tcp_state":"established"}"#)?;
+        tcp_with_state.validate_transport_metadata()?;
+
+        let udp_with_tcp_state: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","tcp_state":"established"}"#)?;
+        let error = match udp_with_tcp_state.validate_transport_metadata() {
+            Ok(()) => return Err("UDP observation with TCP state should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("TCP state requires TCP protocol"));
+
+        let icmp_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"icmp","destination_port":8}"#)?;
+        let error = match icmp_with_port.validate_transport_metadata() {
+            Ok(()) => return Err("ICMP observation with port metadata should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+
+        let application_without_protocol: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"application":"postgres"}"#)?;
+        application_without_protocol.validate_transport_metadata()?;
+
+        let udp_wireguard_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"wire_guard"}"#)?;
+        udp_wireguard_hint.validate_transport_metadata()?;
+
+        let udp_dns_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"dns"}"#)?;
+        udp_dns_hint.validate_transport_metadata()?;
+
+        let tcp_dns_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"dns"}"#)?;
+        tcp_dns_hint.validate_transport_metadata()?;
+
+        let udp_https_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
+        udp_https_hint.validate_transport_metadata()?;
+
+        let udp_memcached_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"memcached"}"#)?;
+        udp_memcached_hint.validate_transport_metadata()?;
+
+        let tcp_wireguard_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
+        let error = match tcp_wireguard_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP WireGuard hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint wireguard requires UDP protocol"));
+
+        let tcp_icmp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"icmp"}"#)?;
+        let error = match tcp_icmp_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP ICMP hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint icmp requires ICMP protocol"));
+
+        let udp_postgres_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"postgres"}"#)?;
+        let error = match udp_postgres_hint.validate_transport_metadata() {
+            Ok(()) => return Err("UDP TCP-only service application hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint postgres requires TCP protocol"));
+
+        let icmp_postgres_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"icmp","application":"postgres"}"#)?;
+        let error = match icmp_postgres_hint.validate_transport_metadata() {
+            Ok(()) => return Err("ICMP service application hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint postgres requires TCP protocol"));
+
+        let any_protocol: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"any"}"#)?;
+        let error = match any_protocol.validate_transport_metadata() {
+            Ok(()) => {
+                return Err("packet-flow observation with protocol any should be rejected".into())
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("concrete transport protocol"));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_destination_classifier_rejects_unusable_targets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for destination in [
+            "100.64.0.11",
+            "10.42.7.25",
+            "172.20.1.10",
+            "fd00::42",
+            "2001:db8::42",
+        ] {
+            assert_eq!(
+                api::packet_flow_destination_drop_reason(destination.parse()?),
+                None,
+                "{destination} should remain eligible"
+            );
+        }
+
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("0.0.0.0".parse()?),
+            Some(api::AgentPacketFlowDropReason::Unspecified)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("::".parse()?),
+            Some(api::AgentPacketFlowDropReason::Unspecified)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("127.0.0.1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Loopback)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Loopback)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("224.0.0.1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Multicast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("ff02::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::Multicast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("255.255.255.255".parse()?),
+            Some(api::AgentPacketFlowDropReason::Broadcast)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("169.254.10.20".parse()?),
+            Some(api::AgentPacketFlowDropReason::LinkLocal)
+        );
+        assert_eq!(
+            api::packet_flow_destination_drop_reason("fe80::1".parse()?),
+            Some(api::AgentPacketFlowDropReason::LinkLocal)
+        );
+        Ok(())
     }
 
     #[test]
@@ -2085,6 +10248,73 @@ mod tests {
             NatTraversalStrategy::RelayPreferred
         );
         assert_eq!(classification.observed_endpoint, None);
+    }
+
+    #[test]
+    fn nat_classification_detects_address_dependent_mapping() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 0, 0, 10], 50_000));
+        let first_stun = std::net::SocketAddr::from(([198, 51, 100, 1], 3478));
+        let second_stun = std::net::SocketAddr::from(([198, 51, 100, 2], 3478));
+        let classification = NatClassification::from_observations_with_filtering(
+            local_addr,
+            vec![
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: second_stun,
+                    reflexive_addr: std::net::SocketAddr::from(([203, 0, 113, 10], 40_001)),
+                    observed_at: assessed_at,
+                },
+            ],
+            vec![
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::SameAddress,
+                    response_origin: Some(first_stun),
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::ChangePort,
+                    response_origin: Some(std::net::SocketAddr::from(([198, 51, 100, 1], 3479))),
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+                NatFilteringObservation {
+                    local_addr,
+                    stun_server: first_stun,
+                    probe: NatFilteringProbeKind::ChangeAddressAndPort,
+                    response_origin: None,
+                    other_address: Some(second_stun),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(
+            classification.mapping_behavior,
+            NatMappingBehavior::AddressDependent
+        );
+        assert_eq!(
+            classification.filtering_behavior,
+            NatFilteringBehavior::AddressDependent
+        );
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::CoordinatedHolePunch
+        );
+        assert_eq!(classification.observed_endpoint, None);
+        assert!(classification.confidence > 0.5);
     }
 
     #[test]

@@ -9,8 +9,6 @@ cluster:
   controlPlaneUrl: "http://ipars-control-plane:8443"
   signalUrl: "http://ipars-signal:9443"
   stunEndpoint: ""
-  relayEndpoint: "ipars-relay:51820"
-  relayAdmissionUrl: "http://ipars-relay:9580"
 
 rbac:
   create: true
@@ -22,6 +20,10 @@ serviceAccount:
 
 agent:
   interfaceName: ipars0
+  routeBackend: command
+  peerMap:
+    enabled: true
+    pollIntervalSeconds: 30
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   routeProvider: false
@@ -51,6 +53,10 @@ agent:
   privileged: false
   securityContext:
     allowPrivilegeEscalation: ""
+    readOnlyRootFilesystem: ""
+    seccompProfile:
+      type: ""
+      localhostProfile: ""
     capabilities:
       add:
         - NET_ADMIN
@@ -74,29 +80,51 @@ agent:
     maxSurge: ""
     minReadySeconds: ""
     revisionHistoryLimit: ""
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: ""
+    maxUnavailable: ""
   apiService:
     enabled: false
     exposureAcknowledged: false
     allowUnrestrictedLoadBalancer: false
     allowClusterExternalTrafficPolicy: false
     type: ClusterIP
+    clusterIP: ""
+    clusterIPs: []
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
+    loadBalancerIP: ""
+    externalIPs: []
     healthCheckNodePort: 0
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    trafficDistribution: ""
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
+    appProtocol: http
+    publishNotReadyAddresses: false
     port: 9780
+    targetPort: 9780
     nodePort: 0
   relayForwarder:
+    enabled: false
+    endpoint: ""
+    bind: ""
+    wireguardEndpoint: ""
     maxSessions: 1024
     restartBackoffSeconds: 5
+    crashWindowSeconds: 60
+    maxCrashesPerWindow: 3
+    crashCooldownSeconds: 60
     netns: ""
+  relayAdmissionBearerTokenSecret:
+    name: ""
+    key: ""
   relayAdvertisement:
     enabled: false
     publicEndpoint: ""
@@ -110,26 +138,35 @@ agent:
     allowUnrestrictedLoadBalancer: false
     allowClusterExternalTrafficPolicy: false
     type: LoadBalancer
+    clusterIP: ""
+    clusterIPs: []
     annotations: {}
     loadBalancerSourceRanges: []
     loadBalancerClass: ""
+    loadBalancerIP: ""
+    externalIPs: []
     healthCheckNodePort: 0
     allocateLoadBalancerNodePorts: true
     ipFamilyPolicy: ""
     ipFamilies: []
     internalTrafficPolicy: ""
+    trafficDistribution: ""
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
+    udpAppProtocol: ipars.io/relay-udp
+    httpAppProtocol: http
+    publishNotReadyAddresses: false
     udpPort: 51820
+    udpTargetPort: 51820
     httpPort: 9580
+    httpTargetPort: 9580
     udpNodePort: 0
     httpNodePort: 0
 
 serviceExposure:
   enabled: true
   discoverServices: false
-  apiServer: true
   discoverApiServer: true
   apiServerCidrs: []
   serviceCidrs:

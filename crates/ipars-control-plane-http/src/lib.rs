@@ -11,9 +11,9 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
+    RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
@@ -64,6 +64,7 @@ where
         .route("/v1/metrics", get(metrics::<S, L>))
         .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
+        .route("/v1/paths/{node_id}", get(paths::<S, L>))
         .route(
             "/v1/nodes/{node_id}/wireguard-key",
             put(rotate_wireguard_key::<S, L>),
@@ -191,6 +192,19 @@ where
     Ok(Json(response))
 }
 
+async fn paths<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(node_id): Path<String>,
+) -> Result<Json<ControlPlanePathsResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let node_id = NodeId::from_string(node_id);
+    let response = state.plane.paths_for(&node_id).await?;
+    Ok(Json(response))
+}
+
 async fn heartbeat<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Json(request): Json<HeartbeatRequest>,
@@ -281,6 +295,19 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         &mut body,
         "ipars_control_plane_endpoint_candidate_ttl_seconds{{cluster_id=\"{cluster_id}\"}} {}",
         metrics.endpoint_candidate_ttl_seconds
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_path_state_ttl_seconds Path-state freshness window used by control-plane status and metrics."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_path_state_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_path_state_ttl_seconds{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.path_state_ttl_seconds
     );
     prometheus_line!(
         &mut body,
@@ -470,6 +497,16 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_stale_paths Number of pair-scoped paths older than the control-plane path-state TTL."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_stale_paths gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_stale_paths{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.stale_path_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_path_state_count Pair-scoped paths by selected state."
     );
     prometheus_line!(
@@ -559,15 +596,15 @@ mod tests {
     };
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        ControlPlaneMetricsResponse, ControlPlanePolicyResponse, HeartbeatRequest,
-        HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse,
-        RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+        ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
+        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
+        RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
         RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState,
-        JoinTokenClaims, KeyId, NodeHealth, NodeId, Role, Tag, TokenPolicy, TokenStatus,
-        TransportProtocol,
+        JoinTokenClaims, KeyId, NodeHealth, NodeId, PathMetrics, PathRecord, PathScore, PathState,
+        PeerPathKey, Role, Tag, TokenPolicy, TokenStatus, TransportProtocol,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -633,15 +670,38 @@ mod tests {
         identity_for_node(label).node_id()
     }
 
-    fn signed_heartbeat(label: &str, mut request: HeartbeatRequest) -> HeartbeatRequest {
+    fn signed_heartbeat(label: &str, request: HeartbeatRequest) -> HeartbeatRequest {
+        signed_heartbeat_at(label, request, Utc::now())
+    }
+
+    fn signed_heartbeat_at(
+        label: &str,
+        mut request: HeartbeatRequest,
+        signed_at: chrono::DateTime<Utc>,
+    ) -> HeartbeatRequest {
         let identity = identity_for_node(label);
-        request.node_signature = Some(
-            match identity.sign_heartbeat_request(&request, Utc::now()) {
-                Ok(signature) => signature,
-                Err(error) => panic!("test identity should sign heartbeat: {error}"),
-            },
-        );
+        request.node_signature = Some(match identity.sign_heartbeat_request(&request, signed_at) {
+            Ok(signature) => signature,
+            Err(error) => panic!("test identity should sign heartbeat: {error}"),
+        });
         request
+    }
+
+    fn path(local: &str, remote: &str) -> PathRecord {
+        PathRecord {
+            key: PeerPathKey::new(node_id(local), node_id(remote)),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
+        }
     }
 
     fn signed_wireguard_key_rotation(
@@ -695,7 +755,7 @@ mod tests {
             ledger,
             key_ring,
         ));
-        let app = router(ControlPlaneHttpState::new(plane, join_service));
+        let app = router(ControlPlaneHttpState::new(plane.clone(), join_service));
 
         let response = app
             .clone()
@@ -716,7 +776,7 @@ mod tests {
         assert_eq!(policy.cluster_policy.acl_rules[0].id, "allow-edge");
 
         let request_body = JoinNodeRequest {
-            token: issuer.sign_join_token(claims(cluster_id, issuer.node_id(), key_id))?,
+            token: issuer.sign_join_token(claims(cluster_id.clone(), issuer.node_id(), key_id))?,
             registration: registration("node-http"),
         };
 
@@ -808,6 +868,7 @@ mod tests {
                 },
                 candidates: Vec::new(),
                 relay_capability: None,
+                routes: None,
                 path_state: Vec::new(),
                 node_signature: None,
             },
@@ -843,6 +904,13 @@ mod tests {
         assert_eq!(metrics.healthy_node_count, 1);
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
+        assert_eq!(metrics.stale_path_count, 0);
+        assert_eq!(metrics.path_state_ttl_seconds, 600);
+        assert_eq!(metrics.path_state_counts.len(), 5);
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .all(|entry| entry.count == 0));
         assert_eq!(metrics.vpn_pool_total_count, 6);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
         assert_eq!(metrics.vpn_pool_available_count, 5);
@@ -852,6 +920,65 @@ mod tests {
         assert_eq!(metrics.token_ledger_expired_count, 0);
         assert_eq!(metrics.token_ledger_exhausted_count, 0);
         assert_eq!(metrics.token_ledger_use_count, 1);
+
+        let mut peer_claims = claims(
+            request_body.token.claims.cluster_id.clone(),
+            issuer.node_id(),
+            KeyId::from_string("root"),
+        );
+        peer_claims.nonce = "http-peer".to_string();
+        plane
+            .register_with_claims(peer_claims, registration("node-peer"))
+            .await?;
+        let path_reported_at = Utc::now() + chrono::Duration::seconds(1);
+        let heartbeat = signed_heartbeat_at(
+            "node-http",
+            HeartbeatRequest {
+                node_id: node_id("node-http"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: path_reported_at,
+                    latency_ms: Some(1.0),
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                routes: None,
+                path_state: vec![path("node-http", "node-peer")],
+                node_signature: None,
+            },
+            path_reported_at,
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&heartbeat)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/paths/{}", node_id("node-http")))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let paths: ControlPlanePathsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(paths.node_id, node_id("node-http"));
+        assert_eq!(paths.paths.len(), 1);
+        assert_eq!(paths.paths[0].key.remote, node_id("node-peer"));
+        assert_eq!(paths.stale_path_count, 0);
+        assert_eq!(paths.path_state_ttl_seconds, 600);
 
         let response = app
             .oneshot(
@@ -873,6 +1000,8 @@ mod tests {
         assert!(body.contains("ipars_control_plane_nodes"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
+        assert!(body.contains("ipars_control_plane_stale_paths"));
+        assert!(body.contains("ipars_control_plane_path_state_ttl_seconds"));
         assert!(body.contains("ipars_control_plane_vpn_pool_total"));
         assert!(body.contains("ipars_control_plane_vpn_pool_allocated"));
         assert!(body.contains("ipars_control_plane_vpn_pool_available"));
@@ -886,6 +1015,13 @@ mod tests {
         assert!(body.contains("ipars_control_plane_peer_map_routes_visible"));
         assert!(body.contains("ipars_control_plane_peer_map_routes_acl_denied"));
         assert!(body.contains("ipars_control_plane_node_health"));
+        let prometheus_cluster_id = prometheus_label(cluster_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"DIRECT_NAT_TRAVERSAL\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"RELAY\"}} 0"
+        )));
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::task::{ready, Context, Poll};
@@ -26,7 +26,13 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES: usize = 4096;
+const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
+const MAX_LINUX_ROUTE_COMMAND_ARG_BYTES: usize = 128 * 1024;
+const MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -36,6 +42,12 @@ pub enum RouteManagerError {
     Backend(String),
     #[error("invalid linux network namespace name: {0}")]
     InvalidNamespace(String),
+    #[error("invalid Docker network intent: {0}")]
+    InvalidDockerNetworkIntent(String),
+    #[error("invalid Kubernetes underlay intent: {0}")]
+    InvalidKubernetesUnderlayIntent(String),
+    #[error("invalid route plan: {0}")]
+    InvalidRoutePlan(String),
     #[error("invalid policy rule: {0}")]
     InvalidPolicyRule(String),
 }
@@ -92,6 +104,8 @@ impl LinuxNetworkNamespace {
 fn is_valid_namespace_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
+        && !matches!(name, "." | "..")
+        && !name.starts_with('-')
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -234,16 +248,50 @@ fn open_netlink_socket_in_namespace(
         )
     })?;
 
-    nix::sched::setns(&target_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from)?;
+    set_thread_netns(&target_namespace)?;
+    let restore_guard = ThreadNetnsRestoreGuard::new(current_namespace);
     let socket = Socket::new(protocol);
-    let restore =
-        nix::sched::setns(&current_namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from);
+    let restore = restore_guard.restore();
 
     match (socket, restore) {
         (_, Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Ok(socket), Ok(())) => Ok(socket),
     }
+}
+
+struct ThreadNetnsRestoreGuard {
+    namespace: File,
+    restored: bool,
+}
+
+impl ThreadNetnsRestoreGuard {
+    fn new(namespace: File) -> Self {
+        Self {
+            namespace,
+            restored: false,
+        }
+    }
+
+    fn restore(mut self) -> io::Result<()> {
+        let result = set_thread_netns(&self.namespace);
+        if result.is_ok() {
+            self.restored = true;
+        }
+        result
+    }
+}
+
+impl Drop for ThreadNetnsRestoreGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = set_thread_netns(&self.namespace);
+        }
+    }
+}
+
+fn set_thread_netns(namespace: &File) -> io::Result<()> {
+    nix::sched::setns(namespace, CloneFlags::CLONE_NEWNET).map_err(io::Error::from)
 }
 
 fn open_current_thread_netns() -> io::Result<File> {
@@ -323,6 +371,211 @@ pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
     }
 }
 
+pub fn checked_docker_route_plan(
+    intent: DockerNetworkIntent,
+) -> Result<RoutePlan, RouteManagerError> {
+    validate_docker_network_intent(&intent)?;
+    Ok(docker_route_plan(intent))
+}
+
+pub fn validate_docker_network_intent(
+    intent: &DockerNetworkIntent,
+) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&intent.host_interface).map_err(invalid_docker_network_intent)?;
+    validate_linux_interface_name(&intent.overlay_interface)
+        .map_err(invalid_docker_network_intent)?;
+    validate_docker_container_cidrs(&intent.container_cidrs)
+}
+
+pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&plan.interface).map_err(invalid_route_plan)?;
+    let mut seen_routes = BTreeSet::new();
+    for route in &plan.routes {
+        if let Some(reason) = restricted_route_cidr_reason(&route.cidr) {
+            return Err(invalid_route_plan(format!(
+                "route {} must not include {reason} CIDR {}",
+                route.id, route.cidr
+            )));
+        }
+        let canonical = route.cidr.trunc();
+        if route.cidr != canonical {
+            return Err(invalid_route_plan(format!(
+                "route {} must use canonical CIDR {canonical}, not {}",
+                route.id, route.cidr
+            )));
+        }
+        if !seen_routes.insert(route.cidr) {
+            return Err(invalid_route_plan(format!(
+                "route plan must not repeat CIDR {}",
+                route.cidr
+            )));
+        }
+    }
+    for rule in &plan.policy_rules {
+        validate_policy_rule(rule)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_rule(rule: &PolicyRule) -> Result<(), RouteManagerError> {
+    if rule.table == 0 {
+        return Err(RouteManagerError::InvalidPolicyRule(format!(
+            "rule priority {} must use a nonzero routing table",
+            rule.priority
+        )));
+    }
+    if rule.priority == 0 {
+        return Err(RouteManagerError::InvalidPolicyRule(
+            "policy rule priority must be greater than zero".to_string(),
+        ));
+    }
+    policy_rule_address_family(rule)?;
+    Ok(())
+}
+
+fn validate_linux_interface_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("linux interface name cannot be empty".to_string());
+    }
+    if name.len() > 15 {
+        return Err(format!("linux interface name `{name}` exceeds 15 bytes"));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_docker_container_cidrs(cidrs: &[IpNet]) -> Result<(), RouteManagerError> {
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            return Err(invalid_docker_network_intent(format!(
+                "must not include {reason} Docker container CIDR {cidr}"
+            )));
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            return Err(invalid_docker_network_intent(format!(
+                "must use canonical Docker container CIDR route {route}, not {cidr}"
+            )));
+        }
+        if !seen.insert(route) {
+            return Err(invalid_docker_network_intent(format!(
+                "must not repeat Docker container CIDR route {route}"
+            )));
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            return Err(invalid_docker_network_intent(format!(
+                "must not include overlapping Docker container CIDR routes {overlap} and {route}"
+            )));
+        }
+        routes.push(route);
+    }
+    Ok(())
+}
+
+fn invalid_docker_network_intent(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidDockerNetworkIntent(message.into())
+}
+
+fn invalid_route_plan(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidRoutePlan(message.into())
+}
+
+fn restricted_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ip_cidrs_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => ipv4_cidrs_overlap(left, right),
+        (IpNet::V6(left), IpNet::V6(right)) => ipv6_cidrs_overlap(left, right),
+        _ => false,
+    }
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
 pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
     let mut routes = Vec::new();
     for (index, cidr) in intent
@@ -352,6 +605,57 @@ pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
             fwmark: None,
         }],
     }
+}
+
+pub fn checked_kubernetes_route_plan(
+    intent: KubernetesUnderlayIntent,
+) -> Result<RoutePlan, RouteManagerError> {
+    validate_kubernetes_underlay_intent(&intent)?;
+    Ok(kubernetes_route_plan(intent))
+}
+
+pub fn validate_kubernetes_underlay_intent(
+    intent: &KubernetesUnderlayIntent,
+) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(&intent.overlay_interface)
+        .map_err(invalid_kubernetes_underlay_intent)?;
+    let mut seen = BTreeSet::new();
+    validate_kubernetes_underlay_cidrs(
+        "Kubernetes API server CIDR",
+        &intent.api_server_cidrs,
+        &mut seen,
+    )?;
+    validate_kubernetes_underlay_cidrs("Kubernetes Service CIDR", &intent.service_cidrs, &mut seen)
+}
+
+fn validate_kubernetes_underlay_cidrs(
+    label: &str,
+    cidrs: &[IpNet],
+    seen: &mut BTreeSet<IpNet>,
+) -> Result<(), RouteManagerError> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must not include {reason} {label} {cidr}"
+            )));
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must use canonical {label} route {route}, not {cidr}"
+            )));
+        }
+        if !seen.insert(route) {
+            return Err(invalid_kubernetes_underlay_intent(format!(
+                "must not repeat Kubernetes underlay route CIDR {route}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_kubernetes_underlay_intent(message: impl Into<String>) -> RouteManagerError {
+    RouteManagerError::InvalidKubernetesUnderlayIntent(message.into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,6 +738,8 @@ async fn run_system_route_command(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<(), RouteManagerError> {
+    validate_system_route_command_runtime_bounds(timeout, output_max_bytes)?;
+    validate_linux_route_command(&command)?;
     let command_label = command_label(&command.program, &command.args);
     let output =
         run_route_command_output(command, timeout, output_max_bytes, &command_label).await?;
@@ -447,53 +753,198 @@ async fn run_system_route_command(
     )))
 }
 
+fn validate_system_route_command_runtime_bounds(
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<(), RouteManagerError> {
+    if timeout.is_zero() {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command runtime bounds: timeout must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if timeout > MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command runtime bounds: timeout must not exceed {}s",
+            MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT.as_secs()
+        )));
+    }
+    if output_max_bytes == 0 {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command runtime bounds: output_max_bytes must be greater than zero"
+                .to_string(),
+        ));
+    }
+    if output_max_bytes > MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command runtime bounds: output_max_bytes must not exceed {MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_linux_route_command(command: &LinuxRouteCommand) -> Result<(), RouteManagerError> {
+    if command.program.is_empty() {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program cannot be empty".to_string(),
+        ));
+    }
+    if command.program.len() > MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command: program exceeds {MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES} bytes"
+        )));
+    }
+    if command.program.as_bytes().contains(&0) {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program must not contain NUL bytes".to_string(),
+        ));
+    }
+    if command.args.len() > MAX_LINUX_ROUTE_COMMAND_ARGS {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command: too many arguments: {} > {MAX_LINUX_ROUTE_COMMAND_ARGS}",
+            command.args.len()
+        )));
+    }
+
+    let mut total_bytes = command.program.len();
+    for (index, arg) in command.args.iter().enumerate() {
+        if arg.len() > MAX_LINUX_ROUTE_COMMAND_ARG_BYTES {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argument {index} exceeds {MAX_LINUX_ROUTE_COMMAND_ARG_BYTES} bytes"
+            )));
+        }
+        if arg.as_bytes().contains(&0) {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argument {index} must not contain NUL bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(arg.len());
+        if total_bytes > MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES {
+            return Err(RouteManagerError::Backend(format!(
+                "invalid linux route command: argv exceeds {MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES} bytes"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_route_command_output(
     command: LinuxRouteCommand,
     timeout: Duration,
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedRouteCommandOutput, RouteManagerError> {
-    tokio::time::timeout(
-        timeout,
-        collect_bounded_route_command_output(command, output_max_bytes),
-    )
-    .await
-    .map_err(|_| {
-        RouteManagerError::Backend(format!(
-            "{command_label} timed out after {}",
-            command_timeout_label(timeout)
-        ))
-    })?
-    .map_err(RouteManagerError::Io)
+    collect_bounded_route_command_output(command, timeout, output_max_bytes, command_label).await
 }
 
 async fn collect_bounded_route_command_output(
     command: LinuxRouteCommand,
+    timeout: Duration,
     output_max_bytes: usize,
-) -> io::Result<BoundedRouteCommandOutput> {
-    let mut child = Command::new(&command.program)
+    command_label: &str,
+) -> Result<BoundedRouteCommandOutput, RouteManagerError> {
+    let mut child_command = Command::new(&command.program);
+    child_command
         .args(&command.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    configure_route_command_process_group(&mut child_command);
+
+    let mut child = child_command.spawn().map_err(RouteManagerError::Io)?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+        .ok_or_else(|| RouteManagerError::Io(io::Error::other("child stdout was not piped")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+        .ok_or_else(|| RouteManagerError::Io(io::Error::other("child stderr was not piped")))?;
 
-    let (status, _stdout, stderr) = tokio::try_join!(
-        child.wait(),
-        read_limited_route_command_output(stdout, output_max_bytes),
-        read_limited_route_command_output(stderr, output_max_bytes)
-    )?;
+    let stdout_task = tokio::spawn(read_limited_route_command_output(stdout, output_max_bytes));
+    let stderr_task = tokio::spawn(read_limited_route_command_output(stderr, output_max_bytes));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(RouteManagerError::Io(error));
+        }
+        Err(_) => {
+            let kill_error = kill_timed_out_route_child(&mut child);
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let mut message = format!(
+                "{command_label} timed out after {}",
+                command_timeout_label(timeout)
+            );
+            if let Some(error) = kill_error {
+                message.push_str(&format!("; failed to kill timed-out child: {error}"));
+            }
+            return Err(RouteManagerError::Backend(message));
+        }
+    };
+
+    let _stdout = collect_route_command_output_task(stdout_task).await?;
+    let stderr = collect_route_command_output_task(stderr_task).await?;
 
     Ok(BoundedRouteCommandOutput { status, stderr })
+}
+
+fn configure_route_command_process_group(_command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        _command.process_group(0);
+    }
+}
+
+fn kill_timed_out_route_child(child: &mut tokio::process::Child) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id() {
+        match kill_route_process_group(pid) {
+            Ok(()) => return None,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => return None,
+            Err(group_error) => {
+                return match child.start_kill() {
+                    Ok(()) => Some(format!(
+                        "process group {pid}: {group_error}; direct child kill succeeded"
+                    )),
+                    Err(child_error) => Some(format!(
+                        "process group {pid}: {group_error}; direct child: {child_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    child.start_kill().err().map(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn kill_route_process_group(pid: u32) -> io::Result<()> {
+    let pgid: i32 = i32::try_from(pid)
+        .map_err(|_| io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error as i32))
+}
+
+async fn collect_route_command_output_task(
+    task: tokio::task::JoinHandle<io::Result<LimitedRouteCommandOutput>>,
+) -> Result<LimitedRouteCommandOutput, RouteManagerError> {
+    match task.await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(RouteManagerError::Io(error)),
+        Err(error) => Err(RouteManagerError::Backend(format!(
+            "route command output reader failed: {error}"
+        ))),
+    }
 }
 
 #[derive(Debug)]
@@ -698,6 +1149,7 @@ where
     R: LinuxRouteCommandRunner,
 {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         for command in Self::apply_route_commands(&plan) {
             self.runner.run(command).await?;
         }
@@ -714,6 +1166,7 @@ where
     }
 
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         for rule in &plan.policy_rules {
             self.runner
                 .run(Self::policy_rule_command("del", rule))
@@ -729,7 +1182,7 @@ where
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = docker_route_plan(intent);
+        let plan = checked_docker_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -738,7 +1191,7 @@ where
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = kubernetes_route_plan(intent);
+        let plan = checked_kubernetes_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -866,6 +1319,7 @@ impl LinuxNetlinkRouteManager {
 #[async_trait]
 impl RouteManager for LinuxNetlinkRouteManager {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for table in LinuxRouteManager::<SystemRouteCommandRunner>::route_tables(&plan) {
@@ -881,6 +1335,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
     }
 
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         let handle = self.open_handle().await?;
         let interface_index = Self::interface_index(&handle, &plan.interface).await?;
         for rule in &plan.policy_rules {
@@ -898,7 +1353,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = docker_route_plan(intent);
+        let plan = checked_docker_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -907,7 +1362,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        let plan = kubernetes_route_plan(intent);
+        let plan = checked_kubernetes_route_plan(intent)?;
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
@@ -992,11 +1447,13 @@ pub struct DryRunLinuxRouteManager;
 
 #[async_trait]
 impl RouteManager for DryRunLinuxRouteManager {
-    async fn apply_routes(&self, _plan: RoutePlan) -> Result<(), RouteManagerError> {
+    async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         Ok(())
     }
 
-    async fn remove_routes(&self, _plan: RoutePlan) -> Result<(), RouteManagerError> {
+    async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+        validate_route_plan(&plan)?;
         Ok(())
     }
 
@@ -1004,14 +1461,14 @@ impl RouteManager for DryRunLinuxRouteManager {
         &self,
         intent: DockerNetworkIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        Ok(docker_route_plan(intent))
+        checked_docker_route_plan(intent)
     }
 
     async fn apply_kubernetes_intent(
         &self,
         intent: KubernetesUnderlayIntent,
     ) -> Result<RoutePlan, RouteManagerError> {
-        Ok(kubernetes_route_plan(intent))
+        checked_kubernetes_route_plan(intent)
     }
 }
 
@@ -1082,6 +1539,93 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn timed_system_route_command_runner_rejects_invalid_command_vectors() {
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+
+        let error = match runner.run(LinuxRouteCommand::new("", ["route"])).await {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("program cannot be empty"));
+
+        let error = match runner
+            .run(LinuxRouteCommand::new("ip", ["route\0bad".to_string()]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("argument 0 must not contain NUL bytes"));
+
+        let error = match runner
+            .run(LinuxRouteCommand::new(
+                "ip",
+                std::iter::repeat_n("route", MAX_LINUX_ROUTE_COMMAND_ARGS + 1),
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("too many arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_rejects_invalid_runtime_bounds() {
+        let error = match TimedSystemRouteCommandRunner::new(Duration::ZERO)
+            .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("timeout must be greater than zero"));
+
+        let error = match TimedSystemRouteCommandRunner::new(
+            MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT + Duration::from_secs(1),
+        )
+        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timeout must not exceed 3600s"));
+
+        let error =
+            match TimedSystemRouteCommandRunner::with_output_max_bytes(Duration::from_secs(1), 0)
+                .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+                .await
+            {
+                Ok(()) => panic!("command should be rejected"),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must be greater than zero"));
+
+        let error = match TimedSystemRouteCommandRunner::with_output_max_bytes(
+            Duration::from_secs(1),
+            MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES + 1,
+        )
+        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("output_max_bytes must not exceed 1048576"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timed_system_route_command_runner_times_out() {
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(10));
         let error = match runner
@@ -1093,6 +1637,51 @@ mod tests {
         };
 
         assert!(error.to_string().contains("timed out after 10ms"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_system_route_command_runner_times_out_and_reaps_child(
+    ) -> Result<(), RouteManagerError> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-route-command-timeout-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let grandchild_pid_path = temp_dir.join("grandchild.pid");
+        let script = format!(
+            "printf '%s\\n' $$ > {}; sleep 60 & printf '%s\\n' $! > {}; wait",
+            pid_path.display(),
+            grandchild_pid_path.display()
+        );
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(100));
+        let error = match runner
+            .run(LinuxRouteCommand::new("sh", ["-c", &script]))
+            .await
+        {
+            Ok(()) => panic!("command should time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("timed out after 100ms"));
+        let pid = wait_for_route_command_pid_file(&pid_path, Duration::from_secs(1)).await?;
+        let grandchild_pid =
+            wait_for_route_command_pid_file(&grandchild_pid_path, Duration::from_secs(1)).await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "timed-out route command child process {pid} was left running"
+        );
+        assert!(
+            wait_for_process_absent(grandchild_pid, Duration::from_secs(2)).await,
+            "timed-out route command grandchild process {grandchild_pid} was left running"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1121,6 +1710,50 @@ mod tests {
         assert!(stderr.contains("stderr truncated after 16 bytes"));
     }
 
+    #[cfg(target_os = "linux")]
+    async fn wait_for_route_command_pid_file(
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<u32, RouteManagerError> {
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        return contents.parse::<u32>().map_err(|error| {
+                            RouteManagerError::Backend(format!(
+                                "failed to parse route command child pid: {error}"
+                            ))
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RouteManagerError::Io(error)),
+            }
+            if started.elapsed() >= timeout {
+                return Err(RouteManagerError::Backend(format!(
+                    "timed out waiting for route command child pid file {}",
+                    path.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        let process_path = std::path::Path::new("/proc").join(pid.to_string());
+        while started.elapsed() < timeout {
+            if !process_path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !process_path.exists()
+    }
+
     fn route_plan() -> Result<RoutePlan, Box<dyn std::error::Error>> {
         Ok(RoutePlan {
             interface: "ipars0".to_string(),
@@ -1140,6 +1773,79 @@ mod tests {
                 fwmark: Some(0x6473),
             }],
         })
+    }
+
+    #[tokio::test]
+    async fn route_plan_validation_rejects_unsafe_and_noncanonical_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            ("", "linux interface name cannot be empty", "10.42.0.0/16"),
+            (
+                "bad interface",
+                "must contain only ASCII letters",
+                "10.42.0.0/16",
+            ),
+            ("ipars0", "unrestricted CIDR 0.0.0.0/0", "0.0.0.0/0"),
+            ("ipars0", "loopback CIDR 127.0.0.0/8", "127.0.0.0/8"),
+            ("ipars0", "canonical CIDR 10.42.0.0/16", "10.42.0.1/16"),
+        ];
+
+        for (interface, expected, cidr) in cases {
+            let mut plan = route_plan()?;
+            plan.interface = interface.to_string();
+            plan.routes[0].cidr = cidr.parse()?;
+            let error = match manager.apply_routes(plan).await {
+                Ok(()) => return Err("invalid route plan should be rejected".into()),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error}"
+            );
+        }
+
+        let mut duplicate = route_plan()?;
+        duplicate.routes.push(Route {
+            id: "route-b".to_string(),
+            ..duplicate.routes[0].clone()
+        });
+        let error = match manager.apply_routes(duplicate).await {
+            Ok(()) => return Err("duplicate route plan should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not repeat CIDR"));
+
+        let mut invalid_rule = route_plan()?;
+        invalid_rule.policy_rules[0].table = 0;
+        let error = match manager.apply_routes(invalid_rule).await {
+            Ok(()) => return Err("invalid policy rule should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidPolicyRule(ref message)
+                if message.contains("must use a nonzero routing table")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_validates_plan_before_running_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+        let mut plan = route_plan()?;
+        plan.routes[0].cidr = "10.42.0.1/16".parse()?;
+
+        let error = match manager.apply_routes(plan).await {
+            Ok(()) => return Err("invalid route plan should be rejected".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RouteManagerError::InvalidRoutePlan(_)));
+        assert!(runner.commands().await.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1163,7 +1869,80 @@ mod tests {
             LinuxNetworkNamespace::from_name("node a"),
             Err(RouteManagerError::InvalidNamespace(name)) if name == "node a"
         ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("."),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "."
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name(".."),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == ".."
+        ));
+        assert!(matches!(
+            LinuxNetworkNamespace::from_name("-node-a"),
+            Err(RouteManagerError::InvalidNamespace(name)) if name == "-node-a"
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn netlink_namespace_context_restores_after_error_and_nested_scope(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let outer = LinuxNetworkNamespace::from_name("outer-ns")?;
+        let inner = LinuxNetworkNamespace::from_name("inner-ns")?;
+
+        let error = match with_netlink_namespace(Some(&outer), || {
+            assert_eq!(
+                current_test_netlink_namespace_name().as_deref(),
+                Some("outer-ns")
+            );
+            let nested: io::Result<()> = with_netlink_namespace(Some(&inner), || {
+                assert_eq!(
+                    current_test_netlink_namespace_name().as_deref(),
+                    Some("inner-ns")
+                );
+                Err(io::Error::other("nested failure"))
+            });
+            assert_eq!(
+                current_test_netlink_namespace_name().as_deref(),
+                Some("outer-ns")
+            );
+            nested
+        }) {
+            Ok(()) => return Err("nested namespace operation should fail".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "nested failure");
+        assert_eq!(current_test_netlink_namespace_name(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn netlink_namespace_context_restores_after_panic() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("panic-ns")?;
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_netlink_namespace(Some(&namespace), || -> io::Result<()> {
+                assert_eq!(
+                    current_test_netlink_namespace_name().as_deref(),
+                    Some("panic-ns")
+                );
+                panic!("forced namespace panic");
+            });
+        });
+
+        assert!(result.is_err());
+        assert_eq!(current_test_netlink_namespace_name(), None);
+        Ok(())
+    }
+
+    fn current_test_netlink_namespace_name() -> Option<String> {
+        NETLINK_NAMESPACE.with(|namespace| {
+            namespace
+                .borrow()
+                .as_ref()
+                .map(|namespace| namespace.name().to_string())
+        })
     }
 
     #[test]
@@ -1216,6 +1995,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_intent_rejects_invalid_container_cidrs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            (vec!["0.0.0.0/0"], "unrestricted Docker container CIDR"),
+            (vec!["127.0.0.0/8"], "loopback Docker container CIDR"),
+            (
+                vec!["172.18.0.1/16"],
+                "canonical Docker container CIDR route 172.18.0.0/16",
+            ),
+            (
+                vec!["172.18.0.0/16", "172.18.0.0/16"],
+                "repeat Docker container CIDR route 172.18.0.0/16",
+            ),
+            (
+                vec!["172.18.0.0/16", "172.18.10.0/24"],
+                "overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24",
+            ),
+        ];
+
+        for (cidrs, expected) in cases {
+            let error = match manager
+                .apply_docker_intent(DockerNetworkIntent {
+                    container_namespace: "container-a".to_string(),
+                    host_interface: "eth0".to_string(),
+                    overlay_interface: "ipars0".to_string(),
+                    container_cidrs: cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<IpNet>, _>>()?,
+                    expose_host_routes: true,
+                })
+                .await
+            {
+                Ok(plan) => {
+                    return Err(format!("invalid Docker CIDR should be rejected: {plan:?}").into());
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, RouteManagerError::InvalidDockerNetworkIntent(ref message) if message.contains(expected)),
+                "unexpected error: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn kubernetes_intent_builds_service_and_api_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let manager = DryRunLinuxRouteManager;
@@ -1240,6 +2068,86 @@ mod tests {
         assert_eq!(plan.routes[1].id, "k8s-1");
         assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
         assert_eq!(plan.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kubernetes_intent_allows_specific_route_inside_service_cidr(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let plan = manager
+            .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                node_name: "worker-a".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                api_server_cidrs: vec!["10.96.0.1/32".parse()?],
+                service_cidrs: vec!["10.96.0.0/12".parse()?],
+                route_provider: NodeId::from_string("route-provider-a"),
+            })
+            .await?;
+
+        assert_eq!(plan.routes.len(), 2);
+        assert_eq!(plan.routes[0].cidr, "10.96.0.1/32".parse::<IpNet>()?);
+        assert_eq!(plan.routes[1].cidr, "10.96.0.0/12".parse::<IpNet>()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kubernetes_intent_rejects_invalid_route_cidrs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            (
+                vec!["0.0.0.0/0"],
+                Vec::new(),
+                "unrestricted Kubernetes API server CIDR",
+            ),
+            (
+                Vec::new(),
+                vec!["127.0.0.0/8"],
+                "loopback Kubernetes Service CIDR",
+            ),
+            (
+                Vec::new(),
+                vec!["10.96.0.1/12"],
+                "canonical Kubernetes Service CIDR route 10.96.0.0/12",
+            ),
+            (
+                vec!["10.96.0.1/32"],
+                vec!["10.96.0.1/32"],
+                "repeat Kubernetes underlay route CIDR 10.96.0.1/32",
+            ),
+        ];
+
+        for (api_server_cidrs, service_cidrs, expected) in cases {
+            let error = match manager
+                .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                    node_name: "worker-a".to_string(),
+                    overlay_interface: "ipars0".to_string(),
+                    api_server_cidrs: api_server_cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    service_cidrs: service_cidrs
+                        .into_iter()
+                        .map(str::parse)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    route_provider: NodeId::from_string("route-provider-a"),
+                })
+                .await
+            {
+                Ok(plan) => {
+                    return Err(
+                        format!("invalid Kubernetes CIDR should be rejected: {plan:?}").into(),
+                    );
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, RouteManagerError::InvalidKubernetesUnderlayIntent(ref message) if message.contains(expected)),
+                "unexpected error: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -1513,6 +2421,80 @@ mod tests {
                 ),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_rejects_invalid_docker_intent_before_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let error = match manager
+            .apply_docker_intent(DockerNetworkIntent {
+                container_namespace: "container-a".to_string(),
+                host_interface: "eth0".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                container_cidrs: vec!["172.18.0.1/16".parse()?],
+                expose_host_routes: true,
+            })
+            .await
+        {
+            Ok(plan) => {
+                return Err(format!(
+                    "invalid Docker intent should fail before route commands: {plan:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                RouteManagerError::InvalidDockerNetworkIntent(ref message)
+                    if message.contains("canonical Docker container CIDR route 172.18.0.0/16")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(runner.commands().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_rejects_invalid_kubernetes_intent_before_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let error = match manager
+            .apply_kubernetes_intent(KubernetesUnderlayIntent {
+                node_name: "worker-a".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                api_server_cidrs: Vec::new(),
+                service_cidrs: vec!["10.96.0.1/12".parse()?],
+                route_provider: NodeId::from_string("route-provider-a"),
+            })
+            .await
+        {
+            Ok(plan) => {
+                return Err(format!(
+                    "invalid Kubernetes intent should fail before route commands: {plan:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                RouteManagerError::InvalidKubernetesUnderlayIntent(ref message)
+                    if message.contains("canonical Kubernetes Service CIDR route 10.96.0.0/12")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(runner.commands().await.is_empty());
         Ok(())
     }
 }

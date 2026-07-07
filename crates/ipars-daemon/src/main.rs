@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fmt::{self, Write as _};
 use std::io::{Read, SeekFrom};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -17,10 +18,11 @@ use aya::programs::TracePoint;
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
-    AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommandRunner,
-    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, RelayForwarderStats, RelaySessionState,
-    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
+    AgentError, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend, LinuxCommand,
+    LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
+    NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier, PeerMapSink, PeerMapSource,
+    PeerMapSync, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
+    TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder, UserspaceWireGuardBackend,
     WireGuardBackend,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
@@ -30,25 +32,34 @@ use ipars_control_plane::{
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 use ipars_crypto::IdentityKeyPair;
-use ipars_relay::{RelayService, UdpRelay};
+use ipars_relay::{
+    encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
+};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_route_manager::{
-    kubernetes_route_plan, DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
+    checked_docker_route_plan, checked_kubernetes_route_plan, kubernetes_route_plan,
+    DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
     LinuxNetlinkRouteManager, LinuxNetworkNamespace, LinuxRouteCommandRunner, LinuxRouteManager,
-    NamespacedLinuxRouteCommandRunner, RouteManager, TimedSystemRouteCommandRunner,
+    NamespacedLinuxRouteCommandRunner, RouteManager, RouteManagerError, RoutePlan,
+    TimedSystemRouteCommandRunner,
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
-use ipars_stun::BindingStunServer;
+use ipars_stun::{
+    BindingStunServer, Rfc5780StunServer, StunServerMetricsSnapshot, StunServerStats,
+};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowClassification,
-    AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason, AgentPacketFlowObservation,
-    AgentPacketFlowTcpState, AgentRelayForwarderMetrics, ControlPlaneMetricsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
+    AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
+    AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowObservation,
+    AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics,
+    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
+    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse, StunMetricsResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -64,9 +75,10 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    AclRule, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    KeyId, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route,
-    SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpointKind,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
+    NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
+    Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -94,6 +106,7 @@ const CAP_SYS_ADMIN_BIT: u8 = 21;
 const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -103,13 +116,43 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES: usize = 2048;
 const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
+const MAX_PACKET_FLOW_EBPF_ATTACH_SPECS: usize = 32;
+const MAX_PACKET_FLOW_READ_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
+const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
+const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
+const MAX_PACKET_FLOW_DEDUP_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_PACKET_FLOW_DEDUP_FINGERPRINTS: usize = 1_048_576;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
+const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
+const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
+const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+const MAX_EBPF_TRACEPOINT_ID_BYTES: usize = 64;
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
     "/sys/kernel/tracing/events",
     "/sys/kernel/debug/tracing/events",
 ];
+
+macro_rules! prometheus_line {
+    ($body:expr, $($arg:tt)*) => {{
+        let _ = writeln!($body, $($arg)*);
+    }};
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "iparsd")]
@@ -250,6 +293,8 @@ struct ControlPlaneArgs {
         default_value_t = 120
     )]
     endpoint_candidate_ttl_seconds: u64,
+    #[arg(long, env = "IPARS_PATH_STATE_TTL_SECONDS", default_value_t = 600)]
+    path_state_ttl_seconds: u64,
     #[arg(long, env = "IPARS_DATABASE_URL")]
     database_url: Option<String>,
     #[arg(long, env = "IPARS_ISSUER_NODE_ID")]
@@ -335,6 +380,10 @@ struct SignalArgs {
 struct StunArgs {
     #[arg(long, env = "IPARS_STUN_LISTEN", default_value = "0.0.0.0:3478")]
     listen: SocketAddr,
+    #[arg(long, env = "IPARS_STUN_ALTERNATE_LISTEN")]
+    alternate_listen: Option<SocketAddr>,
+    #[arg(long, env = "IPARS_STUN_HTTP_LISTEN", default_value = "0.0.0.0:3479")]
+    http_listen: SocketAddr,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -351,10 +400,20 @@ struct RelayArgs {
     admission_url: Option<String>,
     #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     max_sessions: u32,
+    #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS_PER_NODE", default_value_t = 0)]
+    max_sessions_per_node: u32,
     #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
     max_mbps: u32,
     #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
     session_ttl_seconds: u64,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_RATE_LIMIT", default_value_t = 4096)]
+    admission_rate_limit: u32,
+    #[arg(
+        long,
+        env = "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
+        default_value_t = 60
+    )]
+    admission_rate_limit_window_seconds: u64,
     #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
     admission_bearer_token: Option<String>,
 }
@@ -589,6 +648,26 @@ struct AgentArgs {
         default_value_t = WireGuardApplyBackend::Command
     )]
     wireguard_backend: WireGuardApplyBackend,
+    #[arg(long, env = "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND")]
+    userspace_wireguard_command: Option<String>,
+    #[arg(
+        long = "userspace-wireguard-arg",
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS",
+        value_delimiter = ','
+    )]
+    userspace_wireguard_args: Vec<String>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+        default_value_t = 10
+    )]
+    userspace_wireguard_ready_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+        default_value_t = 5
+    )]
+    userspace_wireguard_shutdown_timeout_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_ROUTE_BACKEND",
@@ -749,6 +828,8 @@ enum WireGuardApplyBackend {
     Command,
     #[value(name = "kernel-netlink")]
     KernelNetlink,
+    #[value(name = "userspace-command")]
+    UserspaceCommand,
 }
 
 impl WireGuardApplyBackend {
@@ -756,6 +837,7 @@ impl WireGuardApplyBackend {
         match self {
             Self::Command => "command",
             Self::KernelNetlink => "kernel-netlink",
+            Self::UserspaceCommand => "userspace-command",
         }
     }
 }
@@ -820,10 +902,13 @@ impl PacketFlowDetector {
 struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
+    userspace_wireguard_command: bool,
     route_netlink: bool,
     generic_netlink: bool,
     netfilter_netlink: bool,
     docker_api_socket: bool,
+    conntrack_procfs_path: bool,
+    ebpf_jsonl_event_path: bool,
     ipv4_forwarding: bool,
     ipv6_forwarding: bool,
     cap_net_admin: bool,
@@ -832,6 +917,7 @@ struct RuntimePreflightNeeds {
     cap_perfmon: bool,
     cap_bpf: bool,
     linux_netns: bool,
+    relay_forwarder_netns: bool,
 }
 
 impl RuntimePreflightNeeds {
@@ -839,10 +925,13 @@ impl RuntimePreflightNeeds {
         Self {
             ip_command: false,
             wg_command: false,
+            userspace_wireguard_command: false,
             route_netlink: false,
             generic_netlink: false,
             netfilter_netlink: false,
             docker_api_socket: false,
+            conntrack_procfs_path: false,
+            ebpf_jsonl_event_path: false,
             ipv4_forwarding: false,
             ipv6_forwarding: false,
             cap_net_admin: false,
@@ -851,16 +940,20 @@ impl RuntimePreflightNeeds {
             cap_perfmon: false,
             cap_bpf: false,
             linux_netns: false,
+            relay_forwarder_netns: false,
         }
     }
 
     fn is_empty(self) -> bool {
         !self.ip_command
             && !self.wg_command
+            && !self.userspace_wireguard_command
             && !self.route_netlink
             && !self.generic_netlink
             && !self.netfilter_netlink
             && !self.docker_api_socket
+            && !self.conntrack_procfs_path
+            && !self.ebpf_jsonl_event_path
             && !self.ipv4_forwarding
             && !self.ipv6_forwarding
             && !self.cap_net_admin
@@ -869,6 +962,7 @@ impl RuntimePreflightNeeds {
             && !self.cap_perfmon
             && !self.cap_bpf
             && !self.linux_netns
+            && !self.relay_forwarder_netns
     }
 }
 
@@ -909,6 +1003,7 @@ struct RuntimePreflightChecks {
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
     docker_api_socket: fn(&Path) -> anyhow::Result<()>,
+    conntrack_procfs_path: fn(&Path) -> anyhow::Result<()>,
     ipv4_forwarding: fn() -> anyhow::Result<()>,
     ipv6_forwarding: fn() -> anyhow::Result<()>,
 }
@@ -926,6 +1021,7 @@ impl RuntimePreflightChecks {
             linux_netns: ensure_linux_netns_ready,
             netlink: ensure_netlink_protocol_ready,
             docker_api_socket: ensure_docker_api_socket_ready,
+            conntrack_procfs_path: ensure_conntrack_procfs_path_ready,
             ipv4_forwarding: ensure_ipv4_forwarding_if_known,
             ipv6_forwarding: ensure_ipv6_forwarding_if_known,
         }
@@ -1076,6 +1172,13 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.wg_command {
         ensure_program_in_path("wg", path)?;
     }
+    if needs.userspace_wireguard_command {
+        let command = args
+            .userspace_wireguard_command
+            .as_deref()
+            .context("userspace WireGuard command preflight requested without command")?;
+        ensure_runtime_program_ready(command, path)?;
+    }
     if needs.route_netlink {
         (checks.netlink)(RuntimeNetlinkProtocol::Route)?;
     }
@@ -1088,6 +1191,20 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.docker_api_socket {
         let socket = docker_api_socket_path(args)?;
         (checks.docker_api_socket)(&socket)?;
+    }
+    if needs.conntrack_procfs_path {
+        let path = args
+            .packet_flow_conntrack_path
+            .as_deref()
+            .context("--packet-flow-conntrack-path is required")?;
+        (checks.conntrack_procfs_path)(path)?;
+    }
+    if needs.ebpf_jsonl_event_path {
+        let event_path = args
+            .packet_flow_ebpf_event_path
+            .as_deref()
+            .context("--packet-flow-ebpf-event-path is required")?;
+        ensure_ebpf_jsonl_event_path_ready(event_path)?;
     }
     if needs.ipv4_forwarding {
         (checks.ipv4_forwarding)()?;
@@ -1125,6 +1242,15 @@ fn preflight_agent_runtime_with_path_and_checks(
         let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
         (checks.linux_netns)(&namespace)?;
     }
+    if needs.relay_forwarder_netns {
+        let namespace_name = args
+            .relay_forwarder_netns
+            .as_deref()
+            .or(args.linux_netns.as_deref())
+            .context("relay forwarder namespace preflight requested without --relay-forwarder-netns or --linux-netns")?;
+        let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
+        (checks.linux_netns)(&namespace)?;
+    }
 
     tracing::info!(
         backend = args.runtime_backend.as_str(),
@@ -1132,10 +1258,13 @@ fn preflight_agent_runtime_with_path_and_checks(
         route_backend = args.route_backend.as_str(),
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
+        needs_userspace_wireguard_command = needs.userspace_wireguard_command,
         needs_route_netlink = needs.route_netlink,
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
         needs_docker_api_socket = needs.docker_api_socket,
+        needs_conntrack_procfs_path = needs.conntrack_procfs_path,
+        needs_ebpf_jsonl_event_path = needs.ebpf_jsonl_event_path,
         needs_ipv4_forwarding = needs.ipv4_forwarding,
         needs_ipv6_forwarding = needs.ipv6_forwarding,
         needs_cap_net_admin = needs.cap_net_admin,
@@ -1143,7 +1272,9 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_cap_sys_admin = needs.cap_sys_admin,
         needs_cap_perfmon = needs.cap_perfmon,
         needs_cap_bpf = needs.cap_bpf,
+        needs_relay_forwarder_netns = needs.relay_forwarder_netns,
         linux_netns = ?args.linux_netns,
+        relay_forwarder_netns = ?args.relay_forwarder_netns,
         "runtime backend preflight passed"
     );
     Ok(())
@@ -1178,61 +1309,82 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.relay_session_renew_before_seconds,
             "--relay-session-renew-before-seconds",
         )?;
+        validate_positive_usize(args.hole_punch_attempts, "--hole-punch-attempts")?;
+        validate_positive_millis(
+            args.hole_punch_interval_millis,
+            "--hole-punch-interval-millis",
+        )?;
     }
-    validate_positive_seconds(
+    validate_bounded_u64(
         args.runtime_command_timeout_seconds,
         "--runtime-command-timeout-seconds",
+        MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS,
     )?;
+    validate_userspace_wireguard_config(args)?;
+    validate_runtime_backend_specific_args(args)?;
     validate_positive_usize(
         args.runtime_command_output_max_bytes,
         "--runtime-command-output-max-bytes",
     )?;
+    anyhow::ensure!(
+        args.runtime_command_output_max_bytes <= MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES,
+        "--runtime-command-output-max-bytes must not exceed {MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES}"
+    );
     if args.packet_flow_detector != PacketFlowDetector::Disabled {
         validate_positive_seconds(
             args.packet_flow_poll_interval_seconds,
             "--packet-flow-poll-interval-seconds",
         )?;
     }
+    validate_packet_flow_dedup_ttl_seconds(args.packet_flow_dedup_ttl_seconds)?;
+    validate_packet_flow_detector_specific_args(args)?;
     if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_bytes > 0,
-            "--packet-flow-procfs-max-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_line_bytes > 0,
-            "--packet-flow-procfs-max-line-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_procfs_max_flows > 0,
-            "--packet-flow-procfs-max-flows must be greater than zero"
-        );
+        validate_bounded_u64(
+            args.packet_flow_procfs_max_bytes,
+            "--packet-flow-procfs-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_line_bytes,
+            "--packet-flow-procfs-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_flows,
+            "--packet-flow-procfs-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if matches!(
         args.packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     ) {
-        anyhow::ensure!(
-            args.packet_flow_netlink_max_flows > 0,
-            "--packet-flow-netlink-max-flows must be greater than zero"
-        );
+        validate_bounded_usize(
+            args.packet_flow_netlink_max_flows,
+            "--packet-flow-netlink-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if args.packet_flow_detector == PacketFlowDetector::EbpfJsonl {
         anyhow::ensure!(
             args.packet_flow_ebpf_event_path.is_some(),
             "--packet-flow-ebpf-event-path is required when --packet-flow-detector ebpf-jsonl is set"
         );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_bytes > 0,
-            "--packet-flow-ebpf-event-max-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_line_bytes > 0,
-            "--packet-flow-ebpf-event-max-line-bytes must be greater than zero"
-        );
-        anyhow::ensure!(
-            args.packet_flow_ebpf_event_max_flows > 0,
-            "--packet-flow-ebpf-event-max-flows must be greater than zero"
-        );
+        validate_bounded_u64(
+            args.packet_flow_ebpf_event_max_bytes,
+            "--packet-flow-ebpf-event-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_line_bytes,
+            "--packet-flow-ebpf-event-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_flows,
+            "--packet-flow-ebpf-event-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
     }
     if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
         anyhow::ensure!(
@@ -1247,13 +1399,12 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             !args.packet_flow_ebpf_attach.is_empty(),
             "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
         );
-        for attach in &args.packet_flow_ebpf_attach {
-            EbpfTracepointAttachSpec::parse(attach)?;
-        }
-        anyhow::ensure!(
-            args.packet_flow_ebpf_ringbuf_max_events > 0,
-            "--packet-flow-ebpf-ringbuf-max-events must be greater than zero"
-        );
+        validate_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_ringbuf_max_events,
+            "--packet-flow-ebpf-ringbuf-max-events",
+            MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE,
+        )?;
     }
     if args.apply_docker_routes {
         validate_linux_interface_name(&args.docker_host_interface)?;
@@ -1261,11 +1412,31 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.docker_route_interval_seconds,
             "--docker-route-interval-seconds",
         )?;
+        if let Some(namespace) = args.docker_container_namespace.as_deref() {
+            LinuxNetworkNamespace::from_name(namespace)?;
+        }
         if args.docker_discover_networks {
             validate_docker_discovery_config(args)?;
+        } else if args.docker_api_socket.is_some() {
+            anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
         } else if !args.docker_networks.is_empty() {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
+        } else {
+            anyhow::ensure!(
+                args.docker_container_namespace.is_some(),
+                "--apply-docker-routes requires --docker-container-namespace unless --docker-discover-networks is set"
+            );
+            anyhow::ensure!(
+                !args.docker_container_cidrs.is_empty(),
+                "--apply-docker-routes requires at least one --docker-container-cidr unless --docker-discover-networks is set"
+            );
+            validate_docker_container_cidrs(
+                "--docker-container-cidr",
+                &args.docker_container_cidrs,
+            )?;
         }
+    } else {
+        validate_inactive_docker_route_config(args)?;
     }
     if args.apply_kubernetes_underlay {
         validate_kubernetes_underlay_config(args)?;
@@ -1277,18 +1448,267 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         LinuxNetworkNamespace::from_name(namespace)?;
     }
     validate_agent_relay_capability_config(args)?;
-    if args.relay_forwarder_bind.is_some() && args.relay_forwarder_max_sessions == 0 {
-        anyhow::bail!(
-            "--relay-forwarder-max-sessions must be greater than zero when --relay-forwarder-bind is set"
-        );
-    }
+    validate_relay_forwarder_config(args)?;
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
     }
     Ok(())
 }
 
+fn validate_runtime_backend_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
+    let applies_wireguard = args.apply_peer_map;
+    let applies_routes =
+        args.apply_peer_map || args.apply_docker_routes || args.apply_kubernetes_underlay;
+    let manages_userspace_wireguard = args.userspace_wireguard_command.is_some();
+    let uses_relay_forwarder_namespace = args.relay_forwarder_bind.is_some();
+
+    if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
+        anyhow::ensure!(
+            args.wireguard_backend == WireGuardApplyBackend::Command,
+            "--wireguard-backend requires --runtime-backend linux-command"
+        );
+        anyhow::ensure!(
+            args.route_backend == RouteApplyBackend::Command,
+            "--route-backend requires --runtime-backend linux-command"
+        );
+    }
+
+    if args.wireguard_backend == WireGuardApplyBackend::KernelNetlink {
+        anyhow::ensure!(
+            applies_wireguard,
+            "--wireguard-backend kernel-netlink requires --apply-peer-map"
+        );
+    }
+    if args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand {
+        anyhow::ensure!(
+            applies_wireguard || manages_userspace_wireguard,
+            "--wireguard-backend userspace-command requires --apply-peer-map or --userspace-wireguard-command"
+        );
+    }
+    if args.route_backend == RouteApplyBackend::KernelNetlink {
+        anyhow::ensure!(
+            applies_routes,
+            "--route-backend kernel-netlink requires --apply-peer-map, --apply-docker-routes, or --apply-kubernetes-underlay"
+        );
+    }
+    if args.linux_netns.is_some() {
+        let uses_linux_netns = args.runtime_backend == AgentRuntimeBackend::LinuxCommand
+            && (applies_routes || manages_userspace_wireguard);
+        anyhow::ensure!(
+            uses_linux_netns || uses_relay_forwarder_namespace,
+            "--linux-netns requires an active Linux dataplane loop, --userspace-wireguard-command, or --relay-forwarder-bind"
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_packet_flow_ebpf_attach_specs(values: &[String]) -> anyhow::Result<()> {
+    let _ = parse_packet_flow_ebpf_attach_specs(values)?;
+    Ok(())
+}
+
+fn parse_packet_flow_ebpf_attach_specs(
+    values: &[String],
+) -> anyhow::Result<Vec<EbpfTracepointAttachSpec>> {
+    anyhow::ensure!(
+        values.len() <= MAX_PACKET_FLOW_EBPF_ATTACH_SPECS,
+        "--packet-flow-ebpf-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_ATTACH_SPECS} times"
+    );
+    let mut seen = BTreeSet::new();
+    let mut specs = Vec::with_capacity(values.len());
+    for value in values {
+        let spec = EbpfTracepointAttachSpec::parse(value)?;
+        let key = (
+            spec.program.clone(),
+            spec.category.clone(),
+            spec.name.clone(),
+        );
+        anyhow::ensure!(
+            seen.insert(key.clone()),
+            "--packet-flow-ebpf-attach must not repeat {}:{}:{}",
+            key.0,
+            key.1,
+            key.2
+        );
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.packet_flow_detector != PacketFlowDetector::ProcNetConntrack {
+        anyhow::ensure!(
+            args.packet_flow_conntrack_path.is_none(),
+            "--packet-flow-conntrack-path requires --packet-flow-detector proc-net-conntrack"
+        );
+    }
+    if args.packet_flow_detector != PacketFlowDetector::EbpfJsonl {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_event_path.is_none(),
+            "--packet-flow-ebpf-event-path requires --packet-flow-detector ebpf-jsonl"
+        );
+    }
+    if args.packet_flow_detector != PacketFlowDetector::EbpfRingbuf {
+        anyhow::ensure!(
+            args.packet_flow_ebpf_object_path.is_none(),
+            "--packet-flow-ebpf-object-path requires --packet-flow-detector ebpf-ringbuf"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_attach.is_empty(),
+            "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf"
+        );
+    }
+    if args.packet_flow_detector == PacketFlowDetector::Disabled {
+        anyhow::ensure!(
+            !args.packet_flow_pin,
+            "--packet-flow-pin requires --packet-flow-detector to be enabled"
+        );
+    }
+    Ok(())
+}
+
+fn validate_packet_flow_dedup_ttl_seconds(value: u64) -> anyhow::Result<()> {
+    if value > MAX_PACKET_FLOW_DEDUP_TTL_SECONDS {
+        anyhow::bail!(
+            "--packet-flow-dedup-ttl-seconds must not exceed {MAX_PACKET_FLOW_DEDUP_TTL_SECONDS}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_relay_forwarder_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if let Some(endpoint) = args.relay_forwarder_endpoint {
+        validate_usable_socket_endpoint(endpoint, "--relay-forwarder-endpoint")?;
+    }
+
+    if args.relay_forwarder_bind.is_some() {
+        let wireguard_endpoint = args.relay_forwarder_wireguard_endpoint.context(
+            "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
+        )?;
+        validate_usable_socket_endpoint(
+            wireguard_endpoint,
+            "--relay-forwarder-wireguard-endpoint",
+        )?;
+        validate_positive_usize(
+            args.relay_forwarder_max_sessions,
+            "--relay-forwarder-max-sessions",
+        )?;
+        validate_positive_seconds(
+            args.relay_forwarder_restart_backoff_seconds,
+            "--relay-forwarder-restart-backoff-seconds",
+        )?;
+        validate_positive_seconds(
+            args.relay_forwarder_crash_window_seconds,
+            "--relay-forwarder-crash-window-seconds",
+        )?;
+        if args.relay_forwarder_max_crashes_per_window == 0 {
+            anyhow::bail!("--relay-forwarder-max-crashes-per-window must be greater than zero");
+        }
+        validate_positive_seconds(
+            args.relay_forwarder_crash_cooldown_seconds,
+            "--relay-forwarder-crash-cooldown-seconds",
+        )?;
+    } else {
+        anyhow::ensure!(
+            args.relay_forwarder_wireguard_endpoint.is_none(),
+            "--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind"
+        );
+        anyhow::ensure!(
+            args.relay_forwarder_netns.is_none(),
+            "--relay-forwarder-netns requires --relay-forwarder-bind"
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_usable_socket_endpoint(endpoint: SocketAddr, label: &str) -> anyhow::Result<()> {
+    if !endpoint_addr_is_usable(endpoint) {
+        anyhow::bail!(
+            "{label} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
+    }
+    Ok(())
+}
+
+fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
+    validate_bounded_u64(
+        args.userspace_wireguard_ready_timeout_seconds,
+        "--userspace-wireguard-ready-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
+    )?;
+    validate_bounded_u64(
+        args.userspace_wireguard_shutdown_timeout_seconds,
+        "--userspace-wireguard-shutdown-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
+    )?;
+
+    let has_userspace_process_config =
+        args.userspace_wireguard_command.is_some() || !args.userspace_wireguard_args.is_empty();
+    if !has_userspace_process_config {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.runtime_backend == AgentRuntimeBackend::LinuxCommand,
+        "--userspace-wireguard-command and --userspace-wireguard-arg require --runtime-backend linux-command"
+    );
+    anyhow::ensure!(
+        args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand,
+        "--userspace-wireguard-command and --userspace-wireguard-arg require --wireguard-backend userspace-command"
+    );
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        validate_runtime_program_token(command, "--userspace-wireguard-command")?;
+    } else {
+        anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
+    }
+    anyhow::ensure!(
+        args.userspace_wireguard_args.len() <= MAX_USERSPACE_WIREGUARD_ARGS,
+        "--userspace-wireguard-arg may be repeated at most {MAX_USERSPACE_WIREGUARD_ARGS} times"
+    );
+    for argument in &args.userspace_wireguard_args {
+        if argument.is_empty() {
+            anyhow::bail!("--userspace-wireguard-arg cannot be empty");
+        }
+        if argument.len() > MAX_USERSPACE_WIREGUARD_ARG_BYTES {
+            anyhow::bail!(
+                "--userspace-wireguard-arg exceeds {MAX_USERSPACE_WIREGUARD_ARG_BYTES} bytes"
+            );
+        }
+        if argument.chars().any(char::is_control) {
+            anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_RUNTIME_PROGRAM_TOKEN_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_RUNTIME_PROGRAM_TOKEN_BYTES} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{label} must not contain whitespace");
+    }
+    if value.contains('/') && !Path::new(value).is_absolute() {
+        anyhow::bail!("{label} must be a bare command name or an absolute path");
+    }
+    Ok(())
+}
+
 fn validate_positive_seconds(value: u64, name: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_positive_millis(value: u64, name: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than zero");
     }
@@ -1309,6 +1729,26 @@ fn validate_positive_usize(value: usize, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_bounded_u64(value: u64, name: &str, max: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{name} must not exceed {max}");
+    }
+    Ok(())
+}
+
+fn validate_bounded_usize(value: usize, name: &str, max: usize) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{name} must not exceed {max}");
+    }
+    Ok(())
+}
+
 fn validate_relay_admission_bearer_token(value: &str, name: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{name} cannot be empty");
@@ -1321,6 +1761,22 @@ fn validate_relay_admission_bearer_token(value: &str, name: &str) -> anyhow::Res
         .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         anyhow::bail!("{name} must not contain whitespace or control characters");
+    }
+    Ok(())
+}
+
+fn validate_daemon_identifier(value: &str, name: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{name} cannot be empty");
+    }
+    if value.len() > MAX_DAEMON_IDENTIFIER_BYTES {
+        anyhow::bail!("{name} exceeds {MAX_DAEMON_IDENTIFIER_BYTES} bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("{name} must contain only ASCII letters, digits, '_', '.' or '-'");
     }
     Ok(())
 }
@@ -1357,6 +1813,9 @@ fn validate_agent_relay_capability_config(args: &AgentArgs) -> anyhow::Result<()
             "--relay-public-endpoint and --relay-admission-url must be set together for relay capability advertisement"
         );
     }
+    if let Some(public_endpoint) = args.relay_public_endpoint {
+        validate_usable_socket_endpoint(public_endpoint, "--relay-public-endpoint")?;
+    }
     if let Some(admission_url) = args.relay_admission_url.as_deref() {
         validate_http_url(admission_url, "--relay-admission-url")?;
     }
@@ -1385,6 +1844,11 @@ fn validate_http_url(value: &str, name: &str) -> anyhow::Result<()> {
     if url.host_str().is_none() {
         anyhow::bail!("{name} must include a host");
     }
+    if !http_url_is_usable_endpoint(value) {
+        anyhow::bail!(
+            "{name} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        );
+    }
     Ok(())
 }
 
@@ -1393,21 +1857,34 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         args.packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
+    let conntrack_procfs_path = args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack
+        && args.packet_flow_conntrack_path.is_some();
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
+    let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
+    let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
+        && (args.relay_forwarder_netns.is_some() || args.linux_netns.is_some());
     if args.runtime_backend == AgentRuntimeBackend::DryRun {
         return RuntimePreflightNeeds {
             netfilter_netlink,
             docker_api_socket,
+            conntrack_procfs_path,
+            ebpf_jsonl_event_path: ebpf_jsonl,
             cap_net_admin: netfilter_netlink,
+            cap_sys_admin: relay_forwarder_netns,
             cap_perfmon: ebpf_ringbuf,
             cap_bpf: ebpf_ringbuf,
+            relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
         };
     }
     if args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
         return RuntimePreflightNeeds {
             docker_api_socket,
+            conntrack_procfs_path,
+            ebpf_jsonl_event_path: ebpf_jsonl,
+            cap_sys_admin: relay_forwarder_netns,
+            relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
         };
     }
@@ -1418,27 +1895,45 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_routes && args.route_backend == RouteApplyBackend::Command;
     let applies_wireguard_with_command =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::Command;
+    let applies_wireguard_with_userspace_command =
+        applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand;
     let applies_routes_with_netlink =
         applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
     let applies_wireguard_with_netlink =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::KernelNetlink;
+    let starts_userspace_wireguard = args.userspace_wireguard_command.is_some();
+    let uses_namespaced_userspace_wireguard_commands = args.linux_netns.is_some()
+        && (applies_wireguard_with_userspace_command || starts_userspace_wireguard);
     let ipv4_forwarding = agent_routes_may_forward_ipv4(args);
     let ipv6_forwarding = agent_routes_may_forward_ipv6(args);
     RuntimePreflightNeeds {
-        ip_command: applies_routes_with_command || applies_wireguard_with_command,
-        wg_command: applies_wireguard_with_command,
+        ip_command: applies_routes_with_command
+            || applies_wireguard_with_command
+            || uses_namespaced_userspace_wireguard_commands,
+        wg_command: applies_wireguard_with_command
+            || applies_wireguard_with_userspace_command
+            || starts_userspace_wireguard,
+        userspace_wireguard_command: starts_userspace_wireguard,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
         docker_api_socket,
+        conntrack_procfs_path,
+        ebpf_jsonl_event_path: ebpf_jsonl,
         ipv4_forwarding,
         ipv6_forwarding,
-        cap_net_admin: applies_routes || applies_wireguard || netfilter_netlink,
-        cap_net_raw: applies_wireguard,
-        cap_sys_admin: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        cap_net_admin: applies_routes
+            || (applies_wireguard && !applies_wireguard_with_userspace_command)
+            || netfilter_netlink,
+        cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
+        cap_sys_admin: (args.linux_netns.is_some()
+            && (applies_routes || applies_wireguard || starts_userspace_wireguard))
+            || relay_forwarder_netns,
         cap_perfmon: ebpf_ringbuf,
         cap_bpf: ebpf_ringbuf,
-        linux_netns: args.linux_netns.is_some() && (applies_routes || applies_wireguard),
+        linux_netns: args.linux_netns.is_some()
+            && (applies_routes || applies_wireguard || starts_userspace_wireguard),
+        relay_forwarder_netns,
     }
 }
 
@@ -1507,15 +2002,157 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
 
 fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_docker_api_version(&args.docker_api_version)?;
-    for filter in &args.docker_networks {
-        validate_docker_network_filter(filter)?;
+    if let Some(socket) = args.docker_api_socket.as_deref() {
+        validate_docker_api_socket_path(socket, "--docker-api-socket")?;
     }
+    validate_docker_network_filters(&args.docker_networks)?;
     if !args.docker_container_cidrs.is_empty() {
         anyhow::bail!(
             "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
         );
     }
     Ok(())
+}
+
+fn validate_inactive_docker_route_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.docker_discover_networks {
+        anyhow::bail!("--docker-discover-networks requires --apply-docker-routes");
+    }
+    if args.docker_api_socket.is_some() {
+        anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+    }
+    if !args.docker_networks.is_empty() {
+        anyhow::bail!("--docker-network requires --docker-discover-networks");
+    }
+    if args.docker_container_namespace.is_some() {
+        anyhow::bail!("--docker-container-namespace requires --apply-docker-routes");
+    }
+    if !args.docker_container_cidrs.is_empty() {
+        anyhow::bail!("--docker-container-cidr requires --apply-docker-routes");
+    }
+    if args.docker_host_interface != "docker0" {
+        anyhow::bail!("--docker-host-interface requires --apply-docker-routes");
+    }
+    if args.docker_route_interval_seconds != 60 {
+        anyhow::bail!("--docker-route-interval-seconds requires --apply-docker-routes");
+    }
+    if !args.docker_expose_host_routes {
+        anyhow::bail!("--docker-expose-host-routes=false requires --apply-docker-routes");
+    }
+    Ok(())
+}
+
+fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!(
+                "{flag} must use canonical Docker container CIDR route {route}, not {cidr}"
+            );
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping Docker container CIDR routes {overlap} and {route}"
+            );
+        }
+        routes.push(route);
+    }
+    Ok(())
+}
+
+fn restricted_route_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        ipnet::IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        ipnet::IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ip_cidrs_overlap(left: &ipnet::IpNet, right: &ipnet::IpNet) -> bool {
+    match (left, right) {
+        (ipnet::IpNet::V4(left), ipnet::IpNet::V4(right)) => ipv4_cidrs_overlap(left, right),
+        (ipnet::IpNet::V6(left), ipnet::IpNet::V6(right)) => ipv6_cidrs_overlap(left, right),
+        _ => false,
+    }
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 fn validate_docker_api_version(version: &str) -> anyhow::Result<()> {
@@ -1551,6 +2188,17 @@ fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
     validate_docker_network_token(filter, "Docker network filter")
 }
 
+fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for filter in filters {
+        validate_docker_network_filter(filter)?;
+        if !seen.insert(filter.as_str()) {
+            anyhow::bail!("--docker-network `{filter}` must not be repeated");
+        }
+    }
+    Ok(())
+}
+
 fn validate_docker_network_name(name: &str) -> anyhow::Result<()> {
     validate_docker_network_token(name, "Docker network name")
 }
@@ -1576,11 +2224,21 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.kubernetes_route_interval_seconds,
         "--kubernetes-route-interval-seconds",
     )?;
+    let mut namespaces = BTreeSet::new();
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
+        if !namespaces.insert(namespace.as_str()) {
+            anyhow::bail!("--kubernetes-namespace `{namespace}` must not be repeated");
+        }
     }
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
+    }
+    if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        validate_daemon_identifier(route_provider, "--kubernetes-route-provider")?;
+    }
+    if let Some(api_url) = args.kubernetes_api_url.as_deref() {
+        validate_http_url(api_url, "--kubernetes-api-url")?;
     }
     if !args.kubernetes_discover_services {
         if !args.kubernetes_namespaces.is_empty() {
@@ -1590,6 +2248,45 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
             anyhow::bail!(
                 "--kubernetes-service-label-selector requires --kubernetes-discover-services"
             );
+        }
+        if args.kubernetes_api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
+            anyhow::bail!(
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr unless --kubernetes-discover-services is set"
+            );
+        }
+    }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
+    Ok(())
+}
+
+fn validate_kubernetes_underlay_route_cidrs(
+    flag: &str,
+    label: &str,
+    cidrs: &[ipnet::IpNet],
+    seen: &mut BTreeSet<ipnet::IpNet>,
+) -> anyhow::Result<()> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} {label} {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical {label} route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Kubernetes underlay route CIDR {route}");
         }
     }
     Ok(())
@@ -1635,14 +2332,34 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
 }
 
 fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
-    if program_exists_in_path(program, path) {
+    if program_ready_in_path(program, path) {
         Ok(())
     } else {
-        anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
+        anyhow::bail!(
+            "missing required Linux runtime command `{program}` in PATH; expected an executable regular file"
+        );
     }
 }
 
-fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
+fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    validate_runtime_program_token(program, "configured userspace WireGuard command")?;
+    if program.contains('/') {
+        let program_path = Path::new(program);
+        anyhow::ensure!(
+            program_path.is_absolute(),
+            "configured userspace WireGuard command `{program}` must be a bare command name or an absolute path"
+        );
+        if is_executable_file(program_path) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "configured userspace WireGuard command `{program}` is not an executable file"
+        );
+    }
+    ensure_program_in_path(program, path)
+}
+
+fn program_ready_in_path(program: &str, path: Option<&OsStr>) -> bool {
     let Some(path) = path else {
         return false;
     };
@@ -1653,14 +2370,18 @@ fn program_exists_in_path(program: &str, path: Option<&OsStr>) -> bool {
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    path.symlink_metadata()
+        .map(|metadata| {
+            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
+    path.symlink_metadata()
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
@@ -1729,6 +2450,58 @@ fn ensure_ebpf_object_file_ready(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_ebpf_jsonl_event_path_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "eBPF packet-flow JSONL event path {} is not readable",
+                    path.display()
+                )
+            })
+        }
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "eBPF packet-flow JSONL event path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "eBPF packet-flow JSONL event path {} must be a regular file when it exists",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_conntrack_procfs_path_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "conntrack procfs packet-flow path {} is not readable",
+                    path.display()
+                )
+            })
+        }
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "conntrack procfs packet-flow path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "conntrack procfs packet-flow path {} must be a regular file when it exists",
+        path.display()
+    );
+    Ok(())
+}
+
 fn ensure_docker_api_socket_ready(path: &Path) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("Docker API socket {} is not readable", path.display()))?;
@@ -1774,8 +2547,20 @@ fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
             .join(&attachment.name)
             .join("id");
         checked.push(tracepoint_id.display().to_string());
-        match std::fs::metadata(&tracepoint_id) {
-            Ok(metadata) if metadata.is_file() => return Ok(()),
+        match std::fs::symlink_metadata(&tracepoint_id) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "eBPF tracepoint `{}/{}` for program `{}` has symlink id path {}",
+                    attachment.category,
+                    attachment.name,
+                    attachment.program,
+                    tracepoint_id.display()
+                );
+            }
+            Ok(metadata) if metadata.is_file() => {
+                validate_ebpf_tracepoint_id_file(attachment, &tracepoint_id)?;
+                return Ok(());
+            }
             Ok(_) => {
                 anyhow::bail!(
                     "eBPF tracepoint `{}/{}` for program `{}` has non-file id path {}",
@@ -1806,6 +2591,81 @@ fn ensure_ebpf_tracepoint_ready_in_roots<'a>(
         attachment.program,
         checked.join(", ")
     )
+}
+
+fn validate_ebpf_tracepoint_id_file(
+    attachment: &EbpfTracepointAttachSpec,
+    path: &Path,
+) -> anyhow::Result<u64> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open eBPF tracepoint `{}/{}` id for program `{}` at {}",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_EBPF_TRACEPOINT_ID_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed to read eBPF tracepoint `{}/{}` id for program `{}` at {}",
+                attachment.category,
+                attachment.name,
+                attachment.program,
+                path.display()
+            )
+        })?;
+    if bytes.len() > MAX_EBPF_TRACEPOINT_ID_BYTES {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} exceeds {MAX_EBPF_TRACEPOINT_ID_BYTES} bytes",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    let contents = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is not UTF-8",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    let value = contents.trim();
+    if value.is_empty() {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is empty",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    let id = value.parse::<u64>().with_context(|| {
+        format!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} is not numeric: {value}",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        )
+    })?;
+    if id == 0 {
+        anyhow::bail!(
+            "eBPF tracepoint `{}/{}` id for program `{}` at {} must be greater than zero",
+            attachment.category,
+            attachment.name,
+            attachment.program,
+            path.display()
+        );
+    }
+    Ok(id)
 }
 
 fn ensure_ipv4_forwarding_if_known() -> anyhow::Result<()> {
@@ -1914,7 +2774,7 @@ struct LinuxNetnsPathReport {
 }
 
 fn ensure_linux_netns_ready(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
-    let path = Path::new("/var/run/netns").join(namespace.name());
+    let path = netns_path(namespace);
     let current_path = current_process_netns_path();
     let report = inspect_linux_netns_path(namespace, &path, current_path.as_deref())?;
     if report.same_as_current == Some(true) {
@@ -2044,7 +2904,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Signal(args) => {
             run_signal(args, otel_metrics_enabled, otel_metrics_interval).await
         }
-        Command::Stun(args) => run_stun(args).await,
+        Command::Stun(args) => run_stun(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Agent(args) => run_agent(*args, otel_metrics_enabled, otel_metrics_interval).await,
     }
@@ -2117,6 +2977,7 @@ where
         ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
     config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
     config.cluster_policy.endpoint_candidate_ttl_seconds = args.endpoint_candidate_ttl_seconds;
+    config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
     let mut key_ring = IssuerKeyRing::default();
@@ -2156,11 +3017,22 @@ where
 }
 
 fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Result<()> {
+    validate_daemon_identifier(&args.cluster_id, "--cluster-id")?;
+    validate_daemon_identifier(&args.issuer_node_id, "--issuer-node-id")?;
+    validate_daemon_identifier(&args.issuer_key_id, "--issuer-key-id")?;
+    for trusted in &args.trusted_issuer_keys {
+        validate_daemon_identifier(
+            &trusted.issuer_node_id,
+            "--trusted-issuer-key issuer_node_id",
+        )?;
+        validate_daemon_identifier(&trusted.key_id, "--trusted-issuer-key key_id")?;
+    }
     validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
     validate_positive_seconds(
         args.endpoint_candidate_ttl_seconds,
         "--endpoint-candidate-ttl-seconds",
-    )
+    )?;
+    validate_positive_seconds(args.path_state_ttl_seconds, "--path-state-ttl-seconds")
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
@@ -2218,19 +3090,379 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     )
 }
 
-async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
-    let server = BindingStunServer::bind(args.listen).await?;
-    let listen = server.local_addr()?;
-    tracing::info!(%listen, "stun listening");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let shutdown_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(true);
+async fn run_stun(
+    args: StunArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
+    let stats = Arc::new(StunServerStats::default());
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (listen, alternate_listen, udp_task) = if let Some(alternate_listen) = args.alternate_listen
+    {
+        let server = Rfc5780StunServer::bind(args.listen, alternate_listen).await?;
+        let listen = server.primary_addr()?;
+        let alternate_listen = server.alternate_addr()?;
+        (
+            listen,
+            Some(alternate_listen),
+            tokio::spawn(server.serve_with_stats(shutdown_rx, stats.clone())),
+        )
+    } else {
+        let server = BindingStunServer::bind(args.listen).await?;
+        let listen = server.local_addr()?;
+        (
+            listen,
+            None,
+            tokio::spawn(server.serve_with_stats(shutdown_rx, stats.clone())),
+        )
+    };
+    let otel_metrics_task = otel_metrics_enabled.then(|| {
+        start_stun_otel_metrics_export(
+            stats.clone(),
+            listen,
+            alternate_listen,
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        )
     });
-    let result = server.serve(shutdown_rx).await;
-    shutdown_task.abort();
-    result?;
-    Ok(())
+    tracing::info!(%listen, ?alternate_listen, http_listen = %args.http_listen, "stun listening");
+    let result = serve_router(
+        args.http_listen,
+        stun_router(StunHttpState::new(listen, alternate_listen, stats)),
+    )
+    .await;
+    udp_task.abort();
+    if let Some(task) = otel_metrics_task {
+        task.abort();
+    }
+    result
+}
+
+#[derive(Debug, Clone)]
+struct StunHttpState {
+    listen: SocketAddr,
+    alternate_listen: Option<SocketAddr>,
+    stats: Arc<StunServerStats>,
+}
+
+impl StunHttpState {
+    fn new(
+        listen: SocketAddr,
+        alternate_listen: Option<SocketAddr>,
+        stats: Arc<StunServerStats>,
+    ) -> Self {
+        Self {
+            listen,
+            alternate_listen,
+            stats,
+        }
+    }
+
+    fn metrics(&self) -> StunMetricsResponse {
+        let snapshot = self.stats.snapshot();
+        StunMetricsResponse {
+            listen: self.listen,
+            alternate_listen: self.alternate_listen,
+            binding_request_count: snapshot.binding_request_count,
+            binding_response_count: snapshot.binding_response_count,
+            invalid_packet_count: snapshot.invalid_packet_count,
+            socket_receive_error_count: snapshot.socket_receive_error_count,
+            socket_send_error_count: snapshot.socket_send_error_count,
+            generated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StunHealthResponse {
+    status: &'static str,
+}
+
+fn stun_router(state: StunHttpState) -> Router {
+    Router::new()
+        .route("/healthz", axum::routing::get(stun_healthz))
+        .route("/v1/metrics", axum::routing::get(stun_metrics))
+        .route("/metrics", axum::routing::get(stun_prometheus_metrics))
+        .with_state(state)
+}
+
+async fn stun_healthz() -> axum::Json<StunHealthResponse> {
+    axum::Json(StunHealthResponse { status: "ok" })
+}
+
+async fn stun_metrics(
+    axum::extract::State(state): axum::extract::State<StunHttpState>,
+) -> axum::Json<StunMetricsResponse> {
+    axum::Json(state.metrics())
+}
+
+async fn stun_prometheus_metrics(
+    axum::extract::State(state): axum::extract::State<StunHttpState>,
+) -> impl axum::response::IntoResponse {
+    let metrics = state.metrics();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_stun_prometheus_metrics(&metrics),
+    )
+}
+
+fn render_stun_prometheus_metrics(metrics: &StunMetricsResponse) -> String {
+    let listen = prometheus_label(&metrics.listen.to_string());
+    let mut body = String::new();
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_server_active STUN server process active state."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_stun_server_active gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_server_active{{listen=\"{listen}\"}} 1"
+    );
+    if let Some(alternate_listen) = metrics.alternate_listen {
+        let alternate_listen = prometheus_label(&alternate_listen.to_string());
+        prometheus_line!(
+            &mut body,
+            "# HELP ipars_stun_rfc5780_alternate_server_active STUN RFC5780 alternate socket active state."
+        );
+        prometheus_line!(
+            &mut body,
+            "# TYPE ipars_stun_rfc5780_alternate_server_active gauge"
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_stun_rfc5780_alternate_server_active{{listen=\"{listen}\",alternate_listen=\"{alternate_listen}\"}} 1"
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_binding_requests_total Valid STUN Binding requests received by the server."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_stun_binding_requests_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_binding_requests_total{{listen=\"{listen}\"}} {}",
+        metrics.binding_request_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_binding_responses_total STUN Binding success responses sent by the server."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_stun_binding_responses_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_binding_responses_total{{listen=\"{listen}\"}} {}",
+        metrics.binding_response_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_invalid_packets_total Malformed or unsupported STUN packets received by the server."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_stun_invalid_packets_total counter");
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_invalid_packets_total{{listen=\"{listen}\"}} {}",
+        metrics.invalid_packet_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_socket_receive_errors_total STUN server UDP receive errors."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_stun_socket_receive_errors_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_socket_receive_errors_total{{listen=\"{listen}\"}} {}",
+        metrics.socket_receive_error_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_stun_socket_send_errors_total STUN server UDP send errors."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_stun_socket_send_errors_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_socket_send_errors_total{{listen=\"{listen}\"}} {}",
+        metrics.socket_send_error_count
+    );
+    body
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StunOtelSnapshot {
+    binding_request_count: u64,
+    binding_response_count: u64,
+    invalid_packet_count: u64,
+    socket_receive_error_count: u64,
+    socket_send_error_count: u64,
+}
+
+impl From<&StunServerMetricsSnapshot> for StunOtelSnapshot {
+    fn from(snapshot: &StunServerMetricsSnapshot) -> Self {
+        Self {
+            binding_request_count: snapshot.binding_request_count,
+            binding_response_count: snapshot.binding_response_count,
+            invalid_packet_count: snapshot.invalid_packet_count,
+            socket_receive_error_count: snapshot.socket_receive_error_count,
+            socket_send_error_count: snapshot.socket_send_error_count,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StunOtelMetrics {
+    server_active: Gauge<u64>,
+    rfc5780_alternate_server_active: Gauge<u64>,
+    binding_requests: Counter<u64>,
+    binding_responses: Counter<u64>,
+    invalid_packets: Counter<u64>,
+    socket_receive_errors: Counter<u64>,
+    socket_send_errors: Counter<u64>,
+}
+
+impl StunOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.stun");
+        Self {
+            server_active: meter
+                .u64_gauge("ipars.stun.server.active")
+                .with_description("STUN server process active state.")
+                .build(),
+            rfc5780_alternate_server_active: meter
+                .u64_gauge("ipars.stun.rfc5780_alternate_server.active")
+                .with_description("STUN RFC5780 alternate socket active state.")
+                .build(),
+            binding_requests: meter
+                .u64_counter("ipars.stun.binding_requests")
+                .with_description("Valid STUN Binding requests received by the server.")
+                .build(),
+            binding_responses: meter
+                .u64_counter("ipars.stun.binding_responses")
+                .with_description("STUN Binding success responses sent by the server.")
+                .build(),
+            invalid_packets: meter
+                .u64_counter("ipars.stun.invalid_packets")
+                .with_description("Malformed or unsupported STUN packets received by the server.")
+                .build(),
+            socket_receive_errors: meter
+                .u64_counter("ipars.stun.socket_receive_errors")
+                .with_description("STUN server UDP receive errors.")
+                .build(),
+            socket_send_errors: meter
+                .u64_counter("ipars.stun.socket_send_errors")
+                .with_description("STUN server UDP send errors.")
+                .build(),
+        }
+    }
+
+    fn record_status(
+        &self,
+        listen: SocketAddr,
+        alternate_listen: Option<SocketAddr>,
+        snapshot: &StunServerMetricsSnapshot,
+        previous: Option<&StunOtelSnapshot>,
+    ) {
+        let labels = StunOtelStatusLabels::new(listen, alternate_listen);
+        let attrs = labels.primary_attrs();
+        self.server_active.record(1, &attrs);
+        if let Some(alternate_attrs) = labels.alternate_attrs() {
+            self.rfc5780_alternate_server_active
+                .record(1, &alternate_attrs);
+        }
+        self.binding_requests.add(
+            counter_delta(
+                snapshot.binding_request_count,
+                previous.map(|previous| previous.binding_request_count),
+            ),
+            &attrs,
+        );
+        self.binding_responses.add(
+            counter_delta(
+                snapshot.binding_response_count,
+                previous.map(|previous| previous.binding_response_count),
+            ),
+            &attrs,
+        );
+        self.invalid_packets.add(
+            counter_delta(
+                snapshot.invalid_packet_count,
+                previous.map(|previous| previous.invalid_packet_count),
+            ),
+            &attrs,
+        );
+        self.socket_receive_errors.add(
+            counter_delta(
+                snapshot.socket_receive_error_count,
+                previous.map(|previous| previous.socket_receive_error_count),
+            ),
+            &attrs,
+        );
+        self.socket_send_errors.add(
+            counter_delta(
+                snapshot.socket_send_error_count,
+                previous.map(|previous| previous.socket_send_error_count),
+            ),
+            &attrs,
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StunOtelStatusLabels {
+    listen: String,
+    alternate_listen: Option<String>,
+}
+
+impl StunOtelStatusLabels {
+    fn new(listen: SocketAddr, alternate_listen: Option<SocketAddr>) -> Self {
+        Self {
+            listen: listen.to_string(),
+            alternate_listen: alternate_listen.map(|address| address.to_string()),
+        }
+    }
+
+    fn primary_attrs(&self) -> [KeyValue; 1] {
+        [KeyValue::new("listen", self.listen.clone())]
+    }
+
+    fn alternate_attrs(&self) -> Option<[KeyValue; 2]> {
+        self.alternate_listen.as_ref().map(|alternate_listen| {
+            [
+                KeyValue::new("listen", self.listen.clone()),
+                KeyValue::new("alternate_listen", alternate_listen.clone()),
+            ]
+        })
+    }
+}
+
+fn start_stun_otel_metrics_export(
+    stats: Arc<StunServerStats>,
+    listen: SocketAddr,
+    alternate_listen: Option<SocketAddr>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let metrics = StunOtelMetrics::new();
+        let mut previous = None;
+        loop {
+            let snapshot = stats.snapshot();
+            metrics.record_status(listen, alternate_listen, &snapshot, previous.as_ref());
+            previous = Some(StunOtelSnapshot::from(&snapshot));
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -2239,6 +3471,8 @@ struct ControlPlaneOtelMetrics {
     relay_candidates: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
+    stale_paths: Gauge<u64>,
+    path_state_ttl_seconds: Gauge<u64>,
     vpn_pool_total: Gauge<u64>,
     vpn_pool_allocated: Gauge<u64>,
     vpn_pool_available: Gauge<u64>,
@@ -2276,6 +3510,16 @@ impl ControlPlaneOtelMetrics {
                 .u64_gauge("ipars.control_plane.endpoint_candidate_ttl_seconds")
                 .with_description(
                     "Endpoint candidate freshness window used by control-plane peer maps.",
+                )
+                .build(),
+            stale_paths: meter
+                .u64_gauge("ipars.control_plane.stale_paths")
+                .with_description("Control-plane paths older than the path-state TTL.")
+                .build(),
+            path_state_ttl_seconds: meter
+                .u64_gauge("ipars.control_plane.path_state_ttl_seconds")
+                .with_description(
+                    "Path-state freshness window used by control-plane status and metrics.",
                 )
                 .build(),
             vpn_pool_total: meter
@@ -2357,6 +3601,10 @@ impl ControlPlaneOtelMetrics {
         );
         self.endpoint_candidate_ttl_seconds
             .record(metrics.endpoint_candidate_ttl_seconds, &cluster_attrs);
+        self.stale_paths
+            .record(metrics.stale_path_count as u64, &cluster_attrs);
+        self.path_state_ttl_seconds
+            .record(metrics.path_state_ttl_seconds, &cluster_attrs);
         self.vpn_pool_total
             .record(metrics.vpn_pool_total_count, &cluster_attrs);
         self.vpn_pool_allocated
@@ -2493,9 +3741,14 @@ fn apply_token_ledger_metrics(
 struct SignalOtelSnapshot {
     node_upsert_count: u64,
     path_negotiation_count: u64,
+    path_acl_denied_count: u64,
+    relay_candidate_acl_denied_count: u64,
+    fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
     path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
+    hole_punch_acl_denied_count: u64,
     hole_punch_nat_suppressed_count: u64,
+    hole_punch_nat_suppressed_strategy_counts: Vec<NatTraversalStrategyCount>,
 }
 
 impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
@@ -2503,9 +3756,18 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
         Self {
             node_upsert_count: metrics.node_upsert_count,
             path_negotiation_count: metrics.path_negotiation_count,
+            path_acl_denied_count: metrics.path_acl_denied_count,
+            relay_candidate_acl_denied_count: metrics.relay_candidate_acl_denied_count,
+            fresh_nat_classification_strategy_counts: metrics
+                .fresh_nat_classification_strategy_counts
+                .clone(),
             path_negotiation_state_counts: metrics.path_negotiation_state_counts.clone(),
             hole_punch_plan_count: metrics.hole_punch_plan_count,
+            hole_punch_acl_denied_count: metrics.hole_punch_acl_denied_count,
             hole_punch_nat_suppressed_count: metrics.hole_punch_nat_suppressed_count,
+            hole_punch_nat_suppressed_strategy_counts: metrics
+                .hole_punch_nat_suppressed_strategy_counts
+                .clone(),
         }
     }
 }
@@ -2528,9 +3790,13 @@ struct SignalOtelMetrics {
     nat_classification_min_confidence_percent: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
+    path_acl_denials: Counter<u64>,
+    relay_candidate_acl_denials: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
     hole_punch_plans: Counter<u64>,
+    hole_punch_acl_denials: Counter<u64>,
     hole_punch_nat_suppressions: Counter<u64>,
+    hole_punch_nat_suppressions_by_strategy: Counter<u64>,
 }
 
 impl SignalOtelMetrics {
@@ -2607,6 +3873,16 @@ impl SignalOtelMetrics {
                 .u64_counter("ipars.signal.path_negotiations")
                 .with_description("Signal path negotiation requests handled.")
                 .build(),
+            path_acl_denials: meter
+                .u64_counter("ipars.signal.path_acl_denials")
+                .with_description("Signal path negotiations hidden by cluster ACL policy.")
+                .build(),
+            relay_candidate_acl_denials: meter
+                .u64_counter("ipars.signal.relay_candidate_acl_denials")
+                .with_description(
+                    "Eligible relay candidates removed from signal negotiation by cluster ACL policy.",
+                )
+                .build(),
             path_negotiations_by_state: meter
                 .u64_counter("ipars.signal.path_negotiations.by_state")
                 .with_description("Successful signal path negotiations by selected state.")
@@ -2615,9 +3891,19 @@ impl SignalOtelMetrics {
                 .u64_counter("ipars.signal.hole_punch_plans")
                 .with_description("Signal hole-punch plan requests handled.")
                 .build(),
+            hole_punch_acl_denials: meter
+                .u64_counter("ipars.signal.hole_punch_acl_denials")
+                .with_description("Signal hole-punch plans hidden by cluster ACL policy.")
+                .build(),
             hole_punch_nat_suppressions: meter
                 .u64_counter("ipars.signal.hole_punch_nat_suppressions")
                 .with_description("Signal hole-punch plans suppressed by NAT classification.")
+                .build(),
+            hole_punch_nat_suppressions_by_strategy: meter
+                .u64_counter("ipars.signal.hole_punch_nat_suppressions.by_strategy")
+                .with_description(
+                    "Hole-punch suppressing NAT classifications observed during suppressed plans by traversal strategy.",
+                )
                 .build(),
         }
     }
@@ -2632,10 +3918,10 @@ impl SignalOtelMetrics {
             .record(metrics.relay_candidate_count as u64, &[]);
         self.nat_classifications
             .record(metrics.nat_classification_count as u64, &[]);
-        for strategy_count in &metrics.fresh_nat_classification_strategy_counts {
-            let attrs = [KeyValue::new("strategy", strategy_count.strategy.as_str())];
+        for strategy in NatTraversalStrategy::ALL {
+            let attrs = [KeyValue::new("strategy", strategy.as_str())];
             self.fresh_nat_classifications_by_strategy
-                .record(strategy_count.count as u64, &attrs);
+                .record(signal_nat_strategy_count(metrics, strategy) as u64, &attrs);
         }
         self.fresh_low_confidence_nat_classifications.record(
             metrics.fresh_low_confidence_nat_classification_count as u64,
@@ -2683,6 +3969,20 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        self.path_acl_denials.add(
+            counter_delta(
+                metrics.path_acl_denied_count,
+                previous.map(|previous| previous.path_acl_denied_count),
+            ),
+            &[],
+        );
+        self.relay_candidate_acl_denials.add(
+            counter_delta(
+                metrics.relay_candidate_acl_denied_count,
+                previous.map(|previous| previous.relay_candidate_acl_denied_count),
+            ),
+            &[],
+        );
         for state in [
             PathState::DirectPublic,
             PathState::DirectIpv6,
@@ -2707,6 +4007,13 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        self.hole_punch_acl_denials.add(
+            counter_delta(
+                metrics.hole_punch_acl_denied_count,
+                previous.map(|previous| previous.hole_punch_acl_denied_count),
+            ),
+            &[],
+        );
         self.hole_punch_nat_suppressions.add(
             counter_delta(
                 metrics.hole_punch_nat_suppressed_count,
@@ -2714,6 +4021,20 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        for strategy in NatTraversalStrategy::ALL {
+            let attrs = [KeyValue::new("strategy", strategy.as_str())];
+            self.hole_punch_nat_suppressions_by_strategy.add(
+                counter_delta(
+                    signal_hole_punch_nat_suppression_strategy_count(metrics, strategy) as u64,
+                    previous.map(|previous| {
+                        signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                            previous, strategy,
+                        ) as u64
+                    }),
+                ),
+                &attrs,
+            );
+        }
     }
 }
 
@@ -2751,14 +4072,71 @@ fn signal_snapshot_path_state_count(snapshot: &SignalOtelSnapshot, state: PathSt
         .unwrap_or(0)
 }
 
+fn signal_nat_strategy_count(
+    metrics: &SignalMetricsResponse,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    metrics
+        .fresh_nat_classification_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn signal_snapshot_nat_strategy_count(
+    snapshot: &SignalOtelSnapshot,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    snapshot
+        .fresh_nat_classification_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_hole_punch_nat_suppression_strategy_count(
+    metrics: &SignalMetricsResponse,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    metrics
+        .hole_punch_nat_suppressed_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn signal_snapshot_hole_punch_nat_suppression_strategy_count(
+    snapshot: &SignalOtelSnapshot,
+    strategy: NatTraversalStrategy,
+) -> usize {
+    snapshot
+        .hole_punch_nat_suppressed_strategy_counts
+        .iter()
+        .find(|entry| entry.strategy == strategy)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RelayOtelSnapshot {
+    admission_attempt_count: u64,
+    admission_success_count: u64,
+    admission_failure_count: u64,
+    admission_failures_by_reason: BTreeMap<RelayAdmissionFailureReason, u64>,
     dataplane: RelayDataplaneMetrics,
 }
 
 impl From<&RelayStatusResponse> for RelayOtelSnapshot {
     fn from(status: &RelayStatusResponse) -> Self {
         Self {
+            admission_attempt_count: status.admission_attempt_count,
+            admission_success_count: status.admission_success_count,
+            admission_failure_count: status.admission_failure_count,
+            admission_failures_by_reason: status.admission_failures_by_reason.clone(),
             dataplane: status.dataplane.clone(),
         }
     }
@@ -2766,6 +4144,10 @@ impl From<&RelayStatusResponse> for RelayOtelSnapshot {
 
 #[derive(Debug)]
 struct RelayOtelMetrics {
+    admission_attempts: Counter<u64>,
+    admission_success: Counter<u64>,
+    admission_failures: Counter<u64>,
+    admission_failures_by_reason: Counter<u64>,
     datagrams_received: Counter<u64>,
     datagram_bytes_received: Counter<u64>,
     datagrams_forwarded: Counter<u64>,
@@ -2776,6 +4158,7 @@ struct RelayOtelMetrics {
     active_sessions: Gauge<u64>,
     max_sessions: Gauge<u64>,
     available_sessions: Gauge<u64>,
+    max_sessions_per_node: Gauge<u64>,
     max_mbps: Gauge<u64>,
     enabled_by_policy: Gauge<u64>,
     e2e_only: Gauge<u64>,
@@ -2786,6 +4169,22 @@ impl RelayOtelMetrics {
     fn new() -> Self {
         let meter = global::meter("iparsd.relay");
         Self {
+            admission_attempts: meter
+                .u64_counter("ipars.relay.admission.attempts")
+                .with_description("Relay session admission attempts.")
+                .build(),
+            admission_success: meter
+                .u64_counter("ipars.relay.admission.success")
+                .with_description("Relay session admissions accepted.")
+                .build(),
+            admission_failures: meter
+                .u64_counter("ipars.relay.admission.failures")
+                .with_description("Relay session admission failures.")
+                .build(),
+            admission_failures_by_reason: meter
+                .u64_counter("ipars.relay.admission.failures_by_reason")
+                .with_description("Relay session admission failures, by reason.")
+                .build(),
             datagrams_received: meter
                 .u64_counter("ipars.relay.datagrams.received")
                 .with_description("UDP relay datagrams received.")
@@ -2829,6 +4228,12 @@ impl RelayOtelMetrics {
                 .u64_gauge("ipars.relay.sessions.available")
                 .with_description("Available relay session capacity.")
                 .build(),
+            max_sessions_per_node: meter
+                .u64_gauge("ipars.relay.sessions.max_per_node")
+                .with_description(
+                    "Configured active relay session cap per participating node. Zero means disabled.",
+                )
+                .build(),
             max_mbps: meter
                 .u64_gauge("ipars.relay.max_mbps")
                 .with_description("Configured relay throughput budget.")
@@ -2858,6 +4263,41 @@ impl RelayOtelMetrics {
         );
         let relay_node = status.relay_node.as_str().to_string();
         let relay_attrs = [KeyValue::new("relay_node", relay_node.clone())];
+        let admission_attempt_delta = counter_delta(
+            status.admission_attempt_count,
+            previous.map(|snapshot| snapshot.admission_attempt_count),
+        );
+        if admission_attempt_delta > 0 {
+            self.admission_attempts
+                .add(admission_attempt_delta, &relay_attrs);
+        }
+        let admission_success_delta = counter_delta(
+            status.admission_success_count,
+            previous.map(|snapshot| snapshot.admission_success_count),
+        );
+        if admission_success_delta > 0 {
+            self.admission_success
+                .add(admission_success_delta, &relay_attrs);
+        }
+        let admission_failure_delta = counter_delta(
+            status.admission_failure_count,
+            previous.map(|snapshot| snapshot.admission_failure_count),
+        );
+        if admission_failure_delta > 0 {
+            self.admission_failures
+                .add(admission_failure_delta, &relay_attrs);
+        }
+        let admission_failure_reason_delta = relay_admission_failure_reason_delta(
+            &status.admission_failures_by_reason,
+            previous.map(|snapshot| &snapshot.admission_failures_by_reason),
+        );
+        for (reason, count) in admission_failure_reason_delta {
+            let attrs = [
+                KeyValue::new("relay_node", relay_node.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.admission_failures_by_reason.add(count, &attrs);
+        }
         self.datagrams_received
             .add(delta.datagrams_received, &relay_attrs);
         self.datagram_bytes_received
@@ -2884,6 +4324,10 @@ impl RelayOtelMetrics {
             .record(status.capability.max_sessions as u64, &relay_attrs);
         self.available_sessions
             .record(status.capability.available_capacity() as u64, &relay_attrs);
+        self.max_sessions_per_node.record(
+            status.max_sessions_per_node.unwrap_or_default() as u64,
+            &relay_attrs,
+        );
         self.max_mbps
             .record(status.capability.max_mbps as u64, &relay_attrs);
         self.enabled_by_policy
@@ -2910,15 +4354,13 @@ fn relay_dataplane_delta(
     previous: Option<&RelayDataplaneMetrics>,
 ) -> RelayDataplaneMetrics {
     let mut drops_by_reason = BTreeMap::new();
-    for (reason, current_count) in &current.drops_by_reason {
+    for reason in RelayDataplaneDropReason::ALL {
+        let current_count = current.drops_by_reason.get(&reason).copied().unwrap_or(0);
         let previous_count = previous
-            .and_then(|previous| previous.drops_by_reason.get(reason))
+            .and_then(|previous| previous.drops_by_reason.get(&reason))
             .copied()
             .unwrap_or(0);
-        let delta = current_count.saturating_sub(previous_count);
-        if delta > 0 {
-            drops_by_reason.insert(*reason, delta);
-        }
+        drops_by_reason.insert(reason, current_count.saturating_sub(previous_count));
     }
     RelayDataplaneMetrics {
         datagrams_received: counter_delta(
@@ -2947,6 +4389,22 @@ fn relay_dataplane_delta(
         ),
         drops_by_reason,
     }
+}
+
+fn relay_admission_failure_reason_delta(
+    current: &BTreeMap<RelayAdmissionFailureReason, u64>,
+    previous: Option<&BTreeMap<RelayAdmissionFailureReason, u64>>,
+) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for reason in RelayAdmissionFailureReason::ALL {
+        let current_count = current.get(&reason).copied().unwrap_or(0);
+        let previous_count = previous
+            .and_then(|previous| previous.get(&reason))
+            .copied()
+            .unwrap_or(0);
+        delta_by_reason.insert(reason, current_count.saturating_sub(previous_count));
+    }
+    delta_by_reason
 }
 
 fn counter_delta(current: u64, previous: Option<u64>) -> u64 {
@@ -2993,6 +4451,7 @@ struct AgentOtelSnapshot {
     relay_admission_attempt_count: u64,
     relay_admission_success_count: u64,
     relay_admission_failure_count: u64,
+    relay_admission_failure_reason_counts: BTreeMap<AgentRelayAdmissionFailureReason, u64>,
     path_probe_record_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
@@ -3000,6 +4459,8 @@ struct AgentOtelSnapshot {
     packet_flow_unmatched_count: u64,
     packet_flow_filtered_count: u64,
     packet_flow_filtered_reason_counts: BTreeMap<AgentPacketFlowDropReason, u64>,
+    packet_flow_duplicate_suppression_count: u64,
+    packet_flow_duplicate_suppression_counts: BTreeMap<AgentPacketFlowDuplicateSource, u64>,
     packet_flow_classification_counts: BTreeMap<AgentPacketFlowClassification, u64>,
     packet_flow_application_counts: BTreeMap<AgentPacketFlowApplication, u64>,
 }
@@ -3021,6 +4482,11 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
             relay_admission_attempt_count: metrics.relay_admission_attempt_count,
             relay_admission_success_count: metrics.relay_admission_success_count,
             relay_admission_failure_count: metrics.relay_admission_failure_count,
+            relay_admission_failure_reason_counts: metrics
+                .relay_admission_failure_reason_counts
+                .iter()
+                .map(|entry| (entry.reason, entry.count))
+                .collect(),
             path_probe_record_count: metrics.path_probe_record_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
@@ -3031,6 +4497,13 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                 .packet_flow_filtered_reason_counts
                 .iter()
                 .map(|entry| (entry.reason, entry.count))
+                .collect(),
+            packet_flow_duplicate_suppression_count: metrics
+                .packet_flow_duplicate_suppression_count,
+            packet_flow_duplicate_suppression_counts: metrics
+                .packet_flow_duplicate_suppression_counts
+                .iter()
+                .map(|entry| (entry.source, entry.count))
                 .collect(),
             packet_flow_classification_counts: metrics
                 .packet_flow_classification_counts
@@ -3053,6 +4526,7 @@ struct AgentOtelMetrics {
     paths_by_state: Gauge<u64>,
     relay_sessions: Gauge<u64>,
     relay_forwarders: Gauge<u64>,
+    userspace_wireguard_process_state: Gauge<u64>,
     path_change_events: Gauge<u64>,
     lazy_active_peers: Gauge<u64>,
     lazy_pinned_peers: Gauge<u64>,
@@ -3062,6 +4536,7 @@ struct AgentOtelMetrics {
     relay_admission_attempts: Counter<u64>,
     relay_admission_success: Counter<u64>,
     relay_admission_failures: Counter<u64>,
+    relay_admission_failures_by_reason: Counter<u64>,
     path_probe_records: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
@@ -3069,13 +4544,36 @@ struct AgentOtelMetrics {
     packet_flow_unmatched: Counter<u64>,
     packet_flow_filtered: Counter<u64>,
     packet_flow_filtered_by_reason: Counter<u64>,
+    packet_flow_duplicate_suppressions: Counter<u64>,
+    packet_flow_duplicate_suppressions_by_source: Counter<u64>,
     packet_flow_classified_by_lifecycle: Counter<u64>,
     packet_flow_classified_by_application: Counter<u64>,
     forwarder_outbound_packets: Counter<u64>,
+    forwarder_socket_receive_errors: Counter<u64>,
     forwarder_outbound_payload_bytes: Counter<u64>,
     forwarder_outbound_datagram_bytes: Counter<u64>,
+    forwarder_outbound_dropped_unexpected_source_packets: Counter<u64>,
+    forwarder_outbound_dropped_unexpected_source_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_expired_session_packets: Counter<u64>,
+    forwarder_outbound_dropped_expired_session_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_oversized_packets: Counter<u64>,
+    forwarder_outbound_dropped_oversized_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_oversized_datagram_bytes: Counter<u64>,
+    forwarder_outbound_dropped_socket_error_packets: Counter<u64>,
+    forwarder_outbound_dropped_socket_error_payload_bytes: Counter<u64>,
+    forwarder_outbound_dropped_socket_error_datagram_bytes: Counter<u64>,
+    forwarder_outbound_dropped_non_wireguard_packets: Counter<u64>,
+    forwarder_outbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
     forwarder_inbound_packets: Counter<u64>,
     forwarder_inbound_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_expired_session_packets: Counter<u64>,
+    forwarder_inbound_dropped_expired_session_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_oversized_packets: Counter<u64>,
+    forwarder_inbound_dropped_oversized_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_socket_error_packets: Counter<u64>,
+    forwarder_inbound_dropped_socket_error_payload_bytes: Counter<u64>,
+    forwarder_inbound_dropped_non_wireguard_packets: Counter<u64>,
+    forwarder_inbound_dropped_non_wireguard_payload_bytes: Counter<u64>,
 }
 
 impl AgentOtelMetrics {
@@ -3101,6 +4599,12 @@ impl AgentOtelMetrics {
             relay_forwarders: meter
                 .u64_gauge("ipars.agent.relay.forwarders")
                 .with_description("Supervised relay forwarder endpoints.")
+                .build(),
+            userspace_wireguard_process_state: meter
+                .u64_gauge("ipars.agent.userspace_wireguard.process.state")
+                .with_description(
+                    "Managed userspace WireGuard process state, exported as one-hot gauges.",
+                )
                 .build(),
             path_change_events: meter
                 .u64_gauge("ipars.agent.path_change_events")
@@ -3140,6 +4644,12 @@ impl AgentOtelMetrics {
                 .u64_counter("ipars.agent.relay.admission.failures")
                 .with_description("Relay admission candidate attempts rejected or unreachable.")
                 .build(),
+            relay_admission_failures_by_reason: meter
+                .u64_counter("ipars.agent.relay.admission.failures.by_reason")
+                .with_description(
+                    "Relay admission candidate failures by agent-observed reason.",
+                )
+                .build(),
             path_probe_records: meter
                 .u64_counter("ipars.agent.path_probe.records")
                 .with_description("Path probe records accepted by the agent.")
@@ -3163,13 +4673,25 @@ impl AgentOtelMetrics {
             packet_flow_filtered: meter
                 .u64_counter("ipars.agent.packet_flow.filtered")
                 .with_description(
-                    "Packet-flow observations filtered before lazy-connect resolution.",
+                    "Packet-flow observations filtered before or after lazy-connect resolution.",
                 )
                 .build(),
             packet_flow_filtered_by_reason: meter
                 .u64_counter("ipars.agent.packet_flow.filtered.by_reason")
                 .with_description(
-                    "Packet-flow observations filtered before lazy-connect resolution, by reason.",
+                    "Packet-flow observations filtered before or after lazy-connect resolution, by reason.",
+                )
+                .build(),
+            packet_flow_duplicate_suppressions: meter
+                .u64_counter("ipars.agent.packet_flow.duplicate_suppressions")
+                .with_description(
+                    "Duplicate packet-flow observations suppressed before lazy-connect resolution.",
+                )
+                .build(),
+            packet_flow_duplicate_suppressions_by_source: meter
+                .u64_counter("ipars.agent.packet_flow.duplicate_suppressions.by_source")
+                .with_description(
+                    "Duplicate packet-flow observations suppressed before lazy-connect resolution, by detector source.",
                 )
                 .build(),
             packet_flow_classified_by_lifecycle: meter
@@ -3188,6 +4710,12 @@ impl AgentOtelMetrics {
                 .u64_counter("ipars.agent.relay.forwarder.outbound.packets")
                 .with_description("Relay forwarder packets sent from local WireGuard to relay.")
                 .build(),
+            forwarder_socket_receive_errors: meter
+                .u64_counter("ipars.agent.relay.forwarder.socket_receive.errors")
+                .with_description(
+                    "Relay forwarder recoverable UDP receive errors that did not stop the forwarder.",
+                )
+                .build(),
             forwarder_outbound_payload_bytes: meter
                 .u64_counter("ipars.agent.relay.forwarder.outbound.payload.bytes")
                 .with_description(
@@ -3200,6 +4728,101 @@ impl AgentOtelMetrics {
                 .with_description("Relay forwarder framed datagram bytes sent to relay.")
                 .with_unit("By")
                 .build(),
+            forwarder_outbound_dropped_unexpected_source_packets: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.unexpected_source.packets",
+                )
+                .with_description(
+                    "Relay forwarder packets dropped before relay because the sender did not match the configured local WireGuard endpoint.",
+                )
+                .build(),
+            forwarder_outbound_dropped_unexpected_source_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.unexpected_source.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder payload bytes dropped before relay because the sender did not match the configured local WireGuard endpoint.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_expired_session_packets: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.expired_session.packets",
+                )
+                .with_description(
+                    "Relay forwarder local packets dropped before relay because the relay session credential expired.",
+                )
+                .build(),
+            forwarder_outbound_dropped_expired_session_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.expired_session.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder local payload bytes dropped before relay because the relay session credential expired.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_oversized_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.oversized.packets")
+                .with_description(
+                    "Relay forwarder local packets dropped before relay because the framed relay datagram would exceed the UDP payload limit.",
+                )
+                .build(),
+            forwarder_outbound_dropped_oversized_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.oversized.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder local payload bytes dropped before relay because the framed relay datagram would exceed the UDP payload limit.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_oversized_datagram_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.oversized.datagram.bytes",
+                )
+                .with_description(
+                    "Relay forwarder framed datagram bytes dropped before relay because they would exceed the UDP payload limit.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_socket_error_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.socket_error.packets")
+                .with_description(
+                    "Relay forwarder local packets dropped because sending the framed relay datagram failed.",
+                )
+                .build(),
+            forwarder_outbound_dropped_socket_error_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.socket_error.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder local payload bytes dropped because sending the framed relay datagram failed.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_socket_error_datagram_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.outbound.dropped.socket_error.datagram.bytes",
+                )
+                .with_description(
+                    "Relay forwarder framed datagram bytes dropped because sending them to the relay failed.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_outbound_dropped_non_wireguard_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.non_wireguard.packets")
+                .with_description(
+                    "Relay forwarder local packets dropped before relay because they were not WireGuard datagrams.",
+                )
+                .build(),
+            forwarder_outbound_dropped_non_wireguard_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.outbound.dropped.non_wireguard.payload.bytes")
+                .with_description(
+                    "Relay forwarder local payload bytes dropped before relay because they were not WireGuard datagrams.",
+                )
+                .with_unit("By")
+                .build(),
             forwarder_inbound_packets: meter
                 .u64_counter("ipars.agent.relay.forwarder.inbound.packets")
                 .with_description(
@@ -3209,6 +4832,66 @@ impl AgentOtelMetrics {
             forwarder_inbound_payload_bytes: meter
                 .u64_counter("ipars.agent.relay.forwarder.inbound.payload.bytes")
                 .with_description("Relay forwarder opaque payload bytes received from relay.")
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_expired_session_packets: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.inbound.dropped.expired_session.packets",
+                )
+                .with_description(
+                    "Relay forwarder relay packets dropped before local WireGuard because the relay session credential expired.",
+                )
+                .build(),
+            forwarder_inbound_dropped_expired_session_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.inbound.dropped.expired_session.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped before local WireGuard because the relay session credential expired.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_oversized_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.oversized.packets")
+                .with_description(
+                    "Relay forwarder relay packets dropped before local WireGuard because the payload exceeds the UDP payload limit.",
+                )
+                .build(),
+            forwarder_inbound_dropped_oversized_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.inbound.dropped.oversized.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped before local WireGuard because the payload exceeds the UDP payload limit.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_socket_error_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.socket_error.packets")
+                .with_description(
+                    "Relay forwarder relay packets dropped because sending the payload to local WireGuard failed.",
+                )
+                .build(),
+            forwarder_inbound_dropped_socket_error_payload_bytes: meter
+                .u64_counter(
+                    "ipars.agent.relay.forwarder.inbound.dropped.socket_error.payload.bytes",
+                )
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped because sending the payload to local WireGuard failed.",
+                )
+                .with_unit("By")
+                .build(),
+            forwarder_inbound_dropped_non_wireguard_packets: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.non_wireguard.packets")
+                .with_description(
+                    "Relay forwarder relay packets dropped before local WireGuard because they were not WireGuard datagrams.",
+                )
+                .build(),
+            forwarder_inbound_dropped_non_wireguard_payload_bytes: meter
+                .u64_counter("ipars.agent.relay.forwarder.inbound.dropped.non_wireguard.payload.bytes")
+                .with_description(
+                    "Relay forwarder relay payload bytes dropped before local WireGuard because they were not WireGuard datagrams.",
+                )
                 .with_unit("By")
                 .build(),
         }
@@ -3224,6 +4907,23 @@ impl AgentOtelMetrics {
             .record(metrics.relay_session_count as u64, &node_attrs);
         self.relay_forwarders
             .record(metrics.relay_forwarder_count as u64, &node_attrs);
+        let userspace_wireguard_state = metrics
+            .userspace_wireguard_process
+            .as_ref()
+            .map(|status| status.state)
+            .unwrap_or(AgentManagedProcessState::Disabled);
+        for state in AgentManagedProcessState::ALL {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("state", state.as_str()),
+            ];
+            let value = if state == userspace_wireguard_state {
+                1
+            } else {
+                0
+            };
+            self.userspace_wireguard_process_state.record(value, &attrs);
+        }
         self.path_change_events
             .record(metrics.path_change_event_count as u64, &node_attrs);
         self.lazy_active_peers
@@ -3266,6 +4966,13 @@ impl AgentOtelMetrics {
         if relay_admission_failure_delta > 0 {
             self.relay_admission_failures
                 .add(relay_admission_failure_delta, &node_attrs);
+        }
+        for (reason, delta) in agent_relay_admission_failure_reason_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.relay_admission_failures_by_reason.add(delta, &attrs);
         }
 
         let path_probe_delta = counter_delta(
@@ -3315,57 +5022,45 @@ impl AgentOtelMetrics {
             self.packet_flow_filtered
                 .add(packet_flow_filtered_delta, &node_attrs);
         }
-        for reason_count in &metrics.packet_flow_filtered_reason_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_filtered_reason_counts
-                    .get(&reason_count.reason)
-                    .copied()
-            });
-            let delta = counter_delta(reason_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("reason", reason_count.reason.as_str()),
-                ];
-                self.packet_flow_filtered_by_reason.add(delta, &attrs);
-            }
+        for (reason, delta) in agent_packet_flow_filtered_reason_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.packet_flow_filtered_by_reason.add(delta, &attrs);
         }
-        for classification_count in &metrics.packet_flow_classification_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_classification_counts
-                    .get(&classification_count.classification)
-                    .copied()
-            });
-            let delta = counter_delta(classification_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new(
-                        "classification",
-                        classification_count.classification.as_str(),
-                    ),
-                ];
-                self.packet_flow_classified_by_lifecycle.add(delta, &attrs);
-            }
+        let packet_flow_duplicate_suppression_delta = counter_delta(
+            metrics.packet_flow_duplicate_suppression_count,
+            previous.map(|previous| previous.packet_flow_duplicate_suppression_count),
+        );
+        if packet_flow_duplicate_suppression_delta > 0 {
+            self.packet_flow_duplicate_suppressions
+                .add(packet_flow_duplicate_suppression_delta, &node_attrs);
         }
-        for application_count in &metrics.packet_flow_application_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_application_counts
-                    .get(&application_count.application)
-                    .copied()
-            });
-            let delta = counter_delta(application_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("application", application_count.application.as_str()),
-                ];
-                self.packet_flow_classified_by_application
-                    .add(delta, &attrs);
-            }
+        for (source, delta) in
+            agent_packet_flow_duplicate_suppression_source_delta(metrics, previous)
+        {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("source", source.as_str()),
+            ];
+            self.packet_flow_duplicate_suppressions_by_source
+                .add(delta, &attrs);
+        }
+        for (classification, delta) in agent_packet_flow_classification_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("classification", classification.as_str()),
+            ];
+            self.packet_flow_classified_by_lifecycle.add(delta, &attrs);
+        }
+        for (application, delta) in agent_packet_flow_application_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("application", application.as_str()),
+            ];
+            self.packet_flow_classified_by_application
+                .add(delta, &attrs);
         }
 
         for state in [
@@ -3394,18 +5089,197 @@ impl AgentOtelMetrics {
                 KeyValue::new("peer", forwarder.peer.as_str().to_string()),
                 KeyValue::new("relay_node", forwarder.relay_node.as_str().to_string()),
             ];
+            self.forwarder_socket_receive_errors
+                .add(forwarder.socket_receive_errors, &attrs);
             self.forwarder_outbound_packets
                 .add(forwarder.outbound_packets, &attrs);
             self.forwarder_outbound_payload_bytes
                 .add(forwarder.outbound_payload_bytes, &attrs);
             self.forwarder_outbound_datagram_bytes
                 .add(forwarder.outbound_datagram_bytes, &attrs);
+            self.forwarder_outbound_dropped_unexpected_source_packets
+                .add(forwarder.outbound_dropped_unexpected_source_packets, &attrs);
+            self.forwarder_outbound_dropped_unexpected_source_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_unexpected_source_payload_bytes,
+                    &attrs,
+                );
+            self.forwarder_outbound_dropped_expired_session_packets
+                .add(forwarder.outbound_dropped_expired_session_packets, &attrs);
+            self.forwarder_outbound_dropped_expired_session_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_expired_session_payload_bytes,
+                    &attrs,
+                );
+            self.forwarder_outbound_dropped_oversized_packets
+                .add(forwarder.outbound_dropped_oversized_packets, &attrs);
+            self.forwarder_outbound_dropped_oversized_payload_bytes
+                .add(forwarder.outbound_dropped_oversized_payload_bytes, &attrs);
+            self.forwarder_outbound_dropped_oversized_datagram_bytes
+                .add(forwarder.outbound_dropped_oversized_datagram_bytes, &attrs);
+            self.forwarder_outbound_dropped_socket_error_packets
+                .add(forwarder.outbound_dropped_socket_error_packets, &attrs);
+            self.forwarder_outbound_dropped_socket_error_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_socket_error_payload_bytes,
+                    &attrs,
+                );
+            self.forwarder_outbound_dropped_socket_error_datagram_bytes
+                .add(
+                    forwarder.outbound_dropped_socket_error_datagram_bytes,
+                    &attrs,
+                );
+            self.forwarder_outbound_dropped_non_wireguard_packets
+                .add(forwarder.outbound_dropped_non_wireguard_packets, &attrs);
+            self.forwarder_outbound_dropped_non_wireguard_payload_bytes
+                .add(
+                    forwarder.outbound_dropped_non_wireguard_payload_bytes,
+                    &attrs,
+                );
             self.forwarder_inbound_packets
                 .add(forwarder.inbound_packets, &attrs);
             self.forwarder_inbound_payload_bytes
                 .add(forwarder.inbound_payload_bytes, &attrs);
+            self.forwarder_inbound_dropped_expired_session_packets
+                .add(forwarder.inbound_dropped_expired_session_packets, &attrs);
+            self.forwarder_inbound_dropped_expired_session_payload_bytes
+                .add(
+                    forwarder.inbound_dropped_expired_session_payload_bytes,
+                    &attrs,
+                );
+            self.forwarder_inbound_dropped_oversized_packets
+                .add(forwarder.inbound_dropped_oversized_packets, &attrs);
+            self.forwarder_inbound_dropped_oversized_payload_bytes
+                .add(forwarder.inbound_dropped_oversized_payload_bytes, &attrs);
+            self.forwarder_inbound_dropped_socket_error_packets
+                .add(forwarder.inbound_dropped_socket_error_packets, &attrs);
+            self.forwarder_inbound_dropped_socket_error_payload_bytes
+                .add(forwarder.inbound_dropped_socket_error_payload_bytes, &attrs);
+            self.forwarder_inbound_dropped_non_wireguard_packets
+                .add(forwarder.inbound_dropped_non_wireguard_packets, &attrs);
+            self.forwarder_inbound_dropped_non_wireguard_payload_bytes
+                .add(
+                    forwarder.inbound_dropped_non_wireguard_payload_bytes,
+                    &attrs,
+                );
         }
     }
+}
+
+fn agent_relay_admission_failure_reason_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentRelayAdmissionFailureReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for reason in AgentRelayAdmissionFailureReason::ALL {
+        let current_count = metrics
+            .relay_admission_failure_reason_counts
+            .iter()
+            .find(|entry| entry.reason == reason)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .relay_admission_failure_reason_counts
+                .get(&reason)
+                .copied()
+        });
+        delta_by_reason.insert(reason, counter_delta(current_count, previous_count));
+    }
+    delta_by_reason
+}
+
+fn agent_packet_flow_filtered_reason_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowDropReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for reason in AgentPacketFlowDropReason::ALL {
+        let current_count = metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .find(|entry| entry.reason == reason)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_filtered_reason_counts
+                .get(&reason)
+                .copied()
+        });
+        delta_by_reason.insert(reason, counter_delta(current_count, previous_count));
+    }
+    delta_by_reason
+}
+
+fn agent_packet_flow_duplicate_suppression_source_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowDuplicateSource, u64> {
+    let mut delta_by_source = BTreeMap::new();
+    for source in AgentPacketFlowDuplicateSource::ALL {
+        let current_count = metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .find(|entry| entry.source == source)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_duplicate_suppression_counts
+                .get(&source)
+                .copied()
+        });
+        delta_by_source.insert(source, counter_delta(current_count, previous_count));
+    }
+    delta_by_source
+}
+
+fn agent_packet_flow_classification_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowClassification, u64> {
+    let mut delta_by_classification = BTreeMap::new();
+    for classification in AgentPacketFlowClassification::ALL {
+        let current_count = metrics
+            .packet_flow_classification_counts
+            .iter()
+            .find(|entry| entry.classification == classification)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_classification_counts
+                .get(&classification)
+                .copied()
+        });
+        delta_by_classification
+            .insert(classification, counter_delta(current_count, previous_count));
+    }
+    delta_by_classification
+}
+
+fn agent_packet_flow_application_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowApplication, u64> {
+    let mut delta_by_application = BTreeMap::new();
+    for application in AgentPacketFlowApplication::ALL {
+        let current_count = metrics
+            .packet_flow_application_counts
+            .iter()
+            .find(|entry| entry.application == application)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_application_counts
+                .get(&application)
+                .copied()
+        });
+        delta_by_application.insert(application, counter_delta(current_count, previous_count));
+    }
+    delta_by_application
 }
 
 fn agent_forwarder_deltas(
@@ -3436,6 +5310,10 @@ fn agent_forwarder_delta(
         relay_node: current.relay_node.clone(),
         relay_endpoint: current.relay_endpoint,
         local_endpoint: current.local_endpoint,
+        socket_receive_errors: counter_delta(
+            current.socket_receive_errors,
+            previous.map(|previous| previous.socket_receive_errors),
+        ),
         outbound_packets: counter_delta(
             current.outbound_packets,
             previous.map(|previous| previous.outbound_packets),
@@ -3448,6 +5326,54 @@ fn agent_forwarder_delta(
             current.outbound_datagram_bytes,
             previous.map(|previous| previous.outbound_datagram_bytes),
         ),
+        outbound_dropped_unexpected_source_packets: counter_delta(
+            current.outbound_dropped_unexpected_source_packets,
+            previous.map(|previous| previous.outbound_dropped_unexpected_source_packets),
+        ),
+        outbound_dropped_unexpected_source_payload_bytes: counter_delta(
+            current.outbound_dropped_unexpected_source_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_unexpected_source_payload_bytes),
+        ),
+        outbound_dropped_expired_session_packets: counter_delta(
+            current.outbound_dropped_expired_session_packets,
+            previous.map(|previous| previous.outbound_dropped_expired_session_packets),
+        ),
+        outbound_dropped_expired_session_payload_bytes: counter_delta(
+            current.outbound_dropped_expired_session_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_expired_session_payload_bytes),
+        ),
+        outbound_dropped_oversized_packets: counter_delta(
+            current.outbound_dropped_oversized_packets,
+            previous.map(|previous| previous.outbound_dropped_oversized_packets),
+        ),
+        outbound_dropped_oversized_payload_bytes: counter_delta(
+            current.outbound_dropped_oversized_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_oversized_payload_bytes),
+        ),
+        outbound_dropped_oversized_datagram_bytes: counter_delta(
+            current.outbound_dropped_oversized_datagram_bytes,
+            previous.map(|previous| previous.outbound_dropped_oversized_datagram_bytes),
+        ),
+        outbound_dropped_socket_error_packets: counter_delta(
+            current.outbound_dropped_socket_error_packets,
+            previous.map(|previous| previous.outbound_dropped_socket_error_packets),
+        ),
+        outbound_dropped_socket_error_payload_bytes: counter_delta(
+            current.outbound_dropped_socket_error_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_socket_error_payload_bytes),
+        ),
+        outbound_dropped_socket_error_datagram_bytes: counter_delta(
+            current.outbound_dropped_socket_error_datagram_bytes,
+            previous.map(|previous| previous.outbound_dropped_socket_error_datagram_bytes),
+        ),
+        outbound_dropped_non_wireguard_packets: counter_delta(
+            current.outbound_dropped_non_wireguard_packets,
+            previous.map(|previous| previous.outbound_dropped_non_wireguard_packets),
+        ),
+        outbound_dropped_non_wireguard_payload_bytes: counter_delta(
+            current.outbound_dropped_non_wireguard_payload_bytes,
+            previous.map(|previous| previous.outbound_dropped_non_wireguard_payload_bytes),
+        ),
         inbound_packets: counter_delta(
             current.inbound_packets,
             previous.map(|previous| previous.inbound_packets),
@@ -3456,16 +5382,69 @@ fn agent_forwarder_delta(
             current.inbound_payload_bytes,
             previous.map(|previous| previous.inbound_payload_bytes),
         ),
+        inbound_dropped_expired_session_packets: counter_delta(
+            current.inbound_dropped_expired_session_packets,
+            previous.map(|previous| previous.inbound_dropped_expired_session_packets),
+        ),
+        inbound_dropped_expired_session_payload_bytes: counter_delta(
+            current.inbound_dropped_expired_session_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_expired_session_payload_bytes),
+        ),
+        inbound_dropped_oversized_packets: counter_delta(
+            current.inbound_dropped_oversized_packets,
+            previous.map(|previous| previous.inbound_dropped_oversized_packets),
+        ),
+        inbound_dropped_oversized_payload_bytes: counter_delta(
+            current.inbound_dropped_oversized_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_oversized_payload_bytes),
+        ),
+        inbound_dropped_socket_error_packets: counter_delta(
+            current.inbound_dropped_socket_error_packets,
+            previous.map(|previous| previous.inbound_dropped_socket_error_packets),
+        ),
+        inbound_dropped_socket_error_payload_bytes: counter_delta(
+            current.inbound_dropped_socket_error_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_socket_error_payload_bytes),
+        ),
+        inbound_dropped_non_wireguard_packets: counter_delta(
+            current.inbound_dropped_non_wireguard_packets,
+            previous.map(|previous| previous.inbound_dropped_non_wireguard_packets),
+        ),
+        inbound_dropped_non_wireguard_payload_bytes: counter_delta(
+            current.inbound_dropped_non_wireguard_payload_bytes,
+            previous.map(|previous| previous.inbound_dropped_non_wireguard_payload_bytes),
+        ),
         last_forwarded_at: current.last_forwarded_at,
     }
 }
 
 fn has_agent_forwarder_delta(delta: &AgentRelayForwarderMetrics) -> bool {
     delta.outbound_packets > 0
+        || delta.socket_receive_errors > 0
         || delta.outbound_payload_bytes > 0
         || delta.outbound_datagram_bytes > 0
+        || delta.outbound_dropped_unexpected_source_packets > 0
+        || delta.outbound_dropped_unexpected_source_payload_bytes > 0
+        || delta.outbound_dropped_expired_session_packets > 0
+        || delta.outbound_dropped_expired_session_payload_bytes > 0
+        || delta.outbound_dropped_oversized_packets > 0
+        || delta.outbound_dropped_oversized_payload_bytes > 0
+        || delta.outbound_dropped_oversized_datagram_bytes > 0
+        || delta.outbound_dropped_socket_error_packets > 0
+        || delta.outbound_dropped_socket_error_payload_bytes > 0
+        || delta.outbound_dropped_socket_error_datagram_bytes > 0
+        || delta.outbound_dropped_non_wireguard_packets > 0
+        || delta.outbound_dropped_non_wireguard_payload_bytes > 0
         || delta.inbound_packets > 0
         || delta.inbound_payload_bytes > 0
+        || delta.inbound_dropped_expired_session_packets > 0
+        || delta.inbound_dropped_expired_session_payload_bytes > 0
+        || delta.inbound_dropped_oversized_packets > 0
+        || delta.inbound_dropped_oversized_payload_bytes > 0
+        || delta.inbound_dropped_socket_error_packets > 0
+        || delta.inbound_dropped_socket_error_payload_bytes > 0
+        || delta.inbound_dropped_non_wireguard_packets > 0
+        || delta.inbound_dropped_non_wireguard_payload_bytes > 0
 }
 
 fn start_agent_otel_metrics_export(
@@ -3498,12 +5477,27 @@ async fn run_relay(
     validate_relay_config(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
-    let public_endpoint = args.public_endpoint.unwrap_or(udp_addr);
+    let public_endpoint = args
+        .public_endpoint
+        .context("--public-endpoint is required for relay advertisement")?;
     let admission_url = args
         .admission_url
         .clone()
-        .unwrap_or_else(|| format!("http://{}", args.http_listen));
-    let service = Arc::new(RelayService::with_session_ttl(
+        .context("--admission-url is required for relay advertisement")?;
+    let admission_rate_limit = if args.admission_rate_limit > 0 {
+        Some(RelayAdmissionRateLimit {
+            max_attempts: args.admission_rate_limit,
+            window: chrono_duration_seconds(
+                args.admission_rate_limit_window_seconds,
+                "--admission-rate-limit-window-seconds",
+            )?,
+        })
+    } else {
+        None
+    };
+    let max_sessions_per_node =
+        (args.max_sessions_per_node > 0).then_some(args.max_sessions_per_node);
+    let service = Arc::new(RelayService::with_session_ttl_admission_controls(
         NodeId::from_string(args.relay_node_id),
         RelayCapability {
             enabled_by_policy: true,
@@ -3514,7 +5508,9 @@ async fn run_relay(
             max_mbps: args.max_mbps,
             e2e_only: true,
         },
-        chrono::Duration::seconds(args.session_ttl_seconds as i64),
+        chrono_duration_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?,
+        admission_rate_limit,
+        max_sessions_per_node,
     ));
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
@@ -3538,20 +5534,46 @@ async fn run_relay(
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
-    if let Some(admission_url) = args.admission_url.as_deref() {
-        validate_http_url(admission_url, "--admission-url")?;
-    }
+    validate_daemon_identifier(&args.relay_node_id, "--relay-node-id")?;
+    let public_endpoint = args
+        .public_endpoint
+        .context("--public-endpoint is required for relay advertisement")?;
+    validate_usable_socket_endpoint(public_endpoint, "--public-endpoint")?;
+    let admission_url = args
+        .admission_url
+        .as_deref()
+        .context("--admission-url is required for relay advertisement")?;
+    validate_http_url(admission_url, "--admission-url")?;
     if args.max_sessions == 0 {
         anyhow::bail!("--max-sessions must be greater than zero");
     }
     if args.max_mbps == 0 {
         anyhow::bail!("--max-mbps must be greater than zero");
     }
-    validate_positive_seconds(args.session_ttl_seconds, "--session-ttl-seconds")?;
+    if args.max_sessions_per_node > args.max_sessions {
+        anyhow::bail!("--max-sessions-per-node must be less than or equal to --max-sessions");
+    }
+    validate_bounded_u64(
+        args.session_ttl_seconds,
+        "--session-ttl-seconds",
+        MAX_RELAY_SESSION_TTL_SECONDS,
+    )?;
+    if args.admission_rate_limit > 0 {
+        validate_bounded_u64(
+            args.admission_rate_limit_window_seconds,
+            "--admission-rate-limit-window-seconds",
+            MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
+        )?;
+    }
     if let Some(token) = args.admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--admission-bearer-token")?;
     }
     Ok(())
+}
+
+fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Duration> {
+    let seconds = i64::try_from(value).with_context(|| format!("{name} is too large"))?;
+    Ok(chrono::Duration::seconds(seconds))
 }
 
 async fn run_agent(
@@ -3559,21 +5581,36 @@ async fn run_agent(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    validate_agent_runtime_config(&args)?;
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
-    let relay_capability_reporter = agent_relay_capability_reporter(&args);
+    let relay_capability_reporter = agent_relay_capability_reporter(&args)?;
     let relay_capability = relay_capability_reporter
         .as_ref()
         .map(|reporter| reporter.advertised.clone());
-    if args.stun_servers.len() > 1 {
-        runtime
-            .classify_nat(args.stun_bind, args.stun_servers.clone())
-            .await?;
-    } else if let Some(stun_server) = args.stun_servers.first().copied() {
-        runtime.probe_stun(args.stun_bind, stun_server).await?;
-    }
     let join_token = agent_join_token(&args)?;
+    let stun_servers = agent_stun_servers(&args, join_token.as_ref()).await?;
+    if stun_servers.len() > 1 {
+        if let Err(error) = runtime
+            .classify_nat(args.stun_bind, stun_servers.clone())
+            .await
+        {
+            tracing::warn!(
+                %error,
+                stun_servers = stun_servers.len(),
+                "startup STUN NAT classification failed; continuing without initial NAT classification"
+            );
+        }
+    } else if let Some(stun_server) = stun_servers.first().copied() {
+        if let Err(error) = runtime.probe_stun(args.stun_bind, stun_server).await {
+            tracing::warn!(
+                %error,
+                %stun_server,
+                "startup STUN probe failed; continuing without initial reflexive candidate"
+            );
+        }
+    }
     let mut registered_control_plane_base = None;
     let registered_node = if let Some(token) = &join_token {
         let requested_routes = agent_requested_routes(&args, runtime.state().node_id.clone())
@@ -3610,6 +5647,8 @@ async fn run_agent(
     let signal_bases =
         signal_base_urls(join_token.as_ref(), args.signal_url.as_deref()).unwrap_or_default();
     preflight_agent_runtime(&args)?;
+    let userspace_wireguard_process =
+        start_userspace_wireguard_process(&args, runtime.clone()).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
     if otel_metrics_enabled {
@@ -3619,6 +5658,8 @@ async fn run_agent(
         ));
     }
     if !args.disable_heartbeat && !control_plane_bases.is_empty() {
+        let heartbeat_route_reporter =
+            heartbeat_route_reporter(&args, runtime.state().node_id.clone());
         background_tasks.push(start_heartbeat_reporting(
             runtime.clone(),
             runtime
@@ -3628,6 +5669,7 @@ async fn run_agent(
             control_plane_bases.clone(),
             Duration::from_secs(args.heartbeat_interval_seconds),
             relay_capability_reporter.clone(),
+            heartbeat_route_reporter,
         ));
     }
     let peer_map_task = if args.apply_peer_map {
@@ -3652,7 +5694,7 @@ async fn run_agent(
     match args.packet_flow_detector {
         PacketFlowDetector::Disabled => {}
         PacketFlowDetector::ProcNetConntrack => {
-            let limits = ProcNetConntrackReadLimits::from_args(&args);
+            let limits = ProcNetConntrackReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
@@ -3674,7 +5716,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::ConntrackNetlink => {
-            let limits = ConntrackNetlinkReadLimits::from_args(&args);
+            let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 interval_seconds = args.packet_flow_poll_interval_seconds,
@@ -3692,7 +5734,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::ConntrackNetlinkEvents => {
-            let limits = ConntrackNetlinkReadLimits::from_args(&args);
+            let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds,
@@ -3710,7 +5752,7 @@ async fn run_agent(
             ));
         }
         PacketFlowDetector::EbpfJsonl => {
-            let limits = EbpfJsonlReadLimits::from_args(&args);
+            let limits = EbpfJsonlReadLimits::from_args(&args)?;
             let event_path = args
                 .packet_flow_ebpf_event_path
                 .clone()
@@ -3737,7 +5779,7 @@ async fn run_agent(
         }
         PacketFlowDetector::EbpfRingbuf => {
             let config = EbpfRingbufConfig::from_args(&args)?;
-            let limits = EbpfRingbufReadLimits::from_args(&args);
+            let limits = EbpfRingbufReadLimits::from_args(&args)?;
             tracing::info!(
                 detector = args.packet_flow_detector.as_str(),
                 object_path = %config.object_path.display(),
@@ -3766,6 +5808,7 @@ async fn run_agent(
                 node,
                 signal_bases.clone(),
                 Duration::from_secs(args.signal_registration_interval_seconds),
+                relay_capability_reporter.clone(),
             ));
         }
     }
@@ -3806,7 +5849,351 @@ async fn run_agent(
     if let Some(supervisor) = relay_forwarder_supervisor {
         supervisor.shutdown_all(runtime.as_ref()).await;
     }
+    if let Some(process) = userspace_wireguard_process {
+        process.shutdown().await;
+    }
     result
+}
+
+struct ManagedUserspaceWireGuardProcess {
+    label: String,
+    pid: Option<u32>,
+    runtime: Arc<AgentRuntime>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ManagedUserspaceWireGuardProcess {
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            if shutdown.send(()).is_err() {
+                tracing::info!(
+                    command = %self.label,
+                    pid = ?self.pid,
+                    "userspace WireGuard process monitor already stopped"
+                );
+            }
+        }
+
+        if let Err(error) = self.task.await {
+            tracing::warn!(
+                command = %self.label,
+                pid = ?self.pid,
+                %error,
+                "userspace WireGuard process monitor task failed"
+            );
+            self.runtime
+                .record_userspace_wireguard_process_status(
+                    AgentManagedProcessState::Failed,
+                    self.pid,
+                    None,
+                    Some(error.to_string()),
+                )
+                .await;
+        }
+    }
+}
+
+async fn start_userspace_wireguard_process(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+) -> anyhow::Result<Option<ManagedUserspaceWireGuardProcess>> {
+    let Some(command) = userspace_wireguard_launch_command(args)? else {
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Disabled,
+                None,
+                None,
+                None,
+            )
+            .await;
+        return Ok(None);
+    };
+    let label = runtime_command_label(&command.program, &command.args);
+    let mut child = tokio::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
+    let pid = child.id();
+    runtime
+        .record_userspace_wireguard_process_status(
+            AgentManagedProcessState::Starting,
+            pid,
+            None,
+            None,
+        )
+        .await;
+    tracing::info!(
+        command = %label,
+        pid = ?pid,
+        interface = %args.wireguard_interface,
+        "started userspace WireGuard process"
+    );
+    let shutdown_timeout = Duration::from_secs(args.userspace_wireguard_shutdown_timeout_seconds);
+    if let Err(error) = wait_for_userspace_wireguard_ready(args, &mut child, &label).await {
+        let message = error.to_string();
+        let status =
+            cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout)
+                .await;
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Failed,
+                pid,
+                status.map(|status| status.to_string()),
+                Some(message),
+            )
+            .await;
+        return Err(error);
+    }
+    runtime
+        .record_userspace_wireguard_process_status(AgentManagedProcessState::Ready, pid, None, None)
+        .await;
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(monitor_userspace_wireguard_process(
+        child,
+        label.clone(),
+        pid,
+        runtime.clone(),
+        shutdown_rx,
+        shutdown_timeout,
+    ));
+    Ok(Some(ManagedUserspaceWireGuardProcess {
+        label,
+        pid,
+        runtime,
+        shutdown: Some(shutdown),
+        task,
+    }))
+}
+
+async fn cleanup_unready_userspace_wireguard_process(
+    child: tokio::process::Child,
+    label: String,
+    shutdown_timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    tracing::warn!(
+        command = %label,
+        "stopping userspace WireGuard process after readiness failure"
+    );
+    let mut child = child;
+    stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await
+}
+
+async fn monitor_userspace_wireguard_process(
+    mut child: tokio::process::Child,
+    label: String,
+    pid: Option<u32>,
+    runtime: Arc<AgentRuntime>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    shutdown_timeout: Duration,
+) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    command = %label,
+                    pid = ?pid,
+                    %status,
+                    "userspace WireGuard process exited unexpectedly"
+                );
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        AgentManagedProcessState::Exited,
+                        pid,
+                        Some(status.to_string()),
+                        None,
+                    )
+                    .await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    command = %label,
+                    pid = ?pid,
+                    %error,
+                    "failed to inspect userspace WireGuard process"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = &mut shutdown => {
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        AgentManagedProcessState::Stopping,
+                        pid,
+                        None,
+                        None,
+                    )
+                    .await;
+                let status = stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
+                let stopped = status.is_some();
+                runtime
+                    .record_userspace_wireguard_process_status(
+                        if stopped {
+                            AgentManagedProcessState::Stopped
+                        } else {
+                            AgentManagedProcessState::Failed
+                        },
+                        pid,
+                        status.map(|status| status.to_string()),
+                        if stopped {
+                            None
+                        } else {
+                            Some("failed to stop userspace WireGuard process cleanly".to_string())
+                        },
+                    )
+                    .await;
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+async fn stop_userspace_wireguard_child(
+    child: &mut tokio::process::Child,
+    label: &str,
+    shutdown_timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            tracing::info!(
+                command = %label,
+                %status,
+                "userspace WireGuard process already exited"
+            );
+            return Some(status);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed to inspect userspace WireGuard process before shutdown"
+            );
+        }
+    }
+
+    if let Err(error) = child.start_kill() {
+        tracing::warn!(
+            command = %label,
+            %error,
+            "failed to signal userspace WireGuard process shutdown"
+        );
+        return None;
+    }
+    match tokio::time::timeout(shutdown_timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            tracing::info!(
+                command = %label,
+                %status,
+                "userspace WireGuard process stopped"
+            );
+            Some(status)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed waiting for userspace WireGuard process shutdown"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                command = %label,
+                timeout_seconds = shutdown_timeout.as_secs(),
+                "timed out waiting for userspace WireGuard process shutdown"
+            );
+            None
+        }
+    }
+}
+
+async fn wait_for_userspace_wireguard_ready(
+    args: &AgentArgs,
+    child: &mut tokio::process::Child,
+    label: &str,
+) -> anyhow::Result<()> {
+    let ready_command = userspace_wireguard_ready_command(args)?;
+    let runner = TimedSystemCommandRunner::with_output_max_bytes(
+        runtime_command_timeout(args),
+        runtime_command_output_max_bytes(args),
+    );
+    let timeout = Duration::from_secs(args.userspace_wireguard_ready_timeout_seconds);
+    let started = Instant::now();
+    loop {
+        if runner.run(ready_command.clone()).await.is_ok() {
+            tracing::info!(
+                command = %label,
+                interface = %args.wireguard_interface,
+                "userspace WireGuard interface is ready"
+            );
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect userspace WireGuard process readiness")?
+        {
+            anyhow::bail!(
+                "userspace WireGuard process `{label}` exited before interface {} became ready: {status}",
+                args.wireguard_interface
+            );
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "userspace WireGuard process `{label}` did not expose interface {} within {} seconds",
+                args.wireguard_interface,
+                args.userspace_wireguard_ready_timeout_seconds
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn userspace_wireguard_launch_command(args: &AgentArgs) -> anyhow::Result<Option<LinuxCommand>> {
+    let Some(program) = args.userspace_wireguard_command.as_deref() else {
+        return Ok(None);
+    };
+    let command_args = if args.userspace_wireguard_args.is_empty() {
+        vec![args.wireguard_interface.clone()]
+    } else {
+        args.userspace_wireguard_args.clone()
+    };
+    let command = LinuxCommand::new(program, command_args);
+    Ok(Some(userspace_wireguard_namespaced_command(args, command)?))
+}
+
+fn userspace_wireguard_ready_command(args: &AgentArgs) -> anyhow::Result<LinuxCommand> {
+    userspace_wireguard_namespaced_command(
+        args,
+        LinuxCommand::new("wg", ["show", args.wireguard_interface.as_str()]),
+    )
+}
+
+fn userspace_wireguard_namespaced_command(
+    args: &AgentArgs,
+    command: LinuxCommand,
+) -> anyhow::Result<LinuxCommand> {
+    if let Some(namespace) = args.linux_netns.as_deref() {
+        Ok(command.in_namespace(&LinuxNetworkNamespace::from_name(namespace)?))
+    } else {
+        Ok(command)
+    }
+}
+
+fn runtime_command_label(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, args.join(" "))
+    }
 }
 
 async fn start_peer_map_sync(
@@ -3892,6 +6279,87 @@ async fn start_peer_map_sync(
                             command_output_max_bytes,
                         ),
                         None,
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::Command,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                            namespace,
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        )),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::UserspaceCommand, RouteApplyBackend::Command, None) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxRouteManager::new(
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::KernelNetlink,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxNetlinkRouteManager::new_in_namespace(namespace),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceCommand,
+                    RouteApplyBackend::KernelNetlink,
+                    None,
+                ) => {
+                    start_peer_map_sync_with_userspace_wireguard(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxNetlinkRouteManager::new(),
                     )
                     .await
                 }
@@ -4131,6 +6599,35 @@ fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<R
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct HeartbeatRouteReporter {
+    args: AgentArgs,
+    node_id: NodeId,
+}
+
+fn heartbeat_route_reporter(args: &AgentArgs, node_id: NodeId) -> Option<HeartbeatRouteReporter> {
+    let reports_routes = (args.apply_docker_routes && args.docker_expose_host_routes)
+        || args.apply_kubernetes_underlay;
+    reports_routes.then(|| HeartbeatRouteReporter {
+        args: args.clone(),
+        node_id,
+    })
+}
+
+async fn heartbeat_routes(reporter: Option<&HeartbeatRouteReporter>) -> Option<Vec<Route>> {
+    let reporter = reporter?;
+    match agent_requested_routes(&reporter.args, reporter.node_id.clone()).await {
+        Ok(routes) => Some(routes),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to refresh advertised routes for heartbeat; preserving control-plane route state"
+            );
+            None
+        }
+    }
+}
+
 fn docker_api_networks_url(api_version: &str) -> String {
     let version = api_version.trim_matches('/');
     if version.is_empty() {
@@ -4156,6 +6653,7 @@ fn resolve_docker_api_socket(
     exists: impl Fn(&Path) -> bool,
 ) -> anyhow::Result<PathBuf> {
     if let Some(configured) = configured {
+        validate_docker_api_socket_path(configured, "--docker-api-socket")?;
         return Ok(configured.to_path_buf());
     }
     if let Some(path) = docker_host
@@ -4174,6 +6672,7 @@ fn resolve_docker_api_socket(
     if let Some(runtime_dir) = xdg_runtime_dir {
         let rootless = PathBuf::from(runtime_dir).join("docker.sock");
         if exists(&rootless) {
+            validate_docker_api_socket_path(&rootless, "XDG_RUNTIME_DIR/docker.sock")?;
             return Ok(rootless);
         }
     }
@@ -4192,11 +6691,27 @@ fn docker_host_unix_socket_path(docker_host: &OsStr) -> anyhow::Result<Option<Pa
         if path.is_empty() {
             anyhow::bail!("DOCKER_HOST unix:// value must include a socket path");
         }
-        return Ok(Some(PathBuf::from(path)));
+        let path = PathBuf::from(path);
+        validate_docker_api_socket_path(&path, "DOCKER_HOST unix:// socket path")?;
+        return Ok(Some(path));
     }
     anyhow::bail!(
         "Docker API discovery only supports unix:// DOCKER_HOST values; set --docker-api-socket for a local Unix socket"
     )
+}
+
+fn validate_docker_api_socket_path(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("{label} must be an absolute Unix socket path");
+    }
+    let value = path
+        .as_os_str()
+        .to_str()
+        .with_context(|| format!("{label} must be valid UTF-8"))?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+    Ok(())
 }
 
 fn docker_discovered_routes(
@@ -4204,8 +6719,27 @@ fn docker_discovered_routes(
     filters: &[String],
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
     let mut network_names = BTreeSet::new();
-    let mut cidrs = BTreeMap::<ipnet::IpNet, String>::new();
+    let mut cidrs = Vec::<ipnet::IpNet>::new();
+    let requested_filters = filters.iter().cloned().collect::<BTreeSet<_>>();
+    let mut matched_filters = BTreeSet::new();
+    let mut bridge_matched_filters = BTreeSet::new();
+    let mut subnet_matched_filters = BTreeSet::new();
     for network in networks {
+        let matching_filters = docker_network_matching_filters(network, filters);
+        if filters.is_empty() {
+            if network.driver != "bridge" {
+                continue;
+            }
+        } else {
+            if matching_filters.is_empty() {
+                continue;
+            }
+            matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
+            if network.driver != "bridge" {
+                continue;
+            }
+            bridge_matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
+        }
         if !docker_network_matches(network, filters) {
             continue;
         }
@@ -4221,19 +6755,56 @@ fn docker_discovered_routes(
                     network.name
                 )
             })?;
-            cidrs.entry(cidr).or_insert_with(|| network.name.clone());
+            cidrs.push(cidr);
             found_subnet = true;
         }
         if found_subnet {
+            subnet_matched_filters.extend(matching_filters.iter().map(|filter| (*filter).clone()));
             network_names.insert(network.name.clone());
+        }
+    }
+    if !requested_filters.is_empty() {
+        let missing_filters = requested_filters
+            .difference(&matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery did not find requested network filters: {}",
+                missing_filters.join(",")
+            );
+        }
+
+        let non_bridge_filters = requested_filters
+            .difference(&bridge_matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !non_bridge_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery requested non-bridge networks: {}",
+                non_bridge_filters.join(",")
+            );
+        }
+
+        let subnetless_filters = requested_filters
+            .difference(&subnet_matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !subnetless_filters.is_empty() {
+            anyhow::bail!(
+                "Docker network discovery requested networks without IPAM subnets: {}",
+                subnetless_filters.join(",")
+            );
         }
     }
     if cidrs.is_empty() {
         anyhow::bail!("Docker network discovery found no bridge networks with IPAM subnets");
     }
+    validate_docker_container_cidrs("Docker network discovery", &cidrs)?;
+    cidrs.sort();
     Ok(DockerDiscoveredRoutes {
         network_names: network_names.into_iter().collect(),
-        cidrs: cidrs.into_keys().collect(),
+        cidrs,
     })
 }
 
@@ -4245,6 +6816,16 @@ fn docker_network_matches(network: &DockerApiNetwork, filters: &[String]) -> boo
         || filters
             .iter()
             .any(|filter| filter == &network.name || filter == &network.id)
+}
+
+fn docker_network_matching_filters<'a>(
+    network: &DockerApiNetwork,
+    filters: &'a [String],
+) -> Vec<&'a String> {
+    filters
+        .iter()
+        .filter(|filter| *filter == &network.name || *filter == &network.id)
+        .collect()
 }
 
 fn docker_namespace_from_networks(network_names: &[String]) -> String {
@@ -4336,6 +6917,7 @@ fn docker_network_intent(args: &AgentArgs) -> anyhow::Result<DockerNetworkIntent
     if args.docker_container_cidrs.is_empty() {
         anyhow::bail!("--apply-docker-routes requires at least one --docker-container-cidr");
     }
+    validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
 
     Ok(DockerNetworkIntent {
         container_namespace,
@@ -4350,24 +6932,33 @@ async fn run_docker_route_loop<M>(manager: M, source: DockerRouteSource, interva
 where
     M: RouteManager + 'static,
 {
+    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
-            Ok(intent) => match manager.apply_docker_intent(intent.clone()).await {
-                Ok(plan) => tracing::info!(
-                    route_source = source.source_label(),
-                    container_namespace = %intent.container_namespace,
-                    host_interface = %intent.host_interface,
-                    routes = plan.routes.len(),
-                    policy_rules = plan.policy_rules.len(),
-                    "applied Docker overlay routes"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    route_source = source.source_label(),
-                    container_namespace = %intent.container_namespace,
-                    "failed to apply Docker overlay routes; will retry"
-                ),
-            },
+            Ok(intent) => {
+                let result = match checked_docker_route_plan(intent.clone()) {
+                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(summary) => tracing::info!(
+                        route_source = source.source_label(),
+                        container_namespace = %intent.container_namespace,
+                        host_interface = %intent.host_interface,
+                        routes = summary.plan.routes.len(),
+                        policy_rules = summary.plan.policy_rules.len(),
+                        routes_removed = summary.routes_removed,
+                        policy_rules_removed = summary.policy_rules_removed,
+                        "applied Docker overlay routes"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        route_source = source.source_label(),
+                        container_namespace = %intent.container_namespace,
+                        "failed to apply Docker overlay routes; will retry"
+                    ),
+                }
+            }
             Err(error) => tracing::warn!(
                 %error,
                 route_source = source.source_label(),
@@ -4375,6 +6966,97 @@ where
             ),
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+async fn apply_managed_route_plan<M>(
+    manager: &M,
+    applied_plan: &mut Option<RoutePlan>,
+    plan: RoutePlan,
+) -> Result<ManagedRouteApplySummary, RouteManagerError>
+where
+    M: RouteManager + ?Sized,
+{
+    let mut routes_removed = 0;
+    let mut policy_rules_removed = 0;
+    if let Some(previous) = applied_plan.as_ref().cloned() {
+        let stale = stale_managed_route_plan(&previous, &plan);
+        if !stale.routes.is_empty() || !stale.policy_rules.is_empty() {
+            routes_removed = stale.routes.len();
+            policy_rules_removed = stale.policy_rules.len();
+            manager.remove_routes(stale).await?;
+            *applied_plan = Some(retained_managed_route_plan(&previous, &plan));
+        }
+    }
+    manager.apply_routes(plan.clone()).await?;
+    *applied_plan = Some(plan.clone());
+    Ok(ManagedRouteApplySummary {
+        plan,
+        routes_removed,
+        policy_rules_removed,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedRouteApplySummary {
+    plan: RoutePlan,
+    routes_removed: usize,
+    policy_rules_removed: usize,
+}
+
+fn stale_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
+    if previous.interface != current.interface {
+        return previous.clone();
+    }
+    RoutePlan {
+        interface: previous.interface.clone(),
+        routes: previous
+            .routes
+            .iter()
+            .filter(|route| {
+                !current
+                    .routes
+                    .iter()
+                    .any(|current| current.cidr == route.cidr)
+            })
+            .cloned()
+            .collect(),
+        policy_rules: previous
+            .policy_rules
+            .iter()
+            .filter(|rule| !current.policy_rules.contains(rule))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn retained_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
+    if previous.interface != current.interface {
+        return RoutePlan {
+            interface: current.interface.clone(),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+    }
+    RoutePlan {
+        interface: previous.interface.clone(),
+        routes: previous
+            .routes
+            .iter()
+            .filter(|route| {
+                current
+                    .routes
+                    .iter()
+                    .any(|current| current.cidr == route.cidr)
+            })
+            .cloned()
+            .collect(),
+        policy_rules: previous
+            .policy_rules
+            .iter()
+            .filter(|rule| current.policy_rules.contains(rule))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -4517,20 +7199,8 @@ impl KubernetesApiRouteDiscovery {
             std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
             std::env::var_os("KUBERNETES_SERVICE_PORT").as_deref(),
         )?;
-        let token = std::fs::read_to_string(&args.kubernetes_service_account_token_path)
-            .with_context(|| {
-                format!(
-                    "failed to read Kubernetes service account token from {}",
-                    args.kubernetes_service_account_token_path.display()
-                )
-            })?;
-        let token = token.trim();
-        if token.is_empty() {
-            anyhow::bail!(
-                "Kubernetes service account token at {} is empty",
-                args.kubernetes_service_account_token_path.display()
-            );
-        }
+        let token =
+            read_kubernetes_service_account_token(&args.kubernetes_service_account_token_path)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -4600,6 +7270,19 @@ impl KubernetesApiRouteDiscovery {
         if api_server_cidrs.is_empty() && service_cidrs.is_empty() {
             anyhow::bail!("Kubernetes API discovery found no service or API server routes");
         }
+        let mut route_cidrs = BTreeSet::new();
+        validate_kubernetes_underlay_route_cidrs(
+            "Kubernetes API discovery",
+            "Kubernetes API server CIDR",
+            &api_server_cidrs,
+            &mut route_cidrs,
+        )?;
+        validate_kubernetes_underlay_route_cidrs(
+            "Kubernetes API discovery",
+            "Kubernetes Service CIDR",
+            &service_cidrs,
+            &mut route_cidrs,
+        )?;
         Ok(KubernetesUnderlayIntent {
             node_name: self.node_name.clone(),
             overlay_interface: self.overlay_interface.clone(),
@@ -4670,26 +7353,107 @@ fn kubernetes_api_base_url(
     service_port: Option<&OsStr>,
 ) -> anyhow::Result<String> {
     if let Some(configured) = configured {
+        validate_http_url(configured, "--kubernetes-api-url")?;
         return Ok(configured.trim_end_matches('/').to_string());
     }
-    let host = service_host
-        .and_then(OsStr::to_str)
-        .filter(|host| !host.is_empty())
-        .context("--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST")?;
-    let port = service_port
-        .and_then(OsStr::to_str)
-        .filter(|port| !port.is_empty())
-        .unwrap_or("443");
+    let Some(host) = service_host else {
+        anyhow::bail!(
+            "--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST"
+        );
+    };
+    let host = host
+        .to_str()
+        .context("KUBERNETES_SERVICE_HOST must be valid UTF-8")?;
+    if host.is_empty() {
+        anyhow::bail!(
+            "--kubernetes-discover-services requires --kubernetes-api-url or KUBERNETES_SERVICE_HOST"
+        );
+    }
+    let port = kubernetes_service_port(service_port)?;
     let host = match host.parse::<IpAddr>() {
         Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
         _ => host.to_string(),
     };
-    Ok(format!("https://{host}:{port}"))
+    let api_url = format!("https://{host}:{port}");
+    validate_http_url(&api_url, "KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT")?;
+    Ok(api_url)
+}
+
+fn kubernetes_service_port(service_port: Option<&OsStr>) -> anyhow::Result<u16> {
+    let Some(port) = service_port else {
+        return Ok(443);
+    };
+    let port = port
+        .to_str()
+        .context("KUBERNETES_SERVICE_PORT must be valid UTF-8")?;
+    if port.is_empty() {
+        return Ok(443);
+    }
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("KUBERNETES_SERVICE_PORT `{port}` must be an integer port"))?;
+    if port == 0 {
+        anyhow::bail!("KUBERNETES_SERVICE_PORT must be greater than zero");
+    }
+    Ok(port)
 }
 
 fn default_kubernetes_service_account_ca_cert() -> Option<PathBuf> {
     let path = PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
     path.exists().then_some(path)
+}
+
+fn read_kubernetes_service_account_token(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Kubernetes service account token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    ensure_kubernetes_service_account_token_size(metadata.len(), path)?;
+
+    let mut token = String::new();
+    let mut reader = file
+        .by_ref()
+        .take(MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES + 1);
+    reader.read_to_string(&mut token).with_context(|| {
+        format!(
+            "failed to read Kubernetes service account token from {}",
+            path.display()
+        )
+    })?;
+    ensure_kubernetes_service_account_token_size(token.len() as u64, path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "Kubernetes service account token at {} is empty",
+            path.display()
+        );
+    }
+    Ok(token.to_string())
+}
+
+fn ensure_kubernetes_service_account_token_size(size: u64, path: &Path) -> anyhow::Result<()> {
+    if size > MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES {
+        anyhow::bail!(
+            "Kubernetes service account token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn kubernetes_service_route_cidrs(
@@ -4758,6 +7522,19 @@ fn kubernetes_underlay_intent(
             "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
         );
     }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
     let route_provider = args
         .kubernetes_route_provider
         .clone()
@@ -4782,24 +7559,33 @@ async fn run_kubernetes_underlay_route_loop<M>(
 ) where
     M: RouteManager + 'static,
 {
+    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
-            Ok(intent) => match manager.apply_kubernetes_intent(intent.clone()).await {
-                Ok(plan) => tracing::info!(
-                    route_source = source.source_label(),
-                    node_name = %intent.node_name,
-                    route_provider = %intent.route_provider,
-                    routes = plan.routes.len(),
-                    policy_rules = plan.policy_rules.len(),
-                    "applied Kubernetes underlay routes"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    route_source = source.source_label(),
-                    node_name = %intent.node_name,
-                    "failed to apply Kubernetes underlay routes; will retry"
-                ),
-            },
+            Ok(intent) => {
+                let result = match checked_kubernetes_route_plan(intent.clone()) {
+                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(summary) => tracing::info!(
+                        route_source = source.source_label(),
+                        node_name = %intent.node_name,
+                        route_provider = %intent.route_provider,
+                        routes = summary.plan.routes.len(),
+                        policy_rules = summary.plan.policy_rules.len(),
+                        routes_removed = summary.routes_removed,
+                        policy_rules_removed = summary.policy_rules_removed,
+                        "applied Kubernetes underlay routes"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        route_source = source.source_label(),
+                        node_name = %intent.node_name,
+                        "failed to apply Kubernetes underlay routes; will retry"
+                    ),
+                }
+            }
             Err(error) => tracing::warn!(
                 %error,
                 route_source = source.source_label(),
@@ -4892,6 +7678,37 @@ where
         route_backend = args.route_backend.as_str(),
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with command WireGuard and kernel route netlink backends"
+    );
+    Ok(start_peer_map_sync_with_sink(
+        args,
+        runtime,
+        control_plane_urls,
+        applier,
+    ))
+}
+
+async fn start_peer_map_sync_with_userspace_wireguard<W, R>(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+    control_plane_urls: Vec<String>,
+    wireguard_runner: W,
+    route_manager: R,
+) -> anyhow::Result<tokio::task::JoinHandle<()>>
+where
+    W: LinuxCommandRunner + 'static,
+    R: RouteManager + 'static,
+{
+    let wireguard =
+        UserspaceWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
+    wireguard.ensure_interface().await?;
+    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    tracing::info!(
+        backend = args.runtime_backend.as_str(),
+        wireguard_backend = args.wireguard_backend.as_str(),
+        route_backend = args.route_backend.as_str(),
+        linux_netns = ?args.linux_netns,
+        "starting peer-map sync with userspace WireGuard command backend"
     );
     Ok(start_peer_map_sync_with_sink(
         args,
@@ -5379,24 +8196,33 @@ impl RelayForwarderSupervisor {
 
 #[cfg(unix)]
 fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let current = std::fs::metadata("/proc/self/ns/net")
-        .context("failed to inspect current network namespace")?;
     let target_path = netns_path(namespace);
-    let target = std::fs::metadata(&target_path).with_context(|| {
-        format!(
-            "failed to inspect network namespace {}; run the agent inside it or create {}",
-            namespace.name(),
-            target_path.display()
-        )
-    })?;
-    if current.dev() == target.dev() && current.ino() == target.ino() {
+    let current_path =
+        current_process_netns_path().context("failed to locate current network namespace")?;
+    ensure_process_in_netns_path(namespace, &target_path, &current_path)
+}
+
+#[cfg(unix)]
+fn ensure_process_in_netns_path(
+    namespace: &LinuxNetworkNamespace,
+    target_path: &Path,
+    current_netns_path: &Path,
+) -> anyhow::Result<()> {
+    let report = inspect_linux_netns_path(namespace, target_path, Some(current_netns_path))
+        .with_context(|| {
+            format!(
+                "failed to inspect network namespace {}; run the agent inside it or create {}",
+                namespace.name(),
+                target_path.display()
+            )
+        })?;
+    if report.same_as_current == Some(true) {
         return Ok(());
     }
     anyhow::bail!(
-        "relay forwarder requires process network namespace {}; current process is in a different namespace",
-        namespace.name()
+        "relay forwarder requires process network namespace {}; current process is in a different namespace than {}",
+        namespace.name(),
+        target_path.display()
     )
 }
 
@@ -5409,7 +8235,7 @@ fn ensure_process_in_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<
 }
 
 fn netns_path(namespace: &LinuxNetworkNamespace) -> std::path::PathBuf {
-    Path::new("/var/run/netns").join(namespace.name())
+    namespace.path()
 }
 
 #[derive(Debug)]
@@ -5495,6 +8321,7 @@ fn start_heartbeat_reporting(
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
+    route_reporter: Option<HeartbeatRouteReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_heartbeat_loop(
@@ -5503,6 +8330,7 @@ fn start_heartbeat_reporting(
             control_plane_urls,
             interval,
             relay_capability_reporter,
+            route_reporter,
         )
         .await;
     })
@@ -5514,20 +8342,28 @@ async fn run_heartbeat_loop(
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
+    route_reporter: Option<HeartbeatRouteReporter>,
 ) {
     let client = reqwest::Client::new();
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
-        let request =
-            match heartbeat_request(runtime.as_ref(), &identity, relay_capability.clone()).await {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
-                    tokio::time::sleep(interval).await;
-                    continue;
-                }
-            };
+        let routes = heartbeat_routes(route_reporter.as_ref()).await;
+        let request = match heartbeat_request(
+            runtime.as_ref(),
+            &identity,
+            relay_capability.clone(),
+            routes,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
         match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
             Ok(response) => tracing::info!(
                 accepted = response.accepted,
@@ -5588,20 +8424,17 @@ async fn heartbeat_request(
     runtime: &AgentRuntime,
     identity: &IdentityKeyPair,
     relay_capability: Option<RelayCapability>,
+    routes: Option<Vec<Route>>,
 ) -> anyhow::Result<HeartbeatRequest> {
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
+    let health = agent_health_from_status(&status, "agent heartbeat");
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
-        health: NodeHealth {
-            state: HealthState::Healthy,
-            last_seen_at: chrono::Utc::now(),
-            latency_ms: None,
-            relay_load: None,
-            message: Some("agent heartbeat".to_string()),
-        },
+        health,
         candidates: status.candidates,
         relay_capability,
+        routes,
         path_state,
         node_signature: None,
     };
@@ -5618,9 +8451,17 @@ fn start_signal_registration(
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_signal_registration_loop(runtime, node, signal_urls, interval).await;
+        run_signal_registration_loop(
+            runtime,
+            node,
+            signal_urls,
+            interval,
+            relay_capability_reporter,
+        )
+        .await;
     })
 }
 
@@ -5629,10 +8470,14 @@ async fn run_signal_registration_loop(
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
+    relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
     let client = reqwest::Client::new();
     loop {
-        let request = signal_node_upsert_request(runtime.as_ref(), node.clone()).await;
+        let relay_capability =
+            heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
+        let request =
+            signal_node_upsert_request(runtime.as_ref(), node.clone(), relay_capability).await;
         match send_signal_node_upsert_to_signal_services(&client, &signal_urls, request).await {
             Ok(successes) => tracing::info!(
                 node_id = %node.node_id,
@@ -5707,19 +8552,78 @@ async fn send_signal_node_upsert(
 async fn signal_node_upsert_request(
     runtime: &AgentRuntime,
     mut node: NodeRecord,
+    relay_capability: Option<RelayCapability>,
 ) -> SignalNodeUpsertRequest {
     let status = runtime.status().await;
+    let health = agent_health_from_status(&status, "agent signal registration");
     node.endpoint_candidates = status.candidates;
+    node.relay_capability =
+        signal_relay_capability(node.relay_capability.as_ref(), relay_capability);
     SignalNodeUpsertRequest {
         node,
         nat_classification: status.nat_classification,
-        health: Some(NodeHealth {
-            state: HealthState::Healthy,
-            last_seen_at: chrono::Utc::now(),
-            latency_ms: None,
-            relay_load: None,
-            message: Some("agent signal registration".to_string()),
-        }),
+        health: Some(health),
+    }
+}
+
+fn signal_relay_capability(
+    registered_capability: Option<&RelayCapability>,
+    refreshed_capability: Option<RelayCapability>,
+) -> Option<RelayCapability> {
+    let registered_capability = registered_capability?;
+    if !registered_capability.enabled_by_policy {
+        return None;
+    }
+    let mut refreshed_capability = refreshed_capability?;
+    refreshed_capability.enabled_by_policy = true;
+    Some(refreshed_capability)
+}
+
+fn agent_health_from_status(
+    status: &ipars_types::api::AgentStatusResponse,
+    healthy_message: &str,
+) -> NodeHealth {
+    let mut health = NodeHealth {
+        state: HealthState::Healthy,
+        last_seen_at: chrono::Utc::now(),
+        latency_ms: None,
+        relay_load: None,
+        message: Some(healthy_message.to_string()),
+    };
+    let Some(process) = status.userspace_wireguard_process.as_ref() else {
+        return health;
+    };
+
+    match process.state {
+        AgentManagedProcessState::Disabled | AgentManagedProcessState::Ready => health,
+        AgentManagedProcessState::Starting
+        | AgentManagedProcessState::Stopping
+        | AgentManagedProcessState::Stopped => {
+            health.state = HealthState::Degraded;
+            health.message = Some(format!(
+                "userspace WireGuard process state={}",
+                process.state.as_str()
+            ));
+            health
+        }
+        AgentManagedProcessState::Exited | AgentManagedProcessState::Failed => {
+            health.state = HealthState::Unhealthy;
+            health.message = Some(format!(
+                "userspace WireGuard process state={}{}{}",
+                process.state.as_str(),
+                process
+                    .exit_status
+                    .as_deref()
+                    .map(|status| format!(", exit_status={status}"))
+                    .unwrap_or_default(),
+                process
+                    .message
+                    .as_deref()
+                    .map(|message| format!(", message={message}"))
+                    .unwrap_or_default()
+            ));
+            health
+        }
     }
 }
 
@@ -5803,27 +8707,62 @@ async fn negotiate_signal_paths(
         let request = signal_path_request(&status, &peer);
         let (signal_url, response) =
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
-        let relay_candidates = selected_relay_candidates(&response);
-        let record = signal_path_record(response, chrono::Utc::now());
+        let mut relay_candidates = selected_relay_candidates(&response);
+        promote_active_relay_candidate(runtime, &peer.node_id, &mut relay_candidates).await;
+        let candidate_record = signal_path_record(response, chrono::Utc::now());
+        let (mut record, mut path_selection) =
+            stable_signal_path_record(runtime, candidate_record).await;
         if record.selected_state == PathState::DirectNatTraversal {
-            match fetch_hole_punch_plan(client, &signal_url, &record.key).await {
-                Ok(plan) => match hole_puncher.execute(&status.node_id, &plan).await {
-                    Ok(attempts) => tracing::info!(
-                        attempts,
-                        peer = %record.key.remote,
-                        "executed UDP hole punch plan"
-                    ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        peer = %record.key.remote,
-                        "failed to execute UDP hole punch plan"
-                    ),
-                },
-                Err(error) => tracing::warn!(
+            let hole_punch_result = match fetch_hole_punch_plan(client, &signal_url, &record.key)
+                .await
+            {
+                Ok(plan) => hole_puncher
+                    .execute(&status.node_id, &plan)
+                    .await
+                    .map(|attempts| {
+                        tracing::info!(
+                            attempts,
+                            peer = %record.key.remote,
+                            "executed UDP hole punch plan"
+                        );
+                    }),
+                Err(error) => Err(AgentError::HolePunch(format!(
+                    "failed to fetch UDP hole punch plan: {error:#}"
+                ))),
+            };
+            if let Err(error) = hole_punch_result {
+                tracing::warn!(
                     %error,
                     peer = %record.key.remote,
-                    "failed to fetch UDP hole punch plan"
-                ),
+                    "failed to prepare direct NAT traversal path"
+                );
+                if let Some(fallback) = relay_fallback_path_record(&record, &relay_candidates) {
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        relay = ?fallback.relay_node,
+                        "falling back to relay after direct NAT traversal setup failed"
+                    );
+                    record = fallback;
+                    path_selection = StableSignalPathSelection::Candidate;
+                } else {
+                    record = unreachable_path_record(
+                        &record,
+                        "direct_nat_traversal_failed",
+                        chrono::Utc::now(),
+                    );
+                    path_selection = StableSignalPathSelection::Candidate;
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        "direct NAT traversal setup failed and no relay fallback candidate was available; marking path unreachable"
+                    );
+                }
+            }
+        }
+        if record.selected_state == PathState::Relay
+            && path_selection == StableSignalPathSelection::Candidate
+        {
+            if let Some(preferred_relay) = relay_candidates.first() {
+                record.relay_node = Some(preferred_relay.node_id.clone());
             }
         }
         if record.selected_state == PathState::Relay {
@@ -5848,6 +8787,7 @@ async fn negotiate_signal_paths(
                         .await
                         {
                             Ok(session) => {
+                                record.relay_node = Some(session.relay_node.clone());
                                 tracing::info!(
                                     peer = %record.key.remote,
                                     relay = %session.relay_node,
@@ -5868,18 +8808,50 @@ async fn negotiate_signal_paths(
                                 }
                             }
                             Err(error) => {
-                                if let Some(supervisor) =
-                                    options.relay_forwarder_supervisor.as_ref()
+                                if let Some(session) =
+                                    active_relay_session(runtime, &peer.node_id).await
                                 {
-                                    supervisor.remove(runtime, &peer.node_id).await;
+                                    record.relay_node = Some(session.relay_node.clone());
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        relay = %session.relay_node,
+                                        expires_at = %session.expires_at,
+                                        "failed relay admission renewal; retaining existing relay session"
+                                    );
+                                    if let Some(supervisor) =
+                                        options.relay_forwarder_supervisor.as_ref()
+                                    {
+                                        if let Err(error) =
+                                            supervisor.upsert(runtime, session).await
+                                        {
+                                            tracing::warn!(
+                                                %error,
+                                                peer = %record.key.remote,
+                                                "failed to ensure existing relay forwarder"
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                                    remove_relay_session_for_peer(
+                                        runtime,
+                                        options.relay_forwarder_supervisor.as_ref(),
+                                        &peer.node_id,
+                                        Some(PathState::Unreachable),
+                                        "removed relay session after relay admission failed",
+                                    )
+                                    .await;
+                                    record = unreachable_path_record(
+                                        &record,
+                                        "relay_admission_failed",
+                                        chrono::Utc::now(),
+                                    );
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to admit relay session; marking path unreachable"
+                                    );
                                 }
-                                tracing::warn!(
-                                    %error,
-                                    peer = %record.key.remote,
-                                    "failed to admit relay session"
-                                );
                             }
                         }
                     } else {
@@ -5888,8 +8860,9 @@ async fn negotiate_signal_paths(
                             relay = %preferred_relay.node_id,
                             "reusing existing relay session"
                         );
-                        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-                            if let Some(session) = runtime.relay_session(&peer.node_id).await {
+                        if let Some(session) = runtime.relay_session(&peer.node_id).await {
+                            record.relay_node = Some(session.relay_node.clone());
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
                                 if let Err(error) = supervisor.upsert(runtime, session).await {
                                     tracing::warn!(
                                         %error,
@@ -5902,15 +8875,46 @@ async fn negotiate_signal_paths(
                     }
                 }
                 None => {
-                    if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-                        supervisor.remove(runtime, &peer.node_id).await;
-                    } else {
-                        runtime.remove_relay_forwarder_endpoint(&peer.node_id).await;
+                    let mut retained_existing_session = false;
+                    if path_selection == StableSignalPathSelection::CurrentRelay {
+                        if let Some(session) = active_relay_session(runtime, &peer.node_id).await {
+                            record.relay_node = Some(session.relay_node.clone());
+                            retained_existing_session = true;
+                            tracing::debug!(
+                                peer = %record.key.remote,
+                                relay = %session.relay_node,
+                                "keeping existing relay path without fresh relay candidates"
+                            );
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+                                if let Err(error) = supervisor.upsert(runtime, session).await {
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to ensure existing relay forwarder"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    tracing::warn!(
-                        peer = %record.key.remote,
-                        "signal selected relay path without a usable relay candidate"
-                    );
+                    if !retained_existing_session {
+                        remove_relay_session_for_peer(
+                            runtime,
+                            options.relay_forwarder_supervisor.as_ref(),
+                            &peer.node_id,
+                            Some(PathState::Unreachable),
+                            "removed relay session after relay candidates disappeared",
+                        )
+                        .await;
+                        record = unreachable_path_record(
+                            &record,
+                            "no_usable_relay_candidate",
+                            chrono::Utc::now(),
+                        );
+                        tracing::warn!(
+                            peer = %record.key.remote,
+                            "signal selected relay path without a usable relay candidate; marking path unreachable"
+                        );
+                    }
                 }
             }
         } else {
@@ -5926,6 +8930,45 @@ async fn negotiate_signal_paths(
         runtime.upsert_path_state(record).await;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableSignalPathSelection {
+    Candidate,
+    CurrentRelay,
+}
+
+async fn stable_signal_path_record(
+    runtime: &AgentRuntime,
+    candidate: PathRecord,
+) -> (PathRecord, StableSignalPathSelection) {
+    if let Some(mut current) = runtime.path_record_for_peer(&candidate.key.remote).await {
+        if current.selected_state == PathState::Relay
+            && candidate.selected_state.is_direct()
+            && !PathSelector::should_promote(&current, &candidate)
+        {
+            if let Some(session) = active_relay_session(runtime, &candidate.key.remote).await {
+                current.updated_at = candidate.updated_at;
+                current.relay_node = Some(session.relay_node.clone());
+                tracing::debug!(
+                    peer = %candidate.key.remote,
+                    relay = %session.relay_node,
+                    relay_score = current.score.value,
+                    direct_score = candidate.score.value,
+                    "keeping relay path until direct candidate score clears promotion margin"
+                );
+                return (current, StableSignalPathSelection::CurrentRelay);
+            }
+            tracing::debug!(
+                peer = %candidate.key.remote,
+                relay_score = current.score.value,
+                direct_score = candidate.score.value,
+                "accepting direct candidate because current relay path has no active session"
+            );
+        }
+    }
+
+    (candidate, StableSignalPathSelection::Candidate)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5980,6 +9023,10 @@ async fn remove_relay_session_for_peer(
             state = ?selected_state,
             "{message}"
         );
+    } else if let Some(supervisor) = relay_forwarder_supervisor {
+        supervisor.remove(runtime, peer).await;
+    } else {
+        runtime.remove_relay_forwarder_endpoint(peer).await;
     }
 }
 
@@ -6067,16 +9114,21 @@ struct RelayCapabilityReporter {
     status_url: Option<String>,
 }
 
-fn agent_relay_capability_reporter(args: &AgentArgs) -> Option<RelayCapabilityReporter> {
-    let advertised = agent_relay_capability(args)?;
+fn agent_relay_capability_reporter(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<RelayCapabilityReporter>> {
+    validate_agent_relay_capability_config(args)?;
+    let Some(advertised) = agent_relay_capability(args) else {
+        return Ok(None);
+    };
     let status_url = args
         .relay_status_url
         .clone()
         .or_else(|| args.relay_admission_url.clone());
-    Some(RelayCapabilityReporter {
+    Ok(Some(RelayCapabilityReporter {
         advertised,
         status_url,
-    })
+    }))
 }
 
 async fn heartbeat_relay_capability(
@@ -6088,14 +9140,24 @@ async fn heartbeat_relay_capability(
         return Some(reporter.advertised.clone());
     };
     match fetch_relay_status(client, status_url).await {
-        Ok(status) => Some(relay_capability_from_status(&reporter.advertised, &status)),
+        Ok(status) if status.health == HealthState::Healthy => {
+            Some(relay_capability_from_status(&reporter.advertised, &status))
+        }
+        Ok(status) => {
+            tracing::warn!(
+                status_url,
+                health = ?status.health,
+                "relay status is not healthy; omitting relay capability from reports"
+            );
+            None
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
                 status_url,
-                "failed to refresh relay status for heartbeat; using configured relay capability"
+                "failed to refresh relay status; omitting relay capability from reports"
             );
-            Some(reporter.advertised.clone())
+            None
         }
     }
 }
@@ -6143,36 +9205,96 @@ async fn relay_session_needs_renewal(
         .await
 }
 
+async fn active_relay_session(runtime: &AgentRuntime, peer: &NodeId) -> Option<RelaySessionState> {
+    runtime.active_relay_session(peer, chrono::Utc::now()).await
+}
+
+#[derive(Debug)]
+enum AgentRelayAdmissionError {
+    NoEndpointCandidate,
+    InvalidRelayCandidate(anyhow::Error),
+    Unavailable(anyhow::Error),
+    Rejected(anyhow::Error),
+    InvalidResponse(anyhow::Error),
+}
+
+impl AgentRelayAdmissionError {
+    fn reason(&self) -> AgentRelayAdmissionFailureReason {
+        match self {
+            Self::NoEndpointCandidate => AgentRelayAdmissionFailureReason::NoEndpointCandidate,
+            Self::InvalidRelayCandidate(_) => {
+                AgentRelayAdmissionFailureReason::InvalidRelayCandidate
+            }
+            Self::Unavailable(_) => AgentRelayAdmissionFailureReason::Unavailable,
+            Self::Rejected(_) => AgentRelayAdmissionFailureReason::Rejected,
+            Self::InvalidResponse(_) => AgentRelayAdmissionFailureReason::InvalidResponse,
+        }
+    }
+}
+
+impl fmt::Display for AgentRelayAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoEndpointCandidate => {
+                write!(formatter, "relay session requires endpoint candidates")
+            }
+            Self::InvalidRelayCandidate(error) => {
+                write!(formatter, "invalid relay candidate: {error:#}")
+            }
+            Self::Unavailable(error) => {
+                write!(
+                    formatter,
+                    "failed to send relay admission request: {error:#}"
+                )
+            }
+            Self::Rejected(error) => {
+                write!(formatter, "relay rejected admission request: {error:#}")
+            }
+            Self::InvalidResponse(error) => {
+                write!(formatter, "invalid relay admission response: {error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentRelayAdmissionError {}
+
 async fn admit_relay_session(
     client: &reqwest::Client,
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
     relay: &NodeRecord,
     relay_admission_bearer_token: Option<&str>,
-) -> anyhow::Result<RelaySessionState> {
+) -> Result<RelaySessionState, AgentRelayAdmissionError> {
     let request = relay_admission_request(status, peer)
-        .context("relay session requires endpoint candidates")?;
-    let relay_endpoint = relay_public_endpoint(relay)?;
-    let mut request_builder = client.post(relay_admission_url(relay)?).json(&request);
+        .ok_or(AgentRelayAdmissionError::NoEndpointCandidate)?;
+    let relay_endpoint =
+        relay_public_endpoint(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
+    let admission_url =
+        relay_admission_url(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
+    let mut request_builder = client.post(admission_url).json(&request);
     if let Some(token) = relay_admission_bearer_token {
         request_builder = request_builder.bearer_auth(token);
     }
     let response = request_builder
         .send()
         .await
-        .context("failed to send relay admission request")?
+        .map_err(|error| AgentRelayAdmissionError::Unavailable(anyhow::Error::new(error)))?
         .error_for_status()
-        .context("relay rejected admission request")?
+        .map_err(|error| AgentRelayAdmissionError::Rejected(anyhow::Error::new(error)))?
         .json::<RelayAdmissionResponse>()
         .await
-        .context("failed to decode relay admission response")?;
+        .map_err(|error| AgentRelayAdmissionError::InvalidResponse(anyhow::Error::new(error)))?;
 
-    Ok(relay_session_state_from_admission(
+    relay_session_state_from_admission(
         peer,
         relay,
+        &request,
         response,
         relay_endpoint,
-    ))
+        chrono::Utc::now(),
+    )
+    .map_err(AgentRelayAdmissionError::InvalidResponse)
 }
 
 async fn admit_relay_session_from_candidates(
@@ -6192,7 +9314,7 @@ async fn admit_relay_session_from_candidates(
                 return Ok(session);
             }
             Err(error) => {
-                runtime.record_relay_admission_failure();
+                runtime.record_relay_admission_failure_reason(error.reason());
                 errors.push(format!("{}: {error:#}", relay.node_id));
                 tracing::warn!(
                     relay = %relay.node_id,
@@ -6213,15 +9335,18 @@ async fn admit_relay_session_from_candidates(
 fn relay_session_state_from_admission(
     peer: &NodeRecord,
     relay: &NodeRecord,
+    request: &RelayAdmissionRequest,
     response: RelayAdmissionResponse,
     relay_endpoint: SocketAddr,
-) -> RelaySessionState {
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RelaySessionState> {
+    validate_relay_admission_response(peer, request, &response, now)?;
     let (admitted_local_addr, admitted_peer_addr) = if response.left == peer.node_id {
         (response.right_addr, response.left_addr)
     } else {
         (response.left_addr, response.right_addr)
     };
-    RelaySessionState {
+    Ok(RelaySessionState {
         peer: peer.node_id.clone(),
         relay_node: relay.node_id.clone(),
         relay_endpoint,
@@ -6230,7 +9355,58 @@ fn relay_session_state_from_admission(
         session_id: response.session_id,
         session_token: response.session_token,
         expires_at: response.expires_at,
+    })
+}
+
+fn validate_relay_admission_response(
+    peer: &NodeRecord,
+    request: &RelayAdmissionRequest,
+    response: &RelayAdmissionResponse,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    if response.left != request.left || response.right != request.right {
+        anyhow::bail!(
+            "relay admission response node pair mismatch: expected {} -> {}, got {} -> {}",
+            request.left,
+            request.right,
+            response.left,
+            response.right
+        );
     }
+    if response.left != peer.node_id && response.right != peer.node_id {
+        anyhow::bail!(
+            "relay admission response target mismatch: expected peer {} in node pair {} -> {}",
+            peer.node_id,
+            response.left,
+            response.right
+        );
+    }
+    if response.left_addr != request.left_addr || response.right_addr != request.right_addr {
+        anyhow::bail!(
+            "relay admission response endpoint mismatch: expected {} -> {}, got {} -> {}",
+            request.left_addr,
+            request.right_addr,
+            response.left_addr,
+            response.right_addr
+        );
+    }
+    let expected_session_id = RelaySessionId::new(&request.left, &request.right);
+    if response.session_id != expected_session_id.as_str() {
+        anyhow::bail!(
+            "relay admission response session id mismatch: expected {}, got {}",
+            expected_session_id.as_str(),
+            response.session_id
+        );
+    }
+    if response.expires_at <= now {
+        anyhow::bail!(
+            "relay admission response already expired at {}",
+            response.expires_at
+        );
+    }
+    encode_relay_datagram(&response.session_id, &response.session_token, &[0])
+        .context("relay admission response returned invalid session credential")?;
+    Ok(())
 }
 
 fn relay_admission_request(
@@ -6267,6 +9443,7 @@ fn relay_admission_request(
 fn relay_session_endpoint(candidates: &[EndpointCandidate]) -> Option<SocketAddr> {
     candidates
         .iter()
+        .filter(|candidate| endpoint_addr_is_usable(candidate.addr))
         .filter_map(|candidate| {
             relay_session_endpoint_rank(candidate).map(|rank| (rank, candidate))
         })
@@ -6290,9 +9467,6 @@ fn relay_session_endpoint_rank(candidate: &EndpointCandidate) -> Option<u8> {
 }
 
 fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
-    if response.preferred_state != PathState::Relay {
-        return Vec::new();
-    }
     let mut candidates = response
         .relay_candidates
         .iter()
@@ -6305,18 +9479,101 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        let left = left.relay_capability.as_ref();
-        let right = right.relay_capability.as_ref();
-        left.map(|capability| capability.active_sessions)
-            .cmp(&right.map(|capability| capability.active_sessions))
-            .then_with(|| {
-                right
-                    .map(|capability| capability.max_mbps)
-                    .cmp(&left.map(|capability| capability.max_mbps))
-            })
-    });
+    candidates.sort_by(relay_candidate_ordering);
     candidates
+}
+
+fn relay_candidate_ordering(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
+    match (
+        left.relay_capability.as_ref(),
+        right.relay_capability.as_ref(),
+    ) {
+        (Some(left), Some(right)) => relay_utilization_ordering(left, right)
+            .then_with(|| right.available_capacity().cmp(&left.available_capacity()))
+            .then_with(|| right.max_mbps.cmp(&left.max_mbps))
+            .then_with(|| left.active_sessions.cmp(&right.active_sessions)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn relay_utilization_ordering(
+    left: &RelayCapability,
+    right: &RelayCapability,
+) -> std::cmp::Ordering {
+    let left_numerator = u64::from(left.active_sessions) * u64::from(right.max_sessions);
+    let right_numerator = u64::from(right.active_sessions) * u64::from(left.max_sessions);
+    left_numerator.cmp(&right_numerator)
+}
+
+async fn promote_active_relay_candidate(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    candidates: &mut Vec<NodeRecord>,
+) -> Option<NodeId> {
+    let session = active_relay_session(runtime, peer).await?;
+    let position = candidates
+        .iter()
+        .position(|relay| relay.node_id == session.relay_node)?;
+    if position > 0 {
+        let relay = candidates.remove(position);
+        candidates.insert(0, relay);
+    }
+    Some(session.relay_node)
+}
+
+fn unreachable_path_record(
+    previous: &PathRecord,
+    reason: &'static str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> PathRecord {
+    let mut score = PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), true, 0);
+    score.reasons.push(reason.to_string());
+    PathRecord {
+        key: previous.key.clone(),
+        selected_state: PathState::Unreachable,
+        selected_candidate: None,
+        relay_node: None,
+        score,
+        updated_at,
+        pinned: previous.pinned,
+    }
+}
+
+fn relay_fallback_path_record(
+    direct_record: &PathRecord,
+    relay_candidates: &[NodeRecord],
+) -> Option<PathRecord> {
+    let relay = relay_candidates.first()?;
+    let relay_load = relay.relay_capability.as_ref().map(|capability| {
+        if capability.max_sessions == 0 {
+            1.0
+        } else {
+            capability.active_sessions as f32 / capability.max_sessions as f32
+        }
+    });
+    let mut score = PathScore::calculate(
+        PathState::Relay,
+        &PathMetrics {
+            relay_load,
+            ..PathMetrics::default()
+        },
+        true,
+        0,
+    );
+    score
+        .reasons
+        .push("direct_nat_traversal_failed".to_string());
+    Some(PathRecord {
+        key: direct_record.key.clone(),
+        selected_state: PathState::Relay,
+        selected_candidate: None,
+        relay_node: Some(relay.node_id.clone()),
+        score,
+        updated_at: chrono::Utc::now(),
+        pinned: direct_record.pinned,
+    })
 }
 
 fn relay_admission_url(relay: &NodeRecord) -> anyhow::Result<String> {
@@ -6467,6 +9724,7 @@ async fn run_peer_map_sync_loop<S, A>(
                 peers_applied = summary.peers_applied,
                 peers_removed = summary.peers_removed,
                 routes_applied = summary.routes_applied,
+                routes_removed = summary.routes_removed,
                 interface = %interface,
                 "applied control-plane peer map"
             ),
@@ -6494,7 +9752,11 @@ fn start_proc_net_conntrack_packet_flow_detector(
             match read_conntrack_packet_flows(&paths, limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "proc-net-conntrack");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::ProcNetConntrack,
+                    );
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -6532,7 +9794,11 @@ fn start_conntrack_netlink_packet_flow_detector(
             match read_conntrack_netlink_packet_flows(limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "conntrack-netlink");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::ConntrackNetlink,
+                    );
                     let matched_count = record_packet_flow_observations(
                         runtime.as_ref(),
                         flows,
@@ -6610,7 +9876,11 @@ fn start_ebpf_jsonl_packet_flow_detector(
             match read_ebpf_jsonl_packet_flows(&event_path, &mut cursor, limits).await {
                 Ok(flows) => {
                     let (flows, duplicate_count) = deduper.retain_new(flows);
-                    log_packet_flow_duplicates(duplicate_count, "ebpf-jsonl");
+                    record_packet_flow_duplicate_suppressions(
+                        runtime.as_ref(),
+                        duplicate_count,
+                        AgentPacketFlowDuplicateSource::EbpfJsonl,
+                    );
                     let matched_count =
                         record_packet_flow_observations(runtime.as_ref(), flows, pin, "ebpf-jsonl")
                             .await;
@@ -6684,7 +9954,11 @@ async fn run_ebpf_ringbuf_packet_flow_detector_once(
         let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
         guard.clear_ready();
         let (flows, duplicate_count) = deduper.retain_new(flows);
-        log_packet_flow_duplicates(duplicate_count, "ebpf-ringbuf");
+        record_packet_flow_duplicate_suppressions(
+            runtime,
+            duplicate_count,
+            AgentPacketFlowDuplicateSource::EbpfRingbuf,
+        );
         let matched_count =
             record_packet_flow_observations(runtime, flows, pin, "ebpf-ringbuf").await;
         if matched_count > 0 {
@@ -6770,11 +10044,16 @@ fn packet_flow_dedup_ttl(seconds: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
-fn log_packet_flow_duplicates(duplicate_count: usize, source: &'static str) {
+fn record_packet_flow_duplicate_suppressions(
+    runtime: &AgentRuntime,
+    duplicate_count: usize,
+    source: AgentPacketFlowDuplicateSource,
+) {
     if duplicate_count > 0 {
+        runtime.record_packet_flow_duplicate_suppression(source, duplicate_count as u64);
         tracing::debug!(
             suppressed = duplicate_count,
-            source,
+            source = source.as_str(),
             "suppressed duplicate packet-flow observations"
         );
     }
@@ -6783,6 +10062,7 @@ fn log_packet_flow_duplicates(duplicate_count: usize, source: &'static str) {
 #[derive(Debug)]
 struct PacketFlowDeduper {
     ttl: Option<Duration>,
+    max_entries: usize,
     seen: BTreeMap<PacketFlowFingerprint, Instant>,
 }
 
@@ -6790,6 +10070,16 @@ impl PacketFlowDeduper {
     fn new(ttl: Option<Duration>) -> Self {
         Self {
             ttl,
+            max_entries: MAX_PACKET_FLOW_DEDUP_FINGERPRINTS,
+            seen: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_entries(ttl: Option<Duration>, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries,
             seen: BTreeMap::new(),
         }
     }
@@ -6813,7 +10103,25 @@ impl PacketFlowDeduper {
             self.seen.insert(fingerprint, now);
             retained.push(flow);
         }
+        self.prune_to_max_entries();
         (retained, duplicate_count)
+    }
+
+    fn prune_to_max_entries(&mut self) {
+        let excess = self.seen.len().saturating_sub(self.max_entries);
+        if excess == 0 {
+            return;
+        }
+
+        let mut oldest = self
+            .seen
+            .iter()
+            .map(|(fingerprint, last_seen)| (fingerprint.clone(), *last_seen))
+            .collect::<Vec<_>>();
+        oldest.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        for (fingerprint, _) in oldest.into_iter().take(excess) {
+            self.seen.remove(&fingerprint);
+        }
     }
 }
 
@@ -6824,6 +10132,7 @@ struct PacketFlowFingerprint {
     protocol: Option<u8>,
     source_port: Option<u16>,
     destination_port: Option<u16>,
+    application: AgentPacketFlowApplication,
     conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
     tcp_state: Option<AgentPacketFlowTcpState>,
 }
@@ -6836,6 +10145,7 @@ impl From<&PacketFlowRecord> for PacketFlowFingerprint {
             protocol: flow.observation.protocol.map(transport_protocol_number),
             source_port: flow.observation.source_port,
             destination_port: flow.observation.destination_port,
+            application: flow.observation.application(),
             conntrack_status: flow.observation.conntrack_status.clone(),
             tcp_state: flow.observation.tcp_state,
         }
@@ -6867,7 +10177,11 @@ async fn run_conntrack_netlink_event_detector_once(
         {
             recorded_any = true;
             let (flows, duplicate_count) = deduper.retain_new(flows);
-            log_packet_flow_duplicates(duplicate_count, "conntrack-netlink-events");
+            record_packet_flow_duplicate_suppressions(
+                runtime,
+                duplicate_count,
+                AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
+            );
             let matched_count =
                 record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events")
                     .await;
@@ -6952,12 +10266,27 @@ struct ProcNetConntrackReadLimits {
 }
 
 impl ProcNetConntrackReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_u64(
+            args.packet_flow_procfs_max_bytes,
+            "--packet-flow-procfs-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_line_bytes,
+            "--packet-flow-procfs-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_procfs_max_flows,
+            "--packet-flow-procfs-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_bytes: args.packet_flow_procfs_max_bytes,
             max_line_bytes: args.packet_flow_procfs_max_line_bytes,
             max_flows: args.packet_flow_procfs_max_flows,
-        }
+        })
     }
 }
 
@@ -6977,10 +10306,15 @@ struct ConntrackNetlinkReadLimits {
 }
 
 impl ConntrackNetlinkReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_usize(
+            args.packet_flow_netlink_max_flows,
+            "--packet-flow-netlink-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_flows: args.packet_flow_netlink_max_flows,
-        }
+        })
     }
 }
 
@@ -7000,12 +10334,27 @@ struct EbpfJsonlReadLimits {
 }
 
 impl EbpfJsonlReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_u64(
+            args.packet_flow_ebpf_event_max_bytes,
+            "--packet-flow-ebpf-event-max-bytes",
+            MAX_PACKET_FLOW_READ_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_line_bytes,
+            "--packet-flow-ebpf-event-max-line-bytes",
+            MAX_PACKET_FLOW_LINE_BYTES,
+        )?;
+        validate_bounded_usize(
+            args.packet_flow_ebpf_event_max_flows,
+            "--packet-flow-ebpf-event-max-flows",
+            MAX_PACKET_FLOW_RECORDS,
+        )?;
+        Ok(Self {
             max_bytes: args.packet_flow_ebpf_event_max_bytes,
             max_line_bytes: args.packet_flow_ebpf_event_max_line_bytes,
             max_flows: args.packet_flow_ebpf_event_max_flows,
-        }
+        })
     }
 }
 
@@ -7032,11 +10381,15 @@ impl EbpfRingbufConfig {
             .packet_flow_ebpf_object_path
             .clone()
             .context("--packet-flow-ebpf-object-path is required")?;
-        let attachments = args
-            .packet_flow_ebpf_attach
-            .iter()
-            .map(|attach| EbpfTracepointAttachSpec::parse(attach))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        validate_ebpf_identifier(
+            &args.packet_flow_ebpf_ringbuf_map,
+            "--packet-flow-ebpf-ringbuf-map",
+        )?;
+        anyhow::ensure!(
+            !args.packet_flow_ebpf_attach.is_empty(),
+            "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
+        );
+        let attachments = parse_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
         Ok(Self {
             object_path,
             ringbuf_map: args.packet_flow_ebpf_ringbuf_map.clone(),
@@ -7080,10 +10433,15 @@ struct EbpfRingbufReadLimits {
 }
 
 impl EbpfRingbufReadLimits {
-    fn from_args(args: &AgentArgs) -> Self {
-        Self {
+    fn from_args(args: &AgentArgs) -> anyhow::Result<Self> {
+        validate_bounded_usize(
+            args.packet_flow_ebpf_ringbuf_max_events,
+            "--packet-flow-ebpf-ringbuf-max-events",
+            MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE,
+        )?;
+        Ok(Self {
             max_events_per_wake: args.packet_flow_ebpf_ringbuf_max_events,
-        }
+        })
     }
 }
 
@@ -7128,35 +10486,53 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
         "unsupported eBPF packet-flow event version {}",
         event.version
     );
-    let protocol = ebpf_packet_flow_protocol(event.protocol);
+    validate_ebpf_packet_flow_unused_fields(&event)?;
+    let protocol = ebpf_packet_flow_protocol(event.protocol)?;
     let tcp_state = ebpf_packet_flow_tcp_state(event.tcp_state)?;
-    let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status);
+    validate_ebpf_packet_flow_transport_metadata(&event)?;
+    let conntrack_status = ebpf_packet_flow_conntrack_status(event.conntrack_status)?;
     let source_port = optional_nonzero_port(event.source_port());
     let destination_port = optional_nonzero_port(event.destination_port());
-    let source = ebpf_packet_flow_ip(event.ip_family, &event.source)?;
-    let destination = ebpf_packet_flow_ip(event.ip_family, &event.destination)?;
+    let source = optional_ebpf_packet_flow_source(event.ip_family, &event.source)?;
+    let destination = ebpf_packet_flow_ip(event.ip_family, "destination", &event.destination)?;
     Ok(PacketFlowRecord {
         destination,
         observation: AgentPacketFlowObservation {
-            source: Some(source),
+            source,
             protocol,
             source_port,
             destination_port,
             detector: Some("ebpf-ringbuf".to_string()),
+            application: None,
+            payload_prefix: Vec::new(),
             conntrack_status,
             tcp_state,
         },
     })
 }
 
-fn ebpf_packet_flow_protocol(value: u8) -> Option<TransportProtocol> {
-    match value {
+fn validate_ebpf_packet_flow_unused_fields(event: &PacketFlowEvent) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        event.flags == 0,
+        "unsupported eBPF packet-flow event flags 0x{:02x}",
+        event.flags
+    );
+    anyhow::ensure!(
+        event.reserved.iter().all(|byte| *byte == 0),
+        "unsupported eBPF packet-flow reserved bytes"
+    );
+    Ok(())
+}
+
+fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtocol>> {
+    let protocol = match value {
         PACKET_FLOW_PROTOCOL_UNKNOWN => None,
         PACKET_FLOW_PROTOCOL_ICMP => Some(TransportProtocol::Icmp),
         PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
         PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
-        _ => Some(TransportProtocol::Any),
-    }
+        _ => anyhow::bail!("unsupported eBPF packet-flow protocol code {value}"),
+    };
+    Ok(protocol)
 }
 
 fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
@@ -7177,7 +10553,36 @@ fn ebpf_packet_flow_tcp_state(value: u8) -> anyhow::Result<Option<AgentPacketFlo
     Ok(state)
 }
 
-fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackStatus> {
+fn validate_ebpf_packet_flow_transport_metadata(event: &PacketFlowEvent) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        event.protocol == PACKET_FLOW_PROTOCOL_TCP
+            || event.tcp_state == PACKET_FLOW_TCP_STATE_UNKNOWN,
+        "unsupported eBPF packet-flow TCP state {} for non-TCP protocol code {}",
+        event.tcp_state,
+        event.protocol
+    );
+    let protocol_has_ports = matches!(
+        event.protocol,
+        PACKET_FLOW_PROTOCOL_TCP | PACKET_FLOW_PROTOCOL_UDP
+    );
+    anyhow::ensure!(
+        protocol_has_ports || (event.source_port() == 0 && event.destination_port() == 0),
+        "unsupported eBPF packet-flow port metadata for protocol code {}",
+        event.protocol
+    );
+    Ok(())
+}
+
+fn ebpf_packet_flow_conntrack_status(
+    value: u8,
+) -> anyhow::Result<Vec<AgentPacketFlowConntrackStatus>> {
+    let known_bits = PACKET_FLOW_CONNTRACK_UNREPLIED | PACKET_FLOW_CONNTRACK_ASSURED;
+    let unsupported_bits = value & !known_bits;
+    anyhow::ensure!(
+        unsupported_bits == 0,
+        "unsupported eBPF packet-flow conntrack status bits 0x{:02x}",
+        unsupported_bits
+    );
     let mut status = Vec::new();
     if value & PACKET_FLOW_CONNTRACK_UNREPLIED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Unreplied);
@@ -7185,54 +10590,35 @@ fn ebpf_packet_flow_conntrack_status(value: u8) -> Vec<AgentPacketFlowConntrackS
     if value & PACKET_FLOW_CONNTRACK_ASSURED != 0 {
         status.push(AgentPacketFlowConntrackStatus::Assured);
     }
-    status
+    Ok(status)
 }
 
 fn optional_nonzero_port(value: u16) -> Option<u16> {
     (value != 0).then_some(value)
 }
 
-fn ebpf_packet_flow_ip(ip_family: u8, bytes: &[u8]) -> anyhow::Result<IpAddr> {
+fn ebpf_packet_flow_ip(ip_family: u8, field: &str, bytes: &[u8]) -> anyhow::Result<IpAddr> {
+    let octets: [u8; 16] = bytes
+        .try_into()
+        .with_context(|| format!("eBPF packet-flow {field} IP field had invalid length"))?;
     match ip_family {
-        PACKET_FLOW_IP_FAMILY_IPV4 => Ok(IpAddr::V4(Ipv4Addr::new(
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ))),
-        PACKET_FLOW_IP_FAMILY_IPV6 => {
-            let octets: [u8; 16] = bytes
-                .try_into()
-                .context("eBPF packet-flow IPv6 field had invalid length")?;
-            Ok(IpAddr::V6(Ipv6Addr::from(octets)))
+        PACKET_FLOW_IP_FAMILY_IPV4 => {
+            anyhow::ensure!(
+                octets[4..].iter().all(|byte| *byte == 0),
+                "unsupported eBPF packet-flow IPv4 {field} padding bytes"
+            );
+            Ok(IpAddr::V4(Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            )))
         }
+        PACKET_FLOW_IP_FAMILY_IPV6 => Ok(IpAddr::V6(Ipv6Addr::from(octets))),
         _ => anyhow::bail!("unsupported eBPF packet-flow IP family {ip_family}"),
     }
 }
 
-fn packet_flow_destination_drop_reason(destination: IpAddr) -> Option<AgentPacketFlowDropReason> {
-    if destination.is_unspecified() {
-        return Some(AgentPacketFlowDropReason::Unspecified);
-    }
-    if destination.is_loopback() {
-        return Some(AgentPacketFlowDropReason::Loopback);
-    }
-    if destination.is_multicast() {
-        return Some(AgentPacketFlowDropReason::Multicast);
-    }
-    match destination {
-        IpAddr::V4(address) if address == Ipv4Addr::BROADCAST => {
-            Some(AgentPacketFlowDropReason::Broadcast)
-        }
-        IpAddr::V4(address) if address.is_link_local() => {
-            Some(AgentPacketFlowDropReason::LinkLocal)
-        }
-        IpAddr::V6(address) if is_ipv6_unicast_link_local(address) => {
-            Some(AgentPacketFlowDropReason::LinkLocal)
-        }
-        _ => None,
-    }
-}
-
-fn is_ipv6_unicast_link_local(address: Ipv6Addr) -> bool {
-    address.segments()[0] & 0xffc0 == 0xfe80
+fn optional_ebpf_packet_flow_source(ip_family: u8, bytes: &[u8]) -> anyhow::Result<Option<IpAddr>> {
+    let source = ebpf_packet_flow_ip(ip_family, "source", bytes)?;
+    Ok((!source.is_unspecified()).then_some(source))
 }
 
 async fn read_conntrack_netlink_packet_flows(
@@ -7342,6 +10728,8 @@ const IPCTNL_MSG_CT_GET: u16 = 1;
 const NFNETLINK_V0: u8 = 0;
 const CTA_TUPLE_ORIG: u16 = 1;
 const CTA_TUPLE_REPLY: u16 = 2;
+const CTA_STATUS: u16 = 3;
+const CTA_PROTOINFO: u16 = 4;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
 const CTA_IP_V4_SRC: u16 = 1;
@@ -7351,7 +10739,22 @@ const CTA_IP_V6_DST: u16 = 4;
 const CTA_PROTO_NUM: u16 = 1;
 const CTA_PROTO_SRC_PORT: u16 = 2;
 const CTA_PROTO_DST_PORT: u16 = 3;
+const CTA_PROTOINFO_TCP: u16 = 1;
+const CTA_PROTOINFO_TCP_STATE: u16 = 1;
 const NLA_TYPE_MASK: u16 = 0x3fff;
+const IPS_SEEN_REPLY: u32 = 1 << 1;
+const IPS_ASSURED: u32 = 1 << 2;
+const TCP_CONNTRACK_NONE: u8 = 0;
+const TCP_CONNTRACK_SYN_SENT: u8 = 1;
+const TCP_CONNTRACK_SYN_RECV: u8 = 2;
+const TCP_CONNTRACK_ESTABLISHED: u8 = 3;
+const TCP_CONNTRACK_FIN_WAIT: u8 = 4;
+const TCP_CONNTRACK_CLOSE_WAIT: u8 = 5;
+const TCP_CONNTRACK_LAST_ACK: u8 = 6;
+const TCP_CONNTRACK_TIME_WAIT: u8 = 7;
+const TCP_CONNTRACK_CLOSE: u8 = 8;
+const TCP_CONNTRACK_LISTEN: u8 = 9;
+const TCP_CONNTRACK_SYN_SENT2: u8 = 10;
 
 fn conntrack_netlink_event_group_mask() -> u32 {
     netlink_group_mask(NFNLGRP_CONNTRACK_NEW) | netlink_group_mask(NFNLGRP_CONNTRACK_UPDATE)
@@ -7469,11 +10872,30 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
     if payload.len() < NFGENMSG_LEN {
         anyhow::bail!("truncated conntrack netlink nfgenmsg payload");
     }
+    let attributes = netlink_attributes(&payload[NFGENMSG_LEN..])?;
+    let mut conntrack_status = Vec::new();
+    let mut tcp_state = None;
+    for attribute in &attributes {
+        match attribute.kind {
+            CTA_STATUS => {
+                conntrack_status = parse_conntrack_netlink_status(attribute.value)?;
+            }
+            CTA_PROTOINFO => {
+                tcp_state = parse_conntrack_protoinfo_tcp_state(attribute.value)?;
+            }
+            _ => {}
+        }
+    }
+
     let mut flows = Vec::new();
-    for attribute in netlink_attributes(&payload[NFGENMSG_LEN..])? {
+    for attribute in attributes {
         match attribute.kind {
             CTA_TUPLE_ORIG | CTA_TUPLE_REPLY => {
-                if let Some(flow) = parse_conntrack_tuple_packet_flow(attribute.value)? {
+                if let Some(flow) = parse_conntrack_tuple_packet_flow(
+                    attribute.value,
+                    &conntrack_status,
+                    tcp_state,
+                )? {
                     flows.push(flow);
                 }
             }
@@ -7483,8 +10905,74 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
     Ok(flows)
 }
 
-fn parse_conntrack_tuple_packet_flow(payload: &[u8]) -> anyhow::Result<Option<PacketFlowRecord>> {
-    let mut tuple = ConntrackTupleFields::default();
+fn parse_conntrack_netlink_status(
+    payload: &[u8],
+) -> anyhow::Result<Vec<AgentPacketFlowConntrackStatus>> {
+    anyhow::ensure!(
+        payload.len() == 4,
+        "invalid conntrack netlink status attribute length: {}",
+        payload.len()
+    );
+    let bits = u32::from_be_bytes(payload.try_into()?);
+    let mut status = Vec::new();
+    if bits & IPS_SEEN_REPLY == 0 {
+        status.push(AgentPacketFlowConntrackStatus::Unreplied);
+    }
+    if bits & IPS_ASSURED != 0 {
+        status.push(AgentPacketFlowConntrackStatus::Assured);
+    }
+    Ok(status)
+}
+
+fn parse_conntrack_protoinfo_tcp_state(
+    payload: &[u8],
+) -> anyhow::Result<Option<AgentPacketFlowTcpState>> {
+    for attribute in netlink_attributes(payload)? {
+        if attribute.kind != CTA_PROTOINFO_TCP {
+            continue;
+        }
+        for tcp_attribute in netlink_attributes(attribute.value)? {
+            if tcp_attribute.kind != CTA_PROTOINFO_TCP_STATE {
+                continue;
+            }
+            anyhow::ensure!(
+                tcp_attribute.value.len() == 1,
+                "invalid conntrack netlink TCP state attribute length: {}",
+                tcp_attribute.value.len()
+            );
+            return Ok(conntrack_tcp_state(tcp_attribute.value[0]));
+        }
+    }
+    Ok(None)
+}
+
+fn conntrack_tcp_state(value: u8) -> Option<AgentPacketFlowTcpState> {
+    match value {
+        TCP_CONNTRACK_NONE => None,
+        TCP_CONNTRACK_SYN_SENT => Some(AgentPacketFlowTcpState::SynSent),
+        TCP_CONNTRACK_SYN_RECV => Some(AgentPacketFlowTcpState::SynRecv),
+        TCP_CONNTRACK_ESTABLISHED => Some(AgentPacketFlowTcpState::Established),
+        TCP_CONNTRACK_FIN_WAIT => Some(AgentPacketFlowTcpState::FinWait),
+        TCP_CONNTRACK_CLOSE_WAIT => Some(AgentPacketFlowTcpState::CloseWait),
+        TCP_CONNTRACK_LAST_ACK => Some(AgentPacketFlowTcpState::LastAck),
+        TCP_CONNTRACK_TIME_WAIT => Some(AgentPacketFlowTcpState::TimeWait),
+        TCP_CONNTRACK_CLOSE => Some(AgentPacketFlowTcpState::Close),
+        TCP_CONNTRACK_LISTEN => Some(AgentPacketFlowTcpState::Listen),
+        TCP_CONNTRACK_SYN_SENT2 => Some(AgentPacketFlowTcpState::SynSent2),
+        _ => None,
+    }
+}
+
+fn parse_conntrack_tuple_packet_flow(
+    payload: &[u8],
+    conntrack_status: &[AgentPacketFlowConntrackStatus],
+    tcp_state: Option<AgentPacketFlowTcpState>,
+) -> anyhow::Result<Option<PacketFlowRecord>> {
+    let mut tuple = ConntrackTupleFields {
+        conntrack_status: conntrack_status.to_vec(),
+        tcp_state,
+        ..Default::default()
+    };
     for attribute in netlink_attributes(payload)? {
         match attribute.kind {
             CTA_TUPLE_IP => parse_conntrack_ip_tuple(attribute.value, &mut tuple)?,
@@ -7516,6 +11004,8 @@ impl ConntrackTupleFields {
                 source_port: self.source_port,
                 destination_port: self.destination_port,
                 detector: None,
+                application: None,
+                payload_prefix: Vec::new(),
                 conntrack_status: self.conntrack_status,
                 tcp_state: self.tcp_state,
             },
@@ -7763,6 +11253,7 @@ async fn read_ebpf_jsonl_packet_flows(
     cursor: &mut EbpfJsonlReadCursor,
     limits: EbpfJsonlReadLimits,
 ) -> anyhow::Result<Vec<PacketFlowRecord>> {
+    ensure_ebpf_jsonl_event_path_ready(path)?;
     let mut file = tokio::fs::File::open(path).await.with_context(|| {
         format!(
             "failed to open eBPF packet-flow event file {}",
@@ -7858,6 +11349,11 @@ fn parse_ebpf_jsonl_packet_flow_line(
     );
     let event: EbpfJsonlPacketFlowEvent =
         serde_json::from_slice(line).context("failed to parse eBPF packet-flow JSON event")?;
+    event
+        .observation
+        .validate_transport_metadata()
+        .map_err(anyhow::Error::msg)
+        .context("invalid eBPF packet-flow JSON event metadata")?;
     Ok(PacketFlowRecord {
         destination: event.destination,
         observation: event.observation,
@@ -8131,28 +11627,44 @@ fn control_plane_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
-        token.map(|token| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "control-plane URL")
+    } else if let Some(token) = token {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
                 .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let base_urls =
-        base_urls.context("control-plane URL is required and no control-plane bootstrap exists")?;
-    let base_urls = dedupe_urls_preserve_order(
-        base_urls
-            .into_iter()
-            .map(|base_url| normalize_base_url(&base_url)),
-    );
+                .collect::<Vec<_>>(),
+            "control-plane bootstrap endpoint",
+        )
+    } else {
+        anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
+    };
+    let base_urls = normalize_http_base_urls(base_urls, name)?;
     if base_urls.is_empty() {
         anyhow::bail!("control-plane URL is required and no control-plane bootstrap exists");
     }
     Ok(base_urls)
+}
+
+fn normalize_http_base_urls(
+    base_urls: impl IntoIterator<Item = String>,
+    name: &str,
+) -> anyhow::Result<Vec<String>> {
+    Ok(dedupe_urls_preserve_order(
+        base_urls
+            .into_iter()
+            .map(|base_url| normalize_http_base_url(&base_url, name))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    ))
+}
+
+fn normalize_http_base_url(base_url: &str, name: &str) -> anyhow::Result<String> {
+    validate_http_url(base_url, name)?;
+    Ok(normalize_base_url(base_url))
 }
 
 fn normalize_base_url(base_url: &str) -> String {
@@ -8185,27 +11697,93 @@ fn signal_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url.map(|url| vec![url.to_string()]).or_else(|| {
-        token.map(|token| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "signal URL")
+    } else if let Some(token) = token {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
                 .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let base_urls = base_urls.context("signal URL is required and no signal bootstrap exists")?;
-    let base_urls = dedupe_urls_preserve_order(
-        base_urls
-            .into_iter()
-            .map(|base_url| normalize_base_url(&base_url)),
-    );
+                .collect::<Vec<_>>(),
+            "signal bootstrap endpoint",
+        )
+    } else {
+        anyhow::bail!("signal URL is required and no signal bootstrap exists");
+    };
+    let base_urls = normalize_http_base_urls(base_urls, name)?;
     if base_urls.is_empty() {
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
     }
     Ok(base_urls)
+}
+
+async fn agent_stun_servers(
+    args: &AgentArgs,
+    token: Option<&SignedJoinToken>,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut servers = Vec::new();
+    for server in &args.stun_servers {
+        if !endpoint_addr_is_usable(*server) {
+            anyhow::bail!(
+                "--stun-server must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+            );
+        }
+        servers.push(*server);
+    }
+    if let Some(token) = token {
+        for endpoint in token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
+        {
+            servers
+                .extend(resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await?);
+        }
+    }
+    Ok(dedupe_socket_addrs_preserve_order(servers))
+}
+
+async fn resolve_udp_bootstrap_socket_addrs(
+    url: &str,
+    name: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{name} must be an absolute URL"))?;
+    if parsed.scheme() != "udp" {
+        anyhow::bail!("{name} must use udp");
+    }
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("{name} must include a host"))?;
+    let port = parsed
+        .port()
+        .with_context(|| format!("{name} must include a port"))?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve {name} {url}"))?
+        .filter(|addr| endpoint_addr_is_usable(*addr))
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        anyhow::bail!("{name} {url} resolved to no usable socket addresses");
+    }
+    Ok(addrs)
+}
+
+fn dedupe_socket_addrs_preserve_order(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for addr in addrs {
+        if seen.insert(addr) {
+            deduped.push(addr);
+        }
+    }
+    deduped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8229,12 +11807,15 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use ipars_agent::AgentNodeState;
+    use ipars_route_manager::PolicyRule;
     use ipars_types::api::{
         AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
-        AgentPacketFlowDropReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
-        PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+        AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSourceCount,
+        AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
+        PathStateCount, RelayAdmissionResponse, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -8274,6 +11855,32 @@ mod tests {
         }
     }
 
+    fn ipv6_candidate(node_id: &str, cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            addr: SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10)),
+                51820,
+            ),
+            ..candidate(node_id, EndpointCandidateKind::Ipv6, cost)
+        }
+    }
+
+    fn agent_status(
+        node_id: &str,
+        candidates: Vec<EndpointCandidate>,
+    ) -> ipars_types::api::AgentStatusResponse {
+        ipars_types::api::AgentStatusResponse {
+            node_id: NodeId::from_string(node_id),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wg-{node_id}"),
+            candidate_count: candidates.len(),
+            candidates,
+            nat_classification: None,
+            userspace_wireguard_process: None,
+            state_updated_at: Utc::now(),
+        }
+    }
+
     fn node_record(node_id: &str) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(node_id),
@@ -8288,6 +11895,109 @@ mod tests {
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
+        }
+    }
+
+    fn test_route_plan(
+        interface: &str,
+        cidrs: &[&str],
+        priorities: &[u32],
+    ) -> anyhow::Result<RoutePlan> {
+        Ok(RoutePlan {
+            interface: interface.to_string(),
+            routes: cidrs
+                .iter()
+                .enumerate()
+                .map(|(index, cidr)| {
+                    Ok(Route {
+                        id: format!("test-route-{index}"),
+                        cidr: cidr
+                            .parse()
+                            .with_context(|| format!("test route CIDR {cidr} should parse"))?,
+                        advertised_by: NodeId::from_string("route-provider"),
+                        via: Some(NodeId::from_string("route-provider")),
+                        metric: 50,
+                        tags: Default::default(),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            policy_rules: priorities
+                .iter()
+                .map(|priority| PolicyRule {
+                    table: 10_064,
+                    priority: *priority,
+                    from: None,
+                    to: None,
+                    fwmark: None,
+                })
+                .collect(),
+        })
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingManagedRouteManager {
+        applied: tokio::sync::RwLock<Vec<RoutePlan>>,
+        removed: tokio::sync::RwLock<Vec<RoutePlan>>,
+    }
+
+    #[async_trait]
+    impl RouteManager for RecordingManagedRouteManager {
+        async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.applied.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            self.removed.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn apply_docker_intent(
+            &self,
+            _intent: DockerNetworkIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "docker intent is not used by daemon route reconciliation tests".to_string(),
+            ))
+        }
+
+        async fn apply_kubernetes_intent(
+            &self,
+            _intent: KubernetesUnderlayIntent,
+        ) -> Result<RoutePlan, RouteManagerError> {
+            Err(RouteManagerError::Backend(
+                "kubernetes intent is not used by daemon route reconciliation tests".to_string(),
+            ))
+        }
+    }
+
+    fn test_relay_capability(max_sessions: u32, active_sessions: u32) -> RelayCapability {
+        RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51_820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
+            max_sessions,
+            active_sessions,
+            max_mbps: 1000,
+            e2e_only: true,
+        }
+    }
+
+    fn test_relay_status_response(
+        health: HealthState,
+        max_sessions: u32,
+        active_sessions: u32,
+    ) -> RelayStatusResponse {
+        RelayStatusResponse {
+            relay_node: NodeId::from_string("relay-a"),
+            capability: test_relay_capability(max_sessions, active_sessions),
+            health,
+            admission_attempt_count: 0,
+            admission_success_count: 0,
+            admission_failure_count: 0,
+            admission_failures_by_reason: BTreeMap::new(),
+            max_sessions_per_node: Some(20),
+            dataplane: RelayDataplaneMetrics::default(),
         }
     }
 
@@ -8318,11 +12028,140 @@ mod tests {
         Ok((format!("http://{addr}"), task))
     }
 
+    fn assert_agent_relay_admission_failure_reason(
+        metrics: &AgentMetricsResponse,
+        reason: AgentRelayAdmissionFailureReason,
+        count: u64,
+    ) {
+        assert!(
+            metrics
+                .relay_admission_failure_reason_counts
+                .iter()
+                .any(|entry| entry.reason == reason && entry.count == count),
+            "missing relay admission failure reason {reason:?}={count}: {:?}",
+            metrics.relay_admission_failure_reason_counts
+        );
+    }
+
     async fn unused_http_base_url() -> anyhow::Result<String> {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
         drop(listener);
         Ok(format!("http://{addr}"))
+    }
+
+    #[test]
+    fn stale_managed_route_plan_tracks_dropped_routes_and_rules() -> anyhow::Result<()> {
+        let previous = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
+
+        let stale = stale_managed_route_plan(&previous, &current);
+
+        assert_eq!(stale.interface, "ipars0");
+        assert_eq!(stale.routes.len(), 1);
+        assert_eq!(
+            stale.routes[0].cidr,
+            "10.10.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert_eq!(stale.policy_rules.len(), 1);
+        assert_eq!(stale.policy_rules[0].priority, 10_050);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_managed_route_plan_removes_all_previous_routes_on_interface_change(
+    ) -> anyhow::Result<()> {
+        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
+        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
+
+        assert_eq!(stale_managed_route_plan(&previous, &current), previous);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_managed_route_plan_keeps_only_routes_still_present_by_cidr() -> anyhow::Result<()> {
+        let previous = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
+
+        let retained = retained_managed_route_plan(&previous, &current);
+
+        assert_eq!(retained.interface, "ipars0");
+        assert_eq!(retained.routes.len(), 1);
+        assert_eq!(
+            retained.routes[0].cidr,
+            "10.11.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert_eq!(retained.policy_rules.len(), 1);
+        assert_eq!(retained.policy_rules[0].priority, 10_051);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_managed_route_plan_clears_state_on_interface_change() -> anyhow::Result<()> {
+        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
+        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
+
+        let retained = retained_managed_route_plan(&previous, &current);
+
+        assert_eq!(retained.interface, "ipars1");
+        assert!(retained.routes.is_empty());
+        assert!(retained.policy_rules.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_route_plan_reconciles_removed_routes_and_rules_before_apply(
+    ) -> anyhow::Result<()> {
+        let manager = RecordingManagedRouteManager::default();
+        let mut applied_plan = None;
+        let first = test_route_plan(
+            "ipars0",
+            &["10.10.0.0/16", "10.11.0.0/16"],
+            &[10_050, 10_051],
+        )?;
+        let second = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
+
+        let first_summary =
+            apply_managed_route_plan(&manager, &mut applied_plan, first.clone()).await?;
+        let second_summary =
+            apply_managed_route_plan(&manager, &mut applied_plan, second.clone()).await?;
+
+        assert_eq!(applied_plan, Some(second.clone()));
+        assert_eq!(
+            first_summary,
+            ManagedRouteApplySummary {
+                plan: first.clone(),
+                routes_removed: 0,
+                policy_rules_removed: 0,
+            }
+        );
+        assert_eq!(
+            second_summary,
+            ManagedRouteApplySummary {
+                plan: second.clone(),
+                routes_removed: 1,
+                policy_rules_removed: 1,
+            }
+        );
+        assert_eq!(manager.applied.read().await.as_slice(), &[first, second]);
+        let removed = manager.removed.read().await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].routes.len(), 1);
+        assert_eq!(
+            removed[0].routes[0].cidr,
+            "10.10.0.0/16".parse::<ipnet::IpNet>()?
+        );
+        assert_eq!(removed[0].policy_rules.len(), 1);
+        assert_eq!(removed[0].policy_rules[0].priority, 10_050);
+        Ok(())
     }
 
     #[test]
@@ -8406,12 +12245,14 @@ mod tests {
             peer_map_route_candidate_count: 3,
             peer_map_route_visible_count: 2,
             peer_map_route_acl_denied_count: 1,
+            stale_path_count: 0,
             path_count: 3,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,
                 count: 3,
             }],
             endpoint_candidate_ttl_seconds: 120,
+            path_state_ttl_seconds: 600,
             generated_at: Utc::now(),
         };
 
@@ -8456,6 +12297,194 @@ mod tests {
         assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 3);
         assert_eq!(cli.observability.log_filter, "ipars=debug");
         assert_eq!(cli.command.component(), "agent");
+    }
+
+    #[test]
+    fn stun_command_accepts_root_observability_args() {
+        let cli = Cli::parse_from([
+            "iparsd",
+            "--otel-enabled",
+            "--otel-metrics-poll-interval-seconds",
+            "2",
+            "stun",
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+
+        let Command::Stun(args) = cli.command else {
+            panic!("expected stun command");
+        };
+        assert!(cli.observability.otel_active());
+        assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 2);
+        assert_eq!(args.listen, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn stun_command_accepts_http_listen() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "stun",
+            "--listen",
+            "0.0.0.0:3478",
+            "--alternate-listen",
+            "127.0.0.1:3480",
+            "--http-listen",
+            "127.0.0.1:3479",
+        ])?;
+
+        let Command::Stun(args) = cli.command else {
+            anyhow::bail!("expected stun command");
+        };
+        assert_eq!(args.listen, SocketAddr::from(([0, 0, 0, 0], 3478)));
+        assert_eq!(
+            args.alternate_listen,
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480)))
+        );
+        assert_eq!(args.http_listen, SocketAddr::from(([127, 0, 0, 1], 3479)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stun_http_metrics_json_reports_listener_and_stats() -> anyhow::Result<()> {
+        let state = StunHttpState::new(
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
+            Arc::new(StunServerStats::default()),
+        );
+
+        let axum::Json(metrics) = stun_metrics(axum::extract::State(state)).await;
+
+        assert_eq!(metrics.listen, SocketAddr::from(([127, 0, 0, 1], 3478)));
+        assert_eq!(
+            metrics.alternate_listen,
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480)))
+        );
+        assert_eq!(metrics.binding_request_count, 0);
+        assert_eq!(metrics.binding_response_count, 0);
+        assert_eq!(metrics.invalid_packet_count, 0);
+        assert_eq!(metrics.socket_receive_error_count, 0);
+        assert_eq!(metrics.socket_send_error_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stun_prometheus_metrics_render_all_server_counters() {
+        let metrics = StunMetricsResponse {
+            listen: SocketAddr::from(([127, 0, 0, 1], 3478)),
+            alternate_listen: Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
+            binding_request_count: 7,
+            binding_response_count: 6,
+            invalid_packet_count: 2,
+            socket_receive_error_count: 1,
+            socket_send_error_count: 3,
+            generated_at: Utc::now(),
+        };
+
+        let rendered = render_stun_prometheus_metrics(&metrics);
+
+        assert!(rendered.contains("ipars_stun_server_active{listen=\"127.0.0.1:3478\"} 1"));
+        assert!(rendered.contains(
+            "ipars_stun_rfc5780_alternate_server_active{listen=\"127.0.0.1:3478\",alternate_listen=\"127.0.0.1:3480\"} 1"
+        ));
+        assert!(rendered.contains("ipars_stun_binding_requests_total{listen=\"127.0.0.1:3478\"} 7"));
+        assert!(
+            rendered.contains("ipars_stun_binding_responses_total{listen=\"127.0.0.1:3478\"} 6")
+        );
+        assert!(rendered.contains("ipars_stun_invalid_packets_total{listen=\"127.0.0.1:3478\"} 2"));
+        assert!(rendered
+            .contains("ipars_stun_socket_receive_errors_total{listen=\"127.0.0.1:3478\"} 1"));
+        assert!(
+            rendered.contains("ipars_stun_socket_send_errors_total{listen=\"127.0.0.1:3478\"} 3")
+        );
+    }
+
+    #[test]
+    fn stun_otel_snapshot_copies_server_metrics() {
+        let snapshot = StunServerMetricsSnapshot {
+            binding_request_count: 7,
+            binding_response_count: 6,
+            invalid_packet_count: 2,
+            socket_receive_error_count: 1,
+            socket_send_error_count: 3,
+        };
+
+        assert_eq!(
+            StunOtelSnapshot::from(&snapshot),
+            StunOtelSnapshot {
+                binding_request_count: 7,
+                binding_response_count: 6,
+                invalid_packet_count: 2,
+                socket_receive_error_count: 1,
+                socket_send_error_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn stun_otel_status_labels_include_rfc5780_alternate_listener() {
+        let labels = StunOtelStatusLabels::new(
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
+        );
+
+        assert_eq!(
+            labels,
+            StunOtelStatusLabels {
+                listen: "127.0.0.1:3478".to_string(),
+                alternate_listen: Some("127.0.0.1:3480".to_string()),
+            }
+        );
+        let primary_attrs = labels.primary_attrs();
+        assert_eq!(primary_attrs.len(), 1);
+        let Some(alternate_attrs) = labels.alternate_attrs() else {
+            panic!("alternate listener should produce OTLP labels");
+        };
+        assert_eq!(alternate_attrs.len(), 2);
+
+        let no_alternate =
+            StunOtelStatusLabels::new(SocketAddr::from(([127, 0, 0, 1], 3478)), None);
+        assert!(no_alternate.alternate_attrs().is_none());
+    }
+
+    #[test]
+    fn stun_otel_delta_records_first_snapshot_and_handles_counter_reset() {
+        let previous = StunOtelSnapshot {
+            binding_request_count: 10,
+            binding_response_count: 8,
+            invalid_packet_count: 3,
+            socket_receive_error_count: 2,
+            socket_send_error_count: 1,
+        };
+        let current = StunServerMetricsSnapshot {
+            binding_request_count: 12,
+            binding_response_count: 9,
+            invalid_packet_count: 1,
+            socket_receive_error_count: 2,
+            socket_send_error_count: 4,
+        };
+
+        assert_eq!(counter_delta(current.binding_request_count, None), 12);
+        assert_eq!(
+            counter_delta(
+                current.binding_request_count,
+                Some(previous.binding_request_count),
+            ),
+            2
+        );
+        assert_eq!(
+            counter_delta(
+                current.invalid_packet_count,
+                Some(previous.invalid_packet_count)
+            ),
+            0
+        );
+        assert_eq!(
+            counter_delta(
+                current.socket_send_error_count,
+                Some(previous.socket_send_error_count),
+            ),
+            3
+        );
     }
 
     #[test]
@@ -8507,6 +12536,92 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_runtime_identifiers_must_be_path_safe() -> anyhow::Result<()> {
+        let oversized_key_id = "x".repeat(MAX_DAEMON_IDENTIFIER_BYTES + 1);
+        let cases = vec![
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "bad/cluster".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                "--cluster-id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                "--issuer-node-id must contain only ASCII letters, digits, '_', '.' or '-'"
+                    .to_string(),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    oversized_key_id,
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                ],
+                format!("--issuer-key-id exceeds {MAX_DAEMON_IDENTIFIER_BYTES} bytes"),
+            ),
+            (
+                vec![
+                    "iparsd".to_string(),
+                    "control-plane".to_string(),
+                    "--cluster-id".to_string(),
+                    "cluster-a".to_string(),
+                    "--issuer-node-id".to_string(),
+                    "issuer-a".to_string(),
+                    "--issuer-key-id".to_string(),
+                    "root".to_string(),
+                    "--issuer-public-key".to_string(),
+                    "pub-a".to_string(),
+                    "--trusted-issuer-key".to_string(),
+                    "issuer/b,root-next,pub-b".to_string(),
+                ],
+                "--trusted-issuer-key issuer_node_id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv)?;
+            let Command::ControlPlane(args) = cli.command else {
+                anyhow::bail!("expected control-plane command");
+            };
+            let error = match validate_control_plane_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid control-plane runtime config"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(&expected),
+                "expected {expected}, got {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn control_plane_args_accept_acl_rules() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -8523,6 +12638,8 @@ mod tests {
             "45",
             "--endpoint-candidate-ttl-seconds",
             "75",
+            "--path-state-ttl-seconds",
+            "180",
             "--acl-rule",
             r#"{"id":"edge-to-db","from_roles":["edge"],"from_tags":["app"],"to_roles":["database"],"to_tags":["db"],"routes":["10.42.0.0/16"],"protocol":"any","action":"allow"}"#,
         ])?;
@@ -8532,6 +12649,7 @@ mod tests {
         };
         assert_eq!(args.relay_health_ttl_seconds, 45);
         assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
+        assert_eq!(args.path_state_ttl_seconds, 180);
         validate_control_plane_runtime_config(&args)?;
         assert_eq!(args.acl_rules.len(), 1);
         let rule = &args.acl_rules[0];
@@ -8605,6 +12723,36 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_path_state_ttl_must_be_positive() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--path-state-ttl-seconds",
+            "0",
+        ])?;
+
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let error = match validate_control_plane_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("unexpected valid control-plane runtime config"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--path-state-ttl-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
     fn signal_candidate_ttl_must_be_positive() -> anyhow::Result<()> {
         let cli =
             Cli::try_parse_from(["iparsd", "signal", "--endpoint-candidate-ttl-seconds", "0"])?;
@@ -8668,6 +12816,93 @@ mod tests {
     }
 
     #[test]
+    fn signal_otel_nat_suppression_strategy_counts_default_missing_strategies() {
+        let metrics = SignalMetricsResponse {
+            node_count: 0,
+            relay_candidate_count: 0,
+            nat_classification_count: 0,
+            stale_nat_classification_count: 0,
+            fresh_low_confidence_nat_classification_count: 0,
+            fresh_nat_classification_strategy_counts: vec![NatTraversalStrategyCount {
+                strategy: NatTraversalStrategy::CoordinatedHolePunch,
+                count: 3,
+            }],
+            health_report_count: 0,
+            healthy_node_count: 0,
+            degraded_node_count: 0,
+            unhealthy_node_count: 0,
+            stale_health_report_count: 0,
+            stale_endpoint_candidate_count: 0,
+            node_upsert_count: 0,
+            path_negotiation_count: 0,
+            path_acl_denied_count: 0,
+            relay_candidate_acl_denied_count: 0,
+            path_negotiation_state_counts: Vec::new(),
+            hole_punch_plan_count: 1,
+            hole_punch_acl_denied_count: 0,
+            hole_punch_nat_suppressed_count: 1,
+            hole_punch_nat_suppressed_strategy_counts: vec![NatTraversalStrategyCount {
+                strategy: NatTraversalStrategy::RelayPreferred,
+                count: 2,
+            }],
+            relay_health_ttl_seconds: 30,
+            endpoint_candidate_ttl_seconds: 120,
+            nat_classification_ttl_seconds: 300,
+            nat_classification_min_confidence_percent: 50,
+            generated_at: Utc::now(),
+        };
+        let snapshot = SignalOtelSnapshot::from(&metrics);
+
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::CoordinatedHolePunch),
+            3
+        );
+        assert_eq!(
+            signal_nat_strategy_count(&metrics, NatTraversalStrategy::DirectCandidate),
+            0
+        );
+        assert_eq!(
+            signal_snapshot_nat_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::CoordinatedHolePunch,
+            ),
+            3
+        );
+        assert_eq!(
+            signal_snapshot_nat_strategy_count(&snapshot, NatTraversalStrategy::RelayPreferred),
+            0
+        );
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &metrics,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            2
+        );
+        assert_eq!(
+            signal_hole_punch_nat_suppression_strategy_count(
+                &metrics,
+                NatTraversalStrategy::DirectCandidate,
+            ),
+            0
+        );
+        assert_eq!(
+            signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::RelayPreferred,
+            ),
+            2
+        );
+        assert_eq!(
+            signal_snapshot_hole_punch_nat_suppression_strategy_count(
+                &snapshot,
+                NatTraversalStrategy::InsufficientData,
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn relay_otel_delta_records_first_snapshot_as_counter_increment() {
         let mut current = RelayDataplaneMetrics {
             datagrams_received: 10,
@@ -8695,6 +12930,16 @@ mod tests {
                 .drops_by_reason
                 .get(&RelayDataplaneDropReason::MalformedFrame),
             Some(&2)
+        );
+        assert_eq!(
+            delta.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::UnknownSession),
+            Some(&0)
         );
     }
 
@@ -8749,6 +12994,42 @@ mod tests {
                 .get(&RelayDataplaneDropReason::RateLimited),
             Some(&4)
         );
+        assert_eq!(
+            delta.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::SessionExpired),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn relay_admission_failure_reason_delta_records_counter_increments() {
+        let mut previous = BTreeMap::new();
+        previous.insert(RelayAdmissionFailureReason::Unauthorized, 2);
+        previous.insert(RelayAdmissionFailureReason::AdmissionDenied, 1);
+        let mut current = previous.clone();
+        current.insert(RelayAdmissionFailureReason::Unauthorized, 5);
+        current.insert(RelayAdmissionFailureReason::InvalidSessionCredential, 1);
+
+        let delta = relay_admission_failure_reason_delta(&current, Some(&previous));
+
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&3)
+        );
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::InvalidSessionCredential),
+            Some(&1)
+        );
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&0)
+        );
+        assert_eq!(delta.len(), RelayAdmissionFailureReason::ALL.len());
     }
 
     fn agent_forwarder_metrics(
@@ -8765,48 +13046,40 @@ mod tests {
             relay_node: NodeId::from_string(relay_node),
             relay_endpoint: SocketAddr::from(([203, 0, 113, 10], 51_820)),
             local_endpoint: SocketAddr::from(([127, 0, 0, 1], 52_000)),
+            socket_receive_errors: 0,
             outbound_packets,
             outbound_payload_bytes,
             outbound_datagram_bytes,
+            outbound_dropped_unexpected_source_packets: 0,
+            outbound_dropped_unexpected_source_payload_bytes: 0,
+            outbound_dropped_expired_session_packets: 0,
+            outbound_dropped_expired_session_payload_bytes: 0,
+            outbound_dropped_oversized_packets: 0,
+            outbound_dropped_oversized_payload_bytes: 0,
+            outbound_dropped_oversized_datagram_bytes: 0,
+            outbound_dropped_socket_error_packets: 0,
+            outbound_dropped_socket_error_payload_bytes: 0,
+            outbound_dropped_socket_error_datagram_bytes: 0,
+            outbound_dropped_non_wireguard_packets: 0,
+            outbound_dropped_non_wireguard_payload_bytes: 0,
             inbound_packets,
             inbound_payload_bytes,
+            inbound_dropped_expired_session_packets: 0,
+            inbound_dropped_expired_session_payload_bytes: 0,
+            inbound_dropped_oversized_packets: 0,
+            inbound_dropped_oversized_payload_bytes: 0,
+            inbound_dropped_socket_error_packets: 0,
+            inbound_dropped_socket_error_payload_bytes: 0,
+            inbound_dropped_non_wireguard_packets: 0,
+            inbound_dropped_non_wireguard_payload_bytes: 0,
             last_forwarded_at: None,
         }
     }
 
-    #[test]
-    fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
-        let current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
-
-        let delta = agent_forwarder_delta(&current, None);
-
-        assert_eq!(delta.outbound_packets, 5);
-        assert_eq!(delta.outbound_payload_bytes, 500);
-        assert_eq!(delta.outbound_datagram_bytes, 620);
-        assert_eq!(delta.inbound_packets, 3);
-        assert_eq!(delta.inbound_payload_bytes, 300);
-        assert!(has_agent_forwarder_delta(&delta));
-    }
-
-    #[test]
-    fn agent_otel_delta_records_only_forwarder_increments_since_previous_snapshot() {
-        let previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
-        let current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
-
-        let delta = agent_forwarder_delta(&current, Some(&previous));
-
-        assert_eq!(delta.outbound_packets, 4);
-        assert_eq!(delta.outbound_payload_bytes, 350);
-        assert_eq!(delta.outbound_datagram_bytes, 430);
-        assert_eq!(delta.inbound_packets, 4);
-        assert_eq!(delta.inbound_payload_bytes, 400);
-        assert!(has_agent_forwarder_delta(&delta));
-    }
-
-    #[test]
-    fn agent_otel_delta_skips_unchanged_forwarders() {
-        let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
-        let metrics = AgentMetricsResponse {
+    fn agent_metrics_with_category_counts(
+        forwarder: AgentRelayForwarderMetrics,
+    ) -> AgentMetricsResponse {
+        AgentMetricsResponse {
             node_id: NodeId::from_string("node-a"),
             candidate_count: 2,
             path_count: 1,
@@ -8814,6 +13087,10 @@ mod tests {
             relay_admission_attempt_count: 3,
             relay_admission_success_count: 2,
             relay_admission_failure_count: 1,
+            relay_admission_failure_reason_counts: vec![AgentRelayAdmissionFailureReasonCount {
+                reason: AgentRelayAdmissionFailureReason::Rejected,
+                count: 1,
+            }],
             relay_forwarder_count: 1,
             relay_forwarders: vec![forwarder],
             path_change_event_count: 1,
@@ -8838,6 +13115,11 @@ mod tests {
                 reason: AgentPacketFlowDropReason::Multicast,
                 count: 3,
             }],
+            packet_flow_duplicate_suppression_count: 5,
+            packet_flow_duplicate_suppression_counts: vec![AgentPacketFlowDuplicateSourceCount {
+                source: AgentPacketFlowDuplicateSource::EbpfRingbuf,
+                count: 5,
+            }],
             packet_flow_classification_counts: vec![AgentPacketFlowClassificationCount {
                 classification: AgentPacketFlowClassification::Established,
                 count: 2,
@@ -8846,11 +13128,296 @@ mod tests {
                 application: AgentPacketFlowApplication::WireGuard,
                 count: 2,
             }],
+            userspace_wireguard_process: None,
             generated_at: Utc::now(),
-        };
+        }
+    }
+
+    #[test]
+    fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
+        let mut current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        current.socket_receive_errors = 2;
+        current.outbound_dropped_unexpected_source_packets = 1;
+        current.outbound_dropped_unexpected_source_payload_bytes = 32;
+        current.outbound_dropped_expired_session_packets = 1;
+        current.outbound_dropped_expired_session_payload_bytes = 64;
+        current.outbound_dropped_oversized_packets = 1;
+        current.outbound_dropped_oversized_payload_bytes = 80;
+        current.outbound_dropped_oversized_datagram_bytes = 120;
+        current.outbound_dropped_socket_error_packets = 1;
+        current.outbound_dropped_socket_error_payload_bytes = 88;
+        current.outbound_dropped_socket_error_datagram_bytes = 132;
+        current.outbound_dropped_non_wireguard_packets = 2;
+        current.outbound_dropped_non_wireguard_payload_bytes = 42;
+        current.inbound_dropped_expired_session_packets = 1;
+        current.inbound_dropped_expired_session_payload_bytes = 48;
+        current.inbound_dropped_oversized_packets = 1;
+        current.inbound_dropped_oversized_payload_bytes = 72;
+        current.inbound_dropped_socket_error_packets = 1;
+        current.inbound_dropped_socket_error_payload_bytes = 56;
+        current.inbound_dropped_non_wireguard_packets = 1;
+        current.inbound_dropped_non_wireguard_payload_bytes = 24;
+
+        let delta = agent_forwarder_delta(&current, None);
+
+        assert_eq!(delta.socket_receive_errors, 2);
+        assert_eq!(delta.outbound_packets, 5);
+        assert_eq!(delta.outbound_payload_bytes, 500);
+        assert_eq!(delta.outbound_datagram_bytes, 620);
+        assert_eq!(delta.outbound_dropped_unexpected_source_packets, 1);
+        assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 32);
+        assert_eq!(delta.outbound_dropped_expired_session_packets, 1);
+        assert_eq!(delta.outbound_dropped_expired_session_payload_bytes, 64);
+        assert_eq!(delta.outbound_dropped_oversized_packets, 1);
+        assert_eq!(delta.outbound_dropped_oversized_payload_bytes, 80);
+        assert_eq!(delta.outbound_dropped_oversized_datagram_bytes, 120);
+        assert_eq!(delta.outbound_dropped_socket_error_packets, 1);
+        assert_eq!(delta.outbound_dropped_socket_error_payload_bytes, 88);
+        assert_eq!(delta.outbound_dropped_socket_error_datagram_bytes, 132);
+        assert_eq!(delta.outbound_dropped_non_wireguard_packets, 2);
+        assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 42);
+        assert_eq!(delta.inbound_packets, 3);
+        assert_eq!(delta.inbound_payload_bytes, 300);
+        assert_eq!(delta.inbound_dropped_expired_session_packets, 1);
+        assert_eq!(delta.inbound_dropped_expired_session_payload_bytes, 48);
+        assert_eq!(delta.inbound_dropped_oversized_packets, 1);
+        assert_eq!(delta.inbound_dropped_oversized_payload_bytes, 72);
+        assert_eq!(delta.inbound_dropped_socket_error_packets, 1);
+        assert_eq!(delta.inbound_dropped_socket_error_payload_bytes, 56);
+        assert_eq!(delta.inbound_dropped_non_wireguard_packets, 1);
+        assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 24);
+        assert!(has_agent_forwarder_delta(&delta));
+    }
+
+    #[test]
+    fn agent_otel_delta_records_only_forwarder_increments_since_previous_snapshot() {
+        let mut previous = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        previous.socket_receive_errors = 2;
+        previous.outbound_dropped_unexpected_source_packets = 1;
+        previous.outbound_dropped_unexpected_source_payload_bytes = 32;
+        previous.outbound_dropped_expired_session_packets = 1;
+        previous.outbound_dropped_expired_session_payload_bytes = 64;
+        previous.outbound_dropped_oversized_packets = 1;
+        previous.outbound_dropped_oversized_payload_bytes = 80;
+        previous.outbound_dropped_oversized_datagram_bytes = 120;
+        previous.outbound_dropped_socket_error_packets = 1;
+        previous.outbound_dropped_socket_error_payload_bytes = 88;
+        previous.outbound_dropped_socket_error_datagram_bytes = 132;
+        previous.outbound_dropped_non_wireguard_packets = 2;
+        previous.outbound_dropped_non_wireguard_payload_bytes = 100;
+        previous.inbound_dropped_expired_session_packets = 1;
+        previous.inbound_dropped_expired_session_payload_bytes = 48;
+        previous.inbound_dropped_oversized_packets = 1;
+        previous.inbound_dropped_oversized_payload_bytes = 72;
+        previous.inbound_dropped_socket_error_packets = 1;
+        previous.inbound_dropped_socket_error_payload_bytes = 56;
+        previous.inbound_dropped_non_wireguard_packets = 1;
+        previous.inbound_dropped_non_wireguard_payload_bytes = 50;
+        let mut current = agent_forwarder_metrics("peer-a", "relay-a", 9, 850, 1050, 7, 700);
+        current.socket_receive_errors = 5;
+        current.outbound_dropped_unexpected_source_packets = 3;
+        current.outbound_dropped_unexpected_source_payload_bytes = 96;
+        current.outbound_dropped_expired_session_packets = 4;
+        current.outbound_dropped_expired_session_payload_bytes = 160;
+        current.outbound_dropped_oversized_packets = 5;
+        current.outbound_dropped_oversized_payload_bytes = 208;
+        current.outbound_dropped_oversized_datagram_bytes = 280;
+        current.outbound_dropped_socket_error_packets = 4;
+        current.outbound_dropped_socket_error_payload_bytes = 168;
+        current.outbound_dropped_socket_error_datagram_bytes = 252;
+        current.outbound_dropped_non_wireguard_packets = 5;
+        current.outbound_dropped_non_wireguard_payload_bytes = 140;
+        current.inbound_dropped_expired_session_packets = 5;
+        current.inbound_dropped_expired_session_payload_bytes = 144;
+        current.inbound_dropped_oversized_packets = 3;
+        current.inbound_dropped_oversized_payload_bytes = 136;
+        current.inbound_dropped_socket_error_packets = 5;
+        current.inbound_dropped_socket_error_payload_bytes = 184;
+        current.inbound_dropped_non_wireguard_packets = 3;
+        current.inbound_dropped_non_wireguard_payload_bytes = 90;
+
+        let delta = agent_forwarder_delta(&current, Some(&previous));
+
+        assert_eq!(delta.socket_receive_errors, 3);
+        assert_eq!(delta.outbound_packets, 4);
+        assert_eq!(delta.outbound_payload_bytes, 350);
+        assert_eq!(delta.outbound_datagram_bytes, 430);
+        assert_eq!(delta.outbound_dropped_unexpected_source_packets, 2);
+        assert_eq!(delta.outbound_dropped_unexpected_source_payload_bytes, 64);
+        assert_eq!(delta.outbound_dropped_expired_session_packets, 3);
+        assert_eq!(delta.outbound_dropped_expired_session_payload_bytes, 96);
+        assert_eq!(delta.outbound_dropped_oversized_packets, 4);
+        assert_eq!(delta.outbound_dropped_oversized_payload_bytes, 128);
+        assert_eq!(delta.outbound_dropped_oversized_datagram_bytes, 160);
+        assert_eq!(delta.outbound_dropped_socket_error_packets, 3);
+        assert_eq!(delta.outbound_dropped_socket_error_payload_bytes, 80);
+        assert_eq!(delta.outbound_dropped_socket_error_datagram_bytes, 120);
+        assert_eq!(delta.outbound_dropped_non_wireguard_packets, 3);
+        assert_eq!(delta.outbound_dropped_non_wireguard_payload_bytes, 40);
+        assert_eq!(delta.inbound_packets, 4);
+        assert_eq!(delta.inbound_payload_bytes, 400);
+        assert_eq!(delta.inbound_dropped_expired_session_packets, 4);
+        assert_eq!(delta.inbound_dropped_expired_session_payload_bytes, 96);
+        assert_eq!(delta.inbound_dropped_oversized_packets, 2);
+        assert_eq!(delta.inbound_dropped_oversized_payload_bytes, 64);
+        assert_eq!(delta.inbound_dropped_socket_error_packets, 4);
+        assert_eq!(delta.inbound_dropped_socket_error_payload_bytes, 128);
+        assert_eq!(delta.inbound_dropped_non_wireguard_packets, 2);
+        assert_eq!(delta.inbound_dropped_non_wireguard_payload_bytes, 40);
+        assert!(has_agent_forwarder_delta(&delta));
+    }
+
+    #[test]
+    fn agent_otel_delta_skips_unchanged_forwarders() {
+        let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let metrics = agent_metrics_with_category_counts(forwarder);
         let previous = AgentOtelSnapshot::from(&metrics);
 
+        assert_eq!(
+            previous
+                .relay_admission_failure_reason_counts
+                .get(&AgentRelayAdmissionFailureReason::Rejected),
+            Some(&1)
+        );
+        assert_eq!(
+            previous
+                .packet_flow_duplicate_suppression_counts
+                .get(&AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            Some(&5)
+        );
         assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
+    }
+
+    #[test]
+    fn agent_otel_category_deltas_zero_fill_all_known_labels() {
+        let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let metrics = agent_metrics_with_category_counts(forwarder);
+
+        let relay_admission_delta = agent_relay_admission_failure_reason_delta(&metrics, None);
+        assert_eq!(
+            relay_admission_delta.len(),
+            AgentRelayAdmissionFailureReason::ALL.len()
+        );
+        assert_eq!(
+            relay_admission_delta.get(&AgentRelayAdmissionFailureReason::Rejected),
+            Some(&1)
+        );
+        assert_eq!(
+            relay_admission_delta.get(&AgentRelayAdmissionFailureReason::Unavailable),
+            Some(&0)
+        );
+
+        let filtered_delta = agent_packet_flow_filtered_reason_delta(&metrics, None);
+        assert_eq!(filtered_delta.len(), AgentPacketFlowDropReason::ALL.len());
+        assert_eq!(
+            filtered_delta.get(&AgentPacketFlowDropReason::Multicast),
+            Some(&3)
+        );
+        assert_eq!(
+            filtered_delta.get(&AgentPacketFlowDropReason::NoOverlayMatch),
+            Some(&0)
+        );
+
+        let duplicate_delta = agent_packet_flow_duplicate_suppression_source_delta(&metrics, None);
+        assert_eq!(
+            duplicate_delta.len(),
+            AgentPacketFlowDuplicateSource::ALL.len()
+        );
+        assert_eq!(
+            duplicate_delta.get(&AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            Some(&5)
+        );
+        assert_eq!(
+            duplicate_delta.get(&AgentPacketFlowDuplicateSource::ProcNetConntrack),
+            Some(&0)
+        );
+
+        let classification_delta = agent_packet_flow_classification_delta(&metrics, None);
+        assert_eq!(
+            classification_delta.len(),
+            AgentPacketFlowClassification::ALL.len()
+        );
+        assert_eq!(
+            classification_delta.get(&AgentPacketFlowClassification::Established),
+            Some(&2)
+        );
+        assert_eq!(
+            classification_delta.get(&AgentPacketFlowClassification::Closed),
+            Some(&0)
+        );
+
+        let application_delta = agent_packet_flow_application_delta(&metrics, None);
+        assert_eq!(
+            application_delta.len(),
+            AgentPacketFlowApplication::ALL.len()
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::WireGuard),
+            Some(&2)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Dns),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Consul),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Vault),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Nomad),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Jaeger),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Loki),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Tempo),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Zipkin),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::ClickHouse),
+            Some(&0)
+        );
+
+        let previous = AgentOtelSnapshot::from(&metrics);
+        assert!(
+            agent_relay_admission_failure_reason_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_filtered_reason_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_duplicate_suppression_source_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_classification_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_application_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
     }
 
     async fn insert_dead_forwarder(
@@ -8967,7 +13534,7 @@ mod tests {
                 Some("http://relay-a:9580")
             );
             let reporter =
-                agent_relay_capability_reporter(&args).context("expected relay reporter")?;
+                agent_relay_capability_reporter(&args)?.context("expected relay reporter")?;
             assert_eq!(reporter.status_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.relay_admission_bearer_token.as_deref(),
@@ -9054,6 +13621,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_relay_capability_reporter_validates_advertisement_config() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        let error = match agent_relay_capability_reporter(&args) {
+            Ok(_) => anyhow::bail!("unexpected valid relay capability reporter"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--relay-admission-url"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
+    }
+
+    #[test]
     fn agent_relay_capability_config_rejects_incomplete_or_zero_capacity() -> anyhow::Result<()> {
         let status_without_advertisement = Cli::try_parse_from([
             "iparsd",
@@ -9126,6 +13719,28 @@ mod tests {
             anyhow::bail!("expected agent command");
         }
 
+        let unusable_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "0.0.0.0:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_public_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-public-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         let invalid_admission_url = Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -9145,6 +13760,28 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-admission-url must be an absolute URL"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_admission_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-admission-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
         } else {
             anyhow::bail!("expected agent command");
         }
@@ -9170,6 +13807,30 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--relay-status-url must use http or https"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_status_url = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-public-endpoint",
+            "203.0.113.30:51820",
+            "--relay-admission-url",
+            "http://relay-a:9580",
+            "--relay-status-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Agent(args) = unusable_status_url.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-status-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
         } else {
             anyhow::bail!("expected agent command");
         }
@@ -9289,22 +13950,36 @@ mod tests {
     }
 
     #[test]
-    fn relay_session_state_uses_advertised_relay_node() {
+    fn relay_session_state_uses_advertised_relay_node() -> anyhow::Result<()> {
         let peer = node_record("node-b");
         let relay = node_record("relay-advertised");
         let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
-        let response = RelayAdmissionResponse {
-            relay_node: NodeId::from_string("relay-daemon-local-name"),
-            session_id: "node-a:node-b".to_string(),
-            session_token: "relay-secret".to_string(),
-            expires_at: Utc::now() + ChronoDuration::seconds(300),
+        let request = RelayAdmissionRequest {
             left: NodeId::from_string("node-a"),
             right: peer.node_id.clone(),
             left_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
             right_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
         };
+        let now = Utc::now();
+        let response = RelayAdmissionResponse {
+            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            session_id: "node-a:node-b".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: now + ChronoDuration::seconds(300),
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+        };
 
-        let session = relay_session_state_from_admission(&peer, &relay, response, relay_endpoint);
+        let session = relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            response,
+            relay_endpoint,
+            now,
+        )?;
 
         assert_eq!(session.peer, NodeId::from_string("node-b"));
         assert_eq!(session.relay_node, NodeId::from_string("relay-advertised"));
@@ -9317,25 +13992,40 @@ mod tests {
             session.admitted_peer_addr,
             SocketAddr::from(([203, 0, 113, 11], 51_820))
         );
+        Ok(())
     }
 
     #[test]
-    fn relay_session_state_maps_admitted_addrs_to_local_view() {
+    fn relay_session_state_maps_admitted_addrs_to_local_view() -> anyhow::Result<()> {
         let peer = node_record("node-a");
         let relay = node_record("relay-advertised");
         let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
-        let response = RelayAdmissionResponse {
-            relay_node: NodeId::from_string("relay-daemon-local-name"),
-            session_id: "node-a:node-z".to_string(),
-            session_token: "relay-secret".to_string(),
-            expires_at: Utc::now() + ChronoDuration::seconds(300),
+        let now = Utc::now();
+        let request = RelayAdmissionRequest {
             left: peer.node_id.clone(),
             right: NodeId::from_string("node-z"),
             left_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
             right_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
         };
+        let response = RelayAdmissionResponse {
+            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            session_id: "node-a:node-z".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: now + ChronoDuration::seconds(300),
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+        };
 
-        let session = relay_session_state_from_admission(&peer, &relay, response, relay_endpoint);
+        let session = relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            response,
+            relay_endpoint,
+            now,
+        )?;
 
         assert_eq!(
             session.admitted_local_addr,
@@ -9345,6 +14035,107 @@ mod tests {
             session.admitted_peer_addr,
             SocketAddr::from(([203, 0, 113, 11], 51_820))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_session_state_rejects_inconsistent_admission_response() -> anyhow::Result<()> {
+        let peer = node_record("node-b");
+        let relay = node_record("relay-a");
+        let request = RelayAdmissionRequest {
+            left: NodeId::from_string("node-a"),
+            right: peer.node_id.clone(),
+            left_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+            right_addr: SocketAddr::from(([203, 0, 113, 11], 51_820)),
+        };
+        let now = Utc::now();
+        let valid_response = RelayAdmissionResponse {
+            relay_node: relay.node_id.clone(),
+            session_id: "node-a:node-b".to_string(),
+            session_token: "relay-secret".to_string(),
+            expires_at: now + ChronoDuration::seconds(300),
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+        };
+        let relay_endpoint = SocketAddr::from(([203, 0, 113, 30], 51_820));
+
+        let mut wrong_pair = valid_response.clone();
+        wrong_pair.right = NodeId::from_string("node-c");
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_pair,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong node pair should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("node pair mismatch"));
+
+        let mut wrong_endpoint = valid_response.clone();
+        wrong_endpoint.right_addr = SocketAddr::from(([203, 0, 113, 99], 51_820));
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_endpoint,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong endpoint should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("endpoint mismatch"));
+
+        let mut wrong_session_id = valid_response.clone();
+        wrong_session_id.session_id = "node-a:node-c".to_string();
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            wrong_session_id,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("wrong session id should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("session id mismatch"));
+
+        let mut expired = valid_response.clone();
+        expired.expires_at = now - ChronoDuration::seconds(1);
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            expired,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("expired credential should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already expired"));
+
+        let mut invalid_credential = valid_response;
+        invalid_credential.session_token.clear();
+        let error = match relay_session_state_from_admission(
+            &peer,
+            &relay,
+            &request,
+            invalid_credential,
+            relay_endpoint,
+            now,
+        ) {
+            Ok(session) => anyhow::bail!("invalid credential should be rejected: {session:?}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid session credential"));
+        Ok(())
     }
 
     #[test]
@@ -9382,6 +14173,11 @@ mod tests {
                 e2e_only: true,
             },
             health: HealthState::Healthy,
+            admission_attempt_count: 0,
+            admission_success_count: 0,
+            admission_failure_count: 0,
+            admission_failures_by_reason: BTreeMap::new(),
+            max_sessions_per_node: Some(20),
             dataplane: RelayDataplaneMetrics::default(),
         };
 
@@ -9393,6 +14189,41 @@ mod tests {
         assert_eq!(refreshed.max_sessions, 250);
         assert_eq!(refreshed.active_sessions, 12);
         assert_eq!(refreshed.max_mbps, 500);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_relay_capability_omits_unhealthy_status() -> anyhow::Result<()> {
+        async fn degraded_status() -> axum::Json<RelayStatusResponse> {
+            axum::Json(test_relay_status_response(HealthState::Degraded, 250, 12))
+        }
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/status", axum::routing::get(degraded_status)),
+        )
+        .await?;
+        let reporter = RelayCapabilityReporter {
+            advertised: test_relay_capability(100, 0),
+            status_url: Some(relay_base),
+        };
+
+        let capability = heartbeat_relay_capability(&reqwest::Client::new(), Some(&reporter)).await;
+
+        assert!(capability.is_none());
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_relay_capability_omits_unreachable_status_url() -> anyhow::Result<()> {
+        let reporter = RelayCapabilityReporter {
+            advertised: test_relay_capability(100, 0),
+            status_url: Some(unused_http_base_url().await?),
+        };
+
+        let capability = heartbeat_relay_capability(&reqwest::Client::new(), Some(&reporter)).await;
+
+        assert!(capability.is_none());
+        Ok(())
     }
 
     #[test]
@@ -9452,7 +14283,7 @@ mod tests {
             assert_eq!(args.packet_flow_procfs_max_line_bytes, 2048);
             assert_eq!(args.packet_flow_procfs_max_flows, 4096);
             assert_eq!(
-                ProcNetConntrackReadLimits::from_args(&args),
+                ProcNetConntrackReadLimits::from_args(&args)?,
                 ProcNetConntrackReadLimits {
                     max_bytes: 1_048_576,
                     max_line_bytes: 2048,
@@ -9509,6 +14340,169 @@ mod tests {
     }
 
     #[test]
+    fn agent_packet_flow_dedup_ttl_may_be_disabled_but_must_be_bounded() -> anyhow::Result<()> {
+        let disabled = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-dedup-ttl-seconds",
+            "0",
+        ])?;
+        if let Command::Agent(args) = disabled.command {
+            validate_agent_runtime_config(&args)?;
+            assert_eq!(
+                packet_flow_dedup_ttl(args.packet_flow_dedup_ttl_seconds),
+                None
+            );
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let oversized = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-dedup-ttl-seconds",
+            "86401",
+        ])?;
+        if let Command::Agent(args) = oversized.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("oversized packet-flow dedup TTL should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-dedup-ttl-seconds must not exceed 86400"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_procfs_packet_flow_limits_must_be_bounded() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--packet-flow-procfs-max-bytes",
+                (MAX_PACKET_FLOW_READ_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-procfs-max-bytes must not exceed {MAX_PACKET_FLOW_READ_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-procfs-max-line-bytes",
+                (MAX_PACKET_FLOW_LINE_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-procfs-max-line-bytes must not exceed {MAX_PACKET_FLOW_LINE_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-procfs-max-flows",
+                (MAX_PACKET_FLOW_RECORDS + 1).to_string(),
+                format!("--packet-flow-procfs-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"),
+            ),
+        ];
+        for (flag, value, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "proc-net-conntrack",
+                flag,
+                value.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_detector_specific_options_require_matching_detector() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "conntrack-netlink",
+                    "--packet-flow-conntrack-path",
+                    "/tmp/nf_conntrack",
+                ],
+                "--packet-flow-conntrack-path requires --packet-flow-detector proc-net-conntrack",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "proc-net-conntrack",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                ],
+                "--packet-flow-ebpf-event-path requires --packet-flow-detector ebpf-jsonl",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                ],
+                "--packet-flow-ebpf-object-path requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_sys_enter_connect:syscalls:sys_enter_connect",
+                ],
+                "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
+                vec!["iparsd", "agent", "--packet-flow-pin"],
+                "--packet-flow-pin requires --packet-flow-detector to be enabled",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid packet-flow detector config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_args_accept_conntrack_netlink_packet_flow_detector() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -9530,7 +14524,7 @@ mod tests {
             assert_eq!(args.packet_flow_poll_interval_seconds, 3);
             assert_eq!(args.packet_flow_netlink_max_flows, 8192);
             assert_eq!(
-                ConntrackNetlinkReadLimits::from_args(&args),
+                ConntrackNetlinkReadLimits::from_args(&args)?,
                 ConntrackNetlinkReadLimits { max_flows: 8192 }
             );
             return Ok(());
@@ -9597,7 +14591,7 @@ mod tests {
             assert_eq!(args.packet_flow_ebpf_event_max_line_bytes, 1024);
             assert_eq!(args.packet_flow_ebpf_event_max_flows, 2048);
             assert_eq!(
-                EbpfJsonlReadLimits::from_args(&args),
+                EbpfJsonlReadLimits::from_args(&args)?,
                 EbpfJsonlReadLimits {
                     max_bytes: 1_048_576,
                     max_line_bytes: 1024,
@@ -9668,6 +14662,284 @@ mod tests {
     }
 
     #[test]
+    fn agent_ebpf_jsonl_packet_flow_limits_must_be_bounded() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--packet-flow-ebpf-event-max-bytes",
+                (MAX_PACKET_FLOW_READ_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-bytes must not exceed {MAX_PACKET_FLOW_READ_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-ebpf-event-max-line-bytes",
+                (MAX_PACKET_FLOW_LINE_BYTES + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-line-bytes must not exceed {MAX_PACKET_FLOW_LINE_BYTES}"
+                ),
+            ),
+            (
+                "--packet-flow-ebpf-event-max-flows",
+                (MAX_PACKET_FLOW_RECORDS + 1).to_string(),
+                format!(
+                    "--packet-flow-ebpf-event-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"
+                ),
+            ),
+        ];
+        for (flag, value, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                "ebpf-jsonl",
+                "--packet-flow-ebpf-event-path",
+                "/run/ipars/ebpf-flows.jsonl",
+                flag,
+                value.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_read_limit_configs_revalidate_runtime_boundaries() -> anyhow::Result<()> {
+        let procfs_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-procfs-max-bytes",
+            "0",
+        ])?;
+        if let Command::Agent(args) = procfs_cli.command {
+            let error = match ProcNetConntrackReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected procfs read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-procfs-max-bytes must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let netlink_limit = (MAX_PACKET_FLOW_RECORDS + 1).to_string();
+        let netlink_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "conntrack-netlink",
+            "--packet-flow-netlink-max-flows",
+            netlink_limit.as_str(),
+        ])?;
+        if let Command::Agent(args) = netlink_cli.command {
+            let error = match ConntrackNetlinkReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected netlink read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-netlink-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let jsonl_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-jsonl",
+            "--packet-flow-ebpf-event-path",
+            "/run/ipars/ebpf-flows.jsonl",
+            "--packet-flow-ebpf-event-max-line-bytes",
+            "0",
+        ])?;
+        if let Command::Agent(args) = jsonl_cli.command {
+            let error = match EbpfJsonlReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected eBPF JSONL read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-event-max-line-bytes must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let ringbuf_limit = (MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE + 1).to_string();
+        let ringbuf_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+            "--packet-flow-ebpf-ringbuf-max-events",
+            ringbuf_limit.as_str(),
+        ])?;
+        if let Command::Agent(args) = ringbuf_cli.command {
+            let error = match EbpfRingbufReadLimits::from_args(&args) {
+                Ok(limits) => anyhow::bail!("unexpected eBPF ringbuf read limits: {limits:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-ebpf-ringbuf-max-events must not exceed {MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_preflight_checks_ebpf_jsonl_event_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-path-preflight")?;
+        let regular = base.join("events.jsonl");
+        std::fs::write(&regular, b"")?;
+        let missing = base.join("missing.jsonl");
+        let directory = base.join("events-dir");
+        std::fs::create_dir(&directory)?;
+
+        ensure_ebpf_jsonl_event_path_ready(&regular)?;
+        ensure_ebpf_jsonl_event_path_ready(&missing)?;
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-jsonl",
+            "--packet-flow-ebpf-event-path",
+            directory.to_str().context("non-UTF-8 temp path")?,
+        ])?;
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(needs.ebpf_jsonl_event_path);
+
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful eBPF JSONL path preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must be a regular file"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_preflight_checks_procfs_conntrack_custom_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("conntrack-procfs-path-preflight")?;
+        let regular = base.join("nf_conntrack");
+        std::fs::write(&regular, b"")?;
+        let missing = base.join("missing_conntrack");
+        let directory = base.join("conntrack-dir");
+        std::fs::create_dir(&directory)?;
+
+        ensure_conntrack_procfs_path_ready(&regular)?;
+        ensure_conntrack_procfs_path_ready(&missing)?;
+
+        let default_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+        ])?;
+        if let Command::Agent(args) = default_cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.conntrack_procfs_path);
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let custom_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "proc-net-conntrack",
+            "--packet-flow-conntrack-path",
+            directory.to_str().context("non-UTF-8 temp path")?,
+        ])?;
+        if let Command::Agent(args) = custom_cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.conntrack_procfs_path);
+
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful conntrack path preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must be a regular file"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conntrack_procfs_path_preflight_rejects_symlink() -> anyhow::Result<()> {
+        let base = unique_test_dir("conntrack-procfs-path-symlink")?;
+        let target = base.join("nf_conntrack");
+        let link = base.join("nf_conntrack_link");
+        std::fs::write(&target, b"")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_conntrack_procfs_path_ready(&link) {
+            Ok(()) => anyhow::bail!("unexpected successful conntrack symlink preflight"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ebpf_jsonl_event_path_preflight_rejects_symlink() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-path-symlink")?;
+        let target = base.join("events.jsonl");
+        let link = base.join("events-link.jsonl");
+        std::fs::write(&target, b"")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_ebpf_jsonl_event_path_ready(&link) {
+            Ok(()) => anyhow::bail!("unexpected successful eBPF JSONL symlink preflight"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
     fn agent_args_accept_ebpf_ringbuf_packet_flow_detector() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -9700,7 +14972,7 @@ mod tests {
             assert_eq!(args.packet_flow_ebpf_attach.len(), 2);
             assert_eq!(args.packet_flow_ebpf_ringbuf_max_events, 128);
             assert_eq!(
-                EbpfRingbufReadLimits::from_args(&args),
+                EbpfRingbufReadLimits::from_args(&args)?,
                 EbpfRingbufReadLimits {
                     max_events_per_wake: 128,
                 }
@@ -9715,6 +14987,69 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn ebpf_ringbuf_config_revalidates_runtime_boundaries() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-ringbuf-map",
+                    "bad/map",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-ringbuf-map",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                ],
+                "--packet-flow-ebpf-attach must be set at least once",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-attach must not repeat ipars_ingress:net:netif_receive_skb",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match EbpfRingbufConfig::from_args(&args) {
+                    Ok(config) => anyhow::bail!("unexpected valid eBPF ringbuf config: {config:?}"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected `{expected}`, got `{error}`"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -9758,6 +15093,21 @@ mod tests {
                     "/run/ipars/ipars-packet-flow.bpf.o",
                     "--packet-flow-ebpf-attach",
                     "ipars_ingress:net:netif_receive_skb",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
+                ],
+                "--packet-flow-ebpf-attach must not repeat ipars_ingress:net:netif_receive_skb",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_ingress:net:netif_receive_skb",
                     "--packet-flow-ebpf-ringbuf-max-events",
                     "0",
                 ],
@@ -9777,6 +15127,57 @@ mod tests {
             } else {
                 anyhow::bail!("expected agent command");
             }
+        }
+
+        let mut too_many_attach = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--packet-flow-detector".to_string(),
+            "ebpf-ringbuf".to_string(),
+            "--packet-flow-ebpf-object-path".to_string(),
+            "/run/ipars/ipars-packet-flow.bpf.o".to_string(),
+        ];
+        for index in 0..=MAX_PACKET_FLOW_EBPF_ATTACH_SPECS {
+            too_many_attach.push("--packet-flow-ebpf-attach".to_string());
+            too_many_attach.push(format!("ipars_{index}:syscalls:sys_enter_sendto"));
+        }
+        let cli = Cli::try_parse_from(too_many_attach)?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid eBPF ringbuf config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-attach may be repeated at most 32 times"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let too_many_ringbuf_events =
+            (MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE + 1).to_string();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-attach",
+            "ipars_ingress:net:netif_receive_skb",
+            "--packet-flow-ebpf-ringbuf-max-events",
+            too_many_ringbuf_events.as_str(),
+        ])?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid eBPF ringbuf config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--packet-flow-ebpf-ringbuf-max-events must not exceed {MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE}"
+            )));
+        } else {
+            anyhow::bail!("expected agent command");
         }
         Ok(())
     }
@@ -9808,11 +15209,42 @@ mod tests {
     }
 
     #[test]
+    fn agent_netlink_packet_flow_limit_must_be_bounded() -> anyhow::Result<()> {
+        let too_many_flows = (MAX_PACKET_FLOW_RECORDS + 1).to_string();
+        let expected =
+            format!("--packet-flow-netlink-max-flows must not exceed {MAX_PACKET_FLOW_RECORDS}");
+        for detector in ["conntrack-netlink", "conntrack-netlink-events"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--packet-flow-detector",
+                detector,
+                "--packet-flow-netlink-max-flows",
+                too_many_flows.as_str(),
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(&expected),
+                    "{detector} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ebpf_jsonl_parser_extracts_packet_flow_events() -> anyhow::Result<()> {
         let mut cursor = EbpfJsonlReadCursor::default();
         let flows = parse_ebpf_jsonl_packet_flow_bytes(
-            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","conntrack_status":["assured"]}
+            br#"{"destination":"100.64.0.11","source":"192.0.2.10","protocol":"udp","source_port":50000,"destination_port":51820,"detector":"xdp-flow","application":"wire_guard","conntrack_status":["assured"]}
 {"destination":"fd00::42","source":"2001:db8::1","protocol":"tcp","source_port":443,"destination_port":51820,"tcp_state":"established"}
+{"destination":"100.64.0.12","protocol":"tcp","payload_prefix":"GET /metrics HTTP/1.1\r\n"}
 "#,
             &mut cursor,
             EbpfJsonlReadLimits {
@@ -9823,13 +15255,21 @@ mod tests {
         )?;
 
         assert!(cursor.partial_line.is_empty());
-        assert_eq!(flows.len(), 2);
+        assert_eq!(flows.len(), 3);
         assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
         assert_eq!(flows[0].observation.source, Some("192.0.2.10".parse()?));
         assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Udp));
         assert_eq!(flows[0].observation.source_port, Some(50000));
         assert_eq!(flows[0].observation.destination_port, Some(51820));
         assert_eq!(flows[0].observation.detector.as_deref(), Some("xdp-flow"));
+        assert_eq!(
+            flows[0].observation.application,
+            Some(AgentPacketFlowApplication::WireGuard)
+        );
+        assert_eq!(
+            flows[0].observation.application(),
+            AgentPacketFlowApplication::WireGuard
+        );
         assert_eq!(
             flows[0].observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]
@@ -9839,6 +15279,15 @@ mod tests {
         assert_eq!(
             flows[1].observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
+        );
+        assert_eq!(flows[2].destination, "100.64.0.12".parse::<IpAddr>()?);
+        assert_eq!(
+            flows[2].observation.payload_prefix,
+            b"GET /metrics HTTP/1.1\r\n"
+        );
+        assert_eq!(
+            flows[2].observation.application(),
+            AgentPacketFlowApplication::Prometheus
         );
         Ok(())
     }
@@ -9871,6 +15320,46 @@ mod tests {
             flow.observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
         );
+
+        let mut unknown_source_event = event;
+        unknown_source_event[16..32].fill(0);
+        let unknown_source_flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_source_event)?;
+        assert_eq!(
+            unknown_source_flow.destination,
+            "100.64.0.11".parse::<IpAddr>()?
+        );
+        assert_eq!(unknown_source_flow.observation.source, None);
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_ringbuf_parser_rejects_packet_flow_ipv4_padding_bytes() -> anyhow::Result<()> {
+        let mut event = [0_u8; PACKET_FLOW_EVENT_LEN];
+        event[0] = PACKET_FLOW_EVENT_VERSION;
+        event[1] = PACKET_FLOW_IP_FAMILY_IPV4;
+        event[2] = PACKET_FLOW_PROTOCOL_UDP;
+        event[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        event[32..36].copy_from_slice(&[100, 64, 0, 11]);
+
+        let mut bad_source_padding = event;
+        bad_source_padding[20] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_source_padding) {
+            Ok(_) => anyhow::bail!("nonzero eBPF IPv4 source padding should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow IPv4 source padding bytes"));
+
+        let mut bad_destination_padding = event;
+        bad_destination_padding[36] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_destination_padding) {
+            Ok(_) => anyhow::bail!("nonzero eBPF IPv4 destination padding should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow IPv4 destination padding bytes"));
         Ok(())
     }
 
@@ -9913,6 +15402,73 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported eBPF packet-flow event version"));
+
+        let mut bad_flags = event;
+        bad_flags[5] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_flags) {
+            Ok(_) => anyhow::bail!("nonzero eBPF event flags should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow event flags"));
+
+        let mut bad_reserved = event;
+        bad_reserved[10] = 0x01;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&bad_reserved) {
+            Ok(_) => anyhow::bail!("nonzero eBPF event reserved bytes should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow reserved bytes"));
+
+        let mut unsupported_conntrack_status = event;
+        unsupported_conntrack_status[4] = PACKET_FLOW_CONNTRACK_UNREPLIED | 0x80;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&unsupported_conntrack_status) {
+            Ok(_) => anyhow::bail!("unsupported eBPF conntrack status bits should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow conntrack status bits"));
+
+        let mut inconsistent_transport_metadata = event;
+        inconsistent_transport_metadata[3] = PACKET_FLOW_TCP_STATE_ESTABLISHED;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&inconsistent_transport_metadata) {
+            Ok(_) => anyhow::bail!("TCP state on non-TCP eBPF event should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow TCP state"));
+
+        let mut inconsistent_port_metadata = event;
+        inconsistent_port_metadata[2] = PACKET_FLOW_PROTOCOL_ICMP;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&inconsistent_port_metadata) {
+            Ok(_) => anyhow::bail!("port metadata on non-port eBPF event should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow port metadata"));
+
+        let mut unknown_protocol = event;
+        unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
+        unknown_protocol[8..10].copy_from_slice(&0_u16.to_be_bytes());
+        let flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_protocol)?;
+        assert_eq!(flow.observation.protocol, None);
+        assert_eq!(flow.observation.destination_port, None);
+
+        let mut unsupported_protocol = event;
+        unsupported_protocol[2] = 132;
+        let error = match parse_ebpf_ringbuf_packet_flow_event(&unsupported_protocol) {
+            Ok(_) => anyhow::bail!("unsupported eBPF protocol code should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported eBPF packet-flow protocol code"));
         Ok(())
     }
 
@@ -10051,6 +15607,136 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--packet-flow-ebpf-event-max-line-bytes"));
+
+        let oversized_detector = "x".repeat(ipars_types::api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1);
+        let oversized_detector_line =
+            format!(r#"{{"destination":"100.64.0.13","detector":"{oversized_detector}"}}"#) + "\n";
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            oversized_detector_line.as_bytes(),
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized eBPF JSONL detector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .chain()
+            .any(|cause| cause.to_string().contains("packet-flow detector exceeds")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"detector\":\"\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("empty eBPF JSONL detector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow detector must not be empty")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"detector\":\"ebpf-jsonl\\nspoof\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("eBPF JSONL detector control characters should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow detector must not contain control characters")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"source\":\"127.0.0.1\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("loopback eBPF JSONL source should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("source must not use loopback address")));
+
+        let oversized_statuses =
+            ["\"assured\""; ipars_types::api::PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS + 1].join(",");
+        let oversized_status_line =
+            format!(r#"{{"destination":"100.64.0.13","conntrack_status":[{oversized_statuses}]}}"#)
+                + "\n";
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            oversized_status_line.as_bytes(),
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("oversized eBPF JSONL conntrack_status should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow conntrack_status exceeds")));
+
+        let inconsistent_transport_line =
+            br#"{"destination":"100.64.0.13","protocol":"icmp","destination_port":8}
+"#;
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            inconsistent_transport_line,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => {
+                anyhow::bail!("inconsistent eBPF JSONL packet-flow metadata should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("port metadata requires TCP or UDP protocol")));
+
+        let inconsistent_application_line =
+            br#"{"destination":"100.64.0.13","protocol":"icmp","application":"postgres"}
+"#;
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            inconsistent_application_line,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!(
+                "protocol-incompatible eBPF JSONL application hint should be rejected"
+            ),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("application hint postgres requires TCP protocol")));
         Ok(())
     }
 
@@ -10085,6 +15771,35 @@ mod tests {
         assert_eq!(flows[0].observation.protocol, Some(TransportProtocol::Tcp));
 
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ebpf_jsonl_reader_rejects_symlinked_event_path() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-jsonl-reader-symlink")?;
+        let target = base.join("events.jsonl");
+        let link = base.join("events-link.jsonl");
+        std::fs::write(&target, "{\"destination\":\"100.64.0.11\"}\n")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match read_ebpf_jsonl_packet_flows(
+            &link,
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        )
+        .await
+        {
+            Ok(_) => anyhow::bail!("unexpected successful symlinked eBPF JSONL read"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(base);
         Ok(())
     }
 
@@ -10269,6 +15984,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Some(AgentPacketFlowDropReason::LinkLocal)
         );
         assert_eq!(AgentPacketFlowDropReason::LinkLocal.as_str(), "link_local");
+        assert_eq!(
+            AgentPacketFlowDropReason::NoOverlayMatch.as_str(),
+            "no_overlay_match"
+        );
+        assert_eq!(
+            AgentPacketFlowDropReason::InconsistentTransportMetadata.as_str(),
+            "inconsistent_transport_metadata"
+        );
         Ok(())
     }
 
@@ -10309,6 +16032,110 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(retained.len(), 1);
         assert_eq!(duplicates, 0);
         Ok(())
+    }
+
+    #[test]
+    fn packet_flow_deduper_keeps_application_classification_changes() -> anyhow::Result<()> {
+        let base = PacketFlowRecord {
+            destination: "100.64.0.11".parse()?,
+            observation: AgentPacketFlowObservation {
+                source: Some("192.0.2.10".parse()?),
+                protocol: Some(TransportProtocol::Tcp),
+                source_port: Some(54_321),
+                destination_port: Some(15_432),
+                ..AgentPacketFlowObservation::default()
+            },
+        };
+        let mut classified = base.clone();
+        classified.observation.application = Some(AgentPacketFlowApplication::Postgres);
+
+        let mut deduper = PacketFlowDeduper::new(Some(Duration::from_secs(60)));
+        let (retained, duplicates) =
+            deduper.retain_new(vec![base.clone(), classified.clone(), classified.clone()]);
+        assert_eq!(retained, vec![base.clone(), classified.clone()]);
+        assert_eq!(duplicates, 1);
+
+        let (retained, duplicates) = deduper.retain_new(vec![base, classified]);
+        assert!(retained.is_empty());
+        assert_eq!(duplicates, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn packet_flow_deduper_prunes_oldest_fingerprints_to_capacity() -> anyhow::Result<()> {
+        let first = PacketFlowRecord {
+            destination: "100.64.0.11".parse()?,
+            observation: AgentPacketFlowObservation::default(),
+        };
+        let second = PacketFlowRecord {
+            destination: "100.64.0.12".parse()?,
+            observation: AgentPacketFlowObservation::default(),
+        };
+        let mut deduper = PacketFlowDeduper::with_max_entries(Some(Duration::from_secs(60)), 1);
+
+        let (retained, duplicates) = deduper.retain_new(vec![first.clone()]);
+        assert_eq!(retained, vec![first.clone()]);
+        assert_eq!(duplicates, 0);
+        assert_eq!(deduper.seen.len(), 1);
+        let old_seen = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap_or_else(Instant::now);
+        for last_seen in deduper.seen.values_mut() {
+            *last_seen = old_seen;
+        }
+
+        let (retained, duplicates) = deduper.retain_new(vec![second.clone()]);
+        assert_eq!(retained, vec![second.clone()]);
+        assert_eq!(duplicates, 0);
+        assert_eq!(deduper.seen.len(), 1);
+        assert!(deduper
+            .seen
+            .contains_key(&PacketFlowFingerprint::from(&second)));
+        assert!(!deduper
+            .seen
+            .contains_key(&PacketFlowFingerprint::from(&first)));
+
+        let (retained, duplicates) = deduper.retain_new(vec![first.clone(), second]);
+        assert_eq!(retained, vec![first]);
+        assert_eq!(duplicates, 1);
+        assert_eq!(deduper.seen.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packet_flow_duplicate_suppression_records_agent_metrics() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+
+        record_packet_flow_duplicate_suppressions(
+            &runtime,
+            3,
+            AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
+        );
+        record_packet_flow_duplicate_suppressions(
+            &runtime,
+            0,
+            AgentPacketFlowDuplicateSource::EbpfJsonl,
+        );
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 3);
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(|entry| {
+                entry.source == AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents
+                    && entry.count == 3
+            }));
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(
+                |entry| entry.source == AgentPacketFlowDuplicateSource::EbpfJsonl
+                    && entry.count == 0
+            ));
     }
 
     #[tokio::test]
@@ -10401,6 +16228,29 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn conntrack_netlink_lifecycle_metadata_parsers_classify_status_and_tcp_state(
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            parse_conntrack_netlink_status(&0_u32.to_be_bytes())?,
+            vec![AgentPacketFlowConntrackStatus::Unreplied]
+        );
+        assert_eq!(
+            parse_conntrack_netlink_status(&(IPS_SEEN_REPLY | IPS_ASSURED).to_be_bytes())?,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+
+        let protoinfo = test_nla(
+            CTA_PROTOINFO_TCP | TEST_NLA_F_NESTED,
+            &test_nla(CTA_PROTOINFO_TCP_STATE, &[TCP_CONNTRACK_CLOSE_WAIT]),
+        );
+        assert_eq!(
+            parse_conntrack_protoinfo_tcp_state(&protoinfo)?,
+            Some(AgentPacketFlowTcpState::CloseWait)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn conntrack_netlink_parser_extracts_orig_and_reply_flow_metadata() -> anyhow::Result<()> {
         let ipv4_source = Ipv4Addr::new(192, 0, 2, 10);
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
@@ -10420,7 +16270,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 test_nla(
                     CTA_TUPLE_PROTO | TEST_NLA_F_NESTED,
                     &[
-                        test_nla(CTA_PROTO_NUM, &[17]),
+                        test_nla(CTA_PROTO_NUM, &[6]),
                         test_nla(CTA_PROTO_SRC_PORT, &50_000_u16.to_be_bytes()),
                         test_nla(CTA_PROTO_DST_PORT, &51_820_u16.to_be_bytes()),
                     ]
@@ -10452,7 +16302,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ]
             .concat(),
         );
+        let status = test_nla(CTA_STATUS, &(IPS_SEEN_REPLY | IPS_ASSURED).to_be_bytes());
+        let protoinfo = test_nla(
+            CTA_PROTOINFO | TEST_NLA_F_NESTED,
+            &test_nla(
+                CTA_PROTOINFO_TCP | TEST_NLA_F_NESTED,
+                &test_nla(CTA_PROTOINFO_TCP_STATE, &[TCP_CONNTRACK_ESTABLISHED]),
+            ),
+        );
         let mut payload = vec![0, NFNETLINK_V0, 0, 0];
+        payload.extend(status);
+        payload.extend(protoinfo);
         payload.extend(orig_tuple);
         payload.extend(reply_tuple);
 
@@ -10483,9 +16343,30 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .find(|flow| flow.destination == IpAddr::from(ipv4_destination))
             .context("missing orig flow")?;
         assert_eq!(orig.observation.source, Some(IpAddr::from(ipv4_source)));
-        assert_eq!(orig.observation.protocol, Some(TransportProtocol::Udp));
+        assert_eq!(orig.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(orig.observation.source_port, Some(50_000));
         assert_eq!(orig.observation.destination_port, Some(51_820));
+        assert_eq!(
+            orig.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            orig.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
+        let reply = result
+            .flows
+            .iter()
+            .find(|flow| flow.destination == IpAddr::from(ipv6_destination))
+            .context("missing reply flow")?;
+        assert_eq!(
+            reply.observation.conntrack_status,
+            vec![AgentPacketFlowConntrackStatus::Assured]
+        );
+        assert_eq!(
+            reply.observation.tcp_state,
+            Some(AgentPacketFlowTcpState::Established)
+        );
         Ok(())
     }
 
@@ -10657,7 +16538,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Ok(()) => anyhow::bail!("symlinked Docker socket should fail preflight"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(format!("{error:#}").contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
@@ -10687,6 +16568,74 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_rejects_unsafe_path_program_entries() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_test_dir("runtime-command-preflight")?;
+
+        let executable_bin = base.join("executable-bin");
+        std::fs::create_dir(&executable_bin)?;
+        let executable = executable_bin.join("ip");
+        std::fs::write(&executable, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        ensure_program_in_path("ip", Some(executable_bin.as_os_str()))?;
+
+        let non_executable_bin = base.join("non-executable-bin");
+        std::fs::create_dir(&non_executable_bin)?;
+        let non_executable = non_executable_bin.join("ip");
+        std::fs::write(&non_executable, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644))?;
+        let non_executable_error =
+            match ensure_program_in_path("ip", Some(non_executable_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful non-executable command preflight"),
+                Err(error) => error,
+            };
+        assert!(non_executable_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let directory_bin = base.join("directory-bin");
+        std::fs::create_dir(&directory_bin)?;
+        std::fs::create_dir(directory_bin.join("ip"))?;
+        let directory_error = match ensure_program_in_path("ip", Some(directory_bin.as_os_str())) {
+            Ok(()) => anyhow::bail!("unexpected successful directory command preflight"),
+            Err(error) => error,
+        };
+        assert!(directory_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let symlink_bin = base.join("symlink-bin");
+        std::fs::create_dir(&symlink_bin)?;
+        std::os::unix::fs::symlink(&executable, symlink_bin.join("ip"))?;
+        let symlink_error = match ensure_program_in_path("ip", Some(symlink_bin.as_os_str())) {
+            Ok(()) => anyhow::bail!("unexpected successful symlink command preflight"),
+            Err(error) => error,
+        };
+        assert!(symlink_error
+            .to_string()
+            .contains("expected an executable regular file"));
+
+        let userspace_link = base.join("wireguard-go-link");
+        std::os::unix::fs::symlink(&executable, &userspace_link)?;
+        let userspace_link = userspace_link.display().to_string();
+        let userspace_error =
+            match ensure_runtime_program_ready(userspace_link.as_str(), Some(OsStr::new(""))) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful symlink userspace command preflight")
+                }
+                Err(error) => error,
+            };
+        assert!(userspace_error
+            .to_string()
+            .contains("is not an executable file"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
     #[test]
     fn runtime_preflight_allows_kernel_netlink_without_wg_command() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
@@ -10714,6 +16663,726 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_accepts_userspace_wireguard_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-command",
+            "--route-backend",
+            "kernel-netlink",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert_eq!(
+                args.wireguard_backend,
+                WireGuardApplyBackend::UserspaceCommand
+            );
+            assert_eq!(args.wireguard_backend.as_str(), "userspace-command");
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_backend_specific_options_require_active_linux_dataplane() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-backend",
+                    "dry-run",
+                    "--apply-peer-map",
+                    "--wireguard-backend",
+                    "kernel-netlink",
+                ],
+                "--wireguard-backend requires --runtime-backend linux-command",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-backend",
+                    "dry-run",
+                    "--apply-peer-map",
+                    "--route-backend",
+                    "kernel-netlink",
+                ],
+                "--route-backend requires --runtime-backend linux-command",
+            ),
+            (
+                vec!["iparsd", "agent", "--wireguard-backend", "kernel-netlink"],
+                "--wireguard-backend kernel-netlink requires --apply-peer-map",
+            ),
+            (
+                vec!["iparsd", "agent", "--wireguard-backend", "userspace-command"],
+                "--wireguard-backend userspace-command requires --apply-peer-map or --userspace-wireguard-command",
+            ),
+            (
+                vec!["iparsd", "agent", "--route-backend", "kernel-netlink"],
+                "--route-backend kernel-netlink requires --apply-peer-map, --apply-docker-routes, or --apply-kubernetes-underlay",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--linux-netns",
+                    "node-a",
+                    "--skip-runtime-preflight",
+                ],
+                "--linux-netns requires an active Linux dataplane loop, --userspace-wireguard-command, or --relay-forwarder-bind",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_preflight_requires_ip_for_namespaced_userspace_wireguard_backend(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-command",
+            "--route-backend",
+            "kernel-netlink",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(!needs.userspace_wireguard_command);
+            assert!(needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(needs.cap_sys_admin);
+            assert!(needs.linux_netns);
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful namespaced userspace preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("missing required Linux runtime command `ip`"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_checks_namespace_for_managed_userspace_wireguard_process(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.userspace_wireguard_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(needs.cap_sys_admin);
+            assert!(needs.linux_netns);
+
+            let base = unique_test_dir("namespaced-userspace-preflight")?;
+            let bin = base.join("bin");
+            std::fs::create_dir(&bin)?;
+            for program in ["ip", "wg", "wireguard-go"] {
+                let path = bin.join(program);
+                std::fs::write(&path, b"#!/bin/sh\n")?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.cap_sys_admin = preflight_fail_cap_sys_admin;
+            let cap_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(bin.as_os_str()),
+                checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful namespaced userspace CAP preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(cap_error.to_string().contains("blocked test CAP_SYS_ADMIN"));
+
+            let mut namespace_checks = test_preflight_checks(preflight_noop_netlink);
+            namespace_checks.linux_netns = preflight_fail_linux_netns;
+            let namespace_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(bin.as_os_str()),
+                namespace_checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful namespaced userspace namespace preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(namespace_error
+                .to_string()
+                .contains("blocked test netns node-a"));
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_launch_command_defaults_interface_and_wraps_namespace(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--linux-netns",
+            "node-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let command = match userspace_wireguard_launch_command(&args)? {
+                Some(command) => command,
+                None => anyhow::bail!("expected userspace WireGuard launch command"),
+            };
+            assert_eq!(command.program, "ip");
+            assert_eq!(
+                command.args,
+                vec![
+                    "netns".to_string(),
+                    "exec".to_string(),
+                    "node-a".to_string(),
+                    "wireguard-go".to_string(),
+                    "ipars0".to_string(),
+                ]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_launch_command_accepts_explicit_args() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg=--foreground",
+            "--userspace-wireguard-arg=ipars42",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let command = match userspace_wireguard_launch_command(&args)? {
+                Some(command) => command,
+                None => anyhow::bail!("expected userspace WireGuard launch command"),
+            };
+            assert_eq!(command.program, "wireguard-go");
+            assert_eq!(
+                command.args,
+                vec!["--foreground".to_string(), "ipars42".to_string()]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_args_reject_control_characters() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg",
+            "ipars0\n--unexpected",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--userspace-wireguard-arg must not contain control characters"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn userspace_wireguard_command_rejects_relative_paths() -> anyhow::Result<()> {
+        for command in ["./wireguard-go", "bin/wireguard-go"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--wireguard-backend",
+                "userspace-command",
+                "--userspace-wireguard-command",
+                command,
+            ])?;
+
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard command"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--userspace-wireguard-command must be a bare command name or an absolute path"),
+                    "unexpected error for {command}: {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let error = match ensure_runtime_program_ready("./wireguard-go", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful relative command preflight"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must be a bare command name or an absolute path"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn userspace_wireguard_command_rejects_whitespace() -> anyhow::Result<()> {
+        for command in ["wireguard go", "/usr/local/bin/wireguard go"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--wireguard-backend",
+                "userspace-command",
+                "--userspace-wireguard-command",
+                command,
+            ])?;
+
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard command"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--userspace-wireguard-command must not contain whitespace"),
+                    "unexpected error for {command}: {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let error = match ensure_runtime_program_ready("wireguard go", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful whitespace command preflight"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not contain whitespace"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn userspace_wireguard_process_config_rejects_oversized_tokens() -> anyhow::Result<()> {
+        let validate = |argv: Vec<String>, expected: &str| -> anyhow::Result<()> {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected {expected}, got {error}"
+                );
+                return Ok(());
+            }
+
+            Err(anyhow::anyhow!("expected agent command"))
+        };
+
+        validate(
+            vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                "--userspace-wireguard-command".to_string(),
+                "x".repeat(MAX_RUNTIME_PROGRAM_TOKEN_BYTES + 1),
+            ],
+            "--userspace-wireguard-command exceeds 4096 bytes",
+        )?;
+
+        let mut too_many_args = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--wireguard-backend".to_string(),
+            "userspace-command".to_string(),
+            "--userspace-wireguard-command".to_string(),
+            "wireguard-go".to_string(),
+        ];
+        for index in 0..=MAX_USERSPACE_WIREGUARD_ARGS {
+            too_many_args.push("--userspace-wireguard-arg".to_string());
+            too_many_args.push(format!("arg-{index}"));
+        }
+        validate(
+            too_many_args,
+            "--userspace-wireguard-arg may be repeated at most 128 times",
+        )?;
+
+        validate(
+            vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                "--userspace-wireguard-command".to_string(),
+                "wireguard-go".to_string(),
+                "--userspace-wireguard-arg".to_string(),
+                "x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES + 1),
+            ],
+            "--userspace-wireguard-arg exceeds 4096 bytes",
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn userspace_wireguard_process_config_requires_userspace_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--wireguard-backend userspace-command"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_userspace_wireguard_command() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--wireguard-backend",
+            "userspace-command",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.userspace_wireguard_command);
+            let error = match ensure_runtime_program_ready("wireguard-go", Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful command preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("missing required Linux runtime command `wireguard-go`"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_start_failure_stops_child_process() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "iparsd-userspace-wg-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
+        let cli = Cli::try_parse_from(vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--wireguard-backend".to_string(),
+            "userspace-command".to_string(),
+            "--userspace-wireguard-command".to_string(),
+            "/bin/sh".to_string(),
+            "--userspace-wireguard-arg=-c".to_string(),
+            "--userspace-wireguard-arg".to_string(),
+            shell_script.to_string(),
+            "--userspace-wireguard-arg=ipars-test-wg".to_string(),
+            "--userspace-wireguard-arg".to_string(),
+            pid_arg,
+            "--userspace-wireguard-ready-timeout-seconds".to_string(),
+            "1".to_string(),
+            "--userspace-wireguard-shutdown-timeout-seconds".to_string(),
+            "1".to_string(),
+            "--runtime-command-timeout-seconds".to_string(),
+            "1".to_string(),
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let runtime = Arc::new(AgentRuntime::new(
+                AgentNodeState::generate(Utc::now()),
+                ClusterPolicy::default(),
+            ));
+            let error = match start_userspace_wireguard_process(&args, runtime.clone()).await {
+                Ok(Some(process)) => {
+                    process.shutdown().await;
+                    anyhow::bail!("unexpected ready userspace WireGuard process")
+                }
+                Ok(None) => anyhow::bail!("expected userspace WireGuard launch command"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not expose interface ipars0 within 1 seconds"),
+                "unexpected readiness error: {error}"
+            );
+            let pid = std::fs::read_to_string(&pid_path)?
+                .trim()
+                .parse::<u32>()
+                .context("failed to parse child pid")?;
+            assert!(
+                wait_for_process_absent(pid, Duration::from_secs(2)).await,
+                "userspace WireGuard child process {pid} was left running after readiness failure"
+            );
+            let status = runtime
+                .userspace_wireguard_process_status()
+                .await
+                .context("missing userspace WireGuard process status")?;
+            assert_eq!(status.state, AgentManagedProcessState::Failed);
+            assert_eq!(status.pid, Some(pid));
+            assert!(status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not expose interface ipars0 within 1 seconds"));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Ok(());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_monitor_shutdown_stops_child_process() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "iparsd-userspace-wg-monitor-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(shell_script)
+            .arg("ipars-monitor")
+            .arg(&pid_arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start monitor test child")?;
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let task = tokio::spawn(monitor_userspace_wireguard_process(
+            child,
+            "monitor-test".to_string(),
+            Some(pid),
+            runtime.clone(),
+            shutdown_rx,
+            Duration::from_secs(1),
+        ));
+
+        assert!(shutdown.send(()).is_ok());
+        task.await?;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "userspace WireGuard monitor child process {pid} was left running after shutdown"
+        );
+        let status = runtime
+            .userspace_wireguard_process_status()
+            .await
+            .context("missing userspace WireGuard process status")?;
+        assert_eq!(status.state, AgentManagedProcessState::Stopped);
+        assert_eq!(status.pid, Some(pid));
+        assert!(status.exit_status.is_some());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_monitor_records_unexpected_exit() -> anyhow::Result<()> {
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start monitor exit test child")?;
+        let pid = child.id();
+        let (_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        monitor_userspace_wireguard_process(
+            child,
+            "monitor-exit-test".to_string(),
+            pid,
+            runtime.clone(),
+            shutdown_rx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let status = runtime
+            .userspace_wireguard_process_status()
+            .await
+            .context("missing userspace WireGuard process status")?;
+        assert_eq!(status.state, AgentManagedProcessState::Exited);
+        assert_eq!(status.pid, pid);
+        assert!(status
+            .exit_status
+            .as_deref()
+            .unwrap_or_default()
+            .contains('7'));
+        Ok(())
+    }
+
+    async fn wait_for_pid_file(path: &Path, timeout: Duration) -> anyhow::Result<u32> {
+        let started = Instant::now();
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let contents = contents.trim();
+                    if !contents.is_empty() {
+                        match contents.parse::<u32>() {
+                            Ok(pid) => return Ok(pid),
+                            Err(error) if started.elapsed() >= timeout => {
+                                return Err(error).context("failed to parse child pid");
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read child pid file {}", path.display())
+                    });
+                }
+            }
+            anyhow::ensure!(
+                started.elapsed() < timeout,
+                "timed out waiting for child pid file {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_process_absent(pid: u32, timeout: Duration) -> bool {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let started = Instant::now();
+        loop {
+            if !proc_path.exists() {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]
@@ -10854,6 +17523,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         anyhow::bail!("blocked test net.ipv6.conf.all.forwarding")
     }
 
+    fn preflight_fail_cap_sys_admin() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test CAP_SYS_ADMIN")
+    }
+
+    fn preflight_fail_linux_netns(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+        anyhow::bail!("blocked test netns {}", namespace.name())
+    }
+
     fn preflight_fail_generic_netlink(protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
         if protocol == RuntimeNetlinkProtocol::Generic {
             anyhow::bail!("blocked test {}", protocol.as_str());
@@ -10882,6 +17559,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             linux_netns: preflight_noop_netns,
             netlink,
             docker_api_socket: preflight_noop_path,
+            conntrack_procfs_path: preflight_noop_path,
             ipv4_forwarding: preflight_noop,
             ipv6_forwarding: preflight_noop,
         }
@@ -10902,6 +17580,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             linux_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
             docker_api_socket: preflight_noop_path,
+            conntrack_procfs_path: preflight_noop_path,
             ipv4_forwarding,
             ipv6_forwarding,
         }
@@ -10933,6 +17612,103 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 Err(error) => error,
             };
             assert!(error.to_string().contains("blocked test NETLINK_GENERIC"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_relay_forwarder_namespace() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-netns",
+            "relay-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(!needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(!needs.netfilter_netlink);
+            assert!(!needs.linux_netns);
+            assert!(needs.relay_forwarder_netns);
+            assert!(needs.cap_sys_admin);
+
+            let mut cap_checks = test_preflight_checks(preflight_noop_netlink);
+            cap_checks.cap_sys_admin = preflight_fail_cap_sys_admin;
+            let cap_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                cap_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful relay forwarder CAP preflight"),
+                Err(error) => error,
+            };
+            assert!(cap_error.to_string().contains("blocked test CAP_SYS_ADMIN"));
+
+            let mut namespace_checks = test_preflight_checks(preflight_noop_netlink);
+            namespace_checks.linux_netns = preflight_fail_linux_netns;
+            let namespace_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                namespace_checks,
+            ) {
+                Ok(()) => {
+                    anyhow::bail!("unexpected successful relay forwarder namespace preflight")
+                }
+                Err(error) => error,
+            };
+            assert!(namespace_error
+                .to_string()
+                .contains("blocked test netns relay-a"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_checks_relay_forwarder_inherited_linux_namespace() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--linux-netns",
+            "node-a",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.linux_netns);
+            assert!(needs.relay_forwarder_netns);
+            assert!(needs.cap_sys_admin);
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.linux_netns = preflight_fail_linux_netns;
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful inherited namespace preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("blocked test netns node-a"));
             return Ok(());
         }
 
@@ -11020,6 +17796,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "--apply-docker-routes",
             "--route-backend",
             "kernel-netlink",
+            "--docker-container-namespace",
+            "compose-default",
             "--docker-container-cidr",
             "172.18.0.0/16",
         ])?;
@@ -11179,8 +17957,52 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let tracepoint_dir = second_root.join("syscalls/sys_enter_connect");
         std::fs::create_dir_all(&tracepoint_dir)?;
-        std::fs::write(tracepoint_dir.join("id"), b"123\n")?;
+        let tracepoint_id = tracepoint_dir.join("id");
+        std::fs::write(&tracepoint_id, b"123\n")?;
         ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots)?;
+
+        std::fs::write(&tracepoint_id, b"")?;
+        let empty_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful empty tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(empty_id_error.to_string().contains("is empty"));
+
+        std::fs::write(&tracepoint_id, b"abc\n")?;
+        let non_numeric_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful non-numeric tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(format!("{non_numeric_id_error:#}").contains("is not numeric"));
+
+        std::fs::write(&tracepoint_id, b"0\n")?;
+        let zero_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful zero tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(zero_id_error
+            .to_string()
+            .contains("must be greater than zero"));
+
+        std::fs::write(&tracepoint_id, vec![b'1'; MAX_EBPF_TRACEPOINT_ID_BYTES + 1])?;
+        let oversized_id_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+            Ok(()) => anyhow::bail!("unexpected successful oversized tracepoint id preflight"),
+            Err(error) => error,
+        };
+        assert!(oversized_id_error.to_string().contains("exceeds"));
+
+        #[cfg(unix)]
+        {
+            let target = base.join("tracepoint-id-target");
+            std::fs::write(&target, b"123\n")?;
+            std::fs::remove_file(&tracepoint_id)?;
+            std::os::unix::fs::symlink(&target, &tracepoint_id)?;
+            let symlink_error = match ensure_ebpf_tracepoint_ready_in_roots(&attachment, roots) {
+                Ok(()) => anyhow::bail!("unexpected successful symlink tracepoint preflight"),
+                Err(error) => error,
+            };
+            assert!(symlink_error.to_string().contains("symlink id path"));
+        }
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
@@ -11271,6 +18093,62 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn agent_hole_punch_config_must_be_positive_when_signal_paths_are_enabled() -> anyhow::Result<()>
+    {
+        for (flag, expected) in [
+            (
+                "--hole-punch-attempts",
+                "--hole-punch-attempts must be greater than zero",
+            ),
+            (
+                "--hole-punch-interval-millis",
+                "--hole-punch-interval-millis must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--skip-runtime-preflight",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid agent runtime config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let disabled = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--disable-signal-paths",
+            "--hole-punch-attempts",
+            "0",
+            "--hole-punch-interval-millis",
+            "0",
+        ])?;
+        if let Command::Agent(args) = disabled.command {
+            validate_agent_runtime_config(&args)?;
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn runtime_config_validation_survives_skipped_runtime_preflight() -> anyhow::Result<()> {
         let invalid_docker_host_interface = Cli::try_parse_from([
             "iparsd",
@@ -11320,6 +18198,116 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected agent command");
         }
 
+        let option_like_relay_forwarder_namespace = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+            "--relay-forwarder-netns=-node-a",
+        ])?;
+        if let Command::Agent(args) = option_like_relay_forwarder_namespace.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("invalid linux network namespace name"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_relay_forwarder_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-endpoint",
+            "127.0.0.1:0",
+        ])?;
+        if let Command::Agent(args) = unusable_relay_forwarder_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--relay-forwarder-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let missing_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+        ])?;
+        if let Command::Agent(args) = missing_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind"
+            ));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let unusable_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-wireguard-endpoint",
+            "0.0.0.0:51820",
+        ])?;
+        if let Command::Agent(args) = unusable_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-forwarder-wireguard-endpoint"));
+            assert!(error.to_string().contains("usable nonzero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let inactive_forwarder_wireguard_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+        ])?;
+        if let Command::Agent(args) = inactive_forwarder_wireguard_endpoint.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         let zero_forwarder_capacity = Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -11341,10 +18329,56 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(error
                 .to_string()
                 .contains("--relay-forwarder-max-sessions must be greater than zero"));
-            return Ok(());
+        } else {
+            anyhow::bail!("expected agent command");
         }
 
-        Err(anyhow::anyhow!("expected agent command"))
+        for (flag, expected) in [
+            (
+                "--relay-forwarder-restart-backoff-seconds",
+                "--relay-forwarder-restart-backoff-seconds must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-crash-window-seconds",
+                "--relay-forwarder-crash-window-seconds must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-max-crashes-per-window",
+                "--relay-forwarder-max-crashes-per-window must be greater than zero",
+            ),
+            (
+                "--relay-forwarder-crash-cooldown-seconds",
+                "--relay-forwarder-crash-cooldown-seconds must be greater than zero",
+            ),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--skip-runtime-preflight",
+                "--relay-forwarder-bind",
+                "127.0.0.1:0",
+                "--relay-forwarder-wireguard-endpoint",
+                "127.0.0.1:51820",
+                flag,
+                "0",
+            ])?;
+            if let Command::Agent(args) = cli.command {
+                let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                    Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "{flag} should fail with {expected}, got {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -11424,6 +18458,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
 
         assert!(error.to_string().contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_forwarder_process_netns_check_rejects_symlink_target() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("relay-forwarder-netns-symlink")?;
+        let target = base.join("target");
+        let link = base.join("node-a");
+        let current = base.join("current");
+        std::fs::write(&target, b"netns")?;
+        std::fs::write(&current, b"netns")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match ensure_process_in_netns_path(&namespace, &link, &current) {
+            Ok(_) => anyhow::bail!("unexpected successful relay forwarder netns check"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("must not be a symlink"));
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
@@ -11786,6 +18842,87 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn kubernetes_discovery_namespaces_must_be_unique() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-services",
+            "--kubernetes-namespace",
+            "default",
+            "--kubernetes-namespace",
+            "default",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("duplicate Kubernetes namespace filter should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-namespace `default` must not be repeated"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_rejects_invalid_route_provider() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-route-provider",
+            "route provider",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("invalid Kubernetes route provider should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--kubernetes-route-provider must contain only ASCII letters, digits, '_', '.' or '-'"
+            ));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_rejects_invalid_api_url() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-services",
+            "--kubernetes-api-url",
+            "udp://kubernetes.default.svc",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("invalid Kubernetes API URL should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--kubernetes-api-url must use http or https"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn kubernetes_service_discovery_builds_host_route_cidrs() -> anyhow::Result<()> {
         let services = KubernetesServiceList {
             items: vec![
@@ -11803,6 +18940,48 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "fd00::20/128".parse::<ipnet::IpNet>()?,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_service_account_token_reader_validates_input() -> anyhow::Result<()> {
+        let base = unique_test_dir("kubernetes-service-account-token")?;
+        let token_path = base.join("token");
+        std::fs::write(&token_path, " bearer-token\n")?;
+        assert_eq!(
+            read_kubernetes_service_account_token(&token_path)?,
+            "bearer-token"
+        );
+
+        let directory = base.join("token-dir");
+        std::fs::create_dir(&directory)?;
+        let directory_error = match read_kubernetes_service_account_token(&directory) {
+            Ok(_) => anyhow::bail!("directory service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(directory_error.contains("must resolve to a regular file"));
+
+        let empty_path = base.join("empty-token");
+        std::fs::write(&empty_path, " \n")?;
+        let empty_error = match read_kubernetes_service_account_token(&empty_path) {
+            Ok(_) => anyhow::bail!("empty service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(empty_error.contains("Kubernetes service account token at"));
+        assert!(empty_error.contains("is empty"));
+
+        let oversized_path = base.join("oversized-token");
+        std::fs::write(
+            &oversized_path,
+            "x".repeat(MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES as usize + 1),
+        )?;
+        let oversized_error = match read_kubernetes_service_account_token(&oversized_path) {
+            Ok(_) => anyhow::bail!("oversized service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(oversized_error.contains("exceeds maximum size"));
+
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 
@@ -11836,6 +19015,51 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             kubernetes_api_server_env_cidr(Some(std::ffi::OsStr::new("10.96.0.1")))?,
             Some("10.96.0.1/32".parse::<ipnet::IpNet>()?)
         );
+        let scheme_error =
+            match kubernetes_api_base_url(Some("udp://kubernetes.default.svc"), None, None) {
+                Ok(url) => anyhow::bail!("invalid Kubernetes API URL should be rejected: {url}"),
+                Err(error) => error.to_string(),
+            };
+        assert!(scheme_error.contains("--kubernetes-api-url must use http or https"));
+        let numeric_host_error = match kubernetes_api_base_url(Some("https://0.0.0.0"), None, None)
+        {
+            Ok(url) => anyhow::bail!("unusable Kubernetes API URL should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(numeric_host_error.contains(
+            "--kubernetes-api-url must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        ));
+        let port_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("10.96.0.1")),
+            Some(std::ffi::OsStr::new("abc")),
+        ) {
+            Ok(url) => anyhow::bail!("invalid Kubernetes Service port should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(port_error.contains("KUBERNETES_SERVICE_PORT `abc` must be an integer port"));
+        let zero_port_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("10.96.0.1")),
+            Some(std::ffi::OsStr::new("0")),
+        ) {
+            Ok(url) => {
+                anyhow::bail!("zero Kubernetes Service port should be rejected: {url}");
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(zero_port_error.contains("KUBERNETES_SERVICE_PORT must be greater than zero"));
+        let env_host_error = match kubernetes_api_base_url(
+            None,
+            Some(std::ffi::OsStr::new("0.0.0.0")),
+            Some(std::ffi::OsStr::new("443")),
+        ) {
+            Ok(url) => anyhow::bail!("unusable Kubernetes Service host should be rejected: {url}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(env_host_error.contains(
+            "KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        ));
         Ok(())
     }
 
@@ -11919,6 +19143,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "172.18.0.0/16",
         ])?;
         if let Command::Agent(args) = missing_namespace.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Docker namespace should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("--apply-docker-routes requires --docker-container-namespace"));
             assert!(docker_network_intent(&args).is_err());
         }
 
@@ -11930,7 +19159,104 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "compose-default",
         ])?;
         if let Command::Agent(args) = missing_routes.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Docker CIDR should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error
+                .contains("--apply-docker-routes requires at least one --docker-container-cidr"));
             assert!(docker_network_intent(&args).is_err());
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_route_settings_require_route_application() -> anyhow::Result<()> {
+        let discovery_error =
+            agent_runtime_config_error(vec!["iparsd", "agent", "--docker-discover-networks"])?;
+        assert!(
+            discovery_error.contains("--docker-discover-networks requires --apply-docker-routes")
+        );
+
+        let namespace_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-container-namespace",
+            "compose-default",
+        ])?;
+        assert!(
+            namespace_error.contains("--docker-container-namespace requires --apply-docker-routes")
+        );
+
+        let cidr_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(cidr_error.contains("--docker-container-cidr requires --apply-docker-routes"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_requires_network_discovery() -> anyhow::Result<()> {
+        let static_mode_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-api-socket",
+            "/var/run/docker.sock",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(
+            static_mode_error.contains("--docker-api-socket requires --docker-discover-networks")
+        );
+
+        let inactive_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-api-socket",
+            "/var/run/docker.sock",
+        ])?;
+        assert!(inactive_error.contains("--docker-api-socket requires --docker-discover-networks"));
+
+        let relative_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            "docker.sock",
+        ])?;
+        assert!(relative_error.contains("--docker-api-socket must be an absolute Unix socket path"));
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_underlay_intent_rejects_invalid_route_cidrs() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.1/12",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match kubernetes_underlay_intent(&args, NodeId::from_string("local")) {
+                Ok(intent) => {
+                    anyhow::bail!("invalid Kubernetes intent should be rejected: {intent:?}");
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(
+                "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12"
+            ));
             return Ok(());
         }
 
@@ -11949,6 +19275,126 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn docker_explicit_container_cidrs_reject_unsafe_ranges() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "0.0.0.0/0",
+                "--docker-container-cidr must not include unrestricted Docker container CIDR 0.0.0.0/0",
+            ),
+            (
+                "127.0.0.0/8",
+                "--docker-container-cidr must not include loopback Docker container CIDR 127.0.0.0/8",
+            ),
+            (
+                "fe80::/64",
+                "--docker-container-cidr must not include link-local Docker container CIDR fe80::/64",
+            ),
+            (
+                "172.18.10.1/24",
+                "--docker-container-cidr must use canonical Docker container CIDR route 172.18.10.0/24, not 172.18.10.1/24",
+            ),
+        ];
+
+        for (cidr, expected) in cases {
+            let error = agent_runtime_config_error(vec![
+                "iparsd",
+                "agent",
+                "--apply-docker-routes",
+                "--docker-container-namespace",
+                "compose-default",
+                "--docker-container-cidr",
+                cidr,
+            ])?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+
+        let duplicate = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+        ])?;
+        assert!(duplicate.contains(
+            "--docker-container-cidr must not repeat Docker container CIDR route 172.18.0.0/16"
+        ));
+
+        let overlapping = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-container-namespace",
+            "compose-default",
+            "--docker-container-cidr",
+            "172.18.0.0/16",
+            "--docker-container-cidr",
+            "172.18.10.0/24",
+        ])?;
+        assert!(overlapping.contains(
+            "--docker-container-cidr must not include overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_explicit_route_cidrs_reject_invalid_ranges() -> anyhow::Result<()> {
+        let cases = vec![
+            (
+                "--kubernetes-api-server-cidr",
+                "0.0.0.0/0",
+                "--kubernetes-api-server-cidr must not include unrestricted Kubernetes API server CIDR 0.0.0.0/0",
+            ),
+            (
+                "--kubernetes-service-cidr",
+                "127.0.0.0/8",
+                "--kubernetes-service-cidr must not include loopback Kubernetes Service CIDR 127.0.0.0/8",
+            ),
+            (
+                "--kubernetes-service-cidr",
+                "10.96.0.1/12",
+                "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12",
+            ),
+        ];
+
+        for (flag, cidr, expected) in cases {
+            let error = agent_runtime_config_error(vec![
+                "iparsd",
+                "agent",
+                "--apply-kubernetes-underlay",
+                flag,
+                cidr,
+            ])?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+
+        let duplicate = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-api-server-cidr",
+            "10.96.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.1/32",
+        ])?;
+        assert!(duplicate.contains(
+            "--kubernetes-service-cidr must not repeat Kubernetes underlay route CIDR 10.96.0.1/32"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn agent_runtime_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
         let cases = vec![
             (
@@ -11960,8 +19406,44 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "--runtime-command-timeout-seconds must be greater than zero",
             ),
             (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-command-timeout-seconds",
+                    "3601",
+                ],
+                "--runtime-command-timeout-seconds must not exceed 3600",
+            ),
+            (
                 vec!["iparsd", "agent", "--runtime-command-output-max-bytes", "0"],
                 "--runtime-command-output-max-bytes must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--runtime-command-output-max-bytes",
+                    "1048577",
+                ],
+                "--runtime-command-output-max-bytes must not exceed 1048576",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--userspace-wireguard-ready-timeout-seconds",
+                    "3601",
+                ],
+                "--userspace-wireguard-ready-timeout-seconds must not exceed 3600",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--userspace-wireguard-shutdown-timeout-seconds",
+                    "3601",
+                ],
+                "--userspace-wireguard-shutdown-timeout-seconds must not exceed 3600",
             ),
             (
                 vec![
@@ -12073,12 +19555,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     #[test]
     fn docker_api_discovery_selects_bridge_network_subnets() -> anyhow::Result<()> {
         let networks = vec![
-            docker_api_network(
-                "other-id",
-                "compose_extra",
-                "bridge",
-                &["172.19.0.0/16", "172.18.0.0/16"],
-            ),
+            docker_api_network("other-id", "compose_extra", "bridge", &["172.19.0.0/16"]),
             docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
             docker_api_network(
                 "default-id",
@@ -12130,6 +19607,151 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
         assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_unsafe_discovered_cidrs() -> anyhow::Result<()> {
+        let networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["0.0.0.0/0"],
+        )];
+
+        let error = match docker_discovered_routes(&networks, &[]) {
+            Ok(_) => anyhow::bail!("unsafe Docker API subnet should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(
+            "Docker network discovery must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
+
+        let non_canonical_networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["172.18.10.1/24"],
+        )];
+        let non_canonical = match docker_discovered_routes(&non_canonical_networks, &[]) {
+            Ok(_) => anyhow::bail!("non-canonical Docker API subnet should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(non_canonical.contains(
+            "Docker network discovery must use canonical Docker container CIDR route 172.18.10.0/24, not 172.18.10.1/24"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_duplicate_or_overlapping_discovered_cidrs() -> anyhow::Result<()>
+    {
+        let duplicate_networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_extra", "bridge", &["172.18.0.0/16"]),
+        ];
+        let duplicate = match docker_discovered_routes(&duplicate_networks, &[]) {
+            Ok(_) => anyhow::bail!("duplicate Docker API subnets should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(duplicate.contains(
+            "Docker network discovery must not repeat Docker container CIDR route 172.18.0.0/16"
+        ));
+
+        let overlapping_networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_extra", "bridge", &["172.18.10.0/24"]),
+        ];
+        let overlapping = match docker_discovered_routes(&overlapping_networks, &[]) {
+            Ok(_) => anyhow::bail!("overlapping Docker API subnets should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(overlapping.contains(
+            "Docker network discovery must not include overlapping Docker container CIDR routes 172.18.0.0/16 and 172.18.10.0/24"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_unmatched_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![docker_api_network(
+            "default-id",
+            "compose_default",
+            "bridge",
+            &["172.18.0.0/16"],
+        )];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "missing".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("missing Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("did not find requested network filters"));
+        assert!(error.contains("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_non_bridge_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("host-id", "host", "host", &["192.0.2.0/24"]),
+        ];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "host".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("non-bridge Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("requested non-bridge networks"));
+        assert!(error.contains("host"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_reports_subnetless_filtered_networks() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("empty-id", "compose_empty", "bridge", &[]),
+        ];
+
+        let error = match docker_discovered_routes(
+            &networks,
+            &["compose_default".to_string(), "empty-id".to_string()],
+        ) {
+            Ok(_) => anyhow::bail!("subnetless Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("without IPAM subnets"));
+        assert!(error.contains("empty-id"));
         Ok(())
     }
 
@@ -12324,6 +19946,34 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[test]
+    fn docker_network_filters_must_be_unique() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-network",
+            "compose_default",
+            "--docker-network",
+            "compose_default",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(_) => anyhow::bail!("duplicate Docker network filter should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--docker-network `compose_default` must not be repeated"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
     #[tokio::test]
     async fn docker_explicit_cidrs_build_agent_requested_routes() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
@@ -12400,6 +20050,44 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Ok(())
     }
 
+    #[test]
+    fn docker_api_socket_resolution_requires_absolute_socket_paths() -> anyhow::Result<()> {
+        let explicit_error = match resolve_docker_api_socket(
+            Some(Path::new("docker.sock")),
+            None,
+            None,
+            |_| false,
+        ) {
+            Ok(path) => anyhow::bail!("relative explicit socket should be rejected: {path:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(explicit_error.contains("--docker-api-socket must be an absolute Unix socket path"));
+
+        let docker_host_error = match resolve_docker_api_socket(
+            None,
+            Some(OsStr::new("unix://docker.sock")),
+            None,
+            |_| false,
+        ) {
+            Ok(path) => anyhow::bail!("relative DOCKER_HOST socket should be rejected: {path:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(docker_host_error
+            .contains("DOCKER_HOST unix:// socket path must be an absolute Unix socket path"));
+        let rootless_error =
+            match resolve_docker_api_socket(None, None, Some(OsStr::new("run/user/1000")), |path| {
+                path == Path::new("run/user/1000/docker.sock")
+            }) {
+                Ok(path) => {
+                    anyhow::bail!("relative XDG runtime socket should be rejected: {path:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+        assert!(rootless_error
+            .contains("XDG_RUNTIME_DIR/docker.sock must be an absolute Unix socket path"));
+        Ok(())
+    }
+
     fn docker_api_network(
         id: &str,
         name: &str,
@@ -12435,6 +20123,13 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-kubernetes-underlay"])?;
 
         if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("missing Kubernetes routes should be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
+            ));
             assert!(kubernetes_underlay_intent(&args, NodeId::from_string("local")).is_err());
             return Ok(());
         }
@@ -12449,16 +20144,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
             "--admission-url",
             "http://relay-a:9580",
             "--session-ttl-seconds",
             "60",
+            "--max-sessions-per-node",
+            "25",
+            "--admission-rate-limit",
+            "120",
+            "--admission-rate-limit-window-seconds",
+            "30",
             "--admission-bearer-token",
             "cluster-relay-secret",
         ])?;
 
         if let Command::Relay(args) = cli.command {
             assert_eq!(args.session_ttl_seconds, 60);
+            assert_eq!(args.max_sessions_per_node, 25);
+            assert_eq!(args.admission_rate_limit, 120);
+            assert_eq!(args.admission_rate_limit_window_seconds, 30);
+            assert_eq!(args.public_endpoint, Some("203.0.113.10:51820".parse()?));
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.admission_bearer_token.as_deref(),
@@ -12472,11 +20179,93 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
     #[test]
     fn relay_config_rejects_invalid_admission_url_and_zero_capacity() -> anyhow::Result<()> {
+        let missing_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = missing_public_endpoint.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--public-endpoint is required"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let missing_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+        ])?;
+        if let Command::Relay(args) = missing_admission_url.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--admission-url is required"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let invalid_relay_node_id = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay/a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = invalid_relay_node_id.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(
+                "--relay-node-id must contain only ASCII letters, digits, '_', '.' or '-'"
+            ));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let unusable_public_endpoint = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "0.0.0.0:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+        if let Command::Relay(args) = unusable_public_endpoint.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--public-endpoint must use a usable nonzero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let invalid_admission_url = Cli::try_parse_from([
             "iparsd",
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
             "--admission-url",
             "relay-a",
         ])?;
@@ -12492,11 +20281,36 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected relay command");
         }
 
+        let unusable_admission_url = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://0.0.0.0:9580",
+        ])?;
+        if let Command::Relay(args) = unusable_admission_url.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("--admission-url"));
+            assert!(error.to_string().contains("usable non-unspecified"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let zero_sessions = Cli::try_parse_from([
             "iparsd",
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--max-sessions",
             "0",
         ])?;
@@ -12517,6 +20331,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--max-mbps",
             "0",
         ])?;
@@ -12532,11 +20350,41 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected relay command");
         }
 
+        let node_limit_above_capacity = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--max-sessions",
+            "10",
+            "--max-sessions-per-node",
+            "11",
+        ])?;
+        if let Command::Relay(args) = node_limit_above_capacity.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--max-sessions-per-node must be less than or equal to --max-sessions"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let zero_ttl = Cli::try_parse_from([
             "iparsd",
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--session-ttl-seconds",
             "0",
         ])?;
@@ -12552,11 +20400,90 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             anyhow::bail!("expected relay command");
         }
 
+        let oversized_ttl_seconds = (MAX_RELAY_SESSION_TTL_SECONDS + 1).to_string();
+        let oversized_ttl = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--session-ttl-seconds",
+            oversized_ttl_seconds.as_str(),
+        ])?;
+        if let Command::Relay(args) = oversized_ttl.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--session-ttl-seconds must not exceed {MAX_RELAY_SESSION_TTL_SECONDS}"
+            )));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let zero_rate_window = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--admission-rate-limit-window-seconds",
+            "0",
+        ])?;
+        if let Command::Relay(args) = zero_rate_window.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--admission-rate-limit-window-seconds must be greater than zero"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
+        let oversized_rate_window_seconds =
+            (MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS + 1).to_string();
+        let oversized_rate_window = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--admission-rate-limit-window-seconds",
+            oversized_rate_window_seconds.as_str(),
+        ])?;
+        if let Command::Relay(args) = oversized_rate_window.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!(
+                "--admission-rate-limit-window-seconds must not exceed {MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}"
+            )));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let invalid_bearer = Cli::try_parse_from([
             "iparsd",
             "relay",
             "--relay-node-id",
             "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
             "--admission-bearer-token",
             "not allowed",
         ])?;
@@ -12664,6 +20591,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 },
             ],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("peer-a");
@@ -12712,6 +20640,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 source: CandidateSource::StunProbe,
             }],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("node-a");
@@ -12736,6 +20665,94 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 right_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
             })
         );
+    }
+
+    #[test]
+    fn relay_admission_request_ignores_unusable_session_endpoints() {
+        let local = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let status = agent_status(
+            "local",
+            vec![
+                EndpointCandidate {
+                    addr: SocketAddr::from(([0, 0, 0, 0], 40000)),
+                    ..candidate("local", EndpointCandidateKind::StunReflexive, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([224, 0, 0, 1], 40000)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+                },
+            ],
+        );
+        let mut peer_record = node_record("peer-a");
+        peer_record.endpoint_candidates = vec![
+            EndpointCandidate {
+                addr: SocketAddr::from(([255, 255, 255, 255], 40000)),
+                ..candidate("peer-a", EndpointCandidateKind::StunReflexive, 1)
+            },
+            EndpointCandidate {
+                addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 40000),
+                ..candidate("peer-a", EndpointCandidateKind::Ipv6, 1)
+            },
+            EndpointCandidate {
+                addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+                ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)
+            },
+        ];
+
+        let request = relay_admission_request(&status, &peer_record);
+
+        assert_eq!(
+            request,
+            Some(RelayAdmissionRequest {
+                left: local,
+                right: peer,
+                left_addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                right_addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+            })
+        );
+    }
+
+    #[test]
+    fn relay_admission_request_requires_usable_session_endpoints() {
+        let status = agent_status(
+            "local",
+            vec![
+                EndpointCandidate {
+                    addr: SocketAddr::from(([0, 0, 0, 0], 40000)),
+                    ..candidate("local", EndpointCandidateKind::StunReflexive, 1)
+                },
+                EndpointCandidate {
+                    addr: SocketAddr::from(([203, 0, 113, 10], 0)),
+                    ..candidate("local", EndpointCandidateKind::PublicUdp, 1)
+                },
+            ],
+        );
+        let mut peer_record = node_record("peer-a");
+        peer_record.endpoint_candidates = vec![EndpointCandidate {
+            addr: SocketAddr::from(([198, 51, 100, 20], 50000)),
+            ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)
+        }];
+
+        assert_eq!(relay_admission_request(&status, &peer_record), None);
+
+        let status = agent_status(
+            "local",
+            vec![EndpointCandidate {
+                addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+            }],
+        );
+        peer_record.endpoint_candidates = vec![EndpointCandidate {
+            addr: SocketAddr::from(([224, 0, 0, 1], 40000)),
+            ..candidate("peer-a", EndpointCandidateKind::PublicUdp, 1)
+        }];
+
+        assert_eq!(relay_admission_request(&status, &peer_record), None);
     }
 
     #[test]
@@ -12779,14 +20796,217 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
     }
 
+    #[test]
+    fn selected_relay_candidates_prefer_lower_utilization_over_raw_session_count() {
+        let mut nearly_full_small = node_record("relay-nearly-full-small");
+        nearly_full_small.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 9,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut lightly_loaded_large = node_record("relay-lightly-loaded-large");
+        lightly_loaded_large.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some("http://203.0.113.32:9580".to_string()),
+            max_sessions: 1000,
+            active_sessions: 20,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![nearly_full_small, lightly_loaded_large],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let selected = selected_relay_candidates(&response).into_iter().next();
+
+        assert_eq!(
+            selected.map(|relay| relay.node_id),
+            Some(NodeId::from_string("relay-lightly-loaded-large"))
+        );
+    }
+
+    #[test]
+    fn selected_relay_candidates_remain_available_for_direct_fallback() {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )],
+            relay_candidates: vec![relay],
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let selected = selected_relay_candidates(&response);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].node_id, NodeId::from_string("relay-a"));
+    }
+
+    #[tokio::test]
+    async fn active_relay_candidate_is_promoted_for_path_stability() {
+        let mut low_load = node_record("relay-low-load");
+        low_load.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut current = node_record("relay-current");
+        current.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some("http://203.0.113.32:9580".to_string()),
+            max_sessions: 100,
+            active_sessions: 50,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![current.clone(), low_load.clone()],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let mut selected = selected_relay_candidates(&response);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                NodeId::from_string("relay-low-load"),
+                NodeId::from_string("relay-current")
+            ]
+        );
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-current"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 32], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-current".to_string(),
+                session_token: "token-current".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+
+        let promoted = promote_active_relay_candidate(&runtime, &peer, &mut selected).await;
+
+        assert_eq!(promoted, Some(NodeId::from_string("relay-current")));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|relay| relay.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                NodeId::from_string("relay-current"),
+                NodeId::from_string("relay-low-load")
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_fallback_path_record_marks_direct_nat_setup_failure() -> anyhow::Result<()> {
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some("http://203.0.113.31:9580".to_string()),
+            max_sessions: 10,
+            active_sessions: 2,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let direct = PathRecord {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: true,
+        };
+
+        let fallback = relay_fallback_path_record(&direct, &[relay])
+            .context("relay fallback should be built")?;
+
+        assert_eq!(fallback.key, direct.key);
+        assert_eq!(fallback.selected_state, PathState::Relay);
+        assert_eq!(fallback.selected_candidate, None);
+        assert_eq!(fallback.relay_node, Some(NodeId::from_string("relay-a")));
+        assert!(fallback.pinned);
+        assert!(fallback
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_load=0.20"));
+        assert!(fallback
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn relay_admission_fails_over_to_next_candidate() -> anyhow::Result<()> {
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-good"),
-                session_id: "session-a".to_string(),
+                session_id,
                 session_token: "token-a".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -12859,6 +21079,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 source: CandidateSource::StunProbe,
             }],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -12895,7 +21116,136 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_admission_fails_over_after_invalid_response() -> anyhow::Result<()> {
+        async fn relay_admission_invalid_session_id(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-bad"),
+                session_id: "wrong-session".to_string(),
+                session_token: "token-bad".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-good"),
+                session_id,
+                session_token: "token-good".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let (bad_base, bad_task) = spawn_test_http_service(Router::new().route(
+            "/v1/sessions",
+            axum::routing::post(relay_admission_invalid_session_id),
+        ))
+        .await?;
+        let (good_base, good_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay_bad = node_record("relay-bad");
+        relay_bad.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(bad_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut relay_good = node_record("relay-good");
+        relay_good.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(good_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let local = NodeId::from_string("local");
+        let status = ipars_types::api::AgentStatusResponse {
+            node_id: local.clone(),
+            identity_public_key: "identity-local".to_string(),
+            wireguard_public_key: "wg-local".to_string(),
+            candidate_count: 1,
+            candidates: vec![EndpointCandidate {
+                node_id: local,
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }],
+            nat_classification: None,
+            userspace_wireguard_process: None,
+            state_updated_at: Utc::now(),
+        };
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![EndpointCandidate {
+            node_id: peer.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }];
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        let session = admit_relay_session_from_candidates(
+            &reqwest::Client::new(),
+            &runtime,
+            &status,
+            &peer,
+            &[relay_bad, relay_good],
+            None,
+        )
+        .await?;
+
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        assert_eq!(session.session_id, "local:peer-a");
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+            1,
+        );
+        bad_task.abort();
+        good_task.abort();
         Ok(())
     }
 
@@ -12912,9 +21262,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             {
                 return Err(axum::http::StatusCode::UNAUTHORIZED);
             }
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
             Ok(axum::Json(RelayAdmissionResponse {
                 relay_node: NodeId::from_string("relay-secure"),
-                session_id: "session-secure".to_string(),
+                session_id,
                 session_token: "token-secure".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
                 left: request.left,
@@ -12955,6 +21308,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 source: CandidateSource::StunProbe,
             }],
             nat_classification: None,
+            userspace_wireguard_process: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -12982,8 +21336,605 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         .await?;
 
         assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
-        assert_eq!(accepted.session_id, "session-secure");
+        assert_eq!(accepted.session_id, "local:peer-a");
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_records_relay_selected_after_admission_failover(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-good"),
+                session_id,
+                session_token: "token-good".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let unavailable = unused_http_base_url().await?;
+        let mut relay_bad = node_record("relay-bad");
+        relay_bad.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unavailable),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay_good = node_record("relay-good");
+        relay_good.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 1,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay_good, relay_bad],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-good")));
+        let session = runtime
+            .relay_session(&peer.node_id)
+            .await
+            .context("relay session should be stored")?;
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
+
+        signal_task.abort();
+        control_plane_task.abort();
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_marks_relay_unreachable_when_admission_fails() -> anyhow::Result<()>
+    {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unused_http_base_url().await?),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("unreachable path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Unreachable);
+        assert_eq!(record.relay_node, None);
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_admission_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
+
+        signal_task.abort();
+        control_plane_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_retains_active_relay_session_when_renewal_fails(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.node_id.clone(),
+                relay_node: NodeId::from_string("relay-old"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 30], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-old".to_string(),
+                session_token: "token-old".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+
+        let mut relay = node_record("relay-new");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(unused_http_base_url().await?),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(120),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-old")));
+        let session = runtime
+            .relay_session(&peer.node_id)
+            .await
+            .context("existing relay session should be retained")?;
+        assert_eq!(session.relay_node, NodeId::from_string("relay-old"));
+        assert_eq!(session.session_id, "session-old");
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::Unavailable,
+            1,
+        );
+
+        signal_task.abort();
+        control_plane_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_falls_back_to_relay_when_hole_punch_setup_fails(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-a"),
+                session_id,
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: peer.endpoint_candidates.clone(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("fallback path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Relay);
+        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-a")));
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_some());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
+
+        signal_task.abort();
+        control_plane_task.abort();
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_marks_nat_traversal_unreachable_without_relay_fallback(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate(
+            "peer-a",
+            EndpointCandidateKind::StunReflexive,
+            10,
+        )];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/{node_id}",
+                axum::routing::get(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: peer.endpoint_candidates.clone(),
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectNatTraversal,
+            score: PathScore {
+                value: 105.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        let record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("unreachable path record should be stored")?;
+        assert_eq!(record.selected_state, PathState::Unreachable);
+        assert_eq!(record.selected_candidate, None);
+        assert_eq!(record.relay_node, None);
+        assert!(record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_nat_traversal_failed"));
+        assert!(runtime.relay_session(&peer.node_id).await.is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 0);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
+
+        signal_task.abort();
+        control_plane_task.abort();
         Ok(())
     }
 
@@ -13009,14 +21960,56 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         runtime.upsert_path_state(path.clone()).await;
 
         let identity = runtime.state().identity_key_pair()?;
-        let request = heartbeat_request(&runtime, &identity, None).await?;
+        let advertised_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: node_id.clone(),
+            via: Some(node_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        };
+        let request = heartbeat_request(
+            &runtime,
+            &identity,
+            None,
+            Some(vec![advertised_route.clone()]),
+        )
+        .await?;
 
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.node_signature.is_some());
         assert!(request.candidates.is_empty());
         assert!(request.relay_capability.is_none());
+        assert_eq!(request.routes, Some(vec![advertised_route]));
         assert_eq!(request.path_state, vec![path]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_marks_failed_userspace_wireguard_unhealthy() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Failed,
+                Some(4242),
+                Some("signal: 9 (SIGKILL)".to_string()),
+                Some("failed to stop userspace WireGuard process cleanly".to_string()),
+            )
+            .await;
+        let identity = runtime.state().identity_key_pair()?;
+
+        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+
+        assert_eq!(request.health.state, HealthState::Unhealthy);
+        let message = request.health.message.as_deref().unwrap_or_default();
+        assert!(message.contains("state=failed"));
+        assert!(message.contains("exit_status=signal: 9 (SIGKILL)"));
+        assert!(message.contains("failed to stop userspace WireGuard process cleanly"));
+        assert!(request.node_signature.is_some());
         Ok(())
     }
 
@@ -13028,7 +22021,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         let node = node_record("node-a");
 
-        let request = signal_node_upsert_request(&runtime, node).await;
+        let request = signal_node_upsert_request(&runtime, node, None).await;
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
@@ -13036,6 +22029,80 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             request.health.as_ref().map(|health| health.state),
             Some(HealthState::Healthy)
         );
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_refreshes_policy_enabled_relay_capability() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let mut node = node_record("node-a");
+        node.relay_capability = Some(test_relay_capability(100, 1));
+        let refreshed = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 30], 51_820))),
+            admission_url: Some("http://203.0.113.30:9580".to_string()),
+            max_sessions: 250,
+            active_sessions: 12,
+            max_mbps: 750,
+            e2e_only: true,
+        };
+
+        let request = signal_node_upsert_request(&runtime, node, Some(refreshed)).await;
+        let relay_capability = match request.node.relay_capability {
+            Some(relay_capability) => relay_capability,
+            None => panic!("policy enabled relay should remain advertised"),
+        };
+
+        assert!(relay_capability.enabled_by_policy);
+        assert_eq!(relay_capability.max_sessions, 250);
+        assert_eq!(relay_capability.active_sessions, 12);
+        assert_eq!(relay_capability.max_mbps, 750);
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_clears_relay_capability_without_status_refresh() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let mut node = node_record("node-a");
+        node.relay_capability = Some(test_relay_capability(100, 1));
+
+        let request = signal_node_upsert_request(&runtime, node, None).await;
+
+        assert!(request.node.relay_capability.is_none());
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_reports_userspace_wireguard_exit_health() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Exited,
+                Some(4242),
+                Some("exit status: 1".to_string()),
+                None,
+            )
+            .await;
+        let node = node_record("node-a");
+
+        let request = signal_node_upsert_request(&runtime, node, None).await;
+
+        let health = match request.health {
+            Some(health) => health,
+            None => panic!("signal upsert should include health"),
+        };
+        assert_eq!(health.state, HealthState::Unhealthy);
+        assert!(health
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("state=exited"));
     }
 
     #[tokio::test]
@@ -13146,6 +22213,215 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
     }
 
+    #[tokio::test]
+    async fn stable_signal_path_record_keeps_relay_when_direct_gain_is_small() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        let current = PathRecord {
+            key: PeerPathKey::new(local.clone(), peer.clone()),
+            selected_state: PathState::Relay,
+            selected_candidate: None,
+            relay_node: Some(NodeId::from_string("relay-a")),
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now() - ChronoDuration::seconds(10),
+            pinned: false,
+        };
+        runtime.upsert_path_state(current).await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 31], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+        let candidate_updated_at = Utc::now();
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: candidate_updated_at,
+            pinned: false,
+        };
+
+        let (selected, selection) = stable_signal_path_record(&runtime, candidate_record).await;
+
+        assert_eq!(selection, StableSignalPathSelection::CurrentRelay);
+        assert_eq!(selected.selected_state, PathState::Relay);
+        assert_eq!(selected.relay_node, Some(NodeId::from_string("relay-a")));
+        assert_eq!(selected.updated_at, candidate_updated_at);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_without_active_relay_session() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_when_relay_session_expired() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 31], 51820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
+                session_id: "session-a".to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() - ChronoDuration::seconds(1),
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 74.9,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
+    }
+
+    #[tokio::test]
+    async fn stable_signal_path_record_accepts_direct_when_gain_clears_margin() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore {
+                    value: 70.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now() - ChronoDuration::seconds(10),
+                pinned: false,
+            })
+            .await;
+        let candidate_record = PathRecord {
+            key: PeerPathKey::new(local, peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore {
+                value: 75.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let (selected, selection) =
+            stable_signal_path_record(&runtime, candidate_record.clone()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::Candidate);
+        assert_eq!(selected, candidate_record);
+    }
+
     #[test]
     fn signal_path_record_selects_direct_candidate() {
         let response = SignalPathResponse {
@@ -13171,6 +22447,35 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 .as_ref()
                 .map(|candidate| candidate.kind),
             Some(EndpointCandidateKind::PublicUdp)
+        );
+        assert_eq!(record.relay_node, None);
+    }
+
+    #[test]
+    fn signal_path_record_selects_ipv6_candidate() {
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![
+                candidate("peer-a", EndpointCandidateKind::PublicUdp, 1),
+                ipv6_candidate("peer-a", 50),
+            ],
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectIpv6,
+            score: PathScore {
+                value: 120.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::DirectIpv6);
+        assert_eq!(
+            record
+                .selected_candidate
+                .as_ref()
+                .map(|candidate| candidate.kind),
+            Some(EndpointCandidateKind::Ipv6)
         );
         assert_eq!(record.relay_node, None);
     }
@@ -13289,6 +22594,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn control_plane_base_urls_reject_non_http_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+
+        let error = match control_plane_base_urls(Some(&token), None) {
+            Ok(_) => anyhow::bail!("non-HTTP control-plane bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("control-plane bootstrap endpoint must use http or https"));
+        Ok(())
+    }
+
+    #[test]
     fn agent_control_plane_base_urls_prefer_registration_and_dedupe() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
             BootstrapEndpoint {
@@ -13339,6 +22661,29 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
+    fn control_plane_base_url_override_must_be_http() -> anyhow::Result<()> {
+        let error = match control_plane_base_url(None, Some("udp://127.0.0.1:8443")) {
+            Ok(_) => anyhow::bail!("non-HTTP control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("control-plane URL must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_base_url_override_rejects_unusable_numeric_host() -> anyhow::Result<()> {
+        let error = match control_plane_base_url(None, Some("http://0.0.0.0:8443")) {
+            Ok(_) => anyhow::bail!("unusable control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
+    }
+
+    #[test]
     fn signal_base_url_uses_token_bootstrap() -> anyhow::Result<()> {
         let token = token_with_bootstrap(vec![
             BootstrapEndpoint {
@@ -13380,6 +22725,125 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             signal_base_urls(Some(&token), Some("http://127.0.0.1:9443/"))?,
             vec!["http://127.0.0.1:9443".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_urls_reject_non_http_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:9443".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }]);
+
+        let error = match signal_base_urls(Some(&token), None) {
+            Ok(_) => anyhow::bail!("non-HTTP signal bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("signal bootstrap endpoint must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_override_must_be_http() -> anyhow::Result<()> {
+        let error = match signal_base_url(None, Some("udp://127.0.0.1:9443")) {
+            Ok(_) => anyhow::bail!("non-HTTP signal override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("signal URL must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn signal_base_url_override_rejects_unusable_numeric_host() -> anyhow::Result<()> {
+        let error = match signal_base_url(None, Some("http://0.0.0.0:9443")) {
+            Ok(_) => anyhow::bail!("unusable signal override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("signal URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_merge_explicit_and_token_bootstraps() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--stun-server", "203.0.113.9:3478"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "udp://203.0.113.9:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.10:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.11:3479".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ]);
+
+        assert_eq!(
+            agent_stun_servers(&args, Some(&token)).await?,
+            vec![
+                SocketAddr::from(([203, 0, 113, 9], 3478)),
+                SocketAddr::from(([203, 0, 113, 10], 3478)),
+                SocketAddr::from(([203, 0, 113, 11], 3479)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_reject_invalid_token_bootstraps() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+
+        let error = match agent_stun_servers(&args, Some(&token)).await {
+            Ok(_) => anyhow::bail!("invalid STUN bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("STUN bootstrap must use udp"));
+
+        let unusable_token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://0.0.0.0:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+        let error = match agent_stun_servers(&args, Some(&unusable_token)).await {
+            Ok(_) => anyhow::bail!("unusable STUN bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("resolved to no usable socket addresses"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_reject_unusable_explicit_servers() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--stun-server", "0.0.0.0:3478"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        let error = match agent_stun_servers(&args, None).await {
+            Ok(_) => anyhow::bail!("unusable explicit STUN server should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--stun-server"));
+        assert!(error.to_string().contains("usable nonzero"));
         Ok(())
     }
 

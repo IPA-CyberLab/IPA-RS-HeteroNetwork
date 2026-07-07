@@ -1,0 +1,6 @@
+services:
+  agent:
+    environment:
+      - IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock
+    volumes:
+      - ${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro

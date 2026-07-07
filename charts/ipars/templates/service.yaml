@@ -4,39 +4,154 @@
 {{- $relayServiceTypeValid := or (eq .Values.agent.relayService.type "ClusterIP") (eq .Values.agent.relayService.type "NodePort") (eq .Values.agent.relayService.type "LoadBalancer") -}}
 {{- $agentApiInternalTrafficPolicyValid := or (eq .Values.agent.apiService.internalTrafficPolicy "") (eq .Values.agent.apiService.internalTrafficPolicy "Local") (eq .Values.agent.apiService.internalTrafficPolicy "Cluster") -}}
 {{- $relayInternalTrafficPolicyValid := or (eq .Values.agent.relayService.internalTrafficPolicy "") (eq .Values.agent.relayService.internalTrafficPolicy "Local") (eq .Values.agent.relayService.internalTrafficPolicy "Cluster") -}}
+{{- $agentApiTrafficDistributionValid := or (eq .Values.agent.apiService.trafficDistribution "") (eq .Values.agent.apiService.trafficDistribution "PreferSameZone") (eq .Values.agent.apiService.trafficDistribution "PreferSameNode") (eq .Values.agent.apiService.trafficDistribution "PreferClose") -}}
+{{- $relayTrafficDistributionValid := or (eq .Values.agent.relayService.trafficDistribution "") (eq .Values.agent.relayService.trafficDistribution "PreferSameZone") (eq .Values.agent.relayService.trafficDistribution "PreferSameNode") (eq .Values.agent.relayService.trafficDistribution "PreferClose") -}}
 {{- $agentApiSessionAffinityValid := or (eq .Values.agent.apiService.sessionAffinity "") (eq .Values.agent.apiService.sessionAffinity "None") (eq .Values.agent.apiService.sessionAffinity "ClientIP") -}}
 {{- $relaySessionAffinityValid := or (eq .Values.agent.relayService.sessionAffinity "") (eq .Values.agent.relayService.sessionAffinity "None") (eq .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- $agentApiExternalTrafficPolicyValid := or (eq .Values.agent.apiService.externalTrafficPolicy "Local") (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") -}}
 {{- $relayExternalTrafficPolicyValid := or (eq .Values.agent.relayService.externalTrafficPolicy "Local") (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.exposureAcknowledged" "value" .Values.agent.apiService.exposureAcknowledged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allowUnrestrictedLoadBalancer" "value" .Values.agent.apiService.allowUnrestrictedLoadBalancer) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allowClusterExternalTrafficPolicy" "value" .Values.agent.apiService.allowClusterExternalTrafficPolicy) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.allocateLoadBalancerNodePorts" "value" .Values.agent.apiService.allocateLoadBalancerNodePorts) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.publishNotReadyAddresses" "value" .Values.agent.apiService.publishNotReadyAddresses) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.exposureAcknowledged" "value" .Values.agent.relayService.exposureAcknowledged) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allowUnrestrictedLoadBalancer" "value" .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allowClusterExternalTrafficPolicy" "value" .Values.agent.relayService.allowClusterExternalTrafficPolicy) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.allocateLoadBalancerNodePorts" "value" .Values.agent.relayService.allocateLoadBalancerNodePorts) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.publishNotReadyAddresses" "value" .Values.agent.relayService.publishNotReadyAddresses) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
-{{- $agentApiPort := int .Values.agent.apiService.port -}}
-{{- $agentApiNodePort := int .Values.agent.apiService.nodePort -}}
+{{- $agentApiPortValue := printf "%v" .Values.agent.apiService.port -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.port" "value" $agentApiPortValue "max" 65535) -}}
+{{- $agentApiPort := int $agentApiPortValue -}}
+{{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
+{{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
+{{- $agentApiClusterIP := .Values.agent.apiService.clusterIP -}}
+{{- $agentApiClusterIPs := .Values.agent.apiService.clusterIPs -}}
+{{- $agentApiNodePortValue := printf "%v" .Values.agent.apiService.nodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.nodePort" "value" $agentApiNodePortValue "max" 32767) -}}
+{{- $agentApiNodePort := int $agentApiNodePortValue -}}
 {{- $agentApiLoadBalancerClass := .Values.agent.apiService.loadBalancerClass -}}
-{{- $agentApiHealthCheckNodePort := int .Values.agent.apiService.healthCheckNodePort -}}
+{{- $agentApiLoadBalancerIP := .Values.agent.apiService.loadBalancerIP -}}
+{{- $agentApiExternalIPs := .Values.agent.apiService.externalIPs -}}
+{{- $agentApiLoadBalancerSourceRanges := .Values.agent.apiService.loadBalancerSourceRanges -}}
+{{- $agentApiHealthCheckNodePortValue := printf "%v" .Values.agent.apiService.healthCheckNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.healthCheckNodePort" "value" $agentApiHealthCheckNodePortValue "max" 32767) -}}
+{{- $agentApiHealthCheckNodePort := int $agentApiHealthCheckNodePortValue -}}
 {{- $agentApiAllocateLoadBalancerNodePorts := .Values.agent.apiService.allocateLoadBalancerNodePorts -}}
 {{- $agentApiIpFamilyPolicy := .Values.agent.apiService.ipFamilyPolicy -}}
 {{- $agentApiIpFamilies := .Values.agent.apiService.ipFamilies -}}
 {{- $agentApiIpFamilyPolicyDual := or (eq $agentApiIpFamilyPolicy "PreferDualStack") (eq $agentApiIpFamilyPolicy "RequireDualStack") -}}
-{{- $agentApiSessionAffinityTimeoutSeconds := int .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
-{{- $relayUdpPort := int .Values.agent.relayService.udpPort -}}
-{{- $relayHttpPort := int .Values.agent.relayService.httpPort -}}
-{{- $relayUdpNodePort := int .Values.agent.relayService.udpNodePort -}}
-{{- $relayHttpNodePort := int .Values.agent.relayService.httpNodePort -}}
+{{- $agentApiSessionAffinityTimeoutValue := printf "%v" .Values.agent.apiService.sessionAffinityTimeoutSeconds -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.sessionAffinityTimeoutSeconds" "value" $agentApiSessionAffinityTimeoutValue "max" 86400) -}}
+{{- $agentApiSessionAffinityTimeoutSeconds := int $agentApiSessionAffinityTimeoutValue -}}
+{{- $relayUdpPortValue := printf "%v" .Values.agent.relayService.udpPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpPort" "value" $relayUdpPortValue "max" 65535) -}}
+{{- $relayUdpPort := int $relayUdpPortValue -}}
+{{- $relayUdpTargetPortValue := printf "%v" .Values.agent.relayService.udpTargetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpTargetPort" "value" $relayUdpTargetPortValue "max" 65535) -}}
+{{- $relayUdpTargetPort := int $relayUdpTargetPortValue -}}
+{{- $relayHttpPortValue := printf "%v" .Values.agent.relayService.httpPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpPort" "value" $relayHttpPortValue "max" 65535) -}}
+{{- $relayHttpPort := int $relayHttpPortValue -}}
+{{- $relayHttpTargetPortValue := printf "%v" .Values.agent.relayService.httpTargetPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpTargetPort" "value" $relayHttpTargetPortValue "max" 65535) -}}
+{{- $relayHttpTargetPort := int $relayHttpTargetPortValue -}}
+{{- $relayClusterIP := .Values.agent.relayService.clusterIP -}}
+{{- $relayClusterIPs := .Values.agent.relayService.clusterIPs -}}
+{{- $relayUdpNodePortValue := printf "%v" .Values.agent.relayService.udpNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.udpNodePort" "value" $relayUdpNodePortValue "max" 32767) -}}
+{{- $relayUdpNodePort := int $relayUdpNodePortValue -}}
+{{- $relayHttpNodePortValue := printf "%v" .Values.agent.relayService.httpNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.httpNodePort" "value" $relayHttpNodePortValue "max" 32767) -}}
+{{- $relayHttpNodePort := int $relayHttpNodePortValue -}}
 {{- $relayLoadBalancerClass := .Values.agent.relayService.loadBalancerClass -}}
-{{- $relayHealthCheckNodePort := int .Values.agent.relayService.healthCheckNodePort -}}
+{{- $relayLoadBalancerIP := .Values.agent.relayService.loadBalancerIP -}}
+{{- $relayExternalIPs := .Values.agent.relayService.externalIPs -}}
+{{- $relayLoadBalancerSourceRanges := .Values.agent.relayService.loadBalancerSourceRanges -}}
+{{- $relayHealthCheckNodePortValue := printf "%v" .Values.agent.relayService.healthCheckNodePort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.healthCheckNodePort" "value" $relayHealthCheckNodePortValue "max" 32767) -}}
+{{- $relayHealthCheckNodePort := int $relayHealthCheckNodePortValue -}}
 {{- $relayAllocateLoadBalancerNodePorts := .Values.agent.relayService.allocateLoadBalancerNodePorts -}}
 {{- $relayIpFamilyPolicy := .Values.agent.relayService.ipFamilyPolicy -}}
 {{- $relayIpFamilies := .Values.agent.relayService.ipFamilies -}}
 {{- $relayIpFamilyPolicyDual := or (eq $relayIpFamilyPolicy "PreferDualStack") (eq $relayIpFamilyPolicy "RequireDualStack") -}}
-{{- $relaySessionAffinityTimeoutSeconds := int .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
+{{- $relaySessionAffinityTimeoutValue := printf "%v" .Values.agent.relayService.sessionAffinityTimeoutSeconds -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayService.sessionAffinityTimeoutSeconds" "value" $relaySessionAffinityTimeoutValue "max" 86400) -}}
+{{- $relaySessionAffinityTimeoutSeconds := int $relaySessionAffinityTimeoutValue -}}
+{{- $agentApiClusterIPSet := dict -}}
+{{- $agentApiExternalIPSet := dict -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
 {{- if and $relayServiceActive (not $relayServiceTypeValid) -}}
 {{- fail "agent.relayService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
+{{- if and .Values.agent.relayService.enabled (not .Values.agent.relayAdvertisement.enabled) -}}
+{{- fail "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true so the Service exposes an advertised relay endpoint" -}}
+{{- end -}}
+{{- if not .Values.agent.apiService.enabled -}}
+{{- if or (ne .Values.agent.apiService.type "ClusterIP") (ne $agentApiPort 9780) (ne .Values.agent.apiService.appProtocol "http") (ne $agentApiClusterIP "") $agentApiClusterIPs (ne $agentApiNodePort 0) (ne $agentApiLoadBalancerClass "") (ne $agentApiLoadBalancerIP "") $agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0) (not $agentApiAllocateLoadBalancerNodePorts) (ne $agentApiIpFamilyPolicy "") $agentApiIpFamilies (ne .Values.agent.apiService.internalTrafficPolicy "") (ne .Values.agent.apiService.trafficDistribution "") (ne .Values.agent.apiService.sessionAffinity "") (ne $agentApiSessionAffinityTimeoutSeconds 0) (ne .Values.agent.apiService.externalTrafficPolicy "Local") .Values.agent.apiService.publishNotReadyAddresses .Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged .Values.agent.apiService.allowUnrestrictedLoadBalancer .Values.agent.apiService.allowClusterExternalTrafficPolicy -}}
+{{- fail "agent.apiService exposure-specific values require agent.apiService.enabled=true" -}}
+{{- end -}}
+{{- end -}}
+{{- if not $relayServiceActive -}}
+{{- if or (ne .Values.agent.relayService.type "LoadBalancer") (ne $relayUdpPort 51820) (ne $relayUdpTargetPort 51820) (ne $relayHttpPort 9580) (ne $relayHttpTargetPort 9580) (ne .Values.agent.relayService.udpAppProtocol "ipars.io/relay-udp") (ne .Values.agent.relayService.httpAppProtocol "http") (ne $relayClusterIP "") $relayClusterIPs (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0) (ne $relayLoadBalancerClass "") (ne $relayLoadBalancerIP "") $relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0) (not $relayAllocateLoadBalancerNodePorts) (ne $relayIpFamilyPolicy "") $relayIpFamilies (ne .Values.agent.relayService.internalTrafficPolicy "") (ne .Values.agent.relayService.trafficDistribution "") (ne .Values.agent.relayService.sessionAffinity "") (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.externalTrafficPolicy "Local") .Values.agent.relayService.publishNotReadyAddresses .Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged .Values.agent.relayService.allowUnrestrictedLoadBalancer .Values.agent.relayService.allowClusterExternalTrafficPolicy -}}
+{{- fail "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true" -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled (or (lt $agentApiPort 1) (gt $agentApiPort 65535)) -}}
 {{- fail "agent.apiService.port must be between 1 and 65535" -}}
+{{- end -}}
+{{- if or (lt $agentApiTargetPort 1) (gt $agentApiTargetPort 65535) -}}
+{{- fail "agent.apiService.targetPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiClusterIP "") -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.apiService.clusterIP" "value" $agentApiClusterIP) -}}
+{{- if and $agentApiIpFamilies (ne (index $agentApiIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $agentApiClusterIP))) -}}
+{{- fail "agent.apiService.clusterIP family must match the first agent.apiService.ipFamilies value" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiClusterIPs -}}
+{{- if eq $agentApiClusterIP "" -}}
+{{- fail "agent.apiService.clusterIPs requires agent.apiService.clusterIP" -}}
+{{- end -}}
+{{- if gt (len $agentApiClusterIPs) 2 -}}
+{{- fail "agent.apiService.clusterIPs accepts at most two values" -}}
+{{- end -}}
+{{- range $ip := $agentApiClusterIPs -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.apiService.clusterIPs" "value" $ip) -}}
+{{- end -}}
+{{- if ne (printf "%v" (index $agentApiClusterIPs 0)) $agentApiClusterIP -}}
+{{- fail "agent.apiService.clusterIPs[0] must match agent.apiService.clusterIP" -}}
+{{- end -}}
+{{- if eq (len $agentApiClusterIPs) 2 -}}
+{{- $agentApiSecondaryClusterIP := printf "%v" (index $agentApiClusterIPs 1) -}}
+{{- if eq (ternary "IPv6" "IPv4" (contains ":" $agentApiClusterIP)) (ternary "IPv6" "IPv4" (contains ":" $agentApiSecondaryClusterIP)) -}}
+{{- fail "agent.apiService.clusterIPs must contain one IPv4 and one IPv6 address when two values are set" -}}
+{{- end -}}
+{{- if not $agentApiIpFamilyPolicyDual -}}
+{{- fail "agent.apiService.clusterIPs with two values require ipFamilyPolicy PreferDualStack or RequireDualStack" -}}
+{{- end -}}
+{{- if ne (len $agentApiIpFamilies) 2 -}}
+{{- fail "agent.apiService.clusterIPs with two values require two ipFamilies values" -}}
+{{- end -}}
+{{- if ne (index $agentApiIpFamilies 1) (ternary "IPv6" "IPv4" (contains ":" $agentApiSecondaryClusterIP)) -}}
+{{- fail "agent.apiService.clusterIPs[1] family must match agent.apiService.ipFamilies[1]" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiClusterIP "") -}}
+{{- $_ := set $agentApiClusterIPSet $agentApiClusterIP true -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiClusterIPs -}}
+{{- range $ip := $agentApiClusterIPs -}}
+{{- $_ := set $agentApiClusterIPSet (printf "%v" $ip) true -}}
+{{- end -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) (not $agentApiExternal) -}}
 {{- fail "agent.apiService.nodePort requires agent.apiService.type NodePort or LoadBalancer" -}}
@@ -49,6 +164,45 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerClass "") -}}
 {{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.loadBalancerClass" "value" $agentApiLoadBalancerClass) -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerIP "") (ne .Values.agent.apiService.type "LoadBalancer") -}}
+{{- fail "agent.apiService.loadBalancerIP requires agent.apiService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerIP "") -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.loadBalancerIP" "value" $agentApiLoadBalancerIP) -}}
+{{- end -}}
+{{- if .Values.agent.apiService.enabled -}}
+{{- range $ip := $agentApiExternalIPs -}}
+{{- $ipValue := printf "%v" $ip -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $agentApiExternalIPSet $ipValue -}}
+{{- fail (printf "agent.apiService.externalIPs entry %q must not be repeated" $ipValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiExternalIPSet $ipValue true -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.agent.apiService.enabled -}}
+{{- $agentApiLoadBalancerSourceRangeSet := dict -}}
+{{- range $range := $agentApiLoadBalancerSourceRanges -}}
+{{- $rangeValue := printf "%v" $range -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "agent.apiService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- if hasKey $agentApiLoadBalancerSourceRangeSet $rangeValue -}}
+{{- fail (printf "agent.apiService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
+{{- end -}}
+{{- $_ := set $agentApiLoadBalancerSourceRangeSet $rangeValue true -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiLoadBalancerSourceRanges (ne .Values.agent.apiService.type "LoadBalancer") -}}
+{{- fail "agent.apiService.loadBalancerSourceRanges requires agent.apiService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiLoadBalancerSourceRanges .Values.agent.apiService.allowUnrestrictedLoadBalancer -}}
+{{- fail "agent.apiService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.apiService.loadBalancerSourceRanges" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled .Values.agent.apiService.allowUnrestrictedLoadBalancer (ne .Values.agent.apiService.type "LoadBalancer") -}}
+{{- fail "agent.apiService.allowUnrestrictedLoadBalancer=true requires agent.apiService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne .Values.agent.apiService.appProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.apiService.appProtocol" "value" .Values.agent.apiService.appProtocol) -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiHealthCheckNodePort 0) (ne .Values.agent.apiService.type "LoadBalancer") -}}
 {{- fail "agent.apiService.healthCheckNodePort requires agent.apiService.type LoadBalancer" -}}
@@ -96,8 +250,56 @@
 {{- if and $relayServiceActive (or (lt $relayUdpPort 1) (gt $relayUdpPort 65535)) -}}
 {{- fail "agent.relayService.udpPort must be between 1 and 65535" -}}
 {{- end -}}
+{{- if and $relayServiceActive (or (lt $relayUdpTargetPort 1) (gt $relayUdpTargetPort 65535)) -}}
+{{- fail "agent.relayService.udpTargetPort must be between 1 and 65535" -}}
+{{- end -}}
 {{- if and $relayServiceActive (or (lt $relayHttpPort 1) (gt $relayHttpPort 65535)) -}}
 {{- fail "agent.relayService.httpPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (or (lt $relayHttpTargetPort 1) (gt $relayHttpTargetPort 65535)) -}}
+{{- fail "agent.relayService.httpTargetPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayClusterIP "") -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}
+{{- if hasKey $agentApiClusterIPSet $relayClusterIP -}}
+{{- fail (printf "agent.relayService.clusterIP %q must not reuse agent.apiService clusterIPs" $relayClusterIP) -}}
+{{- end -}}
+{{- if and $relayIpFamilies (ne (index $relayIpFamilies 0) (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP))) -}}
+{{- fail "agent.relayService.clusterIP family must match the first agent.relayService.ipFamilies value" -}}
+{{- end -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayClusterIPs -}}
+{{- if eq $relayClusterIP "" -}}
+{{- fail "agent.relayService.clusterIPs requires agent.relayService.clusterIP" -}}
+{{- end -}}
+{{- if gt (len $relayClusterIPs) 2 -}}
+{{- fail "agent.relayService.clusterIPs accepts at most two values" -}}
+{{- end -}}
+{{- range $ip := $relayClusterIPs -}}
+{{- $ipValue := printf "%v" $ip -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIPs" "value" $ip) -}}
+{{- if hasKey $agentApiClusterIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs" $ipValue) -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (printf "%v" (index $relayClusterIPs 0)) $relayClusterIP -}}
+{{- fail "agent.relayService.clusterIPs[0] must match agent.relayService.clusterIP" -}}
+{{- end -}}
+{{- if eq (len $relayClusterIPs) 2 -}}
+{{- $relaySecondaryClusterIP := printf "%v" (index $relayClusterIPs 1) -}}
+{{- if eq (ternary "IPv6" "IPv4" (contains ":" $relayClusterIP)) (ternary "IPv6" "IPv4" (contains ":" $relaySecondaryClusterIP)) -}}
+{{- fail "agent.relayService.clusterIPs must contain one IPv4 and one IPv6 address when two values are set" -}}
+{{- end -}}
+{{- if not $relayIpFamilyPolicyDual -}}
+{{- fail "agent.relayService.clusterIPs with two values require ipFamilyPolicy PreferDualStack or RequireDualStack" -}}
+{{- end -}}
+{{- if ne (len $relayIpFamilies) 2 -}}
+{{- fail "agent.relayService.clusterIPs with two values require two ipFamilies values" -}}
+{{- end -}}
+{{- if ne (index $relayIpFamilies 1) (ternary "IPv6" "IPv4" (contains ":" $relaySecondaryClusterIP)) -}}
+{{- fail "agent.relayService.clusterIPs[1] family must match agent.relayService.ipFamilies[1]" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive (or (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0)) (not $relayExternal) -}}
 {{- fail "agent.relayService udpNodePort/httpNodePort require agent.relayService.type NodePort or LoadBalancer" -}}
@@ -117,6 +319,52 @@
 {{- if and $relayServiceActive (ne $relayLoadBalancerClass "") -}}
 {{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.loadBalancerClass" "value" $relayLoadBalancerClass) -}}
 {{- end -}}
+{{- if and $relayServiceActive (ne $relayLoadBalancerIP "") (ne .Values.agent.relayService.type "LoadBalancer") -}}
+{{- fail "agent.relayService.loadBalancerIP requires agent.relayService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayLoadBalancerIP "") -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.loadBalancerIP" "value" $relayLoadBalancerIP) -}}
+{{- end -}}
+{{- if $relayServiceActive -}}
+{{- $relayExternalIPSet := dict -}}
+{{- range $ip := $relayExternalIPs -}}
+{{- $ipValue := printf "%v" $ip -}}
+{{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $relayExternalIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q must not be repeated" $ipValue) -}}
+{{- end -}}
+{{- if hasKey $agentApiExternalIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q must not reuse agent.apiService.externalIPs" $ipValue) -}}
+{{- end -}}
+{{- $_ := set $relayExternalIPSet $ipValue true -}}
+{{- end -}}
+{{- end -}}
+{{- if $relayServiceActive -}}
+{{- $relayLoadBalancerSourceRangeSet := dict -}}
+{{- range $range := $relayLoadBalancerSourceRanges -}}
+{{- $rangeValue := printf "%v" $range -}}
+{{- include "ipars.validateRestrictedCidr" (dict "path" "agent.relayService.loadBalancerSourceRanges" "value" $rangeValue) -}}
+{{- if hasKey $relayLoadBalancerSourceRangeSet $rangeValue -}}
+{{- fail (printf "agent.relayService.loadBalancerSourceRanges entry %q must not be repeated" $rangeValue) -}}
+{{- end -}}
+{{- $_ := set $relayLoadBalancerSourceRangeSet $rangeValue true -}}
+{{- end -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayLoadBalancerSourceRanges (ne .Values.agent.relayService.type "LoadBalancer") -}}
+{{- fail "agent.relayService.loadBalancerSourceRanges requires agent.relayService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayLoadBalancerSourceRanges .Values.agent.relayService.allowUnrestrictedLoadBalancer -}}
+{{- fail "agent.relayService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.relayService.loadBalancerSourceRanges" -}}
+{{- end -}}
+{{- if and $relayServiceActive .Values.agent.relayService.allowUnrestrictedLoadBalancer (ne .Values.agent.relayService.type "LoadBalancer") -}}
+{{- fail "agent.relayService.allowUnrestrictedLoadBalancer=true requires agent.relayService.type LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne .Values.agent.relayService.udpAppProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.udpAppProtocol" "value" .Values.agent.relayService.udpAppProtocol) -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne .Values.agent.relayService.httpAppProtocol "") -}}
+{{- include "ipars.validateOptionalQualifiedNameWithPrefix" (dict "path" "agent.relayService.httpAppProtocol" "value" .Values.agent.relayService.httpAppProtocol) -}}
+{{- end -}}
 {{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) (ne .Values.agent.relayService.type "LoadBalancer") -}}
 {{- fail "agent.relayService.healthCheckNodePort requires agent.relayService.type LoadBalancer" -}}
 {{- end -}}
@@ -128,6 +376,38 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) (or (eq $relayHealthCheckNodePort $relayUdpNodePort) (eq $relayHealthCheckNodePort $relayHttpNodePort)) -}}
 {{- fail "agent.relayService.healthCheckNodePort must differ from relay NodePorts" -}}
+{{- end -}}
+{{- $explicitNodePorts := dict -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiNodePort 0) -}}
+{{- $_ := set $explicitNodePorts (printf "%d" $agentApiNodePort) "agent.apiService.nodePort" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (ne $agentApiHealthCheckNodePort 0) -}}
+{{- $portKey := printf "%d" $agentApiHealthCheckNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.apiService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $agentApiHealthCheckNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.apiService.healthCheckNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayUdpNodePort 0) -}}
+{{- $portKey := printf "%d" $relayUdpNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.udpNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayUdpNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.udpNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayHttpNodePort 0) -}}
+{{- $portKey := printf "%d" $relayHttpNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.httpNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayHttpNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.httpNodePort" -}}
+{{- end -}}
+{{- if and $relayServiceActive (ne $relayHealthCheckNodePort 0) -}}
+{{- $portKey := printf "%d" $relayHealthCheckNodePort -}}
+{{- if hasKey $explicitNodePorts $portKey -}}
+{{- fail (printf "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s" $relayHealthCheckNodePort (get $explicitNodePorts $portKey)) -}}
+{{- end -}}
+{{- $_ := set $explicitNodePorts $portKey "agent.relayService.healthCheckNodePort" -}}
 {{- end -}}
 {{- if and $relayServiceActive (not $relayAllocateLoadBalancerNodePorts) (ne .Values.agent.relayService.type "LoadBalancer") -}}
 {{- fail "agent.relayService.allocateLoadBalancerNodePorts=false requires agent.relayService.type LoadBalancer" -}}
@@ -166,6 +446,12 @@
 {{- if and $relayServiceActive (not $relayInternalTrafficPolicyValid) -}}
 {{- fail "agent.relayService.internalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiTrafficDistributionValid) -}}
+{{- fail "agent.apiService.trafficDistribution must be PreferSameZone, PreferSameNode, or PreferClose" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayTrafficDistributionValid) -}}
+{{- fail "agent.relayService.trafficDistribution must be PreferSameZone, PreferSameNode, or PreferClose" -}}
+{{- end -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiSessionAffinityValid) -}}
 {{- fail "agent.apiService.sessionAffinity must be None or ClientIP" -}}
 {{- end -}}
@@ -184,14 +470,26 @@
 {{- if and $relayServiceActive (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.sessionAffinity "ClientIP") -}}
 {{- fail "agent.relayService.sessionAffinityTimeoutSeconds requires agent.relayService.sessionAffinity ClientIP" -}}
 {{- end -}}
-{{- if and .Values.agent.apiService.enabled $agentApiExternal (not $agentApiExternalTrafficPolicyValid) -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiExternalTrafficPolicyValid) -}}
 {{- fail "agent.apiService.externalTrafficPolicy must be Local or Cluster" -}}
 {{- end -}}
-{{- if and $relayServiceActive $relayExternal (not $relayExternalTrafficPolicyValid) -}}
+{{- if and $relayServiceActive (not $relayExternalTrafficPolicyValid) -}}
 {{- fail "agent.relayService.externalTrafficPolicy must be Local or Cluster" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled (not $agentApiExternal) (ne .Values.agent.apiService.externalTrafficPolicy "Local") -}}
+{{- fail "agent.apiService.externalTrafficPolicy requires agent.apiService.type NodePort or LoadBalancer" -}}
+{{- end -}}
+{{- if and $relayServiceActive (not $relayExternal) (ne .Values.agent.relayService.externalTrafficPolicy "Local") -}}
+{{- fail "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (not .Values.agent.apiService.exposureAcknowledged) -}}
 {{- fail "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled $agentApiExternalIPs (not .Values.agent.apiService.exposureAcknowledged) -}}
+{{- fail "agent.apiService.externalIPs require agent.apiService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and .Values.agent.apiService.enabled .Values.agent.apiService.exposureAcknowledged (not $agentApiExternal) (not $agentApiExternalIPs) -}}
+{{- fail "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs" -}}
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (eq .Values.agent.apiService.type "LoadBalancer") (not .Values.agent.apiService.loadBalancerSourceRanges) (not .Values.agent.apiService.allowUnrestrictedLoadBalancer) -}}
 {{- fail "agent.apiService LoadBalancer exposure requires agent.apiService.loadBalancerSourceRanges or agent.apiService.allowUnrestrictedLoadBalancer=true" -}}
@@ -199,13 +497,23 @@
 {{- if and .Values.agent.apiService.enabled $agentApiExternal (eq .Values.agent.apiService.externalTrafficPolicy "Cluster") (not .Values.agent.apiService.allowClusterExternalTrafficPolicy) -}}
 {{- fail "agent.apiService externalTrafficPolicy=Cluster requires agent.apiService.allowClusterExternalTrafficPolicy=true" -}}
 {{- end -}}
+{{- if and .Values.agent.apiService.enabled .Values.agent.apiService.allowClusterExternalTrafficPolicy (or (not $agentApiExternal) (ne .Values.agent.apiService.externalTrafficPolicy "Cluster")) -}}
+{{- fail "agent.apiService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster" -}}
+{{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
-{{- range $key, $_ := .Values.agent.apiService.annotations -}}
+{{- range $key, $value := .Values.agent.apiService.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.apiService.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.apiService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}
 {{- if and $relayServiceActive $relayExternal (not .Values.agent.relayService.exposureAcknowledged) -}}
 {{- fail "agent.relayService external exposure requires agent.relayService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and $relayServiceActive $relayExternalIPs (not .Values.agent.relayService.exposureAcknowledged) -}}
+{{- fail "agent.relayService.externalIPs require agent.relayService.exposureAcknowledged=true" -}}
+{{- end -}}
+{{- if and $relayServiceActive .Values.agent.relayService.exposureAcknowledged (not $relayExternal) (not $relayExternalIPs) -}}
+{{- fail "agent.relayService.exposureAcknowledged=true requires external Service type or externalIPs" -}}
 {{- end -}}
 {{- if and $relayServiceActive (eq .Values.agent.relayService.type "LoadBalancer") (not .Values.agent.relayService.loadBalancerSourceRanges) (not .Values.agent.relayService.allowUnrestrictedLoadBalancer) -}}
 {{- fail "agent.relayService LoadBalancer exposure requires agent.relayService.loadBalancerSourceRanges or agent.relayService.allowUnrestrictedLoadBalancer=true" -}}
@@ -213,9 +521,13 @@
 {{- if and $relayServiceActive $relayExternal (eq .Values.agent.relayService.externalTrafficPolicy "Cluster") (not .Values.agent.relayService.allowClusterExternalTrafficPolicy) -}}
 {{- fail "agent.relayService externalTrafficPolicy=Cluster requires agent.relayService.allowClusterExternalTrafficPolicy=true" -}}
 {{- end -}}
+{{- if and $relayServiceActive .Values.agent.relayService.allowClusterExternalTrafficPolicy (or (not $relayExternal) (ne .Values.agent.relayService.externalTrafficPolicy "Cluster")) -}}
+{{- fail "agent.relayService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster" -}}
+{{- end -}}
 {{- if $relayServiceActive -}}
-{{- range $key, $_ := .Values.agent.relayService.annotations -}}
+{{- range $key, $value := .Values.agent.relayService.annotations -}}
 {{- include "ipars.validateAnnotationKey" (dict "path" "agent.relayService.annotations" "key" $key) -}}
+{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.relayService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled }}
@@ -224,7 +536,8 @@ kind: Service
 metadata:
   name: {{ include "ipars.fullname" . }}-agent
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: agent
   {{- with .Values.agent.apiService.annotations }}
   annotations:
@@ -232,12 +545,26 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.apiService.type }}
+  {{- if .Values.agent.apiService.clusterIP }}
+  clusterIP: {{ .Values.agent.apiService.clusterIP | quote }}
+  {{- end }}
+  {{- if .Values.agent.apiService.clusterIPs }}
+  clusterIPs:
+{{- toYaml .Values.agent.apiService.clusterIPs | nindent 4 }}
+  {{- end }}
   {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.apiService.loadBalancerSourceRanges | nindent 4 }}
   {{- end }}
   {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerClass }}
   loadBalancerClass: {{ .Values.agent.apiService.loadBalancerClass | quote }}
+  {{- end }}
+  {{- if and (eq .Values.agent.apiService.type "LoadBalancer") .Values.agent.apiService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.agent.apiService.loadBalancerIP | quote }}
+  {{- end }}
+  {{- if .Values.agent.apiService.externalIPs }}
+  externalIPs:
+{{- toYaml .Values.agent.apiService.externalIPs | nindent 4 }}
   {{- end }}
   {{- if ne $agentApiHealthCheckNodePort 0 }}
   healthCheckNodePort: {{ $agentApiHealthCheckNodePort }}
@@ -258,6 +585,12 @@ spec:
   {{- if .Values.agent.apiService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.apiService.internalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.apiService.trafficDistribution }}
+  trafficDistribution: {{ .Values.agent.apiService.trafficDistribution }}
+  {{- end }}
+  {{- if .Values.agent.apiService.publishNotReadyAddresses }}
+  publishNotReadyAddresses: true
+  {{- end }}
   {{- if .Values.agent.apiService.sessionAffinity }}
   sessionAffinity: {{ .Values.agent.apiService.sessionAffinity }}
   {{- end }}
@@ -267,12 +600,16 @@ spec:
       timeoutSeconds: {{ $agentApiSessionAffinityTimeoutSeconds }}
   {{- end }}
   selector:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
   ports:
     - name: http
       protocol: TCP
+      {{- if .Values.agent.apiService.appProtocol }}
+      appProtocol: {{ .Values.agent.apiService.appProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.apiService.port }}
-      targetPort: 9780
+      targetPort: {{ .Values.agent.apiService.targetPort }}
       {{- if and $agentApiExternal (ne $agentApiNodePort 0) }}
       nodePort: {{ $agentApiNodePort }}
       {{- end }}
@@ -284,7 +621,8 @@ kind: Service
 metadata:
   name: {{ include "ipars.fullname" . }}-relay
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: relay
   {{- with .Values.agent.relayService.annotations }}
   annotations:
@@ -292,12 +630,26 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.agent.relayService.type }}
+  {{- if .Values.agent.relayService.clusterIP }}
+  clusterIP: {{ .Values.agent.relayService.clusterIP | quote }}
+  {{- end }}
+  {{- if .Values.agent.relayService.clusterIPs }}
+  clusterIPs:
+{{- toYaml .Values.agent.relayService.clusterIPs | nindent 4 }}
+  {{- end }}
   {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
 {{- toYaml .Values.agent.relayService.loadBalancerSourceRanges | nindent 4 }}
   {{- end }}
   {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerClass }}
   loadBalancerClass: {{ .Values.agent.relayService.loadBalancerClass | quote }}
+  {{- end }}
+  {{- if and (eq .Values.agent.relayService.type "LoadBalancer") .Values.agent.relayService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.agent.relayService.loadBalancerIP | quote }}
+  {{- end }}
+  {{- if .Values.agent.relayService.externalIPs }}
+  externalIPs:
+{{- toYaml .Values.agent.relayService.externalIPs | nindent 4 }}
   {{- end }}
   {{- if ne $relayHealthCheckNodePort 0 }}
   healthCheckNodePort: {{ $relayHealthCheckNodePort }}
@@ -318,6 +670,12 @@ spec:
   {{- if .Values.agent.relayService.internalTrafficPolicy }}
   internalTrafficPolicy: {{ .Values.agent.relayService.internalTrafficPolicy }}
   {{- end }}
+  {{- if .Values.agent.relayService.trafficDistribution }}
+  trafficDistribution: {{ .Values.agent.relayService.trafficDistribution }}
+  {{- end }}
+  {{- if .Values.agent.relayService.publishNotReadyAddresses }}
+  publishNotReadyAddresses: true
+  {{- end }}
   {{- if .Values.agent.relayService.sessionAffinity }}
   sessionAffinity: {{ .Values.agent.relayService.sessionAffinity }}
   {{- end }}
@@ -327,19 +685,26 @@ spec:
       timeoutSeconds: {{ $relaySessionAffinityTimeoutSeconds }}
   {{- end }}
   selector:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
   ports:
     - name: relay-udp
       protocol: UDP
+      {{- if .Values.agent.relayService.udpAppProtocol }}
+      appProtocol: {{ .Values.agent.relayService.udpAppProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.relayService.udpPort }}
-      targetPort: {{ .Values.agent.relayService.udpPort }}
+      targetPort: {{ .Values.agent.relayService.udpTargetPort }}
       {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
       nodePort: {{ $relayUdpNodePort }}
       {{- end }}
     - name: relay-http
       protocol: TCP
+      {{- if .Values.agent.relayService.httpAppProtocol }}
+      appProtocol: {{ .Values.agent.relayService.httpAppProtocol | quote }}
+      {{- end }}
       port: {{ .Values.agent.relayService.httpPort }}
-      targetPort: {{ .Values.agent.relayService.httpPort }}
+      targetPort: {{ .Values.agent.relayService.httpTargetPort }}
       {{- if and $relayExternal (ne $relayHttpNodePort 0) }}
       nodePort: {{ $relayHttpNodePort }}
       {{- end }}

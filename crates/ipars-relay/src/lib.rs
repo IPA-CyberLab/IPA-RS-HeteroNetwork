@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use ipars_types::api::{
-    RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
-    RelayStatusResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
 };
-use ipars_types::{HealthState, NodeId, RelayCapability};
+use ipars_types::{endpoint_addr_is_usable, HealthState, NodeId, RelayCapability};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, RwLock};
@@ -18,6 +20,8 @@ const DEFAULT_SESSION_TTL_SECONDS: i64 = 300;
 pub enum RelayError {
     #[error("relay admission denied")]
     AdmissionDenied,
+    #[error("relay node session limit exceeded")]
+    NodeSessionLimitExceeded,
     #[error("unknown relay session")]
     UnknownSession,
     #[error("relay session expired")]
@@ -78,6 +82,12 @@ pub struct RelaySessionAdmission {
     pub right_addr: SocketAddr,
     pub session_token: String,
     pub session_ttl: chrono::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayAdmissionRateLimit {
+    pub max_attempts: u32,
+    pub window: chrono::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,13 +244,17 @@ impl RelayTable {
         capability: &RelayCapability,
         admission: RelaySessionAdmission,
     ) -> Result<RelaySessionCredentials, RelayError> {
+        let now = Utc::now();
+        self.purge_expired(now);
         if !capability.can_admit() {
             return Err(RelayError::AdmissionDenied);
         }
 
         let id = RelaySessionId::new(&admission.left, &admission.right);
-        validate_relay_session_admission(&id, &admission.session_token)?;
-        let now = Utc::now();
+        validate_relay_session_admission(&admission, &id)?;
+        if self.has_session_pair(&admission.left, &admission.right) {
+            return Err(RelayError::AdmissionDenied);
+        }
         let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
         if let Some(existing) = self.sessions.get_mut(&id) {
             if !existing.is_expired(now) {
@@ -417,12 +431,26 @@ impl RelayTable {
         self.sessions.len()
     }
 
+    pub fn active_session_count_for_node(&self, node: &NodeId) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.left == *node || session.right == *node)
+            .count()
+    }
+
     pub fn bytes_forwarded(&self) -> u64 {
         self.dataplane.payload_bytes_forwarded
     }
 
     pub fn dataplane_metrics(&self) -> RelayDataplaneMetrics {
         self.dataplane.clone()
+    }
+
+    fn has_session_pair(&self, left: &NodeId, right: &NodeId) -> bool {
+        self.sessions.values().any(|session| {
+            (session.left == *left && session.right == *right)
+                || (session.left == *right && session.right == *left)
+        })
     }
 
     fn remove_expired_session(
@@ -486,6 +514,7 @@ fn default_session_ttl() -> chrono::Duration {
 fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
     match error {
         RelayError::AdmissionDenied => RelayDataplaneDropReason::AdmissionDenied,
+        RelayError::NodeSessionLimitExceeded => RelayDataplaneDropReason::AdmissionDenied,
         RelayError::UnknownSession => RelayDataplaneDropReason::UnknownSession,
         RelayError::SessionExpired => RelayDataplaneDropReason::SessionExpired,
         RelayError::InvalidSessionCredential => RelayDataplaneDropReason::InvalidSessionCredential,
@@ -496,14 +525,60 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
     }
 }
 
+fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFailureReason {
+    match error {
+        RelayError::AdmissionDenied => RelayAdmissionFailureReason::AdmissionDenied,
+        RelayError::NodeSessionLimitExceeded => {
+            RelayAdmissionFailureReason::NodeSessionLimitExceeded
+        }
+        RelayError::RateLimited => RelayAdmissionFailureReason::RateLimited,
+        RelayError::InvalidSessionCredential => {
+            RelayAdmissionFailureReason::InvalidSessionCredential
+        }
+        RelayError::Socket(_) => RelayAdmissionFailureReason::SocketError,
+        RelayError::UnknownSession
+        | RelayError::SessionExpired
+        | RelayError::MalformedFrame
+        | RelayError::FrameTooLarge => RelayAdmissionFailureReason::InternalError,
+    }
+}
+
+fn zero_filled_admission_failure_reasons(
+    observed: BTreeMap<RelayAdmissionFailureReason, u64>,
+) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+    RelayAdmissionFailureReason::ALL
+        .into_iter()
+        .map(|reason| (reason, observed.get(&reason).copied().unwrap_or_default()))
+        .collect()
+}
+
+fn zero_filled_dataplane_metrics(mut metrics: RelayDataplaneMetrics) -> RelayDataplaneMetrics {
+    let observed = metrics.drops_by_reason;
+    metrics.drops_by_reason = RelayDataplaneDropReason::ALL
+        .into_iter()
+        .map(|reason| (reason, observed.get(&reason).copied().unwrap_or_default()))
+        .collect();
+    metrics
+}
+
 fn validate_relay_session_admission(
+    admission: &RelaySessionAdmission,
     session_id: &RelaySessionId,
-    session_token: &str,
 ) -> Result<(), RelayError> {
+    if admission.left == admission.right || admission.left_addr == admission.right_addr {
+        return Err(RelayError::AdmissionDenied);
+    }
+    if !endpoint_addr_is_usable(admission.left_addr)
+        || !endpoint_addr_is_usable(admission.right_addr)
+    {
+        return Err(RelayError::AdmissionDenied);
+    }
     if session_id.as_str().len() > MAX_RELAY_SESSION_ID_BYTES {
         return Err(RelayError::AdmissionDenied);
     }
-    if session_token.is_empty() || session_token.len() > MAX_RELAY_SESSION_TOKEN_BYTES {
+    if admission.session_token.is_empty()
+        || admission.session_token.len() > MAX_RELAY_SESSION_TOKEN_BYTES
+    {
         return Err(RelayError::InvalidSessionCredential);
     }
     Ok(())
@@ -514,6 +589,9 @@ fn validate_relay_frame_sizes(
     session_token_len: usize,
     ciphertext_payload_len: usize,
 ) -> Result<(), RelayError> {
+    if session_id_len == 0 || session_token_len == 0 || ciphertext_payload_len == 0 {
+        return Err(RelayError::MalformedFrame);
+    }
     if session_id_len > MAX_RELAY_SESSION_ID_BYTES
         || session_token_len > MAX_RELAY_SESSION_TOKEN_BYTES
         || ciphertext_payload_len > MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES
@@ -674,6 +752,19 @@ pub struct RelayService {
     capability: RwLock<RelayCapability>,
     table: std::sync::Arc<RwLock<RelayTable>>,
     session_ttl: chrono::Duration,
+    admission_rate_limit: Option<RelayAdmissionRateLimit>,
+    max_sessions_per_node: Option<u32>,
+    admission_rate_window: Mutex<RelayAdmissionRateWindow>,
+    admission_attempts: AtomicU64,
+    admission_successes: AtomicU64,
+    admission_failures: AtomicU64,
+    admission_failures_by_reason: Mutex<BTreeMap<RelayAdmissionFailureReason, u64>>,
+}
+
+#[derive(Debug)]
+struct RelayAdmissionRateWindow {
+    started_at: DateTime<Utc>,
+    attempts: u32,
 }
 
 impl RelayService {
@@ -686,11 +777,46 @@ impl RelayService {
         capability: RelayCapability,
         session_ttl: chrono::Duration,
     ) -> Self {
+        Self::with_session_ttl_and_admission_rate_limit(relay_node, capability, session_ttl, None)
+    }
+
+    pub fn with_session_ttl_and_admission_rate_limit(
+        relay_node: NodeId,
+        capability: RelayCapability,
+        session_ttl: chrono::Duration,
+        admission_rate_limit: Option<RelayAdmissionRateLimit>,
+    ) -> Self {
+        Self::with_session_ttl_admission_controls(
+            relay_node,
+            capability,
+            session_ttl,
+            admission_rate_limit,
+            None,
+        )
+    }
+
+    pub fn with_session_ttl_admission_controls(
+        relay_node: NodeId,
+        capability: RelayCapability,
+        session_ttl: chrono::Duration,
+        admission_rate_limit: Option<RelayAdmissionRateLimit>,
+        max_sessions_per_node: Option<u32>,
+    ) -> Self {
         Self {
             relay_node,
             capability: RwLock::new(capability),
             table: std::sync::Arc::new(RwLock::new(RelayTable::default())),
             session_ttl: session_ttl.max(chrono::Duration::milliseconds(1)),
+            admission_rate_limit,
+            max_sessions_per_node: max_sessions_per_node.filter(|limit| *limit > 0),
+            admission_rate_window: Mutex::new(RelayAdmissionRateWindow {
+                started_at: Utc::now(),
+                attempts: 0,
+            }),
+            admission_attempts: AtomicU64::new(0),
+            admission_successes: AtomicU64::new(0),
+            admission_failures: AtomicU64::new(0),
+            admission_failures_by_reason: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -702,21 +828,103 @@ impl RelayService {
         &self,
         request: RelayAdmissionRequest,
     ) -> Result<RelayAdmissionResponse, RelayError> {
+        self.admission_attempts.fetch_add(1, Ordering::Relaxed);
+        let result = match self.record_admission_attempt_for_limit(Utc::now()) {
+            Ok(()) => self.admit_inner(request).await,
+            Err(error) => Err(error),
+        };
+        match &result {
+            Ok(_) => {
+                self.admission_successes.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.record_admission_failure(relay_error_admission_failure_reason(error));
+            }
+        }
+        result
+    }
+
+    pub fn record_unauthorized_admission_attempt(&self) -> Result<(), RelayError> {
+        self.admission_attempts.fetch_add(1, Ordering::Relaxed);
+        match self.record_admission_attempt_for_limit(Utc::now()) {
+            Ok(()) => {
+                self.record_admission_failure(RelayAdmissionFailureReason::Unauthorized);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_admission_failure(relay_error_admission_failure_reason(&error));
+                Err(error)
+            }
+        }
+    }
+
+    fn record_admission_attempt_for_limit(&self, now: DateTime<Utc>) -> Result<(), RelayError> {
+        let Some(limit) = self.admission_rate_limit else {
+            return Ok(());
+        };
+        if limit.max_attempts == 0 || limit.window <= chrono::Duration::zero() {
+            return Ok(());
+        }
+
+        let mut window = self
+            .admission_rate_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if now.signed_duration_since(window.started_at) >= limit.window {
+            window.started_at = now;
+            window.attempts = 0;
+        }
+        if window.attempts >= limit.max_attempts {
+            return Err(RelayError::RateLimited);
+        }
+        window.attempts = window.attempts.saturating_add(1);
+        Ok(())
+    }
+
+    fn record_admission_failure(&self, reason: RelayAdmissionFailureReason) {
+        self.admission_failures.fetch_add(1, Ordering::Relaxed);
+        let mut failures_by_reason = self
+            .admission_failures_by_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = failures_by_reason.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn admission_failures_by_reason(&self) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+        self.admission_failures_by_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn admit_inner(
+        &self,
+        request: RelayAdmissionRequest,
+    ) -> Result<RelayAdmissionResponse, RelayError> {
         let mut capability = self.capability.write().await;
         let mut table = self.table.write().await;
         table.purge_expired(Utc::now());
         capability.active_sessions = table.session_count() as u32;
-        let credentials = table.admit_with_options(
-            &capability,
-            RelaySessionAdmission {
-                left: request.left.clone(),
-                right: request.right.clone(),
-                left_addr: request.left_addr,
-                right_addr: request.right_addr,
-                session_token: Uuid::new_v4().to_string(),
-                session_ttl: self.session_ttl,
-            },
-        )?;
+        let admission = RelaySessionAdmission {
+            left: request.left.clone(),
+            right: request.right.clone(),
+            left_addr: request.left_addr,
+            right_addr: request.right_addr,
+            session_token: Uuid::new_v4().to_string(),
+            session_ttl: self.session_ttl,
+        };
+        let session_id = RelaySessionId::new(&admission.left, &admission.right);
+        validate_relay_session_admission(&admission, &session_id)?;
+        if table.has_session_pair(&admission.left, &admission.right) {
+            return Err(RelayError::AdmissionDenied);
+        }
+        if self.node_session_limit_exceeded(&table, &admission.left)
+            || self.node_session_limit_exceeded(&table, &admission.right)
+        {
+            return Err(RelayError::NodeSessionLimitExceeded);
+        }
+        let credentials = table.admit_with_options(&capability, admission)?;
         capability.active_sessions = table.session_count() as u32;
 
         Ok(RelayAdmissionResponse {
@@ -740,8 +948,21 @@ impl RelayService {
             relay_node: self.relay_node.clone(),
             capability: capability.clone(),
             health: HealthState::Healthy,
-            dataplane: table.dataplane_metrics(),
+            admission_attempt_count: self.admission_attempts.load(Ordering::Relaxed),
+            admission_success_count: self.admission_successes.load(Ordering::Relaxed),
+            admission_failure_count: self.admission_failures.load(Ordering::Relaxed),
+            admission_failures_by_reason: zero_filled_admission_failure_reasons(
+                self.admission_failures_by_reason(),
+            ),
+            max_sessions_per_node: self.max_sessions_per_node,
+            dataplane: zero_filled_dataplane_metrics(table.dataplane_metrics()),
         }
+    }
+
+    fn node_session_limit_exceeded(&self, table: &RelayTable, node: &NodeId) -> bool {
+        self.max_sessions_per_node
+            .map(|limit| table.active_session_count_for_node(node) >= limit as usize)
+            .unwrap_or(false)
     }
 }
 
@@ -787,6 +1008,7 @@ impl UdpRelay {
 
 #[cfg(test)]
 mod tests {
+    use ipars_types::api::RelayAdmissionFailureReason;
     use ipars_types::RelayCapability;
 
     use super::*;
@@ -867,6 +1089,126 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_self_or_same_endpoint_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+
+        let same_node = table.admit_with_token(
+            &capability,
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node-a"),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        );
+        assert!(matches!(same_node, Err(RelayError::AdmissionDenied)));
+
+        let same_endpoint = table.admit_with_token(
+            &capability,
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node-b"),
+            left_addr,
+            left_addr,
+            "relay-secret".to_string(),
+        );
+        assert!(matches!(same_endpoint, Err(RelayError::AdmissionDenied)));
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_unusable_session_endpoint_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("node-a");
+        let right = NodeId::from_string("node-b");
+        let valid_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+
+        for addr in [
+            SocketAddr::from(([0, 0, 0, 0], 10000)),
+            SocketAddr::from(([10, 0, 0, 1], 0)),
+            SocketAddr::from(([224, 0, 0, 1], 10000)),
+            SocketAddr::from(([255, 255, 255, 255], 10000)),
+            SocketAddr::from(([0xff02, 0, 0, 0, 0, 0, 0, 1], 10000)),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 10000)),
+        ] {
+            let rejected = table.admit_with_token(
+                &capability,
+                left.clone(),
+                right.clone(),
+                addr,
+                valid_addr,
+                "relay-secret".to_string(),
+            );
+            assert!(
+                matches!(rejected, Err(RelayError::AdmissionDenied)),
+                "{addr} should be denied"
+            );
+        }
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_duplicate_node_pair_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("node-a");
+        let right = NodeId::from_string("node-b");
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let duplicate_same_direction = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            SocketAddr::from(([10, 0, 0, 1], 10001)),
+            SocketAddr::from(([10, 0, 0, 2], 10001)),
+            "replacement-secret".to_string(),
+        );
+        assert!(matches!(
+            duplicate_same_direction,
+            Err(RelayError::AdmissionDenied)
+        ));
+
+        let duplicate_reversed = table.admit_with_token(
+            &capability,
+            right.clone(),
+            left.clone(),
+            right_addr,
+            left_addr,
+            "replacement-secret".to_string(),
+        );
+        assert!(matches!(
+            duplicate_reversed,
+            Err(RelayError::AdmissionDenied)
+        ));
+        assert_eq!(table.session_count(), 1);
+
+        assert_eq!(
+            table.forward_target(&RelayFrame {
+                session_id: credentials.session_id,
+                session_token: credentials.session_token,
+                source: left,
+                destination: right,
+                ciphertext_payload: b"opaque".to_vec(),
+            })?,
+            right_addr
+        );
+        Ok(())
+    }
+
+    #[test]
     fn relay_rejects_oversized_frames_and_records_drop_reason() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -924,6 +1266,44 @@ mod tests {
             RelayDataplaneDropReason::FrameTooLarge.as_str(),
             "frame_too_large"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_empty_direct_frames_and_records_drop_reason() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            SocketAddr::from(([10, 0, 0, 1], 10000)),
+            SocketAddr::from(([10, 0, 0, 2], 10000)),
+            "relay-secret".to_string(),
+        )?;
+
+        let error = table.forward_target(&RelayFrame {
+            session_id: credentials.session_id,
+            session_token: credentials.session_token,
+            source: left,
+            destination: right,
+            ciphertext_payload: Vec::new(),
+        });
+
+        assert!(matches!(error, Err(RelayError::MalformedFrame)));
+        let metrics = table.dataplane_metrics();
+        assert_eq!(metrics.datagrams_received, 1);
+        assert_eq!(metrics.datagrams_forwarded, 0);
+        assert_eq!(metrics.datagrams_dropped, 1);
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&1)
+        );
+        assert_eq!(metrics.payload_bytes_forwarded, 0);
         Ok(())
     }
 
@@ -997,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_admission_reuses_live_session_token() -> Result<(), RelayError> {
+    fn relay_admission_rejects_live_session_replacement() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
         let left = NodeId::from_string("left");
@@ -1022,16 +1402,17 @@ mod tests {
             second_left_addr,
             second_right_addr,
             "right-secret".to_string(),
-        )?;
+        );
 
-        assert_eq!(second.session_id, first.session_id);
-        assert_eq!(second.session_token, first.session_token);
+        assert!(matches!(second, Err(RelayError::AdmissionDenied)));
         assert_eq!(table.session_count(), 1);
         let datagram =
-            encode_relay_datagram(second.session_id.as_str(), &second.session_token, b"opaque")?;
-        let (target, payload) = table.forward_datagram_for_addr(second_left_addr, &datagram)?;
-        assert_eq!(target, second_right_addr);
+            encode_relay_datagram(first.session_id.as_str(), &first.session_token, b"opaque")?;
+        let (target, payload) = table.forward_datagram_for_addr(first_left_addr, &datagram)?;
+        assert_eq!(target, first_right_addr);
         assert_eq!(payload, b"opaque");
+        let rejected = table.forward_datagram_for_addr(second_left_addr, &datagram);
+        assert!(matches!(rejected, Err(RelayError::UnknownSession)));
         Ok(())
     }
 
@@ -1219,6 +1600,340 @@ mod tests {
         let status = service.status().await;
 
         assert_eq!(status.capability.active_sessions, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_status_zero_fills_reason_metrics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+
+        let status = service.status().await;
+
+        assert_eq!(
+            status.admission_failures_by_reason.len(),
+            RelayAdmissionFailureReason::ALL.len()
+        );
+        for reason in RelayAdmissionFailureReason::ALL {
+            assert_eq!(
+                status.admission_failures_by_reason.get(&reason),
+                Some(&0),
+                "{reason:?} should be zero-filled"
+            );
+        }
+        assert_eq!(
+            status.dataplane.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        for reason in RelayDataplaneDropReason::ALL {
+            assert_eq!(
+                status.dataplane.drops_by_reason.get(&reason),
+                Some(&0),
+                "{reason:?} should be zero-filled"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_status_reports_admission_counters(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        capability.max_sessions = 1;
+        let service = RelayService::new(NodeId::from_string("relay"), capability);
+
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-a"),
+                right: NodeId::from_string("right-a"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-b"),
+                right: NodeId::from_string("right-b"),
+                left_addr: SocketAddr::from(([10, 0, 0, 3], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 4], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_duplicate_pair_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("right"),
+                right: NodeId::from_string("left"),
+                left_addr: SocketAddr::from(([10, 0, 0, 2], 10001)),
+                right_addr: SocketAddr::from(([10, 0, 0, 1], 10001)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_enforces_per_node_session_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::with_session_ttl_admission_controls(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            None,
+            Some(1),
+        );
+        service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("shared-left"),
+                right: NodeId::from_string("right-a"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("shared-left"),
+                right: NodeId::from_string("right-b"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10001)),
+                right_addr: SocketAddr::from(([10, 0, 0, 3], 10000)),
+            })
+            .await;
+
+        assert!(matches!(
+            rejected,
+            Err(RelayError::NodeSessionLimitExceeded)
+        ));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 1);
+        assert_eq!(status.max_sessions_per_node, Some(1));
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 1);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::NodeSessionLimitExceeded),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayAdmissionFailureReason::NodeSessionLimitExceeded.as_str(),
+            "node_session_limit_exceeded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_invalid_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("left"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_unusable_endpoint_admission_as_denied(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([0, 0, 0, 0], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_rate_limit_window_resets() -> Result<(), RelayError> {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 1,
+                window: chrono::Duration::seconds(1),
+            }),
+        );
+        let now = Utc::now();
+
+        service.record_admission_attempt_for_limit(now)?;
+        let limited = service.record_admission_attempt_for_limit(now);
+        assert!(matches!(limited, Err(RelayError::RateLimited)));
+        service.record_admission_attempt_for_limit(now + chrono::Duration::seconds(1))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_rate_limited_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 2,
+                window: chrono::Duration::seconds(60),
+            }),
+        );
+
+        for index in 0..2 {
+            service
+                .admit(RelayAdmissionRequest {
+                    left: NodeId::from_string(format!("left-{index}")),
+                    right: NodeId::from_string(format!("right-{index}")),
+                    left_addr: SocketAddr::from(([10, 0, 0, 1], 10000 + index)),
+                    right_addr: SocketAddr::from(([10, 0, 0, 2], 10000 + index)),
+                })
+                .await?;
+        }
+
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left-limited"),
+                right: NodeId::from_string("right-limited"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 12000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 12000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::RateLimited)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 2);
+        assert_eq!(status.admission_attempt_count, 3);
+        assert_eq!(status.admission_success_count, 2);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::RateLimited),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayAdmissionFailureReason::RateLimited.as_str(),
+            "rate_limited"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_rate_limits_unauthorized_admission_attempts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::with_session_ttl_and_admission_rate_limit(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+            chrono::Duration::seconds(300),
+            Some(RelayAdmissionRateLimit {
+                max_attempts: 1,
+                window: chrono::Duration::seconds(60),
+            }),
+        );
+
+        service.record_unauthorized_admission_attempt()?;
+        let rejected = service.record_unauthorized_admission_attempt();
+
+        assert!(matches!(rejected, Err(RelayError::RateLimited)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 2);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 2);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&1)
+        );
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::RateLimited),
+            Some(&1)
+        );
         Ok(())
     }
 

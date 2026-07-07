@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -7,8 +8,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use ipars_agent::UdpHolePuncher;
-use ipars_types::api::SignalHolePunchPlanResponse;
-use ipars_types::{CandidateSource, EndpointCandidate, EndpointCandidateKind, NodeId, PeerPathKey};
+use ipars_signal::SignalRegistry;
+use ipars_types::api::{SignalHolePunchPlanResponse, SignalPathRequest};
+use ipars_types::{
+    CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
+    NatClassification, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy, NodeId,
+    NodeRecord, PathState, PeerPathKey, Role, TokenPolicy, VpnIp,
+};
 
 const DIRECT_TEST_NAME: &str = "udp_hole_puncher_sends_signal_payload_between_network_namespaces";
 const NAT_TEST_NAME: &str =
@@ -19,10 +25,15 @@ const MIXED_PORT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_mixed_port_snat_network_namespaces";
 const ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces";
+const ONE_SIDED_PORT_PRESERVING_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_network_namespaces";
+const ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_does_not_traverse_one_sided_address_port_dependent_snat_network_namespaces";
 const ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces";
 const ASYMMETRIC_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_snat_network_namespaces";
+const SIGNAL_PLAN_TEST_NAME: &str = "udp_hole_puncher_uses_signal_plan_between_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -131,6 +142,128 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
     assert_success("puncher-b", puncher_b.wait_with_output()?)?;
     assert_success("receiver-a", receiver_a.wait_with_output()?)?;
     assert_success("receiver-b", receiver_b.wait_with_output()?)?;
+
+    let _ = fs::remove_file(ready_a);
+    let _ = fs::remove_file(ready_b);
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping signal-plan hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+
+    let suffix = unique_suffix()?;
+    let namespace_a = format!("ipars-hps-a-{suffix}");
+    let namespace_b = format!("ipars-hps-b-{suffix}");
+    let _guard_a = NamespaceGuard::create(namespace_a.clone())?;
+    let _guard_b = NamespaceGuard::create(namespace_b.clone())?;
+
+    let veth_a = format!("ihpsa{suffix}");
+    let veth_b = format!("ihpsb{suffix}");
+    let _veth_guard = VethGuard::create(&veth_a, &veth_b)?;
+    command(
+        "ip",
+        [
+            "link",
+            "set",
+            veth_a.as_str(),
+            "netns",
+            namespace_a.as_str(),
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "link",
+            "set",
+            veth_b.as_str(),
+            "netns",
+            namespace_b.as_str(),
+        ],
+    )?;
+
+    configure_namespace_interface(&namespace_a, &veth_a, "10.240.2.1/30")?;
+    configure_namespace_interface(&namespace_b, &veth_b, "10.240.2.2/30")?;
+
+    let plan_json = signal_plan_json(
+        "node-a",
+        "10.240.2.1:40111".parse()?,
+        "node-b",
+        "10.240.2.2:40112".parse()?,
+    )
+    .await?;
+    let ready_a = temp_file(format!("ipars-hps-ready-a-{suffix}"));
+    let ready_b = temp_file(format!("ipars-hps-ready-b-{suffix}"));
+    let receiver_a = spawn_child(
+        SIGNAL_PLAN_TEST_NAME,
+        &namespace_a,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.1:40111"),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+            (
+                "IPARS_HOLE_PUNCH_READY_FILE",
+                ready_a.to_str().unwrap_or_default(),
+            ),
+        ],
+    )?;
+    let receiver_b = spawn_child(
+        SIGNAL_PLAN_TEST_NAME,
+        &namespace_b,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.2:40112"),
+            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+            (
+                "IPARS_HOLE_PUNCH_READY_FILE",
+                ready_b.to_str().unwrap_or_default(),
+            ),
+        ],
+    )?;
+    wait_for_file(&ready_a)?;
+    wait_for_file(&ready_b)?;
+
+    let puncher_a = spawn_child(
+        SIGNAL_PLAN_TEST_NAME,
+        &namespace_a,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.1:0"),
+            ("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
+        ],
+    )?;
+    let puncher_b = spawn_child(
+        SIGNAL_PLAN_TEST_NAME,
+        &namespace_b,
+        [
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
+            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.2:0"),
+            ("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
+        ],
+    )?;
+
+    assert_success("signal-plan-puncher-a", puncher_a.wait_with_output()?)?;
+    assert_success("signal-plan-puncher-b", puncher_b.wait_with_output()?)?;
+    assert_success("signal-plan-receiver-a", receiver_a.wait_with_output()?)?;
+    assert_success("signal-plan-receiver-b", receiver_b.wait_with_output()?)?;
 
     let _ = fs::remove_file(ready_a);
     let _ = fs::remove_file(ready_b);
@@ -357,6 +490,82 @@ async fn udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespace
     run_one_sided_snat_hole_punch_topology(ONE_SIDED_NAT_TEST_NAME)
 }
 
+#[tokio::test]
+async fn udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping one-sided port-preserving public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_one_sided_snat_hole_punch_topology_with(
+        ONE_SIDED_PORT_PRESERVING_NAT_TEST_NAME,
+        OneSidedSnatTopology {
+            label: "onepresnat",
+            private_second_octet: 248,
+            public_third_octet: 6,
+            left_bind_port: 40101,
+            left_reflexive_port: 40101,
+            left_snat_port: None,
+            right_bind_port: 40102,
+            expect_left_packet: true,
+            expect_right_packet: true,
+        },
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_does_not_traverse_one_sided_address_port_dependent_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    run_one_sided_snat_hole_punch_topology_with(
+        ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME,
+        OneSidedSnatTopology {
+            label: "oneapdnat",
+            private_second_octet: 249,
+            public_third_octet: 7,
+            left_bind_port: 40101,
+            left_reflexive_port: 50101,
+            left_snat_port: Some(51101),
+            right_bind_port: 40102,
+            expect_left_packet: false,
+            expect_right_packet: true,
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TwoSidedSnatTopology {
     private_second_octet: u8,
@@ -540,8 +749,41 @@ fn run_two_sided_snat_hole_punch_topology(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OneSidedSnatTopology {
+    label: &'static str,
+    private_second_octet: u8,
+    public_third_octet: u8,
+    left_bind_port: u16,
+    left_reflexive_port: u16,
+    left_snat_port: Option<u16>,
+    right_bind_port: u16,
+    expect_left_packet: bool,
+    expect_right_packet: bool,
+}
+
 fn run_one_sided_snat_hole_punch_topology(
     test_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_one_sided_snat_hole_punch_topology_with(
+        test_name,
+        OneSidedSnatTopology {
+            label: "onesnat",
+            private_second_octet: 244,
+            public_third_octet: 2,
+            left_bind_port: 40101,
+            left_reflexive_port: 50101,
+            left_snat_port: Some(50101),
+            right_bind_port: 40102,
+            expect_left_packet: true,
+            expect_right_packet: true,
+        },
+    )
+}
+
+fn run_one_sided_snat_hole_punch_topology_with(
+    test_name: &str,
+    topology: OneSidedSnatTopology,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let suffix = unique_suffix()?;
     let left_namespace = format!("ipars-hp-left-{suffix}");
@@ -563,13 +805,10 @@ fn run_one_sided_snat_hole_punch_topology(
     move_link_to_namespace(&left_nat_public_if, &left_nat_namespace)?;
     move_link_to_namespace(&right_if, &right_namespace)?;
 
-    let left_ip = "10.244.0.2";
-    let left_gateway = "10.244.0.1";
-    let left_public_ip = "198.18.2.1";
-    let right_public_ip = "198.18.2.2";
-    let left_bind_port = 40101;
-    let left_reflexive_port = 50101;
-    let right_bind_port = 40102;
+    let left_ip = format!("10.{}.0.2", topology.private_second_octet);
+    let left_gateway = format!("10.{}.0.1", topology.private_second_octet);
+    let left_public_ip = format!("198.18.{}.1", topology.public_third_octet);
+    let right_public_ip = format!("198.18.{}.2", topology.public_third_octet);
 
     configure_namespace_interface(&left_namespace, &left_if, &format!("{left_ip}/30"))?;
     configure_namespace_interface(
@@ -596,7 +835,7 @@ fn run_one_sided_snat_hole_punch_topology(
             "replace",
             "default",
             "via",
-            left_gateway,
+            left_gateway.as_str(),
         ],
     )?;
 
@@ -604,26 +843,36 @@ fn run_one_sided_snat_hole_punch_topology(
         &left_nat_namespace,
         &left_nat_public_if,
         &format!("{left_ip}/32"),
-        left_public_ip,
-        Some(left_reflexive_port),
+        left_public_ip.as_str(),
+        topology.left_snat_port,
     )?;
 
-    let left_ready = temp_file(format!("ipars-hp-onesnat-ready-left-{suffix}"));
-    let right_ready = temp_file(format!("ipars-hp-onesnat-ready-right-{suffix}"));
-    let start_file = temp_file(format!("ipars-hp-onesnat-start-{suffix}"));
+    let left_ready = temp_file(format!("ipars-hp-{}-ready-left-{suffix}", topology.label));
+    let right_ready = temp_file(format!("ipars-hp-{}-ready-right-{suffix}", topology.label));
+    let start_file = temp_file(format!("ipars-hp-{}-start-{suffix}", topology.label));
     let left_ready_str = left_ready.to_string_lossy().into_owned();
     let right_ready_str = right_ready.to_string_lossy().into_owned();
     let start_file_str = start_file.to_string_lossy().into_owned();
-    let left_bind = format!("{left_ip}:{left_bind_port}");
-    let right_bind = format!("{right_public_ip}:{right_bind_port}");
-    let source_reflexive = format!("{left_public_ip}:{left_reflexive_port}");
+    let left_bind = format!("{}:{}", left_ip, topology.left_bind_port);
+    let right_bind = format!("{}:{}", right_public_ip, topology.right_bind_port);
+    let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
     let target_reflexive = right_bind.clone();
+    let left_child_role = if topology.expect_left_packet {
+        "nat-duplex"
+    } else {
+        "nat-duplex-timeout"
+    };
+    let right_child_role = if topology.expect_right_packet {
+        "nat-duplex"
+    } else {
+        "nat-duplex-timeout"
+    };
 
     let left = spawn_child(
         test_name,
         &left_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", left_child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
             ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
             (
@@ -643,7 +892,7 @@ fn run_one_sided_snat_hole_punch_topology(
         test_name,
         &right_namespace,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "nat-duplex"),
+            ("IPARS_HOLE_PUNCH_CHILD_ROLE", right_child_role),
             ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
             ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
             (
@@ -676,6 +925,7 @@ async fn run_child(role: &str) -> Result<(), Box<dyn std::error::Error>> {
     match role {
         "receiver" => run_receiver().await,
         "puncher" => run_puncher().await,
+        "signal-plan-puncher" => run_signal_plan_puncher().await,
         "nat-duplex" => run_nat_duplex(true).await,
         "nat-duplex-timeout" => run_nat_duplex(false).await,
         other => Err(format!("unknown hole-punch child role `{other}`").into()),
@@ -710,6 +960,22 @@ async fn run_puncher() -> Result<(), Box<dyn std::error::Error>> {
         start_after_millis: 0,
         expires_at: Utc::now() + ChronoDuration::seconds(10),
     };
+
+    let sent = UdpHolePuncher::new(bind)
+        .with_attempts(1)
+        .with_interval(Duration::ZERO)
+        .execute(&local_node, &plan)
+        .await?;
+    assert_eq!(sent, 1);
+    Ok(())
+}
+
+async fn run_signal_plan_puncher() -> Result<(), Box<dyn std::error::Error>> {
+    let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
+    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let plan = serde_json::from_str::<SignalHolePunchPlanResponse>(&required_env(
+        "IPARS_HOLE_PUNCH_PLAN_JSON",
+    )?)?;
 
     let sent = UdpHolePuncher::new(bind)
         .with_attempts(1)
@@ -770,6 +1036,98 @@ async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::E
     assert!(payload.contains("source=node-a target=node-b"));
     assert!(payload.contains(&format!("local={expected_local}")));
     Ok(())
+}
+
+async fn signal_plan_json(
+    source_node: &str,
+    source_reflexive: SocketAddr,
+    target_node: &str,
+    target_reflexive: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let registry = SignalRegistry::new(ClusterPolicy::default());
+    let source_id = NodeId::from_string(source_node);
+    let target_id = NodeId::from_string(target_node);
+    let source_candidate = reflexive_candidate_addr(source_node, source_reflexive);
+    let target_candidate = reflexive_candidate_addr(target_node, target_reflexive);
+    let source = signal_node_record(
+        source_id.clone(),
+        source_candidate.clone(),
+        Ipv4Addr::new(100, 64, 0, 10),
+    );
+    let target = signal_node_record(
+        target_id.clone(),
+        target_candidate.clone(),
+        Ipv4Addr::new(100, 64, 0, 11),
+    );
+    let source_nat = coordinated_hole_punch_nat(source_reflexive);
+    let target_nat = coordinated_hole_punch_nat(target_reflexive);
+    registry
+        .upsert_node_with_nat(source.clone(), Some(source_nat.clone()))
+        .await?;
+    registry
+        .upsert_node_with_nat(target, Some(target_nat))
+        .await?;
+
+    let path = registry
+        .negotiate(SignalPathRequest {
+            source: source_id.clone(),
+            target: target_id.clone(),
+            source_candidates: source.endpoint_candidates.clone(),
+            source_nat_classification: Some(source_nat),
+            desired_routes: Vec::new(),
+        })
+        .await?;
+    assert_eq!(path.preferred_state, PathState::DirectNatTraversal);
+
+    let plan = registry.hole_punch_plan(source_id, target_id).await?;
+    assert_eq!(
+        plan.source_reflexive
+            .as_ref()
+            .map(|candidate| candidate.addr),
+        Some(source_reflexive)
+    );
+    assert_eq!(
+        plan.target_reflexive
+            .as_ref()
+            .map(|candidate| candidate.addr),
+        Some(target_reflexive)
+    );
+    Ok(serde_json::to_string(&plan)?)
+}
+
+fn signal_node_record(
+    node_id: NodeId,
+    candidate: EndpointCandidate,
+    vpn_ip: Ipv4Addr,
+) -> NodeRecord {
+    NodeRecord {
+        node_id: node_id.clone(),
+        cluster_id: ClusterId::from_string("netns-signal-plan"),
+        vpn_ip: VpnIp(IpAddr::V4(vpn_ip)),
+        identity_public_key: format!("identity-{node_id}"),
+        wireguard_public_key: format!("wireguard-{node_id}"),
+        role: Role::edge(),
+        tags: BTreeSet::new(),
+        endpoint_candidates: vec![candidate],
+        relay_capability: None,
+        token_policy: TokenPolicy::default(),
+        routes: Vec::new(),
+        registered_at: Utc::now(),
+    }
+}
+
+fn coordinated_hole_punch_nat(local_addr: SocketAddr) -> NatClassification {
+    NatClassification {
+        local_addr,
+        mapping_behavior: NatMappingBehavior::EndpointIndependent,
+        filtering_behavior: NatFilteringBehavior::EndpointIndependent,
+        observed_endpoint: Some(local_addr),
+        observations: Vec::new(),
+        filtering_observations: Vec::new(),
+        strategy: NatTraversalStrategy::CoordinatedHolePunch,
+        confidence: 1.0,
+        assessed_at: Utc::now(),
+    }
 }
 
 fn reflexive_candidate(

@@ -320,6 +320,7 @@ mod tests {
             },
             candidates: Vec::new(),
             relay_capability: None,
+            routes: None,
             path_state: Vec::new(),
             node_signature: None,
         };

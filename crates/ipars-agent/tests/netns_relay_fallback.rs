@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 const TEST_NAME: &str = "relay_forwarder_fallback_proxies_datagrams_between_network_namespaces";
 const SESSION_ID: &str = "node-a:node-b";
 const SESSION_TOKEN: &str = "relay-secret";
+const WRONG_SESSION_TOKEN: &str = "relay-wrong-secret";
 const LEFT_NODE: &str = "node-a";
 const RIGHT_NODE: &str = "node-b";
 const RELAY_NODE: &str = "relay-a";
@@ -226,6 +227,14 @@ async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
     let (len, _) =
         tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await??;
     assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
+
+    let rejected_datagram = encode_relay_datagram(
+        SESSION_ID,
+        WRONG_SESSION_TOKEN,
+        b"credential-bypass-attempt",
+    )?;
+    socket.send_to(&rejected_datagram, relay_endpoint).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let datagram = encode_relay_datagram(SESSION_ID, SESSION_TOKEN, b"opaque-wireguard-inbound")?;
     socket.send_to(&datagram, relay_endpoint).await?;

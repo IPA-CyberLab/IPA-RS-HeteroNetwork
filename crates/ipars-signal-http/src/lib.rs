@@ -245,6 +245,32 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_path_acl_denials_total Total signal path negotiations hidden by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_path_acl_denials_total {}",
+        metrics.path_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_relay_candidate_acl_denials_total Total eligible relay candidates removed from signal negotiation by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_relay_candidate_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_relay_candidate_acl_denials_total {}",
+        metrics.relay_candidate_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_path_negotiation_state_total Successful signal path negotiations by selected state."
     );
     prometheus_line!(
@@ -274,6 +300,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_hole_punch_acl_denials_total Total signal hole-punch plans hidden by cluster ACL policy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_acl_denials_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_hole_punch_acl_denials_total {}",
+        metrics.hole_punch_acl_denied_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_hole_punch_nat_suppressions_total Total hole-punch plans suppressed by fresh NAT classification strategy."
     );
     prometheus_line!(
@@ -285,6 +324,22 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         "ipars_signal_hole_punch_nat_suppressions_total {}",
         metrics.hole_punch_nat_suppressed_count
     );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_hole_punch_nat_suppressions_by_strategy_total Total hole-punch suppressing NAT classifications observed during suppressed plans by traversal strategy."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_hole_punch_nat_suppressions_by_strategy_total counter"
+    );
+    for strategy_count in &metrics.hole_punch_nat_suppressed_strategy_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_signal_hole_punch_nat_suppressions_by_strategy_total{{strategy=\"{}\"}} {}",
+            strategy_count.strategy.as_str(),
+            strategy_count.count
+        );
+    }
     prometheus_line!(
         &mut body,
         "# HELP ipars_signal_relay_health_ttl_seconds Relay health freshness window used by signal."
@@ -380,6 +435,15 @@ impl IntoResponse for ApiError {
             }) => (
                 StatusCode::BAD_REQUEST,
                 format!("candidate for node {node_id} belongs to {candidate_node_id}"),
+            ),
+            Self::Signal(SignalError::CandidateInvalid {
+                node_id,
+                kind,
+                addr,
+                reason,
+            }) => (
+                StatusCode::BAD_REQUEST,
+                format!("candidate {kind:?} at {addr} for node {node_id} is invalid: {reason}"),
             ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
         };
@@ -542,10 +606,24 @@ mod tests {
         assert_eq!(metrics.nat_classification_min_confidence_percent, 50);
         assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
+        assert_eq!(metrics.path_acl_denied_count, 0);
+        assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        assert!(metrics
+            .hole_punch_nat_suppressed_strategy_counts
+            .iter()
+            .any(
+                |entry| entry.strategy == NatTraversalStrategy::DirectCandidate && entry.count == 0
+            ));
         assert_eq!(
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
             1
+        );
+        assert_eq!(metrics.path_negotiation_state_counts.len(), 5);
+        assert_eq!(
+            signal_path_state_count(&metrics, ipars_types::PathState::Relay),
+            0
         );
 
         let response = app
@@ -570,10 +648,17 @@ mod tests {
             "ipars_signal_fresh_nat_classifications_by_strategy{strategy=\"direct_candidate\"} 0"
         ));
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
+        assert!(body.contains("ipars_signal_path_acl_denials_total 0"));
+        assert!(body.contains("ipars_signal_relay_candidate_acl_denials_total 0"));
+        assert!(body.contains("ipars_signal_hole_punch_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
+        assert!(body.contains(
+            "ipars_signal_hole_punch_nat_suppressions_by_strategy_total{strategy=\"direct_candidate\"} 0"
+        ));
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
         );
+        assert!(body.contains("ipars_signal_path_negotiation_state_total{state=\"RELAY\"} 0"));
         Ok(())
     }
 
@@ -605,6 +690,37 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("candidate for node node-a belongs to node-b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_signal_rejects_invalid_endpoint_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let app = router(SignalHttpState::new(registry));
+        let node = node(
+            "node-a",
+            vec![candidate("node-a", EndpointCandidateKind::Ipv6)],
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
+                        node,
+                        nat_classification: None,
+                        health: None,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("IPv6 candidates must use an IPv6 socket address"));
         Ok(())
     }
 

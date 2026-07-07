@@ -34,6 +34,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let relay_http_port = free_tcp_port()?;
     let agent_port = free_tcp_port()?;
     let stun_port = free_udp_port()?;
+    let stun_alternate_port = free_udp_port()?;
+    let stun_http_port = free_tcp_port()?;
     let relay_udp_port = free_udp_port()?;
 
     let init = generated_init_output(relay_udp_port)?;
@@ -55,6 +57,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             control_plane: control_plane_port,
             signal: signal_port,
             stun: stun_port,
+            stun_alternate: stun_alternate_port,
+            stun_http: stun_http_port,
             relay_udp: relay_udp_port,
             relay_http: relay_http_port,
             agent: agent_port,
@@ -69,17 +73,169 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         project_name: format!("ipars-config-{}", unique_suffix()?),
         compose_files: vec![PathBuf::from("docker/compose.yaml")],
         docker_socket: docker_socket.clone(),
+        extra_env: Vec::new(),
     };
     let rendered = run_compose(&base_compose, ["config"])?;
     let rendered =
         String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
     anyhow::ensure!(
-        rendered.contains(&format!("source: {}", docker_socket.display())),
-        "rendered base Compose config did not include the Docker API socket bind"
+        !rendered.contains(&format!("source: {}", docker_socket.display())),
+        "rendered base Compose config unexpectedly included the Docker API socket bind"
     );
     anyhow::ensure!(
+        !rendered.contains("target: /run/ipars/docker.sock"),
+        "rendered base Compose config unexpectedly mounted the Docker API socket in the agent container"
+    );
+
+    let multi_network_compose = ComposeProject {
+        repo_root: repo_root.clone(),
+        project_name: format!("ipars-config-{}", unique_suffix()?),
+        compose_files: vec![
+            PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.rootless.yaml"),
+            PathBuf::from("docker/compose.docker-discovery.yaml"),
+        ],
+        docker_socket,
+        extra_env: vec![
+            (
+                "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_NETWORKS".to_string(),
+                "edge_default,edge_apps".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+                "compose-edge".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+                "br-edge".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+                "15".to_string(),
+            ),
+            (
+                "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+                "userspace-command".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+                "wireguard-go".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+                "ipars0,--foreground".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+                "20".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
+                "127.0.0.1:45182".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_BIND".to_string(),
+                "0.0.0.0:45182".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
+                "127.0.0.1:51820".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+                "relay-fw".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
+                "7".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
+                "11".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
+                "22".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
+                "4".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
+                "33".to_string(),
+            ),
+        ],
+    };
+    let rendered = run_compose(&multi_network_compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
+    assert_rendered_compose_env(
+        &rendered,
+        &[
+            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
+            ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
+            ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
+            ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
+            ("IPARS_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
+            ("IPARS_DOCKER_HOST_INTERFACE", "br-edge"),
+            ("IPARS_DOCKER_EXPOSE_HOST_ROUTES", "false"),
+            ("IPARS_DOCKER_ROUTE_INTERVAL_SECONDS", "15"),
+            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
+            ("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND", "wireguard-go"),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS",
+                "ipars0,--foreground",
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+                "30",
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+                "20",
+            ),
+            ("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT", "127.0.0.1:45182"),
+            ("IPARS_AGENT_RELAY_FORWARDER_BIND", "0.0.0.0:45182"),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT",
+                "127.0.0.1:51820",
+            ),
+            ("IPARS_AGENT_RELAY_FORWARDER_NETNS", "relay-fw"),
+            ("IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS", "7"),
+            ("IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS", "11"),
+            ("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS", "22"),
+            ("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW", "4"),
+            ("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS", "33"),
+        ],
+    )?;
+    anyhow::ensure!(
         rendered.contains("target: /run/ipars/docker.sock"),
-        "rendered base Compose config did not mount the Docker API socket in the agent container"
+        "rendered Docker discovery Compose config did not mount the Docker API socket"
+    );
+    anyhow::ensure!(
+        !rendered.contains("cap_add"),
+        "rendered rootless Compose config unexpectedly kept Linux capability additions"
+    );
+    anyhow::ensure!(
+        !rendered.contains("/dev/net/tun"),
+        "rendered rootless Compose config unexpectedly kept the TUN device mount"
     );
 
     let compose = ComposeProject {
@@ -87,12 +243,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         project_name: format!("ipars-smoke-{}", unique_suffix()?),
         compose_files: vec![PathBuf::from("docker/compose.yaml"), override_path],
         docker_socket: temp_dir.join("unused-docker.sock"),
+        extra_env: Vec::new(),
     };
     let _compose_guard = ComposeCleanup {
         repo_root: compose.repo_root.clone(),
         project_name: compose.project_name.clone(),
         compose_files: compose.compose_files.clone(),
         docker_socket: compose.docker_socket.clone(),
+        extra_env: compose.extra_env.clone(),
     };
 
     let rendered = run_compose(&compose, ["config"])?;
@@ -109,7 +267,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered smoke Compose config did not include the inline join token override"
     );
 
-    run_compose(
+    run_compose_with_diagnostics(
         &compose,
         ["up", "-d", "--build", "--wait", "--wait-timeout", "180"],
     )?;
@@ -164,6 +322,8 @@ struct ComposeOverridePorts {
     control_plane: u16,
     signal: u16,
     stun: u16,
+    stun_alternate: u16,
+    stun_http: u16,
     relay_udp: u16,
     relay_http: u16,
     agent: u16,
@@ -198,6 +358,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
   stun:
     ports:
       - "{stun_port}:3478/udp"
+      - "{stun_alternate_port}:3480/udp"
+      - "{stun_http_port}:3479"
 
   relay:
     cap_add: !reset []
@@ -212,6 +374,18 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
     secrets: !reset []
     volumes: !reset
       - agent-data:/var/lib/ipars
+    environment: !override
+      IPARS_ROLE: agent
+      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
+      IPARS_AGENT_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
+      IPARS_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
+      IPARS_AGENT_RELAY_MAX_SESSIONS: "10000"
+      IPARS_AGENT_RELAY_MAX_MBPS: "1000"
     command:
       - agent
       - --listen
@@ -222,15 +396,6 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - dry-run
       - --stun-server
       - 127.0.0.1:{stun_port}
-    environment:
-      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
-      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
-      IPARS_AGENT_JOIN_TOKEN: {join_token}
-      IPARS_AGENT_JOIN_TOKEN_PATH:
-      IPARS_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
-      IPARS_AGENT_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
-      IPARS_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{agent_port}/healthz >/dev/null"]
       interval: 10s
@@ -245,6 +410,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
         control_plane_port = config.ports.control_plane,
         signal_port = config.ports.signal,
         stun_port = config.ports.stun,
+        stun_alternate_port = config.ports.stun_alternate,
+        stun_http_port = config.ports.stun_http,
         relay_udp_port = config.ports.relay_udp,
         relay_http_port = config.ports.relay_http,
         agent_port = config.ports.agent,
@@ -255,12 +422,23 @@ fn yaml_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn assert_rendered_compose_env(rendered: &str, expected: &[(&str, &str)]) -> Result<()> {
+    for (name, value) in expected {
+        anyhow::ensure!(
+            rendered.contains(name) && rendered.contains(value),
+            "rendered Compose config did not include expected environment {name}={value}\n{rendered}"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ComposeProject {
     repo_root: PathBuf,
     project_name: String,
     compose_files: Vec<PathBuf>,
     docker_socket: PathBuf,
+    extra_env: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -269,6 +447,7 @@ struct ComposeCleanup {
     project_name: String,
     compose_files: Vec<PathBuf>,
     docker_socket: PathBuf,
+    extra_env: Vec<(String, String)>,
 }
 
 impl Drop for ComposeCleanup {
@@ -278,6 +457,7 @@ impl Drop for ComposeCleanup {
             project_name: self.project_name.clone(),
             compose_files: self.compose_files.clone(),
             docker_socket: self.docker_socket.clone(),
+            extra_env: self.extra_env.clone(),
         };
         let mut command = compose_command(&project);
         command.args(["down", "--volumes", "--remove-orphans", "--timeout", "1"]);
@@ -304,6 +484,27 @@ fn run_compose<const N: usize>(compose: &ComposeProject, args: [&str; N]) -> Res
         .with_context(|| format!("failed to run docker compose {args:?}"))?;
     ensure_success(&format!("docker compose {args:?}"), &output)?;
     Ok(output)
+}
+
+fn run_compose_with_diagnostics<const N: usize>(
+    compose: &ComposeProject,
+    args: [&str; N],
+) -> Result<Output> {
+    let mut command = compose_command(compose);
+    command.args(args);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose {args:?}"))?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    anyhow::bail!(
+        "docker compose {args:?} failed with status {}\nstdout:\n{}\nstderr:\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        compose_diagnostics(compose)
+    )
 }
 
 fn assert_compose_services_running(compose: &ComposeProject, expected: &[&str]) -> Result<()> {
@@ -400,6 +601,9 @@ fn compose_command(compose: &ComposeProject) -> Command {
         .current_dir(&compose.repo_root)
         .env("IPARS_DOCKER_API_SOCKET_HOST", &compose.docker_socket)
         .args(["compose", "-p", &compose.project_name]);
+    for (name, value) in &compose.extra_env {
+        command.env(name, value);
+    }
     for file in &compose.compose_files {
         command.arg("-f").arg(file);
     }

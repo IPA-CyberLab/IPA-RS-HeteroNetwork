@@ -8,15 +8,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
-    AgentMetricsResponse, AgentNatClassifyRequest, AgentNatClassifyResponse,
+    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
+    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentPacketFlowDropReason,
     AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
     RotateWireGuardKeyResponse,
 };
-use ipars_types::{NodeId, PathState};
-use serde::Serialize;
+use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
+use serde::{Deserialize, Serialize};
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -187,12 +188,39 @@ async fn path_probe(
     State(state): State<AgentHttpState>,
     Json(request): Json<AgentPathProbeRequest>,
 ) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
+    request.metrics.validate()?;
+    validate_path_probe_selected_candidate(&request)?;
     let recorded_at = chrono::Utc::now();
     let path = state.runtime.record_path_probe(request, recorded_at).await;
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPathProbeResponse { path, recorded_at }),
     ))
+}
+
+fn validate_path_probe_selected_candidate(request: &AgentPathProbeRequest) -> Result<(), ApiError> {
+    let Some(candidate) = request.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    if candidate.node_id != request.peer {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate belongs to node {} instead of path peer {}",
+            candidate.node_id, request.peer
+        )));
+    }
+    if let Err(reason) = candidate.validate_kind_address() {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate {:?} at {} is invalid: {reason}",
+            candidate.kind, candidate.addr
+        )));
+    }
+    if !endpoint_addr_is_usable(candidate.addr) {
+        return Err(ApiError::BadRequest(format!(
+            "selected candidate {:?} at {} is unusable",
+            candidate.kind, candidate.addr
+        )));
+    }
+    Ok(())
 }
 
 async fn stun_probe(
@@ -248,6 +276,10 @@ async fn packet_flow(
 ) -> Result<(StatusCode, Json<AgentPacketFlowResponse>), ApiError> {
     let recorded_at = chrono::Utc::now();
     let observation = request.observation;
+    observation
+        .validate_transport_metadata()
+        .map_err(ApiError::BadRequest)?;
+    let destination_drop_reason = packet_flow_destination_drop_reason(request.destination);
     let matched = state
         .runtime
         .record_packet_flow_observation(
@@ -257,12 +289,18 @@ async fn packet_flow(
             request.pin,
         )
         .await;
+    let filtered_reason = destination_drop_reason.or_else(|| {
+        matched
+            .is_none()
+            .then_some(AgentPacketFlowDropReason::NoOverlayMatch)
+    });
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPacketFlowResponse {
             destination: request.destination,
             recorded_at,
             observation,
+            filtered_reason,
             matched,
         }),
     ))
@@ -347,6 +385,22 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_admission_failures_by_reason_total Relay admission candidate failures by agent-observed reason."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_admission_failures_by_reason_total counter"
+    );
+    for reason_count in &metrics.relay_admission_failure_reason_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{node_id}\",reason=\"{}\"}} {}",
+            reason_count.reason.as_str(),
+            reason_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarders Number of supervised relay forwarder endpoints."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_relay_forwarders gauge");
@@ -354,6 +408,36 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "ipars_agent_relay_forwarders{{node_id=\"{node_id}\"}} {}",
         metrics.relay_forwarder_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_userspace_wireguard_process_state Managed userspace WireGuard process state, exported as one-hot gauges."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_userspace_wireguard_process_state gauge"
+    );
+    let userspace_wireguard_state = metrics
+        .userspace_wireguard_process
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or(AgentManagedProcessState::Disabled);
+    for state in AgentManagedProcessState::ALL {
+        let value = u8::from(state == userspace_wireguard_state);
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_userspace_wireguard_process_state{{node_id=\"{node_id}\",state=\"{}\"}} {}",
+            state.as_str(),
+            value
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_socket_receive_errors_total Relay forwarder recoverable UDP receive errors that did not stop the forwarder."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_socket_receive_errors_total counter"
     );
     prometheus_line!(
         &mut body,
@@ -381,6 +465,102 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total Relay forwarder packets dropped before relay because the sender did not match the configured local WireGuard endpoint."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total Relay forwarder payload bytes dropped before relay because the sender did not match the configured local WireGuard endpoint."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total Relay forwarder local packets dropped before relay because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total Relay forwarder local payload bytes dropped before relay because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_oversized_packets_total Relay forwarder local packets dropped before relay because the framed relay datagram would exceed the UDP payload limit."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_oversized_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_oversized_payload_bytes_total Relay forwarder local payload bytes dropped before relay because the framed relay datagram would exceed the UDP payload limit."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_oversized_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_oversized_datagram_bytes_total Relay forwarder framed datagram bytes dropped before relay because they would exceed the UDP payload limit."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_oversized_datagram_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_socket_error_packets_total Relay forwarder local packets dropped because sending the framed relay datagram failed."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_socket_error_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_socket_error_payload_bytes_total Relay forwarder local payload bytes dropped because sending the framed relay datagram failed."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_socket_error_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_socket_error_datagram_bytes_total Relay forwarder framed datagram bytes dropped because sending them to the relay failed."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_socket_error_datagram_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total Relay forwarder local packets dropped before relay because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total Relay forwarder local payload bytes dropped before relay because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_relay_forwarder_inbound_packets_total Relay forwarder packets received from relay and sent to local WireGuard."
     );
     prometheus_line!(
@@ -395,9 +575,78 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "# TYPE ipars_agent_relay_forwarder_inbound_payload_bytes_total counter"
     );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total Relay forwarder relay packets dropped before local WireGuard because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total Relay forwarder relay payload bytes dropped before local WireGuard because the relay session credential expired."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_oversized_packets_total Relay forwarder relay packets dropped before local WireGuard because the payload exceeds the UDP payload limit."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_oversized_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_oversized_payload_bytes_total Relay forwarder relay payload bytes dropped before local WireGuard because the payload exceeds the UDP payload limit."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_oversized_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_socket_error_packets_total Relay forwarder relay packets dropped because sending the payload to local WireGuard failed."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_socket_error_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_socket_error_payload_bytes_total Relay forwarder relay payload bytes dropped because sending the payload to local WireGuard failed."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_socket_error_payload_bytes_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total Relay forwarder relay packets dropped before local WireGuard because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total Relay forwarder relay payload bytes dropped before local WireGuard because they were not WireGuard datagrams."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total counter"
+    );
     for forwarder in &metrics.relay_forwarders {
         let peer = prometheus_label(forwarder.peer.as_str());
         let relay_node = prometheus_label(forwarder.relay_node.as_str());
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_socket_receive_errors_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.socket_receive_errors
+        );
         prometheus_line!(
             &mut body,
             "ipars_agent_relay_forwarder_outbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
@@ -415,6 +664,66 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         );
         prometheus_line!(
             &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_unexpected_source_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_unexpected_source_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_expired_session_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_expired_session_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_oversized_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_oversized_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_oversized_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_oversized_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_oversized_datagram_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_oversized_datagram_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_socket_error_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_socket_error_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_socket_error_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_socket_error_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_socket_error_datagram_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_socket_error_datagram_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_non_wireguard_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.outbound_dropped_non_wireguard_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
             "ipars_agent_relay_forwarder_inbound_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.inbound_packets
         );
@@ -422,6 +731,46 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
             &mut body,
             "ipars_agent_relay_forwarder_inbound_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
             forwarder.inbound_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_expired_session_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_expired_session_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_expired_session_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_oversized_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_oversized_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_oversized_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_oversized_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_socket_error_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_socket_error_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_socket_error_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_socket_error_payload_bytes
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_non_wireguard_packets
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_payload_bytes_total{{node_id=\"{node_id}\",peer=\"{peer}\",relay_node=\"{relay_node}\"}} {}",
+            forwarder.inbound_dropped_non_wireguard_payload_bytes
         );
     }
     prometheus_line!(
@@ -551,7 +900,7 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_agent_packet_flow_filtered_total Packet-flow observations filtered before lazy-connect resolution."
+        "# HELP ipars_agent_packet_flow_filtered_total Packet-flow observations filtered before or after lazy-connect resolution."
     );
     prometheus_line!(
         &mut body,
@@ -564,7 +913,36 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before lazy-connect resolution, by reason."
+        "# HELP ipars_agent_packet_flow_duplicate_suppressions_total Duplicate packet-flow observations suppressed before lazy-connect resolution."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_duplicate_suppressions_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_packet_flow_duplicate_suppressions_total{{node_id=\"{node_id}\"}} {}",
+        metrics.packet_flow_duplicate_suppression_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_duplicate_suppressions_by_source_total Duplicate packet-flow observations suppressed before lazy-connect resolution, by detector source."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_packet_flow_duplicate_suppressions_by_source_total counter"
+    );
+    for source_count in &metrics.packet_flow_duplicate_suppression_counts {
+        prometheus_line!(
+            &mut body,
+            "ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{node_id}\",source=\"{}\"}} {}",
+            source_count.source.as_str(),
+            source_count.count
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_packet_flow_filtered_by_reason_total Packet-flow observations filtered before or after lazy-connect resolution, by reason."
     );
     prometheus_line!(
         &mut body,
@@ -644,17 +1022,32 @@ fn prometheus_label(value: &str) -> String {
 }
 
 #[derive(Debug)]
-pub struct ApiError(AgentError);
+pub enum ApiError {
+    Agent(AgentError),
+    BadRequest(String),
+}
 
 impl From<AgentError> for ApiError {
     fn from(error: AgentError) -> Self {
-        Self(error)
+        Self::Agent(error)
+    }
+}
+
+impl From<PathMetricsValidationError> for ApiError {
+    fn from(error: PathMetricsValidationError) -> Self {
+        Self::BadRequest(error.to_string())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
+        let error = match self {
+            ApiError::BadRequest(error) => {
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+            }
+            ApiError::Agent(error) => error,
+        };
+        let status = match error {
             AgentError::Io(_)
             | AgentError::Json(_)
             | AgentError::Crypto(_)
@@ -671,14 +1064,14 @@ impl IntoResponse for ApiError {
         (
             status,
             Json(ErrorResponse {
-                error: self.0.to_string(),
+                error: error.to_string(),
             }),
         )
             .into_response()
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -695,14 +1088,15 @@ mod tests {
     use ipars_agent::{AgentNodeState, AgentRuntime, FileAgentStateStore, RelayForwarderStats};
     use ipars_types::api::{
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
-        AgentPacketFlowDropReason, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
-        AgentPacketFlowTcpState, AgentWireGuardKeyRotationRequest,
-        AgentWireGuardKeyRotationResponse, PeerMap, RelayMap, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse,
+        AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowMatchKind,
+        AgentPacketFlowObservation, AgentRelayAdmissionFailureReason,
+        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap, RelayMap,
+        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
-        ClusterId, ClusterPolicy, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
-        PathState, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+        CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
+        NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role,
+        Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -799,6 +1193,14 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         ));
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Ready,
+                Some(4242),
+                None,
+                None,
+            )
+            .await;
         let node_id = runtime.state().node_id.clone();
         let app = router(AgentHttpState::new(runtime));
 
@@ -816,6 +1218,20 @@ mod tests {
         let status: AgentStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(status.node_id, node_id);
         assert_eq!(status.candidate_count, 0);
+        assert_eq!(
+            status
+                .userspace_wireguard_process
+                .as_ref()
+                .map(|process| process.state),
+            Some(AgentManagedProcessState::Ready)
+        );
+        assert_eq!(
+            status
+                .userspace_wireguard_process
+                .as_ref()
+                .and_then(|process| process.pid),
+            Some(4242)
+        );
         Ok(())
     }
 
@@ -931,8 +1347,15 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 51820)),
             std::net::SocketAddr::from(([127, 0, 0, 1], 52000)),
         ));
+        forwarder_metrics.record_socket_receive_error();
         forwarder_metrics.record_outbound(64, 128);
+        forwarder_metrics.record_outbound_expired_session_drop(96);
+        forwarder_metrics.record_outbound_oversized_drop(112, 160);
+        forwarder_metrics.record_outbound_socket_error_drop(120, 176);
         forwarder_metrics.record_inbound(32);
+        forwarder_metrics.record_inbound_expired_session_drop(48);
+        forwarder_metrics.record_inbound_oversized_drop(80);
+        forwarder_metrics.record_inbound_socket_error_drop(88);
         runtime
             .upsert_relay_forwarder_endpoint(
                 NodeId::from_string("peer-a"),
@@ -944,6 +1367,15 @@ mod tests {
             .await;
         runtime.record_relay_admission_attempt();
         runtime.record_relay_admission_success();
+        runtime.record_relay_admission_failure_reason(AgentRelayAdmissionFailureReason::Rejected);
+        runtime
+            .record_userspace_wireguard_process_status(
+                AgentManagedProcessState::Ready,
+                Some(4242),
+                None,
+                None,
+            )
+            .await;
         runtime
             .record_peer_activity(NodeId::from_string("peer-a"), Utc::now(), true)
             .await;
@@ -956,6 +1388,12 @@ mod tests {
             .await;
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Multicast);
         runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::Broadcast);
+        runtime
+            .record_packet_flow_filtered(AgentPacketFlowDropReason::InconsistentTransportMetadata);
+        runtime.record_packet_flow_duplicate_suppression(
+            AgentPacketFlowDuplicateSource::ConntrackNetlink,
+            2,
+        );
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -972,17 +1410,103 @@ mod tests {
         let metrics: AgentMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_id, node_id);
         assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.path_state_counts.len(), 5);
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .any(|entry| entry.state == PathState::Relay && entry.count == 1));
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .any(|entry| entry.state == PathState::DirectPublic && entry.count == 0));
         assert_eq!(metrics.relay_forwarder_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
         assert_eq!(metrics.relay_forwarders.len(), 1);
+        assert_eq!(metrics.relay_forwarders[0].socket_receive_errors, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_payload_bytes, 64);
         assert_eq!(metrics.relay_forwarders[0].outbound_datagram_bytes, 128);
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_expired_session_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_expired_session_payload_bytes,
+            96
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_oversized_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_oversized_payload_bytes,
+            112
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_oversized_datagram_bytes,
+            160
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_socket_error_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_socket_error_payload_bytes,
+            120
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].outbound_dropped_socket_error_datagram_bytes,
+            176
+        );
         assert_eq!(metrics.relay_forwarders[0].inbound_packets, 1);
         assert_eq!(metrics.relay_forwarders[0].inbound_payload_bytes, 32);
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_expired_session_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_expired_session_payload_bytes,
+            48
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_oversized_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_oversized_payload_bytes,
+            80
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_socket_error_packets,
+            1
+        );
+        assert_eq!(
+            metrics.relay_forwarders[0].inbound_dropped_socket_error_payload_bytes,
+            88
+        );
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 1);
-        assert_eq!(metrics.relay_admission_failure_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert!(metrics
+            .relay_admission_failure_reason_counts
+            .iter()
+            .any(|entry| {
+                entry.reason == AgentRelayAdmissionFailureReason::Rejected && entry.count == 1
+            }));
+        assert_eq!(
+            metrics
+                .userspace_wireguard_process
+                .as_ref()
+                .map(|status| status.state),
+            Some(AgentManagedProcessState::Ready)
+        );
+        assert_eq!(
+            metrics
+                .userspace_wireguard_process
+                .as_ref()
+                .and_then(|status| status.pid),
+            Some(4242)
+        );
         assert_eq!(metrics.lazy_connect.active_peer_count, 1);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 1);
         assert_eq!(metrics.path_probe_record_count, 0);
@@ -990,7 +1514,15 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
-        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(metrics.packet_flow_filtered_count, 4);
+        assert_eq!(metrics.packet_flow_duplicate_suppression_count, 2);
+        assert!(metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .any(
+                |entry| entry.source == AgentPacketFlowDuplicateSource::ConntrackNetlink
+                    && entry.count == 2
+            ));
         assert!(metrics
             .packet_flow_classification_counts
             .iter()
@@ -1009,6 +1541,20 @@ mod tests {
             .packet_flow_filtered_reason_counts
             .iter()
             .any(|entry| entry.reason == AgentPacketFlowDropReason::Multicast && entry.count == 1));
+        assert!(metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .any(
+                |entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch
+                    && entry.count == 1
+            ));
+        assert!(metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .any(
+                |entry| entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
+                    && entry.count == 1
+            ));
 
         let prometheus_response = app
             .clone()
@@ -1030,10 +1576,42 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
+        assert!(body.contains("state=\"DIRECT_PUBLIC\""));
+        assert!(body.contains("state=\"DIRECT_IPV6\""));
+        assert!(body.contains("state=\"DIRECT_NAT_TRAVERSAL\""));
+        assert!(body.contains("state=\"UNREACHABLE\""));
         assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
+        assert!(body.contains(
+            "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total"
+        ));
+        assert!(body.contains(
+            "ipars_agent_relay_forwarder_outbound_dropped_expired_session_packets_total"
+        ));
+        assert!(
+            body.contains("ipars_agent_relay_forwarder_outbound_dropped_oversized_packets_total")
+        );
+        assert!(body.contains("ipars_agent_relay_forwarder_socket_receive_errors_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_outbound_dropped_socket_error_packets_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_outbound_dropped_non_wireguard_packets_total"));
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_inbound_dropped_expired_session_packets_total"));
+        assert!(
+            body.contains("ipars_agent_relay_forwarder_inbound_dropped_oversized_packets_total")
+        );
+        assert!(
+            body.contains("ipars_agent_relay_forwarder_inbound_dropped_socket_error_packets_total")
+        );
+        assert!(body
+            .contains("ipars_agent_relay_forwarder_inbound_dropped_non_wireguard_packets_total"));
         assert!(body.contains("ipars_agent_relay_admission_attempts_total"));
         assert!(body.contains("ipars_agent_relay_admission_success_total"));
         assert!(body.contains("ipars_agent_relay_admission_failures_total"));
+        assert!(body.contains("ipars_agent_relay_admission_failures_by_reason_total"));
+        assert!(body.contains("ipars_agent_userspace_wireguard_process_state"));
+        assert!(body.contains("state=\"ready\"} 1"));
+        assert!(body.contains("state=\"disabled\"} 0"));
         assert!(body.contains("peer=\"peer-a\""));
         assert!(body.contains("relay_node=\"relay-a\""));
         assert!(body.contains("peer=\"peer-a\",relay_node=\"relay-a\"} 64"));
@@ -1045,11 +1623,31 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_observations_total"));
         assert!(body.contains("ipars_agent_packet_flow_unmatched_total"));
         assert!(body.contains("ipars_agent_packet_flow_filtered_total"));
+        assert!(body.contains("ipars_agent_packet_flow_duplicate_suppressions_total"));
+        assert!(body.contains("ipars_agent_packet_flow_duplicate_suppressions_by_source_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"RELAY\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"DIRECT_PUBLIC\"}} 0"
+        )));
+        assert!(body.contains(
+            &format!("ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"rejected\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{prometheus_node_id}\",source=\"conntrack-netlink\"}} 2")
+        ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"multicast\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"no_overlay_match\"}} 1")
+        ));
+        assert!(body.contains(
+            &format!("ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"inconsistent_transport_metadata\"}} 1")
         ));
         assert!(body.contains(
             &format!("ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{prometheus_node_id}\",classification=\"unknown\"}} 1")
@@ -1059,6 +1657,30 @@ mod tests {
         ));
         assert!(body.contains(&format!(
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"kafka\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"consul\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"vault\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"nomad\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"jaeger\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"loki\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"tempo\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"zipkin\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"clickhouse\"}} 0"
         )));
 
         let paths_response = app
@@ -1175,6 +1797,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_agent_rejects_invalid_path_probe_metrics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let metrics_runtime = Arc::clone(&runtime);
+        let app = router(AgentHttpState::new(runtime));
+        let request = AgentPathProbeRequest {
+            peer: NodeId::from_string("peer-probed"),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: None,
+            relay_node: None,
+            metrics: PathMetrics {
+                latency_ms: Some(-1.0),
+                ..PathMetrics::default()
+            },
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("latency_ms"));
+        assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_unusable_path_probe_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let metrics_runtime = Arc::clone(&runtime);
+        let app = router(AgentHttpState::new(runtime));
+        let peer = NodeId::from_string("peer-probed");
+        let request = AgentPathProbeRequest {
+            peer: peer.clone(),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(EndpointCandidate {
+                node_id: peer,
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: "203.0.113.10:0".parse()?,
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }),
+            relay_node: None,
+            metrics: PathMetrics::default(),
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("selected candidate"));
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is unusable"));
+        assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn http_agent_records_peer_activity_for_lazy_connect(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
@@ -1247,8 +1967,10 @@ mod tests {
                             source_port: Some(50_000),
                             destination_port: Some(51820),
                             detector: Some("unit-test".to_string()),
+                            application: Some(AgentPacketFlowApplication::WireGuard),
+                            payload_prefix: Vec::new(),
                             conntrack_status: vec![AgentPacketFlowConntrackStatus::Assured],
-                            tcp_state: Some(AgentPacketFlowTcpState::Established),
+                            tcp_state: None,
                         },
                     })?))?,
             )
@@ -1268,13 +1990,15 @@ mod tests {
             Some("unit-test")
         );
         assert_eq!(
+            packet_flow.observation.application,
+            Some(AgentPacketFlowApplication::WireGuard)
+        );
+        assert_eq!(
             packet_flow.observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]
         );
-        assert_eq!(
-            packet_flow.observation.tcp_state,
-            Some(AgentPacketFlowTcpState::Established)
-        );
+        assert_eq!(packet_flow.observation.tcp_state, None);
+        assert_eq!(packet_flow.filtered_reason, None);
         let matched = packet_flow
             .matched
             .ok_or_else(|| std::io::Error::other("route should match peer"))?;
@@ -1283,6 +2007,128 @@ mod tests {
         assert_eq!(matched.route, Some(route));
         assert!(matched.pinned);
         assert!(runtime.should_connect_peer(&peer_record).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_inconsistent_packet_flow_transport_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"100.64.0.11","protocol":"udp","tcp_state":"established"}"#,
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: ErrorResponse = serde_json::from_slice(&body)?;
+        assert!(error
+            .error
+            .contains("packet-flow TCP state requires TCP protocol"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_filters_unusable_packet_flow_destinations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"127.0.0.1","protocol":"tcp","destination_port":443}"#,
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(packet_flow.matched.is_none());
+        assert_eq!(
+            packet_flow.filtered_reason,
+            Some(AgentPacketFlowDropReason::Loopback)
+        );
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 0);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::Loopback)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::NoOverlayMatch)
+                .map(|entry| entry.count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_reports_no_overlay_packet_flow_matches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"192.0.2.10","protocol":"tcp","destination_port":443}"#,
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(packet_flow.matched.is_none());
+        assert_eq!(
+            packet_flow.filtered_reason,
+            Some(AgentPacketFlowDropReason::NoOverlayMatch)
+        );
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 1);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_unmatched_count, 1);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
         Ok(())
     }
 }

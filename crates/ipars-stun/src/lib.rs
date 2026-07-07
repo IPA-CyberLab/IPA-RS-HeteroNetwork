@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use ipars_types::{
-    CandidateSource, EndpointCandidate, EndpointCandidateKind, NatFilteringObservation,
-    NatFilteringProbeKind, NatProbeObservation, NodeId,
+    endpoint_addr_is_usable, CandidateSource, EndpointCandidate, EndpointCandidateKind,
+    NatFilteringObservation, NatFilteringProbeKind, NatProbeObservation, NodeId,
 };
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
@@ -22,6 +24,7 @@ const STUN_HEADER_LEN: usize = 20;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const CHANGE_REQUEST_CHANGE_IP: u32 = 0x04;
 const CHANGE_REQUEST_CHANGE_PORT: u32 = 0x02;
+const BINDING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const FILTERING_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
@@ -30,6 +33,11 @@ pub enum StunError {
     Socket(#[from] std::io::Error),
     #[error("stun response is invalid: {0}")]
     InvalidResponse(String),
+    #[error("stun request to {stun_server} timed out after {timeout:?}")]
+    Timeout {
+        stun_server: SocketAddr,
+        timeout: Duration,
+    },
 }
 
 #[async_trait]
@@ -51,6 +59,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_server: SocketAddr,
     ) -> Result<NatProbeObservation, StunError> {
+        validate_stun_server(stun_server)?;
         let socket = UdpSocket::bind(local_bind).await?;
         observe_binding_with_socket(&socket, stun_server).await
     }
@@ -60,6 +69,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_servers: &[SocketAddr],
     ) -> Result<Vec<NatProbeObservation>, StunError> {
+        validate_stun_servers(stun_servers)?;
         let socket = UdpSocket::bind(local_bind).await?;
         let mut observations = Vec::with_capacity(stun_servers.len());
         for stun_server in stun_servers {
@@ -73,6 +83,7 @@ impl UdpStunProbe {
         local_bind: SocketAddr,
         stun_server: SocketAddr,
     ) -> Result<Vec<NatFilteringObservation>, StunError> {
+        validate_stun_server(stun_server)?;
         let socket = UdpSocket::bind(local_bind).await?;
         let baseline = match tokio::time::timeout(
             FILTERING_PROBE_TIMEOUT,
@@ -129,6 +140,22 @@ impl UdpStunProbe {
     }
 }
 
+fn validate_stun_servers(stun_servers: &[SocketAddr]) -> Result<(), StunError> {
+    for stun_server in stun_servers {
+        validate_stun_server(*stun_server)?;
+    }
+    Ok(())
+}
+
+fn validate_stun_server(stun_server: SocketAddr) -> Result<(), StunError> {
+    if !endpoint_addr_is_usable(stun_server) {
+        return Err(StunError::InvalidResponse(format!(
+            "STUN server {stun_server} is unusable"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl StunProbe for UdpStunProbe {
     async fn probe(
@@ -148,6 +175,57 @@ pub struct BindingStunServer {
 
 pub type EchoStunServer = BindingStunServer;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StunServerMetricsSnapshot {
+    pub binding_request_count: u64,
+    pub binding_response_count: u64,
+    pub invalid_packet_count: u64,
+    pub socket_receive_error_count: u64,
+    pub socket_send_error_count: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct StunServerStats {
+    binding_request_count: AtomicU64,
+    binding_response_count: AtomicU64,
+    invalid_packet_count: AtomicU64,
+    socket_receive_error_count: AtomicU64,
+    socket_send_error_count: AtomicU64,
+}
+
+impl StunServerStats {
+    pub fn snapshot(&self) -> StunServerMetricsSnapshot {
+        StunServerMetricsSnapshot {
+            binding_request_count: self.binding_request_count.load(Ordering::Relaxed),
+            binding_response_count: self.binding_response_count.load(Ordering::Relaxed),
+            invalid_packet_count: self.invalid_packet_count.load(Ordering::Relaxed),
+            socket_receive_error_count: self.socket_receive_error_count.load(Ordering::Relaxed),
+            socket_send_error_count: self.socket_send_error_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_binding_request(&self) {
+        self.binding_request_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_binding_response(&self) {
+        self.binding_response_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_invalid_packet(&self) {
+        self.invalid_packet_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_socket_receive_error(&self) {
+        self.socket_receive_error_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_socket_send_error(&self) {
+        self.socket_send_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl BindingStunServer {
     pub async fn bind(addr: SocketAddr) -> Result<Self, StunError> {
         Ok(Self {
@@ -160,20 +238,52 @@ impl BindingStunServer {
     }
 
     pub async fn serve_once(&self) -> Result<(), StunError> {
+        self.serve_once_inner(None).await
+    }
+
+    pub async fn serve_once_with_stats(&self, stats: &StunServerStats) -> Result<(), StunError> {
+        self.serve_once_inner(Some(stats)).await
+    }
+
+    async fn serve_once_inner(&self, stats: Option<&StunServerStats>) -> Result<(), StunError> {
         let mut buffer = [0_u8; 1500];
-        let (len, peer) = self.socket.recv_from(&mut buffer).await?;
-        let request = decode_binding_request(&buffer[..len])?;
-        let response = encode_binding_success_response_with_attrs(
-            request.transaction_id,
+        let (len, peer) = match self.socket.recv_from(&mut buffer).await {
+            Ok(packet) => packet,
+            Err(error) => {
+                if let Some(stats) = stats {
+                    stats.record_socket_receive_error();
+                }
+                return Err(error.into());
+            }
+        };
+        respond_to_binding_request(
+            &self.socket,
+            &buffer[..len],
             peer,
             Some(self.socket.local_addr()?),
             None,
-        )?;
-        self.socket.send_to(&response, peer).await?;
-        Ok(())
+            stats,
+        )
+        .await
     }
 
-    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+    pub async fn serve(self, shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+        self.serve_inner(shutdown, None).await
+    }
+
+    pub async fn serve_with_stats(
+        self,
+        shutdown: watch::Receiver<bool>,
+        stats: Arc<StunServerStats>,
+    ) -> Result<(), StunError> {
+        self.serve_inner(shutdown, Some(stats)).await
+    }
+
+    async fn serve_inner(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        stats: Option<Arc<StunServerStats>>,
+    ) -> Result<(), StunError> {
         let mut buffer = [0_u8; 1500];
         loop {
             tokio::select! {
@@ -183,20 +293,66 @@ impl BindingStunServer {
                     }
                 }
                 packet = self.socket.recv_from(&mut buffer) => {
-                    let (len, peer) = packet?;
-                    if let Ok(request) = decode_binding_request(&buffer[..len]) {
-                        let response = encode_binding_success_response_with_attrs(
-                            request.transaction_id,
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            if let Some(stats) = stats.as_deref() {
+                                stats.record_socket_receive_error();
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    respond_to_binding_request(
+                        &self.socket,
+                        &buffer[..len],
                             peer,
                             Some(self.socket.local_addr()?),
                             None,
-                        )?;
-                        self.socket.send_to(&response, peer).await?;
-                    }
+                        stats.as_deref(),
+                    )
+                    .await?;
                 }
             }
         }
     }
+}
+
+async fn respond_to_binding_request(
+    response_socket: &UdpSocket,
+    request_bytes: &[u8],
+    peer: SocketAddr,
+    response_origin: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
+    stats: Option<&StunServerStats>,
+) -> Result<(), StunError> {
+    let request = match decode_binding_request(request_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            if let Some(stats) = stats {
+                stats.record_invalid_packet();
+            }
+            return Ok(());
+        }
+    };
+    if let Some(stats) = stats {
+        stats.record_binding_request();
+    }
+    let response = encode_binding_success_response_with_attrs(
+        request.transaction_id,
+        peer,
+        response_origin,
+        other_address,
+    )?;
+    if let Err(error) = response_socket.send_to(&response, peer).await {
+        if let Some(stats) = stats {
+            stats.record_socket_send_error();
+        }
+        return Err(error.into());
+    }
+    if let Some(stats) = stats {
+        stats.record_binding_response();
+    }
+    Ok(())
 }
 
 pub struct Rfc5780StunServer {
@@ -224,21 +380,61 @@ impl Rfc5780StunServer {
     }
 
     pub async fn serve_once(&self) -> Result<(), StunError> {
+        self.serve_once_inner(None).await
+    }
+
+    pub async fn serve_once_with_stats(&self, stats: &StunServerStats) -> Result<(), StunError> {
+        self.serve_once_inner(Some(stats)).await
+    }
+
+    async fn serve_once_inner(&self, stats: Option<&StunServerStats>) -> Result<(), StunError> {
         let mut primary_buffer = [0_u8; 1500];
         let mut alternate_buffer = [0_u8; 1500];
         tokio::select! {
             packet = self.primary.recv_from(&mut primary_buffer) => {
-                let (len, peer) = packet?;
-                self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer).await
+                let (len, peer) = match packet {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        if let Some(stats) = stats {
+                            stats.record_socket_receive_error();
+                        }
+                        return Err(error.into());
+                    }
+                };
+                self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer, stats).await
             }
             packet = self.alternate.recv_from(&mut alternate_buffer) => {
-                let (len, peer) = packet?;
-                self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer).await
+                let (len, peer) = match packet {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        if let Some(stats) = stats {
+                            stats.record_socket_receive_error();
+                        }
+                        return Err(error.into());
+                    }
+                };
+                self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer, stats).await
             }
         }
     }
 
-    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+    pub async fn serve(self, shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+        self.serve_inner(shutdown, None).await
+    }
+
+    pub async fn serve_with_stats(
+        self,
+        shutdown: watch::Receiver<bool>,
+        stats: Arc<StunServerStats>,
+    ) -> Result<(), StunError> {
+        self.serve_inner(shutdown, Some(stats)).await
+    }
+
+    async fn serve_inner(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        stats: Option<Arc<StunServerStats>>,
+    ) -> Result<(), StunError> {
         let mut primary_buffer = [0_u8; 1500];
         let mut alternate_buffer = [0_u8; 1500];
         loop {
@@ -249,12 +445,28 @@ impl Rfc5780StunServer {
                     }
                 }
                 packet = self.primary.recv_from(&mut primary_buffer) => {
-                    let (len, peer) = packet?;
-                    self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer).await?;
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            if let Some(stats) = stats.as_deref() {
+                                stats.record_socket_receive_error();
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    self.respond_to_request(&self.primary, &self.alternate, &primary_buffer[..len], peer, stats.as_deref()).await?;
                 }
                 packet = self.alternate.recv_from(&mut alternate_buffer) => {
-                    let (len, peer) = packet?;
-                    self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer).await?;
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            if let Some(stats) = stats.as_deref() {
+                                stats.record_socket_receive_error();
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    self.respond_to_request(&self.alternate, &self.primary, &alternate_buffer[..len], peer, stats.as_deref()).await?;
                 }
             }
         }
@@ -266,11 +478,20 @@ impl Rfc5780StunServer {
         other_socket: &UdpSocket,
         request_bytes: &[u8],
         peer: SocketAddr,
+        stats: Option<&StunServerStats>,
     ) -> Result<(), StunError> {
         let request = match decode_binding_request(request_bytes) {
             Ok(request) => request,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                if let Some(stats) = stats {
+                    stats.record_invalid_packet();
+                }
+                return Ok(());
+            }
         };
+        if let Some(stats) = stats {
+            stats.record_binding_request();
+        }
         let response_socket = if request.options.change_ip || request.options.change_port {
             other_socket
         } else {
@@ -284,7 +505,15 @@ impl Rfc5780StunServer {
             Some(response_origin),
             Some(other_address),
         )?;
-        response_socket.send_to(&response, peer).await?;
+        if let Err(error) = response_socket.send_to(&response, peer).await {
+            if let Some(stats) = stats {
+                stats.record_socket_send_error();
+            }
+            return Err(error.into());
+        }
+        if let Some(stats) = stats {
+            stats.record_binding_response();
+        }
         Ok(())
     }
 }
@@ -354,7 +583,16 @@ async fn observe_binding_details_with_socket(
     let request = encode_binding_request(transaction_id, options)?;
     socket.send_to(&request, stun_server).await?;
     let mut buffer = [0_u8; 1500];
-    let (len, _server_addr) = socket.recv_from(&mut buffer).await?;
+    let (len, _server_addr) =
+        match tokio::time::timeout(BINDING_RESPONSE_TIMEOUT, socket.recv_from(&mut buffer)).await {
+            Ok(response) => response?,
+            Err(_) => {
+                return Err(StunError::Timeout {
+                    stun_server,
+                    timeout: BINDING_RESPONSE_TIMEOUT,
+                })
+            }
+        };
     decode_binding_success_response_details(&buffer[..len], transaction_id)
 }
 
@@ -890,6 +1128,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_probe_rejects_unusable_stun_servers_before_send() {
+        let error = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddr::from(([203, 0, 113, 10], 0)),
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 203.0.113.10:0 is unusable")
+        ));
+
+        let error = UdpStunProbe
+            .observe_binding_many(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                &[
+                    SocketAddr::from(([203, 0, 113, 10], 3478)),
+                    SocketAddr::from(([0, 0, 0, 0], 3478)),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 0.0.0.0:3478 is unusable")
+        ));
+
+        let error = UdpStunProbe
+            .observe_filtering(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddr::from(([224, 0, 0, 1], 3478)),
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::InvalidResponse(message))
+                if message.contains("STUN server 224.0.0.1:3478 is unusable")
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_probe_times_out_when_server_does_not_answer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let unused_addr = socket.local_addr()?;
+        drop(socket);
+
+        let error = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                unused_addr,
+            )
+            .await;
+        assert!(matches!(
+            error,
+            Err(StunError::Timeout { stun_server, .. }) if stun_server == unused_addr
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn binding_server_serves_until_shutdown() -> Result<(), Box<dyn std::error::Error>> {
         let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let server_addr = server.local_addr()?;
@@ -907,6 +1209,42 @@ mod tests {
 
         shutdown_tx.send(true)?;
         server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binding_server_stats_count_valid_and_invalid_packets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let stats = Arc::new(StunServerStats::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_stats = stats.clone();
+        let server_task =
+            tokio::spawn(async move { server.serve_with_stats(shutdown_rx, server_stats).await });
+
+        let invalid_sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        invalid_sender
+            .send_to(b"not-a-stun-binding-request", server_addr)
+            .await?;
+
+        let candidate = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                server_addr,
+            )
+            .await?;
+        assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.binding_request_count, 1);
+        assert_eq!(snapshot.binding_response_count, 1);
+        assert_eq!(snapshot.invalid_packet_count, 1);
+        assert_eq!(snapshot.socket_receive_error_count, 0);
+        assert_eq!(snapshot.socket_send_error_count, 0);
         Ok(())
     }
 
@@ -986,6 +1324,42 @@ mod tests {
         );
         assert_eq!(observations[1].response_origin, Some(alternate_addr));
         assert_eq!(observations[1].other_address, Some(alternate_addr));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rfc5780_server_stats_count_filtering_probes_and_invalid_packets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = Rfc5780StunServer::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await?;
+        let primary_addr = server.primary_addr()?;
+        let stats = Arc::new(StunServerStats::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_stats = stats.clone();
+        let server_task =
+            tokio::spawn(async move { server.serve_with_stats(shutdown_rx, server_stats).await });
+
+        let invalid_sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        invalid_sender
+            .send_to(b"not-a-stun-binding-request", primary_addr)
+            .await?;
+
+        let observations = UdpStunProbe
+            .observe_filtering(SocketAddr::from(([127, 0, 0, 1], 0)), primary_addr)
+            .await?;
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
+        assert_eq!(observations.len(), 2);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.binding_request_count, 2);
+        assert_eq!(snapshot.binding_response_count, 2);
+        assert_eq!(snapshot.invalid_packet_count, 1);
+        assert_eq!(snapshot.socket_receive_error_count, 0);
+        assert_eq!(snapshot.socket_send_error_count, 0);
         Ok(())
     }
 }

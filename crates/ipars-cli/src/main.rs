@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -9,18 +9,36 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_types::api::{
-    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentStatusResponse,
-    ControlPlaneMetricsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
     RegisterNodeRequest, RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest,
     RevokeTokenResponse,
 };
 use ipars_types::{
-    BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
-    EndpointCandidateKind, JoinTokenClaims, KeyId, NodeId, PathMetrics, PathState, Role, Route,
-    SignedJoinToken, Tag, TokenPolicy,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
+    CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
+    NodeId, PathMetrics, PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
+const MAX_JOIN_TOKEN_TAGS: usize = 64;
+const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
+const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
+const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
+const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
+const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
+const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
+const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
+const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
+const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
+const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
+const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
+const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -101,6 +119,10 @@ struct InitArgs {
     signal_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:3478")]
     stun_listen: SocketAddr,
+    #[arg(long)]
+    stun_alternate_listen: Option<SocketAddr>,
+    #[arg(long, default_value = "0.0.0.0:3479")]
+    stun_http_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:51820")]
     relay_udp_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:9580")]
@@ -144,7 +166,7 @@ struct RoutesArgs {
 
 #[derive(Debug, Subcommand)]
 enum TokenCommand {
-    Create(TokenCreateArgs),
+    Create(Box<TokenCreateArgs>),
     Revoke(TokenRevokeArgs),
 }
 
@@ -168,6 +190,14 @@ struct TokenCreateArgs {
     ttl_seconds: i64,
     #[arg(long = "bootstrap")]
     bootstrap_endpoints: Vec<String>,
+    #[arg(long = "control-plane-bootstrap")]
+    control_plane_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "signal-bootstrap")]
+    signal_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "stun-bootstrap")]
+    stun_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "relay-bootstrap")]
+    relay_bootstrap_endpoints: Vec<String>,
     #[arg(long, default_value_t = false)]
     allow_relay: bool,
     #[arg(long, conflicts_with = "unlimited_uses")]
@@ -200,13 +230,28 @@ struct RelayStatusArgs {
 #[derive(Debug, Subcommand)]
 enum PathCommand {
     Status(PathStatusArgs),
+    Activity(PathActivityArgs),
     Probe(PathProbeArgs),
 }
 
 #[derive(Debug, Args)]
 struct PathStatusArgs {
+    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    agent_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_NODE_ID")]
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PathActivityArgs {
     #[arg(long, env = "IPARS_AGENT_URL")]
     agent_url: Option<String>,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, default_value_t = false)]
+    pin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -249,7 +294,7 @@ struct PathProbeArgs {
 
 #[derive(Debug, Subcommand)]
 enum DockerCommand {
-    Install(DockerInstallArgs),
+    Install(Box<DockerInstallArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -277,6 +322,50 @@ struct DockerInstallArgs {
     docker_host_interface: String,
     #[arg(long = "docker-container-cidr")]
     docker_container_cidrs: Vec<ipnet::IpNet>,
+    #[arg(long = "disable-docker-expose-host-routes", default_value_t = false)]
+    disable_docker_expose_host_routes: bool,
+    #[arg(long = "docker-route-interval-seconds", default_value_t = 60)]
+    docker_route_interval_seconds: u64,
+    #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
+    route_backend: String,
+    #[arg(long)]
+    userspace_wireguard_command: Option<String>,
+    #[arg(long = "userspace-wireguard-arg")]
+    userspace_wireguard_args: Vec<String>,
+    #[arg(
+        long = "userspace-wireguard-ready-timeout-seconds",
+        default_value_t = 10
+    )]
+    userspace_wireguard_ready_timeout_seconds: u64,
+    #[arg(
+        long = "userspace-wireguard-shutdown-timeout-seconds",
+        default_value_t = 5
+    )]
+    userspace_wireguard_shutdown_timeout_seconds: u64,
+    #[arg(long = "relay-forwarder-endpoint")]
+    relay_forwarder_endpoint: Option<String>,
+    #[arg(
+        long = "relay-forwarder-bind",
+        requires = "relay_forwarder_wireguard_endpoint"
+    )]
+    relay_forwarder_bind: Option<String>,
+    #[arg(
+        long = "relay-forwarder-wireguard-endpoint",
+        requires = "relay_forwarder_bind"
+    )]
+    relay_forwarder_wireguard_endpoint: Option<String>,
+    #[arg(long = "relay-forwarder-netns", requires = "relay_forwarder_bind")]
+    relay_forwarder_netns: Option<String>,
+    #[arg(long = "relay-forwarder-max-sessions", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_SESSIONS)]
+    relay_forwarder_max_sessions: usize,
+    #[arg(long = "relay-forwarder-restart-backoff-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS)]
+    relay_forwarder_restart_backoff_seconds: u64,
+    #[arg(long = "relay-forwarder-crash-window-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS)]
+    relay_forwarder_crash_window_seconds: u64,
+    #[arg(long = "relay-forwarder-max-crashes-per-window", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW)]
+    relay_forwarder_max_crashes_per_window: u32,
+    #[arg(long = "relay-forwarder-crash-cooldown-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS)]
+    relay_forwarder_crash_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -291,6 +380,12 @@ struct K8sInstallArgs {
     join_token_secret: String,
     #[arg(long, default_value = "token")]
     join_token_key: String,
+    #[arg(long = "image-repository", value_parser = parse_container_image_repository)]
+    image_repository: Option<String>,
+    #[arg(long = "image-tag", value_parser = parse_container_image_tag)]
+    image_tag: Option<String>,
+    #[arg(long = "image-pull-policy", value_parser = parse_kubernetes_image_pull_policy)]
+    image_pull_policy: Option<String>,
     #[arg(long = "image-pull-secret", value_parser = parse_kubernetes_image_pull_secret_name)]
     image_pull_secrets: Vec<String>,
     #[arg(long = "agent-privileged", default_value_t = false)]
@@ -301,6 +396,12 @@ struct K8sInstallArgs {
     agent_drop_capabilities: Vec<String>,
     #[arg(long = "disable-agent-privilege-escalation", default_value_t = false)]
     disable_agent_privilege_escalation: bool,
+    #[arg(long = "agent-read-only-root-filesystem", default_value_t = false)]
+    agent_read_only_root_filesystem: bool,
+    #[arg(long = "agent-seccomp-profile", value_parser = parse_kubernetes_seccomp_profile_type)]
+    agent_seccomp_profile: Option<String>,
+    #[arg(long = "agent-seccomp-localhost-profile", value_parser = parse_kubernetes_seccomp_localhost_profile)]
+    agent_seccomp_localhost_profile: Option<String>,
     #[arg(long, default_value_t = false)]
     kubernetes_discover_services: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -317,6 +418,12 @@ struct K8sInstallArgs {
     kubernetes_route_provider: Option<String>,
     #[arg(long, default_value_t = 60)]
     kubernetes_route_interval_seconds: u64,
+    #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
+    route_backend: String,
+    #[arg(long = "disable-agent-peer-map", default_value_t = false)]
+    disable_agent_peer_map: bool,
+    #[arg(long = "agent-peer-map-poll-interval-seconds", default_value_t = 30)]
+    agent_peer_map_poll_interval_seconds: u64,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -351,6 +458,8 @@ struct K8sInstallArgs {
     agent_node_selectors: Vec<KeyValueArg>,
     #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
     agent_tolerations: Vec<KubernetesTolerationArg>,
+    #[arg(long = "disable-agent-host-network", default_value_t = false)]
+    disable_agent_host_network: bool,
     #[arg(long = "disable-agent-service-account-token", default_value_t = false)]
     disable_agent_service_account_token: bool,
     #[arg(long = "agent-dns-policy", value_parser = parse_kubernetes_dns_policy)]
@@ -385,12 +494,36 @@ struct K8sInstallArgs {
     agent_min_ready_seconds: Option<u32>,
     #[arg(long = "agent-revision-history-limit", value_parser = parse_kubernetes_non_negative_i32)]
     agent_revision_history_limit: Option<u32>,
+    #[arg(long = "agent-pdb-min-available", value_parser = parse_kubernetes_int_or_percent)]
+    agent_pdb_min_available: Option<String>,
+    #[arg(long = "agent-pdb-max-unavailable", value_parser = parse_kubernetes_int_or_percent)]
+    agent_pdb_max_unavailable: Option<String>,
     #[arg(long, default_value = "ClusterIP", value_parser = parse_kubernetes_service_type)]
     agent_api_service_type: String,
+    #[arg(long = "agent-api-cluster-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
+    agent_api_cluster_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_agent_api", "agent_api_cluster_ip"])]
+    agent_api_secondary_cluster_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-port", value_parser = parse_kubernetes_service_port, requires = "expose_agent_api")]
+    agent_api_port: Option<u16>,
+    #[arg(long = "agent-api-target-port", value_parser = parse_kubernetes_service_port)]
+    agent_api_target_port: Option<u16>,
     #[arg(long = "agent-api-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_node_port: Option<u16>,
+    #[arg(long = "agent-api-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_agent_api")]
+    agent_api_app_protocol: Option<String>,
+    #[arg(
+        long = "agent-api-publish-not-ready-addresses",
+        default_value_t = false,
+        requires = "expose_agent_api"
+    )]
+    agent_api_publish_not_ready_addresses: bool,
     #[arg(long = "agent-api-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_agent_api")]
     agent_api_load_balancer_class: Option<String>,
+    #[arg(long = "agent-api-load-balancer-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
+    agent_api_load_balancer_ip: Option<IpAddr>,
+    #[arg(long = "agent-api-external-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_agent_api")]
+    agent_api_external_ips: Vec<IpAddr>,
     #[arg(long = "agent-api-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_agent_api")]
     agent_api_health_check_node_port: Option<u16>,
     #[arg(
@@ -412,6 +545,8 @@ struct K8sInstallArgs {
     agent_api_network_policy_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "agent-api-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_agent_api")]
     agent_api_internal_traffic_policy: Option<String>,
+    #[arg(long = "agent-api-traffic-distribution", value_parser = parse_kubernetes_traffic_distribution, requires = "expose_agent_api")]
+    agent_api_traffic_distribution: Option<String>,
     #[arg(long = "agent-api-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_agent_api")]
     agent_api_session_affinity: Option<String>,
     #[arg(long = "agent-api-session-affinity-timeout-seconds", value_parser = parse_kubernetes_session_affinity_timeout_seconds, requires = "expose_agent_api")]
@@ -428,12 +563,38 @@ struct K8sInstallArgs {
     expose_relay: bool,
     #[arg(long, default_value = "LoadBalancer", value_parser = parse_kubernetes_service_type)]
     relay_service_type: String,
+    #[arg(long = "relay-cluster-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
+    relay_cluster_ip: Option<IpAddr>,
+    #[arg(long = "relay-secondary-cluster-ip", value_parser = parse_kubernetes_service_ip, requires_all = ["expose_relay", "relay_cluster_ip"])]
+    relay_secondary_cluster_ip: Option<IpAddr>,
+    #[arg(long = "relay-udp-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_udp_port: Option<u16>,
+    #[arg(long = "relay-udp-target-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_udp_target_port: Option<u16>,
+    #[arg(long = "relay-http-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_http_port: Option<u16>,
+    #[arg(long = "relay-http-target-port", value_parser = parse_kubernetes_service_port, requires = "expose_relay")]
+    relay_http_target_port: Option<u16>,
     #[arg(long = "relay-udp-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_udp_node_port: Option<u16>,
     #[arg(long = "relay-http-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_http_node_port: Option<u16>,
+    #[arg(long = "relay-udp-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_relay")]
+    relay_udp_app_protocol: Option<String>,
+    #[arg(long = "relay-http-app-protocol", value_parser = parse_kubernetes_app_protocol, requires = "expose_relay")]
+    relay_http_app_protocol: Option<String>,
+    #[arg(
+        long = "relay-publish-not-ready-addresses",
+        default_value_t = false,
+        requires = "expose_relay"
+    )]
+    relay_publish_not_ready_addresses: bool,
     #[arg(long = "relay-load-balancer-class", value_parser = parse_kubernetes_load_balancer_class, requires = "expose_relay")]
     relay_load_balancer_class: Option<String>,
+    #[arg(long = "relay-load-balancer-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
+    relay_load_balancer_ip: Option<IpAddr>,
+    #[arg(long = "relay-external-ip", value_parser = parse_kubernetes_service_ip, requires = "expose_relay")]
+    relay_external_ips: Vec<IpAddr>,
     #[arg(long = "relay-health-check-node-port", value_parser = parse_kubernetes_node_port, requires = "expose_relay")]
     relay_health_check_node_port: Option<u16>,
     #[arg(
@@ -455,6 +616,8 @@ struct K8sInstallArgs {
     relay_network_policy_cidrs: Vec<ipnet::IpNet>,
     #[arg(long = "relay-internal-traffic-policy", value_parser = parse_kubernetes_internal_traffic_policy, requires = "expose_relay")]
     relay_internal_traffic_policy: Option<String>,
+    #[arg(long = "relay-traffic-distribution", value_parser = parse_kubernetes_traffic_distribution, requires = "expose_relay")]
+    relay_traffic_distribution: Option<String>,
     #[arg(long = "relay-session-affinity", value_parser = parse_kubernetes_session_affinity, requires = "expose_relay")]
     relay_session_affinity: Option<String>,
     #[arg(long = "relay-session-affinity-timeout-seconds", value_parser = parse_kubernetes_session_affinity_timeout_seconds, requires = "expose_relay")]
@@ -463,18 +626,93 @@ struct K8sInstallArgs {
     relay_external_traffic_policy: String,
     #[arg(long = "relay-service-annotation", value_parser = parse_key_value, requires = "expose_relay")]
     relay_service_annotations: Vec<KeyValueArg>,
-    #[arg(long)]
+    #[arg(long = "relay-admission-bearer-token-secret")]
+    relay_admission_bearer_token_secret: Option<String>,
+    #[arg(long = "relay-admission-bearer-token-key")]
+    relay_admission_bearer_token_key: Option<String>,
+    #[arg(long, requires = "expose_relay")]
     relay_public_endpoint: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "expose_relay")]
     relay_admission_url: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "expose_relay")]
     relay_status_url: Option<String>,
+    #[arg(long = "relay-forwarder-endpoint")]
+    relay_forwarder_endpoint: Option<String>,
+    #[arg(
+        long = "relay-forwarder-bind",
+        requires = "relay_forwarder_wireguard_endpoint"
+    )]
+    relay_forwarder_bind: Option<String>,
+    #[arg(
+        long = "relay-forwarder-wireguard-endpoint",
+        requires = "relay_forwarder_bind"
+    )]
+    relay_forwarder_wireguard_endpoint: Option<String>,
+    #[arg(long = "relay-forwarder-netns", requires = "relay_forwarder_bind")]
+    relay_forwarder_netns: Option<String>,
+    #[arg(long = "relay-forwarder-max-sessions", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_SESSIONS)]
+    relay_forwarder_max_sessions: usize,
+    #[arg(long = "relay-forwarder-restart-backoff-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS)]
+    relay_forwarder_restart_backoff_seconds: u64,
+    #[arg(long = "relay-forwarder-crash-window-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS)]
+    relay_forwarder_crash_window_seconds: u64,
+    #[arg(long = "relay-forwarder-max-crashes-per-window", default_value_t = DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW)]
+    relay_forwarder_max_crashes_per_window: u32,
+    #[arg(long = "relay-forwarder-crash-cooldown-seconds", default_value_t = DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS)]
+    relay_forwarder_crash_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyValueArg {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayForwarderInstallSettings<'a> {
+    endpoint: Option<&'a str>,
+    bind: Option<&'a str>,
+    wireguard_endpoint: Option<&'a str>,
+    netns: Option<&'a str>,
+    max_sessions: usize,
+    restart_backoff_seconds: u64,
+    crash_window_seconds: u64,
+    max_crashes_per_window: u32,
+    crash_cooldown_seconds: u64,
+}
+
+impl<'a> RelayForwarderInstallSettings<'a> {
+    fn from_docker(args: &'a DockerInstallArgs) -> Self {
+        Self {
+            endpoint: args.relay_forwarder_endpoint.as_deref(),
+            bind: args.relay_forwarder_bind.as_deref(),
+            wireguard_endpoint: args.relay_forwarder_wireguard_endpoint.as_deref(),
+            netns: args.relay_forwarder_netns.as_deref(),
+            max_sessions: args.relay_forwarder_max_sessions,
+            restart_backoff_seconds: args.relay_forwarder_restart_backoff_seconds,
+            crash_window_seconds: args.relay_forwarder_crash_window_seconds,
+            max_crashes_per_window: args.relay_forwarder_max_crashes_per_window,
+            crash_cooldown_seconds: args.relay_forwarder_crash_cooldown_seconds,
+        }
+    }
+
+    fn from_k8s(args: &'a K8sInstallArgs) -> Self {
+        Self {
+            endpoint: args.relay_forwarder_endpoint.as_deref(),
+            bind: args.relay_forwarder_bind.as_deref(),
+            wireguard_endpoint: args.relay_forwarder_wireguard_endpoint.as_deref(),
+            netns: args.relay_forwarder_netns.as_deref(),
+            max_sessions: args.relay_forwarder_max_sessions,
+            restart_backoff_seconds: args.relay_forwarder_restart_backoff_seconds,
+            crash_window_seconds: args.relay_forwarder_crash_window_seconds,
+            max_crashes_per_window: args.relay_forwarder_max_crashes_per_window,
+            crash_cooldown_seconds: args.relay_forwarder_crash_cooldown_seconds,
+        }
+    }
+
+    fn active(self) -> bool {
+        self.endpoint.is_some() || self.bind.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,7 +755,7 @@ async fn main() -> anyhow::Result<()> {
             None => print_json(&StaticStatus::routes())?,
         },
         Command::Token { command } => match command {
-            TokenCommand::Create(args) => print_json(&create_token(args)?)?,
+            TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
         },
         Command::Relay {
@@ -529,8 +767,21 @@ async fn main() -> anyhow::Result<()> {
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
                 Some(agent_url) => print_json(&path_status(agent_url).await?)?,
+                None if args.control_plane_url.is_some() => {
+                    print_json(&control_plane_path_status(&args).await?)?
+                }
+                None if args.node_id.is_some() => {
+                    anyhow::bail!("ipars path status requires --control-plane-url with --node-id")
+                }
                 None => print_json(&StaticStatus::path())?,
             },
+            PathCommand::Activity(args) => {
+                let agent_url = args
+                    .agent_url
+                    .as_deref()
+                    .context("ipars path activity requires --agent-url or IPARS_AGENT_URL")?;
+                print_json(&path_activity(agent_url, &args).await?)?
+            }
             PathCommand::Probe(args) => {
                 let agent_url = args
                     .agent_url
@@ -541,7 +792,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Docker {
             command: DockerCommand::Install(args),
-        } => print_json(&docker_install_plan(args)?)?,
+        } => print_json(&docker_install_plan(*args)?)?,
         Command::K8s {
             command: K8sCommand::Install(args),
         } => print_json(&k8s_install_plan(*args)?)?,
@@ -550,6 +801,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
+    validate_init_bootstrap_inputs(&args)?;
     let identity = issuer_key_from_source(
         args.issuer_private_key_b64.as_deref(),
         args.issuer_private_key_path.as_deref(),
@@ -576,7 +828,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
             allowed_routes: args.allowed_routes.clone(),
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
-    );
+    )?;
     let token = identity.sign_join_token(claims)?;
     let daemon_specs = init_daemon_specs(
         &args,
@@ -621,6 +873,29 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     })
 }
 
+fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
+    if !endpoint_addr_is_usable(args.public_endpoint) {
+        anyhow::bail!(
+            "--public-endpoint must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
+    }
+    validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
+    validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
+    if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
+        anyhow::bail!(
+            "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
+        );
+    }
+    Ok(())
+}
+
+fn validate_listen_port_for_bootstrap(addr: SocketAddr, flag: &str) -> anyhow::Result<()> {
+    if addr.port() == 0 {
+        anyhow::bail!("{flag} must use a nonzero port for bootstrap token generation");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitDaemonSpec {
     service: &'static str,
@@ -662,6 +937,19 @@ fn init_daemon_specs(
             args.relay_http_listen.port()
         )
     });
+    let mut stun_args = vec![
+        "stun".to_string(),
+        "--listen".to_string(),
+        args.stun_listen.to_string(),
+    ];
+    if let Some(stun_alternate_listen) = args.stun_alternate_listen {
+        stun_args.push("--alternate-listen".to_string());
+        stun_args.push(stun_alternate_listen.to_string());
+    }
+    stun_args.extend([
+        "--http-listen".to_string(),
+        args.stun_http_listen.to_string(),
+    ]);
 
     vec![
         InitDaemonSpec {
@@ -694,11 +982,7 @@ fn init_daemon_specs(
         },
         InitDaemonSpec {
             service: "stun",
-            args: vec![
-                "stun".to_string(),
-                "--listen".to_string(),
-                args.stun_listen.to_string(),
-            ],
+            args: stun_args,
             log_path: log_dir.join("stun.log"),
         },
         InitDaemonSpec {
@@ -878,18 +1162,11 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.issuer_private_key_path.as_deref(),
         MissingIssuerPath::GenerateEphemeral,
     )?;
+    let bootstrap_endpoints = token_create_bootstrap_endpoints(&args)?;
     let cluster_id = args
         .cluster_id
         .map(ClusterId::from_string)
         .unwrap_or_default();
-    let bootstrap_endpoints = args
-        .bootstrap_endpoints
-        .into_iter()
-        .map(|url| BootstrapEndpoint {
-            url,
-            kind: BootstrapEndpointKind::ControlPlane,
-        })
-        .collect();
     let token = issuer.sign_join_token(claims(
         cluster_id,
         TokenIssuer {
@@ -905,8 +1182,139 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
             allowed_routes: args.allowed_routes,
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
-    ))?;
+    )?)?;
     Ok(token)
+}
+
+fn token_create_bootstrap_endpoints(
+    args: &TokenCreateArgs,
+) -> anyhow::Result<Vec<BootstrapEndpoint>> {
+    let mut endpoints = Vec::new();
+    for url in args
+        .bootstrap_endpoints
+        .iter()
+        .chain(args.control_plane_bootstrap_endpoints.iter())
+    {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::ControlPlane,
+            "--bootstrap/--control-plane-bootstrap",
+        )?);
+    }
+    for url in &args.signal_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Signal,
+            "--signal-bootstrap",
+        )?);
+    }
+    for url in &args.stun_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Stun,
+            "--stun-bootstrap",
+        )?);
+    }
+    for url in &args.relay_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::Relay,
+            "--relay-bootstrap",
+        )?);
+    }
+    Ok(endpoints)
+}
+
+fn validated_bootstrap_endpoint(
+    url: &str,
+    kind: BootstrapEndpointKind,
+    flag: &str,
+) -> anyhow::Result<BootstrapEndpoint> {
+    match kind {
+        BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::Signal => {
+            validate_http_bootstrap_url(url, flag)?;
+        }
+        BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
+            validate_udp_bootstrap_url(url, flag)?;
+        }
+    }
+    Ok(BootstrapEndpoint {
+        url: url.to_string(),
+        kind,
+    })
+}
+
+fn validate_http_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{flag} must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    validate_literal_bootstrap_socket(&parsed, flag)?;
+    if !http_url_is_usable_endpoint(url) {
+        anyhow::bail!(
+            "{flag} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast HTTP bootstrap endpoint"
+        );
+    }
+    Ok(())
+}
+
+fn normalize_http_api_base_url(base_url: &str, name: &str) -> anyhow::Result<String> {
+    let parsed =
+        reqwest::Url::parse(base_url).with_context(|| format!("{name} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{name} must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{name} must include a host");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{name} must not include a query or fragment");
+    }
+    if !http_url_is_usable_endpoint(base_url) {
+        anyhow::bail!(
+            "{name} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast numeric host"
+        );
+    }
+    Ok(base_url.trim_end_matches('/').to_string())
+}
+
+fn validate_udp_bootstrap_url(url: &str, flag: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if parsed.scheme() != "udp" {
+        anyhow::bail!("{flag} must use udp");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    if parsed.port().is_none() {
+        anyhow::bail!("{flag} must include a port");
+    }
+    validate_literal_bootstrap_socket(&parsed, flag)?;
+    Ok(())
+}
+
+fn validate_literal_bootstrap_socket(parsed: &reqwest::Url, flag: &str) -> anyhow::Result<()> {
+    let Some(host) = parsed.host_str() else {
+        return Ok(());
+    };
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+    let port = parsed
+        .port_or_known_default()
+        .with_context(|| format!("{flag} must include a port"))?;
+    let addr = SocketAddr::new(ip, port);
+    if !endpoint_addr_is_usable(addr) {
+        anyhow::bail!(
+            "{flag} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast bootstrap address"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -989,12 +1397,15 @@ fn write_issuer_private_key(path: &Path, key: &IdentityKeyPair) -> anyhow::Resul
 }
 
 async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenResponse> {
+    validate_token_identifier(&args.cluster_id, "--cluster-id")?;
+    validate_token_identifier(&args.nonce, "--nonce")?;
     let request = RevokeTokenRequest {
         cluster_id: ClusterId::from_string(args.cluster_id),
         nonce: args.nonce,
     };
+    let url = control_plane_token_revoke_url(&args.control_plane_url)?;
     reqwest::Client::new()
-        .post(control_plane_token_revoke_url(&args.control_plane_url))
+        .post(&url)
         .json(&request)
         .send()
         .await
@@ -1052,6 +1463,43 @@ async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
     get_json(agent_url, "/v1/paths", "agent path status").await
 }
 
+async fn control_plane_path_status(
+    args: &PathStatusArgs,
+) -> anyhow::Result<ControlPlanePathsResponse> {
+    let control_plane_url = args
+        .control_plane_url
+        .as_deref()
+        .context("ipars path status requires --control-plane-url")?;
+    let node_id = required_node_id(args.node_id.as_deref(), "path status")?;
+    get_json(
+        control_plane_url,
+        &format!("/v1/paths/{node_id}"),
+        "control-plane path status",
+    )
+    .await
+}
+
+async fn path_activity(
+    agent_url: &str,
+    args: &PathActivityArgs,
+) -> anyhow::Result<AgentPeerActivityResponse> {
+    let request = path_activity_request(args)?;
+    post_json(
+        agent_url,
+        "/v1/peer-activity",
+        "agent peer activity",
+        &request,
+    )
+    .await
+}
+
+fn path_activity_request(args: &PathActivityArgs) -> anyhow::Result<AgentPeerActivityRequest> {
+    Ok(AgentPeerActivityRequest {
+        peer: validated_node_id(&args.peer, "--peer")?,
+        pin: args.pin,
+    })
+}
+
 async fn path_probe(
     agent_url: &str,
     args: &PathProbeArgs,
@@ -1064,11 +1512,17 @@ fn path_probe_request(
     args: &PathProbeArgs,
     observed_at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<AgentPathProbeRequest> {
-    Ok(AgentPathProbeRequest {
-        peer: NodeId::from_string(args.peer.clone()),
+    let peer = validated_node_id(&args.peer, "--peer")?;
+    let relay_node = args
+        .relay_node
+        .as_deref()
+        .map(|relay_node| validated_node_id(relay_node, "--relay-node"))
+        .transpose()?;
+    let request = AgentPathProbeRequest {
+        peer: peer.clone(),
         selected_state: args.state,
-        selected_candidate: path_probe_candidate(args, observed_at)?,
-        relay_node: args.relay_node.clone().map(NodeId::from_string),
+        selected_candidate: path_probe_candidate(args, observed_at, &peer)?,
+        relay_node,
         metrics: PathMetrics {
             latency_ms: args.latency_ms,
             loss_ppm: args.loss_ppm,
@@ -1079,12 +1533,15 @@ fn path_probe_request(
         policy_allowed: !args.policy_denied,
         cost: args.cost,
         pin: args.pin,
-    })
+    };
+    request.metrics.validate()?;
+    Ok(request)
 }
 
 fn path_probe_candidate(
     args: &PathProbeArgs,
     observed_at: chrono::DateTime<Utc>,
+    peer: &NodeId,
 ) -> anyhow::Result<Option<EndpointCandidate>> {
     let Some(addr) = args.candidate_addr else {
         if args.candidate_kind.is_some()
@@ -1097,8 +1554,8 @@ fn path_probe_candidate(
         return Ok(None);
     };
 
-    Ok(Some(EndpointCandidate {
-        node_id: NodeId::from_string(args.peer.clone()),
+    let candidate = EndpointCandidate {
+        node_id: peer.clone(),
         kind: args
             .candidate_kind
             .unwrap_or(EndpointCandidateKind::PublicUdp),
@@ -1109,14 +1566,29 @@ fn path_probe_candidate(
         source: args
             .candidate_source
             .unwrap_or(CandidateSource::ControlPlane),
-    }))
+    };
+    if let Err(reason) = candidate.validate_kind_address() {
+        anyhow::bail!(
+            "selected candidate {:?} at {} is invalid: {reason}",
+            candidate.kind,
+            candidate.addr
+        );
+    }
+    if !endpoint_addr_is_usable(candidate.addr) {
+        anyhow::bail!(
+            "selected candidate {:?} at {} is unusable",
+            candidate.kind,
+            candidate.addr
+        );
+    }
+    Ok(Some(candidate))
 }
 
 async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<T>
 where
     T: DeserializeOwned,
 {
-    let url = api_url(base_url, path);
+    let url = api_url(base_url, path, label)?;
     reqwest::Client::new()
         .get(&url)
         .send()
@@ -1139,7 +1611,7 @@ where
     Request: Serialize + ?Sized,
     Response: DeserializeOwned,
 {
-    let url = api_url(base_url, path);
+    let url = api_url(base_url, path, label)?;
     reqwest::Client::new()
         .post(&url)
         .json(request)
@@ -1153,12 +1625,9 @@ where
         .with_context(|| format!("failed to decode {label} response from {url}"))
 }
 
-fn api_url(base_url: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+fn api_url(base_url: &str, path: &str, label: &str) -> anyhow::Result<String> {
+    let base_url = normalize_http_api_base_url(base_url, &format!("{label} URL"))?;
+    Ok(format!("{}/{}", base_url, path.trim_start_matches('/')))
 }
 
 fn parse_path_state(value: &str) -> Result<PathState, String> {
@@ -1212,6 +1681,15 @@ fn parse_bootstrap_scheme(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_route_backend(value: &str) -> Result<String, String> {
+    match value {
+        "command" | "kernel-netlink" => Ok(value.to_string()),
+        _ => Err(format!(
+            "route backend must be command or kernel-netlink; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_service_type(value: &str) -> Result<String, String> {
     match value {
         "ClusterIP" | "NodePort" | "LoadBalancer" => Ok(value.to_string()),
@@ -1239,6 +1717,15 @@ fn parse_kubernetes_internal_traffic_policy(value: &str) -> Result<String, Strin
     }
 }
 
+fn parse_kubernetes_traffic_distribution(value: &str) -> Result<String, String> {
+    match value {
+        "PreferSameZone" | "PreferSameNode" | "PreferClose" => Ok(value.to_string()),
+        _ => Err(format!(
+            "traffic distribution must be PreferSameZone, PreferSameNode, or PreferClose; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_session_affinity(value: &str) -> Result<String, String> {
     match value {
         "None" | "ClientIP" => Ok(value.to_string()),
@@ -1257,6 +1744,15 @@ fn parse_kubernetes_dns_policy(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_kubernetes_seccomp_profile_type(value: &str) -> Result<String, String> {
+    match value {
+        "RuntimeDefault" | "Localhost" | "Unconfined" => Ok(value.to_string()),
+        _ => Err(format!(
+            "seccomp profile type must be RuntimeDefault, Localhost, or Unconfined; got {value}"
+        )),
+    }
+}
+
 fn parse_kubernetes_host_path_type(value: &str) -> Result<String, String> {
     match value {
         "DirectoryOrCreate" | "Directory" => Ok(value.to_string()),
@@ -1268,6 +1764,11 @@ fn parse_kubernetes_host_path_type(value: &str) -> Result<String, String> {
 
 fn parse_kubernetes_absolute_path(value: &str) -> Result<String, String> {
     validate_kubernetes_absolute_path(value, "Kubernetes path")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_seccomp_localhost_profile(value: &str) -> Result<String, String> {
+    validate_kubernetes_seccomp_localhost_profile(value)?;
     Ok(value.to_string())
 }
 
@@ -1308,8 +1809,47 @@ fn parse_kubernetes_ip_family(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_kubernetes_service_ip(value: &str) -> Result<IpAddr, String> {
+    let ip = value
+        .parse::<IpAddr>()
+        .map_err(|_| format!("Service IP address must be IPv4 or IPv6; got {value}"))?;
+    if let Some(reason) = kubernetes_service_ip_rejection_reason(ip) {
+        return Err(format!(
+            "Service IP address must not use {reason} address {ip}"
+        ));
+    }
+    Ok(ip)
+}
+
 const KUBERNETES_NODE_PORT_MIN: u16 = 30000;
 const KUBERNETES_NODE_PORT_MAX: u16 = 32767;
+const KUBERNETES_SERVICE_PORT_MIN: u16 = 1;
+const KUBERNETES_SERVICE_PORT_MAX: u16 = 65535;
+
+fn parse_kubernetes_service_port(value: &str) -> Result<u16, String> {
+    let port = value.parse::<u16>().map_err(|_| {
+        format!(
+            "Service port must be an integer between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}; got {value}"
+        )
+    })?;
+    if (KUBERNETES_SERVICE_PORT_MIN..=KUBERNETES_SERVICE_PORT_MAX).contains(&port) {
+        Ok(port)
+    } else {
+        Err(format!(
+            "Service port must be between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}; got {value}"
+        ))
+    }
+}
+
+fn validate_kubernetes_service_port_value(port: u16, flag: &str) -> anyhow::Result<()> {
+    if (KUBERNETES_SERVICE_PORT_MIN..=KUBERNETES_SERVICE_PORT_MAX).contains(&port) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{flag} must be between {KUBERNETES_SERVICE_PORT_MIN} and {KUBERNETES_SERVICE_PORT_MAX}"
+        );
+    }
+}
 
 fn parse_kubernetes_node_port(value: &str) -> Result<u16, String> {
     let port = value
@@ -1326,6 +1866,11 @@ fn parse_kubernetes_node_port(value: &str) -> Result<u16, String> {
 
 fn parse_kubernetes_load_balancer_class(value: &str) -> Result<String, String> {
     validate_kubernetes_load_balancer_class(value)?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_app_protocol(value: &str) -> Result<String, String> {
+    validate_kubernetes_app_protocol(value)?;
     Ok(value.to_string())
 }
 
@@ -1426,6 +1971,25 @@ fn parse_kubernetes_service_account_name(value: &str) -> Result<String, String> 
 fn parse_kubernetes_image_pull_secret_name(value: &str) -> Result<String, String> {
     validate_kubernetes_dns_subdomain(value, "imagePullSecrets entry")?;
     Ok(value.to_string())
+}
+
+fn parse_container_image_repository(value: &str) -> Result<String, String> {
+    validate_container_image_repository(value, "image repository")?;
+    Ok(value.to_string())
+}
+
+fn parse_container_image_tag(value: &str) -> Result<String, String> {
+    validate_container_image_tag(value, "image tag")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_image_pull_policy(value: &str) -> Result<String, String> {
+    match value {
+        "Always" | "IfNotPresent" | "Never" => Ok(value.to_string()),
+        _ => Err(format!(
+            "image pull policy must be Always, IfNotPresent, or Never; got {value}"
+        )),
+    }
 }
 
 fn parse_linux_capability(value: &str) -> Result<String, String> {
@@ -1629,6 +2193,22 @@ fn validate_kubernetes_load_balancer_class(value: &str) -> Result<(), String> {
     validate_kubernetes_qualified_name(name, "loadBalancerClass name")
 }
 
+fn validate_kubernetes_app_protocol(value: &str) -> Result<(), String> {
+    let (prefix, name) = match value.split_once('/') {
+        Some((prefix, name)) => {
+            if name.contains('/') {
+                return Err("appProtocol must contain at most one '/' separator".to_string());
+            }
+            (Some(prefix), name)
+        }
+        None => (None, value),
+    };
+    if let Some(prefix) = prefix {
+        validate_kubernetes_dns_subdomain(prefix, "appProtocol prefix")?;
+    }
+    validate_kubernetes_qualified_name(name, "appProtocol name")
+}
+
 fn validate_kubernetes_dns_subdomain(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -1689,7 +2269,14 @@ fn validate_kubernetes_qualified_name(value: &str, label: &str) -> Result<(), St
     Ok(())
 }
 
+const KUBERNETES_ANNOTATION_VALUE_MAX_BYTES: usize = 262_144;
+
 fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
+    if value.len() > KUBERNETES_ANNOTATION_VALUE_MAX_BYTES {
+        return Err(format!(
+            "annotation value exceeds {KUBERNETES_ANNOTATION_VALUE_MAX_BYTES} bytes"
+        ));
+    }
     if value.chars().any(char::is_control) {
         return Err("annotation value cannot contain control characters".to_string());
     }
@@ -1698,6 +2285,23 @@ fn validate_kubernetes_annotation_value(value: &str) -> Result<(), String> {
             "annotation value cannot contain whitespace in generated Helm --set-string commands"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_annotation_args(
+    flag: &str,
+    annotations: &[KeyValueArg],
+) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for annotation in annotations {
+        validate_kubernetes_annotation_key(&annotation.key)
+            .map_err(|error| anyhow::anyhow!("{flag} {error}"))?;
+        validate_kubernetes_annotation_value(&annotation.value)
+            .map_err(|error| anyhow::anyhow!("{flag} {error}"))?;
+        if !seen.insert(annotation.key.as_str()) {
+            anyhow::bail!("{flag} must not repeat annotation key {}", annotation.key);
+        }
     }
     Ok(())
 }
@@ -1725,6 +2329,137 @@ fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(),
         .is_some_and(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(format!("{label} must end with a digit or suffix letter"));
+    }
+    Ok(())
+}
+
+fn validate_container_image_repository(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 255 {
+        return Err(format!("{label} exceeds 255 bytes"));
+    }
+    if value.starts_with('/') || value.ends_with('/') || value.contains("//") {
+        return Err(format!(
+            "{label} must be a non-empty slash-separated image repository path"
+        ));
+    }
+    if value.contains('@') {
+        return Err(format!(
+            "{label} must not include a digest; pin an immutable tag with --image-tag"
+        ));
+    }
+    if value.bytes().any(|byte| {
+        !matches!(
+            byte,
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' | b'/' | b':'
+        )
+    }) {
+        return Err(format!(
+            "{label} may contain only lowercase ASCII letters, digits, '.', '_', '-', '/', and registry port ':'"
+        ));
+    }
+    let components = value.split('/').collect::<Vec<_>>();
+    if components
+        .last()
+        .is_some_and(|segment| segment.contains(':'))
+    {
+        return Err(format!(
+            "{label} must not include a tag; use --image-tag instead"
+        ));
+    }
+    for (index, component) in components.iter().enumerate() {
+        if let Some((_, port)) = component.rsplit_once(':') {
+            if index != 0 || components.len() == 1 || port.is_empty() {
+                return Err(format!(
+                    "{label} registry port may only appear before the first '/'"
+                ));
+            }
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{label} registry port must be numeric"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_container_image_tag(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > 128 {
+        return Err(format!("{label} exceeds 128 bytes"));
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(format!("{label} must not be empty"));
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return Err(format!(
+            "{label} must start with an ASCII letter, digit, or '_'"
+        ));
+    }
+    if bytes.any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))) {
+        return Err(format!(
+            "{label} may contain only ASCII letters, digits, '_', '.', and '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_identifier(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_TOKEN_IDENTIFIER_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        anyhow::bail!("{label} must contain only ASCII letters, digits, '_', '.' or '-'");
+    }
+    Ok(())
+}
+
+fn validate_join_token_ttl(ttl_seconds: i64) -> anyhow::Result<()> {
+    if ttl_seconds <= 0 {
+        anyhow::bail!("join token TTL must be greater than zero seconds");
+    }
+    if ttl_seconds > MAX_JOIN_TOKEN_TTL_SECONDS {
+        anyhow::bail!("join token TTL must not exceed {MAX_JOIN_TOKEN_TTL_SECONDS} seconds");
+    }
+    Ok(())
+}
+
+fn validate_join_token_allowed_routes(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    if cidrs.len() > MAX_JOIN_TOKEN_ALLOWED_ROUTES {
+        anyhow::bail!("{flag} may be repeated at most {MAX_JOIN_TOKEN_ALLOWED_ROUTES} times");
+    }
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} join-token allowed route {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical join-token allowed route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat join-token allowed route {route}");
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping join-token allowed routes {overlap} and {route}"
+            );
+        }
+        routes.push(route);
     }
     Ok(())
 }
@@ -1761,6 +2496,12 @@ fn append_helm_string_list(command: &mut String, key: &str, values: &[String]) {
     }
 }
 
+fn append_helm_ipaddr_list(command: &mut String, key: &str, values: &[IpAddr]) {
+    for (index, value) in values.iter().enumerate() {
+        append_helm_set_string(command, &format!("{key}[{index}]"), &value.to_string());
+    }
+}
+
 fn append_helm_literal_list(command: &mut String, key: &str, values: &[String]) {
     if values.is_empty() {
         return;
@@ -1785,9 +2526,14 @@ fn shell_word(value: &str) -> String {
 }
 
 fn required_node_id(value: Option<&str>, command: &str) -> anyhow::Result<NodeId> {
-    value
-        .map(NodeId::from_string)
-        .with_context(|| format!("ipars {command} requires --node-id with --control-plane-url"))
+    let value = value
+        .with_context(|| format!("ipars {command} requires --node-id with --control-plane-url"))?;
+    validated_node_id(value, "--node-id")
+}
+
+fn validated_node_id(value: &str, label: &str) -> anyhow::Result<NodeId> {
+    validate_token_identifier(value, label)?;
+    Ok(NodeId::from_string(value))
 }
 
 fn routes_output(node_id: NodeId, peer_map: PeerMap) -> RoutesOutput {
@@ -1838,8 +2584,21 @@ fn claims(
     ttl_seconds: i64,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
     policy_input: TokenPolicyInput,
-) -> JoinTokenClaims {
+) -> anyhow::Result<JoinTokenClaims> {
+    validate_token_identifier(cluster_id.as_str(), "--cluster-id")?;
+    validate_token_identifier(issuer.node_id.as_str(), "issuer node ID")?;
+    validate_token_identifier(issuer.key_id.as_str(), "--issuer-key-id")?;
+    validate_token_identifier(&role, "--role")?;
+    validate_join_token_ttl(ttl_seconds)?;
+    if tags.len() > MAX_JOIN_TOKEN_TAGS {
+        anyhow::bail!("--tag may be repeated at most {MAX_JOIN_TOKEN_TAGS} times");
+    }
+    for tag in &tags {
+        validate_token_identifier(tag, "--tag")?;
+    }
+    validate_join_token_allowed_routes("--allowed-route", &policy_input.allowed_routes)?;
     let now = Utc::now();
+    let ttl = Duration::seconds(ttl_seconds);
     let tag_set = tags
         .into_iter()
         .map(Tag::from_string)
@@ -1852,10 +2611,10 @@ fn claims(
         ..TokenPolicy::default()
     };
 
-    JoinTokenClaims {
+    Ok(JoinTokenClaims {
         cluster_id,
         bootstrap_endpoints,
-        expires_at: now + Duration::seconds(ttl_seconds),
+        expires_at: now + ttl,
         not_before: now - Duration::seconds(5),
         role: Role::from_string(role),
         tags: tag_set,
@@ -1863,7 +2622,7 @@ fn claims(
         key_id: issuer.key_id,
         policy,
         nonce: format!("nonce-{}", now.timestamp_nanos_opt().unwrap_or_default()),
-    }
+    })
 }
 
 fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
@@ -1911,31 +2670,35 @@ fn control_plane_join_urls(
     token: &SignedJoinToken,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let base_urls = override_url
-        .map(|url| vec![url.to_string()])
-        .unwrap_or_else(|| {
+    let (base_urls, name) = if let Some(url) = override_url {
+        (vec![url.to_string()], "control-plane URL")
+    } else {
+        (
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
                 .map(|endpoint| endpoint.url.clone())
-                .collect()
-        });
+                .collect(),
+            "control-plane bootstrap URL",
+        )
+    };
     if base_urls.is_empty() {
         anyhow::bail!("join token does not contain a control-plane bootstrap URL");
     }
-    Ok(base_urls
+    base_urls
         .into_iter()
-        .map(|base_url| format!("{}/v1/join", base_url.trim_end_matches('/')))
-        .collect())
+        .map(|base_url| {
+            normalize_http_api_base_url(&base_url, name)
+                .map(|base_url| format!("{base_url}/v1/join"))
+        })
+        .collect()
 }
 
-fn control_plane_token_revoke_url(control_plane_url: &str) -> String {
-    format!(
-        "{}/v1/tokens/revoke",
-        control_plane_url.trim_end_matches('/')
-    )
+fn control_plane_token_revoke_url(control_plane_url: &str) -> anyhow::Result<String> {
+    let control_plane_url = normalize_http_api_base_url(control_plane_url, "control-plane URL")?;
+    Ok(format!("{control_plane_url}/v1/tokens/revoke"))
 }
 
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
@@ -2025,22 +2788,35 @@ struct InstallEnvironment {
 fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_docker_install_args(&args)?;
     let compose_file = args.compose_file.display().to_string();
-    let compose_prefix = format!(
-        "docker compose -p {} -f {}",
-        shell_word(&args.project_name),
-        shell_word(&compose_file)
-    );
+    let mut compose_prefix = format!("docker compose -p {}", shell_word(&args.project_name));
+    for compose_file in docker_install_compose_files(&args) {
+        compose_prefix.push_str(" -f ");
+        compose_prefix.push_str(&shell_word(&compose_file));
+    }
     let environment = docker_install_environment(&args);
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
-        "/dev/net/tun available on agent/relay hosts".to_string(),
-        "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
         "net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
     ];
     if args.rootless {
         prerequisites.push(
+            "Rootless Docker Engine for Compose services that cannot receive host kernel capabilities"
+                .to_string(),
+        );
+    } else {
+        prerequisites.push("/dev/net/tun available on agent/relay hosts".to_string());
+        prerequisites.push("CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string());
+    }
+    if args.rootless && args.docker_discover_networks {
+        prerequisites.push(
             "Rootless Docker Engine with a reachable user Docker socket for network discovery"
+                .to_string(),
+        );
+    }
+    if args.rootless {
+        prerequisites.push(
+            "A userspace WireGuard implementation started before the agent and exposing the configured interface through wg(8)"
                 .to_string(),
         );
     }
@@ -2048,35 +2824,92 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites
             .push("Docker API access from the agent for bridge-network IPAM discovery".to_string());
     }
+    if args.relay_forwarder_bind.is_some() {
+        prerequisites.push(
+            "A reachable local WireGuard UDP endpoint for relay forwarder proxying".to_string(),
+        );
+    }
+    if args.relay_forwarder_netns.is_some() {
+        prerequisites.push(
+            "CAP_SYS_ADMIN and a host /var/run/netns bind mount for relay forwarder namespace placement".to_string(),
+        );
+    }
     let mut notes = vec![
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
-        "The bundled Compose file mounts IPARS_DOCKER_API_SOCKET_HOST at /run/ipars/docker.sock for Docker API discovery".to_string(),
+        "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
+        "Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string(),
+        "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+        "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
         "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
     ];
-    if args.rootless {
-        notes.push("Rootless Docker network discovery can use the user socket, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
-    } else {
-        notes.push("Rootless Docker discovery is supported, but full rootless dataplane mutation still needs a userspace WireGuard backend".to_string());
+    if args.docker_discover_networks {
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
+    if args.rootless {
+        notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
+        if args.userspace_wireguard_command.is_some() {
+            notes.push("Rootless Docker network discovery uses the user socket, selects the userspace-command WireGuard backend, and starts the configured userspace WireGuard process before peer-map sync".to_string());
+        } else {
+            notes.push("Rootless Docker network discovery uses the user socket and selects the userspace-command WireGuard backend; set --userspace-wireguard-command or pre-create the configured userspace WireGuard interface before peer-map sync starts".to_string());
+        }
+    } else {
+        notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
+    }
+    if args.relay_forwarder_netns.is_some() {
+        notes.push("Relay forwarder namespace placement keeps the base Compose service least-privileged; add CAP_SYS_ADMIN and bind-mount the host /var/run/netns directory when enabling IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string());
+    }
+
+    let mut commands = Vec::new();
+    if args.docker_discover_networks {
+        commands.push(docker_api_socket_preflight_command(&args));
+    }
+    commands.push(format!("{compose_prefix} config"));
+    commands.push(format!("{compose_prefix} up -d --build"));
 
     Ok(InstallPlan {
         platform: "docker-compose".to_string(),
         manifest: compose_file,
-        commands: vec![
-            format!("{compose_prefix} config"),
-            format!("{compose_prefix} up -d --build"),
-        ],
+        commands,
         environment,
         prerequisites,
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
+            "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
         notes,
     })
+}
+
+fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
+    let mut files = vec![args.compose_file.display().to_string()];
+    if args.rootless {
+        files.push(DOCKER_ROOTLESS_COMPOSE_FILE.to_string());
+    }
+    if args.docker_discover_networks {
+        files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
+    }
+    files
+}
+
+fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
+    let fallback = if let Some(socket) = args.docker_api_socket.as_ref() {
+        format!(
+            "docker_socket={}",
+            shell_word(&socket.display().to_string())
+        )
+    } else if args.rootless {
+        ": \"${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}\"; docker_socket=\"${XDG_RUNTIME_DIR}/docker.sock\"".to_string()
+    } else {
+        "docker_socket=/var/run/docker.sock".to_string()
+    };
+    format!(
+        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+    )
 }
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
@@ -2084,6 +2917,18 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     if let Some(namespace) = args.docker_container_namespace.as_deref() {
         validate_linux_namespace_name(namespace)?;
     }
+    if let Some(socket) = args.docker_api_socket.as_ref() {
+        validate_docker_api_socket_path(socket)?;
+        if !args.docker_discover_networks {
+            anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+        }
+    }
+    validate_positive_docker_seconds(
+        args.docker_route_interval_seconds,
+        "--docker-route-interval-seconds",
+    )?;
+    validate_docker_userspace_wireguard_args(args)?;
+    validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
@@ -2092,8 +2937,212 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
             "--docker-discover-networks cannot be combined with explicit --docker-container-cidr values"
         );
     }
-    for filter in &args.docker_networks {
-        validate_docker_network_filter(filter)?;
+    validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
+    validate_docker_network_filters(&args.docker_networks)?;
+    Ok(())
+}
+
+fn validate_docker_api_socket_path(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("--docker-api-socket must be an absolute Unix socket path");
+    }
+    let value = path
+        .as_os_str()
+        .to_str()
+        .context("--docker-api-socket must be valid UTF-8")?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("--docker-api-socket must not contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_docker_container_cidrs(flag: &str, cidrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut routes = Vec::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} Docker container CIDR {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!(
+                "{flag} must use canonical Docker container CIDR route {route}, not {cidr}"
+            );
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Docker container CIDR route {route}");
+        }
+        if let Some(overlap) = routes
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping Docker container CIDR routes {overlap} and {route}"
+            );
+        }
+        routes.push(route);
+    }
+    Ok(())
+}
+
+fn restricted_route_cidr_reason(cidr: &ipnet::IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        ipnet::IpNet::V4(network) => restricted_docker_ipv4_cidr_reason(network),
+        ipnet::IpNet::V6(network) => restricted_docker_ipv6_cidr_reason(network),
+    }
+}
+
+fn restricted_docker_ipv4_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_docker_ipv6_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ip_cidrs_overlap(left: &ipnet::IpNet, right: &ipnet::IpNet) -> bool {
+    match (left, right) {
+        (ipnet::IpNet::V4(left), ipnet::IpNet::V4(right)) => ipv4_cidrs_overlap(left, right),
+        (ipnet::IpNet::V6(left), ipnet::IpNet::V6(right)) => ipv6_cidrs_overlap(left, right),
+        _ => false,
+    }
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    validate_bounded_docker_seconds(
+        args.userspace_wireguard_ready_timeout_seconds,
+        "--userspace-wireguard-ready-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
+    )?;
+    validate_bounded_docker_seconds(
+        args.userspace_wireguard_shutdown_timeout_seconds,
+        "--userspace-wireguard-shutdown-timeout-seconds",
+        MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS,
+    )?;
+    if !args.userspace_wireguard_args.is_empty() && args.userspace_wireguard_command.is_none() {
+        anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
+    }
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        validate_docker_runtime_program_token(command, "--userspace-wireguard-command")?;
+    }
+    anyhow::ensure!(
+        args.userspace_wireguard_args.len() <= MAX_USERSPACE_WIREGUARD_ARGS,
+        "--userspace-wireguard-arg may be repeated at most {MAX_USERSPACE_WIREGUARD_ARGS} times"
+    );
+    for argument in &args.userspace_wireguard_args {
+        if argument.is_empty() {
+            anyhow::bail!("--userspace-wireguard-arg cannot be empty");
+        }
+        if argument.len() > MAX_USERSPACE_WIREGUARD_ARG_BYTES {
+            anyhow::bail!(
+                "--userspace-wireguard-arg exceeds {MAX_USERSPACE_WIREGUARD_ARG_BYTES} bytes"
+            );
+        }
+        if argument.chars().any(char::is_control) {
+            anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
+        }
+        if argument.contains(',') {
+            anyhow::bail!(
+                "--userspace-wireguard-arg must not contain ',' because Docker Compose passes userspace WireGuard arguments through comma-delimited IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_docker_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_USERSPACE_WIREGUARD_COMMAND_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_USERSPACE_WIREGUARD_COMMAND_BYTES} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+    if value.chars().any(char::is_whitespace) {
+        anyhow::bail!("{label} must not contain whitespace");
+    }
+    if value.contains('/') && !Path::new(value).is_absolute() {
+        anyhow::bail!("{label} must be a bare command name or an absolute path");
+    }
+    Ok(())
+}
+
+fn validate_bounded_docker_seconds(value: u64, label: &str, max: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{label} must be greater than zero");
+    }
+    if value > max {
+        anyhow::bail!("{label} must not exceed {max}");
+    }
+    Ok(())
+}
+
+fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("{label} must be greater than zero");
     }
     Ok(())
 }
@@ -2122,6 +3171,12 @@ fn validate_linux_namespace_name(name: &str) -> anyhow::Result<()> {
     }
     if name.len() > 64 {
         anyhow::bail!("linux network namespace name `{name}` exceeds 64 bytes");
+    }
+    if matches!(name, "." | "..") {
+        anyhow::bail!("linux network namespace name `{name}` must not be '.' or '..'");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("linux network namespace name `{name}` must not start with '-'");
     }
     if !name
         .bytes()
@@ -2174,15 +3229,48 @@ fn validate_docker_network_filter(filter: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for filter in filters {
+        validate_docker_network_filter(filter)?;
+        if !seen.insert(filter.as_str()) {
+            anyhow::bail!("--docker-network `{filter}` must not be repeated");
+        }
+    }
+    Ok(())
+}
+
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
-    let mut environment = vec![InstallEnvironment {
-        name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
-        value: "true".to_string(),
-    }];
+    let mut environment = vec![
+        InstallEnvironment {
+            name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+            value: "true".to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+            value: (!args.disable_docker_expose_host_routes).to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+            value: args.docker_route_interval_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
+            value: args.route_backend.clone(),
+        },
+        InstallEnvironment {
+            name: "IPARS_STUN_ALTERNATE_LISTEN".to_string(),
+            value: DEFAULT_STUN_ALTERNATE_LISTEN.to_string(),
+        },
+    ];
     if args.docker_discover_networks {
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
             value: "true".to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_DOCKER_API_SOCKET".to_string(),
+            value: "/run/ipars/docker.sock".to_string(),
         });
     }
     if !args.docker_networks.is_empty() {
@@ -2196,12 +3284,43 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: socket.display().to_string(),
         });
-    } else if args.rootless {
+    } else if args.rootless && args.docker_discover_networks {
         environment.push(InstallEnvironment {
             name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
             value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
         });
     }
+    if args.rootless || args.userspace_wireguard_command.is_some() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+            value: "userspace-command".to_string(),
+        });
+    }
+    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+            value: command.to_string(),
+        });
+    }
+    if !args.userspace_wireguard_args.is_empty() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+            value: args.userspace_wireguard_args.join(","),
+        });
+    }
+    if args.rootless || args.userspace_wireguard_command.is_some() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+            value: args.userspace_wireguard_ready_timeout_seconds.to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+            value: args
+                .userspace_wireguard_shutdown_timeout_seconds
+                .to_string(),
+        });
+    }
+    append_docker_relay_forwarder_environment(&mut environment, args);
     let container_namespace = args
         .docker_container_namespace
         .clone()
@@ -2232,13 +3351,68 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
     environment
 }
 
+fn append_docker_relay_forwarder_environment(
+    environment: &mut Vec<InstallEnvironment>,
+    args: &DockerInstallArgs,
+) {
+    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
+            value: endpoint.to_string(),
+        });
+    }
+    let Some(bind) = args.relay_forwarder_bind.as_deref() else {
+        return;
+    };
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_BIND".to_string(),
+        value: bind.to_string(),
+    });
+    if let Some(wireguard_endpoint) = args.relay_forwarder_wireguard_endpoint.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
+            value: wireguard_endpoint.to_string(),
+        });
+    }
+    if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+            value: namespace.to_string(),
+        });
+    }
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
+        value: args.relay_forwarder_max_sessions.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
+        value: args.relay_forwarder_restart_backoff_seconds.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
+        value: args.relay_forwarder_crash_window_seconds.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
+        value: args.relay_forwarder_max_crashes_per_window.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
+        value: args.relay_forwarder_crash_cooldown_seconds.to_string(),
+    });
+}
+
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
     validate_k8s_image_pull_secrets(&args)?;
+    validate_k8s_relay_admission_bearer_token_secret(&args)?;
+    validate_k8s_relay_advertisement(&args)?;
+    validate_k8s_relay_forwarder(&args)?;
     validate_k8s_service_account_options(&args)?;
     validate_k8s_agent_pod_options(&args)?;
     validate_k8s_agent_security_context(&args)?;
     validate_k8s_agent_rollout_options(&args)?;
+    validate_k8s_agent_pdb_options(&args)?;
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
@@ -2254,7 +3428,9 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     append_k8s_image_values(&mut helm_command, &args);
     append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
+    append_k8s_relay_forwarder_values(&mut helm_command, &args);
     append_k8s_agent_pod_values(&mut helm_command, &args);
+    append_k8s_relay_admission_bearer_token_values(&mut helm_command, &args);
     if args.enable_network_policy {
         helm_command.push_str(" --set networkPolicy.enabled=true");
         if args.network_policy_acknowledge_host_network {
@@ -2277,14 +3453,49 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             );
         }
     }
+    if let Some(port) = args.agent_api_target_port {
+        helm_command.push_str(&format!(" --set agent.apiService.targetPort={port}"));
+    }
     if args.expose_agent_api {
         helm_command.push_str(" --set agent.apiService.enabled=true");
         helm_command.push_str(&format!(
             " --set agent.apiService.type={}",
             args.agent_api_service_type
         ));
+        if let Some(cluster_ip) = args.agent_api_cluster_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.clusterIP",
+                &cluster_ip.to_string(),
+            );
+            if let Some(secondary_cluster_ip) = args.agent_api_secondary_cluster_ip {
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.apiService.clusterIPs[0]",
+                    &cluster_ip.to_string(),
+                );
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.apiService.clusterIPs[1]",
+                    &secondary_cluster_ip.to_string(),
+                );
+            }
+        }
+        if let Some(port) = args.agent_api_port {
+            helm_command.push_str(&format!(" --set agent.apiService.port={port}"));
+        }
         if let Some(node_port) = args.agent_api_node_port {
             helm_command.push_str(&format!(" --set agent.apiService.nodePort={node_port}"));
+        }
+        if let Some(app_protocol) = args.agent_api_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.appProtocol",
+                app_protocol,
+            );
+        }
+        if args.agent_api_publish_not_ready_addresses {
+            helm_command.push_str(" --set agent.apiService.publishNotReadyAddresses=true");
         }
         if let Some(load_balancer_class) = args.agent_api_load_balancer_class.as_deref() {
             append_helm_set_string(
@@ -2293,6 +3504,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 load_balancer_class,
             );
         }
+        if let Some(load_balancer_ip) = args.agent_api_load_balancer_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.apiService.loadBalancerIP",
+                &load_balancer_ip.to_string(),
+            );
+        }
+        append_helm_ipaddr_list(
+            &mut helm_command,
+            "agent.apiService.externalIPs",
+            &args.agent_api_external_ips,
+        );
         if let Some(health_check_node_port) = args.agent_api_health_check_node_port {
             helm_command.push_str(&format!(
                 " --set agent.apiService.healthCheckNodePort={health_check_node_port}"
@@ -2316,6 +3539,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.apiService.internalTrafficPolicy={internal_traffic_policy}"
             ));
         }
+        if let Some(traffic_distribution) = args.agent_api_traffic_distribution.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.apiService.trafficDistribution={traffic_distribution}"
+            ));
+        }
         if let Some(session_affinity) = args.agent_api_session_affinity.as_deref() {
             helm_command.push_str(&format!(
                 " --set agent.apiService.sessionAffinity={session_affinity}"
@@ -2326,8 +3554,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.apiService.sessionAffinityTimeoutSeconds={timeout_seconds}"
             ));
         }
-        if is_external_kubernetes_service_type(&args.agent_api_service_type) {
+        if is_external_kubernetes_service_type(&args.agent_api_service_type)
+            || !args.agent_api_external_ips.is_empty()
+        {
             helm_command.push_str(" --set agent.apiService.exposureAcknowledged=true");
+        }
+        if is_external_kubernetes_service_type(&args.agent_api_service_type) {
             helm_command.push_str(&format!(
                 " --set agent.apiService.externalTrafficPolicy={}",
                 args.agent_api_external_traffic_policy
@@ -2375,6 +3607,37 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             " --set agent.relayService.type={}",
             args.relay_service_type
         ));
+        if let Some(cluster_ip) = args.relay_cluster_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.clusterIP",
+                &cluster_ip.to_string(),
+            );
+            if let Some(secondary_cluster_ip) = args.relay_secondary_cluster_ip {
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.relayService.clusterIPs[0]",
+                    &cluster_ip.to_string(),
+                );
+                append_helm_set_string(
+                    &mut helm_command,
+                    "agent.relayService.clusterIPs[1]",
+                    &secondary_cluster_ip.to_string(),
+                );
+            }
+        }
+        if let Some(port) = args.relay_udp_port {
+            helm_command.push_str(&format!(" --set agent.relayService.udpPort={port}"));
+        }
+        if let Some(port) = args.relay_udp_target_port {
+            helm_command.push_str(&format!(" --set agent.relayService.udpTargetPort={port}"));
+        }
+        if let Some(port) = args.relay_http_port {
+            helm_command.push_str(&format!(" --set agent.relayService.httpPort={port}"));
+        }
+        if let Some(port) = args.relay_http_target_port {
+            helm_command.push_str(&format!(" --set agent.relayService.httpTargetPort={port}"));
+        }
         if let Some(node_port) = args.relay_udp_node_port {
             helm_command.push_str(&format!(
                 " --set agent.relayService.udpNodePort={node_port}"
@@ -2385,6 +3648,23 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.httpNodePort={node_port}"
             ));
         }
+        if let Some(app_protocol) = args.relay_udp_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.udpAppProtocol",
+                app_protocol,
+            );
+        }
+        if let Some(app_protocol) = args.relay_http_app_protocol.as_deref() {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.httpAppProtocol",
+                app_protocol,
+            );
+        }
+        if args.relay_publish_not_ready_addresses {
+            helm_command.push_str(" --set agent.relayService.publishNotReadyAddresses=true");
+        }
         if let Some(load_balancer_class) = args.relay_load_balancer_class.as_deref() {
             append_helm_set_string(
                 &mut helm_command,
@@ -2392,6 +3672,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 load_balancer_class,
             );
         }
+        if let Some(load_balancer_ip) = args.relay_load_balancer_ip {
+            append_helm_set_string(
+                &mut helm_command,
+                "agent.relayService.loadBalancerIP",
+                &load_balancer_ip.to_string(),
+            );
+        }
+        append_helm_ipaddr_list(
+            &mut helm_command,
+            "agent.relayService.externalIPs",
+            &args.relay_external_ips,
+        );
         if let Some(health_check_node_port) = args.relay_health_check_node_port {
             helm_command.push_str(&format!(
                 " --set agent.relayService.healthCheckNodePort={health_check_node_port}"
@@ -2415,6 +3707,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.internalTrafficPolicy={internal_traffic_policy}"
             ));
         }
+        if let Some(traffic_distribution) = args.relay_traffic_distribution.as_deref() {
+            helm_command.push_str(&format!(
+                " --set agent.relayService.trafficDistribution={traffic_distribution}"
+            ));
+        }
         if let Some(session_affinity) = args.relay_session_affinity.as_deref() {
             helm_command.push_str(&format!(
                 " --set agent.relayService.sessionAffinity={session_affinity}"
@@ -2425,8 +3722,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 " --set agent.relayService.sessionAffinityTimeoutSeconds={timeout_seconds}"
             ));
         }
-        if is_external_kubernetes_service_type(&args.relay_service_type) {
+        if is_external_kubernetes_service_type(&args.relay_service_type)
+            || !args.relay_external_ips.is_empty()
+        {
             helm_command.push_str(" --set agent.relayService.exposureAcknowledged=true");
+        }
+        if is_external_kubernetes_service_type(&args.relay_service_type) {
             helm_command.push_str(&format!(
                 " --set agent.relayService.externalTrafficPolicy={}",
                 args.relay_external_traffic_policy
@@ -2503,9 +3804,12 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
+            "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
+            "LoadBalancer IP and externalIPs reject unspecified, loopback, link-local, multicast, and broadcast addresses".to_string(),
+            "LoadBalancer source ranges and NetworkPolicy CIDR allowlists reject unrestricted all-source CIDRs".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
-            "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement because enforcement is CNI-dependent for host-networked pods".to_string(),
+            "NetworkPolicy allowlists are opt-in and require explicit hostNetwork limitation acknowledgement when host networking remains enabled because enforcement is CNI-dependent for host-networked pods".to_string(),
             "Use --disable-agent-service-account-token only when Kubernetes Service API discovery is not required".to_string(),
             "ServiceAccount creation can be disabled only when an equivalent ServiceAccount already exists in the target namespace".to_string(),
             "RBAC is rendered only for Kubernetes Service discovery; --disable-rbac assumes equivalent external RBAC is already managed".to_string(),
@@ -2516,16 +3820,26 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
-            "Image pull Secret names map to the DaemonSet pod imagePullSecrets list for private registries".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
-            "Service type, NodePort, LoadBalancer class, LoadBalancer node-port allocation, source range, traffic policy, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
-            "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
+            "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
+            "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
+            "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
 }
 
 fn append_k8s_image_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(repository) = args.image_repository.as_deref() {
+        append_helm_set_string(command, "image.repository", repository);
+    }
+    if let Some(tag) = args.image_tag.as_deref() {
+        append_helm_set_string(command, "image.tag", tag);
+    }
+    if let Some(pull_policy) = args.image_pull_policy.as_deref() {
+        append_helm_set_string(command, "image.pullPolicy", pull_policy);
+    }
     for (index, secret) in args.image_pull_secrets.iter().enumerate() {
         append_helm_set_string(command, &format!("imagePullSecrets[{index}]"), secret);
     }
@@ -2550,10 +3864,24 @@ fn append_k8s_service_account_values(command: &mut String, args: &K8sInstallArgs
     }
 }
 
+fn append_k8s_relay_admission_bearer_token_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(secret) = args.relay_admission_bearer_token_secret.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.relayAdmissionBearerTokenSecret.name",
+            secret,
+        );
+    }
+    if let Some(key) = args.relay_admission_bearer_token_key.as_deref() {
+        append_helm_set_string(command, "agent.relayAdmissionBearerTokenSecret.key", key);
+    }
+}
+
 fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_rbac {
         command.push_str(" --set rbac.create=false");
     }
+    command.push_str(&format!(" --set agent.routeBackend={}", args.route_backend));
     command.push_str(&format!(
         " --set serviceExposure.discoverApiServer={}",
         args.kubernetes_discover_api_server
@@ -2594,12 +3922,67 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
     }
 }
 
+fn append_k8s_relay_forwarder_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.relay_forwarder_endpoint.is_none() && args.relay_forwarder_bind.is_none() {
+        return;
+    }
+    command.push_str(" --set agent.relayForwarder.enabled=true");
+    if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
+        append_helm_set_string(command, "agent.relayForwarder.endpoint", endpoint);
+    }
+    if let Some(bind) = args.relay_forwarder_bind.as_deref() {
+        append_helm_set_string(command, "agent.relayForwarder.bind", bind);
+        if let Some(wireguard_endpoint) = args.relay_forwarder_wireguard_endpoint.as_deref() {
+            append_helm_set_string(
+                command,
+                "agent.relayForwarder.wireguardEndpoint",
+                wireguard_endpoint,
+            );
+        }
+        if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
+            append_helm_set_string(command, "agent.relayForwarder.netns", namespace);
+        }
+        command.push_str(&format!(
+            " --set agent.relayForwarder.maxSessions={}",
+            args.relay_forwarder_max_sessions
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.restartBackoffSeconds={}",
+            args.relay_forwarder_restart_backoff_seconds
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.crashWindowSeconds={}",
+            args.relay_forwarder_crash_window_seconds
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.maxCrashesPerWindow={}",
+            args.relay_forwarder_max_crashes_per_window
+        ));
+        command.push_str(&format!(
+            " --set agent.relayForwarder.crashCooldownSeconds={}",
+            args.relay_forwarder_crash_cooldown_seconds
+        ));
+    }
+}
+
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
+    if args.disable_agent_peer_map {
+        command.push_str(" --set agent.peerMap.enabled=false");
+    }
+    command.push_str(&format!(
+        " --set agent.peerMap.pollIntervalSeconds={}",
+        args.agent_peer_map_poll_interval_seconds
+    ));
+    if args.disable_agent_host_network {
+        command.push_str(" --set agent.hostNetwork=false");
+    }
     if args.disable_agent_service_account_token {
         command.push_str(" --set agent.automountServiceAccountToken=false");
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         command.push_str(&format!(" --set agent.dnsPolicy={dns_policy}"));
+    } else if args.disable_agent_host_network {
+        command.push_str(" --set agent.dnsPolicy=ClusterFirst");
     }
     if let Some(host_path) = args.agent_state_host_path.as_deref() {
         append_helm_set_string(command, "agent.state.hostPath", host_path);
@@ -2621,6 +4004,23 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     }
     if args.disable_agent_privilege_escalation {
         command.push_str(" --set agent.securityContext.allowPrivilegeEscalation=false");
+    }
+    if args.agent_read_only_root_filesystem {
+        command.push_str(" --set agent.securityContext.readOnlyRootFilesystem=true");
+    }
+    if let Some(seccomp_type) = args.agent_seccomp_profile.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.securityContext.seccompProfile.type",
+            seccomp_type,
+        );
+    }
+    if let Some(localhost_profile) = args.agent_seccomp_localhost_profile.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.securityContext.seccompProfile.localhostProfile",
+            localhost_profile,
+        );
     }
     append_helm_literal_list(
         command,
@@ -2729,6 +4129,23 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
             " --set agent.rollout.revisionHistoryLimit={revision_history_limit}"
         ));
     }
+    if args.agent_pdb_min_available.is_some() || args.agent_pdb_max_unavailable.is_some() {
+        command.push_str(" --set agent.podDisruptionBudget.enabled=true");
+    }
+    if let Some(min_available) = args.agent_pdb_min_available.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.podDisruptionBudget.minAvailable",
+            min_available,
+        );
+    }
+    if let Some(max_unavailable) = args.agent_pdb_max_unavailable.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.podDisruptionBudget.maxUnavailable",
+            max_unavailable,
+        );
+    }
 }
 
 fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
@@ -2741,6 +4158,9 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if let Some(selector) = args.kubernetes_service_label_selector.as_deref() {
         validate_kubernetes_label_selector(selector)?;
+    }
+    if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        validate_token_identifier(route_provider, "--kubernetes-route-provider")?;
     }
     if !args.kubernetes_discover_services {
         if !args.kubernetes_namespaces.is_empty() {
@@ -2760,6 +4180,19 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.kubernetes_route_interval_seconds == 0 {
         anyhow::bail!("--kubernetes-route-interval-seconds must be greater than zero");
     }
+    let mut route_cidrs = BTreeSet::new();
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-api-server-cidr",
+        "Kubernetes API server CIDR",
+        &args.kubernetes_api_server_cidrs,
+        &mut route_cidrs,
+    )?;
+    validate_kubernetes_underlay_route_cidrs(
+        "--kubernetes-service-cidr",
+        "Kubernetes Service CIDR",
+        &args.kubernetes_service_cidrs,
+        &mut route_cidrs,
+    )?;
     Ok(())
 }
 
@@ -2773,6 +4206,16 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
 }
 
 fn validate_k8s_image_pull_secrets(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(repository) = args.image_repository.as_deref() {
+        validate_container_image_repository(repository, "image repository")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(tag) = args.image_tag.as_deref() {
+        validate_container_image_tag(tag, "image tag").map_err(anyhow::Error::msg)?;
+    }
+    if let Some(pull_policy) = args.image_pull_policy.as_deref() {
+        parse_kubernetes_image_pull_policy(pull_policy).map_err(anyhow::Error::msg)?;
+    }
     let mut names = BTreeSet::new();
     for secret in &args.image_pull_secrets {
         validate_kubernetes_dns_subdomain(secret, "image pull Secret name")
@@ -2780,6 +4223,210 @@ fn validate_k8s_image_pull_secrets(args: &K8sInstallArgs) -> anyhow::Result<()> 
         if !names.insert(secret) {
             anyhow::bail!("--image-pull-secret `{secret}` must not be repeated");
         }
+    }
+    Ok(())
+}
+
+fn validate_k8s_relay_admission_bearer_token_secret(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    match (
+        args.relay_admission_bearer_token_secret.as_deref(),
+        args.relay_admission_bearer_token_key.as_deref(),
+    ) {
+        (Some(secret), Some(key)) => {
+            validate_kubernetes_dns_subdomain(secret, "relay admission bearer token Secret name")
+                .map_err(anyhow::Error::msg)?;
+            validate_kubernetes_secret_key_for_label(
+                key,
+                "relay admission bearer token Secret key",
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "--relay-admission-bearer-token-secret and --relay-admission-bearer-token-key must be provided together"
+            );
+        }
+    }
+}
+
+fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if !args.expose_relay {
+        if args.relay_public_endpoint.is_some() {
+            anyhow::bail!("--relay-public-endpoint requires --expose-relay");
+        }
+        if args.relay_admission_url.is_some() {
+            anyhow::bail!("--relay-admission-url requires --expose-relay");
+        }
+        if args.relay_status_url.is_some() {
+            anyhow::bail!("--relay-status-url requires --expose-relay");
+        }
+        return Ok(());
+    }
+
+    let public_endpoint = args
+        .relay_public_endpoint
+        .as_deref()
+        .context("--expose-relay requires --relay-public-endpoint")?;
+    validate_relay_public_endpoint_arg(public_endpoint, "--relay-public-endpoint")?;
+
+    let admission_url = args
+        .relay_admission_url
+        .as_deref()
+        .context("--expose-relay requires --relay-admission-url")?;
+    validate_relay_http_url_arg(admission_url, "--relay-admission-url")?;
+
+    if let Some(status_url) = args.relay_status_url.as_deref() {
+        validate_relay_http_url_arg(status_url, "--relay-status-url")?;
+    }
+
+    Ok(())
+}
+
+fn validate_k8s_relay_forwarder(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_k8s(args))
+}
+
+fn validate_relay_forwarder_install_settings(
+    settings: RelayForwarderInstallSettings<'_>,
+) -> anyhow::Result<()> {
+    if !settings.active() {
+        if settings.wireguard_endpoint.is_some() {
+            anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
+        }
+        if settings.netns.is_some() {
+            anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
+        }
+        if settings.max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+            anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
+        }
+        if settings.restart_backoff_seconds != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS {
+            anyhow::bail!(
+                "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
+            );
+        }
+        if settings.crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
+        }
+        if settings.max_crashes_per_window != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW {
+            anyhow::bail!(
+                "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
+            );
+        }
+        if settings.crash_cooldown_seconds != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS {
+            anyhow::bail!(
+                "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(endpoint) = settings.endpoint {
+        validate_relay_public_endpoint_arg(endpoint, "--relay-forwarder-endpoint")?;
+    }
+    if let Some(bind) = settings.bind {
+        validate_relay_forwarder_bind_arg(bind, "--relay-forwarder-bind")?;
+
+        let wireguard_endpoint = settings.wireguard_endpoint.context(
+            "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
+        )?;
+        validate_relay_public_endpoint_arg(
+            wireguard_endpoint,
+            "--relay-forwarder-wireguard-endpoint",
+        )?;
+
+        if let Some(namespace) = settings.netns {
+            validate_linux_namespace_name(namespace)?;
+        }
+        if settings.max_sessions == 0 {
+            anyhow::bail!("--relay-forwarder-max-sessions must be greater than zero");
+        }
+        if settings.restart_backoff_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-restart-backoff-seconds must be greater than zero");
+        }
+        if settings.crash_window_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds must be greater than zero");
+        }
+        if settings.max_crashes_per_window == 0 {
+            anyhow::bail!("--relay-forwarder-max-crashes-per-window must be greater than zero");
+        }
+        if settings.crash_cooldown_seconds == 0 {
+            anyhow::bail!("--relay-forwarder-crash-cooldown-seconds must be greater than zero");
+        }
+    } else {
+        if settings.wireguard_endpoint.is_some() {
+            anyhow::bail!("--relay-forwarder-wireguard-endpoint requires --relay-forwarder-bind");
+        }
+        if settings.netns.is_some() {
+            anyhow::bail!("--relay-forwarder-netns requires --relay-forwarder-bind");
+        }
+        if settings.max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS {
+            anyhow::bail!("--relay-forwarder-max-sessions requires --relay-forwarder-bind");
+        }
+        if settings.restart_backoff_seconds != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS {
+            anyhow::bail!(
+                "--relay-forwarder-restart-backoff-seconds requires --relay-forwarder-bind"
+            );
+        }
+        if settings.crash_window_seconds != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS {
+            anyhow::bail!("--relay-forwarder-crash-window-seconds requires --relay-forwarder-bind");
+        }
+        if settings.max_crashes_per_window != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW {
+            anyhow::bail!(
+                "--relay-forwarder-max-crashes-per-window requires --relay-forwarder-bind"
+            );
+        }
+        if settings.crash_cooldown_seconds != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS {
+            anyhow::bail!(
+                "--relay-forwarder-crash-cooldown-seconds requires --relay-forwarder-bind"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_relay_public_endpoint_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let endpoint = value.parse::<SocketAddr>().with_context(|| {
+        format!("{flag} must be an IPv4 host:port or [IPv6]:port socket address")
+    })?;
+    if !endpoint_addr_is_usable(endpoint) {
+        anyhow::bail!(
+            "{flag} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        );
+    }
+    Ok(())
+}
+
+fn validate_relay_forwarder_bind_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let endpoint = value.parse::<SocketAddr>().with_context(|| {
+        format!("{flag} must be an IPv4 host:port or [IPv6]:port bind socket address")
+    })?;
+    if endpoint.port() == 0 {
+        anyhow::bail!("{flag} must use a nonzero port");
+    }
+    if endpoint.ip().is_multicast() {
+        anyhow::bail!("{flag} must not use a multicast bind address");
+    }
+    if endpoint.ip() == IpAddr::V4(Ipv4Addr::BROADCAST) {
+        anyhow::bail!("{flag} must not use a broadcast bind address");
+    }
+    Ok(())
+}
+
+fn validate_relay_http_url_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    let url =
+        reqwest::Url::parse(value).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{flag} must use http or https");
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("{flag} must include a host");
+    }
+    if !http_url_is_usable_endpoint(value) {
+        anyhow::bail!(
+            "{flag} must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast endpoint"
+        );
     }
     Ok(())
 }
@@ -2794,10 +4441,10 @@ fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result
             "--service-account-annotation requires ServiceAccount creation; remove --disable-service-account-creation"
         );
     }
-    for annotation in &args.service_account_annotations {
-        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
-        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
-    }
+    validate_kubernetes_annotation_args(
+        "--service-account-annotation",
+        &args.service_account_annotations,
+    )?;
     Ok(())
 }
 
@@ -2829,20 +4476,23 @@ fn validate_helm_release_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_kubernetes_secret_key(key: &str) -> Result<(), String> {
+    validate_kubernetes_secret_key_for_label(key, "join token Secret key")
+}
+
+fn validate_kubernetes_secret_key_for_label(key: &str, label: &str) -> Result<(), String> {
     if key.is_empty() {
-        return Err("join token Secret key must not be empty".to_string());
+        return Err(format!("{label} must not be empty"));
     }
     if key.len() > 253 {
-        return Err("join token Secret key exceeds 253 bytes".to_string());
+        return Err(format!("{label} exceeds 253 bytes"));
     }
     let valid = key
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
     if !valid {
-        return Err(
-            "join token Secret key must contain only ASCII letters, digits, '-', '_' or '.'"
-                .to_string(),
-        );
+        return Err(format!(
+            "{label} must contain only ASCII letters, digits, '-', '_' or '.'"
+        ));
     }
     Ok(())
 }
@@ -2919,6 +4569,43 @@ fn validate_kubernetes_absolute_path(path: &str, label: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn validate_kubernetes_seccomp_localhost_profile(profile: &str) -> Result<(), String> {
+    if profile.is_empty() {
+        return Err("seccomp localhost profile must not be empty".to_string());
+    }
+    if profile.starts_with('/') {
+        return Err(
+            "seccomp localhost profile must be relative to the kubelet seccomp root".to_string(),
+        );
+    }
+    if profile.ends_with('/') {
+        return Err("seccomp localhost profile must not end with '/'".to_string());
+    }
+    if profile.len() > 255 {
+        return Err("seccomp localhost profile exceeds 255 bytes".to_string());
+    }
+    if profile
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
+        return Err(
+            "seccomp localhost profile must not contain empty or '..' path segments".to_string(),
+        );
+    }
+    if !profile.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.' | b'_' | b'-' | b'@' | b'%' | b'+' | b'=' | b':' | b','
+            )
+    }) {
+        return Err(
+            "seccomp localhost profile must contain only path-safe ASCII characters".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_service_ip_families(
     flag_prefix: &str,
     policy: Option<&str>,
@@ -2952,6 +4639,208 @@ fn validate_kubernetes_service_ip_families(
             "{flag_prefix} with both IPv4 and IPv6 requires ipFamilyPolicy=PreferDualStack or RequireDualStack"
         );
     }
+    Ok(())
+}
+
+fn kubernetes_ip_family(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "IPv4",
+        IpAddr::V6(_) => "IPv6",
+    }
+}
+
+fn kubernetes_service_ip_rejection_reason(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(ip) if ip.is_unspecified() => Some("unspecified"),
+        IpAddr::V4(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V4(ip) if ip.is_link_local() => Some("link-local"),
+        IpAddr::V4(ip) if ip.is_multicast() => Some("multicast"),
+        IpAddr::V4(ip) if ip == Ipv4Addr::BROADCAST => Some("broadcast"),
+        IpAddr::V6(ip) if ip.is_unspecified() => Some("unspecified"),
+        IpAddr::V6(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V6(ip) if ip.is_unicast_link_local() => Some("link-local"),
+        IpAddr::V6(ip) if ip.is_multicast() => Some("multicast"),
+        _ => None,
+    }
+}
+
+fn validate_kubernetes_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
+    if let Some(reason) = kubernetes_service_ip_rejection_reason(ip) {
+        anyhow::bail!("{flag} must not use {reason} address {ip}");
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_external_service_ip(flag: &str, ip: IpAddr) -> anyhow::Result<()> {
+    validate_kubernetes_service_ip(flag, ip)
+}
+
+fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for &ip in ips {
+        validate_kubernetes_external_service_ip(flag, ip)?;
+        if !seen.insert(ip) {
+            anyhow::bail!("{flag} must not repeat external Service IP address {ip}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_external_service_ip_disjoint(
+    left_flag: &str,
+    left_ips: &[IpAddr],
+    right_flag: &str,
+    right_ips: &[IpAddr],
+) -> anyhow::Result<()> {
+    let left_ips = left_ips.iter().copied().collect::<BTreeSet<_>>();
+    for ip in right_ips {
+        if left_ips.contains(ip) {
+            anyhow::bail!(
+                "{right_flag} must not reuse external Service IP address {ip} already assigned by {left_flag}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_restricted_cidrs(
+    flag: &str,
+    cidrs: &[ipnet::IpNet],
+    guidance: &str,
+    duplicate_label: &str,
+) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            if reason == "unrestricted" {
+                anyhow::bail!("{flag} must not include unrestricted CIDR {cidr}; {guidance}");
+            }
+            anyhow::bail!("{flag} must not include {reason} CIDR {cidr}; {guidance}");
+        }
+        let canonical = cidr.trunc();
+        if cidr != &canonical {
+            anyhow::bail!("{flag} must use canonical CIDR {canonical}, not {cidr}");
+        }
+        if !seen.insert(canonical) {
+            anyhow::bail!("{flag} must not repeat {duplicate_label} {canonical}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_underlay_route_cidrs(
+    flag: &str,
+    label: &str,
+    cidrs: &[ipnet::IpNet],
+    seen: &mut BTreeSet<ipnet::IpNet>,
+) -> anyhow::Result<()> {
+    for cidr in cidrs {
+        if let Some(reason) = restricted_route_cidr_reason(cidr) {
+            anyhow::bail!("{flag} must not include {reason} {label} {cidr}");
+        }
+        let route = cidr.trunc();
+        if cidr != &route {
+            anyhow::bail!("{flag} must use canonical {label} route {route}, not {cidr}");
+        }
+        if !seen.insert(route) {
+            anyhow::bail!("{flag} must not repeat Kubernetes underlay route CIDR {route}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_service_cluster_ips(
+    flag_prefix: &str,
+    cluster_ip: Option<IpAddr>,
+    secondary_cluster_ip: Option<IpAddr>,
+    policy: Option<&str>,
+    families: &[String],
+) -> anyhow::Result<()> {
+    let Some(cluster_ip) = cluster_ip else {
+        if secondary_cluster_ip.is_some() {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires --{flag_prefix}-cluster-ip"
+            );
+        }
+        return Ok(());
+    };
+    validate_kubernetes_service_ip(&format!("--{flag_prefix}-cluster-ip"), cluster_ip)?;
+    let cluster_ip_family = kubernetes_ip_family(cluster_ip);
+    if let Some(primary_family) = families.first() {
+        if primary_family != cluster_ip_family {
+            anyhow::bail!(
+                "{flag_prefix} clusterIP family {cluster_ip_family} must match the first --{flag_prefix}-ip-family value {primary_family}"
+            );
+        }
+    }
+    if let Some(secondary_cluster_ip) = secondary_cluster_ip {
+        validate_kubernetes_service_ip(
+            &format!("--{flag_prefix}-secondary-cluster-ip"),
+            secondary_cluster_ip,
+        )?;
+        let secondary_cluster_ip_family = kubernetes_ip_family(secondary_cluster_ip);
+        if secondary_cluster_ip_family == cluster_ip_family {
+            anyhow::bail!(
+                "{flag_prefix} secondary clusterIP family {secondary_cluster_ip_family} must differ from primary clusterIP family {cluster_ip_family}"
+            );
+        }
+        if !matches!(policy, Some("PreferDualStack" | "RequireDualStack")) {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires --{flag_prefix}-ip-family-policy PreferDualStack or RequireDualStack"
+            );
+        }
+        if families.len() != 2 {
+            anyhow::bail!(
+                "--{flag_prefix}-secondary-cluster-ip requires exactly two --{flag_prefix}-ip-family values"
+            );
+        }
+        if let Some(secondary_family) = families.get(1) {
+            if secondary_family != secondary_cluster_ip_family {
+                anyhow::bail!(
+                    "{flag_prefix} secondary clusterIP family {secondary_cluster_ip_family} must match the second --{flag_prefix}-ip-family value {secondary_family}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_service_cluster_ip_disjoint(
+    left_flag_prefix: &str,
+    left_cluster_ip: Option<IpAddr>,
+    left_secondary_cluster_ip: Option<IpAddr>,
+    right_flag_prefix: &str,
+    right_cluster_ip: Option<IpAddr>,
+    right_secondary_cluster_ip: Option<IpAddr>,
+) -> anyhow::Result<()> {
+    let mut left_ips = BTreeMap::new();
+    if let Some(ip) = left_cluster_ip {
+        left_ips.insert(ip, format!("--{left_flag_prefix}-cluster-ip"));
+    }
+    if let Some(ip) = left_secondary_cluster_ip {
+        left_ips.insert(ip, format!("--{left_flag_prefix}-secondary-cluster-ip"));
+    }
+
+    for (ip, right_flag) in [
+        (
+            right_cluster_ip,
+            format!("--{right_flag_prefix}-cluster-ip"),
+        ),
+        (
+            right_secondary_cluster_ip,
+            format!("--{right_flag_prefix}-secondary-cluster-ip"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(ip, flag)| ip.map(|ip| (ip, flag)))
+    {
+        if let Some(left_flag) = left_ips.get(&ip) {
+            anyhow::bail!(
+                "{right_flag} must not reuse Kubernetes Service clusterIP {ip} already assigned by {left_flag}"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -3027,19 +4916,53 @@ fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<
             );
         }
     }
+    if args.relay_forwarder_netns.is_some()
+        && !args.agent_privileged
+        && !(effective_added.contains("ALL")
+            || effective_added.contains("SYS_ADMIN")
+            || effective_added.contains("CAP_SYS_ADMIN"))
+    {
+        anyhow::bail!(
+            "--relay-forwarder-netns requires --agent-privileged or --agent-add-capability SYS_ADMIN"
+        );
+    }
+
+    if let Some(seccomp_profile) = args.agent_seccomp_profile.as_deref() {
+        parse_kubernetes_seccomp_profile_type(seccomp_profile).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(localhost_profile) = args.agent_seccomp_localhost_profile.as_deref() {
+        validate_kubernetes_seccomp_localhost_profile(localhost_profile)
+            .map_err(anyhow::Error::msg)?;
+    }
+    match (
+        args.agent_seccomp_profile.as_deref(),
+        args.agent_seccomp_localhost_profile.as_deref(),
+    ) {
+        (Some("Localhost"), None) => {
+            anyhow::bail!(
+                "--agent-seccomp-profile Localhost requires --agent-seccomp-localhost-profile"
+            );
+        }
+        (Some("Localhost"), Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            anyhow::bail!(
+                "--agent-seccomp-localhost-profile requires --agent-seccomp-profile Localhost"
+            );
+        }
+    }
 
     Ok(())
 }
 
 fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if args.agent_peer_map_poll_interval_seconds == 0 {
+        anyhow::bail!("--agent-peer-map-poll-interval-seconds must be greater than zero");
+    }
     for label in &args.agent_pod_labels {
         validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
         validate_kubernetes_label_value(&label.value).map_err(anyhow::Error::msg)?;
     }
-    for annotation in &args.agent_pod_annotations {
-        validate_kubernetes_annotation_key(&annotation.key).map_err(anyhow::Error::msg)?;
-        validate_kubernetes_annotation_value(&annotation.value).map_err(anyhow::Error::msg)?;
-    }
+    validate_kubernetes_annotation_args("--agent-pod-annotation", &args.agent_pod_annotations)?;
     if let Some(priority_class) = args.agent_priority_class.as_deref() {
         validate_kubernetes_dns_subdomain(priority_class, "agent priority class")
             .map_err(anyhow::Error::msg)?;
@@ -3053,6 +4976,11 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         parse_kubernetes_dns_policy(dns_policy).map_err(anyhow::Error::msg)?;
+        if args.disable_agent_host_network && dns_policy == "ClusterFirstWithHostNet" {
+            anyhow::bail!(
+                "--agent-dns-policy ClusterFirstWithHostNet requires hostNetwork; omit it or choose ClusterFirst/Default/None when --disable-agent-host-network is set"
+            );
+        }
     }
     if let Some(host_path) = args.agent_state_host_path.as_deref() {
         validate_kubernetes_absolute_path(host_path, "agent state host path")
@@ -3130,9 +5058,34 @@ fn validate_k8s_agent_rollout_options(args: &K8sInstallArgs) -> anyhow::Result<(
     Ok(())
 }
 
+fn validate_k8s_agent_pdb_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(min_available) = args.agent_pdb_min_available.as_deref() {
+        validate_kubernetes_int_or_percent(min_available, "agent PodDisruptionBudget minAvailable")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(max_unavailable) = args.agent_pdb_max_unavailable.as_deref() {
+        validate_kubernetes_int_or_percent(
+            max_unavailable,
+            "agent PodDisruptionBudget maxUnavailable",
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    if args.agent_pdb_min_available.is_some() && args.agent_pdb_max_unavailable.is_some() {
+        anyhow::bail!(
+            "--agent-pdb-min-available and --agent-pdb-max-unavailable are mutually exclusive"
+        );
+    }
+    Ok(())
+}
+
 fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.network_policy_acknowledge_host_network && !args.enable_network_policy {
         anyhow::bail!("--network-policy-acknowledge-host-network requires --enable-network-policy");
+    }
+    if args.network_policy_acknowledge_host_network && args.disable_agent_host_network {
+        anyhow::bail!(
+            "--network-policy-acknowledge-host-network only applies when agent host networking is enabled; remove it with --disable-agent-host-network"
+        );
     }
     if !args.agent_api_network_policy_cidrs.is_empty() && !args.enable_network_policy {
         anyhow::bail!("--agent-api-network-policy-cidr requires --enable-network-policy");
@@ -3154,20 +5107,89 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--enable-network-policy requires at least one --agent-api-network-policy-cidr or --relay-network-policy-cidr"
         );
     }
-    if args.enable_network_policy && !args.network_policy_acknowledge_host_network {
+    if args.enable_network_policy
+        && !args.disable_agent_host_network
+        && !args.network_policy_acknowledge_host_network
+    {
         anyhow::bail!(
             "--enable-network-policy requires --network-policy-acknowledge-host-network because the chart runs agents with hostNetwork=true and NetworkPolicy enforcement is CNI-dependent"
         );
     }
+    validate_kubernetes_restricted_cidrs(
+        "--agent-api-network-policy-cidr",
+        &args.agent_api_network_policy_cidrs,
+        "NetworkPolicy allowlists must narrow ingress sources",
+        "NetworkPolicy CIDR allowlist",
+    )?;
+    validate_kubernetes_restricted_cidrs(
+        "--relay-network-policy-cidr",
+        &args.relay_network_policy_cidrs,
+        "NetworkPolicy allowlists must narrow ingress sources",
+        "NetworkPolicy CIDR allowlist",
+    )?;
     Ok(())
 }
 
 fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let agent_api_public_exposure = k8s_agent_api_public_exposure_requires_ack(args);
+    let relay_public_exposure = k8s_relay_public_exposure_requires_ack(args);
+    let agent_api_unrestricted_load_balancer_ack =
+        k8s_agent_api_unrestricted_load_balancer_ack_applies(args);
+    let relay_unrestricted_load_balancer_ack =
+        k8s_relay_unrestricted_load_balancer_ack_applies(args);
+    let agent_api_cluster_external_traffic_policy_ack =
+        k8s_agent_api_cluster_external_traffic_policy_ack_applies(args);
+    let relay_cluster_external_traffic_policy_ack =
+        k8s_relay_cluster_external_traffic_policy_ack_applies(args);
+
+    for (port, flag) in [
+        (args.agent_api_port, "--agent-api-port"),
+        (args.agent_api_target_port, "--agent-api-target-port"),
+        (args.relay_udp_port, "--relay-udp-port"),
+        (args.relay_udp_target_port, "--relay-udp-target-port"),
+        (args.relay_http_port, "--relay-http-port"),
+        (args.relay_http_target_port, "--relay-http-target-port"),
+    ] {
+        if let Some(port) = port {
+            validate_kubernetes_service_port_value(port, flag)?;
+        }
+    }
+
+    if args.agent_api_cluster_ip.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-cluster-ip requires --expose-agent-api");
+    }
+    if args.agent_api_secondary_cluster_ip.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-secondary-cluster-ip requires --expose-agent-api");
+    }
+    if args.agent_api_service_type != "ClusterIP" && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-service-type requires --expose-agent-api");
+    }
+    if args.agent_api_port.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-port requires --expose-agent-api");
+    }
+    if args.agent_api_target_port.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-target-port requires --expose-agent-api");
+    }
     if args.agent_api_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-node-port requires --expose-agent-api");
     }
+    if args.agent_api_app_protocol.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-app-protocol requires --expose-agent-api");
+    }
+    if args.agent_api_publish_not_ready_addresses && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-publish-not-ready-addresses requires --expose-agent-api");
+    }
     if args.agent_api_load_balancer_class.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-load-balancer-class requires --expose-agent-api");
+    }
+    if args.agent_api_load_balancer_ip.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-load-balancer-ip requires --expose-agent-api");
+    }
+    if !args.agent_api_external_ips.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-external-ip requires --expose-agent-api");
+    }
+    if !args.agent_api_allow_source_cidrs.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-allow-source-cidr requires --expose-agent-api");
     }
     if args.agent_api_health_check_node_port.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-health-check-node-port requires --expose-agent-api");
@@ -3184,11 +5206,38 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_api_internal_traffic_policy.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-internal-traffic-policy requires --expose-agent-api");
     }
+    if args.agent_api_traffic_distribution.is_some() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-traffic-distribution requires --expose-agent-api");
+    }
     if args.agent_api_session_affinity.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-session-affinity requires --expose-agent-api");
     }
     if args.agent_api_session_affinity_timeout_seconds.is_some() && !args.expose_agent_api {
         anyhow::bail!("--agent-api-session-affinity-timeout-seconds requires --expose-agent-api");
+    }
+    if !args.agent_api_service_annotations.is_empty() && !args.expose_agent_api {
+        anyhow::bail!("--agent-api-service-annotation requires --expose-agent-api");
+    }
+    if args.relay_cluster_ip.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-cluster-ip requires --expose-relay");
+    }
+    if args.relay_secondary_cluster_ip.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-secondary-cluster-ip requires --expose-relay");
+    }
+    if args.relay_service_type != "LoadBalancer" && !args.expose_relay {
+        anyhow::bail!("--relay-service-type requires --expose-relay");
+    }
+    if args.relay_udp_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-port requires --expose-relay");
+    }
+    if args.relay_udp_target_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-target-port requires --expose-relay");
+    }
+    if args.relay_http_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-port requires --expose-relay");
+    }
+    if args.relay_http_target_port.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-target-port requires --expose-relay");
     }
     if args.relay_udp_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-udp-node-port requires --expose-relay");
@@ -3196,8 +5245,26 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_http_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-http-node-port requires --expose-relay");
     }
+    if args.relay_udp_app_protocol.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-udp-app-protocol requires --expose-relay");
+    }
+    if args.relay_http_app_protocol.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-http-app-protocol requires --expose-relay");
+    }
+    if args.relay_publish_not_ready_addresses && !args.expose_relay {
+        anyhow::bail!("--relay-publish-not-ready-addresses requires --expose-relay");
+    }
     if args.relay_load_balancer_class.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-load-balancer-class requires --expose-relay");
+    }
+    if args.relay_load_balancer_ip.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-load-balancer-ip requires --expose-relay");
+    }
+    if !args.relay_external_ips.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-external-ip requires --expose-relay");
+    }
+    if !args.relay_allow_source_cidrs.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-allow-source-cidr requires --expose-relay");
     }
     if args.relay_health_check_node_port.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-health-check-node-port requires --expose-relay");
@@ -3214,12 +5281,26 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_internal_traffic_policy.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-internal-traffic-policy requires --expose-relay");
     }
+    if args.relay_traffic_distribution.is_some() && !args.expose_relay {
+        anyhow::bail!("--relay-traffic-distribution requires --expose-relay");
+    }
     if args.relay_session_affinity.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-session-affinity requires --expose-relay");
     }
     if args.relay_session_affinity_timeout_seconds.is_some() && !args.expose_relay {
         anyhow::bail!("--relay-session-affinity-timeout-seconds requires --expose-relay");
     }
+    if !args.relay_service_annotations.is_empty() && !args.expose_relay {
+        anyhow::bail!("--relay-service-annotation requires --expose-relay");
+    }
+    validate_kubernetes_annotation_args(
+        "--agent-api-service-annotation",
+        &args.agent_api_service_annotations,
+    )?;
+    validate_kubernetes_annotation_args(
+        "--relay-service-annotation",
+        &args.relay_service_annotations,
+    )?;
     validate_kubernetes_service_ip_families(
         "agent-api",
         args.agent_api_ip_family_policy.as_deref(),
@@ -3229,6 +5310,28 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         "relay",
         args.relay_ip_family_policy.as_deref(),
         &args.relay_ip_families,
+    )?;
+    validate_kubernetes_service_cluster_ips(
+        "agent-api",
+        args.agent_api_cluster_ip,
+        args.agent_api_secondary_cluster_ip,
+        args.agent_api_ip_family_policy.as_deref(),
+        &args.agent_api_ip_families,
+    )?;
+    validate_kubernetes_service_cluster_ips(
+        "relay",
+        args.relay_cluster_ip,
+        args.relay_secondary_cluster_ip,
+        args.relay_ip_family_policy.as_deref(),
+        &args.relay_ip_families,
+    )?;
+    validate_kubernetes_service_cluster_ip_disjoint(
+        "agent-api",
+        args.agent_api_cluster_ip,
+        args.agent_api_secondary_cluster_ip,
+        "relay",
+        args.relay_cluster_ip,
+        args.relay_secondary_cluster_ip,
     )?;
     validate_kubernetes_session_affinity_options(
         "agent-api",
@@ -3240,6 +5343,24 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         args.relay_session_affinity.as_deref(),
         args.relay_session_affinity_timeout_seconds,
     )?;
+    if let Some(traffic_distribution) = args.agent_api_traffic_distribution.as_deref() {
+        parse_kubernetes_traffic_distribution(traffic_distribution).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(traffic_distribution) = args.relay_traffic_distribution.as_deref() {
+        parse_kubernetes_traffic_distribution(traffic_distribution).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(app_protocol) = args.agent_api_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--agent-api-app-protocol {error}"))?;
+    }
+    if let Some(app_protocol) = args.relay_udp_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--relay-udp-app-protocol {error}"))?;
+    }
+    if let Some(app_protocol) = args.relay_http_app_protocol.as_deref() {
+        validate_kubernetes_app_protocol(app_protocol)
+            .map_err(|error| anyhow::anyhow!("--relay-http-app-protocol {error}"))?;
+    }
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
         && !args.allow_public_service_exposure
@@ -3258,6 +5379,11 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             args.relay_service_type
         );
     }
+    if args.allow_public_service_exposure && !(agent_api_public_exposure || relay_public_exposure) {
+        anyhow::bail!(
+            "--allow-public-service-exposure requires an exposed NodePort/LoadBalancer Service or Service externalIPs"
+        );
+    }
     if !args.agent_api_allow_source_cidrs.is_empty()
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -3266,6 +5392,18 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if !args.relay_allow_source_cidrs.is_empty() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-allow-source-cidr only applies to LoadBalancer services");
     }
+    validate_kubernetes_restricted_cidrs(
+        "--agent-api-allow-source-cidr",
+        &args.agent_api_allow_source_cidrs,
+        "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+        "LoadBalancer source CIDR",
+    )?;
+    validate_kubernetes_restricted_cidrs(
+        "--relay-allow-source-cidr",
+        &args.relay_allow_source_cidrs,
+        "use --allow-unrestricted-load-balancer without source ranges to acknowledge unrestricted LoadBalancer exposure",
+        "LoadBalancer source CIDR",
+    )?;
     if args.agent_api_node_port.is_some()
         && !is_external_kubernetes_service_type(&args.agent_api_service_type)
     {
@@ -3276,6 +5414,20 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "--relay-udp-node-port and --relay-http-node-port only apply to NodePort or LoadBalancer services"
+        );
+    }
+    if args.agent_api_external_traffic_policy == "Cluster"
+        && !k8s_agent_api_external_traffic_policy_applies(args)
+    {
+        anyhow::bail!(
+            "--agent-api-external-traffic-policy Cluster requires --expose-agent-api with NodePort or LoadBalancer service type"
+        );
+    }
+    if args.relay_external_traffic_policy == "Cluster"
+        && !k8s_relay_external_traffic_policy_applies(args)
+    {
+        anyhow::bail!(
+            "--relay-external-traffic-policy Cluster requires --expose-relay with NodePort or LoadBalancer service type"
         );
     }
     if args.relay_udp_node_port.is_some()
@@ -3291,6 +5443,39 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.relay_load_balancer_class.is_some() && args.relay_service_type != "LoadBalancer" {
         anyhow::bail!("--relay-load-balancer-class only applies to LoadBalancer services");
     }
+    if args.agent_api_load_balancer_ip.is_some() && args.agent_api_service_type != "LoadBalancer" {
+        anyhow::bail!("--agent-api-load-balancer-ip only applies to LoadBalancer services");
+    }
+    if args.relay_load_balancer_ip.is_some() && args.relay_service_type != "LoadBalancer" {
+        anyhow::bail!("--relay-load-balancer-ip only applies to LoadBalancer services");
+    }
+    if !args.agent_api_external_ips.is_empty() && !args.allow_public_service_exposure {
+        anyhow::bail!(
+            "--agent-api-external-ip requires --allow-public-service-exposure because externalIPs can expose the Service outside the cluster"
+        );
+    }
+    if !args.relay_external_ips.is_empty() && !args.allow_public_service_exposure {
+        anyhow::bail!(
+            "--relay-external-ip requires --allow-public-service-exposure because externalIPs can expose the Service outside the cluster"
+        );
+    }
+    if let Some(ip) = args.agent_api_load_balancer_ip {
+        validate_kubernetes_external_service_ip("--agent-api-load-balancer-ip", ip)?;
+    }
+    if let Some(ip) = args.relay_load_balancer_ip {
+        validate_kubernetes_external_service_ip("--relay-load-balancer-ip", ip)?;
+    }
+    validate_kubernetes_external_service_ips(
+        "--agent-api-external-ip",
+        &args.agent_api_external_ips,
+    )?;
+    validate_kubernetes_external_service_ips("--relay-external-ip", &args.relay_external_ips)?;
+    validate_kubernetes_external_service_ip_disjoint(
+        "--agent-api-external-ip",
+        &args.agent_api_external_ips,
+        "--relay-external-ip",
+        &args.relay_external_ips,
+    )?;
     if args.agent_api_health_check_node_port.is_some()
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -3323,6 +5508,7 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!("--relay-health-check-node-port must differ from relay NodePort overrides");
     }
+    validate_kubernetes_node_port_uniqueness(args)?;
     if args.agent_api_disable_load_balancer_node_ports
         && args.agent_api_service_type != "LoadBalancer"
     {
@@ -3365,6 +5551,13 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--expose-relay with LoadBalancer requires --relay-allow-source-cidr or --allow-unrestricted-load-balancer"
         );
     }
+    if args.allow_unrestricted_load_balancer
+        && !(agent_api_unrestricted_load_balancer_ack || relay_unrestricted_load_balancer_ack)
+    {
+        anyhow::bail!(
+            "--allow-unrestricted-load-balancer requires at least one exposed LoadBalancer Service without source CIDR ranges"
+        );
+    }
     if args.expose_agent_api
         && is_external_kubernetes_service_type(&args.agent_api_service_type)
         && args.agent_api_external_traffic_policy == "Cluster"
@@ -3383,6 +5576,106 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
             "--expose-relay with externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy"
         );
     }
+    if args.allow_cluster_external_traffic_policy
+        && !(agent_api_cluster_external_traffic_policy_ack
+            || relay_cluster_external_traffic_policy_ack)
+    {
+        anyhow::bail!(
+            "--allow-cluster-external-traffic-policy requires at least one exposed NodePort or LoadBalancer Service with externalTrafficPolicy=Cluster"
+        );
+    }
+    Ok(())
+}
+
+fn k8s_agent_api_public_exposure_requires_ack(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api
+        && (is_external_kubernetes_service_type(&args.agent_api_service_type)
+            || !args.agent_api_external_ips.is_empty())
+}
+
+fn k8s_relay_public_exposure_requires_ack(args: &K8sInstallArgs) -> bool {
+    args.expose_relay
+        && (is_external_kubernetes_service_type(&args.relay_service_type)
+            || !args.relay_external_ips.is_empty())
+}
+
+fn k8s_agent_api_unrestricted_load_balancer_ack_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api
+        && args.agent_api_service_type == "LoadBalancer"
+        && args.agent_api_allow_source_cidrs.is_empty()
+}
+
+fn k8s_relay_unrestricted_load_balancer_ack_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_relay
+        && args.relay_service_type == "LoadBalancer"
+        && args.relay_allow_source_cidrs.is_empty()
+}
+
+fn k8s_agent_api_external_traffic_policy_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_agent_api && is_external_kubernetes_service_type(&args.agent_api_service_type)
+}
+
+fn k8s_relay_external_traffic_policy_applies(args: &K8sInstallArgs) -> bool {
+    args.expose_relay && is_external_kubernetes_service_type(&args.relay_service_type)
+}
+
+fn k8s_agent_api_cluster_external_traffic_policy_ack_applies(args: &K8sInstallArgs) -> bool {
+    k8s_agent_api_external_traffic_policy_applies(args)
+        && args.agent_api_external_traffic_policy == "Cluster"
+}
+
+fn k8s_relay_cluster_external_traffic_policy_ack_applies(args: &K8sInstallArgs) -> bool {
+    k8s_relay_external_traffic_policy_applies(args)
+        && args.relay_external_traffic_policy == "Cluster"
+}
+
+fn validate_kubernetes_node_port_uniqueness(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let mut node_ports = Vec::new();
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--agent-api-node-port",
+        args.agent_api_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--agent-api-health-check-node-port",
+        args.agent_api_health_check_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-udp-node-port",
+        args.relay_udp_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-http-node-port",
+        args.relay_http_node_port,
+    )?;
+    add_unique_kubernetes_node_port(
+        &mut node_ports,
+        "--relay-health-check-node-port",
+        args.relay_health_check_node_port,
+    )?;
+    Ok(())
+}
+
+fn add_unique_kubernetes_node_port(
+    node_ports: &mut Vec<(u16, &'static str)>,
+    label: &'static str,
+    port: Option<u16>,
+) -> anyhow::Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+    if let Some((_, existing_label)) = node_ports
+        .iter()
+        .find(|(existing_port, _)| *existing_port == port)
+    {
+        anyhow::bail!(
+            "{label} must not reuse Kubernetes NodePort {port} already assigned to {existing_label}"
+        );
+    }
+    node_ports.push((port, label));
     Ok(())
 }
 
@@ -3441,8 +5734,8 @@ mod tests {
 
     use super::*;
 
-    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
-        SignedJoinToken {
+    fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> anyhow::Result<SignedJoinToken> {
+        Ok(SignedJoinToken {
             claims: claims(
                 ClusterId::from_string("cluster-a"),
                 TokenIssuer {
@@ -3458,8 +5751,38 @@ mod tests {
                     allowed_routes: Vec::new(),
                     max_token_uses: Some(1),
                 },
-            ),
+            )?,
             signature: "signature".to_string(),
+        })
+    }
+
+    fn valid_init_args() -> InitArgs {
+        InitArgs {
+            public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            bootstrap_scheme: "http".to_string(),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: None,
+            emit_issuer_private_key: false,
+            token_ttl_seconds: 300,
+            default_role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            allow_relay: true,
+            max_uses: Some(10),
+            unlimited_uses: false,
+            spawn_daemons: false,
+            daemon_binary: PathBuf::from("iparsd"),
+            daemon_state_dir: temp_path("state"),
+            control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            control_plane_database_url: None,
+            signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
+            stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_alternate_listen: None,
+            stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
+            relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
+            relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
+            relay_admission_url: None,
         }
     }
 
@@ -3474,7 +5797,7 @@ mod tests {
                 url: "https://203.0.113.10:8443/".to_string(),
                 kind: BootstrapEndpointKind::ControlPlane,
             },
-        ]);
+        ])?;
 
         assert_eq!(
             control_plane_join_url(&token, None)?,
@@ -3498,7 +5821,7 @@ mod tests {
                 url: "https://203.0.113.11:8443".to_string(),
                 kind: BootstrapEndpointKind::ControlPlane,
             },
-        ]);
+        ])?;
 
         assert_eq!(
             control_plane_join_urls(&token, None)?,
@@ -3512,7 +5835,7 @@ mod tests {
 
     #[test]
     fn join_url_override_takes_precedence() -> anyhow::Result<()> {
-        let token = token_with_bootstrap(Vec::new());
+        let token = token_with_bootstrap(Vec::new())?;
 
         assert_eq!(
             control_plane_join_url(&token, Some("http://127.0.0.1:8443"))?,
@@ -3522,19 +5845,50 @@ mod tests {
     }
 
     #[test]
-    fn join_url_requires_control_plane_endpoint() {
-        let token = token_with_bootstrap(Vec::new());
+    fn join_url_requires_control_plane_endpoint() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(Vec::new())?;
         let result = control_plane_join_url(&token, None);
 
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn token_revoke_url_trims_control_plane_base_url() {
+    fn join_urls_reject_unusable_control_plane_endpoints() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "http://0.0.0.0:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }])?;
+        let error = match control_plane_join_urls(&token, None) {
+            Ok(_) => panic!("unusable token control-plane bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane bootstrap URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+
+        let token = token_with_bootstrap(Vec::new())?;
+        let error = match control_plane_join_url(&token, Some("udp://127.0.0.1:8443")) {
+            Ok(_) => panic!("non-HTTP control-plane override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn token_revoke_url_trims_control_plane_base_url() -> anyhow::Result<()> {
         assert_eq!(
-            control_plane_token_revoke_url("http://127.0.0.1:8443/"),
+            control_plane_token_revoke_url("http://127.0.0.1:8443/")?,
             "http://127.0.0.1:8443/v1/tokens/revoke"
         );
+        let error = match control_plane_token_revoke_url("http://0.0.0.0:8443") {
+            Ok(_) => anyhow::bail!("unusable control-plane revoke URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control-plane URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
     }
 
     #[test]
@@ -3550,6 +5904,10 @@ mod tests {
             allowed_routes: vec!["10.42.0.0/16".parse()?],
             ttl_seconds: 300,
             bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+            control_plane_bootstrap_endpoints: Vec::new(),
+            signal_bootstrap_endpoints: Vec::new(),
+            stun_bootstrap_endpoints: Vec::new(),
+            relay_bootstrap_endpoints: Vec::new(),
             allow_relay: true,
             max_uses: Some(7),
             unlimited_uses: false,
@@ -3569,6 +5927,223 @@ mod tests {
             Utc::now(),
             &ClusterId::from_string("cluster-a"),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_rejects_invalid_claim_inputs() -> anyhow::Result<()> {
+        fn token_args(issuer: &IdentityKeyPair) -> TokenCreateArgs {
+            TokenCreateArgs {
+                cluster_id: Some("cluster-a".to_string()),
+                issuer_key_id: "root".to_string(),
+                issuer_private_key_b64: Some(issuer.signing_key_b64()),
+                issuer_private_key_path: None,
+                role: "edge".to_string(),
+                tags: Vec::new(),
+                allowed_routes: Vec::new(),
+                ttl_seconds: 300,
+                bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+                control_plane_bootstrap_endpoints: Vec::new(),
+                signal_bootstrap_endpoints: Vec::new(),
+                stun_bootstrap_endpoints: Vec::new(),
+                relay_bootstrap_endpoints: Vec::new(),
+                allow_relay: false,
+                max_uses: Some(1),
+                unlimited_uses: false,
+            }
+        }
+
+        let issuer = IdentityKeyPair::generate();
+        let oversized_identifier = "x".repeat(MAX_TOKEN_IDENTIFIER_BYTES + 1);
+        let too_many_tags = (0..=MAX_JOIN_TOKEN_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        let too_many_routes = (0..=MAX_JOIN_TOKEN_ALLOWED_ROUTES)
+            .map(|index| format!("10.0.{}.{}/32", index / 256, index % 256).parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let cases = vec![
+            (
+                TokenCreateArgs {
+                    cluster_id: Some("bad/cluster".to_string()),
+                    ..token_args(&issuer)
+                },
+                "--cluster-id must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    issuer_key_id: oversized_identifier,
+                    ..token_args(&issuer)
+                },
+                format!("--issuer-key-id exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes"),
+            ),
+            (
+                TokenCreateArgs {
+                    role: "edge role".to_string(),
+                    ..token_args(&issuer)
+                },
+                "--role must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    tags: vec!["edge/tag".to_string()],
+                    ..token_args(&issuer)
+                },
+                "--tag must contain only ASCII letters, digits, '_', '.' or '-'".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    tags: too_many_tags,
+                    ..token_args(&issuer)
+                },
+                format!("--tag may be repeated at most {MAX_JOIN_TOKEN_TAGS} times"),
+            ),
+            (
+                TokenCreateArgs {
+                    ttl_seconds: 0,
+                    ..token_args(&issuer)
+                },
+                "join token TTL must be greater than zero seconds".to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    ttl_seconds: MAX_JOIN_TOKEN_TTL_SECONDS + 1,
+                    ..token_args(&issuer)
+                },
+                format!("join token TTL must not exceed {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec!["0.0.0.0/0".parse()?],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not include unrestricted join-token allowed route 0.0.0.0/0"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec!["10.42.0.1/24".parse()?],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must use canonical join-token allowed route 10.42.0.0/24, not 10.42.0.1/24"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec![
+                        "10.42.0.0/16".parse()?,
+                        "10.42.0.0/16".parse()?,
+                    ],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not repeat join-token allowed route 10.42.0.0/16"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: vec![
+                        "10.42.0.0/16".parse()?,
+                        "10.42.1.0/24".parse()?,
+                    ],
+                    ..token_args(&issuer)
+                },
+                "--allowed-route must not include overlapping join-token allowed routes 10.42.0.0/16 and 10.42.1.0/24"
+                    .to_string(),
+            ),
+            (
+                TokenCreateArgs {
+                    allowed_routes: too_many_routes,
+                    ..token_args(&issuer)
+                },
+                format!("--allowed-route may be repeated at most {MAX_JOIN_TOKEN_ALLOWED_ROUTES} times"),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let error = match create_token(args) {
+                Ok(token) => anyhow::bail!("unexpected valid token: {token:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(&expected),
+                "expected {expected}, got {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn init_rejects_invalid_default_token_claim_inputs() -> anyhow::Result<()> {
+        let error = match init(InitArgs {
+            default_role: "edge role".to_string(),
+            ..valid_init_args()
+        }) {
+            Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--role must contain only ASCII letters"));
+
+        let error = match init(InitArgs {
+            allowed_routes: vec!["0.0.0.0/0".parse()?],
+            ..valid_init_args()
+        }) {
+            Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--allowed-route must not include unrestricted"));
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_accepts_typed_bootstrap_endpoints() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let token = create_token(TokenCreateArgs {
+            cluster_id: Some("cluster-a".to_string()),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: Some(issuer.signing_key_b64()),
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            ttl_seconds: 300,
+            bootstrap_endpoints: vec!["https://203.0.113.10:8443".to_string()],
+            control_plane_bootstrap_endpoints: vec!["https://203.0.113.11:8443".to_string()],
+            signal_bootstrap_endpoints: vec!["https://203.0.113.10:9443".to_string()],
+            stun_bootstrap_endpoints: vec!["udp://203.0.113.10:3478".to_string()],
+            relay_bootstrap_endpoints: vec!["udp://203.0.113.10:51820".to_string()],
+            allow_relay: false,
+            max_uses: Some(1),
+            unlimited_uses: false,
+        })?;
+
+        assert_eq!(
+            token.claims.bootstrap_endpoints,
+            vec![
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.11:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:9443".to_string(),
+                    kind: BootstrapEndpointKind::Signal,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.10:3478".to_string(),
+                    kind: BootstrapEndpointKind::Stun,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.10:51820".to_string(),
+                    kind: BootstrapEndpointKind::Relay,
+                },
+            ]
+        );
         Ok(())
     }
 
@@ -3600,6 +6175,16 @@ mod tests {
             "10.42.0.0/16",
             "--max-uses",
             "7",
+            "--bootstrap",
+            "https://203.0.113.10:8443",
+            "--control-plane-bootstrap",
+            "https://203.0.113.11:8443",
+            "--signal-bootstrap",
+            "https://203.0.113.10:9443",
+            "--stun-bootstrap",
+            "udp://203.0.113.10:3478",
+            "--relay-bootstrap",
+            "udp://203.0.113.10:51820",
         ])?;
         if let Command::Token {
             command: TokenCommand::Create(args),
@@ -3608,10 +6193,203 @@ mod tests {
             assert_eq!(args.allowed_routes, vec!["10.42.0.0/16".parse()?]);
             assert_eq!(args.max_uses, Some(7));
             assert!(!args.unlimited_uses);
+            assert_eq!(
+                token_create_bootstrap_endpoints(&args)?,
+                vec![
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.10:8443".to_string(),
+                        kind: BootstrapEndpointKind::ControlPlane,
+                    },
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.11:8443".to_string(),
+                        kind: BootstrapEndpointKind::ControlPlane,
+                    },
+                    BootstrapEndpoint {
+                        url: "https://203.0.113.10:9443".to_string(),
+                        kind: BootstrapEndpointKind::Signal,
+                    },
+                    BootstrapEndpoint {
+                        url: "udp://203.0.113.10:3478".to_string(),
+                        kind: BootstrapEndpointKind::Stun,
+                    },
+                    BootstrapEndpoint {
+                        url: "udp://203.0.113.10:51820".to_string(),
+                        kind: BootstrapEndpointKind::Relay,
+                    },
+                ]
+            );
             return Ok(());
         }
 
         anyhow::bail!("expected token create command")
+    }
+
+    #[test]
+    fn token_create_rejects_bootstrap_endpoint_scheme_mismatches() -> anyhow::Result<()> {
+        let http_for_stun = TokenCreateArgs {
+            cluster_id: None,
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            ttl_seconds: 300,
+            bootstrap_endpoints: Vec::new(),
+            control_plane_bootstrap_endpoints: Vec::new(),
+            signal_bootstrap_endpoints: Vec::new(),
+            stun_bootstrap_endpoints: vec!["https://203.0.113.10:3478".to_string()],
+            relay_bootstrap_endpoints: Vec::new(),
+            allow_relay: false,
+            max_uses: Some(1),
+            unlimited_uses: false,
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_for_stun) else {
+            anyhow::bail!("http STUN bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--stun-bootstrap"));
+        assert!(error.contains("must use udp"));
+
+        let udp_for_signal = TokenCreateArgs {
+            signal_bootstrap_endpoints: vec!["udp://203.0.113.10:9443".to_string()],
+            stun_bootstrap_endpoints: Vec::new(),
+            ..http_for_stun
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_for_signal) else {
+            anyhow::bail!("udp signal bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--signal-bootstrap"));
+        assert!(error.contains("must use http or https"));
+        Ok(())
+    }
+
+    #[test]
+    fn token_create_rejects_unusable_bootstrap_addresses() -> anyhow::Result<()> {
+        fn token_args() -> TokenCreateArgs {
+            TokenCreateArgs {
+                cluster_id: None,
+                issuer_key_id: "root".to_string(),
+                issuer_private_key_b64: None,
+                issuer_private_key_path: None,
+                role: "edge".to_string(),
+                tags: Vec::new(),
+                allowed_routes: Vec::new(),
+                ttl_seconds: 300,
+                bootstrap_endpoints: Vec::new(),
+                control_plane_bootstrap_endpoints: Vec::new(),
+                signal_bootstrap_endpoints: Vec::new(),
+                stun_bootstrap_endpoints: Vec::new(),
+                relay_bootstrap_endpoints: Vec::new(),
+                allow_relay: false,
+                max_uses: Some(1),
+                unlimited_uses: false,
+            }
+        }
+
+        let http_unspecified = TokenCreateArgs {
+            bootstrap_endpoints: vec!["https://0.0.0.0:8443".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_unspecified) else {
+            anyhow::bail!("unspecified HTTP bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--bootstrap/--control-plane-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let http_zero_port = TokenCreateArgs {
+            signal_bootstrap_endpoints: vec!["https://203.0.113.10:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_zero_port) else {
+            anyhow::bail!("port-zero signal bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--signal-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let http_domain_zero_port = TokenCreateArgs {
+            control_plane_bootstrap_endpoints: vec!["https://control.example:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&http_domain_zero_port) else {
+            anyhow::bail!("port-zero domain control-plane bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--control-plane-bootstrap"));
+        assert!(error.contains("nonzero port"));
+
+        let udp_multicast = TokenCreateArgs {
+            stun_bootstrap_endpoints: vec!["udp://224.0.0.1:3478".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_multicast) else {
+            anyhow::bail!("multicast STUN bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--stun-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        let udp_zero_port = TokenCreateArgs {
+            relay_bootstrap_endpoints: vec!["udp://203.0.113.10:0".to_string()],
+            ..token_args()
+        };
+        let Err(error) = token_create_bootstrap_endpoints(&udp_zero_port) else {
+            anyhow::bail!("port-zero relay bootstrap should be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("--relay-bootstrap"));
+        assert!(error.contains("usable nonzero"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn init_rejects_unusable_bootstrap_generation_inputs() {
+        let mut unusable_public = valid_init_args();
+        unusable_public.public_endpoint = SocketAddr::from(([0, 0, 0, 0], 51820));
+        let Err(error) = init(unusable_public) else {
+            panic!("unspecified public endpoint should fail");
+        };
+        assert!(error.to_string().contains("--public-endpoint"));
+        assert!(error.to_string().contains("usable nonzero"));
+
+        let mut zero_control = valid_init_args();
+        zero_control.control_plane_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_control) else {
+            panic!("port-zero control-plane listen should fail");
+        };
+        assert!(error.to_string().contains("--control-plane-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
+        let mut zero_signal = valid_init_args();
+        zero_signal.signal_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_signal) else {
+            panic!("port-zero signal listen should fail");
+        };
+        assert!(error.to_string().contains("--signal-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
+        let mut zero_relay_http = valid_init_args();
+        zero_relay_http.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_relay_http) else {
+            panic!("port-zero relay HTTP listen should fail");
+        };
+        assert!(error.to_string().contains("--relay-http-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port when --relay-admission-url is omitted"));
+
+        let mut explicit_admission = valid_init_args();
+        explicit_admission.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        explicit_admission.relay_admission_url = Some("http://relay.example.test:9580".to_string());
+        assert!(init(explicit_admission).is_ok());
     }
 
     #[test]
@@ -3638,6 +6416,8 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_alternate_listen: None,
+            stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
@@ -3690,6 +6470,8 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: "127.0.0.1:19443".parse()?,
             stun_listen: "0.0.0.0:13478".parse()?,
+            stun_alternate_listen: Some("127.0.0.1:13480".parse()?),
+            stun_http_listen: "127.0.0.1:13479".parse()?,
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
             relay_admission_url: None,
@@ -3738,6 +6520,16 @@ mod tests {
             value.starts_with("sqlite://") && value.ends_with("control-plane.sqlite?mode=rwc")
         }));
 
+        let stun = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "stun")
+            .context("expected stun daemon command")?;
+        assert!(stun.command.contains(&"stun".to_string()));
+        assert!(stun.command.contains(&"0.0.0.0:13478".to_string()));
+        assert!(stun.command.contains(&"127.0.0.1:13480".to_string()));
+        assert!(stun.command.contains(&"127.0.0.1:13479".to_string()));
+
         let relay = output
             .daemon_commands
             .iter()
@@ -3754,11 +6546,29 @@ mod tests {
     }
 
     #[test]
-    fn api_url_trims_base_and_path_slashes() {
+    fn api_url_trims_base_and_path_slashes() -> anyhow::Result<()> {
         assert_eq!(
-            api_url("http://127.0.0.1:9780/", "/v1/status"),
+            api_url("http://127.0.0.1:9780/", "/v1/status", "agent status")?,
             "http://127.0.0.1:9780/v1/status"
         );
+        let error = match api_url("http://0.0.0.0:9780", "/v1/status", "agent status") {
+            Ok(_) => anyhow::bail!("unusable API base URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent status URL"));
+        assert!(error.to_string().contains("usable non-unspecified"));
+        let error = match api_url(
+            "http://127.0.0.1:9780?debug=true",
+            "/v1/status",
+            "agent status",
+        ) {
+            Ok(_) => anyhow::bail!("query-bearing API base URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must not include a query or fragment"));
+        Ok(())
     }
 
     #[test]
@@ -3810,10 +6620,117 @@ mod tests {
         } = path.command
         {
             assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            assert_eq!(args.control_plane_url, None);
+        } else {
+            anyhow::bail!("expected path status command");
+        }
+
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "status",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Status(args),
+        } = path.command
+        {
+            assert_eq!(args.agent_url, None);
+            assert_eq!(
+                args.control_plane_url.as_deref(),
+                Some("http://127.0.0.1:8443")
+            );
+            assert_eq!(args.node_id.as_deref(), Some("node-a"));
+        } else {
+            anyhow::bail!("expected path status command");
+        }
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "path",
+            "status",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])
+        .is_err());
+
+        let activity = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer-a",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Activity(args),
+        } = activity.command
+        {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
             return Ok(());
         }
 
-        anyhow::bail!("expected path status command")
+        anyhow::bail!("expected path activity command")
+    }
+
+    #[test]
+    fn path_activity_args_build_typed_request() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer-a",
+            "--pin",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Activity(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path activity command");
+        };
+
+        assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+        let request = path_activity_request(&args)?;
+        assert_eq!(request.peer, NodeId::from_string("peer-a"));
+        assert!(request.pin);
+        Ok(())
+    }
+
+    #[test]
+    fn path_activity_rejects_path_unsafe_peer_id() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "activity",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--peer",
+            "peer/a",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Activity(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path activity command");
+        };
+
+        let error = match path_activity_request(&args) {
+            Ok(_) => anyhow::bail!("path-unsafe peer ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--peer must contain only"));
+        Ok(())
     }
 
     #[test]
@@ -3921,6 +6838,138 @@ mod tests {
     }
 
     #[test]
+    fn path_probe_rejects_path_unsafe_peer_and_relay_ids() -> anyhow::Result<()> {
+        let peer_path = Cli::try_parse_from([
+            "ipars", "path", "probe", "--peer", "peer/a", "--state", "relay",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(peer_args),
+        } = peer_path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&peer_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("path-unsafe peer ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--peer must contain only"));
+
+        let relay_path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "relay",
+            "--relay-node",
+            "relay/a",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(relay_args),
+        } = relay_path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&relay_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("path-unsafe relay node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--relay-node must contain only"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_invalid_candidate_kind_address() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_IPV6",
+            "--candidate-kind",
+            "ipv6",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("invalid candidate kind/address should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("IPv6 candidates must use an IPv6 socket address"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_unusable_candidate_address() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--candidate-addr",
+            "203.0.113.10:0",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("unusable candidate address should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("selected candidate"));
+        assert!(error.to_string().contains("is unusable"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_invalid_metrics() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--latency-ms=-1",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => panic!("negative latency must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("latency_ms"));
+        Ok(())
+    }
+
+    #[test]
     fn peers_routes_and_relay_args_accept_api_urls() -> anyhow::Result<()> {
         let peers = Cli::try_parse_from([
             "ipars",
@@ -3977,6 +7026,22 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_node_id_rejects_path_unsafe_values() -> anyhow::Result<()> {
+        let error = match required_node_id(Some("node/a"), "peers") {
+            Ok(_) => anyhow::bail!("path-unsafe node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--node-id must contain only"));
+
+        let error = match required_node_id(Some(""), "path status") {
+            Ok(_) => anyhow::bail!("empty node ID should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--node-id cannot be empty"));
+        Ok(())
+    }
+
+    #[test]
     fn routes_output_flattens_peer_map_routes() -> anyhow::Result<()> {
         let local = NodeId::from_string("node-a");
         let peer = NodeId::from_string("node-b");
@@ -4019,6 +7084,37 @@ mod tests {
         Ok(())
     }
 
+    fn docker_install_test_args() -> DockerInstallArgs {
+        DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        }
+    }
+
     #[test]
     fn docker_install_plan_lists_compose_commands_and_requirements() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
@@ -4031,6 +7127,23 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert_eq!(plan.platform, "docker-compose");
@@ -4054,6 +7167,27 @@ mod tests {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
         assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            Some("true")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            Some("60")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            Some("command")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_STUN_ALTERNATE_LISTEN"),
+            Some(DEFAULT_STUN_ALTERNATE_LISTEN)
+        );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
             Some("compose-default")
         );
@@ -4065,14 +7199,31 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
+        assert!(plan.security.iter().any(|requirement| {
+            requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN")
+                && requirement.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
+        }));
         assert!(plan
             .notes
             .iter()
             .any(|note| note.contains("healthchecks") && note.contains("loopback URLs")));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("IPARS_STUN_ALTERNATE_LISTEN") && note.contains("alternate UDP port")
+        }));
         assert!(plan
             .notes
             .iter()
             .any(|note| note.contains("join token") && note.contains("Compose secret")));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("IPARS_RELAY_PUBLIC_ENDPOINT")
+                && note.contains("IPARS_RELAY_ADMISSION_URL")
+                && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
+                && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
+        }));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_*")));
         Ok(())
     }
 
@@ -4088,12 +7239,195 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert_eq!(
             plan.commands[0],
             "docker compose -p edge -f 'ops/compose file.yaml' config"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_route_advertisement_controls() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            disable_docker_expose_host_routes: true,
+            docker_route_interval_seconds: 15,
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            Some("false")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            Some("15")
+        );
+
+        let error = match docker_install_plan(DockerInstallArgs {
+            docker_route_interval_seconds: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero Docker route interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--docker-route-interval-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_route_backend_selection() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            route_backend: "kernel-netlink".to_string(),
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            Some("kernel-netlink")
+        );
+        assert!(
+            Cli::try_parse_from(["ipars", "docker", "install", "--route-backend", "invalid"])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_and_validates_relay_forwarder_settings() -> anyhow::Result<()> {
+        let endpoint_only = docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"),
+            Some("127.0.0.1:45182")
+        );
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            None
+        );
+        assert_eq!(
+            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            None
+        );
+
+        let plan = docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            relay_forwarder_netns: Some("relay-fw".to_string()),
+            relay_forwarder_max_sessions: 7,
+            relay_forwarder_restart_backoff_seconds: 11,
+            relay_forwarder_crash_window_seconds: 22,
+            relay_forwarder_max_crashes_per_window: 4,
+            relay_forwarder_crash_cooldown_seconds: 33,
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            Some("0.0.0.0:45182")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"),
+            Some("127.0.0.1:51820")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_NETNS"),
+            Some("relay-fw")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            Some("7")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS"),
+            Some("11")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"),
+            Some("22")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"),
+            Some("4")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"),
+            Some("33")
+        );
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|requirement| requirement.contains("CAP_SYS_ADMIN")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS")));
+
+        let invalid_endpoint = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("0.0.0.0:45182".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("unusable relay forwarder endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_endpoint
+            .to_string()
+            .contains("--relay-forwarder-endpoint"));
+
+        let missing_wireguard_endpoint = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relay forwarder bind without WireGuard endpoint should fail"),
+            Err(error) => error,
+        };
+        assert!(missing_wireguard_endpoint
+            .to_string()
+            .contains("--relay-forwarder-wireguard-endpoint is required"));
+
+        let invalid_bind = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_bind: Some("239.1.1.1:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("multicast relay forwarder bind should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_bind.to_string().contains("multicast bind address"));
+
+        let inactive_capacity = match docker_install_plan(DockerInstallArgs {
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_max_sessions: 7,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("forwarder capacity without bind should be rejected"),
+            Err(error) => error,
+        };
+        assert!(inactive_capacity
+            .to_string()
+            .contains("--relay-forwarder-max-sessions requires --relay-forwarder-bind"));
         Ok(())
     }
 
@@ -4109,6 +7443,23 @@ mod tests {
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_host_interface: "br-edge".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["ipars0".to_string()],
+            userspace_wireguard_ready_timeout_seconds: 30,
+            userspace_wireguard_shutdown_timeout_seconds: 20,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
 
         assert!(plan
@@ -4124,12 +7475,42 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET"),
+            Some("/run/ipars/docker.sock")
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
             Some("edge_default,edge_apps")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
             Some("${XDG_RUNTIME_DIR}/docker.sock")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("userspace-command")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"),
+            Some("wireguard-go")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"),
+            Some("ipars0")
+        );
+        assert_eq!(
+            environment_value(
+                &plan,
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"
+            ),
+            Some("30")
+        );
+        assert_eq!(
+            environment_value(
+                &plan,
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"
+            ),
+            Some("20")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
@@ -4143,14 +7524,30 @@ mod tests {
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
             None
         );
+        assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
+        assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
+        assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
+        assert!(plan.commands[0]
+            .contains("Docker API socket path must be an absolute Unix socket path"));
+        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("XDG_RUNTIME_DIR"));
+        assert!(plan.commands[0].contains("docker --host"));
+        assert_eq!(
+            plan.commands[1],
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml -f docker/compose.docker-discovery.yaml config"
+        );
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("userspace WireGuard backend")));
+            .any(|note| note.contains("userspace-command WireGuard backend")));
         assert!(plan
             .notes
             .iter()
             .any(|note| note.contains("IPARS_DOCKER_API_SOCKET_HOST")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("socket preflight command")));
         Ok(())
     }
 
@@ -4160,18 +7557,112 @@ mod tests {
             .join("../../docker/compose.yaml")
             .canonicalize()?;
         let compose = std::fs::read_to_string(compose_path)?;
+        let discovery_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.docker-discovery.yaml")
+            .canonicalize()?;
+        let discovery_compose = std::fs::read_to_string(discovery_compose_path)?;
+        let rootless_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless.yaml")
+            .canonicalize()?;
+        let rootless_compose = std::fs::read_to_string(rootless_compose_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
         assert!(compose
+            .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
+        assert!(compose.contains("IPARS_AGENT_ROUTE_BACKEND=${IPARS_AGENT_ROUTE_BACKEND:-command}"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
+        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"));
+        assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
-        assert!(compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(!compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
         assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+        assert!(compose
+            .contains("IPARS_DOCKER_EXPOSE_HOST_ROUTES=${IPARS_DOCKER_EXPOSE_HOST_ROUTES:-true}"));
         assert!(compose.contains(
+            "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS=${IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:-60}"
+        ));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
+        assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose
+            .contains("IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"));
+        assert!(compose.contains("\"3480:3480/udp\""));
+        assert!(compose.contains("--http-listen"));
+        assert!(compose.contains("0.0.0.0:3479"));
+        assert!(compose.contains("127.0.0.1:3479/healthz"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_BIND"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS=${IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS:-1024}"
+        ));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"));
+        assert!(!compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
+        assert!(discovery_compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(discovery_compose.contains(
+            "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
+        ));
+        assert!(rootless_compose.contains("cap_add: !reset []"));
+        assert!(rootless_compose.contains("devices: !reset []"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_explicit_api_socket_preflight() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: false,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            Some("/run/user/1000/docker.sock")
+        );
+        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("/run/user/1000/docker.sock"));
+        assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
+        assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
+        assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
+        assert!(plan.commands[0]
+            .contains("Docker API socket path must be an absolute Unix socket path"));
+        assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
         Ok(())
     }
 
@@ -4188,6 +7679,23 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("ambiguous Docker install settings should be rejected"),
             Err(error) => error,
@@ -4206,6 +7714,23 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("unused Docker network filter should be rejected"),
             Err(error) => error,
@@ -4224,6 +7749,23 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker network filter should be rejected"),
             Err(error) => error,
@@ -4231,6 +7773,18 @@ mod tests {
         assert!(invalid_filter
             .to_string()
             .contains("must contain only ASCII letters"));
+
+        let duplicate_filter = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string(), "edge_default".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("duplicate Docker network filter should be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate_filter
+            .to_string()
+            .contains("--docker-network `edge_default` must not be repeated"));
 
         let invalid_host_interface = match docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
@@ -4242,6 +7796,23 @@ mod tests {
             docker_container_namespace: None,
             docker_host_interface: "docker/0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker host interface should be rejected"),
             Err(error) => error,
@@ -4260,6 +7831,23 @@ mod tests {
             docker_container_namespace: Some("../compose".to_string()),
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }) {
             Ok(_) => anyhow::bail!("invalid Docker container namespace should be rejected"),
             Err(error) => error,
@@ -4267,6 +7855,365 @@ mod tests {
         assert!(invalid_namespace
             .to_string()
             .contains("linux network namespace name"));
+
+        for namespace in [".", "..", "-compose"] {
+            let invalid_special_namespace = match docker_install_plan(DockerInstallArgs {
+                docker_container_namespace: Some(namespace.to_string()),
+                ..docker_install_test_args()
+            }) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "special Docker container namespace {namespace} should be rejected"
+                    )
+                }
+                Err(error) => error,
+            };
+            assert!(
+                invalid_special_namespace
+                    .to_string()
+                    .contains("linux network namespace name"),
+                "unexpected error for {namespace}: {invalid_special_namespace}"
+            );
+        }
+
+        let relative_api_socket = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_api_socket: Some(PathBuf::from("run/docker.sock")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relative Docker API socket path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relative_api_socket
+            .to_string()
+            .contains("--docker-api-socket must be an absolute Unix socket path"));
+
+        let inactive_api_socket = match docker_install_plan(DockerInstallArgs {
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("Docker API socket without discovery should be rejected"),
+            Err(error) => error,
+        };
+        assert!(inactive_api_socket
+            .to_string()
+            .contains("--docker-api-socket requires --docker-discover-networks"));
+
+        let invalid_ready_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 0,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        }) {
+            Ok(_) => anyhow::bail!("zero userspace WireGuard ready timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_ready_timeout
+            .to_string()
+            .contains("--userspace-wireguard-ready-timeout-seconds"));
+
+        let invalid_shutdown_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 0,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        }) {
+            Ok(_) => anyhow::bail!("zero userspace WireGuard shutdown timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_shutdown_timeout
+            .to_string()
+            .contains("--userspace-wireguard-shutdown-timeout-seconds"));
+
+        let oversized_ready_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 3601,
+            userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        }) {
+            Ok(_) => {
+                anyhow::bail!("oversized userspace WireGuard ready timeout should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(oversized_ready_timeout
+            .to_string()
+            .contains("--userspace-wireguard-ready-timeout-seconds must not exceed 3600"));
+
+        let oversized_shutdown_timeout = match docker_install_plan(DockerInstallArgs {
+            compose_file: PathBuf::from("ops/compose.yaml"),
+            project_name: "edge".to_string(),
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: Vec::new(),
+            docker_api_socket: None,
+            docker_container_namespace: None,
+            docker_host_interface: "docker0".to_string(),
+            docker_container_cidrs: Vec::new(),
+            disable_docker_expose_host_routes: false,
+            docker_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds: 10,
+            userspace_wireguard_shutdown_timeout_seconds: 3601,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
+        }) {
+            Ok(_) => {
+                anyhow::bail!("oversized userspace WireGuard shutdown timeout should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(oversized_shutdown_timeout
+            .to_string()
+            .contains("--userspace-wireguard-shutdown-timeout-seconds must not exceed 3600"));
+
+        let relative_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("./wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relative userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relative_command.to_string().contains(
+            "--userspace-wireguard-command must be a bare command name or an absolute path"
+        ));
+
+        let whitespace_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("whitespace userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(whitespace_command
+            .to_string()
+            .contains("--userspace-wireguard-command must not contain whitespace"));
+
+        let oversized_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some(
+                "x".repeat(MAX_USERSPACE_WIREGUARD_COMMAND_BYTES + 1),
+            ),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("oversized userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(oversized_command
+            .to_string()
+            .contains("--userspace-wireguard-command exceeds 4096 bytes"));
+
+        let mut too_many_args = Vec::new();
+        for index in 0..=MAX_USERSPACE_WIREGUARD_ARGS {
+            too_many_args.push(format!("arg-{index}"));
+        }
+        let too_many_args = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: too_many_args,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("too many userspace WireGuard args should be rejected"),
+            Err(error) => error,
+        };
+        assert!(too_many_args
+            .to_string()
+            .contains("--userspace-wireguard-arg may be repeated at most 128 times"));
+
+        let invalid_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["ipars0\n--unexpected".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("control-character userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(invalid_arg
+            .to_string()
+            .contains("--userspace-wireguard-arg must not contain control characters"));
+
+        let comma_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["--option=a,b".to_string()],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("comma userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(comma_arg.to_string().contains(
+            "--userspace-wireguard-arg must not contain ',' because Docker Compose passes"
+        ));
+
+        let oversized_arg = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            userspace_wireguard_args: vec!["x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES + 1)],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("oversized userspace WireGuard arg should be rejected"),
+            Err(error) => error,
+        };
+        assert!(oversized_arg
+            .to_string()
+            .contains("--userspace-wireguard-arg exceeds 4096 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rootless_static_routes_do_not_export_socket() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            docker_container_namespace: Some("compose-edge".to_string()),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("userspace-command")
+        );
+        assert_eq!(
+            plan.commands[0],
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml config"
+        );
+        assert!(!plan.commands[0].contains("docker --host"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rejects_unsafe_container_cidrs() -> anyhow::Result<()> {
+        let unrestricted = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["0.0.0.0/0".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("unrestricted Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(unrestricted.to_string().contains(
+            "--docker-container-cidr must not include unrestricted Docker container CIDR 0.0.0.0/0"
+        ));
+
+        let loopback = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["127.0.0.0/8".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("loopback Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(loopback.to_string().contains(
+            "--docker-container-cidr must not include loopback Docker container CIDR 127.0.0.0/8"
+        ));
+
+        let non_canonical = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["172.20.10.1/24".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("non-canonical Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(non_canonical.to_string().contains(
+            "--docker-container-cidr must use canonical Docker container CIDR route 172.20.10.0/24, not 172.20.10.1/24"
+        ));
+
+        let duplicate = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?, "172.20.0.0/16".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("duplicate Docker container CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate.to_string().contains(
+            "--docker-container-cidr must not repeat Docker container CIDR route 172.20.0.0/16"
+        ));
+
+        let overlapping = match docker_install_plan(DockerInstallArgs {
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?, "172.20.10.0/24".parse()?],
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("overlapping Docker container CIDRs should be rejected"),
+            Err(error) => error,
+        };
+        assert!(overlapping.to_string().contains(
+            "--docker-container-cidr must not include overlapping Docker container CIDR routes 172.20.0.0/16 and 172.20.10.0/24"
+        ));
         Ok(())
     }
 
@@ -4285,11 +8232,21 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
-            agent_add_capabilities: Vec::new(),
+            agent_add_capabilities: vec![
+                "NET_ADMIN".to_string(),
+                "NET_RAW".to_string(),
+                "SYS_ADMIN".to_string(),
+            ],
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4298,6 +8255,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -4313,6 +8273,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -4330,9 +8291,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: Some("10.96.0.40".parse()?),
+            agent_api_secondary_cluster_ip: Some("2001:db8::40".parse()?),
+            agent_api_port: Some(9781),
+            agent_api_target_port: Some(9790),
             agent_api_node_port: Some(31080),
+            agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
+            agent_api_publish_not_ready_addresses: true,
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
+            agent_api_load_balancer_ip: Some("198.51.100.10".parse()?),
+            agent_api_external_ips: vec!["198.51.100.11".parse()?, "2001:db8::11".parse()?],
             agent_api_health_check_node_port: Some(31081),
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
@@ -4340,6 +8311,7 @@ mod tests {
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_network_policy_cidrs: vec!["10.0.0.0/8".parse()?],
             agent_api_internal_traffic_policy: Some("Local".to_string()),
+            agent_api_traffic_distribution: Some("PreferSameNode".to_string()),
             agent_api_session_affinity: Some("ClientIP".to_string()),
             agent_api_session_affinity_timeout_seconds: Some(600),
             agent_api_external_traffic_policy: "Local".to_string(),
@@ -4349,16 +8321,28 @@ mod tests {
             }],
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: Some("2001:db8::41".parse()?),
+            relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
+            relay_udp_port: Some(51821),
+            relay_udp_target_port: Some(51820),
+            relay_http_port: Some(9581),
+            relay_http_target_port: Some(9580),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
+            relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
+            relay_http_app_protocol: Some("http".to_string()),
+            relay_publish_not_ready_addresses: true,
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
+            relay_load_balancer_ip: Some("203.0.113.10".parse()?),
+            relay_external_ips: vec!["203.0.113.11".parse()?],
             relay_health_check_node_port: Some(31821),
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: Some("PreferDualStack".to_string()),
-            relay_ip_families: vec!["IPv6".to_string()],
+            relay_ip_families: vec!["IPv6".to_string(), "IPv4".to_string()],
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_network_policy_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_internal_traffic_policy: Some("Cluster".to_string()),
+            relay_traffic_distribution: Some("PreferSameZone".to_string()),
             relay_session_affinity: Some("ClientIP".to_string()),
             relay_session_affinity_timeout_seconds: Some(900),
             relay_external_traffic_policy: "Local".to_string(),
@@ -4366,9 +8350,20 @@ mod tests {
                 key: "metallb.universe.tf/address-pool".to_string(),
                 value: "public".to_string(),
             }],
+            relay_admission_bearer_token_secret: Some("relay-admission-token".to_string()),
+            relay_admission_bearer_token_key: Some("token".to_string()),
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            relay_forwarder_netns: Some("relay-fw".to_string()),
+            relay_forwarder_max_sessions: 7,
+            relay_forwarder_restart_backoff_seconds: 11,
+            relay_forwarder_crash_window_seconds: 22,
+            relay_forwarder_max_crashes_per_window: 4,
+            relay_forwarder_crash_cooldown_seconds: 33,
         })?;
 
         assert_eq!(plan.platform, "kubernetes-helm");
@@ -4384,6 +8379,8 @@ mod tests {
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
         assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
         assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
+        assert!(plan.commands[2].contains("--set agent.routeBackend=command"));
+        assert!(plan.commands[2].contains("--set agent.peerMap.pollIntervalSeconds=30"));
         assert!(plan.commands[2].contains("--set networkPolicy.enabled=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
@@ -4391,14 +8388,36 @@ mod tests {
             .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
+        assert!(plan.commands[2].contains("--set-string agent.apiService.clusterIP=10.96.0.40"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[0]=10.96.0.40'")
+        );
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
+        );
+        assert!(plan.commands[2].contains("--set agent.apiService.port=9781"));
+        assert!(plan.commands[2].contains("--set agent.apiService.targetPort=9790"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+        assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
+        assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
+        assert!(
+            plan.commands[2].contains("--set-string agent.apiService.loadBalancerIP=198.51.100.10")
+        );
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[1]=2001:db8::11'"));
         assert!(plan.commands[2].contains("--set agent.apiService.healthCheckNodePort=31081"));
         assert!(plan.commands[2].contains("--set agent.apiService.ipFamilyPolicy=RequireDualStack"));
         assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[0]=IPv4'"));
         assert!(plan.commands[2].contains("--set-string 'agent.apiService.ipFamilies[1]=IPv6'"));
         assert!(plan.commands[2].contains("--set agent.apiService.internalTrafficPolicy=Local"));
+        assert!(
+            plan.commands[2].contains("--set agent.apiService.trafficDistribution=PreferSameNode")
+        );
         assert!(plan.commands[2].contains("--set agent.apiService.sessionAffinity=ClientIP"));
         assert!(
             plan.commands[2].contains("--set agent.apiService.sessionAffinityTimeoutSeconds=600")
@@ -4416,17 +8435,38 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
         assert!(plan.commands[2].contains("--set agent.relayService.type=LoadBalancer"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::41"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::41'"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
+        );
+        assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
+        assert!(plan.commands[2].contains("--set agent.relayService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2].contains(
             "--set-string agent.relayService.loadBalancerClass=example.com/internal-relay"
         ));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.loadBalancerIP=203.0.113.10"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.externalIPs[0]=203.0.113.11'"));
         assert!(plan.commands[2].contains("--set agent.relayService.healthCheckNodePort=31821"));
         assert!(
             plan.commands[2].contains("--set agent.relayService.ipFamilyPolicy=PreferDualStack")
         );
         assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[0]=IPv6'"));
+        assert!(plan.commands[2].contains("--set-string 'agent.relayService.ipFamilies[1]=IPv4'"));
         assert!(plan.commands[2].contains("--set agent.relayService.internalTrafficPolicy=Cluster"));
+        assert!(plan.commands[2]
+            .contains("--set agent.relayService.trafficDistribution=PreferSameZone"));
         assert!(plan.commands[2].contains("--set agent.relayService.sessionAffinity=ClientIP"));
         assert!(
             plan.commands[2].contains("--set agent.relayService.sessionAffinityTimeoutSeconds=900")
@@ -4444,12 +8484,133 @@ mod tests {
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
         assert!(plan.commands[2].contains(
+            "--set-string agent.relayAdmissionBearerTokenSecret.name=relay-admission-token"
+        ));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayAdmissionBearerTokenSecret.key=token"));
+        assert!(plan.commands[2].contains(
             "--set-string 'agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public'"
+        ));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.enabled=true"));
+        assert!(
+            plan.commands[2].contains("--set-string agent.relayForwarder.endpoint=127.0.0.1:45182")
+        );
+        assert!(plan.commands[2].contains("--set-string agent.relayForwarder.bind=0.0.0.0:45182"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820"));
+        assert!(plan.commands[2].contains("--set-string agent.relayForwarder.netns=relay-fw"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.maxSessions=7"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.restartBackoffSeconds=11"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.crashWindowSeconds=22"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.maxCrashesPerWindow=4"));
+        assert!(plan.commands[2].contains("--set agent.relayForwarder.crashCooldownSeconds=33"));
+        assert!(plan.commands[2].contains(
+            "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_ADMIN}'"
         ));
         assert!(plan
             .security
             .iter()
             .any(|requirement| requirement.contains("disabled by default")));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_validates_service_annotations_from_plan_args() -> anyhow::Result<()> {
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+            value: "nlb".to_string(),
+        }];
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent API Service annotations should require exposed service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-annotation requires --expose-agent-api"));
+
+        let mut invalid_agent_key = base_k8s_install_args();
+        invalid_agent_key.expose_agent_api = true;
+        invalid_agent_key.agent_api_service_annotations = vec![KeyValueArg {
+            key: "Example.com/lb".to_string(),
+            value: "nlb".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_agent_key) {
+            Ok(_) => panic!("invalid agent API Service annotation key should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-annotation annotation prefix"));
+
+        let mut duplicate_agent_key = base_k8s_install_args();
+        duplicate_agent_key.expose_agent_api = true;
+        duplicate_agent_key.agent_api_service_annotations = vec![
+            KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb".to_string(),
+            },
+            KeyValueArg {
+                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+                value: "nlb-ip".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_agent_key) {
+            Ok(_) => panic!("duplicate agent API Service annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation must not repeat annotation key service.beta.kubernetes.io/aws-load-balancer-type"
+        ));
+
+        let mut invalid_relay_value = base_k8s_install_args();
+        invalid_relay_value.expose_relay = true;
+        invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        invalid_relay_value.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        invalid_relay_value.relay_service_annotations = vec![KeyValueArg {
+            key: "metallb.universe.tf/address-pool".to_string(),
+            value: "public pool".to_string(),
+        }];
+        let error = match k8s_install_plan(invalid_relay_value) {
+            Ok(_) => panic!("relay Service annotation value whitespace should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-service-annotation annotation value cannot contain whitespace")
+        );
+
+        let mut oversized_agent_value = base_k8s_install_args();
+        oversized_agent_value.expose_agent_api = true;
+        oversized_agent_value.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-name".to_string(),
+            value: "a".repeat(KUBERNETES_ANNOTATION_VALUE_MAX_BYTES + 1),
+        }];
+        let error = match k8s_install_plan(oversized_agent_value) {
+            Ok(_) => panic!("oversized agent API Service annotation value should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--agent-api-service-annotation annotation value exceeds 262144 bytes")
+        );
+
+        let mut duplicate_relay_key = base_k8s_install_args();
+        duplicate_relay_key.expose_relay = true;
+        duplicate_relay_key.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_relay_key.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        duplicate_relay_key.relay_service_annotations = vec![
+            KeyValueArg {
+                key: "metallb.universe.tf/address-pool".to_string(),
+                value: "public".to_string(),
+            },
+            KeyValueArg {
+                key: "metallb.universe.tf/address-pool".to_string(),
+                value: "private".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_relay_key) {
+            Ok(_) => panic!("duplicate relay Service annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation must not repeat annotation key metallb.universe.tf/address-pool"
+        ));
+
         Ok(())
     }
 
@@ -4466,6 +8627,870 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn k8s_install_validates_relay_advertisement_endpoints() -> anyhow::Result<()> {
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--relay-public-endpoint",
+            "203.0.113.10:51820",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut domain_public_endpoint = base_k8s_install_args();
+        domain_public_endpoint.expose_relay = true;
+        domain_public_endpoint.relay_public_endpoint = Some("relay.example.test:51820".to_string());
+        domain_public_endpoint.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(domain_public_endpoint) {
+            Ok(_) => panic!("domain relay public endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("IPv4 host:port or [IPv6]:port socket address"));
+
+        let mut unspecified_public_endpoint = base_k8s_install_args();
+        unspecified_public_endpoint.expose_relay = true;
+        unspecified_public_endpoint.relay_public_endpoint = Some("0.0.0.0:51820".to_string());
+        unspecified_public_endpoint.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unspecified_public_endpoint) {
+            Ok(_) => panic!("unspecified relay public endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("usable nonzero"));
+
+        let mut unusable_admission_url = base_k8s_install_args();
+        unusable_admission_url.expose_relay = true;
+        unusable_admission_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        unusable_admission_url.relay_admission_url = Some("http://0.0.0.0:9580".to_string());
+        let error = match k8s_install_plan(unusable_admission_url) {
+            Ok(_) => panic!("unusable relay admission URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-admission-url must use a nonzero port"));
+
+        let mut invalid_status_url = base_k8s_install_args();
+        invalid_status_url.expose_relay = true;
+        invalid_status_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        invalid_status_url.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        invalid_status_url.relay_status_url = Some("ftp://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(invalid_status_url) {
+            Ok(_) => panic!("invalid relay status URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-status-url must use http or https"));
+
+        let mut valid_ipv6 = base_k8s_install_args();
+        valid_ipv6.expose_relay = true;
+        valid_ipv6.relay_service_type = "ClusterIP".to_string();
+        valid_ipv6.relay_public_endpoint = Some("[2001:db8::10]:51820".to_string());
+        valid_ipv6.relay_admission_url = Some("https://relay.example.test:9580".to_string());
+        valid_ipv6.relay_status_url = Some("http://[2001:db8::10]:9580".to_string());
+        let plan = k8s_install_plan(valid_ipv6)?;
+        assert!(plan.commands[2].contains(
+            "--set-string 'agent.relayAdvertisement.publicEndpoint=[2001:db8::10]:51820'"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_relay_forwarder_settings() -> anyhow::Result<()> {
+        let mut endpoint_only = base_k8s_install_args();
+        endpoint_only.relay_forwarder_endpoint = Some("127.0.0.1:45182".to_string());
+        let plan = k8s_install_plan(endpoint_only)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.relayForwarder.enabled=true"));
+        assert!(helm.contains("--set-string agent.relayForwarder.endpoint=127.0.0.1:45182"));
+        assert!(!helm.contains("agent.relayForwarder.bind"));
+        assert!(!helm.contains("agent.relayForwarder.maxSessions"));
+
+        let mut invalid_endpoint = base_k8s_install_args();
+        invalid_endpoint.relay_forwarder_endpoint = Some("0.0.0.0:45182".to_string());
+        let error = match k8s_install_plan(invalid_endpoint) {
+            Ok(_) => panic!("unusable relay forwarder endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-endpoint"));
+
+        let mut missing_wireguard_endpoint = base_k8s_install_args();
+        missing_wireguard_endpoint.relay_forwarder_bind = Some("0.0.0.0:45182".to_string());
+        let error = match k8s_install_plan(missing_wireguard_endpoint) {
+            Ok(_) => panic!("relay forwarder bind without WireGuard endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-wireguard-endpoint is required"));
+
+        let mut invalid_bind = base_k8s_install_args();
+        invalid_bind.relay_forwarder_bind = Some("239.1.1.1:45182".to_string());
+        invalid_bind.relay_forwarder_wireguard_endpoint = Some("127.0.0.1:51820".to_string());
+        let error = match k8s_install_plan(invalid_bind) {
+            Ok(_) => panic!("multicast relay forwarder bind should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("multicast bind address"));
+
+        let mut inactive_capacity = base_k8s_install_args();
+        inactive_capacity.relay_forwarder_endpoint = Some("127.0.0.1:45182".to_string());
+        inactive_capacity.relay_forwarder_max_sessions = 7;
+        let error = match k8s_install_plan(inactive_capacity) {
+            Ok(_) => panic!("supervisor capacity without bind should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-max-sessions requires --relay-forwarder-bind"));
+
+        let mut netns_without_sys_admin = base_k8s_install_args();
+        netns_without_sys_admin.relay_forwarder_bind = Some("0.0.0.0:45182".to_string());
+        netns_without_sys_admin.relay_forwarder_wireguard_endpoint =
+            Some("127.0.0.1:51820".to_string());
+        netns_without_sys_admin.relay_forwarder_netns = Some("relay-fw".to_string());
+        let error = match k8s_install_plan(netns_without_sys_admin) {
+            Ok(_) => panic!("relay forwarder netns without SYS_ADMIN should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-forwarder-netns requires"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_load_balancer_source_ranges() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let network_policy_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/networkpolicy.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+        let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
+
+        assert!(helpers.contains("ipars.validateRestrictedCidr"));
+        assert!(helpers.contains("must not be an unrestricted CIDR"));
+        assert!(helpers.contains("must be a canonical IPv4 CIDR"));
+        assert!(helpers.contains("must not include unspecified CIDRs"));
+        assert!(helpers.contains("must not include loopback CIDRs"));
+        assert!(helpers.contains("must not include link-local CIDRs"));
+        assert!(helpers.contains("must not include multicast CIDRs"));
+        assert!(helpers.contains("must not include broadcast CIDRs"));
+        assert!(service_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
+        ));
+        assert!(service_template
+            .contains("agent.apiService.loadBalancerSourceRanges entry %q must not be repeated"));
+        assert!(service_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
+        ));
+        assert!(service_template
+            .contains("agent.relayService.loadBalancerSourceRanges entry %q must not be repeated"));
+        assert!(network_policy_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.acknowledgeHostNetwork=true requires networkPolicy.enabled=true"
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.acknowledgeHostNetwork=true only applies when agent.hostNetwork=true"
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.agentApi.allowedCidrs require networkPolicy.enabled=true and networkPolicy.agentApi.enabled=true"
+        ));
+        assert!(network_policy_template.contains(
+            "networkPolicy.relay.allowedCidrs require networkPolicy.enabled=true and networkPolicy.relay.enabled=true"
+        ));
+        assert!(network_policy_template
+            .contains("networkPolicy.agentApi.allowedCidrs entry %q must not be repeated"));
+        assert!(network_policy_template.contains("port: {{ .Values.agent.apiService.targetPort }}"));
+        assert!(!network_policy_template.contains("port: {{ .Values.agent.apiService.port }}"));
+        assert!(network_policy_template
+            .contains("port: {{ .Values.agent.relayService.udpTargetPort }}"));
+        assert!(network_policy_template
+            .contains("port: {{ .Values.agent.relayService.httpTargetPort }}"));
+        assert!(!network_policy_template.contains("port: {{ .Values.agent.relayService.udpPort }}"));
+        assert!(
+            !network_policy_template.contains("port: {{ .Values.agent.relayService.httpPort }}")
+        );
+        assert!(!network_policy_template.contains("port: 9780"));
+        assert!(network_policy_template.contains(
+            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+        ));
+        assert!(network_policy_template
+            .contains("networkPolicy.relay.allowedCidrs entry %q must not be repeated"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_metadata_names() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateChartMetadata\""));
+        assert!(helpers.contains("define \"ipars.validateDnsLabelWithMax\""));
+        assert!(helpers.contains("\"path\" \"Release.Name\""));
+        assert!(helpers.contains("\"path\" \"Release.Namespace\""));
+        assert!(helpers.contains("\"path\" \"nameOverride\""));
+        assert!(helpers.contains("\"path\" \"fullnameOverride\""));
+        assert!(helpers.contains("must be a DNS label of at most %d bytes"));
+        assert!(helpers.contains("\"maxBytes\" 53"));
+        assert!(helpers.contains("\"maxBytes\" 63"));
+        assert!(helpers.contains("contains $name .Release.Name"));
+        assert!(helpers.contains("printf \"%s-%s\" .Release.Name $name"));
+        assert!(helpers.contains(".Values.fullnameOverride | trunc 53"));
+        assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_scopes_release_instance_labels_and_selectors() -> anyhow::Result<()> {
+        let templates_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates")
+            .canonicalize()?;
+        let service_account = std::fs::read_to_string(templates_path.join("serviceaccount.yaml"))?;
+        let rbac = std::fs::read_to_string(templates_path.join("rbac.yaml"))?;
+        let daemonset = std::fs::read_to_string(templates_path.join("daemonset.yaml"))?;
+        let service_template = std::fs::read_to_string(templates_path.join("service.yaml"))?;
+        let network_policy_template =
+            std::fs::read_to_string(templates_path.join("networkpolicy.yaml"))?;
+        let pdb = std::fs::read_to_string(templates_path.join("poddisruptionbudget.yaml"))?;
+        let instance_label = "app.kubernetes.io/instance: {{ .Release.Name | quote }}";
+        let rbac_instance_label = "app.kubernetes.io/instance: {{ $root.Release.Name | quote }}";
+
+        assert!(service_account.contains(instance_label));
+        assert!(rbac.matches(rbac_instance_label).count() >= 4);
+        assert!(daemonset.matches(instance_label).count() >= 3);
+        assert!(service_template.matches(instance_label).count() >= 4);
+        assert!(network_policy_template.matches(instance_label).count() >= 4);
+        assert!(pdb.matches(instance_label).count() >= 2);
+        assert!(daemonset.contains("name: {{ include \"ipars.fullname\" . }}"));
+        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-agent"));
+        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
+        assert!(
+            network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-agent-api")
+        );
+        assert!(network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_annotation_values() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateAnnotationValue\""));
+        assert!(helpers.contains("annotation value must be a string"));
+        assert!(helpers.contains("annotation value exceeds 262144 bytes"));
+        assert!(helpers.contains("annotation value must not contain control characters"));
+        assert!(daemonset.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.podAnnotations.%s\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.apiService.annotations.%s\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.relayService.annotations.%s\""
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_exposure_booleans() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let network_policy_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/networkpolicy.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let rbac_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/rbac.yaml")
+            .canonicalize()?;
+        let service_account_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/serviceaccount.yaml")
+            .canonicalize()?;
+        let pdb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/poddisruptionbudget.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+        let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let rbac = std::fs::read_to_string(rbac_path)?;
+        let service_account = std::fs::read_to_string(service_account_path)?;
+        let pdb = std::fs::read_to_string(pdb_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateBoolean\""));
+        assert!(helpers.contains("define \"ipars.validateOptionalBoolean\""));
+        assert!(helpers.contains("kindIs \"bool\" .value"));
+        assert!(helpers.contains("%s must be true or false"));
+        assert!(helpers.contains("%s must be true, false, or empty"));
+        for path in [
+            "agent.apiService.enabled",
+            "agent.apiService.exposureAcknowledged",
+            "agent.apiService.allowUnrestrictedLoadBalancer",
+            "agent.apiService.allowClusterExternalTrafficPolicy",
+            "agent.apiService.allocateLoadBalancerNodePorts",
+            "agent.apiService.publishNotReadyAddresses",
+            "agent.relayService.enabled",
+            "agent.relayService.exposureAcknowledged",
+            "agent.relayService.allowUnrestrictedLoadBalancer",
+            "agent.relayService.allowClusterExternalTrafficPolicy",
+            "agent.relayService.allocateLoadBalancerNodePorts",
+            "agent.relayService.publishNotReadyAddresses",
+            "agent.relayAdvertisement.enabled",
+        ] {
+            assert!(
+                service_template.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a Service exposure boolean"
+            );
+        }
+        for path in [
+            "rbac.create",
+            "serviceAccount.create",
+            "agent.hostNetwork",
+            "agent.automountServiceAccountToken",
+            "agent.privileged",
+            "agent.routeProvider",
+            "agent.securityContext.allowPrivilegeEscalation",
+            "agent.securityContext.readOnlyRootFilesystem",
+            "agent.peerMap.enabled",
+            "agent.relayForwarder.enabled",
+            "agent.probes.liveness.enabled",
+            "agent.probes.readiness.enabled",
+        ] {
+            assert!(
+                daemonset.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a DaemonSet boolean"
+            );
+        }
+        for path in [
+            "networkPolicy.enabled",
+            "networkPolicy.acknowledgeHostNetwork",
+            "networkPolicy.agentApi.enabled",
+            "networkPolicy.relay.enabled",
+            "agent.hostNetwork",
+        ] {
+            assert!(
+                network_policy_template.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a NetworkPolicy boolean"
+            );
+        }
+        for path in [
+            "serviceExposure.enabled",
+            "serviceExposure.discoverServices",
+            "serviceExposure.discoverApiServer",
+        ] {
+            assert!(
+                daemonset.contains(&format!("\"path\" \"{path}\"")),
+                "{path} should be strictly validated as a Service exposure route boolean"
+            );
+        }
+        assert!(rbac.contains("\"path\" \"rbac.create\""));
+        assert!(rbac.contains("\"path\" \"serviceExposure.enabled\""));
+        assert!(rbac.contains("\"path\" \"serviceExposure.discoverServices\""));
+        assert!(rbac.contains(
+            "and $rbacCreate .Values.serviceExposure.enabled .Values.serviceExposure.discoverServices"
+        ));
+        assert!(service_account.contains("\"path\" \"serviceAccount.create\""));
+        assert!(pdb.contains("\"path\" \"agent.podDisruptionBudget.enabled\""));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateSocketAddress\""));
+        assert!(helpers.contains("define \"ipars.validateBindSocketAddress\""));
+        assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port socket address"));
+        assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port bind socket address"));
+        assert!(helpers.contains("must not use an unspecified address"));
+        assert!(helpers.contains("must not use a multicast address"));
+        assert!(helpers.contains("must not use a broadcast address"));
+        assert!(daemonset
+            .contains("ipars.validateSocketAddress\" (dict \"path\" \"cluster.stunEndpoint\""));
+        assert!(daemonset.contains(
+            "ipars.validateSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateBindSocketAddress\" (dict \"path\" \"agent.relayForwarder.bind\""
+        ));
+        assert!(daemonset.contains("{{- if .Values.agent.relayForwarder.bind }}"));
+        assert!(daemonset.contains("- --relay-forwarder-bind"));
+        assert!(daemonset.contains("- --relay-forwarder-wireguard-endpoint"));
+        assert!(daemonset.contains("- --relay-forwarder-max-sessions"));
+        assert!(daemonset
+            .contains("agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN"));
+        assert!(daemonset.contains("- name: host-netns"));
+        assert!(daemonset.contains("mountPath: /var/run/netns"));
+        assert!(daemonset.contains("path: /var/run/netns"));
+        assert!(daemonset.contains("\"path\" \"agent.apiService.targetPort\""));
+        assert!(daemonset.contains("printf \"0.0.0.0:%d\" $agentApiTargetPort"));
+        assert_eq!(
+            daemonset.matches("port: {{ $agentApiTargetPort }}").count(),
+            2
+        );
+        assert!(!daemonset.contains("port: 9780"));
+        assert!(!daemonset.contains("0.0.0.0:9780"));
+        assert!(!daemonset.contains("cluster.relayEndpoint"));
+        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_validates_http_endpoint_urls() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers.contains("define \"ipars.validateHttpEndpointURL\""));
+        assert!(helpers.contains("must be an absolute HTTP(S) URL with a host"));
+        assert!(helpers.contains("must not include userinfo"));
+        assert!(helpers.contains("port must be between 1 and 65535"));
+        assert!(helpers.contains("host must not be an unspecified address"));
+        assert!(helpers.contains("host must not be a multicast address"));
+        assert!(helpers.contains("host must not be a broadcast address"));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.controlPlaneUrl\""
+        ));
+        assert!(daemonset
+            .contains("ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.signalUrl\""));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
+        ));
+        assert!(!daemonset.contains("$clusterUrlPattern"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_uses_relay_advertisement_instead_of_static_relay_endpoint(
+    ) -> anyhow::Result<()> {
+        let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/values.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let values = std::fs::read_to_string(values_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(!values.contains("relayEndpoint:"));
+        assert!(!values.contains("relayAdmissionUrl:"));
+        assert!(!values.contains("IPARS_RELAY_ENDPOINT"));
+        assert!(values.contains("relayAdvertisement:"));
+        assert!(values.contains("publicEndpoint: \"\""));
+        assert!(values.contains("admissionUrl: \"\""));
+        assert!(daemonset.contains("- --relay-public-endpoint"));
+        assert!(
+            daemonset.contains("- {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}")
+        );
+        assert!(daemonset.contains("- --relay-admission-url"));
+        assert!(daemonset.contains("- {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}"));
+        assert!(!daemonset.contains("cluster.relayEndpoint"));
+        assert!(!daemonset.contains("cluster.relayAdmissionUrl"));
+        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_bounds_daemon_numeric_values_before_int_conversion() -> anyhow::Result<()> {
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
+        assert!(helpers_template.contains("define \"ipars.validateOptionalNonNegativeIntegerMax\""));
+        for (path, value, max) in [
+            (
+                "agent.peerMap.pollIntervalSeconds",
+                "$agentPeerMapPollIntervalSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.maxSessions",
+                "$agentRelayForwarderMaxSessions",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.restartBackoffSeconds",
+                "$agentRelayForwarderRestartBackoffSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.crashWindowSeconds",
+                "$agentRelayForwarderCrashWindowSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayForwarder.maxCrashesPerWindow",
+                "$agentRelayForwarderMaxCrashesPerWindow",
+                "4294967295",
+            ),
+            (
+                "agent.relayForwarder.crashCooldownSeconds",
+                "$agentRelayForwarderCrashCooldownSeconds",
+                "9223372036854775807",
+            ),
+            (
+                "agent.relayAdvertisement.maxSessions",
+                "$relayAdvertisementMaxSessions",
+                "4294967295",
+            ),
+            (
+                "agent.relayAdvertisement.maxMbps",
+                "$relayAdvertisementMaxMbps",
+                "4294967295",
+            ),
+            (
+                "serviceExposure.routeIntervalSeconds",
+                "$serviceExposureRouteIntervalSeconds",
+                "9223372036854775807",
+            ),
+        ] {
+            assert!(
+                daemonset.contains(&format!("\"{path}\" \"value\" {value} \"max\" {max}")),
+                "{path} should validate as a bounded integer before int conversion"
+            );
+        }
+        for probe_field in [
+            "initialDelaySeconds",
+            "periodSeconds",
+            "timeoutSeconds",
+            "failureThreshold",
+        ] {
+            assert!(
+                daemonset.contains(&format!(
+                    "printf \"agent.probes.%s.{probe_field}\" $probeName"
+                )) && daemonset.contains(&format!("\"value\" ${probe_field} \"max\" 2147483647")),
+                "agent probe {probe_field} should validate as a bounded int32 before rendering"
+            );
+        }
+        assert!(daemonset.contains(
+            "ipars.validateNonNegativeInt64\" (dict \"path\" \"agent.terminationGracePeriodSeconds\""
+        ));
+        assert!(daemonset.contains(
+            "ipars.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
+        ));
+        assert!(daemonset.contains(
+            "\"agent.rollout.minReadySeconds\" \"value\" $agentMinReadySeconds \"max\" 2147483647"
+        ));
+        assert!(daemonset.contains(
+            "\"agent.rollout.revisionHistoryLimit\" \"value\" $agentRevisionHistoryLimit \"max\" 2147483647"
+        ));
+        assert!(!daemonset.contains("ipars.validateNonNegativeInteger\" (dict"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_bounds_int_or_percent_values_before_int_conversion() -> anyhow::Result<()> {
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let pdb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/poddisruptionbudget.yaml")
+            .canonicalize()?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let pdb = std::fs::read_to_string(pdb_path)?;
+
+        assert!(helpers_template.contains("define \"ipars.validateIntOrPercent\""));
+        assert!(helpers_template.contains("no greater than 2147483647"));
+        assert!(helpers_template.contains("percentage from 0%% to 100%%"));
+        for path in ["agent.rollout.maxUnavailable", "agent.rollout.maxSurge"] {
+            assert!(
+                daemonset.contains(&format!(
+                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as bounded IntOrString before rendering"
+            );
+        }
+        for path in [
+            "agent.podDisruptionBudget.minAvailable",
+            "agent.podDisruptionBudget.maxUnavailable",
+        ] {
+            assert!(
+                pdb.contains(&format!(
+                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as bounded IntOrString before rendering"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_rejects_inconsistent_service_exposure_values() -> anyhow::Result<()> {
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let helpers_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+        let helpers_template = std::fs::read_to_string(helpers_template_path)?;
+
+        assert!(service_template.contains(
+            "agent.apiService exposure-specific values require agent.apiService.enabled=true"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true so the Service exposes an advertised relay endpoint"
+        ));
+        assert!(service_template.contains(
+            "and .Values.agent.relayService.enabled (not .Values.agent.relayAdvertisement.enabled)"
+        ));
+        assert!(service_template.contains("(ne .Values.agent.apiService.type \"ClusterIP\")"));
+        assert!(service_template.contains("(ne $agentApiPort 9780)"));
+        assert!(service_template.contains("(ne .Values.agent.apiService.appProtocol \"http\")"));
+        assert!(service_template.contains("(ne .Values.agent.relayService.type \"LoadBalancer\")"));
+        assert!(service_template.contains("(ne $relayUdpPort 51820)"));
+        assert!(service_template.contains("(ne $relayUdpTargetPort 51820)"));
+        assert!(service_template.contains("(ne $relayHttpPort 9580)"));
+        assert!(service_template.contains("(ne $relayHttpTargetPort 9580)"));
+        assert!(service_template
+            .contains("(ne .Values.agent.relayService.udpAppProtocol \"ipars.io/relay-udp\")"));
+        assert!(
+            service_template.contains("(ne .Values.agent.relayService.httpAppProtocol \"http\")")
+        );
+        assert!(service_template.contains(
+            "$agentApiExternalIPs $agentApiLoadBalancerSourceRanges (ne $agentApiHealthCheckNodePort 0)"
+        ));
+        assert!(service_template.contains(
+            "$relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0)"
+        ));
+        assert!(service_template.contains(
+            ".Values.agent.apiService.annotations .Values.agent.apiService.exposureAcknowledged"
+        ));
+        assert!(service_template.contains(
+            ".Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged"
+        ));
+        assert!(service_template
+            .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
+        assert!(service_template
+            .contains("(ne .Values.agent.relayService.externalTrafficPolicy \"Local\")"));
+        assert!(service_template.contains(
+            "agent.apiService.loadBalancerSourceRanges requires agent.apiService.type LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.loadBalancerSourceRanges requires agent.relayService.type LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.apiService.loadBalancerSourceRanges"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.relayService.loadBalancerSourceRanges"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.allowClusterExternalTrafficPolicy=true requires NodePort or LoadBalancer type with externalTrafficPolicy=Cluster"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.externalTrafficPolicy requires agent.apiService.type NodePort or LoadBalancer"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
+        ));
+        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
+        assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
+        for path in [
+            "agent.apiService.port",
+            "agent.apiService.targetPort",
+            "agent.apiService.nodePort",
+            "agent.apiService.healthCheckNodePort",
+            "agent.apiService.sessionAffinityTimeoutSeconds",
+            "agent.relayService.udpPort",
+            "agent.relayService.udpTargetPort",
+            "agent.relayService.httpPort",
+            "agent.relayService.httpTargetPort",
+            "agent.relayService.udpNodePort",
+            "agent.relayService.httpNodePort",
+            "agent.relayService.healthCheckNodePort",
+            "agent.relayService.sessionAffinityTimeoutSeconds",
+        ] {
+            assert!(
+                service_template.contains(&format!(
+                    "ipars.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
+                )),
+                "{path} should validate as a bounded integer before int conversion"
+            );
+        }
+        assert!(service_template.contains(
+            "agent.apiService.exposureAcknowledged=true requires external Service type or externalIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.exposureAcknowledged=true requires external Service type or externalIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.udpNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.healthCheckNodePort must not reuse Kubernetes NodePort %d already assigned to %s"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.clusterIP %q must not reuse agent.apiService clusterIPs"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.clusterIPs entry %q must not reuse agent.apiService clusterIPs"
+        ));
+        assert!(service_template.contains("targetPort: {{ .Values.agent.apiService.targetPort }}"));
+        assert!(!service_template.contains("targetPort: 9780"));
+        assert!(
+            service_template.contains("targetPort: {{ .Values.agent.relayService.udpTargetPort }}")
+        );
+        assert!(service_template
+            .contains("targetPort: {{ .Values.agent.relayService.httpTargetPort }}"));
+        assert!(!service_template.contains("targetPort: {{ .Values.agent.relayService.udpPort }}"));
+        assert!(!service_template.contains("targetPort: {{ .Values.agent.relayService.httpPort }}"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_wires_route_backend_selection() -> anyhow::Result<()> {
+        let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/values.yaml")
+            .canonicalize()?;
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let values = std::fs::read_to_string(values_path)?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(values.contains("routeBackend: command"));
+        assert!(!values.contains("  apiServer:"));
+        assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
+        assert!(daemonset.contains(
+            "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs"
+        ));
+        assert!(daemonset
+            .contains("serviceExposure.discoverServices requires serviceExposure.enabled=true"));
+        assert!(daemonset.contains(
+            "serviceExposure.namespaces requires serviceExposure.enabled=true and serviceExposure.discoverServices=true"
+        ));
+        assert!(daemonset.contains(
+            "serviceExposure.serviceLabelSelector requires serviceExposure.enabled=true and serviceExposure.discoverServices=true"
+        ));
+        assert!(daemonset
+            .contains("serviceExposure.routeProviderNodeId requires serviceExposure.enabled=true"));
+        assert!(daemonset.contains(
+            "serviceExposure.routeProviderNodeId must contain only ASCII letters, digits, '_', '.' or '-' and must not exceed 255 bytes"
+        ));
+        assert!(values.contains("peerMap:"));
+        assert!(values.contains("enabled: true"));
+        assert!(values.contains("pollIntervalSeconds: 30"));
+        assert!(daemonset.contains("agent.peerMap.enabled must be true or false"));
+        assert!(daemonset.contains(
+            "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true"
+        ));
+        assert!(daemonset.contains(
+            "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true"
+        ));
+        assert!(daemonset.contains("- --apply-peer-map"));
+        assert!(daemonset.contains("- --peer-map-poll-interval-seconds"));
+        assert!(daemonset.contains("- {{ $agentPeerMapPollIntervalSeconds | quote }}"));
+        assert!(daemonset.contains("- --route-backend"));
+        assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_rejects_unsafe_external_service_ips() -> anyhow::Result<()> {
+        let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/_helpers.tpl")
+            .canonicalize()?;
+        let service_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/service.yaml")
+            .canonicalize()?;
+        let helpers = std::fs::read_to_string(helpers_path)?;
+        let service_template = std::fs::read_to_string(service_template_path)?;
+
+        assert!(helpers.contains("ipars.validateUsableServiceIPAddress"));
+        assert!(helpers.contains("ipars.validateExternalServiceIPAddress"));
+        assert!(helpers.contains("must not be an unspecified address"));
+        assert!(helpers.contains("must not be a loopback address"));
+        assert!(helpers.contains("must not be a link-local address"));
+        assert!(helpers.contains("must not be a multicast address"));
+        assert!(helpers.contains("must not be a broadcast address"));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIPs\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIPs\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.apiService.loadBalancerIP\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.relayService.loadBalancerIP\""
+        ));
+        assert!(
+            service_template.contains("agent.apiService.externalIPs entry %q must not be repeated")
+        );
+        assert!(service_template
+            .contains("agent.relayService.externalIPs entry %q must not be repeated"));
+        assert!(service_template.contains(
+            "agent.relayService.externalIPs entry %q must not reuse agent.apiService.externalIPs"
+        ));
+        Ok(())
+    }
+
     fn base_k8s_install_args() -> K8sInstallArgs {
         K8sInstallArgs {
             release: "edge".to_string(),
@@ -4473,11 +9498,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -4486,6 +9517,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -4501,6 +9535,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -4518,9 +9553,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -4528,15 +9573,27 @@ mod tests {
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -4544,14 +9601,43 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         }
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_agent_api_target_port_without_service_exposure(
+    ) -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_api_target_port = Some(9790);
+
+        let error = match k8s_install_plan(args) {
+            Ok(_) => anyhow::bail!("inactive agent API targetPort override should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--agent-api-target-port requires --expose-agent-api"));
+        Ok(())
     }
 
     #[test]
@@ -4565,12 +9651,16 @@ mod tests {
         args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
+        args.route_backend = "kernel-netlink".to_string();
+        args.agent_peer_map_poll_interval_seconds = 45;
         args.disable_rbac = true;
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
         assert!(helm.contains("--set rbac.create=false"));
+        assert!(helm.contains("--set agent.routeBackend=kernel-netlink"));
+        assert!(helm.contains("--set agent.peerMap.pollIntervalSeconds=45"));
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
         assert!(helm.contains("--set serviceExposure.discoverApiServer=false"));
         assert!(helm.contains("--set serviceExposure.routeIntervalSeconds=15"));
@@ -4586,13 +9676,65 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_plan_rejects_invalid_route_provider() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.kubernetes_route_provider = Some("route provider".to_string());
+
+        let error = match k8s_install_plan(args) {
+            Ok(_) => anyhow::bail!("invalid Kubernetes route provider should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--kubernetes-route-provider must contain only ASCII letters, digits, '_', '.' or '-'"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_rejects_invalid_route_backend() {
+        assert!(
+            Cli::try_parse_from(["ipars", "k8s", "install", "--route-backend", "invalid"]).is_err()
+        );
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_peer_map_sync() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.disable_agent_peer_map = true;
+        args.agent_peer_map_poll_interval_seconds = 45;
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.peerMap.enabled=false"));
+        assert!(helm.contains("--set agent.peerMap.pollIntervalSeconds=45"));
+
+        let mut invalid_interval = base_k8s_install_args();
+        invalid_interval.agent_peer_map_poll_interval_seconds = 0;
+        let error = match k8s_install_plan(invalid_interval) {
+            Ok(_) => anyhow::bail!("zero agent peer-map poll interval should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--agent-peer-map-poll-interval-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_plan_wires_image_pull_secrets() -> anyhow::Result<()> {
         let mut args = base_k8s_install_args();
+        args.image_repository = Some("registry.example.com/platform/ipars".to_string());
+        args.image_tag = Some("2026.07.05".to_string());
+        args.image_pull_policy = Some("Always".to_string());
         args.image_pull_secrets = vec!["registry-cred".to_string(), "mirror.cred".to_string()];
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
+        assert!(helm.contains("--set-string image.repository=registry.example.com/platform/ipars"));
+        assert!(helm.contains("--set-string image.tag=2026.07.05"));
+        assert!(helm.contains("--set-string image.pullPolicy=Always"));
         assert!(helm.contains("--set-string 'imagePullSecrets[0]=registry-cred'"));
         assert!(helm.contains("--set-string 'imagePullSecrets[1]=mirror.cred'"));
 
@@ -4613,6 +9755,33 @@ mod tests {
             "bad secret",
         ])
         .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-repository",
+            "registry.example.com/platform/ipars:latest",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-repository",
+            "registry.example.com:https/platform/ipars",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["ipars", "k8s", "install", "--image-tag", "bad tag",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--image-pull-policy",
+            "Sometimes",
+        ])
+        .is_err());
 
         Ok(())
     }
@@ -4627,11 +9796,19 @@ mod tests {
         ];
         args.agent_drop_capabilities = vec!["MKNOD".to_string()];
         args.disable_agent_privilege_escalation = true;
+        args.agent_read_only_root_filesystem = true;
+        args.agent_seccomp_profile = Some("Localhost".to_string());
+        args.agent_seccomp_localhost_profile = Some("profiles/ipars-agent.json".to_string());
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
         assert!(helm.contains("--set agent.securityContext.allowPrivilegeEscalation=false"));
+        assert!(helm.contains("--set agent.securityContext.readOnlyRootFilesystem=true"));
+        assert!(helm.contains("--set-string agent.securityContext.seccompProfile.type=Localhost"));
+        assert!(helm.contains(
+            "--set-string agent.securityContext.seccompProfile.localhostProfile=profiles/ipars-agent.json"
+        ));
         assert!(helm.contains(
             "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_TIME}'"
         ));
@@ -4667,12 +9844,46 @@ mod tests {
         };
         assert!(error.contains("--disable-agent-privilege-escalation"));
 
+        let mut missing_localhost_profile = base_k8s_install_args();
+        missing_localhost_profile.agent_seccomp_profile = Some("Localhost".to_string());
+        let error = match k8s_install_plan(missing_localhost_profile) {
+            Ok(_) => panic!("Localhost seccomp profile should require a localhost profile path"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-seccomp-localhost-profile"));
+
+        let mut extra_localhost_profile = base_k8s_install_args();
+        extra_localhost_profile.agent_seccomp_profile = Some("RuntimeDefault".to_string());
+        extra_localhost_profile.agent_seccomp_localhost_profile =
+            Some("profiles/ipars-agent.json".to_string());
+        let error = match k8s_install_plan(extra_localhost_profile) {
+            Ok(_) => panic!("non-Localhost seccomp profile should reject localhostProfile"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-seccomp-localhost-profile"));
+
         assert!(Cli::try_parse_from([
             "ipars",
             "k8s",
             "install",
             "--agent-add-capability",
             "net_admin",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-seccomp-profile",
+            "Default",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-seccomp-localhost-profile",
+            "../profile.json",
         ])
         .is_err());
 
@@ -4723,6 +9934,25 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--service-account-annotation"));
+
+        let mut duplicate_annotation = base_k8s_install_args();
+        duplicate_annotation.service_account_annotations = vec![
+            KeyValueArg {
+                key: "eks.amazonaws.com/role-arn".to_string(),
+                value: "arn:aws:iam::123456789012:role/ipars-agent".to_string(),
+            },
+            KeyValueArg {
+                key: "eks.amazonaws.com/role-arn".to_string(),
+                value: "arn:aws:iam::123456789012:role/ipars-agent-v2".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_annotation) {
+            Ok(_) => panic!("duplicate ServiceAccount annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--service-account-annotation must not repeat annotation key eks.amazonaws.com/role-arn"
+        ));
 
         Ok(())
     }
@@ -4775,6 +10005,7 @@ mod tests {
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
 
+        assert!(!helm.contains("--set agent.hostNetwork=false"));
         assert!(helm.contains("--set-string 'agent.podLabels.ipars\\.io/role=agent'"));
         assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
         assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
@@ -4814,6 +10045,40 @@ mod tests {
         assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
         assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+
+        let mut duplicate_pod_annotation = base_k8s_install_args();
+        duplicate_pod_annotation.agent_pod_annotations = vec![
+            KeyValueArg {
+                key: "prometheus.io/scrape".to_string(),
+                value: "true".to_string(),
+            },
+            KeyValueArg {
+                key: "prometheus.io/scrape".to_string(),
+                value: "false".to_string(),
+            },
+        ];
+        let error = match k8s_install_plan(duplicate_pod_annotation) {
+            Ok(_) => panic!("duplicate agent pod annotation keys should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-pod-annotation must not repeat annotation key prometheus.io/scrape"
+        ));
+
+        let mut pod_network = base_k8s_install_args();
+        pod_network.disable_agent_host_network = true;
+        let plan = k8s_install_plan(pod_network)?;
+        assert!(plan.commands[2].contains("--set agent.hostNetwork=false"));
+        assert!(plan.commands[2].contains("--set agent.dnsPolicy=ClusterFirst"));
+
+        let mut invalid_dns_policy = base_k8s_install_args();
+        invalid_dns_policy.disable_agent_host_network = true;
+        invalid_dns_policy.agent_dns_policy = Some("ClusterFirstWithHostNet".to_string());
+        let error = match k8s_install_plan(invalid_dns_policy) {
+            Ok(_) => panic!("ClusterFirstWithHostNet should require hostNetwork"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ClusterFirstWithHostNet requires hostNetwork"));
 
         let mut invalid_selector = base_k8s_install_args();
         invalid_selector.agent_node_selectors = vec![KeyValueArg {
@@ -4869,12 +10134,14 @@ mod tests {
             "ipars",
             "k8s",
             "install",
+            "--disable-agent-host-network",
             "--disable-agent-service-account-token",
         ])?;
         if let Command::K8s {
             command: K8sCommand::Install(args),
         } = parsed.command
         {
+            assert!(args.disable_agent_host_network);
             assert!(args.disable_agent_service_account_token);
         } else {
             anyhow::bail!("expected k8s install command");
@@ -4958,6 +10225,57 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_plan_wires_and_validates_agent_pdb_options() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_pdb_min_available = Some("80%".to_string());
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set agent.podDisruptionBudget.enabled=true"));
+        assert!(helm.contains("--set-string agent.podDisruptionBudget.minAvailable=80%"));
+
+        let mut max_unavailable = base_k8s_install_args();
+        max_unavailable.agent_pdb_max_unavailable = Some("1".to_string());
+        let plan = k8s_install_plan(max_unavailable)?;
+        assert!(
+            plan.commands[2].contains("--set-string agent.podDisruptionBudget.maxUnavailable=1")
+        );
+
+        let both = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-pdb-min-available",
+            "1",
+            "--agent-pdb-max-unavailable",
+            "1",
+        ])?;
+        if let Command::K8s {
+            command: K8sCommand::Install(args),
+        } = both.command
+        {
+            let error = match k8s_install_plan(*args) {
+                Ok(_) => panic!("PDB minAvailable and maxUnavailable should be exclusive"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("mutually exclusive"));
+        } else {
+            anyhow::bail!("expected k8s install command");
+        }
+
+        let invalid_percent = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-pdb-min-available",
+            "101%",
+        ]);
+        assert!(invalid_percent.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_plan_rejects_invalid_install_metadata() {
         let mut invalid_release = base_k8s_install_args();
         invalid_release.release = "Edge".to_string();
@@ -4990,10 +10308,38 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("join token Secret key"));
+
+        let mut missing_bearer_key = base_k8s_install_args();
+        missing_bearer_key.relay_admission_bearer_token_secret =
+            Some("relay-admission-token".to_string());
+        let error = match k8s_install_plan(missing_bearer_key) {
+            Ok(_) => panic!("relay admission bearer token Secret key should be required"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-admission-bearer-token-secret"));
+
+        let mut invalid_bearer_secret = base_k8s_install_args();
+        invalid_bearer_secret.relay_admission_bearer_token_secret = Some("bad secret".to_string());
+        invalid_bearer_secret.relay_admission_bearer_token_key = Some("token".to_string());
+        let error = match k8s_install_plan(invalid_bearer_secret) {
+            Ok(_) => panic!("invalid relay admission bearer token Secret name should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay admission bearer token Secret name"));
+
+        let mut invalid_bearer_key = base_k8s_install_args();
+        invalid_bearer_key.relay_admission_bearer_token_secret =
+            Some("relay-admission-token".to_string());
+        invalid_bearer_key.relay_admission_bearer_token_key = Some("../token".to_string());
+        let error = match k8s_install_plan(invalid_bearer_key) {
+            Ok(_) => panic!("invalid relay admission bearer token Secret key should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("relay admission bearer token Secret key"));
     }
 
     #[test]
-    fn k8s_install_plan_rejects_invalid_route_discovery_settings() {
+    fn k8s_install_plan_rejects_invalid_route_discovery_settings() -> anyhow::Result<()> {
         let mut namespace_without_discovery = base_k8s_install_args();
         namespace_without_discovery.kubernetes_namespaces = vec!["default".to_string()];
         let error = match k8s_install_plan(namespace_without_discovery) {
@@ -5057,6 +10403,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--kubernetes-route-interval-seconds must be greater than zero"));
+
+        let mut unrestricted_api_cidr = base_k8s_install_args();
+        unrestricted_api_cidr.kubernetes_api_server_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_api_cidr) {
+            Ok(_) => panic!("unrestricted API server CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-api-server-cidr must not include unrestricted Kubernetes API server CIDR 0.0.0.0/0"
+        ));
+
+        let mut loopback_service_cidr = base_k8s_install_args();
+        loopback_service_cidr.kubernetes_service_cidrs = vec!["127.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(loopback_service_cidr) {
+            Ok(_) => panic!("loopback Service CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must not include loopback Kubernetes Service CIDR 127.0.0.0/8"
+        ));
+
+        let mut non_canonical_service_cidr = base_k8s_install_args();
+        non_canonical_service_cidr.kubernetes_service_cidrs = vec!["10.96.0.1/12".parse()?];
+        let error = match k8s_install_plan(non_canonical_service_cidr) {
+            Ok(_) => panic!("non-canonical Service CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must use canonical Kubernetes Service CIDR route 10.96.0.0/12, not 10.96.0.1/12"
+        ));
+
+        let mut duplicate_route_cidr = base_k8s_install_args();
+        duplicate_route_cidr.kubernetes_api_server_cidrs = vec!["10.96.0.1/32".parse()?];
+        duplicate_route_cidr.kubernetes_service_cidrs = vec!["10.96.0.1/32".parse()?];
+        let error = match k8s_install_plan(duplicate_route_cidr) {
+            Ok(_) => panic!("duplicate Kubernetes route CIDR should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--kubernetes-service-cidr must not repeat Kubernetes underlay route CIDR 10.96.0.1/32"
+        ));
+
+        Ok(())
     }
 
     #[test]
@@ -5081,6 +10470,19 @@ mod tests {
             "compose-edge",
             "--docker-host-interface",
             "br-edge",
+            "--disable-docker-expose-host-routes",
+            "--docker-route-interval-seconds",
+            "15",
+            "--route-backend",
+            "kernel-netlink",
+            "--userspace-wireguard-command",
+            "wireguard-go",
+            "--userspace-wireguard-arg",
+            "ipars0",
+            "--userspace-wireguard-ready-timeout-seconds",
+            "30",
+            "--userspace-wireguard-shutdown-timeout-seconds",
+            "20",
         ])?;
         if let Command::Docker {
             command: DockerCommand::Install(args),
@@ -5101,6 +10503,16 @@ mod tests {
             );
             assert_eq!(args.docker_host_interface, "br-edge");
             assert!(args.docker_container_cidrs.is_empty());
+            assert!(args.disable_docker_expose_host_routes);
+            assert_eq!(args.docker_route_interval_seconds, 15);
+            assert_eq!(args.route_backend, "kernel-netlink");
+            assert_eq!(
+                args.userspace_wireguard_command.as_deref(),
+                Some("wireguard-go")
+            );
+            assert_eq!(args.userspace_wireguard_args, vec!["ipars0".to_string()]);
+            assert_eq!(args.userspace_wireguard_ready_timeout_seconds, 30);
+            assert_eq!(args.userspace_wireguard_shutdown_timeout_seconds, 20);
         } else {
             anyhow::bail!("expected docker install command");
         }
@@ -5117,6 +10529,12 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--image-repository",
+            "registry.example.com/platform/ipars",
+            "--image-tag",
+            "2026.07.05",
+            "--image-pull-policy",
+            "Always",
             "--image-pull-secret",
             "registry-cred",
             "--agent-privileged",
@@ -5128,6 +10546,9 @@ mod tests {
             "SYS_TIME",
             "--agent-drop-capability",
             "MKNOD",
+            "--agent-read-only-root-filesystem",
+            "--agent-seccomp-profile",
+            "RuntimeDefault",
             "--kubernetes-discover-services",
             "--kubernetes-discover-api-server",
             "false",
@@ -5143,6 +10564,11 @@ mod tests {
             "route-provider-a",
             "--kubernetes-route-interval-seconds",
             "15",
+            "--route-backend",
+            "kernel-netlink",
+            "--disable-agent-peer-map",
+            "--agent-peer-map-poll-interval-seconds",
+            "45",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
@@ -5193,9 +10619,15 @@ mod tests {
             "15",
             "--agent-revision-history-limit",
             "5",
+            "--agent-pdb-min-available",
+            "80%",
             "--expose-agent-api",
             "--agent-api-service-type",
             "LoadBalancer",
+            "--agent-api-port",
+            "9781",
+            "--agent-api-target-port",
+            "9790",
             "--agent-api-node-port",
             "31080",
             "--agent-api-load-balancer-class",
@@ -5214,6 +10646,8 @@ mod tests {
             "10.0.0.0/8",
             "--agent-api-internal-traffic-policy",
             "Local",
+            "--agent-api-traffic-distribution",
+            "PreferSameZone",
             "--agent-api-session-affinity",
             "ClientIP",
             "--agent-api-session-affinity-timeout-seconds",
@@ -5225,6 +10659,14 @@ mod tests {
             "--expose-relay",
             "--relay-service-type",
             "LoadBalancer",
+            "--relay-udp-port",
+            "51821",
+            "--relay-udp-target-port",
+            "51820",
+            "--relay-http-port",
+            "9581",
+            "--relay-http-target-port",
+            "9580",
             "--relay-udp-node-port",
             "31820",
             "--relay-http-node-port",
@@ -5243,6 +10685,8 @@ mod tests {
             "203.0.113.0/24",
             "--relay-internal-traffic-policy",
             "Cluster",
+            "--relay-traffic-distribution",
+            "PreferClose",
             "--relay-session-affinity",
             "ClientIP",
             "--relay-session-affinity-timeout-seconds",
@@ -5251,6 +10695,10 @@ mod tests {
             "Local",
             "--relay-service-annotation",
             "metallb.universe.tf/address-pool=public",
+            "--relay-admission-bearer-token-secret",
+            "relay-admission-token",
+            "--relay-admission-bearer-token-key",
+            "token",
             "--relay-public-endpoint",
             "203.0.113.10:51820",
             "--relay-admission-url",
@@ -5264,6 +10712,12 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert_eq!(
+                args.image_repository.as_deref(),
+                Some("registry.example.com/platform/ipars")
+            );
+            assert_eq!(args.image_tag.as_deref(), Some("2026.07.05"));
+            assert_eq!(args.image_pull_policy.as_deref(), Some("Always"));
             assert_eq!(args.image_pull_secrets, vec!["registry-cred"]);
             assert!(args.agent_privileged);
             assert_eq!(
@@ -5272,6 +10726,12 @@ mod tests {
             );
             assert_eq!(args.agent_drop_capabilities, vec!["MKNOD"]);
             assert!(!args.disable_agent_privilege_escalation);
+            assert!(args.agent_read_only_root_filesystem);
+            assert_eq!(
+                args.agent_seccomp_profile.as_deref(),
+                Some("RuntimeDefault")
+            );
+            assert_eq!(args.agent_seccomp_localhost_profile, None);
             assert!(args.kubernetes_discover_services);
             assert!(!args.kubernetes_discover_api_server);
             assert_eq!(
@@ -5292,6 +10752,9 @@ mod tests {
                 Some("route-provider-a")
             );
             assert_eq!(args.kubernetes_route_interval_seconds, 15);
+            assert_eq!(args.route_backend, "kernel-netlink");
+            assert!(args.disable_agent_peer_map);
+            assert_eq!(args.agent_peer_map_poll_interval_seconds, 45);
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -5370,8 +10833,12 @@ mod tests {
             assert_eq!(args.agent_rollout_max_surge.as_deref(), Some("1"));
             assert_eq!(args.agent_min_ready_seconds, Some(15));
             assert_eq!(args.agent_revision_history_limit, Some(5));
+            assert_eq!(args.agent_pdb_min_available.as_deref(), Some("80%"));
+            assert_eq!(args.agent_pdb_max_unavailable, None);
             assert!(args.expose_agent_api);
             assert_eq!(args.agent_api_service_type, "LoadBalancer");
+            assert_eq!(args.agent_api_port, Some(9781));
+            assert_eq!(args.agent_api_target_port, Some(9790));
             assert_eq!(args.agent_api_node_port, Some(31080));
             assert_eq!(
                 args.agent_api_load_balancer_class.as_deref(),
@@ -5395,6 +10862,10 @@ mod tests {
                 args.agent_api_internal_traffic_policy.as_deref(),
                 Some("Local")
             );
+            assert_eq!(
+                args.agent_api_traffic_distribution.as_deref(),
+                Some("PreferSameZone")
+            );
             assert_eq!(args.agent_api_session_affinity.as_deref(), Some("ClientIP"));
             assert_eq!(args.agent_api_session_affinity_timeout_seconds, Some(600));
             assert_eq!(args.agent_api_external_traffic_policy, "Cluster");
@@ -5407,6 +10878,10 @@ mod tests {
             );
             assert!(args.expose_relay);
             assert_eq!(args.relay_service_type, "LoadBalancer");
+            assert_eq!(args.relay_udp_port, Some(51821));
+            assert_eq!(args.relay_udp_target_port, Some(51820));
+            assert_eq!(args.relay_http_port, Some(9581));
+            assert_eq!(args.relay_http_target_port, Some(9580));
             assert_eq!(args.relay_udp_node_port, Some(31820));
             assert_eq!(args.relay_http_node_port, Some(31580));
             assert_eq!(
@@ -5431,6 +10906,10 @@ mod tests {
                 args.relay_internal_traffic_policy.as_deref(),
                 Some("Cluster")
             );
+            assert_eq!(
+                args.relay_traffic_distribution.as_deref(),
+                Some("PreferClose")
+            );
             assert_eq!(args.relay_session_affinity.as_deref(), Some("ClientIP"));
             assert_eq!(args.relay_session_affinity_timeout_seconds, Some(900));
             assert_eq!(args.relay_external_traffic_policy, "Local");
@@ -5440,6 +10919,14 @@ mod tests {
                     key: "metallb.universe.tf/address-pool".to_string(),
                     value: "public".to_string(),
                 }]
+            );
+            assert_eq!(
+                args.relay_admission_bearer_token_secret.as_deref(),
+                Some("relay-admission-token")
+            );
+            assert_eq!(
+                args.relay_admission_bearer_token_key.as_deref(),
+                Some("token")
             );
             assert_eq!(
                 args.relay_public_endpoint.as_deref(),
@@ -5466,11 +10953,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5479,6 +10972,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -5494,6 +10990,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -5511,9 +11008,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -5521,15 +11028,27 @@ mod tests {
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -5537,13 +11056,26 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
     }
@@ -5566,11 +11098,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -5579,6 +11117,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -5594,6 +11135,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -5611,9 +11153,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -5621,15 +11173,27 @@ mod tests {
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -5637,13 +11201,26 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
     }
@@ -5714,6 +11291,130 @@ mod tests {
         assert!(
             error.contains("--relay-udp-node-port and --relay-http-node-port must be different")
         );
+
+        let mut duplicate_agent_relay = base_k8s_install_args();
+        duplicate_agent_relay.expose_agent_api = true;
+        duplicate_agent_relay.allow_public_service_exposure = true;
+        duplicate_agent_relay.agent_api_service_type = "NodePort".to_string();
+        duplicate_agent_relay.agent_api_node_port = Some(31080);
+        duplicate_agent_relay.expose_relay = true;
+        duplicate_agent_relay.relay_service_type = "NodePort".to_string();
+        duplicate_agent_relay.relay_udp_node_port = Some(31080);
+        duplicate_agent_relay.relay_http_node_port = Some(31580);
+        duplicate_agent_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_agent_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_agent_relay) {
+            Ok(_) => panic!("agent and relay NodePorts should be cluster-unique"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-udp-node-port must not reuse Kubernetes NodePort 31080 already assigned to --agent-api-node-port"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_service_app_protocols() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_app_protocol = Some("ipars.io/agent-http".to_string());
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        valid.relay_http_app_protocol = Some("http".to_string());
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2]
+            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+        assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-app-protocol",
+            "bad/proto/extra",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_app_protocol = Some("http".to_string());
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent API appProtocol requires exposed agent API Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-app-protocol requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay appProtocol requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-udp-app-protocol requires"));
+
+        let mut direct_invalid = base_k8s_install_args();
+        direct_invalid.expose_relay = true;
+        direct_invalid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        direct_invalid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        direct_invalid.relay_http_app_protocol = Some("bad/proto/extra".to_string());
+        let error = match k8s_install_plan(direct_invalid) {
+            Ok(_) => panic!("invalid relay HTTP appProtocol should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-http-app-protocol"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_publish_not_ready_addresses() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_publish_not_ready_addresses = true;
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_publish_not_ready_addresses = true;
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
+        assert!(plan.commands[2].contains("--set agent.relayService.publishNotReadyAddresses=true"));
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_publish_not_ready_addresses = true;
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => {
+                panic!("agent API publishNotReadyAddresses requires exposed agent API Service")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-publish-not-ready-addresses requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_publish_not_ready_addresses = true;
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay publishNotReadyAddresses requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-publish-not-ready-addresses requires"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-api-publish-not-ready-addresses",
+        ]);
+        assert!(parsed.is_err());
 
         Ok(())
     }
@@ -5813,6 +11514,156 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_service_external_addresses() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.allow_public_service_exposure = true;
+        valid.allow_unrestricted_load_balancer = true;
+        valid.agent_api_service_type = "LoadBalancer".to_string();
+        valid.agent_api_load_balancer_ip = Some("198.51.100.10".parse()?);
+        valid.agent_api_external_ips = vec!["198.51.100.11".parse()?, "2001:db8::11".parse()?];
+        valid.expose_relay = true;
+        valid.relay_service_type = "LoadBalancer".to_string();
+        valid.relay_load_balancer_ip = Some("203.0.113.10".parse()?);
+        valid.relay_external_ips = vec!["203.0.113.11".parse()?];
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(
+            plan.commands[2].contains("--set-string agent.apiService.loadBalancerIP=198.51.100.10")
+        );
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[1]=2001:db8::11'"));
+        assert!(plan.commands[2]
+            .contains("--set-string agent.relayService.loadBalancerIP=203.0.113.10"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.externalIPs[0]=203.0.113.11'"));
+
+        let mut cluster_ip_external = base_k8s_install_args();
+        cluster_ip_external.expose_agent_api = true;
+        cluster_ip_external.allow_public_service_exposure = true;
+        cluster_ip_external.agent_api_service_type = "ClusterIP".to_string();
+        cluster_ip_external.agent_api_external_ips = vec!["198.51.100.12".parse()?];
+        let cluster_ip_external_plan = k8s_install_plan(cluster_ip_external)?;
+        assert!(cluster_ip_external_plan.commands[2]
+            .contains("--set agent.apiService.exposureAcknowledged=true"));
+        assert!(cluster_ip_external_plan.commands[2]
+            .contains("--set-string 'agent.apiService.externalIPs[0]=198.51.100.12'"));
+
+        let mut cluster_ip_agent = base_k8s_install_args();
+        cluster_ip_agent.expose_agent_api = true;
+        cluster_ip_agent.agent_api_service_type = "ClusterIP".to_string();
+        cluster_ip_agent.agent_api_load_balancer_ip = Some("198.51.100.10".parse()?);
+        let error = match k8s_install_plan(cluster_ip_agent) {
+            Ok(_) => panic!("ClusterIP agent loadBalancerIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-load-balancer-ip only applies"));
+
+        let mut cluster_ip_relay = base_k8s_install_args();
+        cluster_ip_relay.expose_relay = true;
+        cluster_ip_relay.relay_service_type = "ClusterIP".to_string();
+        cluster_ip_relay.relay_load_balancer_ip = Some("203.0.113.10".parse()?);
+        cluster_ip_relay.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        cluster_ip_relay.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(cluster_ip_relay) {
+            Ok(_) => panic!("ClusterIP relay loadBalancerIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-load-balancer-ip only applies"));
+
+        let mut unacknowledged_agent_external_ip = base_k8s_install_args();
+        unacknowledged_agent_external_ip.expose_agent_api = true;
+        unacknowledged_agent_external_ip.agent_api_external_ips = vec!["198.51.100.11".parse()?];
+        let error = match k8s_install_plan(unacknowledged_agent_external_ip) {
+            Ok(_) => panic!("agent externalIPs should require exposure acknowledgement"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-external-ip requires --allow-public-service-exposure"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_external_ips = vec!["203.0.113.11".parse()?];
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay externalIPs require exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-external-ip requires --expose-relay"));
+
+        let mut unspecified_agent_lb = base_k8s_install_args();
+        unspecified_agent_lb.expose_agent_api = true;
+        unspecified_agent_lb.allow_public_service_exposure = true;
+        unspecified_agent_lb.allow_unrestricted_load_balancer = true;
+        unspecified_agent_lb.agent_api_service_type = "LoadBalancer".to_string();
+        unspecified_agent_lb.agent_api_load_balancer_ip = Some("0.0.0.0".parse()?);
+        let error = match k8s_install_plan(unspecified_agent_lb) {
+            Ok(_) => panic!("agent LoadBalancerIP should reject unspecified addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-load-balancer-ip must not use unspecified address"));
+
+        let mut link_local_relay_external_ip = base_k8s_install_args();
+        link_local_relay_external_ip.expose_relay = true;
+        link_local_relay_external_ip.allow_public_service_exposure = true;
+        link_local_relay_external_ip.allow_unrestricted_load_balancer = true;
+        link_local_relay_external_ip.relay_service_type = "LoadBalancer".to_string();
+        link_local_relay_external_ip.relay_external_ips = vec!["fe80::1".parse()?];
+        link_local_relay_external_ip.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        link_local_relay_external_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(link_local_relay_external_ip) {
+            Ok(_) => panic!("relay externalIPs should reject link-local addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-external-ip must not use link-local address"));
+
+        let mut duplicate_agent_external_ip = base_k8s_install_args();
+        duplicate_agent_external_ip.expose_agent_api = true;
+        duplicate_agent_external_ip.allow_public_service_exposure = true;
+        duplicate_agent_external_ip.agent_api_external_ips =
+            vec!["198.51.100.11".parse()?, "198.51.100.11".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_external_ip) {
+            Ok(_) => panic!("agent externalIPs should reject duplicate addresses"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-external-ip must not repeat external Service IP address 198.51.100.11"
+        ));
+
+        let mut duplicate_cross_service_external_ip = base_k8s_install_args();
+        duplicate_cross_service_external_ip.expose_agent_api = true;
+        duplicate_cross_service_external_ip.expose_relay = true;
+        duplicate_cross_service_external_ip.allow_public_service_exposure = true;
+        duplicate_cross_service_external_ip.agent_api_external_ips = vec!["198.51.100.11".parse()?];
+        duplicate_cross_service_external_ip.relay_external_ips = vec!["198.51.100.11".parse()?];
+        duplicate_cross_service_external_ip.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_external_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_external_ip) {
+            Ok(_) => panic!("agent and relay externalIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-ip must not reuse external Service IP address 198.51.100.11 already assigned by --agent-api-external-ip"
+        ));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-load-balancer-ip",
+            "198.51.100.10/32",
+        ]);
+        assert!(parsed.is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_wires_and_validates_health_check_node_ports() -> anyhow::Result<()> {
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
@@ -5894,6 +11745,27 @@ mod tests {
         };
         assert!(error.contains("must differ from relay NodePort overrides"));
 
+        let mut duplicate_cross_service_health = base_k8s_install_args();
+        duplicate_cross_service_health.expose_agent_api = true;
+        duplicate_cross_service_health.allow_public_service_exposure = true;
+        duplicate_cross_service_health.allow_unrestricted_load_balancer = true;
+        duplicate_cross_service_health.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_cross_service_health.agent_api_health_check_node_port = Some(31821);
+        duplicate_cross_service_health.expose_relay = true;
+        duplicate_cross_service_health.relay_service_type = "LoadBalancer".to_string();
+        duplicate_cross_service_health.relay_health_check_node_port = Some(31821);
+        duplicate_cross_service_health.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_health.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_health) {
+            Ok(_) => panic!("agent and relay healthCheckNodePorts should be cluster-unique"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-health-check-node-port must not reuse Kubernetes NodePort 31821 already assigned to --agent-api-health-check-node-port"
+        ));
+
         Ok(())
     }
 
@@ -5938,6 +11810,55 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-internal-traffic-policy requires"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_wires_and_validates_traffic_distribution() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_traffic_distribution = Some("PreferSameNode".to_string());
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_traffic_distribution = Some("PreferClose".to_string());
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(
+            plan.commands[2].contains("--set agent.apiService.trafficDistribution=PreferSameNode")
+        );
+        assert!(
+            plan.commands[2].contains("--set agent.relayService.trafficDistribution=PreferClose")
+        );
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-traffic-distribution",
+            "Random",
+        ]);
+        assert!(parsed.is_err());
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_traffic_distribution = Some("PreferSameZone".to_string());
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent trafficDistribution requires exposed agent API Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-traffic-distribution requires"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_traffic_distribution = Some("PreferSameZone".to_string());
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay trafficDistribution requires exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-traffic-distribution requires"));
 
         Ok(())
     }
@@ -6036,9 +11957,15 @@ mod tests {
         valid.network_policy_acknowledge_host_network = true;
         valid.expose_agent_api = true;
         valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_port = Some(9781);
+        valid.agent_api_target_port = Some(9790);
         valid.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_udp_port = Some(51821);
+        valid.relay_udp_target_port = Some(51820);
+        valid.relay_http_port = Some(9581);
+        valid.relay_http_target_port = Some(9580);
         valid.relay_network_policy_cidrs = vec!["203.0.113.0/24".parse()?];
         valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
         valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
@@ -6049,9 +11976,19 @@ mod tests {
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
+        assert!(plan.commands[2].contains("--set agent.apiService.port=9781"));
+        assert!(plan.commands[2].contains("--set agent.apiService.targetPort=9790"));
         assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
+        assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("listener ports")));
 
         let parsed = Cli::try_parse_from([
             "ipars",
@@ -6074,6 +12011,28 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--network-policy-acknowledge-host-network"));
+
+        let mut pod_network_policy = base_k8s_install_args();
+        pod_network_policy.disable_agent_host_network = true;
+        pod_network_policy.enable_network_policy = true;
+        pod_network_policy.expose_agent_api = true;
+        pod_network_policy.agent_api_network_policy_cidrs = vec!["10.0.0.0/8".parse()?];
+        let plan = k8s_install_plan(pod_network_policy)?;
+        assert!(plan.commands[2].contains("--set agent.hostNetwork=false"));
+        assert!(!plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
+
+        let mut pod_network_policy_with_irrelevant_ack = base_k8s_install_args();
+        pod_network_policy_with_irrelevant_ack.disable_agent_host_network = true;
+        pod_network_policy_with_irrelevant_ack.enable_network_policy = true;
+        pod_network_policy_with_irrelevant_ack.network_policy_acknowledge_host_network = true;
+        pod_network_policy_with_irrelevant_ack.expose_agent_api = true;
+        pod_network_policy_with_irrelevant_ack.agent_api_network_policy_cidrs =
+            vec!["10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(pod_network_policy_with_irrelevant_ack) {
+            Ok(_) => panic!("hostNetwork acknowledgement should not apply to pod-network agents"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--network-policy-acknowledge-host-network only applies"));
 
         let mut no_cidrs = base_k8s_install_args();
         no_cidrs.enable_network_policy = true;
@@ -6103,6 +12062,93 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-network-policy-cidr requires --expose-relay"));
+
+        let mut unrestricted_agent_policy = base_k8s_install_args();
+        unrestricted_agent_policy.enable_network_policy = true;
+        unrestricted_agent_policy.network_policy_acknowledge_host_network = true;
+        unrestricted_agent_policy.expose_agent_api = true;
+        unrestricted_agent_policy.agent_api_network_policy_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not include unrestricted CIDR 0.0.0.0/0"
+        ));
+
+        let mut loopback_agent_policy = base_k8s_install_args();
+        loopback_agent_policy.enable_network_policy = true;
+        loopback_agent_policy.network_policy_acknowledge_host_network = true;
+        loopback_agent_policy.expose_agent_api = true;
+        loopback_agent_policy.agent_api_network_policy_cidrs = vec!["127.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(loopback_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject loopback CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not include loopback CIDR 127.0.0.0/8"
+        ));
+
+        let mut noncanonical_agent_policy = base_k8s_install_args();
+        noncanonical_agent_policy.enable_network_policy = true;
+        noncanonical_agent_policy.network_policy_acknowledge_host_network = true;
+        noncanonical_agent_policy.expose_agent_api = true;
+        noncanonical_agent_policy.agent_api_network_policy_cidrs = vec!["10.0.0.1/8".parse()?];
+        let error = match k8s_install_plan(noncanonical_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject non-canonical CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must use canonical CIDR 10.0.0.0/8, not 10.0.0.1/8"
+        ));
+
+        let mut unrestricted_relay_policy = base_k8s_install_args();
+        unrestricted_relay_policy.enable_network_policy = true;
+        unrestricted_relay_policy.network_policy_acknowledge_host_network = true;
+        unrestricted_relay_policy.expose_relay = true;
+        unrestricted_relay_policy.relay_service_type = "ClusterIP".to_string();
+        unrestricted_relay_policy.relay_network_policy_cidrs = vec!["::/0".parse()?];
+        unrestricted_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        unrestricted_relay_policy.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unrestricted_relay_policy) {
+            Ok(_) => panic!("relay NetworkPolicy should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-network-policy-cidr must not include unrestricted CIDR ::/0")
+        );
+
+        let mut duplicate_agent_policy = base_k8s_install_args();
+        duplicate_agent_policy.enable_network_policy = true;
+        duplicate_agent_policy.network_policy_acknowledge_host_network = true;
+        duplicate_agent_policy.expose_agent_api = true;
+        duplicate_agent_policy.agent_api_network_policy_cidrs =
+            vec!["10.0.0.0/8".parse()?, "10.0.0.0/8".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr must not repeat NetworkPolicy CIDR allowlist 10.0.0.0/8"
+        ));
+
+        let mut duplicate_relay_policy = base_k8s_install_args();
+        duplicate_relay_policy.enable_network_policy = true;
+        duplicate_relay_policy.network_policy_acknowledge_host_network = true;
+        duplicate_relay_policy.expose_relay = true;
+        duplicate_relay_policy.relay_service_type = "ClusterIP".to_string();
+        duplicate_relay_policy.relay_network_policy_cidrs =
+            vec!["203.0.113.0/24".parse()?, "203.0.113.0/24".parse()?];
+        duplicate_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_relay_policy.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_relay_policy) {
+            Ok(_) => panic!("relay NetworkPolicy should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-network-policy-cidr must not repeat NetworkPolicy CIDR allowlist 203.0.113.0/24"
+        ));
 
         Ok(())
     }
@@ -6173,6 +12219,193 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_wires_and_validates_cluster_ips() -> anyhow::Result<()> {
+        let mut valid = base_k8s_install_args();
+        valid.expose_agent_api = true;
+        valid.agent_api_service_type = "ClusterIP".to_string();
+        valid.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        valid.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        valid.agent_api_ip_family_policy = Some("RequireDualStack".to_string());
+        valid.agent_api_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
+        valid.expose_relay = true;
+        valid.relay_service_type = "ClusterIP".to_string();
+        valid.relay_cluster_ip = Some("2001:db8::41".parse()?);
+        valid.relay_secondary_cluster_ip = Some("10.96.0.41".parse()?);
+        valid.relay_ip_family_policy = Some("PreferDualStack".to_string());
+        valid.relay_ip_families = vec!["IPv6".to_string(), "IPv4".to_string()];
+        valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+
+        let plan = k8s_install_plan(valid)?;
+        assert!(plan.commands[2].contains("--set-string agent.apiService.clusterIP=10.96.0.40"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[0]=10.96.0.40'")
+        );
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.apiService.clusterIPs[1]=2001:db8::40'")
+        );
+        assert!(plan.commands[2].contains("--set-string agent.relayService.clusterIP=2001:db8::41"));
+        assert!(plan.commands[2]
+            .contains("--set-string 'agent.relayService.clusterIPs[0]=2001:db8::41'"));
+        assert!(
+            plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
+        );
+
+        let mut mismatched_agent_family = base_k8s_install_args();
+        mismatched_agent_family.expose_agent_api = true;
+        mismatched_agent_family.agent_api_cluster_ip = Some("2001:db8::40".parse()?);
+        mismatched_agent_family.agent_api_ip_families = vec!["IPv4".to_string()];
+        let error = match k8s_install_plan(mismatched_agent_family) {
+            Ok(_) => panic!("agent clusterIP family mismatch should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent-api clusterIP family IPv6 must match"));
+
+        let mut missing_dual_stack_policy = base_k8s_install_args();
+        missing_dual_stack_policy.expose_agent_api = true;
+        missing_dual_stack_policy.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        missing_dual_stack_policy.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        missing_dual_stack_policy.agent_api_ip_family_policy = Some("SingleStack".to_string());
+        missing_dual_stack_policy.agent_api_ip_families = vec!["IPv4".to_string()];
+        let error = match k8s_install_plan(missing_dual_stack_policy) {
+            Ok(_) => panic!("secondary clusterIP should require dual-stack policy"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-secondary-cluster-ip requires"));
+
+        let mut same_family_secondary = base_k8s_install_args();
+        same_family_secondary.expose_relay = true;
+        same_family_secondary.relay_cluster_ip = Some("10.96.0.40".parse()?);
+        same_family_secondary.relay_secondary_cluster_ip = Some("10.96.0.41".parse()?);
+        same_family_secondary.relay_ip_family_policy = Some("PreferDualStack".to_string());
+        same_family_secondary.relay_ip_families = vec!["IPv4".to_string(), "IPv6".to_string()];
+        same_family_secondary.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        same_family_secondary.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(same_family_secondary) {
+            Ok(_) => panic!("secondary clusterIP family should differ from primary"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("secondary clusterIP family IPv4 must differ"));
+
+        let mut missing_agent_exposure = base_k8s_install_args();
+        missing_agent_exposure.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        let error = match k8s_install_plan(missing_agent_exposure) {
+            Ok(_) => panic!("agent clusterIP should require exposed agent API Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-cluster-ip requires --expose-agent-api"));
+
+        let mut missing_relay_exposure = base_k8s_install_args();
+        missing_relay_exposure.relay_cluster_ip = Some("10.96.0.41".parse()?);
+        let error = match k8s_install_plan(missing_relay_exposure) {
+            Ok(_) => panic!("relay clusterIP should require exposed relay Service"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-cluster-ip requires --expose-relay"));
+
+        let mut duplicate_cross_service_primary = base_k8s_install_args();
+        duplicate_cross_service_primary.expose_agent_api = true;
+        duplicate_cross_service_primary.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_primary.expose_relay = true;
+        duplicate_cross_service_primary.relay_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_primary.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_primary.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_primary) {
+            Ok(_) => panic!("agent and relay primary clusterIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-cluster-ip must not reuse Kubernetes Service clusterIP 10.96.0.40 already assigned by --agent-api-cluster-ip"
+        ));
+
+        let mut duplicate_cross_service_secondary = base_k8s_install_args();
+        duplicate_cross_service_secondary.expose_agent_api = true;
+        duplicate_cross_service_secondary.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        duplicate_cross_service_secondary.agent_api_secondary_cluster_ip =
+            Some("2001:db8::40".parse()?);
+        duplicate_cross_service_secondary.agent_api_ip_family_policy =
+            Some("RequireDualStack".to_string());
+        duplicate_cross_service_secondary.agent_api_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        duplicate_cross_service_secondary.expose_relay = true;
+        duplicate_cross_service_secondary.relay_cluster_ip = Some("10.96.0.41".parse()?);
+        duplicate_cross_service_secondary.relay_secondary_cluster_ip =
+            Some("2001:db8::40".parse()?);
+        duplicate_cross_service_secondary.relay_ip_family_policy =
+            Some("PreferDualStack".to_string());
+        duplicate_cross_service_secondary.relay_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        duplicate_cross_service_secondary.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        duplicate_cross_service_secondary.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_cross_service_secondary) {
+            Ok(_) => panic!("agent and relay secondary clusterIPs should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-secondary-cluster-ip must not reuse Kubernetes Service clusterIP 2001:db8::40 already assigned by --agent-api-secondary-cluster-ip"
+        ));
+
+        let mut missing_primary = base_k8s_install_args();
+        missing_primary.expose_agent_api = true;
+        missing_primary.agent_api_secondary_cluster_ip = Some("2001:db8::40".parse()?);
+        let error = match k8s_install_plan(missing_primary) {
+            Ok(_) => panic!("secondary clusterIP should require primary clusterIP"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-secondary-cluster-ip requires --agent-api-cluster-ip"));
+
+        let mut loopback_cluster_ip = base_k8s_install_args();
+        loopback_cluster_ip.expose_agent_api = true;
+        loopback_cluster_ip.agent_api_cluster_ip = Some("127.0.0.1".parse()?);
+        let error = match k8s_install_plan(loopback_cluster_ip) {
+            Ok(_) => panic!("loopback clusterIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-cluster-ip must not use loopback address 127.0.0.1"));
+
+        let mut link_local_secondary_cluster_ip = base_k8s_install_args();
+        link_local_secondary_cluster_ip.expose_agent_api = true;
+        link_local_secondary_cluster_ip.agent_api_cluster_ip = Some("10.96.0.40".parse()?);
+        link_local_secondary_cluster_ip.agent_api_secondary_cluster_ip = Some("fe80::40".parse()?);
+        link_local_secondary_cluster_ip.agent_api_ip_family_policy =
+            Some("RequireDualStack".to_string());
+        link_local_secondary_cluster_ip.agent_api_ip_families =
+            vec!["IPv4".to_string(), "IPv6".to_string()];
+        let error = match k8s_install_plan(link_local_secondary_cluster_ip) {
+            Ok(_) => panic!("link-local secondary clusterIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error
+            .contains("--agent-api-secondary-cluster-ip must not use link-local address fe80::40"));
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-cluster-ip",
+            "127.0.0.1",
+        ]);
+        assert!(parsed.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--expose-agent-api",
+            "--agent-api-cluster-ip",
+            "None",
+        ]);
+        assert!(parsed.is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_requires_acknowledgement_for_cluster_external_traffic_policy(
     ) -> anyhow::Result<()> {
         let without_ack = k8s_install_plan(K8sInstallArgs {
@@ -6181,11 +12414,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6194,6 +12433,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -6209,6 +12451,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6226,9 +12469,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6236,15 +12489,27 @@ mod tests {
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6252,13 +12517,26 @@ mod tests {
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(without_ack.is_err());
 
@@ -6268,11 +12546,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6281,6 +12565,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -6296,6 +12583,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6313,9 +12601,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6323,15 +12621,27 @@ mod tests {
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Cluster".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6339,18 +12649,158 @@ mod tests {
             relay_allow_source_cidrs: vec!["203.0.113.0/24".parse()?],
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Cluster".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
         assert!(acknowledged.commands[2]
             .contains("--set agent.apiService.allowClusterExternalTrafficPolicy=true"));
         assert!(acknowledged.commands[2]
             .contains("--set agent.relayService.allowClusterExternalTrafficPolicy=true"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_irrelevant_service_exposure_acknowledgements() -> anyhow::Result<()> {
+        let mut public_ack_without_public_service = base_k8s_install_args();
+        public_ack_without_public_service.expose_agent_api = true;
+        public_ack_without_public_service.allow_public_service_exposure = true;
+        let error = match k8s_install_plan(public_ack_without_public_service) {
+            Ok(_) => {
+                panic!("public exposure acknowledgement should require public Service exposure")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-public-service-exposure requires an exposed NodePort/LoadBalancer Service or Service externalIPs"
+        ));
+
+        let mut unrestricted_ack_with_source_ranges = base_k8s_install_args();
+        unrestricted_ack_with_source_ranges.expose_agent_api = true;
+        unrestricted_ack_with_source_ranges.allow_public_service_exposure = true;
+        unrestricted_ack_with_source_ranges.allow_unrestricted_load_balancer = true;
+        unrestricted_ack_with_source_ranges.agent_api_service_type = "LoadBalancer".to_string();
+        unrestricted_ack_with_source_ranges.agent_api_allow_source_cidrs =
+            vec!["198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(unrestricted_ack_with_source_ranges) {
+            Ok(_) => panic!("unrestricted LoadBalancer acknowledgement should require unrestricted LoadBalancer exposure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-unrestricted-load-balancer requires at least one exposed LoadBalancer Service without source CIDR ranges"
+        ));
+
+        let mut cluster_policy_ack_without_cluster_policy = base_k8s_install_args();
+        cluster_policy_ack_without_cluster_policy.expose_agent_api = true;
+        cluster_policy_ack_without_cluster_policy.allow_public_service_exposure = true;
+        cluster_policy_ack_without_cluster_policy.allow_cluster_external_traffic_policy = true;
+        cluster_policy_ack_without_cluster_policy.agent_api_service_type = "NodePort".to_string();
+        let error = match k8s_install_plan(cluster_policy_ack_without_cluster_policy) {
+            Ok(_) => panic!("cluster external traffic policy acknowledgement should require Cluster externalTrafficPolicy"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--allow-cluster-external-traffic-policy requires at least one exposed NodePort or LoadBalancer Service with externalTrafficPolicy=Cluster"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_inactive_service_type_and_target_port_overrides() -> anyhow::Result<()> {
+        let mut inactive_agent_type = base_k8s_install_args();
+        inactive_agent_type.agent_api_service_type = "NodePort".to_string();
+        let error = match k8s_install_plan(inactive_agent_type) {
+            Ok(_) => panic!("inactive agent API Service type override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-service-type requires --expose-agent-api"));
+
+        let mut inactive_agent_target_port = base_k8s_install_args();
+        inactive_agent_target_port.agent_api_target_port = Some(9790);
+        let error = match k8s_install_plan(inactive_agent_target_port) {
+            Ok(_) => panic!("inactive agent API targetPort override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-target-port requires --expose-agent-api"));
+
+        let mut inactive_agent_source_range = base_k8s_install_args();
+        inactive_agent_source_range.agent_api_allow_source_cidrs = vec!["198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(inactive_agent_source_range) {
+            Ok(_) => panic!("inactive agent API source range should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-api-allow-source-cidr requires --expose-agent-api"));
+
+        let mut inactive_relay_type = base_k8s_install_args();
+        inactive_relay_type.relay_service_type = "ClusterIP".to_string();
+        let error = match k8s_install_plan(inactive_relay_type) {
+            Ok(_) => panic!("inactive relay Service type override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-service-type requires --expose-relay"));
+
+        let mut inactive_relay_source_range = base_k8s_install_args();
+        inactive_relay_source_range.relay_allow_source_cidrs = vec!["203.0.113.0/24".parse()?];
+        let error = match k8s_install_plan(inactive_relay_source_range) {
+            Ok(_) => panic!("inactive relay source range should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-allow-source-cidr requires --expose-relay"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_rejects_cluster_external_traffic_policy_on_inactive_services(
+    ) -> anyhow::Result<()> {
+        let mut cluster_policy_without_agent_service = base_k8s_install_args();
+        cluster_policy_without_agent_service.agent_api_external_traffic_policy =
+            "Cluster".to_string();
+        let error = match k8s_install_plan(cluster_policy_without_agent_service) {
+            Ok(_) => panic!(
+                "agent externalTrafficPolicy=Cluster should require exposed external Service"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-external-traffic-policy Cluster requires --expose-agent-api with NodePort or LoadBalancer service type"
+        ));
+
+        let mut cluster_policy_on_cluster_ip = base_k8s_install_args();
+        cluster_policy_on_cluster_ip.expose_relay = true;
+        cluster_policy_on_cluster_ip.relay_service_type = "ClusterIP".to_string();
+        cluster_policy_on_cluster_ip.relay_external_traffic_policy = "Cluster".to_string();
+        cluster_policy_on_cluster_ip.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        cluster_policy_on_cluster_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(cluster_policy_on_cluster_ip) {
+            Ok(_) => panic!(
+                "relay externalTrafficPolicy=Cluster should require exposed external Service"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-traffic-policy Cluster requires --expose-relay with NodePort or LoadBalancer service type"
+        ));
+
         Ok(())
     }
 
@@ -6362,11 +12812,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6375,6 +12831,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -6390,6 +12849,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6407,9 +12867,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "ClusterIP".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6417,15 +12887,27 @@ mod tests {
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6433,13 +12915,26 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(plan.is_err());
         Ok(())
@@ -6454,11 +12949,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6467,6 +12968,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -6482,6 +12986,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6499,9 +13004,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6509,15 +13024,27 @@ mod tests {
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: false,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6525,13 +13052,26 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         });
         assert!(without_ranges.is_err());
 
@@ -6541,11 +13081,17 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            image_repository: None,
+            image_tag: None,
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             agent_privileged: false,
             agent_add_capabilities: Vec::new(),
             agent_drop_capabilities: Vec::new(),
             disable_agent_privilege_escalation: false,
+            agent_read_only_root_filesystem: false,
+            agent_seccomp_profile: None,
+            agent_seccomp_localhost_profile: None,
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -6554,6 +13100,9 @@ mod tests {
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            route_backend: "command".to_string(),
+            disable_agent_peer_map: false,
+            agent_peer_map_poll_interval_seconds: 30,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -6569,6 +13118,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
             agent_state_host_path: None,
@@ -6586,9 +13136,19 @@ mod tests {
             agent_rollout_max_surge: None,
             agent_min_ready_seconds: None,
             agent_revision_history_limit: None,
+            agent_pdb_min_available: None,
+            agent_pdb_max_unavailable: None,
             agent_api_service_type: "LoadBalancer".to_string(),
+            agent_api_cluster_ip: None,
+            agent_api_secondary_cluster_ip: None,
+            agent_api_port: None,
+            agent_api_target_port: None,
             agent_api_node_port: None,
+            agent_api_app_protocol: None,
+            agent_api_publish_not_ready_addresses: false,
             agent_api_load_balancer_class: None,
+            agent_api_load_balancer_ip: None,
+            agent_api_external_ips: Vec::new(),
             agent_api_health_check_node_port: None,
             agent_api_disable_load_balancer_node_ports: false,
             agent_api_ip_family_policy: None,
@@ -6596,15 +13156,27 @@ mod tests {
             agent_api_allow_source_cidrs: Vec::new(),
             agent_api_network_policy_cidrs: Vec::new(),
             agent_api_internal_traffic_policy: None,
+            agent_api_traffic_distribution: None,
             agent_api_session_affinity: None,
             agent_api_session_affinity_timeout_seconds: None,
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: Vec::new(),
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
+            relay_cluster_ip: None,
+            relay_secondary_cluster_ip: None,
+            relay_udp_port: None,
+            relay_udp_target_port: None,
+            relay_http_port: None,
+            relay_http_target_port: None,
             relay_udp_node_port: None,
             relay_http_node_port: None,
+            relay_udp_app_protocol: None,
+            relay_http_app_protocol: None,
+            relay_publish_not_ready_addresses: false,
             relay_load_balancer_class: None,
+            relay_load_balancer_ip: None,
+            relay_external_ips: Vec::new(),
             relay_health_check_node_port: None,
             relay_disable_load_balancer_node_ports: false,
             relay_ip_family_policy: None,
@@ -6612,18 +13184,101 @@ mod tests {
             relay_allow_source_cidrs: Vec::new(),
             relay_network_policy_cidrs: Vec::new(),
             relay_internal_traffic_policy: None,
+            relay_traffic_distribution: None,
             relay_session_affinity: None,
             relay_session_affinity_timeout_seconds: None,
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: Vec::new(),
+            relay_admission_bearer_token_secret: None,
+            relay_admission_bearer_token_key: None,
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_forwarder_endpoint: None,
+            relay_forwarder_bind: None,
+            relay_forwarder_wireguard_endpoint: None,
+            relay_forwarder_netns: None,
+            relay_forwarder_max_sessions: DEFAULT_RELAY_FORWARDER_MAX_SESSIONS,
+            relay_forwarder_restart_backoff_seconds:
+                DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS,
+            relay_forwarder_crash_window_seconds: DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS,
+            relay_forwarder_max_crashes_per_window: DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW,
+            relay_forwarder_crash_cooldown_seconds: DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS,
         })?;
         assert!(unrestricted.commands[2]
             .contains("--set agent.apiService.allowUnrestrictedLoadBalancer=true"));
         assert!(unrestricted.commands[2]
             .contains("--set agent.relayService.allowUnrestrictedLoadBalancer=true"));
+
+        let mut unrestricted_agent_source_range = base_k8s_install_args();
+        unrestricted_agent_source_range.expose_agent_api = true;
+        unrestricted_agent_source_range.allow_public_service_exposure = true;
+        unrestricted_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        unrestricted_agent_source_range.agent_api_allow_source_cidrs = vec!["0.0.0.0/0".parse()?];
+        let error = match k8s_install_plan(unrestricted_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not include unrestricted CIDR 0.0.0.0/0"
+        ));
+
+        let mut unrestricted_relay_source_range = base_k8s_install_args();
+        unrestricted_relay_source_range.expose_relay = true;
+        unrestricted_relay_source_range.allow_public_service_exposure = true;
+        unrestricted_relay_source_range.relay_service_type = "LoadBalancer".to_string();
+        unrestricted_relay_source_range.relay_allow_source_cidrs = vec!["::/0".parse()?];
+        unrestricted_relay_source_range.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        unrestricted_relay_source_range.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(unrestricted_relay_source_range) {
+            Ok(_) => panic!("relay source ranges should reject unrestricted CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-allow-source-cidr must not include unrestricted CIDR ::/0"));
+
+        let mut link_local_agent_source_range = base_k8s_install_args();
+        link_local_agent_source_range.expose_agent_api = true;
+        link_local_agent_source_range.allow_public_service_exposure = true;
+        link_local_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        link_local_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["169.254.0.0/16".parse()?];
+        let error = match k8s_install_plan(link_local_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject link-local CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not include link-local CIDR 169.254.0.0/16"
+        ));
+
+        let mut noncanonical_agent_source_range = base_k8s_install_args();
+        noncanonical_agent_source_range.expose_agent_api = true;
+        noncanonical_agent_source_range.allow_public_service_exposure = true;
+        noncanonical_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        noncanonical_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["198.51.100.1/24".parse()?];
+        let error = match k8s_install_plan(noncanonical_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject non-canonical CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must use canonical CIDR 198.51.100.0/24, not 198.51.100.1/24"
+        ));
+
+        let mut duplicate_agent_source_range = base_k8s_install_args();
+        duplicate_agent_source_range.expose_agent_api = true;
+        duplicate_agent_source_range.allow_public_service_exposure = true;
+        duplicate_agent_source_range.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_agent_source_range.agent_api_allow_source_cidrs =
+            vec!["198.51.100.0/24".parse()?, "198.51.100.0/24".parse()?];
+        let error = match k8s_install_plan(duplicate_agent_source_range) {
+            Ok(_) => panic!("agent API source ranges should reject duplicate CIDRs"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-allow-source-cidr must not repeat LoadBalancer source CIDR 198.51.100.0/24"
+        ));
         Ok(())
     }
 
@@ -6644,6 +13299,11 @@ mod tests {
             Ok("Cluster".to_string())
         );
         assert!(parse_kubernetes_internal_traffic_policy("Public").is_err());
+        assert_eq!(
+            parse_kubernetes_traffic_distribution("PreferSameZone"),
+            Ok("PreferSameZone".to_string())
+        );
+        assert!(parse_kubernetes_traffic_distribution("PreferRandom").is_err());
         assert_eq!(
             parse_kubernetes_session_affinity("ClientIP"),
             Ok("ClientIP".to_string())
@@ -6747,6 +13407,10 @@ mod tests {
         assert_eq!(parse_kubernetes_node_port("32767"), Ok(32767));
         assert!(parse_kubernetes_node_port("29999").is_err());
         assert!(parse_kubernetes_node_port("32768").is_err());
+        assert_eq!(parse_kubernetes_service_port("1"), Ok(1));
+        assert_eq!(parse_kubernetes_service_port("65535"), Ok(65_535));
+        assert!(parse_kubernetes_service_port("0").is_err());
+        assert!(parse_kubernetes_service_port("65536").is_err());
         assert_eq!(
             parse_kubernetes_ip_family_policy("RequireDualStack"),
             Ok("RequireDualStack".to_string())
@@ -6784,6 +13448,11 @@ mod tests {
         assert!(parse_key_value("example.com/bad?=value").is_err());
         assert!(parse_key_value("example.com/key=two words").is_err());
         assert!(parse_key_value("example.com/key=line\nbreak").is_err());
+        let oversized_annotation = format!(
+            "example.com/key={}",
+            "a".repeat(KUBERNETES_ANNOTATION_VALUE_MAX_BYTES + 1)
+        );
+        assert!(parse_key_value(&oversized_annotation).is_err());
         assert_eq!(
             helm_set_key("service.beta.kubernetes.io/aws-load-balancer-type"),
             "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"

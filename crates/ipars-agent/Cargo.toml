@@ -30,3 +30,6 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+ipars-signal = { path = "../ipars-signal" }

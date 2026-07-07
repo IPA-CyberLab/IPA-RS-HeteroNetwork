@@ -1,0 +1,8 @@
+services:
+  relay:
+    cap_add: !reset []
+    devices: !reset []
+
+  agent:
+    cap_add: !reset []
+    devices: !reset []
