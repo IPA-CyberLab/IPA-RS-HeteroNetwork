@@ -300,6 +300,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
     )?;
     assert_compose_service_apis(&compose, &ComposeApiPorts { agent: agent_port })?;
+    assert_compose_relay_dataplane(&compose)?;
 
     Ok(())
 }
@@ -641,6 +642,58 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
     Ok(())
 }
 
+fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
+    let probe = compose_exec_ipars_json(
+        compose,
+        "relay",
+        &[
+            "relay",
+            "probe",
+            "--relay-url",
+            "http://127.0.0.1:9580",
+            "--relay-udp",
+            "127.0.0.1:51820",
+            "--left-node-id",
+            "compose-left",
+            "--right-node-id",
+            "compose-right",
+            "--payload",
+            "compose-relay-dataplane-probe",
+            "--timeout-ms",
+            "5000",
+        ],
+        "relay dataplane probe",
+    )?;
+    ensure_json_string_equals(&probe, "relay_node", "relay-dev")?;
+    ensure_json_u64_at_least_at(
+        &probe,
+        &["status_after_probe", "dataplane", "datagrams_forwarded"],
+        2,
+    )?;
+    ensure_json_u64_at_least_at(
+        &probe,
+        &["status_after_probe", "dataplane", "payload_bytes_forwarded"],
+        2,
+    )?;
+
+    wait_for_json(
+        compose,
+        "relay status after dataplane probe",
+        "relay",
+        "http://127.0.0.1:9580/v1/status",
+        |value| {
+            ensure_json_u64_at_least(value, "admission_success_count", 1)?;
+            ensure_json_u64_at_least_at(value, &["capability", "active_sessions"], 1)?;
+            ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_received"], 2)?;
+            ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_forwarded"], 2)?;
+            ensure_json_u64_at_least_at(value, &["dataplane", "payload_bytes_forwarded"], 2)?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
 fn wait_for_json<F>(
     compose: &ComposeProject,
     label: &str,
@@ -701,6 +754,30 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
     })
 }
 
+fn compose_exec_ipars_json(
+    compose: &ComposeProject,
+    service: &str,
+    args: &[&str],
+    label: &str,
+) -> Result<Value> {
+    let mut command = compose_command(compose);
+    command.args(["exec", "-T", service, "ipars"]);
+    command.args(args);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose exec {service} ipars {args:?}"))?;
+    ensure_success(
+        &format!("docker compose exec {service} ipars {args:?}"),
+        &output,
+    )?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse JSON from {label}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
 fn ensure_json_u64_at_least(value: &Value, field: &str, minimum: u64) -> Result<()> {
     let actual = json_u64_field(value, field)?;
     anyhow::ensure!(
@@ -710,10 +787,34 @@ fn ensure_json_u64_at_least(value: &Value, field: &str, minimum: u64) -> Result<
     Ok(())
 }
 
+fn ensure_json_u64_at_least_at(value: &Value, path: &[&str], minimum: u64) -> Result<()> {
+    let actual = json_u64_field_at(value, path)?;
+    anyhow::ensure!(
+        actual >= minimum,
+        "expected JSON field {} to be at least {minimum}, got {actual}: {value}",
+        path.join(".")
+    );
+    Ok(())
+}
+
 fn json_u64_field(value: &Value, field: &str) -> Result<u64> {
     value.get(field).and_then(Value::as_u64).with_context(|| {
         format!("JSON field {field} was missing or not an unsigned integer: {value}")
     })
+}
+
+fn json_u64_field_at(value: &Value, path: &[&str]) -> Result<u64> {
+    let field = path.join(".");
+    json_value_at(value, path)
+        .and_then(Value::as_u64)
+        .with_context(|| {
+            format!("JSON field {field} was missing or not an unsigned integer: {value}")
+        })
+}
+
+fn json_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |current, field| current.get(*field))
 }
 
 fn ensure_json_string_equals(value: &Value, field: &str, expected: &str) -> Result<()> {

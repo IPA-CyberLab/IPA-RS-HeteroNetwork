@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 
@@ -8,12 +8,13 @@ use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
+use ipars_relay::encode_relay_datagram_with_route;
 use ipars_types::api::{
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
     ControlPlanePathsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayStatusResponse, RevokeTokenRequest,
-    RevokeTokenResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
@@ -38,6 +39,10 @@ const SANITIZED_INIT_DAEMON_PATH: &str =
 const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
 const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
 const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
+const DEFAULT_LOCAL_RELAY_UDP: &str = "127.0.0.1:51820";
+const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
+const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
+const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -235,12 +240,33 @@ struct TokenRevokeArgs {
 #[derive(Debug, Subcommand)]
 enum RelayCommand {
     Status(RelayStatusArgs),
+    Probe(RelayProbeArgs),
 }
 
 #[derive(Debug, Args)]
 struct RelayStatusArgs {
     #[arg(long, env = "IPARS_RELAY_URL")]
     relay_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RelayProbeArgs {
+    #[arg(long, env = "IPARS_RELAY_URL")]
+    relay_url: Option<String>,
+    #[arg(long, env = "IPARS_RELAY_UDP", default_value = DEFAULT_LOCAL_RELAY_UDP)]
+    relay_udp: SocketAddr,
+    #[arg(long, default_value = "probe-left")]
+    left_node_id: String,
+    #[arg(long, default_value = "probe-right")]
+    right_node_id: String,
+    #[arg(long, default_value = "127.0.0.1:0")]
+    left_bind: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:0")]
+    right_bind: SocketAddr,
+    #[arg(long, default_value = "ipars-relay-probe")]
+    payload: String,
+    #[arg(long, default_value_t = DEFAULT_RELAY_PROBE_TIMEOUT_MS)]
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -949,11 +975,12 @@ async fn main() -> anyhow::Result<()> {
             TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
         },
-        Command::Relay {
-            command: RelayCommand::Status(args),
-        } => match args.relay_url.as_deref() {
-            Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
-            None => print_json(&relay_status(defaulted_relay_url(None)).await?)?,
+        Command::Relay { command } => match command {
+            RelayCommand::Status(args) => match args.relay_url.as_deref() {
+                Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
+                None => print_json(&relay_status(defaulted_relay_url(None)).await?)?,
+            },
+            RelayCommand::Probe(args) => print_json(&relay_probe(args).await?)?,
         },
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
@@ -1844,6 +1871,211 @@ async fn agent_routes(agent_url: &str) -> anyhow::Result<RoutesOutput> {
 
 async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
     get_json(relay_url, "/v1/status", "relay status").await
+}
+
+#[derive(Debug, Serialize)]
+struct RelayProbeOutput {
+    relay_node: NodeId,
+    session_id: String,
+    relay_udp: SocketAddr,
+    left: NodeId,
+    right: NodeId,
+    left_addr: SocketAddr,
+    right_addr: SocketAddr,
+    payload_bytes: usize,
+    left_to_right: RelayProbeDirectionOutput,
+    right_to_left: RelayProbeDirectionOutput,
+    status_after_probe: RelayStatusResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayProbeDirectionOutput {
+    source: NodeId,
+    destination: NodeId,
+    bytes_sent: usize,
+    bytes_received: usize,
+}
+
+async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
+    validate_relay_probe_args(&args)?;
+    let relay_url = defaulted_relay_url(args.relay_url.as_deref());
+    let left = validated_node_id(&args.left_node_id, "--left-node-id")?;
+    let right = validated_node_id(&args.right_node_id, "--right-node-id")?;
+    anyhow::ensure!(
+        left != right,
+        "--left-node-id and --right-node-id must be different"
+    );
+
+    let timeout = std::time::Duration::from_millis(args.timeout_ms);
+    let left_socket = bind_probe_socket(args.left_bind, timeout, "--left-bind")?;
+    let right_socket = bind_probe_socket(args.right_bind, timeout, "--right-bind")?;
+    let left_addr = left_socket
+        .local_addr()
+        .context("failed to read left probe socket address")?;
+    let right_addr = right_socket
+        .local_addr()
+        .context("failed to read right probe socket address")?;
+    anyhow::ensure!(
+        endpoint_addr_is_usable(left_addr),
+        "left probe socket resolved to unusable relay target address {left_addr}; use --left-bind with an explicit local interface address"
+    );
+    anyhow::ensure!(
+        endpoint_addr_is_usable(right_addr),
+        "right probe socket resolved to unusable relay target address {right_addr}; use --right-bind with an explicit local interface address"
+    );
+    anyhow::ensure!(
+        left_addr != right_addr,
+        "left and right probe sockets resolved to the same local address {left_addr}"
+    );
+
+    let admission: RelayAdmissionResponse = post_json(
+        relay_url,
+        "/v1/sessions",
+        "relay session admission",
+        &RelayAdmissionRequest {
+            left: left.clone(),
+            right: right.clone(),
+            left_addr,
+            right_addr,
+        },
+    )
+    .await?;
+
+    anyhow::ensure!(
+        admission.left == left
+            && admission.right == right
+            && admission.left_addr == left_addr
+            && admission.right_addr == right_addr,
+        "relay admission response did not echo the requested session endpoints"
+    );
+
+    let payload = args.payload.as_bytes();
+    let left_to_right = relay_probe_direction(
+        &left_socket,
+        &right_socket,
+        args.relay_udp,
+        &admission.session_id,
+        &admission.session_token,
+        &left,
+        &right,
+        payload,
+    )?;
+    let right_to_left_payload = reversed_probe_payload(payload);
+    let right_to_left = relay_probe_direction(
+        &right_socket,
+        &left_socket,
+        args.relay_udp,
+        &admission.session_id,
+        &admission.session_token,
+        &right,
+        &left,
+        &right_to_left_payload,
+    )?;
+
+    let status_after_probe = relay_status(relay_url).await?;
+    anyhow::ensure!(
+        status_after_probe.dataplane.datagrams_forwarded >= 2,
+        "relay dataplane forwarded counter did not record the bidirectional probe: {:?}",
+        status_after_probe.dataplane
+    );
+    anyhow::ensure!(
+        status_after_probe.dataplane.payload_bytes_forwarded
+            >= (payload.len() + right_to_left_payload.len()) as u64,
+        "relay dataplane forwarded-byte counter did not record the bidirectional probe: {:?}",
+        status_after_probe.dataplane
+    );
+
+    Ok(RelayProbeOutput {
+        relay_node: admission.relay_node,
+        session_id: admission.session_id,
+        relay_udp: args.relay_udp,
+        left,
+        right,
+        left_addr,
+        right_addr,
+        payload_bytes: payload.len(),
+        left_to_right,
+        right_to_left,
+        status_after_probe,
+    })
+}
+
+fn validate_relay_probe_args(args: &RelayProbeArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        endpoint_addr_is_usable(args.relay_udp),
+        "--relay-udp must be a usable UDP socket address"
+    );
+    anyhow::ensure!(
+        args.timeout_ms > 0 && args.timeout_ms <= MAX_RELAY_PROBE_TIMEOUT_MS,
+        "--timeout-ms must be between 1 and {MAX_RELAY_PROBE_TIMEOUT_MS}"
+    );
+    anyhow::ensure!(!args.payload.is_empty(), "--payload must not be empty");
+    anyhow::ensure!(
+        args.payload.len() <= MAX_RELAY_PROBE_PAYLOAD_BYTES,
+        "--payload exceeds {MAX_RELAY_PROBE_PAYLOAD_BYTES} bytes"
+    );
+    Ok(())
+}
+
+fn bind_probe_socket(
+    bind_addr: SocketAddr,
+    timeout: std::time::Duration,
+    label: &str,
+) -> anyhow::Result<UdpSocket> {
+    let socket = UdpSocket::bind(bind_addr)
+        .with_context(|| format!("failed to bind relay probe socket for {label} at {bind_addr}"))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .with_context(|| format!("failed to set read timeout on {label} probe socket"))?;
+    Ok(socket)
+}
+
+fn relay_probe_direction(
+    send_socket: &UdpSocket,
+    recv_socket: &UdpSocket,
+    relay_udp: SocketAddr,
+    session_id: &str,
+    session_token: &str,
+    source: &NodeId,
+    destination: &NodeId,
+    payload: &[u8],
+) -> anyhow::Result<RelayProbeDirectionOutput> {
+    let datagram =
+        encode_relay_datagram_with_route(session_id, session_token, source, destination, payload)
+            .context("failed to encode relay probe datagram")?;
+    let bytes_sent = send_socket
+        .send_to(&datagram, relay_udp)
+        .with_context(|| format!("failed to send relay probe datagram to {relay_udp}"))?;
+    anyhow::ensure!(
+        bytes_sent == datagram.len(),
+        "relay probe sent {bytes_sent} of {} encoded bytes",
+        datagram.len()
+    );
+
+    let mut received = vec![0_u8; payload.len().saturating_add(1024).max(2048)];
+    let (bytes_received, remote_addr) = recv_socket
+        .recv_from(&mut received)
+        .with_context(|| format!("timed out waiting for relay probe payload from {source}"))?;
+    anyhow::ensure!(
+        bytes_received == payload.len(),
+        "relay probe received {bytes_received} bytes from {remote_addr}, expected {}",
+        payload.len()
+    );
+    anyhow::ensure!(
+        &received[..bytes_received] == payload,
+        "relay probe payload from {remote_addr} did not match the sent opaque payload"
+    );
+
+    Ok(RelayProbeDirectionOutput {
+        source: source.clone(),
+        destination: destination.clone(),
+        bytes_sent,
+        bytes_received,
+    })
+}
+
+fn reversed_probe_payload(payload: &[u8]) -> Vec<u8> {
+    payload.iter().rev().copied().collect()
 }
 
 async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
@@ -8654,6 +8886,7 @@ fi
             api_url(defaulted_relay_url(None), "/v1/status", "relay status")?,
             "http://127.0.0.1:9580/v1/status"
         );
+        assert_eq!(DEFAULT_LOCAL_RELAY_UDP, "127.0.0.1:51820");
         Ok(())
     }
 
@@ -9155,6 +9388,90 @@ fi
         }
 
         anyhow::bail!("expected relay status command")
+    }
+
+    #[test]
+    fn relay_probe_args_build_valid_dataplane_probe() -> anyhow::Result<()> {
+        let relay = Cli::try_parse_from([
+            "ipars",
+            "relay",
+            "probe",
+            "--relay-url",
+            "http://127.0.0.1:9580",
+            "--relay-udp",
+            "127.0.0.1:51820",
+            "--left-node-id",
+            "left-a",
+            "--right-node-id",
+            "right-b",
+            "--left-bind",
+            "127.0.0.1:0",
+            "--right-bind",
+            "127.0.0.1:0",
+            "--payload",
+            "opaque",
+            "--timeout-ms",
+            "1000",
+        ])?;
+        let Command::Relay {
+            command: RelayCommand::Probe(args),
+        } = relay.command
+        else {
+            anyhow::bail!("expected relay probe command");
+        };
+
+        assert_eq!(args.relay_url.as_deref(), Some("http://127.0.0.1:9580"));
+        assert_eq!(args.relay_udp, "127.0.0.1:51820".parse()?);
+        assert_eq!(args.left_node_id, "left-a");
+        assert_eq!(args.right_node_id, "right-b");
+        assert_eq!(args.left_bind, "127.0.0.1:0".parse()?);
+        assert_eq!(args.right_bind, "127.0.0.1:0".parse()?);
+        assert_eq!(args.payload, "opaque");
+        assert_eq!(args.timeout_ms, 1000);
+        validate_relay_probe_args(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relay_probe_rejects_unusable_endpoint_and_payload() -> anyhow::Result<()> {
+        let relay = Cli::try_parse_from([
+            "ipars",
+            "relay",
+            "probe",
+            "--relay-udp",
+            "0.0.0.0:51820",
+            "--payload",
+            "opaque",
+        ])?;
+        let Command::Relay {
+            command: RelayCommand::Probe(mut args),
+        } = relay.command
+        else {
+            anyhow::bail!("expected relay probe command");
+        };
+
+        let error = match validate_relay_probe_args(&args) {
+            Ok(_) => anyhow::bail!("unusable relay UDP endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--relay-udp must be a usable"));
+
+        args.relay_udp = "127.0.0.1:51820".parse()?;
+        args.payload.clear();
+        let error = match validate_relay_probe_args(&args) {
+            Ok(_) => anyhow::bail!("empty relay probe payload should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--payload must not be empty"));
+
+        args.payload = "opaque".to_string();
+        args.timeout_ms = MAX_RELAY_PROBE_TIMEOUT_MS + 1;
+        let error = match validate_relay_probe_args(&args) {
+            Ok(_) => anyhow::bail!("oversized relay probe timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--timeout-ms must be between"));
+        Ok(())
     }
 
     #[test]

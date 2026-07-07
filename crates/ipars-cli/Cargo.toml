@@ -15,6 +15,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ipars-crypto = { path = "../ipars-crypto" }
+ipars-relay = { path = "../ipars-relay" }
 ipars-types = { path = "../ipars-types" }
 ipnet.workspace = true
 reqwest.workspace = true
