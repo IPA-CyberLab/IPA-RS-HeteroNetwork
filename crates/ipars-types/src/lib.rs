@@ -2849,6 +2849,15 @@ pub mod api {
         if detector.chars().any(char::is_control) {
             return Err("packet-flow detector must not contain control characters".to_string());
         }
+        if !detector
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(
+                "packet-flow detector must be an ASCII token using letters, digits, '.', '_', or '-'"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -13720,8 +13729,8 @@ mod tests {
     fn packet_flow_detector_deserialization_is_bounded_and_printable(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let parsed: api::AgentPacketFlowObservation =
-            serde_json::from_str(r#"{"detector":"ebpf-jsonl"}"#)?;
-        assert_eq!(parsed.detector.as_deref(), Some("ebpf-jsonl"));
+            serde_json::from_str(r#"{"detector":"ebpf-jsonl.v1_0"}"#)?;
+        assert_eq!(parsed.detector.as_deref(), Some("ebpf-jsonl.v1_0"));
 
         let oversized_detector = "x".repeat(api::PACKET_FLOW_DETECTOR_MAX_BYTES + 1);
         let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(&format!(
@@ -13760,6 +13769,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("packet-flow detector must not contain control characters"));
+
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(
+            r#"{"detector":"ebpf jsonl"}"#,
+        ) {
+            Ok(_) => return Err("detector with internal whitespace should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "packet-flow detector must be an ASCII token using letters, digits, '.', '_', or '-'"
+        ));
         Ok(())
     }
 
@@ -13834,6 +13853,18 @@ mod tests {
         assert!(
             error.contains("packet-flow detector must not contain leading or trailing whitespace")
         );
+
+        let non_token_detector = api::AgentPacketFlowObservation {
+            detector: Some("proc/net/conntrack".to_string()),
+            ..Default::default()
+        };
+        let error = match non_token_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct detector non-token characters should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains(
+            "packet-flow detector must be an ASCII token using letters, digits, '.', '_', or '-'"
+        ));
 
         let oversized_payload = api::AgentPacketFlowObservation {
             payload_prefix: vec![0; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],

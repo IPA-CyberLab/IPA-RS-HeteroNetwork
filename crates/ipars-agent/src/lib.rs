@@ -7614,6 +7614,12 @@ mod tests {
                 ..Default::default()
             },
             AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(443),
+                detector: Some("sidecar tag".to_string()),
+                ..Default::default()
+            },
+            AgentPacketFlowObservation {
                 source: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 protocol: Some(TransportProtocol::Tcp),
                 destination_port: Some(443),
@@ -7631,7 +7637,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_observation_count, 0);
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
-        assert_eq!(metrics.packet_flow_filtered_count, 4);
+        assert_eq!(metrics.packet_flow_filtered_count, 5);
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -7640,7 +7646,7 @@ mod tests {
                     entry.reason == AgentPacketFlowDropReason::InconsistentTransportMetadata
                 })
                 .map(|entry| entry.count),
-            Some(4)
+            Some(5)
         );
         assert_eq!(
             metrics
