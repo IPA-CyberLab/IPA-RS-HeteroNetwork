@@ -2741,6 +2741,16 @@ pub mod api {
     const HTTP_REQUEST_METHODS: [&[u8]; 9] = [
         b"GET", b"HEAD", b"POST", b"PUT", b"PATCH", b"DELETE", b"OPTIONS", b"TRACE", b"CONNECT",
     ];
+    const ETCD_GRPC_PATH_PREFIXES: [&[u8]; 8] = [
+        b"/etcdserverpb.KV/",
+        b"/etcdserverpb.Watch/",
+        b"/etcdserverpb.Lease/",
+        b"/etcdserverpb.Cluster/",
+        b"/etcdserverpb.Maintenance/",
+        b"/etcdserverpb.Auth/",
+        b"/v3lockpb.Lock/",
+        b"/v3electionpb.Election/",
+    ];
 
     fn http_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
         if let Some(application) = http_payload_hint_application(payload) {
@@ -2769,6 +2779,9 @@ pub mod api {
             }
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
+            }
+            if etcd_grpc_path(path) {
+                return Some(AgentPacketFlowApplication::Etcd);
             }
             if etcd_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Etcd);
@@ -2832,6 +2845,9 @@ pub mod api {
         if contains_ascii_case_insensitive(payload, b"/zipkin.proto3.SpanService/Report") {
             return Some(AgentPacketFlowApplication::Zipkin);
         }
+        if etcd_grpc_payload(payload) {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
         if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
             return Some(AgentPacketFlowApplication::ClickHouse);
         }
@@ -2857,6 +2873,16 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn etcd_grpc_path(path: &[u8]) -> bool {
+        path_starts_with_any(path, &ETCD_GRPC_PATH_PREFIXES)
+    }
+
+    fn etcd_grpc_payload(payload: &[u8]) -> bool {
+        ETCD_GRPC_PATH_PREFIXES
+            .iter()
+            .any(|prefix| contains_ascii_case_insensitive(payload, prefix))
     }
 
     fn etcd_http_api_path(path: &[u8]) -> bool {
@@ -10280,6 +10306,20 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
         assert_eq!(
+            observation_for_payload(
+                b"POST /etcdserverpb.KV/Range HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /etcdserverpb.KVs/Range HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
             observation_for_payload(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0*application/grpc")
                 .application(),
             api::AgentPacketFlowApplication::Grpc
@@ -10292,6 +10332,11 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
         assert_eq!(
+            observation_for_payload(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/etcdserverpb.Watch/Watch")
+                .application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
             observation_for_payload(b"\x00\x00*application/grpc\x00\x00\x00").application(),
             api::AgentPacketFlowApplication::Grpc
         );
@@ -10301,6 +10346,10 @@ mod tests {
             )
             .application(),
             api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"\x00/v3lockpb.Lock/Lock").application(),
+            api::AgentPacketFlowApplication::Etcd
         );
         assert_eq!(
             observation_for_payload(b"POST /v3/kv/range HTTP/1.1\r\n").application(),
