@@ -401,6 +401,91 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateLabelSelectorExpression" -}}
+{{- $path := .path -}}
+{{- $expression := .expression -}}
+{{- if not (kindIs "map" $expression) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $expression -}}
+{{- if not (has $field (list "key" "operator" "values")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- $key := default "" $expression.key -}}
+{{- if eq $key "" -}}
+{{- fail (printf "%s.key is required" $path) -}}
+{{- end -}}
+{{- include "ipars.validateLabelKey" (dict "path" $path "key" $key) -}}
+{{- $operator := default "" $expression.operator -}}
+{{- if not (has $operator (list "In" "NotIn" "Exists" "DoesNotExist")) -}}
+{{- fail (printf "%s.operator must be In, NotIn, Exists, or DoesNotExist" $path) -}}
+{{- end -}}
+{{- $values := list -}}
+{{- if hasKey $expression "values" -}}
+{{- if not (kindIs "slice" $expression.values) -}}
+{{- fail (printf "%s.values must be a list" $path) -}}
+{{- end -}}
+{{- $values = $expression.values -}}
+{{- end -}}
+{{- if or (eq $operator "In") (eq $operator "NotIn") -}}
+{{- if not $values -}}
+{{- fail (printf "%s.values is required when operator is %s" $path $operator) -}}
+{{- end -}}
+{{- range $value := $values -}}
+{{- include "ipars.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
+{{- end -}}
+{{- else -}}
+{{- if $values -}}
+{{- fail (printf "%s.values must be omitted when operator is %s" $path $operator) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validatePodAffinityTerm" -}}
+{{- $path := .path -}}
+{{- $term := .term -}}
+{{- if not (kindIs "map" $term) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $term -}}
+{{- if not (has $field (list "topologyKey" "namespaces" "matchExpressions")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- $topologyKey := default "" $term.topologyKey -}}
+{{- if eq $topologyKey "" -}}
+{{- fail (printf "%s.topologyKey is required" $path) -}}
+{{- end -}}
+{{- include "ipars.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
+{{- if not (hasKey $term "matchExpressions") -}}
+{{- fail (printf "%s.matchExpressions is required" $path) -}}
+{{- end -}}
+{{- if not (kindIs "slice" $term.matchExpressions) -}}
+{{- fail (printf "%s.matchExpressions must be a list" $path) -}}
+{{- end -}}
+{{- if not $term.matchExpressions -}}
+{{- fail (printf "%s.matchExpressions must not be empty" $path) -}}
+{{- end -}}
+{{- range $expressionIndex, $expression := $term.matchExpressions -}}
+{{- include "ipars.validateLabelSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
+{{- end -}}
+{{- if hasKey $term "namespaces" -}}
+{{- if not (kindIs "slice" $term.namespaces) -}}
+{{- fail (printf "%s.namespaces must be a list" $path) -}}
+{{- end -}}
+{{- $namespaces := dict -}}
+{{- range $namespaceIndex, $namespace := $term.namespaces -}}
+{{- $namespaceValue := printf "%v" $namespace -}}
+{{- include "ipars.validateDnsLabelWithMax" (dict "path" (printf "%s.namespaces[%d]" $path $namespaceIndex) "value" $namespaceValue "maxBytes" 63) -}}
+{{- if hasKey $namespaces $namespaceValue -}}
+{{- fail (printf "%s.namespaces entry %q must not be repeated" $path $namespaceValue) -}}
+{{- end -}}
+{{- $_ := set $namespaces $namespaceValue true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateResourceQuantity" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}

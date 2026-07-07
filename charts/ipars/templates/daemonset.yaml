@@ -357,6 +357,52 @@
 {{- include "ipars.validateNodeSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
 {{- end -}}
 {{- end -}}
+{{- range $index, $term := .Values.agent.podAffinity.required -}}
+{{- include "ipars.validatePodAffinityTerm" (dict "path" (printf "agent.podAffinity.required[%d]" $index) "term" $term) -}}
+{{- end -}}
+{{- range $index, $preference := .Values.agent.podAffinity.preferred -}}
+{{- $path := printf "agent.podAffinity.preferred[%d]" $index -}}
+{{- if not (kindIs "map" $preference) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $preference -}}
+{{- if not (has $field (list "weight" "topologyKey" "namespaces" "matchExpressions")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $preference "weight") -}}
+{{- fail (printf "%s.weight is required" $path) -}}
+{{- end -}}
+{{- $weight := printf "%v" $preference.weight -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- if lt (int $weight) 1 -}}
+{{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
+{{- end -}}
+{{- include "ipars.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
+{{- end -}}
+{{- range $index, $term := .Values.agent.podAntiAffinity.required -}}
+{{- include "ipars.validatePodAffinityTerm" (dict "path" (printf "agent.podAntiAffinity.required[%d]" $index) "term" $term) -}}
+{{- end -}}
+{{- range $index, $preference := .Values.agent.podAntiAffinity.preferred -}}
+{{- $path := printf "agent.podAntiAffinity.preferred[%d]" $index -}}
+{{- if not (kindIs "map" $preference) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $preference -}}
+{{- if not (has $field (list "weight" "topologyKey" "namespaces" "matchExpressions")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $preference "weight") -}}
+{{- fail (printf "%s.weight is required" $path) -}}
+{{- end -}}
+{{- $weight := printf "%v" $preference.weight -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- if lt (int $weight) 1 -}}
+{{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
+{{- end -}}
+{{- include "ipars.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
+{{- end -}}
 {{- range $index, $toleration := .Values.agent.tolerations -}}
 {{- $path := printf "agent.tolerations[%d]" $index -}}
 {{- $tolerationKey := default "" $toleration.key -}}
@@ -661,8 +707,115 @@ spec:
           {{- end }}
         {{- end }}
       {{- end }}
-      {{- if or .Values.agent.nodeAffinity.required.matchExpressions .Values.agent.nodeAffinity.preferred }}
+      {{- if or .Values.agent.nodeAffinity.required.matchExpressions .Values.agent.nodeAffinity.preferred .Values.agent.podAffinity.required .Values.agent.podAffinity.preferred .Values.agent.podAntiAffinity.required .Values.agent.podAntiAffinity.preferred }}
       affinity:
+        {{- if or .Values.agent.podAffinity.required .Values.agent.podAffinity.preferred }}
+        podAffinity:
+          {{- with .Values.agent.podAffinity.required }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            {{- range . }}
+            - labelSelector:
+                matchExpressions:
+                  {{- range .matchExpressions }}
+                  - key: {{ .key | quote }}
+                    operator: {{ .operator | quote }}
+                    {{- if hasKey . "values" }}
+                    values:
+                      {{- range .values }}
+                      - {{ printf "%v" . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+              topologyKey: {{ .topologyKey | quote }}
+              {{- with .namespaces }}
+              namespaces:
+                {{- range . }}
+                - {{ . | quote }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.agent.podAffinity.preferred }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            {{- range . }}
+            - weight: {{ int .weight }}
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    {{- range .matchExpressions }}
+                    - key: {{ .key | quote }}
+                      operator: {{ .operator | quote }}
+                      {{- if hasKey . "values" }}
+                      values:
+                        {{- range .values }}
+                        - {{ printf "%v" . | quote }}
+                        {{- end }}
+                      {{- end }}
+                    {{- end }}
+                topologyKey: {{ .topologyKey | quote }}
+                {{- with .namespaces }}
+                namespaces:
+                  {{- range . }}
+                  - {{ . | quote }}
+                  {{- end }}
+                {{- end }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+        {{- if or .Values.agent.podAntiAffinity.required .Values.agent.podAntiAffinity.preferred }}
+        podAntiAffinity:
+          {{- with .Values.agent.podAntiAffinity.required }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            {{- range . }}
+            - labelSelector:
+                matchExpressions:
+                  {{- range .matchExpressions }}
+                  - key: {{ .key | quote }}
+                    operator: {{ .operator | quote }}
+                    {{- if hasKey . "values" }}
+                    values:
+                      {{- range .values }}
+                      - {{ printf "%v" . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+              topologyKey: {{ .topologyKey | quote }}
+              {{- with .namespaces }}
+              namespaces:
+                {{- range . }}
+                - {{ . | quote }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.agent.podAntiAffinity.preferred }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            {{- range . }}
+            - weight: {{ int .weight }}
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    {{- range .matchExpressions }}
+                    - key: {{ .key | quote }}
+                      operator: {{ .operator | quote }}
+                      {{- if hasKey . "values" }}
+                      values:
+                        {{- range .values }}
+                        - {{ printf "%v" . | quote }}
+                        {{- end }}
+                      {{- end }}
+                    {{- end }}
+                topologyKey: {{ .topologyKey | quote }}
+                {{- with .namespaces }}
+                namespaces:
+                  {{- range . }}
+                  - {{ . | quote }}
+                  {{- end }}
+                {{- end }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+        {{- if or .Values.agent.nodeAffinity.required.matchExpressions .Values.agent.nodeAffinity.preferred }}
         nodeAffinity:
           {{- with .Values.agent.nodeAffinity.required.matchExpressions }}
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -697,6 +850,7 @@ spec:
                   {{- end }}
             {{- end }}
           {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.agent.topologySpreadConstraints }}
       topologySpreadConstraints:

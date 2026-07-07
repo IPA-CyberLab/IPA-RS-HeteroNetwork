@@ -129,6 +129,31 @@ assert_rendered_contains node-affinity 'key: "node.kubernetes.io/instance-type"'
 assert_rendered_contains node-affinity 'operator: "In"'
 assert_rendered_contains node-affinity '- "m7i.large"'
 
+template_ok pod-affinity \
+  --set-string 'agent.podAffinity.required[0].topologyKey=kubernetes.io/hostname' \
+  --set-string 'agent.podAffinity.required[0].namespaces[0]=ipars-system' \
+  --set-string 'agent.podAffinity.required[0].matchExpressions[0].key=app.kubernetes.io/name' \
+  --set-string 'agent.podAffinity.required[0].matchExpressions[0].operator=In' \
+  --set-string 'agent.podAffinity.required[0].matchExpressions[0].values[0]=ipars' \
+  --set 'agent.podAntiAffinity.preferred[0].weight=90' \
+  --set-string 'agent.podAntiAffinity.preferred[0].topologyKey=topology.kubernetes.io/zone' \
+  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=ipars.io/role' \
+  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].operator=Exists'
+
+assert_rendered_contains pod-affinity "podAffinity:"
+assert_rendered_contains pod-affinity "podAntiAffinity:"
+assert_rendered_contains pod-affinity 'topologyKey: "kubernetes.io/hostname"'
+assert_rendered_contains pod-affinity 'topologyKey: "topology.kubernetes.io/zone"'
+assert_rendered_contains pod-affinity "namespaces:"
+assert_rendered_contains pod-affinity '- "ipars-system"'
+assert_rendered_contains pod-affinity 'key: "app.kubernetes.io/name"'
+assert_rendered_contains pod-affinity 'operator: "In"'
+assert_rendered_contains pod-affinity '- "ipars"'
+assert_rendered_contains pod-affinity "podAffinityTerm:"
+assert_rendered_contains pod-affinity "weight: 90"
+assert_rendered_contains pod-affinity 'key: "ipars.io/role"'
+assert_rendered_contains pod-affinity 'operator: "Exists"'
+
 template_ok topology-spread \
   --set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone' \
   --set 'agent.topologySpreadConstraints[0].maxSkew=1' \
@@ -440,6 +465,19 @@ template_fails node-affinity-preferred-zero-weight \
   --set 'agent.nodeAffinity.preferred[0].weight=0' \
   --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].key=node-role.kubernetes.io/worker' \
   --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].operator=Exists'
+
+template_fails pod-affinity-in-without-values \
+  "agent.podAffinity.required[0].matchExpressions[0].values is required when operator is In" \
+  --set-string 'agent.podAffinity.required[0].topologyKey=kubernetes.io/hostname' \
+  --set-string 'agent.podAffinity.required[0].matchExpressions[0].key=app.kubernetes.io/name' \
+  --set-string 'agent.podAffinity.required[0].matchExpressions[0].operator=In'
+
+template_fails pod-affinity-preferred-zero-weight \
+  "agent.podAntiAffinity.preferred[0].weight must be between 1 and 100" \
+  --set 'agent.podAntiAffinity.preferred[0].weight=0' \
+  --set-string 'agent.podAntiAffinity.preferred[0].topologyKey=kubernetes.io/hostname' \
+  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=app.kubernetes.io/name' \
+  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].operator=Exists'
 
 template_fails topology-spread-zero-max-skew \
   "agent.topologySpreadConstraints[0].maxSkew must be greater than zero" \

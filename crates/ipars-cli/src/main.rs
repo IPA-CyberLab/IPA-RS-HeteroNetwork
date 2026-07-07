@@ -512,6 +512,14 @@ struct K8sInstallArgs {
     agent_node_affinity_required: Vec<KubernetesNodeAffinityExpressionArg>,
     #[arg(long = "agent-node-affinity-preferred", value_parser = parse_kubernetes_node_affinity_preferred_arg)]
     agent_node_affinity_preferred: Vec<KubernetesPreferredNodeAffinityArg>,
+    #[arg(long = "agent-pod-affinity-required", value_parser = parse_kubernetes_pod_affinity_required_arg)]
+    agent_pod_affinity_required: Vec<KubernetesPodAffinityTermArg>,
+    #[arg(long = "agent-pod-affinity-preferred", value_parser = parse_kubernetes_pod_affinity_preferred_arg)]
+    agent_pod_affinity_preferred: Vec<KubernetesPreferredPodAffinityArg>,
+    #[arg(long = "agent-pod-anti-affinity-required", value_parser = parse_kubernetes_pod_affinity_required_arg)]
+    agent_pod_anti_affinity_required: Vec<KubernetesPodAffinityTermArg>,
+    #[arg(long = "agent-pod-anti-affinity-preferred", value_parser = parse_kubernetes_pod_affinity_preferred_arg)]
+    agent_pod_anti_affinity_preferred: Vec<KubernetesPreferredPodAffinityArg>,
     #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
     agent_tolerations: Vec<KubernetesTolerationArg>,
     #[arg(long = "agent-topology-spread", value_parser = parse_kubernetes_topology_spread_arg)]
@@ -795,6 +803,26 @@ struct KubernetesNodeAffinityExpressionArg {
 struct KubernetesPreferredNodeAffinityArg {
     weight: u8,
     expression: KubernetesNodeAffinityExpressionArg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesLabelSelectorExpressionArg {
+    key: String,
+    operator: String,
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesPodAffinityTermArg {
+    topology_key: String,
+    match_expressions: Vec<KubernetesLabelSelectorExpressionArg>,
+    namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesPreferredPodAffinityArg {
+    weight: u8,
+    term: KubernetesPodAffinityTermArg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2095,6 +2123,182 @@ fn parse_kubernetes_node_affinity_weight(value: &str) -> Result<u8, String> {
     Ok(parsed)
 }
 
+fn parse_kubernetes_pod_affinity_required_arg(
+    value: &str,
+) -> Result<KubernetesPodAffinityTermArg, String> {
+    parse_kubernetes_pod_affinity_term_arg(value)
+}
+
+fn parse_kubernetes_pod_affinity_preferred_arg(
+    value: &str,
+) -> Result<KubernetesPreferredPodAffinityArg, String> {
+    if value.is_empty() {
+        return Err("preferred pod affinity must not be empty".to_string());
+    }
+    let mut weight = None;
+    let mut term_fields = Vec::new();
+    for part in value.split(',') {
+        let (field, field_value) = part.split_once('=').ok_or_else(|| {
+            "preferred pod affinity fields must use name=value syntax".to_string()
+        })?;
+        if field_value.is_empty() {
+            return Err(format!(
+                "preferred pod affinity field {field} must not be empty"
+            ));
+        }
+        if field == "weight" {
+            let parsed = parse_kubernetes_pod_affinity_weight(field_value)?;
+            if weight.replace(parsed).is_some() {
+                return Err("duplicate preferred pod affinity field weight".to_string());
+            }
+        } else {
+            term_fields.push(part);
+        }
+    }
+    let term = parse_kubernetes_pod_affinity_term_arg(&term_fields.join(","))?;
+    Ok(KubernetesPreferredPodAffinityArg {
+        weight: weight
+            .ok_or_else(|| "preferred pod affinity field weight is required".to_string())?,
+        term,
+    })
+}
+
+fn parse_kubernetes_pod_affinity_term_arg(
+    value: &str,
+) -> Result<KubernetesPodAffinityTermArg, String> {
+    if value.is_empty() {
+        return Err("pod affinity term must not be empty".to_string());
+    }
+    let mut topology_key = None;
+    let mut namespaces = None;
+    let mut expression_fields = Vec::new();
+    for part in value.split(',') {
+        let (field, field_value) = part
+            .split_once('=')
+            .ok_or_else(|| "pod affinity term fields must use name=value syntax".to_string())?;
+        if field_value.is_empty() {
+            return Err(format!("pod affinity term field {field} must not be empty"));
+        }
+        match field {
+            "topologyKey" | "topology-key" => {
+                set_pod_affinity_string_field(&mut topology_key, field, field_value)?
+            }
+            "namespaces" => {
+                let parsed = parse_kubernetes_pod_affinity_namespaces(field_value)?;
+                if namespaces.replace(parsed).is_some() {
+                    return Err("duplicate pod affinity term field namespaces".to_string());
+                }
+            }
+            "key" | "operator" | "values" => expression_fields.push(part),
+            _ => {
+                return Err(format!(
+                    "unknown pod affinity term field {field}; expected topologyKey, namespaces, key, operator, or values"
+                ));
+            }
+        }
+    }
+    let expression = parse_kubernetes_label_selector_expression_arg(&expression_fields.join(","))?;
+    let term = KubernetesPodAffinityTermArg {
+        topology_key: topology_key
+            .ok_or_else(|| "pod affinity term field topologyKey is required".to_string())?,
+        match_expressions: vec![expression],
+        namespaces: namespaces.unwrap_or_default(),
+    };
+    validate_kubernetes_pod_affinity_term_arg(&term)?;
+    Ok(term)
+}
+
+fn parse_kubernetes_label_selector_expression_arg(
+    value: &str,
+) -> Result<KubernetesLabelSelectorExpressionArg, String> {
+    if value.is_empty() {
+        return Err("pod affinity label selector expression must not be empty".to_string());
+    }
+    let mut key = None;
+    let mut operator = None;
+    let mut values = None;
+    for part in value.split(',') {
+        let (field, field_value) = part.split_once('=').ok_or_else(|| {
+            "pod affinity label selector fields must use name=value syntax".to_string()
+        })?;
+        if field_value.is_empty() {
+            return Err(format!(
+                "pod affinity label selector field {field} must not be empty"
+            ));
+        }
+        match field {
+            "key" => set_label_selector_string_field(&mut key, field, field_value)?,
+            "operator" => set_label_selector_string_field(&mut operator, field, field_value)?,
+            "values" => {
+                let parsed = parse_kubernetes_label_selector_values(field_value)?;
+                if values.replace(parsed).is_some() {
+                    return Err("duplicate pod affinity label selector field values".to_string());
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "unknown pod affinity label selector field {field}; expected key, operator, or values"
+                ));
+            }
+        }
+    }
+    let expression = KubernetesLabelSelectorExpressionArg {
+        key: key.ok_or_else(|| "pod affinity label selector field key is required".to_string())?,
+        operator: operator
+            .ok_or_else(|| "pod affinity label selector field operator is required".to_string())?,
+        values: values.unwrap_or_default(),
+    };
+    validate_kubernetes_label_selector_expression_arg(&expression)?;
+    Ok(expression)
+}
+
+fn parse_kubernetes_label_selector_values(value: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for item in value.split('|') {
+        if item.is_empty() {
+            return Err(
+                "pod affinity label selector values must not contain empty entries".to_string(),
+            );
+        }
+        values.push(item.to_string());
+    }
+    if values.is_empty() {
+        return Err("pod affinity label selector values must not be empty".to_string());
+    }
+    Ok(values)
+}
+
+fn parse_kubernetes_pod_affinity_namespaces(value: &str) -> Result<Vec<String>, String> {
+    let mut namespaces = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in value.split('|') {
+        if item.is_empty() {
+            return Err("pod affinity namespaces must not contain empty entries".to_string());
+        }
+        validate_kubernetes_namespace(item).map_err(|error| error.to_string())?;
+        if !seen.insert(item) {
+            return Err(format!(
+                "pod affinity namespace `{item}` must not be repeated"
+            ));
+        }
+        namespaces.push(item.to_string());
+    }
+    if namespaces.is_empty() {
+        return Err("pod affinity namespaces must not be empty".to_string());
+    }
+    Ok(namespaces)
+}
+
+fn parse_kubernetes_pod_affinity_weight(value: &str) -> Result<u8, String> {
+    let parsed = value.parse::<u8>().map_err(|_| {
+        "preferred pod affinity weight must be an integer from 1 to 100".to_string()
+    })?;
+    if !(1..=100).contains(&parsed) {
+        return Err("preferred pod affinity weight must be an integer from 1 to 100".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_kubernetes_toleration_arg(value: &str) -> Result<KubernetesTolerationArg, String> {
     if value.is_empty() {
         return Err("toleration must not be empty".to_string());
@@ -2226,6 +2430,32 @@ fn set_node_affinity_string_field(
 ) -> Result<(), String> {
     if slot.replace(value.to_string()).is_some() {
         Err(format!("duplicate node affinity expression field {field}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_pod_affinity_string_field(
+    slot: &mut Option<String>,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if slot.replace(value.to_string()).is_some() {
+        Err(format!("duplicate pod affinity term field {field}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_label_selector_string_field(
+    slot: &mut Option<String>,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if slot.replace(value.to_string()).is_some() {
+        Err(format!(
+            "duplicate pod affinity label selector field {field}"
+        ))
     } else {
         Ok(())
     }
@@ -2509,6 +2739,71 @@ fn validate_kubernetes_preferred_node_affinity_arg(
         return Err("preferred node affinity weight must be an integer from 1 to 100".to_string());
     }
     validate_kubernetes_node_affinity_expression_arg(&preference.expression)
+}
+
+fn validate_kubernetes_label_selector_expression_arg(
+    expression: &KubernetesLabelSelectorExpressionArg,
+) -> Result<(), String> {
+    validate_kubernetes_label_key(&expression.key)?;
+    match expression.operator.as_str() {
+        "In" | "NotIn" => {
+            if expression.values.is_empty() {
+                return Err(format!(
+                    "pod affinity label selector values are required when operator is {}",
+                    expression.operator
+                ));
+            }
+            for value in &expression.values {
+                validate_kubernetes_label_value(value)?;
+            }
+        }
+        "Exists" | "DoesNotExist" => {
+            if !expression.values.is_empty() {
+                return Err(format!(
+                    "pod affinity label selector values must be omitted when operator is {}",
+                    expression.operator
+                ));
+            }
+        }
+        _ => {
+            return Err(
+                "pod affinity label selector operator must be In, NotIn, Exists, or DoesNotExist"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_pod_affinity_term_arg(
+    term: &KubernetesPodAffinityTermArg,
+) -> Result<(), String> {
+    validate_kubernetes_label_key(&term.topology_key)?;
+    if term.match_expressions.is_empty() {
+        return Err("pod affinity term requires at least one match expression".to_string());
+    }
+    for expression in &term.match_expressions {
+        validate_kubernetes_label_selector_expression_arg(expression)?;
+    }
+    let mut namespaces = std::collections::BTreeSet::new();
+    for namespace in &term.namespaces {
+        validate_kubernetes_namespace(namespace).map_err(|error| error.to_string())?;
+        if !namespaces.insert(namespace.as_str()) {
+            return Err(format!(
+                "pod affinity namespace `{namespace}` must not be repeated"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_preferred_pod_affinity_arg(
+    preference: &KubernetesPreferredPodAffinityArg,
+) -> Result<(), String> {
+    if !(1..=100).contains(&preference.weight) {
+        return Err("preferred pod affinity weight must be an integer from 1 to 100".to_string());
+    }
+    validate_kubernetes_pod_affinity_term_arg(&preference.term)
 }
 
 fn validate_kubernetes_toleration_arg(toleration: &KubernetesTolerationArg) -> Result<(), String> {
@@ -4339,7 +4634,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Chart nameOverride and fullnameOverride values map directly to Helm chart metadata and must remain Kubernetes DNS labels".to_string(),
             "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, node affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
@@ -4657,6 +4952,42 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
             &preference.expression,
         );
     }
+    for (index, term) in args.agent_pod_affinity_required.iter().enumerate() {
+        append_k8s_pod_affinity_term_values(
+            command,
+            &format!("agent.podAffinity.required[{index}]"),
+            term,
+        );
+    }
+    for (index, preference) in args.agent_pod_affinity_preferred.iter().enumerate() {
+        command.push_str(&format!(
+            " --set 'agent.podAffinity.preferred[{index}].weight={}'",
+            preference.weight
+        ));
+        append_k8s_pod_affinity_term_values(
+            command,
+            &format!("agent.podAffinity.preferred[{index}]"),
+            &preference.term,
+        );
+    }
+    for (index, term) in args.agent_pod_anti_affinity_required.iter().enumerate() {
+        append_k8s_pod_affinity_term_values(
+            command,
+            &format!("agent.podAntiAffinity.required[{index}]"),
+            term,
+        );
+    }
+    for (index, preference) in args.agent_pod_anti_affinity_preferred.iter().enumerate() {
+        command.push_str(&format!(
+            " --set 'agent.podAntiAffinity.preferred[{index}].weight={}'",
+            preference.weight
+        ));
+        append_k8s_pod_affinity_term_values(
+            command,
+            &format!("agent.podAntiAffinity.preferred[{index}]"),
+            &preference.term,
+        );
+    }
     for (index, toleration) in args.agent_tolerations.iter().enumerate() {
         if let Some(key) = toleration.key.as_deref() {
             append_helm_set_string(command, &format!("agent.tolerations[{index}].key"), key);
@@ -4788,6 +5119,40 @@ fn append_k8s_node_affinity_expression_values(
     command: &mut String,
     prefix: &str,
     expression: &KubernetesNodeAffinityExpressionArg,
+) {
+    append_helm_set_string(command, &format!("{prefix}.key"), &expression.key);
+    append_helm_set_string(command, &format!("{prefix}.operator"), &expression.operator);
+    for (index, value) in expression.values.iter().enumerate() {
+        append_helm_set_string(command, &format!("{prefix}.values[{index}]"), value);
+    }
+}
+
+fn append_k8s_pod_affinity_term_values(
+    command: &mut String,
+    prefix: &str,
+    term: &KubernetesPodAffinityTermArg,
+) {
+    append_helm_set_string(
+        command,
+        &format!("{prefix}.topologyKey"),
+        &term.topology_key,
+    );
+    for (index, namespace) in term.namespaces.iter().enumerate() {
+        append_helm_set_string(command, &format!("{prefix}.namespaces[{index}]"), namespace);
+    }
+    for (index, expression) in term.match_expressions.iter().enumerate() {
+        append_k8s_label_selector_expression_values(
+            command,
+            &format!("{prefix}.matchExpressions[{index}]"),
+            expression,
+        );
+    }
+}
+
+fn append_k8s_label_selector_expression_values(
+    command: &mut String,
+    prefix: &str,
+    expression: &KubernetesLabelSelectorExpressionArg,
 ) {
     append_helm_set_string(command, &format!("{prefix}.key"), &expression.key);
     append_helm_set_string(command, &format!("{prefix}.operator"), &expression.operator);
@@ -5750,6 +6115,18 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     for preference in &args.agent_node_affinity_preferred {
         validate_kubernetes_preferred_node_affinity_arg(preference).map_err(anyhow::Error::msg)?;
+    }
+    for term in &args.agent_pod_affinity_required {
+        validate_kubernetes_pod_affinity_term_arg(term).map_err(anyhow::Error::msg)?;
+    }
+    for preference in &args.agent_pod_affinity_preferred {
+        validate_kubernetes_preferred_pod_affinity_arg(preference).map_err(anyhow::Error::msg)?;
+    }
+    for term in &args.agent_pod_anti_affinity_required {
+        validate_kubernetes_pod_affinity_term_arg(term).map_err(anyhow::Error::msg)?;
+    }
+    for preference in &args.agent_pod_anti_affinity_preferred {
+        validate_kubernetes_preferred_pod_affinity_arg(preference).map_err(anyhow::Error::msg)?;
     }
     for toleration in &args.agent_tolerations {
         validate_kubernetes_toleration_arg(toleration).map_err(anyhow::Error::msg)?;
@@ -9128,6 +9505,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -9767,10 +10148,15 @@ mod tests {
         assert!(values.contains("nameOverride: \"\""));
         assert!(values.contains("fullnameOverride: \"\""));
         assert!(values.contains("nodeAffinity:"));
+        assert!(values.contains("podAffinity:"));
+        assert!(values.contains("podAntiAffinity:"));
         assert!(values.contains("topologySpreadConstraints: []"));
         assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
         assert!(helpers.contains("define \"ipars.validateNodeSelectorExpression\""));
+        assert!(helpers.contains("define \"ipars.validatePodAffinityTerm\""));
         assert!(daemonset.contains("agent.nodeAffinity.required.matchExpressions[%d]"));
+        assert!(daemonset.contains("agent.podAffinity.required[%d]"));
+        assert!(daemonset.contains("podAntiAffinity:"));
         assert!(daemonset.contains("preferredDuringSchedulingIgnoredDuringExecution"));
         Ok(())
     }
@@ -10512,6 +10898,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -10966,6 +11356,27 @@ mod tests {
                 values: vec!["m7i.large".to_string(), "m7i.xlarge".to_string()],
             },
         }];
+        args.agent_pod_affinity_required = vec![KubernetesPodAffinityTermArg {
+            topology_key: "kubernetes.io/hostname".to_string(),
+            match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                key: "app.kubernetes.io/name".to_string(),
+                operator: "In".to_string(),
+                values: vec!["ipars".to_string()],
+            }],
+            namespaces: vec!["ipars-system".to_string()],
+        }];
+        args.agent_pod_anti_affinity_preferred = vec![KubernetesPreferredPodAffinityArg {
+            weight: 90,
+            term: KubernetesPodAffinityTermArg {
+                topology_key: "topology.kubernetes.io/zone".to_string(),
+                match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                    key: "ipars.io/role".to_string(),
+                    operator: "Exists".to_string(),
+                    values: Vec::new(),
+                }],
+                namespaces: Vec::new(),
+            },
+        }];
         args.agent_tolerations = vec![
             KubernetesTolerationArg {
                 key: Some("node-role.kubernetes.io/control-plane".to_string()),
@@ -11029,6 +11440,30 @@ mod tests {
         ));
         assert!(helm.contains(
             "--set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].values[1]=m7i.xlarge'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.podAffinity.required[0].topologyKey=kubernetes.io/hostname'"
+        ));
+        assert!(helm
+            .contains("--set-string 'agent.podAffinity.required[0].namespaces[0]=ipars-system'"));
+        assert!(helm.contains(
+            "--set-string 'agent.podAffinity.required[0].matchExpressions[0].key=app.kubernetes.io/name'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.podAffinity.required[0].matchExpressions[0].operator=In'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.podAffinity.required[0].matchExpressions[0].values[0]=ipars'"
+        ));
+        assert!(helm.contains("--set 'agent.podAntiAffinity.preferred[0].weight=90'"));
+        assert!(helm.contains(
+            "--set-string 'agent.podAntiAffinity.preferred[0].topologyKey=topology.kubernetes.io/zone'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=ipars.io/role'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].operator=Exists'"
         ));
         assert!(helm.contains(
             "--set-string 'agent.tolerations[0].key=node-role.kubernetes.io/control-plane'"
@@ -11211,6 +11646,42 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("preferred node affinity weight"));
+
+        let mut invalid_pod_affinity = base_k8s_install_args();
+        invalid_pod_affinity.agent_pod_affinity_required = vec![KubernetesPodAffinityTermArg {
+            topology_key: "kubernetes.io/hostname".to_string(),
+            match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                key: "app.kubernetes.io/name".to_string(),
+                operator: "Gt".to_string(),
+                values: vec!["1".to_string()],
+            }],
+            namespaces: Vec::new(),
+        }];
+        let error = match k8s_install_plan(invalid_pod_affinity) {
+            Ok(_) => panic!("pod affinity Gt operator should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("pod affinity label selector operator"));
+
+        let mut invalid_pod_anti_affinity = base_k8s_install_args();
+        invalid_pod_anti_affinity.agent_pod_anti_affinity_preferred =
+            vec![KubernetesPreferredPodAffinityArg {
+                weight: 0,
+                term: KubernetesPodAffinityTermArg {
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                    match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                        key: "app.kubernetes.io/name".to_string(),
+                        operator: "Exists".to_string(),
+                        values: Vec::new(),
+                    }],
+                    namespaces: Vec::new(),
+                },
+            }];
+        let error = match k8s_install_plan(invalid_pod_anti_affinity) {
+            Ok(_) => panic!("preferred pod anti-affinity zero weight should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("preferred pod affinity weight"));
 
         let mut invalid_priority = base_k8s_install_args();
         invalid_priority.agent_priority_class = Some("system/node-critical".to_string());
@@ -11768,6 +12239,14 @@ mod tests {
             "key=node-role.kubernetes.io/worker,operator=Exists",
             "--agent-node-affinity-preferred",
             "weight=75,key=node.kubernetes.io/instance-type,operator=In,values=m7i.large|m7i.xlarge",
+            "--agent-pod-affinity-required",
+            "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=In,values=ipars,namespaces=edge-system",
+            "--agent-pod-affinity-preferred",
+            "weight=60,topologyKey=topology.kubernetes.io/zone,key=ipars.io/role,operator=Exists",
+            "--agent-pod-anti-affinity-required",
+            "topologyKey=kubernetes.io/hostname,key=ipars.io/role,operator=In,values=relay",
+            "--agent-pod-anti-affinity-preferred",
+            "weight=90,topologyKey=topology.kubernetes.io/zone,key=app.kubernetes.io/name,operator=NotIn,values=legacy",
             "--agent-toleration",
             "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
             "--agent-topology-spread",
@@ -12015,6 +12494,60 @@ mod tests {
                 }]
             );
             assert_eq!(
+                args.agent_pod_affinity_required,
+                vec![KubernetesPodAffinityTermArg {
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                    match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                        key: "app.kubernetes.io/name".to_string(),
+                        operator: "In".to_string(),
+                        values: vec!["ipars".to_string()],
+                    }],
+                    namespaces: vec!["edge-system".to_string()],
+                }]
+            );
+            assert_eq!(
+                args.agent_pod_affinity_preferred,
+                vec![KubernetesPreferredPodAffinityArg {
+                    weight: 60,
+                    term: KubernetesPodAffinityTermArg {
+                        topology_key: "topology.kubernetes.io/zone".to_string(),
+                        match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                            key: "ipars.io/role".to_string(),
+                            operator: "Exists".to_string(),
+                            values: Vec::new(),
+                        }],
+                        namespaces: Vec::new(),
+                    },
+                }]
+            );
+            assert_eq!(
+                args.agent_pod_anti_affinity_required,
+                vec![KubernetesPodAffinityTermArg {
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                    match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                        key: "ipars.io/role".to_string(),
+                        operator: "In".to_string(),
+                        values: vec!["relay".to_string()],
+                    }],
+                    namespaces: Vec::new(),
+                }]
+            );
+            assert_eq!(
+                args.agent_pod_anti_affinity_preferred,
+                vec![KubernetesPreferredPodAffinityArg {
+                    weight: 90,
+                    term: KubernetesPodAffinityTermArg {
+                        topology_key: "topology.kubernetes.io/zone".to_string(),
+                        match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                            key: "app.kubernetes.io/name".to_string(),
+                            operator: "NotIn".to_string(),
+                            values: vec!["legacy".to_string()],
+                        }],
+                        namespaces: Vec::new(),
+                    },
+                }]
+            );
+            assert_eq!(
                 args.agent_tolerations,
                 vec![KubernetesTolerationArg {
                     key: Some("node-role.kubernetes.io/control-plane".to_string()),
@@ -12226,6 +12759,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -12380,6 +12917,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -13799,6 +14340,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -13940,6 +14485,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -14215,6 +14764,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -14361,6 +14914,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -14502,6 +15059,10 @@ mod tests {
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
+            agent_pod_affinity_required: Vec::new(),
+            agent_pod_affinity_preferred: Vec::new(),
+            agent_pod_anti_affinity_required: Vec::new(),
+            agent_pod_anti_affinity_preferred: Vec::new(),
             agent_tolerations: Vec::new(),
             agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
@@ -14756,6 +15317,57 @@ mod tests {
         .is_err());
         assert!(parse_kubernetes_node_affinity_preferred_arg(
             "weight=0,key=kubernetes.io/os,operator=Exists"
+        )
+        .is_err());
+        assert_eq!(
+            parse_kubernetes_pod_affinity_required_arg(
+                "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=In,values=ipars,namespaces=default|ipars-system"
+            ),
+            Ok(KubernetesPodAffinityTermArg {
+                topology_key: "kubernetes.io/hostname".to_string(),
+                match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                    key: "app.kubernetes.io/name".to_string(),
+                    operator: "In".to_string(),
+                    values: vec!["ipars".to_string()],
+                }],
+                namespaces: vec!["default".to_string(), "ipars-system".to_string()],
+            })
+        );
+        assert_eq!(
+            parse_kubernetes_pod_affinity_preferred_arg(
+                "weight=90,topologyKey=topology.kubernetes.io/zone,key=ipars.io/role,operator=Exists"
+            ),
+            Ok(KubernetesPreferredPodAffinityArg {
+                weight: 90,
+                term: KubernetesPodAffinityTermArg {
+                    topology_key: "topology.kubernetes.io/zone".to_string(),
+                    match_expressions: vec![KubernetesLabelSelectorExpressionArg {
+                        key: "ipars.io/role".to_string(),
+                        operator: "Exists".to_string(),
+                        values: Vec::new(),
+                    }],
+                    namespaces: Vec::new(),
+                },
+            })
+        );
+        assert!(parse_kubernetes_pod_affinity_required_arg(
+            "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=In"
+        )
+        .is_err());
+        assert!(parse_kubernetes_pod_affinity_required_arg(
+            "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=Exists,values=ipars"
+        )
+        .is_err());
+        assert!(parse_kubernetes_pod_affinity_required_arg(
+            "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=Gt,values=1"
+        )
+        .is_err());
+        assert!(parse_kubernetes_pod_affinity_required_arg(
+            "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=Exists,namespaces=default|default"
+        )
+        .is_err());
+        assert!(parse_kubernetes_pod_affinity_preferred_arg(
+            "weight=101,topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=Exists"
         )
         .is_err());
         assert_eq!(

@@ -73,6 +73,12 @@ agent:
     required:
       matchExpressions: []
     preferred: []
+  podAffinity:
+    required: []
+    preferred: []
+  podAntiAffinity:
+    required: []
+    preferred: []
   tolerations: []
   topologySpreadConstraints: []
   resources:
