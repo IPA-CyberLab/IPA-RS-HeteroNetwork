@@ -1754,6 +1754,7 @@ pub mod api {
         Jaeger,
         Loki,
         Tempo,
+        Zipkin,
         Grpc,
         Kafka,
         Nats,
@@ -1767,7 +1768,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 35] = [
+        pub const ALL: [Self; 36] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1793,6 +1794,7 @@ pub mod api {
             Self::Jaeger,
             Self::Loki,
             Self::Tempo,
+            Self::Zipkin,
             Self::Grpc,
             Self::Kafka,
             Self::Nats,
@@ -1832,6 +1834,7 @@ pub mod api {
                 Self::Jaeger => "jaeger",
                 Self::Loki => "loki",
                 Self::Tempo => "tempo",
+                Self::Zipkin => "zipkin",
                 Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
@@ -2120,6 +2123,9 @@ pub mod api {
             }
             if self.involves_port(3200) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Tempo;
+            }
+            if self.involves_port(9411) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Zipkin;
             }
             if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Grpc;
@@ -2449,6 +2455,9 @@ pub mod api {
             if tempo_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Tempo);
             }
+            if zipkin_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Zipkin);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -2516,6 +2525,9 @@ pub mod api {
         if contains_ascii_case_insensitive(payload, b"/opentelemetry.proto.collector.") {
             return Some(AgentPacketFlowApplication::OpenTelemetry);
         }
+        if contains_ascii_case_insensitive(payload, b"/zipkin.proto3.SpanService/Report") {
+            return Some(AgentPacketFlowApplication::Zipkin);
+        }
         if grpc_http_payload(payload)
             || contains_ascii_case_insensitive(payload, b"application/grpc")
         {
@@ -2567,6 +2579,28 @@ pub mod api {
             || PREFIXES
                 .iter()
                 .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn zipkin_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 13] = [
+            b"/zipkin",
+            b"/api/v2/spans",
+            b"/api/v2/services",
+            b"/api/v2/trace",
+            b"/api/v2/dependencies",
+            b"/api/v2/autocompleteTags",
+            b"/api/v1/spans",
+            b"/api/v1/services",
+            b"/api/v1/trace",
+            b"/api/v1/dependencies",
+            b"/config.json",
+            b"/health",
+            b"/info",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn consul_http_api_path(path: &[u8]) -> bool {
@@ -2905,6 +2939,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"tempo") {
             return Some(AgentPacketFlowApplication::Tempo);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"zipkin") {
+            return Some(AgentPacketFlowApplication::Zipkin);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
             return Some(AgentPacketFlowApplication::Grpc);
         }
@@ -3075,6 +3112,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"tempo-http")
         {
             return Some(AgentPacketFlowApplication::Tempo);
+        }
+        if protocol.eq_ignore_ascii_case(b"zipkin")
+            || protocol.eq_ignore_ascii_case(b"zipkin-http")
+            || protocol.eq_ignore_ascii_case(b"zipkin-grpc")
+        {
+            return Some(AgentPacketFlowApplication::Zipkin);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7545,6 +7588,13 @@ mod tests {
         };
         assert_eq!(tempo.application(), api::AgentPacketFlowApplication::Tempo);
 
+        let zipkin = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9411),
+            ..Default::default()
+        };
+        assert_eq!(zipkin.application(), api::AgentPacketFlowApplication::Zipkin);
+
         let grpc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(50051),
@@ -8254,6 +8304,26 @@ mod tests {
             api::AgentPacketFlowApplication::Tempo
         );
         assert_eq!(
+            observation_for_payload(b"POST /api/v2/spans HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v2/trace/f1cfe82a8eef933b HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /zipkin/ HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /zipkin.proto3.SpanService/Report HTTP/2\r\ncontent-type: application/grpc\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8276,6 +8346,10 @@ mod tests {
             (
                 "tempo-query-frontend.observability.svc",
                 api::AgentPacketFlowApplication::Tempo,
+            ),
+            (
+                "zipkin-collector.observability.svc",
+                api::AgentPacketFlowApplication::Zipkin,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8400,6 +8474,10 @@ mod tests {
             (
                 &[b"tempo-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::Tempo,
+            ),
+            (
+                &[b"zipkin-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Zipkin,
             ),
             (
                 &[b"kafka".as_slice()][..],

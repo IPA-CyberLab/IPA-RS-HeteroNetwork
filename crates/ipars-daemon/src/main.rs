@@ -13358,6 +13358,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Tempo),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Zipkin),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(
