@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(policy.cluster_policy.acl_rules[0].id, "allow-edge");
 
         let request_body = JoinNodeRequest {
-            token: issuer.sign_join_token(claims(cluster_id, issuer.node_id(), key_id))?,
+            token: issuer.sign_join_token(claims(cluster_id.clone(), issuer.node_id(), key_id))?,
             registration: registration("node-http"),
         };
 
@@ -906,6 +906,11 @@ mod tests {
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
         assert_eq!(metrics.stale_path_count, 0);
         assert_eq!(metrics.path_state_ttl_seconds, 600);
+        assert_eq!(metrics.path_state_counts.len(), 5);
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .all(|entry| entry.count == 0));
         assert_eq!(metrics.vpn_pool_total_count, 6);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
         assert_eq!(metrics.vpn_pool_available_count, 5);
@@ -1010,6 +1015,13 @@ mod tests {
         assert!(body.contains("ipars_control_plane_peer_map_routes_visible"));
         assert!(body.contains("ipars_control_plane_peer_map_routes_acl_denied"));
         assert!(body.contains("ipars_control_plane_node_health"));
+        let prometheus_cluster_id = prometheus_label(cluster_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"DIRECT_NAT_TRAVERSAL\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"RELAY\"}} 0"
+        )));
         Ok(())
     }
 }

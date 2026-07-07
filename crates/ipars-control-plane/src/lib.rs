@@ -26,6 +26,14 @@ use ipnet::Ipv4Net;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
     #[error("join token does not allow node registration")]
@@ -1179,9 +1187,12 @@ where
             peer_map_route_acl_denied_count: peer_map_metrics.acl_denied_routes,
             stale_path_count,
             path_count,
-            path_state_counts: path_state_counts
+            path_state_counts: PATH_STATE_METRIC_ORDER
                 .into_iter()
-                .map(|(state, count)| PathStateCount { state, count })
+                .map(|state| PathStateCount {
+                    state,
+                    count: *path_state_counts.get(&state).unwrap_or(&0),
+                })
                 .collect(),
             endpoint_candidate_ttl_seconds: self
                 .config
@@ -2855,6 +2866,7 @@ mod tests {
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.stale_path_count, 1);
         assert_eq!(metrics.path_state_ttl_seconds, 30);
+        assert_eq!(metrics.path_state_counts.len(), 5);
         assert_eq!(
             metrics
                 .path_state_counts
@@ -2862,6 +2874,14 @@ mod tests {
                 .find(|count| count.state == PathState::DirectNatTraversal)
                 .map(|count| count.count),
             Some(1)
+        );
+        assert_eq!(
+            metrics
+                .path_state_counts
+                .iter()
+                .find(|count| count.state == PathState::Relay)
+                .map(|count| count.count),
+            Some(0)
         );
         Ok(())
     }
