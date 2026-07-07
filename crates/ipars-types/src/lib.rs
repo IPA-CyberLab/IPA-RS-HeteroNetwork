@@ -864,6 +864,7 @@ pub enum TransportProtocol {
     Icmp,
     Gre,
     Esp,
+    Ah,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2038,7 +2039,10 @@ pub mod api {
             if self.protocol == Some(TransportProtocol::Icmp) {
                 return AgentPacketFlowApplication::Icmp;
             }
-            if self.protocol == Some(TransportProtocol::Esp) {
+            if matches!(
+                self.protocol,
+                Some(TransportProtocol::Esp | TransportProtocol::Ah)
+            ) {
                 return AgentPacketFlowApplication::Ipsec;
             }
             if self.protocol == Some(TransportProtocol::Gre) {
@@ -2505,8 +2509,13 @@ pub mod api {
             AgentPacketFlowApplication::Ipsec => require_packet_flow_application_protocol(
                 protocol,
                 application,
-                "UDP or ESP",
-                |protocol| matches!(protocol, TransportProtocol::Udp | TransportProtocol::Esp),
+                "UDP, ESP, or AH",
+                |protocol| {
+                    matches!(
+                        protocol,
+                        TransportProtocol::Udp | TransportProtocol::Esp | TransportProtocol::Ah
+                    )
+                },
             ),
             AgentPacketFlowApplication::Gre => {
                 require_packet_flow_application_protocol(protocol, application, "GRE", |protocol| {
@@ -2979,7 +2988,8 @@ pub mod api {
                 TransportProtocol::Any
                 | TransportProtocol::Icmp
                 | TransportProtocol::Gre
-                | TransportProtocol::Esp,
+                | TransportProtocol::Esp
+                | TransportProtocol::Ah,
             ) => false,
         }
     }
@@ -4336,7 +4346,8 @@ pub mod api {
                 TransportProtocol::Any
                 | TransportProtocol::Icmp
                 | TransportProtocol::Gre
-                | TransportProtocol::Esp,
+                | TransportProtocol::Esp
+                | TransportProtocol::Ah,
             ) => false,
         }
     }
@@ -8391,6 +8402,15 @@ mod tests {
             api::AgentPacketFlowApplication::Ipsec
         );
 
+        let native_ah = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Ah),
+            ..Default::default()
+        };
+        assert_eq!(
+            native_ah.application(),
+            api::AgentPacketFlowApplication::Ipsec
+        );
+
         let gre = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Gre),
             ..Default::default()
@@ -11733,6 +11753,14 @@ mod tests {
         };
         assert!(error.contains("port metadata requires TCP or UDP protocol"));
 
+        let ah_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"ah","destination_port":51}"#)?;
+        let error = match ah_with_port.validate_transport_metadata() {
+            Ok(()) => return Err("AH observation with port metadata should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+
         let application_without_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"application":"postgres"}"#)?;
         application_without_protocol.validate_transport_metadata()?;
@@ -11793,13 +11821,17 @@ mod tests {
             serde_json::from_str(r#"{"protocol":"esp","application":"ipsec"}"#)?;
         esp_ipsec_hint.validate_transport_metadata()?;
 
+        let ah_ipsec_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"ah","application":"ipsec"}"#)?;
+        ah_ipsec_hint.validate_transport_metadata()?;
+
         let tcp_ipsec_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ipsec"}"#)?;
         let error = match tcp_ipsec_hint.validate_transport_metadata() {
             Ok(()) => return Err("TCP IPsec hint should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("application hint ipsec requires UDP or ESP protocol"));
+        assert!(error.contains("application hint ipsec requires UDP, ESP, or AH protocol"));
 
         let gre_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"gre","application":"gre"}"#)?;

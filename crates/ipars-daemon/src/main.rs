@@ -66,9 +66,10 @@ use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
 use ipars_types::ebpf::{
     PacketFlowEvent, PACKET_FLOW_CONNTRACK_ASSURED, PACKET_FLOW_CONNTRACK_UNREPLIED,
     PACKET_FLOW_EVENT_VERSION, PACKET_FLOW_IP_FAMILY_IPV4, PACKET_FLOW_IP_FAMILY_IPV6,
-    PACKET_FLOW_PROTOCOL_ESP, PACKET_FLOW_PROTOCOL_GRE, PACKET_FLOW_PROTOCOL_ICMP,
-    PACKET_FLOW_PROTOCOL_TCP, PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN,
-    PACKET_FLOW_RINGBUF_MAP, PACKET_FLOW_TCP_STATE_CLOSE, PACKET_FLOW_TCP_STATE_CLOSE_WAIT,
+    PACKET_FLOW_PROTOCOL_AH, PACKET_FLOW_PROTOCOL_ESP, PACKET_FLOW_PROTOCOL_GRE,
+    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_ICMPV6, PACKET_FLOW_PROTOCOL_TCP,
+    PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_RINGBUF_MAP,
+    PACKET_FLOW_TCP_STATE_CLOSE, PACKET_FLOW_TCP_STATE_CLOSE_WAIT,
     PACKET_FLOW_TCP_STATE_ESTABLISHED, PACKET_FLOW_TCP_STATE_FIN_WAIT,
     PACKET_FLOW_TCP_STATE_LAST_ACK, PACKET_FLOW_TCP_STATE_LISTEN, PACKET_FLOW_TCP_STATE_SYN_RECV,
     PACKET_FLOW_TCP_STATE_SYN_SENT, PACKET_FLOW_TCP_STATE_SYN_SENT2,
@@ -10160,6 +10161,7 @@ fn transport_protocol_number(protocol: TransportProtocol) -> u8 {
         TransportProtocol::Udp => 17,
         TransportProtocol::Gre => 47,
         TransportProtocol::Esp => 50,
+        TransportProtocol::Ah => 51,
     }
 }
 
@@ -10529,11 +10531,12 @@ fn validate_ebpf_packet_flow_unused_fields(event: &PacketFlowEvent) -> anyhow::R
 fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtocol>> {
     let protocol = match value {
         PACKET_FLOW_PROTOCOL_UNKNOWN => None,
-        PACKET_FLOW_PROTOCOL_ICMP => Some(TransportProtocol::Icmp),
+        PACKET_FLOW_PROTOCOL_ICMP | PACKET_FLOW_PROTOCOL_ICMPV6 => Some(TransportProtocol::Icmp),
         PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
         PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
         PACKET_FLOW_PROTOCOL_GRE => Some(TransportProtocol::Gre),
         PACKET_FLOW_PROTOCOL_ESP => Some(TransportProtocol::Esp),
+        PACKET_FLOW_PROTOCOL_AH => Some(TransportProtocol::Ah),
         _ => anyhow::bail!("unsupported eBPF packet-flow protocol code {value}"),
     };
     Ok(protocol)
@@ -11104,6 +11107,8 @@ fn transport_protocol_from_ip_number(number: u8) -> Option<TransportProtocol> {
         17 => Some(TransportProtocol::Udp),
         47 => Some(TransportProtocol::Gre),
         50 => Some(TransportProtocol::Esp),
+        51 => Some(TransportProtocol::Ah),
+        58 => Some(TransportProtocol::Icmp),
         _ => None,
     }
 }
@@ -11456,9 +11461,10 @@ fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProto
     match token {
         "tcp" => Some(TransportProtocol::Tcp),
         "udp" => Some(TransportProtocol::Udp),
-        "icmp" | "icmpv6" => Some(TransportProtocol::Icmp),
+        "icmp" | "icmpv6" | "ipv6-icmp" => Some(TransportProtocol::Icmp),
         "gre" => Some(TransportProtocol::Gre),
         "esp" => Some(TransportProtocol::Esp),
+        "ah" => Some(TransportProtocol::Ah),
         _ => None,
     }
 }
@@ -15428,6 +15434,34 @@ mod tests {
             esp_flow.observation.application(),
             AgentPacketFlowApplication::Ipsec
         );
+
+        let mut ah_event = gre_event;
+        ah_event[2] = PACKET_FLOW_PROTOCOL_AH;
+        let ah_flow = parse_ebpf_ringbuf_packet_flow_event(&ah_event)?;
+        assert_eq!(ah_flow.observation.protocol, Some(TransportProtocol::Ah));
+        assert_eq!(
+            ah_flow.observation.application(),
+            AgentPacketFlowApplication::Ipsec
+        );
+
+        let source_v6 = "2001:db8::2".parse::<Ipv6Addr>()?;
+        let destination_v6 = "fd00::51".parse::<Ipv6Addr>()?;
+        let mut icmpv6_event = [0_u8; PACKET_FLOW_EVENT_LEN];
+        icmpv6_event[0] = PACKET_FLOW_EVENT_VERSION;
+        icmpv6_event[1] = PACKET_FLOW_IP_FAMILY_IPV6;
+        icmpv6_event[2] = PACKET_FLOW_PROTOCOL_ICMPV6;
+        icmpv6_event[16..32].copy_from_slice(&source_v6.octets());
+        icmpv6_event[32..48].copy_from_slice(&destination_v6.octets());
+        let icmpv6_flow = parse_ebpf_ringbuf_packet_flow_event(&icmpv6_event)?;
+        assert_eq!(icmpv6_flow.destination, IpAddr::V6(destination_v6));
+        assert_eq!(
+            icmpv6_flow.observation.protocol,
+            Some(TransportProtocol::Icmp)
+        );
+        assert_eq!(
+            icmpv6_flow.observation.application(),
+            AgentPacketFlowApplication::Icmp
+        );
         Ok(())
     }
 
@@ -15928,12 +15962,28 @@ mod tests {
             Some(TransportProtocol::Esp)
         );
         assert_eq!(
+            transport_protocol_from_ip_number(51),
+            Some(TransportProtocol::Ah)
+        );
+        assert_eq!(
+            transport_protocol_from_ip_number(58),
+            Some(TransportProtocol::Icmp)
+        );
+        assert_eq!(
             transport_protocol_from_conntrack_token("gre"),
             Some(TransportProtocol::Gre)
         );
         assert_eq!(
             transport_protocol_from_conntrack_token("esp"),
             Some(TransportProtocol::Esp)
+        );
+        assert_eq!(
+            transport_protocol_from_conntrack_token("ah"),
+            Some(TransportProtocol::Ah)
+        );
+        assert_eq!(
+            transport_protocol_from_conntrack_token("ipv6-icmp"),
+            Some(TransportProtocol::Icmp)
         );
     }
 
