@@ -1748,6 +1748,7 @@ pub mod api {
         MsSql,
         Oracle,
         ClickHouse,
+        InfluxDb,
         Redis,
         Memcached,
         Prometheus,
@@ -1769,7 +1770,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 37] = [
+        pub const ALL: [Self; 38] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1789,6 +1790,7 @@ pub mod api {
             Self::MsSql,
             Self::Oracle,
             Self::ClickHouse,
+            Self::InfluxDb,
             Self::Redis,
             Self::Memcached,
             Self::Prometheus,
@@ -1830,6 +1832,7 @@ pub mod api {
                 Self::MsSql => "mssql",
                 Self::Oracle => "oracle",
                 Self::ClickHouse => "clickhouse",
+                Self::InfluxDb => "influxdb",
                 Self::Redis => "redis",
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
@@ -2095,6 +2098,9 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::ClickHouse;
+            }
+            if self.involves_port(8086) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::InfluxDb;
             }
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
@@ -2471,6 +2477,9 @@ pub mod api {
             if zipkin_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Zipkin);
             }
+            if influxdb_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::InfluxDb);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -2544,6 +2553,11 @@ pub mod api {
         if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
             return Some(AgentPacketFlowApplication::ClickHouse);
         }
+        if contains_ascii_case_insensitive(payload, b"\r\nx-influxdb-")
+            || contains_ascii_case_insensitive(payload, b"\r\nx-influx-")
+        {
+            return Some(AgentPacketFlowApplication::InfluxDb);
+        }
         if grpc_http_payload(payload)
             || contains_ascii_case_insensitive(payload, b"application/grpc")
         {
@@ -2612,6 +2626,19 @@ pub mod api {
             b"/config.json",
             b"/health",
             b"/info",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn influxdb_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 4] = [
+            b"/api/v2/write",
+            b"/api/v2/query",
+            b"/api/v2/buckets",
+            b"/api/v2/delete",
         ];
 
         PREFIXES
@@ -3018,6 +3045,11 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"clickhouse") {
             return Some(AgentPacketFlowApplication::ClickHouse);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"influxdb")
+            || tls_sni_hostname_has_label_prefix(hostname, b"influx")
+        {
+            return Some(AgentPacketFlowApplication::InfluxDb);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -3143,6 +3175,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"clickhouse-http")
         {
             return Some(AgentPacketFlowApplication::ClickHouse);
+        }
+        if protocol.eq_ignore_ascii_case(b"influxdb")
+            || protocol.eq_ignore_ascii_case(b"influxdb-http")
+            || protocol.eq_ignore_ascii_case(b"influx")
+        {
+            return Some(AgentPacketFlowApplication::InfluxDb);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7562,6 +7600,16 @@ mod tests {
             api::AgentPacketFlowApplication::ClickHouse
         );
 
+        let influxdb_http = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8086),
+            ..Default::default()
+        };
+        assert_eq!(
+            influxdb_http.application(),
+            api::AgentPacketFlowApplication::InfluxDb
+        );
+
         let redis = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(6379),
@@ -8376,6 +8424,22 @@ mod tests {
             api::AgentPacketFlowApplication::ClickHouse
         );
         assert_eq!(
+            observation_for_payload(b"POST /api/v2/write?org=ops&bucket=metrics HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::InfluxDb
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /api/v2/query?org=ops HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::InfluxDb
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /ready HTTP/1.1\r\nHost: influx.example\r\nX-Influxdb-Version: 2.7\r\n\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::InfluxDb
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8406,6 +8470,10 @@ mod tests {
             (
                 "clickhouse-0.analytics.svc",
                 api::AgentPacketFlowApplication::ClickHouse,
+            ),
+            (
+                "influxdb-0.observability.svc",
+                api::AgentPacketFlowApplication::InfluxDb,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8538,6 +8606,10 @@ mod tests {
             (
                 &[b"clickhouse-native".as_slice()][..],
                 api::AgentPacketFlowApplication::ClickHouse,
+            ),
+            (
+                &[b"influxdb-http".as_slice()][..],
+                api::AgentPacketFlowApplication::InfluxDb,
             ),
             (
                 &[b"kafka".as_slice()][..],
