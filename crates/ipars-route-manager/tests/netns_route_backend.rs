@@ -2,9 +2,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipars_route_manager::{
-    DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetlinkRouteManager,
-    LinuxNetworkNamespace, LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager,
-    RoutePlan, SystemRouteCommandRunner,
+    DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetlinkRouteManager, LinuxNetworkNamespace,
+    LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager, RoutePlan,
+    SystemRouteCommandRunner,
 };
 use ipars_types::{NodeId, Route};
 

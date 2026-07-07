@@ -7592,9 +7592,8 @@ mod tests {
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
-        assert!(compose.contains(
-            "IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"
-        ));
+        assert!(compose
+            .contains("IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"));
         assert!(compose.contains("\"3480:3480/udp\""));
         assert!(compose.contains("--http-listen"));
         assert!(compose.contains("0.0.0.0:3479"));

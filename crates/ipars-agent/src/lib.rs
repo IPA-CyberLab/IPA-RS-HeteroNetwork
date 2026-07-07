@@ -12,7 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
-use ipars_relay::encode_relay_datagram;
+use ipars_relay::encode_relay_datagram_with_route;
 use ipars_route_manager::{
     with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
     RouteManagerError, RoutePlan,
@@ -796,9 +796,12 @@ impl UdpRelayFrameForwarder {
 
     pub fn encode_outbound(&self, payload: &[u8]) -> Result<Vec<u8>, AgentError> {
         self.ensure_session_active()?;
-        encode_relay_datagram(
+        let local = relay_session_local_node(&self.session.session_id, &self.session.peer)?;
+        encode_relay_datagram_with_route(
             &self.session.session_id,
             &self.session.session_token,
+            &local,
+            &self.session.peer,
             payload,
         )
         .map_err(|error| AgentError::RelaySession(error.to_string()))
@@ -931,6 +934,23 @@ impl UdpRelayFrameForwarder {
             )));
         }
         Ok(())
+    }
+}
+
+fn relay_session_local_node(session_id: &str, peer: &NodeId) -> Result<NodeId, AgentError> {
+    let Some((left, right)) = session_id.split_once(':') else {
+        return Err(AgentError::RelaySession(format!(
+            "relay session {session_id} does not encode left/right node ids"
+        )));
+    };
+    if peer.as_str() == left {
+        Ok(NodeId::from_string(right))
+    } else if peer.as_str() == right {
+        Ok(NodeId::from_string(left))
+    } else {
+        Err(AgentError::RelaySession(format!(
+            "relay peer {peer} is not part of session {session_id}"
+        )))
     }
 }
 
@@ -1732,9 +1752,7 @@ impl AgentRuntime {
                 &self.packet_flow_application_kubernetes_api_count
             }
             AgentPacketFlowApplication::Etcd => &self.packet_flow_application_etcd_count,
-            AgentPacketFlowApplication::ZooKeeper => {
-                &self.packet_flow_application_zookeeper_count
-            }
+            AgentPacketFlowApplication::ZooKeeper => &self.packet_flow_application_zookeeper_count,
             AgentPacketFlowApplication::Consul => &self.packet_flow_application_consul_count,
             AgentPacketFlowApplication::Vault => &self.packet_flow_application_vault_count,
             AgentPacketFlowApplication::Nomad => &self.packet_flow_application_nomad_count,
@@ -3231,13 +3249,7 @@ impl LazyConnectManager {
             self.advertised_routes.insert(peer.node_id.clone(), routes);
         }
 
-        if self.is_pinned_by_policy(&peer.role, &peer.tags)
-            || has_owned_routes
-            || peer
-                .relay_capability
-                .as_ref()
-                .is_some_and(|capability| capability.can_admit())
-        {
+        if self.is_pinned_by_policy(&peer.role, &peer.tags) || has_owned_routes {
             self.pin_peer(peer.node_id.clone());
         }
     }
@@ -3927,9 +3939,36 @@ mod tests {
         assert!(manager.should_connect_peer(&control_plane));
         assert!(manager.should_connect_peer(&route_provider));
         assert!(manager.should_connect_peer(&kubernetes_control_plane));
-        assert!(manager.should_connect_peer(&relay));
+        assert!(!manager.should_connect_peer(&relay));
         assert!(!manager.should_connect_peer(&ordinary));
-        assert_eq!(manager.metrics().pinned_peer_count, 4);
+        assert_eq!(manager.metrics().pinned_peer_count, 3);
+    }
+
+    #[test]
+    fn lazy_manager_does_not_auto_pin_relay_candidates() {
+        let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let mut relay = peer_record(
+            NodeId::from_string("relay-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-relay",
+            Vec::new(),
+            Vec::new(),
+        );
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+            admission_url: Some("http://203.0.113.10:9580".to_string()),
+            max_sessions: 1024,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        manager.observe_peer(&relay);
+
+        assert!(!manager.should_connect_peer(&relay));
+        assert_eq!(manager.metrics().observed_peer_vpn_ip_count, 1);
+        assert_eq!(manager.metrics().pinned_peer_count, 0);
     }
 
     #[test]
@@ -4806,7 +4845,7 @@ mod tests {
                 relay_endpoint: relay_addr,
                 admitted_local_addr: forwarder_socket.local_addr()?,
                 admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_001)),
-                session_id: "active-session".to_string(),
+                session_id: "left:right".to_string(),
                 session_token: "active-token".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
             },
@@ -4883,7 +4922,7 @@ mod tests {
                 relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
                 admitted_local_addr: forwarder_socket.local_addr()?,
                 admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 60_002)),
-                session_id: "active-session".to_string(),
+                session_id: "left:right".to_string(),
                 session_token: "active-token".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
             },

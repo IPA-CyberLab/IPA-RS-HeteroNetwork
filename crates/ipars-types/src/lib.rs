@@ -4517,9 +4517,7 @@ pub mod api {
         }
         if !descriptor
             .iter()
-            .all(|byte| {
-                matches!(*byte, b'\t' | b'\n' | b'\r') || (0x20..=0x7e).contains(byte)
-            })
+            .all(|byte| matches!(*byte, b'\t' | b'\n' | b'\r') || (0x20..=0x7e).contains(byte))
         {
             return false;
         }
@@ -6852,8 +6850,7 @@ pub mod api {
     }
 
     fn path_starts_with_api_prefix(path: &[u8], prefix: &[u8]) -> bool {
-        path.starts_with(prefix)
-            && matches!(path.get(prefix.len()), None | Some(b'/') | Some(b'?'))
+        path.starts_with(prefix) && matches!(path.get(prefix.len()), None | Some(b'/') | Some(b'?'))
     }
 
     fn path_contains_any(path: &[u8], needles: &[&[u8]]) -> bool {
@@ -7613,7 +7610,10 @@ mod tests {
             destination_port: Some(1521),
             ..Default::default()
         };
-        assert_eq!(oracle.application(), api::AgentPacketFlowApplication::Oracle);
+        assert_eq!(
+            oracle.application(),
+            api::AgentPacketFlowApplication::Oracle
+        );
 
         let clickhouse_http = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
@@ -7721,7 +7721,10 @@ mod tests {
             destination_port: Some(9411),
             ..Default::default()
         };
-        assert_eq!(zipkin.application(), api::AgentPacketFlowApplication::Zipkin);
+        assert_eq!(
+            zipkin.application(),
+            api::AgentPacketFlowApplication::Zipkin
+        );
 
         let grpc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
@@ -8313,8 +8316,7 @@ mod tests {
             api::AgentPacketFlowApplication::Consul
         );
         assert_eq!(
-            observation_for_payload(b"GET /v1/catalog/services?dc=dc1 HTTP/1.1\r\n")
-                .application(),
+            observation_for_payload(b"GET /v1/catalog/services?dc=dc1 HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Consul
         );
         assert_eq!(
@@ -8393,8 +8395,7 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
-            observation_for_payload(b"GET /loki/api/v1/query?query=up HTTP/1.1\r\n")
-                .application(),
+            observation_for_payload(b"GET /loki/api/v1/query?query=up HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Loki
         );
         assert_eq!(
@@ -8406,8 +8407,7 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
-            observation_for_payload(b"GET /api/traces/f1cfe82a8eef933b HTTP/1.1\r\n")
-                .application(),
+            observation_for_payload(b"GET /api/traces/f1cfe82a8eef933b HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Tempo
         );
         assert_eq!(

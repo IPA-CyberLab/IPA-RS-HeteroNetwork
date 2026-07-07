@@ -228,8 +228,11 @@ async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await??;
     assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
 
-    let rejected_datagram =
-        encode_relay_datagram(SESSION_ID, WRONG_SESSION_TOKEN, b"credential-bypass-attempt")?;
+    let rejected_datagram = encode_relay_datagram(
+        SESSION_ID,
+        WRONG_SESSION_TOKEN,
+        b"credential-bypass-attempt",
+    )?;
     socket.send_to(&rejected_datagram, relay_endpoint).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 

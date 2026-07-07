@@ -103,10 +103,13 @@ pub struct RelayFrame {
 struct RelayDatagram {
     session_id: RelaySessionId,
     session_token: String,
+    source: Option<NodeId>,
+    destination: Option<NodeId>,
     ciphertext_payload: Vec<u8>,
 }
 
 const RELAY_FRAME_MAGIC: &[u8] = b"IPARS-RLY1";
+const RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
 const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
 const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
 const MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES: usize = 128 * 1024;
@@ -137,6 +140,51 @@ pub fn encode_relay_datagram(
     datagram.extend_from_slice(&(session_token.len() as u16).to_be_bytes());
     datagram.extend_from_slice(session_id.as_bytes());
     datagram.extend_from_slice(session_token.as_bytes());
+    datagram.extend_from_slice(ciphertext_payload);
+    Ok(datagram)
+}
+
+pub fn encode_relay_datagram_with_route(
+    session_id: &str,
+    session_token: &str,
+    source: &NodeId,
+    destination: &NodeId,
+    ciphertext_payload: &[u8],
+) -> Result<Vec<u8>, RelayError> {
+    if session_id.is_empty()
+        || session_token.is_empty()
+        || source.as_str().is_empty()
+        || destination.as_str().is_empty()
+        || ciphertext_payload.is_empty()
+    {
+        return Err(RelayError::MalformedFrame);
+    }
+    validate_relay_frame_sizes(
+        session_id.len(),
+        session_token.len(),
+        ciphertext_payload.len(),
+    )?;
+    validate_relay_node_id_size(source.as_str().len())?;
+    validate_relay_node_id_size(destination.as_str().len())?;
+
+    let mut datagram = Vec::with_capacity(
+        RELAY_FRAME_MAGIC_V2.len()
+            + 8
+            + session_id.len()
+            + session_token.len()
+            + source.as_str().len()
+            + destination.as_str().len()
+            + ciphertext_payload.len(),
+    );
+    datagram.extend_from_slice(RELAY_FRAME_MAGIC_V2);
+    datagram.extend_from_slice(&(session_id.len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(session_token.len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(source.as_str().len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(destination.as_str().len() as u16).to_be_bytes());
+    datagram.extend_from_slice(session_id.as_bytes());
+    datagram.extend_from_slice(session_token.as_bytes());
+    datagram.extend_from_slice(source.as_str().as_bytes());
+    datagram.extend_from_slice(destination.as_str().as_bytes());
     datagram.extend_from_slice(ciphertext_payload);
     Ok(datagram)
 }
@@ -208,6 +256,20 @@ impl RelayTable {
             return Err(RelayError::AdmissionDenied);
         }
         let expires_at = now + admission.session_ttl.max(chrono::Duration::milliseconds(1));
+        if let Some(existing) = self.sessions.get_mut(&id) {
+            if !existing.is_expired(now) {
+                existing.left_addr = admission.left_addr;
+                existing.right_addr = admission.right_addr;
+                existing.expires_at = expires_at;
+                existing.max_bytes_per_second = megabits_to_bytes_per_second(capability.max_mbps);
+                return Ok(RelaySessionCredentials {
+                    session_id: id,
+                    session_token: existing.session_token.clone(),
+                    expires_at,
+                });
+            }
+        }
+        self.sessions.remove(&id);
         self.sessions.insert(
             id.clone(),
             RelaySession {
@@ -333,12 +395,23 @@ impl RelayTable {
             .get_mut(&datagram.session_id)
             .ok_or(RelayError::UnknownSession)?;
         session.verify_token(&datagram.session_token)?;
-        let target = if session.left_addr == source_addr {
-            session.right_addr
-        } else if session.right_addr == source_addr {
-            session.left_addr
-        } else {
-            return Err(RelayError::UnknownSession);
+        let target = match (datagram.source.as_ref(), datagram.destination.as_ref()) {
+            (Some(source), Some(destination))
+                if source == &session.left && destination == &session.right =>
+            {
+                session.left_addr = source_addr;
+                session.right_addr
+            }
+            (Some(source), Some(destination))
+                if source == &session.right && destination == &session.left =>
+            {
+                session.right_addr = source_addr;
+                session.left_addr
+            }
+            (Some(_), Some(_)) => return Err(RelayError::UnknownSession),
+            _ if session.left_addr == source_addr => session.right_addr,
+            _ if session.right_addr == source_addr => session.left_addr,
+            _ => return Err(RelayError::UnknownSession),
         };
 
         session.consume_rate_limit(datagram.ciphertext_payload.len(), now)?;
@@ -531,6 +604,16 @@ fn validate_relay_frame_sizes(
     Ok(())
 }
 
+fn validate_relay_node_id_size(node_id_len: usize) -> Result<(), RelayError> {
+    if node_id_len == 0
+        || node_id_len > MAX_RELAY_SESSION_ID_BYTES
+        || node_id_len > u16::MAX as usize
+    {
+        return Err(RelayError::FrameTooLarge);
+    }
+    Ok(())
+}
+
 fn relay_session_token_matches(expected: &str, provided: &str) -> bool {
     if expected.len() > MAX_RELAY_SESSION_TOKEN_BYTES
         || provided.len() > MAX_RELAY_SESSION_TOKEN_BYTES
@@ -550,6 +633,13 @@ fn relay_session_token_matches(expected: &str, provided: &str) -> bool {
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
+    if datagram.starts_with(RELAY_FRAME_MAGIC_V2) {
+        return decode_relay_datagram_v2(datagram);
+    }
+    decode_relay_datagram_v1(datagram)
+}
+
+fn decode_relay_datagram_v1(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
     let fixed_header_len = RELAY_FRAME_MAGIC.len() + 4;
     if datagram.len() <= fixed_header_len || !datagram.starts_with(RELAY_FRAME_MAGIC) {
         return Err(RelayError::MalformedFrame);
@@ -586,6 +676,72 @@ fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
     Ok(RelayDatagram {
         session_id: RelaySessionId(session_id),
         session_token,
+        source: None,
+        destination: None,
+        ciphertext_payload: datagram[payload_start..].to_vec(),
+    })
+}
+
+fn decode_relay_datagram_v2(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
+    let fixed_header_len = RELAY_FRAME_MAGIC_V2.len() + 8;
+    if datagram.len() <= fixed_header_len || !datagram.starts_with(RELAY_FRAME_MAGIC_V2) {
+        return Err(RelayError::MalformedFrame);
+    }
+
+    let session_len_offset = RELAY_FRAME_MAGIC_V2.len();
+    let token_len_offset = session_len_offset + 2;
+    let source_len_offset = token_len_offset + 2;
+    let destination_len_offset = source_len_offset + 2;
+    let session_len = u16::from_be_bytes([
+        datagram[session_len_offset],
+        datagram[session_len_offset + 1],
+    ]) as usize;
+    let token_len =
+        u16::from_be_bytes([datagram[token_len_offset], datagram[token_len_offset + 1]]) as usize;
+    let source_len =
+        u16::from_be_bytes([datagram[source_len_offset], datagram[source_len_offset + 1]]) as usize;
+    let destination_len = u16::from_be_bytes([
+        datagram[destination_len_offset],
+        datagram[destination_len_offset + 1],
+    ]) as usize;
+
+    let session_start = fixed_header_len;
+    let token_start = session_start + session_len;
+    let source_start = token_start + token_len;
+    let destination_start = source_start + source_len;
+    let payload_start = destination_start + destination_len;
+    if session_len == 0 || token_len == 0 || source_len == 0 || destination_len == 0 {
+        return Err(RelayError::MalformedFrame);
+    }
+    validate_relay_frame_sizes(
+        session_len,
+        token_len,
+        datagram.len().saturating_sub(payload_start),
+    )?;
+    validate_relay_node_id_size(source_len)?;
+    validate_relay_node_id_size(destination_len)?;
+    if token_start > datagram.len()
+        || source_start > datagram.len()
+        || destination_start > datagram.len()
+        || payload_start >= datagram.len()
+    {
+        return Err(RelayError::MalformedFrame);
+    }
+
+    let session_id = String::from_utf8(datagram[session_start..token_start].to_vec())
+        .map_err(|_| RelayError::MalformedFrame)?;
+    let session_token = String::from_utf8(datagram[token_start..source_start].to_vec())
+        .map_err(|_| RelayError::MalformedFrame)?;
+    let source = String::from_utf8(datagram[source_start..destination_start].to_vec())
+        .map_err(|_| RelayError::MalformedFrame)?;
+    let destination = String::from_utf8(datagram[destination_start..payload_start].to_vec())
+        .map_err(|_| RelayError::MalformedFrame)?;
+
+    Ok(RelayDatagram {
+        session_id: RelaySessionId(session_id),
+        session_token,
+        source: Some(NodeId::from_string(source)),
+        destination: Some(NodeId::from_string(destination)),
         ciphertext_payload: datagram[payload_start..].to_vec(),
     })
 }
@@ -1217,6 +1373,101 @@ mod tests {
         let error = table.forward_target(&second);
 
         assert!(matches!(error, Err(RelayError::RateLimited)));
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_rejects_live_session_replacement() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let first_left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let first_right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let second_left_addr = SocketAddr::from(([10, 0, 0, 3], 10000));
+        let second_right_addr = SocketAddr::from(([10, 0, 0, 4], 10000));
+        let first = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            first_left_addr,
+            first_right_addr,
+            "left-secret".to_string(),
+        )?;
+
+        let second = table.admit_with_token(
+            &capability,
+            left,
+            right,
+            second_left_addr,
+            second_right_addr,
+            "right-secret".to_string(),
+        );
+
+        assert!(matches!(second, Err(RelayError::AdmissionDenied)));
+        assert_eq!(table.session_count(), 1);
+        let datagram =
+            encode_relay_datagram(first.session_id.as_str(), &first.session_token, b"opaque")?;
+        let (target, payload) = table.forward_datagram_for_addr(first_left_addr, &datagram)?;
+        assert_eq!(target, first_right_addr);
+        assert_eq!(payload, b"opaque");
+        let rejected = table.forward_datagram_for_addr(second_left_addr, &datagram);
+        assert!(matches!(rejected, Err(RelayError::UnknownSession)));
+        Ok(())
+    }
+
+    #[test]
+    fn relay_datagram_route_updates_symmetric_nat_source_addr() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let admitted_left_addr = SocketAddr::from(([198, 51, 100, 10], 40000));
+        let admitted_right_addr = SocketAddr::from(([198, 51, 100, 20], 40000));
+        let learned_left_addr = SocketAddr::from(([198, 51, 100, 10], 41000));
+        let learned_right_addr = SocketAddr::from(([198, 51, 100, 20], 42000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            admitted_left_addr,
+            admitted_right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let first_left = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            b"left-first",
+        )?;
+        let (target, payload) = table.forward_datagram_for_addr(learned_left_addr, &first_left)?;
+        assert_eq!(target, admitted_right_addr);
+        assert_eq!(payload, b"left-first");
+
+        let first_right = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &right,
+            &left,
+            b"right-first",
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_right_addr, &first_right)?;
+        assert_eq!(target, learned_left_addr);
+        assert_eq!(payload, b"right-first");
+
+        let second_left = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            b"left-second",
+        )?;
+        let (target, payload) = table.forward_datagram_for_addr(learned_left_addr, &second_left)?;
+        assert_eq!(target, learned_right_addr);
+        assert_eq!(payload, b"left-second");
         Ok(())
     }
 
