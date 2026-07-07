@@ -1747,6 +1747,7 @@ pub mod api {
         Mysql,
         MsSql,
         Oracle,
+        ClickHouse,
         Redis,
         Memcached,
         Prometheus,
@@ -1768,7 +1769,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 36] = [
+        pub const ALL: [Self; 37] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1787,6 +1788,7 @@ pub mod api {
             Self::Mysql,
             Self::MsSql,
             Self::Oracle,
+            Self::ClickHouse,
             Self::Redis,
             Self::Memcached,
             Self::Prometheus,
@@ -1827,6 +1829,7 @@ pub mod api {
                 Self::Mysql => "mysql",
                 Self::MsSql => "mssql",
                 Self::Oracle => "oracle",
+                Self::ClickHouse => "clickhouse",
                 Self::Redis => "redis",
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
@@ -2082,6 +2085,16 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::Oracle;
+            }
+            if (self.involves_port(8123)
+                || self.involves_port(9000)
+                || self.involves_port(9009)
+                || self.involves_port(9010)
+                || self.involves_port(9011)
+                || self.involves_port(9440))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::ClickHouse;
             }
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
@@ -2527,6 +2540,9 @@ pub mod api {
         }
         if contains_ascii_case_insensitive(payload, b"/zipkin.proto3.SpanService/Report") {
             return Some(AgentPacketFlowApplication::Zipkin);
+        }
+        if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
+            return Some(AgentPacketFlowApplication::ClickHouse);
         }
         if grpc_http_payload(payload)
             || contains_ascii_case_insensitive(payload, b"application/grpc")
@@ -2999,6 +3015,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Oracle);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"clickhouse") {
+            return Some(AgentPacketFlowApplication::ClickHouse);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -3118,6 +3137,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"zipkin-grpc")
         {
             return Some(AgentPacketFlowApplication::Zipkin);
+        }
+        if protocol.eq_ignore_ascii_case(b"clickhouse")
+            || protocol.eq_ignore_ascii_case(b"clickhouse-native")
+            || protocol.eq_ignore_ascii_case(b"clickhouse-http")
+        {
+            return Some(AgentPacketFlowApplication::ClickHouse);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7517,6 +7542,26 @@ mod tests {
         };
         assert_eq!(oracle.application(), api::AgentPacketFlowApplication::Oracle);
 
+        let clickhouse_http = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8123),
+            ..Default::default()
+        };
+        assert_eq!(
+            clickhouse_http.application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+
+        let clickhouse_native_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9440),
+            ..Default::default()
+        };
+        assert_eq!(
+            clickhouse_native_tls.application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+
         let redis = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(6379),
@@ -8324,6 +8369,13 @@ mod tests {
             api::AgentPacketFlowApplication::Zipkin
         );
         assert_eq!(
+            observation_for_payload(
+                b"POST /?query=SELECT%201 HTTP/1.1\r\nHost: clickhouse.example\r\nX-ClickHouse-User: default\r\n\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8350,6 +8402,10 @@ mod tests {
             (
                 "zipkin-collector.observability.svc",
                 api::AgentPacketFlowApplication::Zipkin,
+            ),
+            (
+                "clickhouse-0.analytics.svc",
+                api::AgentPacketFlowApplication::ClickHouse,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8478,6 +8534,10 @@ mod tests {
             (
                 &[b"zipkin-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::Zipkin,
+            ),
+            (
+                &[b"clickhouse-native".as_slice()][..],
+                api::AgentPacketFlowApplication::ClickHouse,
             ),
             (
                 &[b"kafka".as_slice()][..],
