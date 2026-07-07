@@ -1753,6 +1753,7 @@ pub mod api {
         OpenTelemetry,
         Jaeger,
         Loki,
+        Tempo,
         Grpc,
         Kafka,
         Nats,
@@ -1766,7 +1767,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 34] = [
+        pub const ALL: [Self; 35] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1791,6 +1792,7 @@ pub mod api {
             Self::OpenTelemetry,
             Self::Jaeger,
             Self::Loki,
+            Self::Tempo,
             Self::Grpc,
             Self::Kafka,
             Self::Nats,
@@ -1829,6 +1831,7 @@ pub mod api {
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Jaeger => "jaeger",
                 Self::Loki => "loki",
+                Self::Tempo => "tempo",
                 Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
@@ -2114,6 +2117,9 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::Loki;
+            }
+            if self.involves_port(3200) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Tempo;
             }
             if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Grpc;
@@ -2440,6 +2446,9 @@ pub mod api {
             if loki_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Loki);
             }
+            if tempo_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Tempo);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -2543,6 +2552,21 @@ pub mod api {
 
     fn loki_http_api_path(path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/loki/api/v1")
+    }
+
+    fn tempo_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 5] = [
+            b"/api/v2/traces",
+            b"/api/search",
+            b"/api/metrics/query",
+            b"/api/metrics/query_range",
+            b"/api/echo",
+        ];
+
+        path.starts_with(b"/api/traces/")
+            || PREFIXES
+                .iter()
+                .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn consul_http_api_path(path: &[u8]) -> bool {
@@ -2878,6 +2902,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"loki") {
             return Some(AgentPacketFlowApplication::Loki);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"tempo") {
+            return Some(AgentPacketFlowApplication::Tempo);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
             return Some(AgentPacketFlowApplication::Grpc);
         }
@@ -3042,6 +3069,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"loki-http")
         {
             return Some(AgentPacketFlowApplication::Loki);
+        }
+        if protocol.eq_ignore_ascii_case(b"tempo")
+            || protocol.eq_ignore_ascii_case(b"tempo-grpc")
+            || protocol.eq_ignore_ascii_case(b"tempo-http")
+        {
+            return Some(AgentPacketFlowApplication::Tempo);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7505,6 +7538,13 @@ mod tests {
         };
         assert_eq!(loki.application(), api::AgentPacketFlowApplication::Loki);
 
+        let tempo = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3200),
+            ..Default::default()
+        };
+        assert_eq!(tempo.application(), api::AgentPacketFlowApplication::Tempo);
+
         let grpc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(50051),
@@ -8188,6 +8228,32 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"GET /api/traces/f1cfe82a8eef933b HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v2/traces/f1cfe82a8eef933b HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/search?q=%7Bstatus%3Derror%7D HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /api/metrics/query_range?q=%7B%7D%7Crate() HTTP/1.1\r\n",
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/echo HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Tempo
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8206,6 +8272,10 @@ mod tests {
             (
                 "loki-gateway.observability.svc",
                 api::AgentPacketFlowApplication::Loki,
+            ),
+            (
+                "tempo-query-frontend.observability.svc",
+                api::AgentPacketFlowApplication::Tempo,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8326,6 +8396,10 @@ mod tests {
             (
                 &[b"loki-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::Loki,
+            ),
+            (
+                &[b"tempo-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Tempo,
             ),
             (
                 &[b"kafka".as_slice()][..],
