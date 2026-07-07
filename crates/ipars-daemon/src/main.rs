@@ -783,7 +783,8 @@ struct AgentArgs {
     #[arg(
         long,
         env = "IPARS_KUBERNETES_DISCOVER_API_SERVER",
-        default_value_t = true
+        default_value_t = true,
+        action = clap::ArgAction::Set
     )]
     kubernetes_discover_api_server: bool,
     #[arg(
@@ -2253,9 +2254,12 @@ fn validate_kubernetes_underlay_config(args: &AgentArgs) -> anyhow::Result<()> {
                 "--kubernetes-service-label-selector requires --kubernetes-discover-services"
             );
         }
-        if args.kubernetes_api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
+        if !args.kubernetes_discover_api_server
+            && args.kubernetes_api_server_cidrs.is_empty()
+            && args.kubernetes_service_cidrs.is_empty()
+        {
             anyhow::bail!(
-                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr unless --kubernetes-discover-services is set"
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr unless --kubernetes-discover-services or --kubernetes-discover-api-server is set"
             );
         }
     }
@@ -7707,16 +7711,37 @@ fn kubernetes_underlay_intent(
     args: &AgentArgs,
     local_node_id: NodeId,
 ) -> anyhow::Result<KubernetesUnderlayIntent> {
-    if args.kubernetes_api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
+    kubernetes_underlay_intent_with_api_server_host(
+        args,
+        local_node_id,
+        std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
+    )
+}
+
+fn kubernetes_underlay_intent_with_api_server_host(
+    args: &AgentArgs,
+    local_node_id: NodeId,
+    service_host: Option<&OsStr>,
+) -> anyhow::Result<KubernetesUnderlayIntent> {
+    let mut api_server_cidrs = args.kubernetes_api_server_cidrs.clone();
+    if args.kubernetes_discover_api_server {
+        if let Some(api_server_cidr) = kubernetes_api_server_env_cidr(service_host)? {
+            api_server_cidrs.push(api_server_cidr);
+            api_server_cidrs.sort();
+            api_server_cidrs.dedup();
+        }
+    }
+
+    if api_server_cidrs.is_empty() && args.kubernetes_service_cidrs.is_empty() {
         anyhow::bail!(
-            "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
+            "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr, --kubernetes-service-cidr, or KUBERNETES_SERVICE_HOST when --kubernetes-discover-api-server is enabled"
         );
     }
     let mut route_cidrs = BTreeSet::new();
     validate_kubernetes_underlay_route_cidrs(
         "--kubernetes-api-server-cidr",
         "Kubernetes API server CIDR",
-        &args.kubernetes_api_server_cidrs,
+        &api_server_cidrs,
         &mut route_cidrs,
     )?;
     validate_kubernetes_underlay_route_cidrs(
@@ -7736,7 +7761,7 @@ fn kubernetes_underlay_intent(
             .clone()
             .unwrap_or_else(|| "unknown-node".to_string()),
         overlay_interface: args.wireguard_interface.clone(),
-        api_server_cidrs: args.kubernetes_api_server_cidrs.clone(),
+        api_server_cidrs,
         service_cidrs: args.kubernetes_service_cidrs.clone(),
         route_provider,
     })
@@ -19361,6 +19386,63 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[test]
+    fn kubernetes_underlay_intent_discovers_api_server_host_route_without_service_discovery(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-node-name",
+            "worker-a",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            assert!(!args.kubernetes_discover_services);
+            assert!(args.kubernetes_discover_api_server);
+
+            let intent = kubernetes_underlay_intent_with_api_server_host(
+                &args,
+                NodeId::from_string("local-node"),
+                Some(OsStr::new("10.96.0.1")),
+            )?;
+            assert_eq!(intent.node_name, "worker-a");
+            assert_eq!(
+                intent.api_server_cidrs,
+                vec!["10.96.0.1/32".parse::<ipnet::IpNet>()?]
+            );
+            assert!(intent.service_cidrs.is_empty());
+
+            let missing_host_error = match kubernetes_underlay_intent_with_api_server_host(
+                &args,
+                NodeId::from_string("local-node"),
+                None,
+            ) {
+                Ok(intent) => {
+                    anyhow::bail!("missing Kubernetes Service host should be rejected: {intent:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(missing_host_error.contains("KUBERNETES_SERVICE_HOST"));
+
+            let invalid_host_error = match kubernetes_underlay_intent_with_api_server_host(
+                &args,
+                NodeId::from_string("local-node"),
+                Some(OsStr::new("kubernetes.default.svc")),
+            ) {
+                Ok(intent) => {
+                    anyhow::bail!("non-IP Kubernetes Service host should be rejected: {intent:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(invalid_host_error.contains("KUBERNETES_SERVICE_HOST"));
+            assert!(invalid_host_error.contains("is not an IP address"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
     #[tokio::test]
     async fn kubernetes_underlay_builds_agent_requested_routes() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
@@ -20758,7 +20840,13 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
     #[test]
     fn kubernetes_underlay_intent_requires_routes() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from(["iparsd", "agent", "--apply-kubernetes-underlay"])?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-discover-api-server",
+            "false",
+        ])?;
 
         if let Command::Agent(args) = cli.command {
             let error = match validate_agent_runtime_config(&args) {
@@ -20766,7 +20854,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 Err(error) => error.to_string(),
             };
             assert!(error.contains(
-                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr"
+                "--apply-kubernetes-underlay requires at least one --kubernetes-api-server-cidr or --kubernetes-service-cidr unless --kubernetes-discover-services or --kubernetes-discover-api-server is set"
             ));
             assert!(kubernetes_underlay_intent(&args, NodeId::from_string("local")).is_err());
             return Ok(());
