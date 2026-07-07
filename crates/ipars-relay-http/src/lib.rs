@@ -475,6 +475,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{header, Request};
+    use ipars_relay::encode_relay_datagram;
     use ipars_types::api::{
         RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
         RelayDataplaneDropReason, RelayStatusResponse,
@@ -518,10 +519,10 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-        let response: RelayAdmissionResponse = serde_json::from_slice(&body)?;
-        assert_eq!(response.session_id, "left:right");
-        assert!(!response.session_token.is_empty());
-        assert!(response.expires_at > chrono::Utc::now());
+        let admission: RelayAdmissionResponse = serde_json::from_slice(&body)?;
+        assert_eq!(admission.session_id, "left:right");
+        assert!(!admission.session_token.is_empty());
+        assert!(admission.expires_at > chrono::Utc::now());
 
         let response = app
             .clone()
@@ -575,6 +576,19 @@ mod tests {
             .await
             .forward_datagram_for_addr(SocketAddr::from(([10, 0, 0, 1], 10000)), b"bad frame");
         assert!(matches!(malformed, Err(RelayError::MalformedFrame)));
+        let invalid_credential = encode_relay_datagram(
+            &admission.session_id,
+            "wrong-session-token",
+            b"opaque-payload",
+        )?;
+        let invalid_credential = table.write().await.forward_datagram_for_addr(
+            SocketAddr::from(([10, 0, 0, 1], 10000)),
+            &invalid_credential,
+        );
+        assert!(matches!(
+            invalid_credential,
+            Err(RelayError::InvalidSessionCredential)
+        ));
 
         let response = app
             .oneshot(
@@ -615,9 +629,12 @@ mod tests {
             "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"internal_error\"} 0"
         ));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
-        assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 2"));
         assert!(body.contains(
             "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"unknown_session\"} 0"
+        ));
+        assert!(body.contains(
+            "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"invalid_session_credential\"} 1"
         ));
         assert!(body.contains(
             "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"malformed_frame\"} 1"
