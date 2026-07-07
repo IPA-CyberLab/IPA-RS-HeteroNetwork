@@ -2432,6 +2432,12 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Snmp);
             }
+            if syslog_payload(payload, self.protocol) {
+                return Some(AgentPacketFlowApplication::Syslog);
+            }
+            if nfs_payload(payload, self.protocol) {
+                return Some(AgentPacketFlowApplication::Nfs);
+            }
             if kerberos_payload(payload, self.protocol) {
                 return Some(AgentPacketFlowApplication::Kerberos);
             }
@@ -4647,6 +4653,302 @@ pub mod api {
             integer = integer.checked_shl(8)?.checked_add(*byte as u32)?;
         }
         Some(integer)
+    }
+
+    fn syslog_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            None | Some(TransportProtocol::Tcp) => {
+                syslog_message_payload(payload) || syslog_octet_counted_payload(payload)
+            }
+            Some(TransportProtocol::Udp) => syslog_message_payload(payload),
+            Some(
+                TransportProtocol::Any
+                | TransportProtocol::IpInIp
+                | TransportProtocol::Icmp
+                | TransportProtocol::Sctp
+                | TransportProtocol::Ipv6Encap
+                | TransportProtocol::Gre
+                | TransportProtocol::Esp
+                | TransportProtocol::Ah,
+            ) => false,
+        }
+    }
+
+    fn syslog_octet_counted_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        while offset < payload.len() && payload[offset].is_ascii_digit() {
+            offset += 1;
+            if offset > 6 {
+                return false;
+            }
+        }
+        if offset == 0 || payload.get(offset) != Some(&b' ') || payload[0] == b'0' {
+            return false;
+        }
+        let frame_len = decimal_usize(&payload[..offset]).unwrap_or(0);
+        if frame_len == 0 {
+            return false;
+        }
+        let message = &payload[offset + 1..];
+        if message.len() > frame_len {
+            return false;
+        }
+        syslog_message_payload(message)
+    }
+
+    fn syslog_message_payload(payload: &[u8]) -> bool {
+        let Some(offset) = syslog_priority_prefix(payload) else {
+            return false;
+        };
+        let message = &payload[offset..];
+        syslog_rfc5424_message(message) || syslog_rfc3164_message(message)
+    }
+
+    fn syslog_priority_prefix(payload: &[u8]) -> Option<usize> {
+        if payload.first() != Some(&b'<') {
+            return None;
+        }
+        let mut offset = 1_usize;
+        while offset < payload.len() && payload[offset].is_ascii_digit() {
+            offset += 1;
+            if offset > 4 {
+                return None;
+            }
+        }
+        if offset == 1 || payload.get(offset) != Some(&b'>') {
+            return None;
+        }
+        let priority = decimal_usize(&payload[1..offset])?;
+        (priority <= 191).then_some(offset + 1)
+    }
+
+    fn syslog_rfc5424_message(payload: &[u8]) -> bool {
+        let Some(mut offset) = payload.strip_prefix(b"1 ").map(|_| 2_usize) else {
+            return false;
+        };
+        let Some((timestamp, next_offset)) = syslog_next_token(payload, offset, 64) else {
+            return false;
+        };
+        if !syslog_rfc5424_timestamp(timestamp) {
+            return false;
+        }
+        offset = next_offset;
+        for max_len in [255_usize, 48, 128, 32] {
+            let Some((token, next_offset)) = syslog_next_token(payload, offset, max_len) else {
+                return false;
+            };
+            if !syslog_printable_token(token) {
+                return false;
+            }
+            offset = next_offset;
+        }
+        matches!(payload.get(offset), Some(b'-' | b'['))
+    }
+
+    fn syslog_rfc5424_timestamp(token: &[u8]) -> bool {
+        if token == b"-" {
+            return true;
+        }
+        token.len() >= b"2000-01-01T00:00:00Z".len()
+            && token.contains(&b'T')
+            && token.iter().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'-' | b':' | b'.' | b'T' | b'Z' | b'+')
+            })
+    }
+
+    fn syslog_next_token(payload: &[u8], offset: usize, max_len: usize) -> Option<(&[u8], usize)> {
+        let rest = payload.get(offset..)?;
+        let len = rest.iter().position(|byte| *byte == b' ')?;
+        if len == 0 || len > max_len {
+            return None;
+        }
+        Some((&rest[..len], offset + len + 1))
+    }
+
+    fn syslog_printable_token(token: &[u8]) -> bool {
+        token == b"-"
+            || token
+                .iter()
+                .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b']')
+    }
+
+    fn syslog_rfc3164_message(payload: &[u8]) -> bool {
+        if payload.len() < 17 || !syslog_month(payload.get(..3).unwrap_or_default()) {
+            return false;
+        }
+        if payload.get(3) != Some(&b' ') || payload.get(6) != Some(&b' ') {
+            return false;
+        }
+        let day = match (payload[4], payload[5]) {
+            (b' ', second) if second.is_ascii_digit() => (second - b'0') as u8,
+            (first, second) if first.is_ascii_digit() && second.is_ascii_digit() => {
+                (first - b'0') * 10 + (second - b'0')
+            }
+            _ => return false,
+        };
+        if !(1..=31).contains(&day) || !syslog_time(payload.get(7..15).unwrap_or_default()) {
+            return false;
+        }
+        if payload.get(15) != Some(&b' ') {
+            return false;
+        }
+        let Some((hostname, message_offset)) = syslog_next_token(payload, 16, 255) else {
+            return false;
+        };
+        syslog_printable_token(hostname)
+            && payload
+                .get(message_offset..)
+                .is_some_and(|message| message.iter().any(|byte| !byte.is_ascii_control()))
+    }
+
+    fn syslog_month(value: &[u8]) -> bool {
+        matches!(
+            value,
+            b"Jan"
+                | b"Feb"
+                | b"Mar"
+                | b"Apr"
+                | b"May"
+                | b"Jun"
+                | b"Jul"
+                | b"Aug"
+                | b"Sep"
+                | b"Oct"
+                | b"Nov"
+                | b"Dec"
+        )
+    }
+
+    fn syslog_time(value: &[u8]) -> bool {
+        if value.len() != 8 || value.get(2) != Some(&b':') || value.get(5) != Some(&b':') {
+            return false;
+        }
+        let Some(hour) = decimal_u8(&value[0..2]) else {
+            return false;
+        };
+        let Some(minute) = decimal_u8(&value[3..5]) else {
+            return false;
+        };
+        let Some(second) = decimal_u8(&value[6..8]) else {
+            return false;
+        };
+        hour <= 23 && minute <= 59 && second <= 59
+    }
+
+    fn nfs_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            None => nfs_rpc_payload(payload, false) || nfs_tcp_payload(payload),
+            Some(TransportProtocol::Tcp) => nfs_tcp_payload(payload),
+            Some(TransportProtocol::Udp) => nfs_rpc_payload(payload, false),
+            Some(
+                TransportProtocol::Any
+                | TransportProtocol::IpInIp
+                | TransportProtocol::Icmp
+                | TransportProtocol::Sctp
+                | TransportProtocol::Ipv6Encap
+                | TransportProtocol::Gre
+                | TransportProtocol::Esp
+                | TransportProtocol::Ah,
+            ) => false,
+        }
+    }
+
+    fn nfs_tcp_payload(payload: &[u8]) -> bool {
+        const RPC_TCP_RECORD_LEN_MASK: u32 = 0x7fff_ffff;
+
+        let Some(record) = read_u32_be(payload, 0) else {
+            return false;
+        };
+        let fragment_len = (record & RPC_TCP_RECORD_LEN_MASK) as usize;
+        if !(40..=16_777_216).contains(&fragment_len) {
+            return false;
+        }
+        let available = payload.len().saturating_sub(4);
+        let message_prefix_len = available.min(fragment_len);
+        let allow_truncated =
+            available < fragment_len && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+        if available < fragment_len && !allow_truncated {
+            return false;
+        }
+        nfs_rpc_payload(&payload[4..4 + message_prefix_len], allow_truncated)
+    }
+
+    fn nfs_rpc_payload(payload: &[u8], allow_truncated: bool) -> bool {
+        const ONC_RPC_CALL: u32 = 0;
+        const ONC_RPC_VERSION: u32 = 2;
+        const NFS_PROGRAM: u32 = 100_003;
+
+        if payload.len() < 24 {
+            return false;
+        }
+        let xid = read_u32_be(payload, 0).unwrap_or(0);
+        let message_type = read_u32_be(payload, 4).unwrap_or(u32::MAX);
+        let rpc_version = read_u32_be(payload, 8).unwrap_or(0);
+        let program = read_u32_be(payload, 12).unwrap_or(0);
+        let version = read_u32_be(payload, 16).unwrap_or(0);
+        let procedure = read_u32_be(payload, 20).unwrap_or(u32::MAX);
+        if xid == 0
+            || message_type != ONC_RPC_CALL
+            || rpc_version != ONC_RPC_VERSION
+            || program != NFS_PROGRAM
+            || !matches!(version, 2..=4)
+            || !nfs_procedure(version, procedure)
+        {
+            return false;
+        }
+        let Some(credential_end) = rpc_auth_opaque_end(payload, 24, allow_truncated) else {
+            return false;
+        };
+        if credential_end >= payload.len() {
+            return allow_truncated;
+        }
+        rpc_auth_opaque_end(payload, credential_end, allow_truncated).is_some()
+    }
+
+    fn nfs_procedure(version: u32, procedure: u32) -> bool {
+        match version {
+            2 | 3 => procedure <= 21,
+            4 => procedure <= 2,
+            _ => false,
+        }
+    }
+
+    fn rpc_auth_opaque_end(payload: &[u8], offset: usize, allow_truncated: bool) -> Option<usize> {
+        const RPC_AUTH_MAX_BYTES: usize = 400;
+
+        let auth_len_offset = offset.checked_add(4)?;
+        let len_offset = offset.checked_add(8)?;
+        if len_offset > payload.len() {
+            return allow_truncated.then_some(payload.len());
+        }
+        let len = read_u32_be(payload, auth_len_offset)? as usize;
+        if len > RPC_AUTH_MAX_BYTES {
+            return None;
+        }
+        let padded_len = len.checked_add(3)? & !3;
+        let end = len_offset.checked_add(padded_len)?;
+        if end > payload.len() {
+            return allow_truncated.then_some(payload.len());
+        }
+        Some(end)
+    }
+
+    fn decimal_usize(value: &[u8]) -> Option<usize> {
+        let mut parsed = 0_usize;
+        for byte in value {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            parsed = parsed
+                .checked_mul(10)?
+                .checked_add((byte - b'0') as usize)?;
+        }
+        Some(parsed)
+    }
+
+    fn decimal_u8(value: &[u8]) -> Option<u8> {
+        let parsed = decimal_usize(value)?;
+        u8::try_from(parsed).ok()
     }
 
     fn smb_payload(payload: &[u8]) -> bool {
@@ -9529,6 +9831,21 @@ mod tests {
             payload
         }
 
+        fn nfs_rpc_call(program: u32, version: u32, procedure: u32) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&0x1020_3040_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&2_u32.to_be_bytes());
+            payload.extend_from_slice(&program.to_be_bytes());
+            payload.extend_from_slice(&version.to_be_bytes());
+            payload.extend_from_slice(&procedure.to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload
+        }
+
         let observation_for_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             payload_prefix: payload.to_vec(),
@@ -9710,6 +10027,52 @@ mod tests {
         invalid_snmp_pdu_tag[13] = 0x30;
         assert_eq!(
             observation_for_udp_payload(&invalid_snmp_pdu_tag).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let syslog_rfc5424 = b"<34>1 2026-07-07T12:34:56Z edge-1 iparsd 123 ID47 - path selected";
+        assert_eq!(
+            observation_for_udp_payload(syslog_rfc5424).application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+        let syslog_rfc3164 = b"<13>Oct 11 22:14:15 edge-1 iparsd: path selected";
+        assert_eq!(
+            observation_for_udp_payload(syslog_rfc3164).application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+        let mut syslog_octet_counted = syslog_rfc5424.len().to_string().into_bytes();
+        syslog_octet_counted.push(b' ');
+        syslog_octet_counted.extend_from_slice(syslog_rfc5424);
+        assert_eq!(
+            observation_for_payload(&syslog_octet_counted).application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"<999>1 2026-07-07T12:34:56Z edge app 1 ID - nope")
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"<34>GET / HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let nfs_v4_compound = nfs_rpc_call(100_003, 4, 1);
+        assert_eq!(
+            observation_for_udp_payload(&nfs_v4_compound).application(),
+            api::AgentPacketFlowApplication::Nfs
+        );
+        let mut nfs_tcp = ((0x8000_0000_u32) | (nfs_v4_compound.len() as u32))
+            .to_be_bytes()
+            .to_vec();
+        nfs_tcp.extend_from_slice(&nfs_v4_compound);
+        assert_eq!(
+            observation_for_payload(&nfs_tcp).application(),
+            api::AgentPacketFlowApplication::Nfs
+        );
+        let not_nfs_mount_rpc = nfs_rpc_call(100_005, 3, 1);
+        assert_eq!(
+            observation_for_udp_payload(&not_nfs_mount_rpc).application(),
             api::AgentPacketFlowApplication::Unknown
         );
 
