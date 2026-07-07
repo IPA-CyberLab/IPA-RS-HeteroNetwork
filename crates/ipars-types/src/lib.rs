@@ -8356,6 +8356,14 @@ pub mod api {
     pub struct AgentMetricsResponse {
         pub node_id: NodeId,
         pub candidate_count: usize,
+        #[serde(default)]
+        pub peer_map_synced: bool,
+        #[serde(default)]
+        pub peer_map_peer_count: usize,
+        #[serde(default)]
+        pub peer_map_route_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub peer_map_generated_at: Option<DateTime<Utc>>,
         pub path_count: usize,
         pub relay_session_count: usize,
         pub relay_admission_attempt_count: u64,

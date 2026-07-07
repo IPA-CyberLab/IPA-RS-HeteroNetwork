@@ -372,6 +372,52 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_peer_map_synced Whether the agent has successfully applied at least one peer map."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_peer_map_synced gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_peer_map_synced{{node_id=\"{node_id}\"}} {}",
+        u8::from(metrics.peer_map_synced)
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_peer_map_peers Number of peers in the last successfully applied peer map."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_peer_map_peers gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_peer_map_peers{{node_id=\"{node_id}\"}} {}",
+        metrics.peer_map_peer_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_peer_map_routes Number of advertised routes in the last successfully applied peer map."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_peer_map_routes gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_peer_map_routes{{node_id=\"{node_id}\"}} {}",
+        metrics.peer_map_route_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_peer_map_generated_timestamp_seconds Unix timestamp of the control-plane peer map currently held by the agent, or 0 before the first successful sync."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_peer_map_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_peer_map_generated_timestamp_seconds{{node_id=\"{node_id}\"}} {}",
+        metrics
+            .peer_map_generated_at
+            .map(|generated_at| generated_at.timestamp())
+            .unwrap_or_default()
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_paths Number of peer paths currently tracked."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_paths gauge");
@@ -1568,6 +1614,26 @@ mod tests {
             AgentPacketFlowDuplicateSource::ConntrackNetlink,
             2,
         );
+        let peer_map_generated_at = Utc::now();
+        let peer_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: NodeId::from_string("peer-a"),
+            via: Some(NodeId::from_string("peer-a")),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_record(
+                    NodeId::from_string("peer-a"),
+                    IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+                    vec![peer_route],
+                )],
+                generated_at: peer_map_generated_at,
+            })
+            .await;
         let app = router(AgentHttpState::new(runtime));
 
         let metrics_response = app
@@ -1583,6 +1649,10 @@ mod tests {
         let body = axum::body::to_bytes(metrics_response.into_body(), usize::MAX).await?;
         let metrics: AgentMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_id, node_id);
+        assert!(metrics.peer_map_synced);
+        assert_eq!(metrics.peer_map_peer_count, 1);
+        assert_eq!(metrics.peer_map_route_count, 1);
+        assert_eq!(metrics.peer_map_generated_at, Some(peer_map_generated_at));
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.path_state_counts.len(), 5);
         assert!(metrics
@@ -1749,6 +1819,10 @@ mod tests {
         let body = axum::body::to_bytes(prometheus_response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_agent_paths"));
+        assert!(body.contains("ipars_agent_peer_map_synced"));
+        assert!(body.contains("ipars_agent_peer_map_peers"));
+        assert!(body.contains("ipars_agent_peer_map_routes"));
+        assert!(body.contains("ipars_agent_peer_map_generated_timestamp_seconds"));
         assert!(body.contains("state=\"RELAY\""));
         assert!(body.contains("state=\"DIRECT_PUBLIC\""));
         assert!(body.contains("state=\"DIRECT_IPV6\""));
@@ -1802,6 +1876,19 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_agent_peer_map_synced{{node_id=\"{prometheus_node_id}\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_peer_map_peers{{node_id=\"{prometheus_node_id}\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_peer_map_routes{{node_id=\"{prometheus_node_id}\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_peer_map_generated_timestamp_seconds{{node_id=\"{prometheus_node_id}\"}} {}",
+            peer_map_generated_at.timestamp()
+        )));
         assert!(body.contains(&format!(
             "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"RELAY\"}} 1"
         )));

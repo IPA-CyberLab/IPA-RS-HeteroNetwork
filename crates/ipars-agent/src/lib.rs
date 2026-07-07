@@ -1339,6 +1339,18 @@ impl AgentRuntime {
         let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         let path_change_events = self.path_change_events.read().await;
         let lazy_connect = self.lazy_connect.read().await;
+        let latest_peer_map = self.latest_peer_map.read().await;
+        let peer_map_peer_count = latest_peer_map
+            .as_ref()
+            .map(|peer_map| peer_map.peers.len())
+            .unwrap_or_default();
+        let peer_map_route_count = latest_peer_map
+            .as_ref()
+            .map(|peer_map| peer_map.peers.iter().map(|peer| peer.routes.len()).sum())
+            .unwrap_or_default();
+        let peer_map_generated_at = latest_peer_map
+            .as_ref()
+            .map(|peer_map| peer_map.generated_at);
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in path_state.values() {
             *path_state_counts.entry(path.selected_state).or_default() += 1;
@@ -1348,6 +1360,10 @@ impl AgentRuntime {
         AgentMetricsResponse {
             node_id: state.node_id,
             candidate_count: candidates.len(),
+            peer_map_synced: latest_peer_map.is_some(),
+            peer_map_peer_count,
+            peer_map_route_count,
+            peer_map_generated_at,
             path_count: path_state.len(),
             relay_session_count: relay_sessions.len(),
             relay_admission_attempt_count: self

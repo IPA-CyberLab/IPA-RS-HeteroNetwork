@@ -4749,6 +4749,10 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
 #[derive(Debug)]
 struct AgentOtelMetrics {
     candidates: Gauge<u64>,
+    peer_map_synced: Gauge<u64>,
+    peer_map_peers: Gauge<u64>,
+    peer_map_routes: Gauge<u64>,
+    peer_map_generated_timestamp_seconds: Gauge<u64>,
     paths: Gauge<u64>,
     paths_by_state: Gauge<u64>,
     relay_sessions: Gauge<u64>,
@@ -4810,6 +4814,26 @@ impl AgentOtelMetrics {
             candidates: meter
                 .u64_gauge("ipars.agent.candidates")
                 .with_description("Endpoint candidates currently known by the agent.")
+                .build(),
+            peer_map_synced: meter
+                .u64_gauge("ipars.agent.peer_map.synced")
+                .with_description("Whether the agent has successfully applied at least one peer map.")
+                .build(),
+            peer_map_peers: meter
+                .u64_gauge("ipars.agent.peer_map.peers")
+                .with_description("Peers in the last successfully applied peer map.")
+                .build(),
+            peer_map_routes: meter
+                .u64_gauge("ipars.agent.peer_map.routes")
+                .with_description(
+                    "Advertised routes in the last successfully applied peer map.",
+                )
+                .build(),
+            peer_map_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.agent.peer_map.generated_timestamp_seconds")
+                .with_description(
+                    "Unix timestamp of the control-plane peer map currently held by the agent, or 0 before the first successful sync.",
+                )
                 .build(),
             paths: meter
                 .u64_gauge("ipars.agent.paths")
@@ -5129,6 +5153,19 @@ impl AgentOtelMetrics {
         let node_attrs = [KeyValue::new("node_id", node_id.clone())];
         self.candidates
             .record(metrics.candidate_count as u64, &node_attrs);
+        self.peer_map_synced
+            .record(if metrics.peer_map_synced { 1 } else { 0 }, &node_attrs);
+        self.peer_map_peers
+            .record(metrics.peer_map_peer_count as u64, &node_attrs);
+        self.peer_map_routes
+            .record(metrics.peer_map_route_count as u64, &node_attrs);
+        self.peer_map_generated_timestamp_seconds.record(
+            metrics
+                .peer_map_generated_at
+                .map(|generated_at| generated_at.timestamp().max(0) as u64)
+                .unwrap_or_default(),
+            &node_attrs,
+        );
         self.paths.record(metrics.path_count as u64, &node_attrs);
         self.relay_sessions
             .record(metrics.relay_session_count as u64, &node_attrs);
@@ -13620,6 +13657,10 @@ mod tests {
         AgentMetricsResponse {
             node_id: NodeId::from_string("node-a"),
             candidate_count: 2,
+            peer_map_synced: true,
+            peer_map_peer_count: 3,
+            peer_map_route_count: 4,
+            peer_map_generated_at: Some(Utc::now()),
             path_count: 1,
             relay_session_count: 1,
             relay_admission_attempt_count: 3,
