@@ -2426,6 +2426,7 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
             path.display()
         )
     })?;
+    ensure_runtime_directory_chain_has_no_symlinks(label, parent)?;
     let parent_metadata = parent
         .metadata()
         .with_context(|| format!("failed to inspect parent directory {}", parent.display()))?;
@@ -2440,6 +2441,53 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
         })?;
         ensure_runtime_parent_directory_safe(label, directory, &metadata, false, effective_uid)?;
         ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_runtime_directory_chain_has_no_symlinks(
+    label: &str,
+    directory: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        directory.is_absolute(),
+        "{label} parent {} must be an absolute directory",
+        directory.display()
+    );
+
+    let mut current = PathBuf::new();
+    for component in directory.components() {
+        match component {
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                let metadata = current.symlink_metadata().with_context(|| {
+                    format!(
+                        "failed to inspect runtime command directory {}",
+                        current.display()
+                    )
+                })?;
+                let relationship = if current == directory {
+                    "parent"
+                } else {
+                    "ancestor"
+                };
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "{label} {relationship} {} must not be a symlink",
+                    current.display()
+                );
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::bail!(
+                    "{label} parent {} must not contain '..' components",
+                    directory.display()
+                );
+            }
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+        }
     }
     Ok(())
 }
@@ -17009,6 +17057,60 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(symlink_error
             .to_string()
             .contains("expected an executable regular file"));
+
+        let symlink_parent_target = base.join("symlink-parent-target");
+        std::fs::create_dir(&symlink_parent_target)?;
+        std::fs::set_permissions(
+            &symlink_parent_target,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let symlink_parent_command = symlink_parent_target.join("ip");
+        std::fs::write(&symlink_parent_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(
+            &symlink_parent_command,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let symlink_parent_bin = base.join("symlink-parent-bin");
+        std::os::unix::fs::symlink(&symlink_parent_target, &symlink_parent_bin)?;
+        let symlink_parent_error =
+            match ensure_program_in_path("ip", Some(symlink_parent_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful symlink parent preflight"),
+                Err(error) => error,
+            };
+        assert!(symlink_parent_error.to_string().contains("parent"));
+        assert!(symlink_parent_error
+            .to_string()
+            .contains("must not be a symlink"));
+
+        let symlink_ancestor_target = base.join("symlink-ancestor-target");
+        let symlink_ancestor_target_bin = symlink_ancestor_target.join("bin");
+        std::fs::create_dir_all(&symlink_ancestor_target_bin)?;
+        std::fs::set_permissions(
+            &symlink_ancestor_target,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        std::fs::set_permissions(
+            &symlink_ancestor_target_bin,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let symlink_ancestor_command = symlink_ancestor_target_bin.join("ip");
+        std::fs::write(&symlink_ancestor_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(
+            &symlink_ancestor_command,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let symlink_ancestor = base.join("symlink-ancestor");
+        std::os::unix::fs::symlink(&symlink_ancestor_target, &symlink_ancestor)?;
+        let symlink_ancestor_bin = symlink_ancestor.join("bin");
+        let symlink_ancestor_error =
+            match ensure_program_in_path("ip", Some(symlink_ancestor_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful symlink ancestor preflight"),
+                Err(error) => error,
+            };
+        assert!(symlink_ancestor_error.to_string().contains("ancestor"));
+        assert!(symlink_ancestor_error
+            .to_string()
+            .contains("must not be a symlink"));
 
         let writable_command_bin = base.join("writable-command-bin");
         std::fs::create_dir(&writable_command_bin)?;
