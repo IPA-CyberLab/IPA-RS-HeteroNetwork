@@ -46,7 +46,9 @@ use ipars_route_manager::{
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
-use ipars_stun::{BindingStunServer, StunServerMetricsSnapshot, StunServerStats};
+use ipars_stun::{
+    BindingStunServer, Rfc5780StunServer, StunServerMetricsSnapshot, StunServerStats,
+};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
     AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
@@ -378,6 +380,8 @@ struct SignalArgs {
 struct StunArgs {
     #[arg(long, env = "IPARS_STUN_LISTEN", default_value = "0.0.0.0:3478")]
     listen: SocketAddr,
+    #[arg(long, env = "IPARS_STUN_ALTERNATE_LISTEN")]
+    alternate_listen: Option<SocketAddr>,
     #[arg(long, env = "IPARS_STUN_HTTP_LISTEN", default_value = "0.0.0.0:3479")]
     http_listen: SocketAddr,
 }
@@ -3091,9 +3095,27 @@ async fn run_stun(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
-    let server = BindingStunServer::bind(args.listen).await?;
-    let listen = server.local_addr()?;
     let stats = Arc::new(StunServerStats::default());
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (listen, alternate_listen, udp_task) = if let Some(alternate_listen) = args.alternate_listen
+    {
+        let server = Rfc5780StunServer::bind(args.listen, alternate_listen).await?;
+        let listen = server.primary_addr()?;
+        let alternate_listen = server.alternate_addr()?;
+        (
+            listen,
+            Some(alternate_listen),
+            tokio::spawn(server.serve_with_stats(shutdown_rx, stats.clone())),
+        )
+    } else {
+        let server = BindingStunServer::bind(args.listen).await?;
+        let listen = server.local_addr()?;
+        (
+            listen,
+            None,
+            tokio::spawn(server.serve_with_stats(shutdown_rx, stats.clone())),
+        )
+    };
     let otel_metrics_task = otel_metrics_enabled.then(|| {
         start_stun_otel_metrics_export(
             stats.clone(),
@@ -3101,12 +3123,10 @@ async fn run_stun(
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
-    tracing::info!(%listen, http_listen = %args.http_listen, "stun listening");
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let udp_task = tokio::spawn(server.serve_with_stats(shutdown_rx, stats.clone()));
+    tracing::info!(%listen, ?alternate_listen, http_listen = %args.http_listen, "stun listening");
     let result = serve_router(
         args.http_listen,
-        stun_router(StunHttpState::new(listen, stats)),
+        stun_router(StunHttpState::new(listen, alternate_listen, stats)),
     )
     .await;
     udp_task.abort();
@@ -3119,18 +3139,28 @@ async fn run_stun(
 #[derive(Debug, Clone)]
 struct StunHttpState {
     listen: SocketAddr,
+    alternate_listen: Option<SocketAddr>,
     stats: Arc<StunServerStats>,
 }
 
 impl StunHttpState {
-    fn new(listen: SocketAddr, stats: Arc<StunServerStats>) -> Self {
-        Self { listen, stats }
+    fn new(
+        listen: SocketAddr,
+        alternate_listen: Option<SocketAddr>,
+        stats: Arc<StunServerStats>,
+    ) -> Self {
+        Self {
+            listen,
+            alternate_listen,
+            stats,
+        }
     }
 
     fn metrics(&self) -> StunMetricsResponse {
         let snapshot = self.stats.snapshot();
         StunMetricsResponse {
             listen: self.listen,
+            alternate_listen: self.alternate_listen,
             binding_request_count: snapshot.binding_request_count,
             binding_response_count: snapshot.binding_response_count,
             invalid_packet_count: snapshot.invalid_packet_count,
@@ -3189,6 +3219,21 @@ fn render_stun_prometheus_metrics(metrics: &StunMetricsResponse) -> String {
         &mut body,
         "ipars_stun_server_active{{listen=\"{listen}\"}} 1"
     );
+    if let Some(alternate_listen) = metrics.alternate_listen {
+        let alternate_listen = prometheus_label(&alternate_listen.to_string());
+        prometheus_line!(
+            &mut body,
+            "# HELP ipars_stun_rfc5780_alternate_server_active STUN RFC5780 alternate socket active state."
+        );
+        prometheus_line!(
+            &mut body,
+            "# TYPE ipars_stun_rfc5780_alternate_server_active gauge"
+        );
+        prometheus_line!(
+            &mut body,
+            "ipars_stun_rfc5780_alternate_server_active{{listen=\"{listen}\",alternate_listen=\"{alternate_listen}\"}} 1"
+        );
+    }
     prometheus_line!(
         &mut body,
         "# HELP ipars_stun_binding_requests_total Valid STUN Binding requests received by the server."
@@ -12216,6 +12261,8 @@ mod tests {
             "stun",
             "--listen",
             "0.0.0.0:3478",
+            "--alternate-listen",
+            "127.0.0.1:3480",
             "--http-listen",
             "127.0.0.1:3479",
         ])?;
@@ -12224,6 +12271,10 @@ mod tests {
             anyhow::bail!("expected stun command");
         };
         assert_eq!(args.listen, SocketAddr::from(([0, 0, 0, 0], 3478)));
+        assert_eq!(
+            args.alternate_listen,
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480)))
+        );
         assert_eq!(args.http_listen, SocketAddr::from(([127, 0, 0, 1], 3479)));
         Ok(())
     }
@@ -12232,12 +12283,17 @@ mod tests {
     async fn stun_http_metrics_json_reports_listener_and_stats() -> anyhow::Result<()> {
         let state = StunHttpState::new(
             SocketAddr::from(([127, 0, 0, 1], 3478)),
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
             Arc::new(StunServerStats::default()),
         );
 
         let axum::Json(metrics) = stun_metrics(axum::extract::State(state)).await;
 
         assert_eq!(metrics.listen, SocketAddr::from(([127, 0, 0, 1], 3478)));
+        assert_eq!(
+            metrics.alternate_listen,
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480)))
+        );
         assert_eq!(metrics.binding_request_count, 0);
         assert_eq!(metrics.binding_response_count, 0);
         assert_eq!(metrics.invalid_packet_count, 0);
@@ -12250,6 +12306,7 @@ mod tests {
     fn stun_prometheus_metrics_render_all_server_counters() {
         let metrics = StunMetricsResponse {
             listen: SocketAddr::from(([127, 0, 0, 1], 3478)),
+            alternate_listen: Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
             binding_request_count: 7,
             binding_response_count: 6,
             invalid_packet_count: 2,
@@ -12261,6 +12318,9 @@ mod tests {
         let rendered = render_stun_prometheus_metrics(&metrics);
 
         assert!(rendered.contains("ipars_stun_server_active{listen=\"127.0.0.1:3478\"} 1"));
+        assert!(rendered.contains(
+            "ipars_stun_rfc5780_alternate_server_active{listen=\"127.0.0.1:3478\",alternate_listen=\"127.0.0.1:3480\"} 1"
+        ));
         assert!(rendered.contains("ipars_stun_binding_requests_total{listen=\"127.0.0.1:3478\"} 7"));
         assert!(
             rendered.contains("ipars_stun_binding_responses_total{listen=\"127.0.0.1:3478\"} 6")

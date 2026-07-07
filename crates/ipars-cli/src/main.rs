@@ -118,6 +118,8 @@ struct InitArgs {
     signal_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:3478")]
     stun_listen: SocketAddr,
+    #[arg(long)]
+    stun_alternate_listen: Option<SocketAddr>,
     #[arg(long, default_value = "0.0.0.0:3479")]
     stun_http_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:51820")]
@@ -934,6 +936,19 @@ fn init_daemon_specs(
             args.relay_http_listen.port()
         )
     });
+    let mut stun_args = vec![
+        "stun".to_string(),
+        "--listen".to_string(),
+        args.stun_listen.to_string(),
+    ];
+    if let Some(stun_alternate_listen) = args.stun_alternate_listen {
+        stun_args.push("--alternate-listen".to_string());
+        stun_args.push(stun_alternate_listen.to_string());
+    }
+    stun_args.extend([
+        "--http-listen".to_string(),
+        args.stun_http_listen.to_string(),
+    ]);
 
     vec![
         InitDaemonSpec {
@@ -966,13 +981,7 @@ fn init_daemon_specs(
         },
         InitDaemonSpec {
             service: "stun",
-            args: vec![
-                "stun".to_string(),
-                "--listen".to_string(),
-                args.stun_listen.to_string(),
-                "--http-listen".to_string(),
-                args.stun_http_listen.to_string(),
-            ],
+            args: stun_args,
             log_path: log_dir.join("stun.log"),
         },
         InitDaemonSpec {
@@ -5763,6 +5772,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_alternate_listen: None,
             stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
@@ -6400,6 +6410,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_alternate_listen: None,
             stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
@@ -6453,6 +6464,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: "127.0.0.1:19443".parse()?,
             stun_listen: "0.0.0.0:13478".parse()?,
+            stun_alternate_listen: Some("127.0.0.1:13480".parse()?),
             stun_http_listen: "127.0.0.1:13479".parse()?,
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
@@ -6509,6 +6521,7 @@ mod tests {
             .context("expected stun daemon command")?;
         assert!(stun.command.contains(&"stun".to_string()));
         assert!(stun.command.contains(&"0.0.0.0:13478".to_string()));
+        assert!(stun.command.contains(&"127.0.0.1:13480".to_string()));
         assert!(stun.command.contains(&"127.0.0.1:13479".to_string()));
 
         let relay = output

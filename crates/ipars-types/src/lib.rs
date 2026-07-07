@@ -1303,6 +1303,8 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct StunMetricsResponse {
         pub listen: SocketAddr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub alternate_listen: Option<SocketAddr>,
         pub binding_request_count: u64,
         pub binding_response_count: u64,
         pub invalid_packet_count: u64,
