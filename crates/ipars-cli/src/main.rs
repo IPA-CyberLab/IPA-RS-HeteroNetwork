@@ -31,6 +31,7 @@ const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
+const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -1293,7 +1294,7 @@ async fn post_join_request(
                 continue;
             }
         };
-        match response.json::<RegisterNodeResponse>().await {
+        match read_bounded_json_response(response, "control-plane join").await {
             Ok(response) => return Ok((join_url.clone(), response)),
             Err(error) => failures.push(format!("{join_url}: decode failed: {error}")),
         }
@@ -1553,17 +1554,15 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
         nonce: args.nonce,
     };
     let url = control_plane_token_revoke_url(&args.control_plane_url)?;
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(&url)
         .json(&request)
         .send()
         .await
         .context("failed to send token revoke request")?
         .error_for_status()
-        .context("control plane rejected token revoke request")?
-        .json::<RevokeTokenResponse>()
-        .await
-        .context("failed to decode token revoke response")
+        .context("control plane rejected token revoke request")?;
+    read_bounded_json_response(response, "token revoke").await
 }
 
 async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
@@ -1738,14 +1737,14 @@ where
     T: DeserializeOwned,
 {
     let url = api_url(base_url, path, label)?;
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(&url)
         .send()
         .await
         .with_context(|| format!("failed to send {label} request to {url}"))?
         .error_for_status()
-        .with_context(|| format!("{label} request to {url} returned an error status"))?
-        .json::<T>()
+        .with_context(|| format!("{label} request to {url} returned an error status"))?;
+    read_bounded_json_response(response, label)
         .await
         .with_context(|| format!("failed to decode {label} response from {url}"))
 }
@@ -1761,15 +1760,15 @@ where
     Response: DeserializeOwned,
 {
     let url = api_url(base_url, path, label)?;
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(&url)
         .json(request)
         .send()
         .await
         .with_context(|| format!("failed to send {label} request to {url}"))?
         .error_for_status()
-        .with_context(|| format!("{label} request to {url} returned an error status"))?
-        .json::<Response>()
+        .with_context(|| format!("{label} request to {url} returned an error status"))?;
+    read_bounded_json_response(response, label)
         .await
         .with_context(|| format!("failed to decode {label} response from {url}"))
 }
@@ -1777,6 +1776,51 @@ where
 fn api_url(base_url: &str, path: &str, label: &str) -> anyhow::Result<String> {
     let base_url = normalize_http_api_base_url(base_url, &format!("{label} URL"))?;
     Ok(format!("{}/{}", base_url, path.trim_start_matches('/')))
+}
+
+async fn read_bounded_json_response<T>(
+    response: reqwest::Response,
+    label: &str,
+) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    read_bounded_json_response_with_limit(response, label, MAX_CLI_HTTP_JSON_RESPONSE_BYTES).await
+}
+
+async fn read_bounded_json_response_with_limit<T>(
+    mut response: reqwest::Response,
+    label: &str,
+    max_bytes: u64,
+) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    if let Some(length) = response.content_length() {
+        ensure_cli_http_json_response_size(length, label, max_bytes)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read {label} response"))?
+    {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        ensure_cli_http_json_response_size(next_len, label, max_bytes)?;
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).with_context(|| format!("failed to decode {label} response"))
+}
+
+fn ensure_cli_http_json_response_size(
+    size: u64,
+    label: &str,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    if size > max_bytes {
+        anyhow::bail!("{label} response exceeds maximum size of {max_bytes} bytes");
+    }
+    Ok(())
 }
 
 fn parse_path_state(value: &str) -> Result<PathState, String> {
@@ -7168,6 +7212,107 @@ mod tests {
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
         }
+    }
+
+    async fn spawn_raw_http_response(
+        response: String,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    #[tokio::test]
+    async fn cli_bounded_json_response_rejects_oversized_responses() -> anyhow::Result<()> {
+        let body = r#"{"ok":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let value: serde_json::Value =
+            read_bounded_json_response_with_limit(response, "test CLI JSON", 64).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for bounded CLI JSON test server")???;
+        assert_eq!(value["ok"], true);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            65
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let error = read_bounded_json_response_with_limit::<serde_json::Value>(
+            response,
+            "test CLI JSON",
+            64,
+        )
+        .await
+        .expect_err("oversized Content-Length should be rejected");
+        assert!(error
+            .to_string()
+            .contains("test CLI JSON response exceeds maximum size of 64 bytes"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized Content-Length CLI JSON test server")???;
+
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n{\"ok\"\r\n5\r\n:true\r\n1\r\n}\r\n0\r\n\r\n"
+            .to_string();
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let error = read_bounded_json_response_with_limit::<serde_json::Value>(
+            response,
+            "test CLI JSON chunked",
+            10,
+        )
+        .await
+        .expect_err("oversized chunked body should be rejected");
+        assert!(error
+            .to_string()
+            .contains("test CLI JSON chunked response exceeds maximum size of 10 bytes"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized chunked CLI JSON test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_get_json_rejects_oversized_http_response() -> anyhow::Result<()> {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_CLI_HTTP_JSON_RESPONSE_BYTES + 1
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let error = get_json::<serde_json::Value>(&url, "/v1/status", "test endpoint")
+            .await
+            .expect_err("oversized CLI HTTP response should be rejected");
+        assert!(format!("{error:#}").contains("test endpoint response exceeds maximum size"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized CLI get_json test server")???;
+        Ok(())
     }
 
     #[test]
