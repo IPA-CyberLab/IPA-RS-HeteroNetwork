@@ -925,7 +925,37 @@ fn assert_compose_agent_packet_flow(
             Ok(())
         },
     )?;
+    assert_compose_agent_packet_flow_prometheus_metrics(compose, service, port, local)?;
 
+    Ok(())
+}
+
+fn assert_compose_agent_packet_flow_prometheus_metrics(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    node_id: &str,
+) -> Result<()> {
+    let metrics = compose_exec_text(
+        compose,
+        service,
+        &format!("http://127.0.0.1:{port}/metrics"),
+    )?;
+    ensure_prometheus_sample_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_observations_total",
+        node_id,
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_matches_total",
+        node_id,
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least(&metrics, "ipars_agent_observed_peer_vpn_ips", node_id, 1.0)?;
+    ensure_prometheus_sample_at_least(&metrics, "ipars_agent_active_peers", node_id, 1.0)?;
+    ensure_prometheus_sample_at_least(&metrics, "ipars_agent_pinned_peers", node_id, 1.0)?;
     Ok(())
 }
 
@@ -1316,6 +1346,32 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
     })
 }
 
+fn compose_exec_text(compose: &ComposeProject, service: &str, url: &str) -> Result<String> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "-fsS",
+        "--max-time",
+        "5",
+        "-H",
+        "Accept: text/plain",
+        url,
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose exec {service} curl {url}"))?;
+    ensure_success(
+        &format!("docker compose exec {service} curl {url}"),
+        &output,
+    )?;
+    String::from_utf8(output.stdout).with_context(|| {
+        format!("text response from docker compose exec {service} curl {url} was not UTF-8")
+    })
+}
+
 fn compose_exec_post_json(
     compose: &ComposeProject,
     service: &str,
@@ -1567,6 +1623,40 @@ fn ensure_json_string_nonempty(value: &Value, field: &str) -> Result<()> {
         "expected JSON field {field} to be non-empty: {value}"
     );
     Ok(())
+}
+
+fn ensure_prometheus_sample_at_least(
+    text: &str,
+    metric: &str,
+    node_id: &str,
+    minimum: f64,
+) -> Result<()> {
+    let prefix = format!(
+        "{metric}{{node_id=\"{}\"}} ",
+        prometheus_label_value(node_id)
+    );
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let actual = value
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("Prometheus sample {metric} was not numeric: {line:?}"))?;
+        anyhow::ensure!(
+            actual >= minimum,
+            "expected Prometheus sample {metric} for node {node_id} to be at least {minimum}, got {actual}:\n{text}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("Prometheus sample {metric} for node {node_id} was missing:\n{text}")
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', "\\\"")
 }
 
 fn parse_compose_ps(stdout: &[u8]) -> Result<Vec<Value>> {
