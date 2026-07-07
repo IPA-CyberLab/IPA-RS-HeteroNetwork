@@ -1741,6 +1741,7 @@ pub mod api {
         Kerberos,
         Ntp,
         Radius,
+        Tacacs,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1776,7 +1777,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 44] = [
+        pub const ALL: [Self; 45] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1789,6 +1790,7 @@ pub mod api {
             Self::Kerberos,
             Self::Ntp,
             Self::Radius,
+            Self::Tacacs,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1837,6 +1839,7 @@ pub mod api {
                 Self::Kerberos => "kerberos",
                 Self::Ntp => "ntp",
                 Self::Radius => "radius",
+                Self::Tacacs => "tacacs",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2128,6 +2131,9 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Radius;
             }
+            if self.involves_port(49) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Tacacs;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2319,6 +2325,9 @@ pub mod api {
             }
             if kerberos_payload(payload, self.protocol) {
                 return Some(AgentPacketFlowApplication::Kerberos);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Tcp) && tacacs_payload(payload) {
+                return Some(AgentPacketFlowApplication::Tacacs);
             }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
@@ -3202,6 +3211,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Radius);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"tacacs")
+            || tls_sni_hostname_has_label_prefix(hostname, b"tacacsplus")
+            || tls_sni_hostname_has_label_prefix(hostname, b"tacacs-plus")
+        {
+            return Some(AgentPacketFlowApplication::Tacacs);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -3425,6 +3440,13 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"radius") || protocol.eq_ignore_ascii_case(b"radsec") {
             return Some(AgentPacketFlowApplication::Radius);
+        }
+        if protocol.eq_ignore_ascii_case(b"tacacs")
+            || protocol.eq_ignore_ascii_case(b"tacacs+")
+            || protocol.eq_ignore_ascii_case(b"tacacsplus")
+            || protocol.eq_ignore_ascii_case(b"tacacs-plus")
+        {
+            return Some(AgentPacketFlowApplication::Tacacs);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -3912,6 +3934,40 @@ pub mod api {
             code,
             1 | 2 | 3 | 4 | 5 | 11 | 12 | 13 | 40 | 41 | 42 | 43 | 44 | 45
         )
+    }
+
+    fn tacacs_payload(payload: &[u8]) -> bool {
+        const TACACS_HEADER_LEN: usize = 12;
+        const TACACS_MAX_BODY_PREFIX_HINT: usize = 1_048_576;
+
+        if payload.len() < TACACS_HEADER_LEN {
+            return false;
+        }
+        let version = payload[0];
+        if version & 0xf0 != 0xc0 || version & 0x0f > 1 {
+            return false;
+        }
+        if !matches!(payload[1], 1 | 2 | 3) {
+            return false;
+        }
+        if payload[2] == 0 {
+            return false;
+        }
+        if payload[3] & !0x05 != 0 {
+            return false;
+        }
+
+        let body_len =
+            u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+        if body_len == 0 || body_len > TACACS_MAX_BODY_PREFIX_HINT {
+            return false;
+        }
+        let Some(total_len) = TACACS_HEADER_LEN.checked_add(body_len) else {
+            return false;
+        };
+        total_len <= payload.len()
+            || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
+                && total_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
     }
 
     fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -8078,6 +8134,16 @@ mod tests {
             api::AgentPacketFlowApplication::Radius
         );
 
+        let tacacs = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(49),
+            ..Default::default()
+        };
+        assert_eq!(
+            tacacs.application(),
+            api::AgentPacketFlowApplication::Tacacs
+        );
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -8979,6 +9045,25 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let mut tacacs_auth_start = vec![
+            0xc0, 1, 1, 0x01, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 4, 1, 2, 3, 4,
+        ];
+        assert_eq!(
+            observation_for_payload(&tacacs_auth_start).application(),
+            api::AgentPacketFlowApplication::Tacacs
+        );
+        tacacs_auth_start[1] = 9;
+        assert_eq!(
+            observation_for_payload(&tacacs_auth_start).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        tacacs_auth_start[1] = 1;
+        tacacs_auth_start[3] = 0x80;
+        assert_eq!(
+            observation_for_payload(&tacacs_auth_start).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -9334,6 +9419,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Radius,
             ),
             (
+                "tacacs-server.identity.svc",
+                api::AgentPacketFlowApplication::Tacacs,
+            ),
+            (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
@@ -9459,6 +9548,10 @@ mod tests {
             (
                 &[b"radsec".as_slice()][..],
                 api::AgentPacketFlowApplication::Radius,
+            ),
+            (
+                &[b"tacacs".as_slice()][..],
+                api::AgentPacketFlowApplication::Tacacs,
             ),
         ] {
             assert_eq!(
@@ -10985,6 +11078,18 @@ mod tests {
         let tcp_radius_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"radius"}"#)?;
         tcp_radius_hint.validate_transport_metadata()?;
+
+        let tcp_tacacs_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"tacacs"}"#)?;
+        tcp_tacacs_hint.validate_transport_metadata()?;
+
+        let udp_tacacs_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"tacacs"}"#)?;
+        let error = match udp_tacacs_hint.validate_transport_metadata() {
+            Ok(()) => return Err("UDP TACACS+ hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint tacacs requires TCP protocol"));
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
