@@ -1750,6 +1750,7 @@ pub mod api {
         Smb,
         Nfs,
         Rdp,
+        Vnc,
         Smtp,
         Imap,
         Pop3,
@@ -1809,7 +1810,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 66] = [
+        pub const ALL: [Self; 67] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1820,6 +1821,7 @@ pub mod api {
             Self::Smb,
             Self::Nfs,
             Self::Rdp,
+            Self::Vnc,
             Self::Smtp,
             Self::Imap,
             Self::Pop3,
@@ -1890,6 +1892,7 @@ pub mod api {
                 Self::Smb => "smb",
                 Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
+                Self::Vnc => "vnc",
                 Self::Smtp => "smtp",
                 Self::Imap => "imap",
                 Self::Pop3 => "pop3",
@@ -2236,6 +2239,11 @@ pub mod api {
             if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Rdp;
             }
+            if (5900..=5999).any(|port| self.involves_port(port))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Vnc;
+            }
             if (self.involves_port(25) || self.involves_port(465) || self.involves_port(587))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
@@ -2552,6 +2560,7 @@ pub mod api {
                 .or_else(|| ldap_payload(payload).then_some(AgentPacketFlowApplication::Ldap))
                 .or_else(|| smb_payload(payload).then_some(AgentPacketFlowApplication::Smb))
                 .or_else(|| rdp_payload(payload).then_some(AgentPacketFlowApplication::Rdp))
+                .or_else(|| vnc_payload(payload).then_some(AgentPacketFlowApplication::Vnc))
                 .or_else(|| {
                     zookeeper_payload(payload).then_some(AgentPacketFlowApplication::ZooKeeper)
                 })
@@ -3912,6 +3921,11 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"rdp") {
             return Some(AgentPacketFlowApplication::Rdp);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"vnc")
+            || tls_sni_hostname_has_label_prefix(hostname, b"rfb")
+        {
+            return Some(AgentPacketFlowApplication::Vnc);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smtp")
             || tls_sni_hostname_has_label_prefix(hostname, b"mx")
         {
@@ -4184,6 +4198,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"rdp") {
             return Some(AgentPacketFlowApplication::Rdp);
+        }
+        if protocol.eq_ignore_ascii_case(b"vnc") || protocol.eq_ignore_ascii_case(b"rfb") {
+            return Some(AgentPacketFlowApplication::Vnc);
         }
         if protocol.eq_ignore_ascii_case(b"ssh") {
             return Some(AgentPacketFlowApplication::Ssh);
@@ -5598,6 +5615,25 @@ pub mod api {
 
     fn rdp_x224_data_tpdu(payload: &[u8], x224_len: usize) -> bool {
         x224_len == 2 && payload.len() >= 7 && payload[6] & 0x7f == 0
+    }
+
+    fn vnc_payload(payload: &[u8]) -> bool {
+        if payload.len() < 12 || !payload.starts_with(b"RFB ") {
+            return false;
+        }
+        if payload[7] != b'.' || payload[11] != b'\n' {
+            return false;
+        }
+        if !payload[4..7].iter().all(u8::is_ascii_digit)
+            || !payload[8..11].iter().all(u8::is_ascii_digit)
+        {
+            return false;
+        }
+        payload[4..7] == *b"003"
+            && matches!(
+                &payload[8..11],
+                b"003" | b"004" | b"005" | b"006" | b"007" | b"008"
+            )
     }
 
     fn smtp_payload(payload: &[u8]) -> bool {
@@ -9658,6 +9694,13 @@ mod tests {
         };
         assert_eq!(rdp.application(), api::AgentPacketFlowApplication::Rdp);
 
+        let vnc = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(5901),
+            ..Default::default()
+        };
+        assert_eq!(vnc.application(), api::AgentPacketFlowApplication::Vnc);
+
         let smtp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(587),
@@ -11577,6 +11620,7 @@ mod tests {
                 api::AgentPacketFlowApplication::Nfs,
             ),
             ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
+            ("vnc-console.ops.svc", api::AgentPacketFlowApplication::Vnc),
             ("smtp-relay.mail.svc", api::AgentPacketFlowApplication::Smtp),
             (
                 "imap-mailbox.mail.svc",
@@ -11643,6 +11687,10 @@ mod tests {
             (
                 &[b"nfsv4".as_slice()][..],
                 api::AgentPacketFlowApplication::Nfs,
+            ),
+            (
+                &[b"rfb".as_slice()][..],
+                api::AgentPacketFlowApplication::Vnc,
             ),
             (
                 &[b"submission".as_slice()][..],
@@ -12079,6 +12127,22 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x01]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"RFB 003.008\n").application(),
+            api::AgentPacketFlowApplication::Vnc
+        );
+        assert_eq!(
+            observation_for_payload(b"RFB 003.003\n").application(),
+            api::AgentPacketFlowApplication::Vnc
+        );
+        assert_eq!(
+            observation_for_payload(b"RFB 002.008\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"RFB 003.009\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
