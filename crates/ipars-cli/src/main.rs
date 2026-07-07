@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -27,6 +27,7 @@ const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
 const MAX_JOIN_TOKEN_TAGS: usize = 64;
 const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
 const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_ISSUER_PRIVATE_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
@@ -1495,10 +1496,10 @@ fn issuer_key_from_path(
     path: &Path,
     missing_path: MissingIssuerPath,
 ) -> anyhow::Result<IdentityKeyPair> {
-    match std::fs::read_to_string(path) {
+    match read_issuer_private_key_file(path) {
         Ok(value) => IdentityKeyPair::from_signing_key_b64(value.trim())
             .with_context(|| format!("failed to load issuer private key from {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match missing_path {
+        Err(error) if is_not_found_error(&error) => match missing_path {
             MissingIssuerPath::GenerateEphemeral => Err(error).with_context(|| {
                 format!("issuer private key path {} does not exist", path.display())
             }),
@@ -1511,6 +1512,77 @@ fn issuer_key_from_path(
         Err(error) => Err(error)
             .with_context(|| format!("failed to read issuer private key from {}", path.display())),
     }
+}
+
+fn read_issuer_private_key_file(path: &Path) -> anyhow::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect issuer private key {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        anyhow::bail!(
+            "issuer private key path {} must not be a symlink",
+            path.display()
+        );
+    }
+    if !file_type.is_file() {
+        anyhow::bail!(
+            "issuer private key path {} must be a regular file",
+            path.display()
+        );
+    }
+    ensure_issuer_private_key_file_size(path, metadata.len())?;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open issuer private key {}", path.display()))?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened issuer private key {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "issuer private key path {} must be a regular file",
+            path.display()
+        );
+    }
+    ensure_issuer_private_key_file_size(path, metadata.len())?;
+
+    let mut bytes = Vec::new();
+    let mut reader = file.take(MAX_ISSUER_PRIVATE_KEY_FILE_BYTES + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read issuer private key {}", path.display()))?;
+    if bytes.len() as u64 > MAX_ISSUER_PRIVATE_KEY_FILE_BYTES {
+        anyhow::bail!(
+            "issuer private key file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_ISSUER_PRIVATE_KEY_FILE_BYTES
+        );
+    }
+    String::from_utf8(bytes).with_context(|| {
+        format!(
+            "failed to decode issuer private key {} as UTF-8",
+            path.display()
+        )
+    })
+}
+
+fn ensure_issuer_private_key_file_size(path: &Path, size: u64) -> anyhow::Result<()> {
+    if size > MAX_ISSUER_PRIVATE_KEY_FILE_BYTES {
+        anyhow::bail!(
+            "issuer private key file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_ISSUER_PRIVATE_KEY_FILE_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn write_issuer_private_key(path: &Path, key: &IdentityKeyPair) -> anyhow::Result<()> {
@@ -7971,6 +8043,57 @@ mod tests {
             &output.cluster_id,
         )?;
         let _ = std::fs::remove_file(key_path);
+        Ok(())
+    }
+
+    #[test]
+    fn issuer_private_key_path_loads_regular_files_and_rejects_unsafe_paths() -> anyhow::Result<()>
+    {
+        let key = IdentityKeyPair::generate();
+        let key_path = temp_path("issuer-existing.key");
+        std::fs::write(&key_path, format!("{}\n", key.signing_key_b64()))?;
+        let restored = issuer_key_from_path(&key_path, MissingIssuerPath::GenerateEphemeral)?;
+        assert_eq!(restored.node_id(), key.node_id());
+        let _ = std::fs::remove_file(&key_path);
+
+        let dir_path = temp_path("issuer-key-dir");
+        std::fs::create_dir_all(&dir_path)?;
+        let Err(error) = issuer_key_from_path(&dir_path, MissingIssuerPath::GenerateEphemeral)
+        else {
+            anyhow::bail!("directory issuer private key path should be rejected");
+        };
+        assert!(format!("{error:#}").contains("must be a regular file"));
+        let _ = std::fs::remove_dir_all(&dir_path);
+
+        let oversized_path = temp_path("issuer-oversized.key");
+        std::fs::write(
+            &oversized_path,
+            vec![b'a'; MAX_ISSUER_PRIVATE_KEY_FILE_BYTES as usize + 1],
+        )?;
+        let Err(error) =
+            issuer_key_from_path(&oversized_path, MissingIssuerPath::GenerateEphemeral)
+        else {
+            anyhow::bail!("oversized issuer private key path should be rejected");
+        };
+        assert!(format!("{error:#}").contains("exceeds maximum size"));
+        let _ = std::fs::remove_file(&oversized_path);
+
+        #[cfg(unix)]
+        {
+            let target_path = temp_path("issuer-target.key");
+            let link_path = temp_path("issuer-link.key");
+            let target_key = IdentityKeyPair::generate();
+            std::fs::write(&target_path, format!("{}\n", target_key.signing_key_b64()))?;
+            std::os::unix::fs::symlink(&target_path, &link_path)?;
+            let Err(error) = issuer_key_from_path(&link_path, MissingIssuerPath::GenerateEphemeral)
+            else {
+                anyhow::bail!("symlink issuer private key path should be rejected");
+            };
+            assert!(format!("{error:#}").contains("must not be a symlink"));
+            let _ = std::fs::remove_file(&link_path);
+            let _ = std::fs::remove_file(&target_path);
+        }
+
         Ok(())
     }
 
