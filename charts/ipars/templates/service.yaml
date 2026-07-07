@@ -536,7 +536,7 @@
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
 {{- range $key, $value := .Values.agent.apiService.annotations -}}
-{{- include "ipars.validateAnnotationKey" (dict "path" "agent.apiService.annotations" "key" $key) -}}
+{{- include "ipars.validateServiceAnnotationKey" (dict "path" "agent.apiService.annotations" "key" $key) -}}
 {{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.apiService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}
@@ -560,7 +560,7 @@
 {{- end -}}
 {{- if $relayServiceActive -}}
 {{- range $key, $value := .Values.agent.relayService.annotations -}}
-{{- include "ipars.validateAnnotationKey" (dict "path" "agent.relayService.annotations" "key" $key) -}}
+{{- include "ipars.validateServiceAnnotationKey" (dict "path" "agent.relayService.annotations" "key" $key) -}}
 {{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.relayService.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- end -}}

@@ -3275,6 +3275,27 @@ fn validate_kubernetes_annotation_args(
     Ok(())
 }
 
+fn validate_kubernetes_service_annotation_args(
+    flag: &str,
+    annotations: &[KeyValueArg],
+) -> anyhow::Result<()> {
+    validate_kubernetes_annotation_args(flag, annotations)?;
+    for annotation in annotations {
+        if kubernetes_service_annotation_controls_source_ranges(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer source ranges; use --agent-api-allow-source-cidr or --relay-allow-source-cidr instead",
+                annotation.key
+            );
+        }
+    }
+    Ok(())
+}
+
+fn kubernetes_service_annotation_controls_source_ranges(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("source-range") || key.contains("inbound-cidr")
+}
+
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -6894,11 +6915,11 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if !args.relay_service_annotations.is_empty() && !args.expose_relay {
         anyhow::bail!("--relay-service-annotation requires --expose-relay");
     }
-    validate_kubernetes_annotation_args(
+    validate_kubernetes_service_annotation_args(
         "--agent-api-service-annotation",
         &args.agent_api_service_annotations,
     )?;
-    validate_kubernetes_annotation_args(
+    validate_kubernetes_service_annotation_args(
         "--relay-service-annotation",
         &args.relay_service_annotations,
     )?;
@@ -10420,6 +10441,20 @@ mod tests {
             "--agent-api-service-annotation must not repeat annotation key service.beta.kubernetes.io/aws-load-balancer-type"
         ));
 
+        let mut agent_source_range_annotation = base_k8s_install_args();
+        agent_source_range_annotation.expose_agent_api = true;
+        agent_source_range_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/load-balancer-source-ranges".to_string(),
+            value: "198.51.100.0/24".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_source_range_annotation) {
+            Ok(_) => panic!("agent API source range annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/load-balancer-source-ranges must not configure LoadBalancer source ranges"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -10470,6 +10505,24 @@ mod tests {
         };
         assert!(error.contains(
             "--relay-service-annotation must not repeat annotation key metallb.universe.tf/address-pool"
+        ));
+
+        let mut relay_inbound_cidr_annotation = base_k8s_install_args();
+        relay_inbound_cidr_annotation.expose_relay = true;
+        relay_inbound_cidr_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_inbound_cidr_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_inbound_cidr_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-inbound-cidrs".to_string(),
+            value: "203.0.113.0/24".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_inbound_cidr_annotation) {
+            Ok(_) => panic!("relay inbound CIDR annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-inbound-cidrs must not configure LoadBalancer source ranges"
         ));
 
         Ok(())
@@ -10799,9 +10852,11 @@ mod tests {
         let service_template = std::fs::read_to_string(service_template_path)?;
 
         assert!(helpers.contains("define \"ipars.validateAnnotationValue\""));
+        assert!(helpers.contains("define \"ipars.validateServiceAnnotationKey\""));
         assert!(helpers.contains("annotation value must be a string"));
         assert!(helpers.contains("annotation value exceeds 262144 bytes"));
         assert!(helpers.contains("annotation value must not contain control characters"));
+        assert!(helpers.contains("must not configure LoadBalancer source ranges"));
         assert!(daemonset.contains(
             "ipars.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
         ));
@@ -10809,7 +10864,13 @@ mod tests {
             "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.podAnnotations.%s\""
         ));
         assert!(service_template.contains(
+            "ipars.validateServiceAnnotationKey\" (dict \"path\" \"agent.apiService.annotations\""
+        ));
+        assert!(service_template.contains(
             "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.apiService.annotations.%s\""
+        ));
+        assert!(service_template.contains(
+            "ipars.validateServiceAnnotationKey\" (dict \"path\" \"agent.relayService.annotations\""
         ));
         assert!(service_template.contains(
             "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.relayService.annotations.%s\""

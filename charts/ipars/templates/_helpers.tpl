@@ -565,6 +565,15 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateServiceAnnotationKey" -}}
+{{- include "ipars.validateAnnotationKey" . -}}
+{{- $key := lower (printf "%v" .key) -}}
+{{- $path := .path -}}
+{{- if or (contains "source-range" $key) (contains "inbound-cidr" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer source ranges; use loadBalancerSourceRanges values instead" $path .key) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateAnnotationValue" -}}
 {{- $rawValue := .value -}}
 {{- $path := .path -}}
