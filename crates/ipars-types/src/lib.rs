@@ -2121,7 +2121,7 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Nomad;
             }
-            if self.involves_port(53)
+            if (self.involves_port(53) || self.involves_port(853))
                 && matches!(
                     self.protocol,
                     None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
@@ -8705,6 +8705,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(dns.application(), api::AgentPacketFlowApplication::Dns);
+
+        let dns_over_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(853),
+            payload_prefix: vec![0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00],
+            ..Default::default()
+        };
+        assert_eq!(
+            dns_over_tls.application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+
+        let dns_over_quic = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(853),
+            ..Default::default()
+        };
+        assert_eq!(
+            dns_over_quic.application(),
+            api::AgentPacketFlowApplication::Dns
+        );
 
         let kubernetes_api = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
