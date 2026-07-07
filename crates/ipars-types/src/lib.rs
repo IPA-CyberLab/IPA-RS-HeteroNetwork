@@ -1738,6 +1738,7 @@ pub mod api {
         Smb,
         Nfs,
         Rdp,
+        Kerberos,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1773,7 +1774,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 41] = [
+        pub const ALL: [Self; 42] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1783,6 +1784,7 @@ pub mod api {
             Self::Smb,
             Self::Nfs,
             Self::Rdp,
+            Self::Kerberos,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1828,6 +1830,7 @@ pub mod api {
                 Self::Smb => "smb",
                 Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
+                Self::Kerberos => "kerberos",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2092,6 +2095,14 @@ pub mod api {
             if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Rdp;
             }
+            if (self.involves_port(88) || self.involves_port(464))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Kerberos;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2272,6 +2283,9 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Snmp);
             }
+            if kerberos_payload(payload, self.protocol) {
+                return Some(AgentPacketFlowApplication::Kerberos);
+            }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
             }
@@ -2346,6 +2360,7 @@ pub mod api {
             | AgentPacketFlowApplication::Nfs
             | AgentPacketFlowApplication::Syslog
             | AgentPacketFlowApplication::Snmp
+            | AgentPacketFlowApplication::Kerberos
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3134,6 +3149,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Ldap);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kerberos")
+            || tls_sni_hostname_has_label_prefix(hostname, b"krb5")
+            || tls_sni_hostname_has_label_prefix(hostname, b"kdc")
+        {
+            return Some(AgentPacketFlowApplication::Kerberos);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -3341,6 +3362,13 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"ldap") || protocol.eq_ignore_ascii_case(b"ldaps") {
             return Some(AgentPacketFlowApplication::Ldap);
+        }
+        if protocol.eq_ignore_ascii_case(b"kerberos")
+            || protocol.eq_ignore_ascii_case(b"krb5")
+            || protocol.eq_ignore_ascii_case(b"kerberos-tcp")
+            || protocol.eq_ignore_ascii_case(b"kerberos-udp")
+        {
+            return Some(AgentPacketFlowApplication::Kerberos);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -3767,6 +3795,132 @@ pub mod api {
             len = len.checked_shl(8)?.checked_add(*byte as usize)?;
         }
         Some((len, offset + 1 + length_bytes))
+    }
+
+    fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            Some(TransportProtocol::Udp) => kerberos_message_payload(
+                payload,
+                payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
+            ),
+            Some(TransportProtocol::Tcp) => kerberos_tcp_payload(payload),
+            None => {
+                kerberos_message_payload(
+                    payload,
+                    payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
+                ) || kerberos_tcp_payload(payload)
+            }
+            Some(TransportProtocol::Any | TransportProtocol::Icmp) => false,
+        }
+    }
+
+    fn kerberos_tcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let message_len =
+            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        if !(4..=1_048_576).contains(&message_len) {
+            return false;
+        }
+        let available = payload.len().saturating_sub(4);
+        let message_prefix_len = available.min(message_len);
+        let allow_truncated =
+            available < message_len && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+        kerberos_message_payload(&payload[4..4 + message_prefix_len], allow_truncated)
+    }
+
+    fn kerberos_message_payload(payload: &[u8], allow_truncated: bool) -> bool {
+        if payload.len() < 8 {
+            return false;
+        }
+        let Some(expected_msg_type) = kerberos_application_message_type(payload[0]) else {
+            return false;
+        };
+        let Some((message_len, message_offset)) = ber_length(payload, 1) else {
+            return false;
+        };
+        if !(6..=1_048_576).contains(&message_len) {
+            return false;
+        }
+        let Some(message_end) = message_offset.checked_add(message_len) else {
+            return false;
+        };
+        if message_end > payload.len() && !allow_truncated {
+            return false;
+        }
+        if payload.get(message_offset) != Some(&0x30) {
+            return false;
+        }
+        let Some((sequence_len, sequence_offset)) = ber_length(payload, message_offset + 1) else {
+            return false;
+        };
+        let Some(sequence_end) = sequence_offset.checked_add(sequence_len) else {
+            return false;
+        };
+        if sequence_end > message_end {
+            return false;
+        }
+        if sequence_end > payload.len() && !allow_truncated {
+            return false;
+        }
+        let sequence_available_end = sequence_end.min(payload.len());
+        let Some(sequence) = payload.get(sequence_offset..sequence_available_end) else {
+            return false;
+        };
+        kerberos_context_integer(sequence, 0xa1) == Some(5)
+            && kerberos_context_integer(sequence, 0xa2) == Some(expected_msg_type)
+    }
+
+    fn kerberos_application_message_type(tag: u8) -> Option<u32> {
+        match tag {
+            0x6a => Some(10),
+            0x6b => Some(11),
+            0x6c => Some(12),
+            0x6d => Some(13),
+            0x6e => Some(14),
+            0x6f => Some(15),
+            0x74 => Some(20),
+            0x75 => Some(21),
+            0x76 => Some(22),
+            0x7e => Some(30),
+            _ => None,
+        }
+    }
+
+    fn kerberos_context_integer(payload: &[u8], tag: u8) -> Option<u32> {
+        let mut offset = 0_usize;
+        while offset < payload.len() {
+            let tag_offset = payload
+                .get(offset..)?
+                .iter()
+                .position(|candidate| *candidate == tag)?
+                + offset;
+            let (field_len, field_offset) = ber_length(payload, tag_offset + 1)?;
+            let field_end = field_offset.checked_add(field_len)?;
+            if field_end > payload.len() {
+                return None;
+            }
+            if payload.get(field_offset) != Some(&0x02) {
+                offset = tag_offset + 1;
+                continue;
+            }
+            let (integer_len, integer_offset) = ber_length(payload, field_offset + 1)?;
+            let integer_end = integer_offset.checked_add(integer_len)?;
+            if integer_len == 0 || integer_len > 4 || integer_end > field_end {
+                return None;
+            }
+            let bytes = payload.get(integer_offset..integer_end)?;
+            if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+                return None;
+            }
+            let mut value = 0_u32;
+            for byte in bytes {
+                value = value.checked_shl(8)?.checked_add(*byte as u32)?;
+            }
+            return Some(value);
+        }
+        None
     }
 
     fn snmp_payload(payload: &[u8]) -> bool {
@@ -7743,6 +7897,26 @@ mod tests {
         };
         assert_eq!(rdp.application(), api::AgentPacketFlowApplication::Rdp);
 
+        let kerberos_kdc = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(88),
+            ..Default::default()
+        };
+        assert_eq!(
+            kerberos_kdc.application(),
+            api::AgentPacketFlowApplication::Kerberos
+        );
+
+        let kerberos_kpasswd = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(464),
+            ..Default::default()
+        };
+        assert_eq!(
+            kerberos_kpasswd.application(),
+            api::AgentPacketFlowApplication::Kerberos
+        );
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -8565,9 +8739,9 @@ mod tests {
         );
 
         let snmp_get_request = vec![
-            0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c',
-            0xa0, 0x19, 0x02, 0x04, 0, 0, 0, 1, 0x02, 0x01, 0, 0x02, 0x01, 0, 0x30, 0x0b,
-            0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
+            0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0,
+            0x19, 0x02, 0x04, 0, 0, 0, 1, 0x02, 0x01, 0, 0x02, 0x01, 0, 0x30, 0x0b, 0x30, 0x09,
+            0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
         ];
         assert_eq!(
             observation_for_udp_payload(&snmp_get_request).application(),
@@ -8581,6 +8755,26 @@ mod tests {
         invalid_snmp_pdu_tag[13] = 0x30;
         assert_eq!(
             observation_for_udp_payload(&invalid_snmp_pdu_tag).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let kerberos_as_req = vec![
+            0x6a, 0x0c, 0x30, 0x0a, 0xa1, 0x03, 0x02, 0x01, 0x05, 0xa2, 0x03, 0x02, 0x01, 0x0a,
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&kerberos_as_req).application(),
+            api::AgentPacketFlowApplication::Kerberos
+        );
+        let mut kerberos_tcp = (kerberos_as_req.len() as u32).to_be_bytes().to_vec();
+        kerberos_tcp.extend_from_slice(&kerberos_as_req);
+        assert_eq!(
+            observation_for_payload(&kerberos_tcp).application(),
+            api::AgentPacketFlowApplication::Kerberos
+        );
+        let mut invalid_kerberos_msg_type = kerberos_as_req.clone();
+        invalid_kerberos_msg_type[13] = 0x0b;
+        assert_eq!(
+            observation_for_udp_payload(&invalid_kerberos_msg_type).application(),
             api::AgentPacketFlowApplication::Unknown
         );
 
@@ -8930,10 +9124,17 @@ mod tests {
                 api::AgentPacketFlowApplication::Ldap,
             ),
             (
+                "kerberos-kdc.identity.svc",
+                api::AgentPacketFlowApplication::Kerberos,
+            ),
+            (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
-            ("nfs-files.storage.svc", api::AgentPacketFlowApplication::Nfs),
+            (
+                "nfs-files.storage.svc",
+                api::AgentPacketFlowApplication::Nfs,
+            ),
             ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
             ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
         ] {
@@ -9040,6 +9241,10 @@ mod tests {
             (
                 &[b"valkey".as_slice()][..],
                 api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                &[b"kerberos".as_slice()][..],
+                api::AgentPacketFlowApplication::Kerberos,
             ),
         ] {
             assert_eq!(
@@ -10542,6 +10747,14 @@ mod tests {
         let tcp_snmp_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"snmp"}"#)?;
         tcp_snmp_hint.validate_transport_metadata()?;
+
+        let udp_kerberos_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"kerberos"}"#)?;
+        udp_kerberos_hint.validate_transport_metadata()?;
+
+        let tcp_kerberos_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"kerberos"}"#)?;
+        tcp_kerberos_hint.validate_transport_metadata()?;
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
