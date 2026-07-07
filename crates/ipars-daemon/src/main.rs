@@ -13364,6 +13364,10 @@ mod tests {
             Some(&0)
         );
         assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Ike),
+            Some(&0)
+        );
+        assert_eq!(
             application_delta.get(&AgentPacketFlowApplication::Consul),
             Some(&0)
         );
