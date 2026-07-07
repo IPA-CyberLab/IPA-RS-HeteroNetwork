@@ -110,6 +110,7 @@ const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
+const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
@@ -7520,16 +7521,43 @@ impl KubernetesApiRouteDiscovery {
         if let Some(selector) = self.service_label_selector.as_deref() {
             request = request.query(&[("labelSelector", selector)]);
         }
-        request
+        let response = request
             .send()
             .await
             .context("failed to query Kubernetes services")?
             .error_for_status()
-            .context("Kubernetes services API returned an error")?
-            .json()
-            .await
-            .context("failed to decode Kubernetes services response")
+            .context("Kubernetes services API returned an error")?;
+        read_kubernetes_services_response(response).await
     }
+}
+
+async fn read_kubernetes_services_response(
+    mut response: reqwest::Response,
+) -> anyhow::Result<KubernetesServiceList> {
+    if let Some(length) = response.content_length() {
+        ensure_kubernetes_services_response_size(length)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read Kubernetes services response")?
+    {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        ensure_kubernetes_services_response_size(next_len)?;
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("failed to decode Kubernetes services response")
+}
+
+fn ensure_kubernetes_services_response_size(size: u64) -> anyhow::Result<()> {
+    if size > MAX_KUBERNETES_SERVICES_RESPONSE_BYTES {
+        anyhow::bail!(
+            "Kubernetes services API response exceeds maximum size of {} bytes",
+            MAX_KUBERNETES_SERVICES_RESPONSE_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn kubernetes_route_source(
@@ -19731,6 +19759,98 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "fd00::20/128".parse::<ipnet::IpNet>()?,
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kubernetes_services_response_reader_bounds_body() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request).into_owned();
+            anyhow::ensure!(
+                request_text.starts_with("GET /api/v1/services "),
+                "unexpected Kubernetes services request line: {request_text}"
+            );
+            let body = r#"{"items":[{"spec":{"clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10","fd00::10"]}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/api/v1/services"))
+            .send()
+            .await?;
+        let services = read_kubernetes_services_response(response).await?;
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for Kubernetes services response server")???;
+        assert_eq!(
+            kubernetes_service_route_cidrs(&services)?,
+            vec![
+                "10.96.0.10/32".parse::<ipnet::IpNet>()?,
+                "fd00::10/128".parse::<ipnet::IpNet>()?,
+            ]
+        );
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let oversized_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_KUBERNETES_SERVICES_RESPONSE_BYTES + 1
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/api/v1/services"))
+            .send()
+            .await?;
+        let error = match read_kubernetes_services_response(response).await {
+            Ok(services) => anyhow::bail!(
+                "oversized Kubernetes services response should be rejected: {services:?}"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Kubernetes services API response exceeds maximum size"));
+        tokio::time::timeout(Duration::from_secs(5), oversized_server)
+            .await
+            .context("timed out waiting for oversized Kubernetes services response server")???;
         Ok(())
     }
 
