@@ -6158,6 +6158,44 @@ fn validate_kubernetes_restricted_cidrs(
     Ok(())
 }
 
+fn ip_cidr_contains(outer: &ipnet::IpNet, inner: &ipnet::IpNet) -> bool {
+    match (outer, inner) {
+        (ipnet::IpNet::V4(outer), ipnet::IpNet::V4(inner)) => {
+            outer.prefix_len() <= inner.prefix_len()
+                && outer.contains(&inner.network())
+                && outer.contains(&inner.broadcast())
+        }
+        (ipnet::IpNet::V6(outer), ipnet::IpNet::V6(inner)) => {
+            outer.prefix_len() <= inner.prefix_len()
+                && outer.contains(&inner.network())
+                && outer.contains(&inner.broadcast())
+        }
+        _ => false,
+    }
+}
+
+fn validate_kubernetes_network_policy_within_source_ranges(
+    network_policy_flag: &str,
+    network_policy_cidrs: &[ipnet::IpNet],
+    source_range_flag: &str,
+    source_ranges: &[ipnet::IpNet],
+) -> anyhow::Result<()> {
+    if network_policy_cidrs.is_empty() || source_ranges.is_empty() {
+        return Ok(());
+    }
+    for cidr in network_policy_cidrs {
+        if !source_ranges
+            .iter()
+            .any(|source_range| ip_cidr_contains(source_range, cidr))
+        {
+            anyhow::bail!(
+                "{network_policy_flag} {cidr} must be contained by one of {source_range_flag} values because NetworkPolicy must not allow sources broader than the LoadBalancer source ranges"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_underlay_route_cidrs(
     flag: &str,
     label: &str,
@@ -6677,6 +6715,18 @@ fn validate_k8s_network_policy(args: &K8sInstallArgs) -> anyhow::Result<()> {
         &args.relay_network_policy_cidrs,
         "NetworkPolicy allowlists must narrow ingress sources",
         "NetworkPolicy CIDR allowlist",
+    )?;
+    validate_kubernetes_network_policy_within_source_ranges(
+        "--agent-api-network-policy-cidr",
+        &args.agent_api_network_policy_cidrs,
+        "--agent-api-allow-source-cidr",
+        &args.agent_api_allow_source_cidrs,
+    )?;
+    validate_kubernetes_network_policy_within_source_ranges(
+        "--relay-network-policy-cidr",
+        &args.relay_network_policy_cidrs,
+        "--relay-allow-source-cidr",
+        &args.relay_allow_source_cidrs,
     )?;
     Ok(())
 }
@@ -10083,7 +10133,7 @@ mod tests {
             agent_api_ip_family_policy: Some("RequireDualStack".to_string()),
             agent_api_ip_families: vec!["IPv4".to_string(), "IPv6".to_string()],
             agent_api_allow_source_cidrs: vec!["198.51.100.0/24".parse()?],
-            agent_api_network_policy_cidrs: vec!["10.0.0.0/8".parse()?],
+            agent_api_network_policy_cidrs: vec!["198.51.100.0/24".parse()?],
             agent_api_internal_traffic_policy: Some("Local".to_string()),
             agent_api_traffic_distribution: Some("PreferSameNode".to_string()),
             agent_api_session_affinity: Some("ClientIP".to_string()),
@@ -10159,7 +10209,7 @@ mod tests {
         assert!(plan.commands[2].contains("--set networkPolicy.acknowledgeHostNetwork=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.agentApi.enabled=true"));
         assert!(plan.commands[2]
-            .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'"));
+            .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=198.51.100.0/24'"));
         assert!(plan.commands[2].contains("--set agent.apiService.enabled=true"));
         assert!(plan.commands[2].contains("--set agent.apiService.type=LoadBalancer"));
         assert!(plan.commands[2].contains("--set-string agent.apiService.clusterIP=10.96.0.40"));
@@ -14752,6 +14802,40 @@ mod tests {
         };
         assert!(error.contains(
             "--relay-network-policy-cidr must not repeat NetworkPolicy CIDR allowlist 203.0.113.0/24"
+        ));
+
+        let mut broad_agent_policy = base_k8s_install_args();
+        broad_agent_policy.enable_network_policy = true;
+        broad_agent_policy.network_policy_acknowledge_host_network = true;
+        broad_agent_policy.expose_agent_api = true;
+        broad_agent_policy.allow_public_service_exposure = true;
+        broad_agent_policy.agent_api_service_type = "LoadBalancer".to_string();
+        broad_agent_policy.agent_api_allow_source_cidrs = vec!["198.51.100.0/24".parse()?];
+        broad_agent_policy.agent_api_network_policy_cidrs = vec!["198.51.0.0/16".parse()?];
+        let error = match k8s_install_plan(broad_agent_policy) {
+            Ok(_) => panic!("agent API NetworkPolicy should not exceed LoadBalancer source ranges"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr 198.51.0.0/16 must be contained by one of --agent-api-allow-source-cidr values"
+        ));
+
+        let mut broad_relay_policy = base_k8s_install_args();
+        broad_relay_policy.enable_network_policy = true;
+        broad_relay_policy.network_policy_acknowledge_host_network = true;
+        broad_relay_policy.expose_relay = true;
+        broad_relay_policy.allow_public_service_exposure = true;
+        broad_relay_policy.relay_service_type = "LoadBalancer".to_string();
+        broad_relay_policy.relay_allow_source_cidrs = vec!["203.0.113.0/24".parse()?];
+        broad_relay_policy.relay_network_policy_cidrs = vec!["203.0.0.0/16".parse()?];
+        broad_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        broad_relay_policy.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(broad_relay_policy) {
+            Ok(_) => panic!("relay NetworkPolicy should not exceed LoadBalancer source ranges"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-network-policy-cidr 203.0.0.0/16 must be contained by one of --relay-allow-source-cidr values"
         ));
 
         Ok(())
