@@ -324,6 +324,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
     assert_compose_agent_lazy_connect_paths(&compose, &agent_nodes, &api_ports)?;
+    assert_compose_control_plane_path_state(&compose, &agent_nodes)?;
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
@@ -460,6 +461,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - "1"
       - --signal-path-interval-seconds
       - "1"
+      - --heartbeat-interval-seconds
+      - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
     healthcheck:
@@ -497,6 +500,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --peer-map-poll-interval-seconds
       - "1"
       - --signal-path-interval-seconds
+      - "1"
+      - --heartbeat-interval-seconds
       - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
@@ -906,6 +911,40 @@ fn ensure_agent_paths_contain(value: &Value, local: &str, remote: &str) -> Resul
         }
     }
     anyhow::bail!("agent paths did not include path {local}->{remote}: {value}")
+}
+
+fn assert_compose_control_plane_path_state(
+    compose: &ComposeProject,
+    nodes: &ComposeAgentNodes,
+) -> Result<()> {
+    assert_compose_control_plane_node_path(compose, &nodes.agent, &nodes.agent_b)?;
+    assert_compose_control_plane_node_path(compose, &nodes.agent_b, &nodes.agent)?;
+    wait_for_json(
+        compose,
+        "control-plane metrics after agent path-state heartbeats",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "path_count", 2)?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+fn assert_compose_control_plane_node_path(
+    compose: &ComposeProject,
+    local: &str,
+    remote: &str,
+) -> Result<()> {
+    wait_for_json(
+        compose,
+        &format!("control-plane path state for {local}"),
+        "control-plane",
+        &format!("http://127.0.0.1:8443/v1/paths/{local}"),
+        |value| ensure_agent_paths_contain(value, local, remote),
+    )?;
+    Ok(())
 }
 
 fn ensure_peer_map_contains(value: &Value, expected_node_id: &str) -> Result<()> {
