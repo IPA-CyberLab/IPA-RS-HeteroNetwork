@@ -96,6 +96,23 @@ assert_rendered_contains service-traffic-controls "internalTrafficPolicy: Cluste
 assert_rendered_contains service-traffic-controls "trafficDistribution: PreferClose"
 assert_rendered_contains service-traffic-controls "timeoutSeconds: 900"
 
+template_ok cluster-external-traffic-policy \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=NodePort \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.externalTrafficPolicy=Cluster \
+  --set agent.apiService.allowClusterExternalTrafficPolicy=true \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=NodePort \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.externalTrafficPolicy=Cluster \
+  --set agent.relayService.allowClusterExternalTrafficPolicy=true
+
+assert_rendered_contains cluster-external-traffic-policy "externalTrafficPolicy: Cluster"
+
 template_ok network-policy \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP \
@@ -154,6 +171,23 @@ template_fails host-network-policy-without-ack \
   --set networkPolicy.enabled=true \
   --set networkPolicy.agentApi.enabled=true \
   --set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'
+
+template_fails agent-api-cluster-external-traffic-policy-without-ack \
+  "agent.apiService externalTrafficPolicy=Cluster requires agent.apiService.allowClusterExternalTrafficPolicy=true" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=NodePort \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.externalTrafficPolicy=Cluster
+
+template_fails relay-cluster-external-traffic-policy-without-ack \
+  "agent.relayService externalTrafficPolicy=Cluster requires agent.relayService.allowClusterExternalTrafficPolicy=true" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=NodePort \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.externalTrafficPolicy=Cluster
 
 template_fails relay-forwarder-netns-without-sys-admin \
   "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" \
