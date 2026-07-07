@@ -2433,6 +2433,7 @@ fn ensure_runtime_command_path_is_absolute(path: Option<&OsStr>) -> anyhow::Resu
             "Linux runtime command PATH entry `{}` must not contain '.' or '..' components",
             directory.display()
         );
+        ensure_runtime_command_path_directory_ready(&directory)?;
     }
     Ok(())
 }
@@ -2458,6 +2459,58 @@ fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::
         );
     }
     ensure_program_in_path(program, path)
+}
+
+#[cfg(unix)]
+fn ensure_runtime_command_path_directory_ready(directory: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let label = "Linux runtime command PATH entry";
+    ensure_runtime_directory_chain_has_no_symlinks(label, directory)?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} {}", directory.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "{label} {} must be a directory",
+        directory.display()
+    );
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    ensure_runtime_path_owner_trusted(label, "at", directory, metadata.uid(), effective_uid)?;
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o022 == 0,
+        "{label} at {} must not be group- or world-writable",
+        directory.display()
+    );
+
+    let mut ancestor = directory.parent();
+    while let Some(directory) = ancestor {
+        let metadata = directory.metadata().with_context(|| {
+            format!(
+                "failed to inspect runtime command PATH ancestor {}",
+                directory.display()
+            )
+        })?;
+        ensure_runtime_parent_directory_safe(label, directory, &metadata, false, effective_uid)?;
+        ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_runtime_command_path_directory_ready(directory: &Path) -> anyhow::Result<()> {
+    let metadata = directory.symlink_metadata().with_context(|| {
+        format!(
+            "failed to inspect Linux runtime command PATH entry {}",
+            directory.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "Linux runtime command PATH entry {} must be a directory",
+        directory.display()
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -17628,6 +17681,50 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         std::fs::write(&executable, b"#!/bin/sh\n")?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
         ensure_program_in_path("ip", Some(executable_bin.as_os_str()))?;
+
+        let unsafe_preceding_bin = base.join("unsafe-preceding-bin");
+        std::fs::create_dir(&unsafe_preceding_bin)?;
+        std::fs::set_permissions(
+            &unsafe_preceding_bin,
+            std::fs::Permissions::from_mode(0o777),
+        )?;
+        let unsafe_preceding_path =
+            std::env::join_paths([unsafe_preceding_bin.as_os_str(), executable_bin.as_os_str()])?;
+        let unsafe_preceding_error =
+            match ensure_program_in_path("ip", Some(unsafe_preceding_path.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful unsafe preceding PATH preflight"),
+                Err(error) => error,
+            };
+        assert!(unsafe_preceding_error
+            .to_string()
+            .contains("Linux runtime command PATH entry"));
+        assert!(unsafe_preceding_error
+            .to_string()
+            .contains("must not be group- or world-writable"));
+
+        let symlink_preceding_target = base.join("symlink-preceding-target");
+        std::fs::create_dir(&symlink_preceding_target)?;
+        std::fs::set_permissions(
+            &symlink_preceding_target,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let symlink_preceding_bin = base.join("symlink-preceding-bin");
+        std::os::unix::fs::symlink(&symlink_preceding_target, &symlink_preceding_bin)?;
+        let symlink_preceding_path = std::env::join_paths([
+            symlink_preceding_bin.as_os_str(),
+            executable_bin.as_os_str(),
+        ])?;
+        let symlink_preceding_error =
+            match ensure_program_in_path("ip", Some(symlink_preceding_path.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful symlink preceding PATH preflight"),
+                Err(error) => error,
+            };
+        assert!(symlink_preceding_error
+            .to_string()
+            .contains("Linux runtime command PATH entry"));
+        assert!(symlink_preceding_error
+            .to_string()
+            .contains("must not be a symlink"));
 
         let non_executable_bin = base.join("non-executable-bin");
         std::fs::create_dir(&non_executable_bin)?;
