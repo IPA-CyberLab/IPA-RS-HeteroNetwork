@@ -1202,11 +1202,9 @@ fn spawn_init_daemons(
     state_dir: &Path,
     specs: &[InitDaemonSpec],
 ) -> anyhow::Result<Vec<InitDaemonProcess>> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create daemon state dir {}", state_dir.display()))?;
+    prepare_init_daemon_directory(state_dir, "daemon state dir")?;
     let log_dir = state_dir.join("logs");
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("failed to create daemon log dir {}", log_dir.display()))?;
+    prepare_init_daemon_directory(&log_dir, "daemon log dir")?;
 
     let mut processes = Vec::with_capacity(specs.len());
     let mut spawned: Vec<Child> = Vec::with_capacity(specs.len());
@@ -1234,11 +1232,7 @@ fn spawn_init_daemons(
 }
 
 fn spawn_init_daemon(binary: &Path, spec: &InitDaemonSpec) -> anyhow::Result<Child> {
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.log_path)
-        .with_context(|| format!("failed to open daemon log {}", spec.log_path.display()))?;
+    let log = open_init_daemon_log(&spec.log_path)?;
     let stdout = log.try_clone().with_context(|| {
         format!(
             "failed to clone daemon log handle {}",
@@ -1257,6 +1251,118 @@ fn spawn_init_daemon(binary: &Path, spec: &InitDaemonSpec) -> anyhow::Result<Chi
                 binary.display()
             )
         })
+}
+
+fn prepare_init_daemon_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {label} {}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("{label} {} must not be a symlink", path.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("{label} {} must be a directory", path.display());
+    }
+    set_owner_only_directory_permissions(path, label)?;
+    Ok(())
+}
+
+fn open_init_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        prepare_init_daemon_directory(parent, "daemon log dir")?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("daemon log {} must not be a symlink", path.display());
+            }
+            if !metadata.is_file() {
+                anyhow::bail!("daemon log {} must be a regular file", path.display());
+            }
+            reject_multi_linked_log(path, &metadata)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect daemon log {}", path.display()));
+        }
+    }
+    let log = init_daemon_log_open_options()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open daemon log {}", path.display()))?;
+    set_owner_only_open_file_permissions(&log, path, "daemon log")?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect daemon log {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("daemon log {} must not be a symlink", path.display());
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("daemon log {} must be a regular file", path.display());
+    }
+    reject_multi_linked_log(path, &metadata)?;
+    Ok(log)
+}
+
+fn init_daemon_log_open_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn set_owner_only_directory_permissions(path: &Path, label: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "failed to set owner-only permissions on {label} {}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn set_owner_only_open_file_permissions(
+    file: &std::fs::File,
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set owner-only permissions on {label} {}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn reject_multi_linked_log(path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            anyhow::bail!(
+                "daemon log {} must not have multiple hard links",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
@@ -8330,6 +8436,71 @@ mod tests {
             .contains(&"http://203.0.113.10:19580".to_string()));
 
         let _ = std::fs::remove_file(key_path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_spawn_paths_are_owner_only_and_reject_linked_logs() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let state_dir = temp_path("spawn-state-hardening");
+        let log_dir = state_dir.join("logs");
+        prepare_init_daemon_directory(&state_dir, "daemon state dir")?;
+        prepare_init_daemon_directory(&log_dir, "daemon log dir")?;
+
+        assert_eq!(
+            std::fs::metadata(&state_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&log_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        let log_path = log_dir.join("control-plane.log");
+        let mut log = open_init_daemon_log(&log_path)?;
+        writeln!(&mut log, "bootstrap log")?;
+        drop(log);
+        let log_metadata = std::fs::metadata(&log_path)?;
+        assert_eq!(log_metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(log_metadata.nlink(), 1);
+
+        let symlink_target = log_dir.join("symlink-target.log");
+        std::fs::write(&symlink_target, b"target\n")?;
+        let symlink_path = log_dir.join("symlink.log");
+        std::os::unix::fs::symlink(&symlink_target, &symlink_path)?;
+        let symlink_error = match open_init_daemon_log(&symlink_path) {
+            Ok(_) => anyhow::bail!("symlinked daemon log should be rejected"),
+            Err(error) => error,
+        };
+        assert!(symlink_error.to_string().contains("must not be a symlink"));
+
+        let symlink_dir_target = temp_path("spawn-state-target");
+        std::fs::create_dir_all(&symlink_dir_target)?;
+        let symlink_dir = temp_path("spawn-state-link");
+        std::os::unix::fs::symlink(&symlink_dir_target, &symlink_dir)?;
+        let dir_error = match prepare_init_daemon_directory(&symlink_dir, "daemon state dir") {
+            Ok(()) => anyhow::bail!("symlinked daemon state dir should be rejected"),
+            Err(error) => error,
+        };
+        assert!(dir_error.to_string().contains("must not be a symlink"));
+
+        let hard_target = log_dir.join("hard-target.log");
+        let hard_link = log_dir.join("hard-link.log");
+        std::fs::write(&hard_target, b"hard\n")?;
+        std::fs::hard_link(&hard_target, &hard_link)?;
+        let hard_error = match open_init_daemon_log(&hard_target) {
+            Ok(_) => anyhow::bail!("multi-linked daemon log should be rejected"),
+            Err(error) => error,
+        };
+        assert!(hard_error
+            .to_string()
+            .contains("must not have multiple hard links"));
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&symlink_dir_target);
+        let _ = std::fs::remove_file(&symlink_dir);
         Ok(())
     }
 
