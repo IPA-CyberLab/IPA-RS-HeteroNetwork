@@ -510,6 +510,8 @@ struct K8sInstallArgs {
     agent_node_selectors: Vec<KeyValueArg>,
     #[arg(long = "agent-toleration", value_parser = parse_kubernetes_toleration_arg)]
     agent_tolerations: Vec<KubernetesTolerationArg>,
+    #[arg(long = "agent-topology-spread", value_parser = parse_kubernetes_topology_spread_arg)]
+    agent_topology_spreads: Vec<KubernetesTopologySpreadArg>,
     #[arg(long = "disable-agent-host-network", default_value_t = false)]
     disable_agent_host_network: bool,
     #[arg(long = "disable-agent-service-account-token", default_value_t = false)]
@@ -776,6 +778,16 @@ struct KubernetesTolerationArg {
     value: Option<String>,
     effect: Option<String>,
     toleration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KubernetesTopologySpreadArg {
+    topology_key: String,
+    max_skew: u32,
+    when_unsatisfiable: String,
+    min_domains: Option<u32>,
+    node_affinity_policy: Option<String>,
+    node_taints_policy: Option<String>,
 }
 
 #[tokio::main]
@@ -2000,6 +2012,74 @@ fn parse_kubernetes_toleration_arg(value: &str) -> Result<KubernetesTolerationAr
     Ok(toleration)
 }
 
+fn parse_kubernetes_topology_spread_arg(
+    value: &str,
+) -> Result<KubernetesTopologySpreadArg, String> {
+    if value.is_empty() {
+        return Err("topology spread constraint must not be empty".to_string());
+    }
+    let mut topology_key = None;
+    let mut max_skew = None;
+    let mut when_unsatisfiable = None;
+    let mut min_domains = None;
+    let mut node_affinity_policy = None;
+    let mut node_taints_policy = None;
+    for part in value.split(',') {
+        let (field, field_value) = part
+            .split_once('=')
+            .ok_or_else(|| "topology spread fields must use name=value syntax".to_string())?;
+        if field_value.is_empty() {
+            return Err(format!("topology spread field {field} must not be empty"));
+        }
+        match field {
+            "topologyKey" | "topology-key" => {
+                set_topology_spread_string_field(&mut topology_key, field, field_value)?
+            }
+            "maxSkew" | "max-skew" => {
+                let value =
+                    parse_kubernetes_positive_i32_u32(field_value, "topology spread maxSkew")?;
+                if max_skew.replace(value).is_some() {
+                    return Err(format!("duplicate topology spread field {field}"));
+                }
+            }
+            "whenUnsatisfiable" | "when-unsatisfiable" => {
+                set_topology_spread_string_field(&mut when_unsatisfiable, field, field_value)?
+            }
+            "minDomains" | "min-domains" => {
+                let value =
+                    parse_kubernetes_positive_i32_u32(field_value, "topology spread minDomains")?;
+                if min_domains.replace(value).is_some() {
+                    return Err(format!("duplicate topology spread field {field}"));
+                }
+            }
+            "nodeAffinityPolicy" | "node-affinity-policy" => {
+                set_topology_spread_string_field(&mut node_affinity_policy, field, field_value)?
+            }
+            "nodeTaintsPolicy" | "node-taints-policy" => {
+                set_topology_spread_string_field(&mut node_taints_policy, field, field_value)?
+            }
+            _ => {
+                return Err(format!(
+                    "unknown topology spread field {field}; expected topologyKey, maxSkew, whenUnsatisfiable, minDomains, nodeAffinityPolicy, or nodeTaintsPolicy"
+                ));
+            }
+        }
+    }
+    let constraint = KubernetesTopologySpreadArg {
+        topology_key: topology_key
+            .ok_or_else(|| "topology spread field topologyKey is required".to_string())?,
+        max_skew: max_skew
+            .ok_or_else(|| "topology spread field maxSkew is required".to_string())?,
+        when_unsatisfiable: when_unsatisfiable
+            .ok_or_else(|| "topology spread field whenUnsatisfiable is required".to_string())?,
+        min_domains,
+        node_affinity_policy,
+        node_taints_policy,
+    };
+    validate_kubernetes_topology_spread_arg(&constraint)?;
+    Ok(constraint)
+}
+
 fn set_toleration_string_field(
     slot: &mut Option<String>,
     field: &str,
@@ -2010,6 +2090,30 @@ fn set_toleration_string_field(
     } else {
         Ok(())
     }
+}
+
+fn set_topology_spread_string_field(
+    slot: &mut Option<String>,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if slot.replace(value.to_string()).is_some() {
+        Err(format!("duplicate topology spread field {field}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_kubernetes_positive_i32_u32(value: &str, label: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{label} must be a positive integer no greater than 2147483647"))?;
+    if parsed == 0 || parsed > i32::MAX as u32 {
+        return Err(format!(
+            "{label} must be a positive integer no greater than 2147483647"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
@@ -2248,6 +2352,53 @@ fn validate_kubernetes_toleration_arg(toleration: &KubernetesTolerationArg) -> R
         return Err("tolerationSeconds requires effect NoExecute".to_string());
     }
 
+    Ok(())
+}
+
+fn validate_kubernetes_topology_spread_arg(
+    constraint: &KubernetesTopologySpreadArg,
+) -> Result<(), String> {
+    validate_kubernetes_label_key(&constraint.topology_key)?;
+    if constraint.max_skew == 0 || constraint.max_skew > i32::MAX as u32 {
+        return Err("topology spread maxSkew must be between 1 and 2147483647".to_string());
+    }
+    match constraint.when_unsatisfiable.as_str() {
+        "DoNotSchedule" | "ScheduleAnyway" => {}
+        _ => {
+            return Err(
+                "topology spread whenUnsatisfiable must be DoNotSchedule or ScheduleAnyway"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(min_domains) = constraint.min_domains {
+        if min_domains == 0 || min_domains > i32::MAX as u32 {
+            return Err("topology spread minDomains must be between 1 and 2147483647".to_string());
+        }
+        if constraint.when_unsatisfiable != "DoNotSchedule" {
+            return Err(
+                "topology spread minDomains requires whenUnsatisfiable=DoNotSchedule".to_string(),
+            );
+        }
+    }
+    if let Some(policy) = constraint.node_affinity_policy.as_deref() {
+        match policy {
+            "Honor" | "Ignore" => {}
+            _ => {
+                return Err(
+                    "topology spread nodeAffinityPolicy must be Honor or Ignore".to_string()
+                );
+            }
+        }
+    }
+    if let Some(policy) = constraint.node_taints_policy.as_deref() {
+        match policy {
+            "Honor" | "Ignore" => {}
+            _ => {
+                return Err("topology spread nodeTaintsPolicy must be Honor or Ignore".to_string());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3992,7 +4143,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Chart nameOverride and fullnameOverride values map directly to Helm chart metadata and must remain Kubernetes DNS labels".to_string(),
             "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
@@ -4318,6 +4469,41 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
                 command,
                 &format!("agent.tolerations[{index}].tolerationSeconds"),
                 &seconds.to_string(),
+            );
+        }
+    }
+    for (index, constraint) in args.agent_topology_spreads.iter().enumerate() {
+        append_helm_set_string(
+            command,
+            &format!("agent.topologySpreadConstraints[{index}].topologyKey"),
+            &constraint.topology_key,
+        );
+        command.push_str(&format!(
+            " --set 'agent.topologySpreadConstraints[{index}].maxSkew={}'",
+            constraint.max_skew
+        ));
+        append_helm_set_string(
+            command,
+            &format!("agent.topologySpreadConstraints[{index}].whenUnsatisfiable"),
+            &constraint.when_unsatisfiable,
+        );
+        if let Some(min_domains) = constraint.min_domains {
+            command.push_str(&format!(
+                " --set 'agent.topologySpreadConstraints[{index}].minDomains={min_domains}'"
+            ));
+        }
+        if let Some(policy) = constraint.node_affinity_policy.as_deref() {
+            append_helm_set_string(
+                command,
+                &format!("agent.topologySpreadConstraints[{index}].nodeAffinityPolicy"),
+                policy,
+            );
+        }
+        if let Some(policy) = constraint.node_taints_policy.as_deref() {
+            append_helm_set_string(
+                command,
+                &format!("agent.topologySpreadConstraints[{index}].nodeTaintsPolicy"),
+                policy,
             );
         }
     }
@@ -5335,6 +5521,16 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     }
     for toleration in &args.agent_tolerations {
         validate_kubernetes_toleration_arg(toleration).map_err(anyhow::Error::msg)?;
+    }
+    let mut topology_spread_keys = std::collections::BTreeSet::new();
+    for constraint in &args.agent_topology_spreads {
+        validate_kubernetes_topology_spread_arg(constraint).map_err(anyhow::Error::msg)?;
+        if !topology_spread_keys.insert(constraint.topology_key.as_str()) {
+            anyhow::bail!(
+                "--agent-topology-spread must not repeat topologyKey {}",
+                constraint.topology_key
+            );
+        }
     }
     if let Some(dns_policy) = args.agent_dns_policy.as_deref() {
         parse_kubernetes_dns_policy(dns_policy).map_err(anyhow::Error::msg)?;
@@ -8699,6 +8895,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -9335,6 +9532,7 @@ mod tests {
         assert!(helpers.contains(".Values.fullnameOverride | trunc 53"));
         assert!(values.contains("nameOverride: \"\""));
         assert!(values.contains("fullnameOverride: \"\""));
+        assert!(values.contains("topologySpreadConstraints: []"));
         assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
         Ok(())
     }
@@ -9725,6 +9923,11 @@ mod tests {
         assert!(daemonset.contains(
             "ipars.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
         ));
+        assert!(daemonset.contains("agent.topologySpreadConstraints[%d]"));
+        assert!(daemonset.contains("\"%s.maxSkew\" $path"));
+        assert!(daemonset.contains("\"%s.minDomains\" $path"));
+        assert!(daemonset.contains("topologySpreadConstraints:"));
+        assert!(daemonset.contains("labelSelector:"));
         assert!(daemonset.contains(
             "\"agent.rollout.minReadySeconds\" \"value\" $agentMinReadySeconds \"max\" 2147483647"
         ));
@@ -10070,6 +10273,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -10525,6 +10729,14 @@ mod tests {
                 toleration_seconds: Some(600),
             },
         ];
+        args.agent_topology_spreads = vec![KubernetesTopologySpreadArg {
+            topology_key: "topology.kubernetes.io/zone".to_string(),
+            max_skew: 1,
+            when_unsatisfiable: "ScheduleAnyway".to_string(),
+            min_domains: None,
+            node_affinity_policy: Some("Honor".to_string()),
+            node_taints_policy: Some("Honor".to_string()),
+        }];
         args.agent_termination_grace_period_seconds = Some(45);
         args.disable_agent_service_account_token = true;
         args.agent_dns_policy = Some("Default".to_string());
@@ -10556,6 +10768,18 @@ mod tests {
         );
         assert!(helm.contains("--set-string 'agent.tolerations[1].effect=NoExecute'"));
         assert!(helm.contains("--set-string 'agent.tolerations[1].tolerationSeconds=600'"));
+        assert!(helm.contains(
+            "--set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone'"
+        ));
+        assert!(helm.contains("--set 'agent.topologySpreadConstraints[0].maxSkew=1'"));
+        assert!(helm.contains(
+            "--set-string 'agent.topologySpreadConstraints[0].whenUnsatisfiable=ScheduleAnyway'"
+        ));
+        assert!(helm.contains(
+            "--set-string 'agent.topologySpreadConstraints[0].nodeAffinityPolicy=Honor'"
+        ));
+        assert!(helm
+            .contains("--set-string 'agent.topologySpreadConstraints[0].nodeTaintsPolicy=Honor'"));
         assert!(helm.contains("--set agent.automountServiceAccountToken=false"));
         assert!(helm.contains("--set agent.dnsPolicy=Default"));
         assert!(helm.contains("--set-string agent.state.hostPath=/opt/ipars/state"));
@@ -10708,6 +10932,36 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("no key requires operator Exists"));
+
+        let mut invalid_topology_spread = base_k8s_install_args();
+        invalid_topology_spread.agent_topology_spreads = vec![KubernetesTopologySpreadArg {
+            topology_key: "Topology.kubernetes.io/zone".to_string(),
+            max_skew: 1,
+            when_unsatisfiable: "ScheduleAnyway".to_string(),
+            min_domains: None,
+            node_affinity_policy: None,
+            node_taints_policy: None,
+        }];
+        let error = match k8s_install_plan(invalid_topology_spread) {
+            Ok(_) => panic!("invalid topology spread should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("label prefix"));
+
+        let mut invalid_min_domains = base_k8s_install_args();
+        invalid_min_domains.agent_topology_spreads = vec![KubernetesTopologySpreadArg {
+            topology_key: "topology.kubernetes.io/zone".to_string(),
+            max_skew: 1,
+            when_unsatisfiable: "ScheduleAnyway".to_string(),
+            min_domains: Some(2),
+            node_affinity_policy: None,
+            node_taints_policy: None,
+        }];
+        let error = match k8s_install_plan(invalid_min_domains) {
+            Ok(_) => panic!("invalid minDomains topology spread should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("minDomains requires"));
 
         let mut invalid_grace = base_k8s_install_args();
         invalid_grace.agent_termination_grace_period_seconds = Some(u64::MAX);
@@ -11211,6 +11465,8 @@ mod tests {
             "kubernetes.io/os=linux",
             "--agent-toleration",
             "key=node-role.kubernetes.io/control-plane,operator=Exists,effect=NoSchedule",
+            "--agent-topology-spread",
+            "topologyKey=topology.kubernetes.io/zone,maxSkew=1,whenUnsatisfiable=DoNotSchedule,minDomains=2,nodeAffinityPolicy=Honor,nodeTaintsPolicy=Honor",
             "--agent-dns-policy",
             "ClusterFirstWithHostNet",
             "--agent-state-host-path",
@@ -11445,6 +11701,17 @@ mod tests {
                 }]
             );
             assert_eq!(
+                args.agent_topology_spreads,
+                vec![KubernetesTopologySpreadArg {
+                    topology_key: "topology.kubernetes.io/zone".to_string(),
+                    max_skew: 1,
+                    when_unsatisfiable: "DoNotSchedule".to_string(),
+                    min_domains: Some(2),
+                    node_affinity_policy: Some("Honor".to_string()),
+                    node_taints_policy: Some("Honor".to_string()),
+                }]
+            );
+            assert_eq!(
                 args.agent_dns_policy.as_deref(),
                 Some("ClusterFirstWithHostNet")
             );
@@ -11634,6 +11901,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -11785,6 +12053,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -13201,6 +13470,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -13339,6 +13609,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -13611,6 +13882,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -13754,6 +14026,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -13892,6 +14165,7 @@ mod tests {
             agent_priority_class: None,
             agent_node_selectors: Vec::new(),
             agent_tolerations: Vec::new(),
+            agent_topology_spreads: Vec::new(),
             disable_agent_host_network: false,
             disable_agent_service_account_token: false,
             agent_dns_policy: None,
@@ -14141,6 +14415,35 @@ mod tests {
         )
         .is_err());
         assert!(parse_kubernetes_toleration_arg("key=Example.com/role").is_err());
+        assert_eq!(
+            parse_kubernetes_topology_spread_arg(
+                "topologyKey=topology.kubernetes.io/zone,maxSkew=1,whenUnsatisfiable=DoNotSchedule,minDomains=2,nodeAffinityPolicy=Honor,nodeTaintsPolicy=Ignore"
+            ),
+            Ok(KubernetesTopologySpreadArg {
+                topology_key: "topology.kubernetes.io/zone".to_string(),
+                max_skew: 1,
+                when_unsatisfiable: "DoNotSchedule".to_string(),
+                min_domains: Some(2),
+                node_affinity_policy: Some("Honor".to_string()),
+                node_taints_policy: Some("Ignore".to_string()),
+            })
+        );
+        assert!(parse_kubernetes_topology_spread_arg(
+            "topologyKey=topology.kubernetes.io/zone,maxSkew=0,whenUnsatisfiable=DoNotSchedule"
+        )
+        .is_err());
+        assert!(parse_kubernetes_topology_spread_arg(
+            "topologyKey=Topology.kubernetes.io/zone,maxSkew=1,whenUnsatisfiable=DoNotSchedule"
+        )
+        .is_err());
+        assert!(parse_kubernetes_topology_spread_arg(
+            "topologyKey=topology.kubernetes.io/zone,maxSkew=1,whenUnsatisfiable=ScheduleAnyway,minDomains=2"
+        )
+        .is_err());
+        assert!(parse_kubernetes_topology_spread_arg(
+            "topologyKey=topology.kubernetes.io/zone,maxSkew=1,whenUnsatisfiable=DoNotSchedule,nodeAffinityPolicy=Prefer"
+        )
+        .is_err());
         assert_eq!(
             parse_kubernetes_priority_class_name("ipars-agent-critical"),
             Ok("ipars-agent-critical".to_string())

@@ -109,6 +109,23 @@ assert_rendered_contains name-overrides "name: fixed-ipars"
 assert_rendered_contains name-overrides "name: fixed-ipars-agent"
 assert_rendered_absent name-overrides "name: edge-ipars"
 
+template_ok topology-spread \
+  --set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone' \
+  --set 'agent.topologySpreadConstraints[0].maxSkew=1' \
+  --set-string 'agent.topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule' \
+  --set 'agent.topologySpreadConstraints[0].minDomains=2' \
+  --set-string 'agent.topologySpreadConstraints[0].nodeAffinityPolicy=Honor' \
+  --set-string 'agent.topologySpreadConstraints[0].nodeTaintsPolicy=Ignore'
+
+assert_rendered_contains topology-spread "topologySpreadConstraints:"
+assert_rendered_contains topology-spread 'topologyKey: "topology.kubernetes.io/zone"'
+assert_rendered_contains topology-spread 'whenUnsatisfiable: "DoNotSchedule"'
+assert_rendered_contains topology-spread "minDomains: 2"
+assert_rendered_contains topology-spread 'nodeAffinityPolicy: "Honor"'
+assert_rendered_contains topology-spread 'nodeTaintsPolicy: "Ignore"'
+assert_rendered_contains topology-spread "labelSelector:"
+assert_rendered_contains topology-spread 'app.kubernetes.io/instance: "ipars"'
+
 template_ok agent-api \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP
@@ -392,6 +409,19 @@ template_fails cluster-stun-endpoint-unspecified \
 template_fails name-override-invalid \
   "nameOverride \"Bad_Name\" must be a DNS label of at most 53 bytes" \
   --set-string nameOverride=Bad_Name
+
+template_fails topology-spread-zero-max-skew \
+  "agent.topologySpreadConstraints[0].maxSkew must be greater than zero" \
+  --set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone' \
+  --set 'agent.topologySpreadConstraints[0].maxSkew=0' \
+  --set-string 'agent.topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule'
+
+template_fails topology-spread-min-domains-schedule-anyway \
+  "agent.topologySpreadConstraints[0].minDomains requires whenUnsatisfiable=DoNotSchedule" \
+  --set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone' \
+  --set 'agent.topologySpreadConstraints[0].maxSkew=1' \
+  --set-string 'agent.topologySpreadConstraints[0].whenUnsatisfiable=ScheduleAnyway' \
+  --set 'agent.topologySpreadConstraints[0].minDomains=2'
 
 template_fails relay-forwarder-netns-without-sys-admin \
   "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" \

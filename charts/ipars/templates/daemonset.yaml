@@ -355,6 +355,54 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- range $index, $constraint := .Values.agent.topologySpreadConstraints -}}
+{{- $path := printf "agent.topologySpreadConstraints[%d]" $index -}}
+{{- if not (kindIs "map" $constraint) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $constraint -}}
+{{- if not (has $field (list "topologyKey" "maxSkew" "whenUnsatisfiable" "minDomains" "nodeAffinityPolicy" "nodeTaintsPolicy")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- $topologyKey := default "" $constraint.topologyKey -}}
+{{- if eq $topologyKey "" -}}
+{{- fail (printf "%s.topologyKey is required" $path) -}}
+{{- end -}}
+{{- include "ipars.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
+{{- if not (hasKey $constraint "maxSkew") -}}
+{{- fail (printf "%s.maxSkew is required" $path) -}}
+{{- end -}}
+{{- $maxSkew := printf "%v" $constraint.maxSkew -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.maxSkew" $path) "value" $maxSkew "max" 2147483647) -}}
+{{- if lt (int $maxSkew) 1 -}}
+{{- fail (printf "%s.maxSkew must be greater than zero" $path) -}}
+{{- end -}}
+{{- $whenUnsatisfiable := default "" $constraint.whenUnsatisfiable -}}
+{{- if not (or (eq $whenUnsatisfiable "DoNotSchedule") (eq $whenUnsatisfiable "ScheduleAnyway")) -}}
+{{- fail (printf "%s.whenUnsatisfiable must be DoNotSchedule or ScheduleAnyway" $path) -}}
+{{- end -}}
+{{- if hasKey $constraint "minDomains" -}}
+{{- $minDomains := printf "%v" $constraint.minDomains -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.minDomains" $path) "value" $minDomains "max" 2147483647) -}}
+{{- if lt (int $minDomains) 1 -}}
+{{- fail (printf "%s.minDomains must be greater than zero" $path) -}}
+{{- end -}}
+{{- if ne $whenUnsatisfiable "DoNotSchedule" -}}
+{{- fail (printf "%s.minDomains requires whenUnsatisfiable=DoNotSchedule" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- if $constraint.nodeAffinityPolicy -}}
+{{- if not (or (eq $constraint.nodeAffinityPolicy "Honor") (eq $constraint.nodeAffinityPolicy "Ignore")) -}}
+{{- fail (printf "%s.nodeAffinityPolicy must be Honor or Ignore" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- if $constraint.nodeTaintsPolicy -}}
+{{- if not (or (eq $constraint.nodeTaintsPolicy "Honor") (eq $constraint.nodeTaintsPolicy "Ignore")) -}}
+{{- fail (printf "%s.nodeTaintsPolicy must be Honor or Ignore" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.cpu" "value" (printf "%v" .Values.agent.resources.requests.cpu)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
 {{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
@@ -576,6 +624,27 @@ spec:
           {{- end }}
           {{- if hasKey . "tolerationSeconds" }}
           tolerationSeconds: {{ int .tolerationSeconds }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.agent.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ int .maxSkew }}
+          topologyKey: {{ .topologyKey | quote }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | quote }}
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "ipars.name" $ | quote }}
+              app.kubernetes.io/instance: {{ $.Release.Name | quote }}
+          {{- if hasKey . "minDomains" }}
+          minDomains: {{ int .minDomains }}
+          {{- end }}
+          {{- if .nodeAffinityPolicy }}
+          nodeAffinityPolicy: {{ .nodeAffinityPolicy | quote }}
+          {{- end }}
+          {{- if .nodeTaintsPolicy }}
+          nodeTaintsPolicy: {{ .nodeTaintsPolicy | quote }}
           {{- end }}
         {{- end }}
       {{- end }}

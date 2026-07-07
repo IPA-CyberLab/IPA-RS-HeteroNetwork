@@ -70,6 +70,7 @@ agent:
   priorityClassName: ""
   nodeSelector: {}
   tolerations: []
+  topologySpreadConstraints: []
   resources:
     requests:
       cpu: ""
