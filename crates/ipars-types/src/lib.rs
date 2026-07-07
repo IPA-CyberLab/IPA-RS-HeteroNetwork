@@ -1740,6 +1740,7 @@ pub mod api {
         Rdp,
         Kerberos,
         Ntp,
+        Radius,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1775,7 +1776,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 43] = [
+        pub const ALL: [Self; 44] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1787,6 +1788,7 @@ pub mod api {
             Self::Rdp,
             Self::Kerberos,
             Self::Ntp,
+            Self::Radius,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1834,6 +1836,7 @@ pub mod api {
                 Self::Rdp => "rdp",
                 Self::Kerberos => "kerberos",
                 Self::Ntp => "ntp",
+                Self::Radius => "radius",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2112,6 +2115,19 @@ pub mod api {
             if self.involves_port(4460) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Ntp;
             }
+            if (self.involves_port(1812)
+                || self.involves_port(1813)
+                || self.involves_port(3799)
+                || self.involves_port(1645)
+                || self.involves_port(1646)
+                || self.involves_port(2083))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Radius;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2289,6 +2305,11 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Ntp);
             }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp))
+                && radius_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Radius);
+            }
             if matches!(
                 self.protocol,
                 None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
@@ -2375,6 +2396,7 @@ pub mod api {
             | AgentPacketFlowApplication::Snmp
             | AgentPacketFlowApplication::Kerberos
             | AgentPacketFlowApplication::Ntp
+            | AgentPacketFlowApplication::Radius
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3175,6 +3197,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Ntp);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"radius")
+            || tls_sni_hostname_has_label_prefix(hostname, b"radsec")
+        {
+            return Some(AgentPacketFlowApplication::Radius);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -3395,6 +3422,9 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"ntske/1")
         {
             return Some(AgentPacketFlowApplication::Ntp);
+        }
+        if protocol.eq_ignore_ascii_case(b"radius") || protocol.eq_ignore_ascii_case(b"radsec") {
+            return Some(AgentPacketFlowApplication::Radius);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -3838,6 +3868,50 @@ pub mod api {
         } else {
             stratum <= 16
         }
+    }
+
+    fn radius_payload(payload: &[u8]) -> bool {
+        if payload.len() < 20 || !radius_code(payload[0]) {
+            return false;
+        }
+        let packet_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+        if !(20..=4096).contains(&packet_len) {
+            return false;
+        }
+        let allow_truncated =
+            packet_len > payload.len() && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+        if packet_len > payload.len() && !allow_truncated {
+            return false;
+        }
+
+        let available_end = packet_len.min(payload.len());
+        let mut offset = 20_usize;
+        let mut attribute_count = 0_usize;
+        while offset < available_end {
+            if available_end - offset < 2 {
+                return allow_truncated;
+            }
+            let attribute_len = payload[offset + 1] as usize;
+            if attribute_len < 2 {
+                return false;
+            }
+            let Some(attribute_end) = offset.checked_add(attribute_len) else {
+                return false;
+            };
+            if attribute_end > available_end {
+                return allow_truncated;
+            }
+            attribute_count += 1;
+            offset = attribute_end;
+        }
+        attribute_count > 0
+    }
+
+    fn radius_code(code: u8) -> bool {
+        matches!(
+            code,
+            1 | 2 | 3 | 4 | 5 | 11 | 12 | 13 | 40 | 41 | 42 | 43 | 44 | 45
+        )
     }
 
     fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -7974,6 +8048,36 @@ mod tests {
         };
         assert_eq!(nts_ke.application(), api::AgentPacketFlowApplication::Ntp);
 
+        let radius_auth = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1812),
+            ..Default::default()
+        };
+        assert_eq!(
+            radius_auth.application(),
+            api::AgentPacketFlowApplication::Radius
+        );
+
+        let radius_accounting = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(1813),
+            ..Default::default()
+        };
+        assert_eq!(
+            radius_accounting.application(),
+            api::AgentPacketFlowApplication::Radius
+        );
+
+        let radsec = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2083),
+            ..Default::default()
+        };
+        assert_eq!(
+            radsec.application(),
+            api::AgentPacketFlowApplication::Radius
+        );
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -8855,6 +8959,26 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let mut radius_access_request = vec![
+            1, 7, 0, 27, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 1, 7, b'a', b'l', b'i', b'c', b'e',
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&radius_access_request).application(),
+            api::AgentPacketFlowApplication::Radius
+        );
+        radius_access_request[0] = 255;
+        assert_eq!(
+            observation_for_udp_payload(&radius_access_request).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        radius_access_request[0] = 1;
+        radius_access_request[21] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&radius_access_request).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -9206,6 +9330,10 @@ mod tests {
             ),
             ("ntp-server.time.svc", api::AgentPacketFlowApplication::Ntp),
             (
+                "radius-auth.identity.svc",
+                api::AgentPacketFlowApplication::Radius,
+            ),
+            (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
@@ -9327,6 +9455,10 @@ mod tests {
             (
                 &[b"ntske/1".as_slice()][..],
                 api::AgentPacketFlowApplication::Ntp,
+            ),
+            (
+                &[b"radsec".as_slice()][..],
+                api::AgentPacketFlowApplication::Radius,
             ),
         ] {
             assert_eq!(
@@ -10845,6 +10977,14 @@ mod tests {
         let tcp_ntp_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ntp"}"#)?;
         tcp_ntp_hint.validate_transport_metadata()?;
+
+        let udp_radius_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"radius"}"#)?;
+        udp_radius_hint.validate_transport_metadata()?;
+
+        let tcp_radius_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"radius"}"#)?;
+        tcp_radius_hint.validate_transport_metadata()?;
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
