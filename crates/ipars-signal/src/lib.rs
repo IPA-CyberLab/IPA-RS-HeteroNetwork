@@ -15,6 +15,14 @@ use ipars_types::{
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
+
 #[derive(Debug, Error)]
 pub enum SignalError {
     #[error("node not found: {0}")]
@@ -424,35 +432,26 @@ impl SignalRegistry {
     }
 
     fn path_negotiation_state_counts(&self) -> Vec<PathStateCount> {
-        [
-            (
-                PathState::DirectPublic,
-                self.direct_public_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::DirectIpv6,
-                self.direct_ipv6_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::DirectNatTraversal,
-                self.direct_nat_traversal_negotiations
-                    .load(Ordering::Relaxed),
-            ),
-            (
-                PathState::Relay,
-                self.relay_negotiations.load(Ordering::Relaxed),
-            ),
-            (
-                PathState::Unreachable,
-                self.unreachable_negotiations.load(Ordering::Relaxed),
-            ),
-        ]
-        .into_iter()
-        .map(|(state, count)| PathStateCount {
-            state,
-            count: count as usize,
-        })
-        .collect()
+        PATH_STATE_METRIC_ORDER
+            .into_iter()
+            .map(|state| {
+                let count = match state {
+                    PathState::DirectPublic => {
+                        self.direct_public_negotiations.load(Ordering::Relaxed)
+                    }
+                    PathState::DirectIpv6 => self.direct_ipv6_negotiations.load(Ordering::Relaxed),
+                    PathState::DirectNatTraversal => self
+                        .direct_nat_traversal_negotiations
+                        .load(Ordering::Relaxed),
+                    PathState::Relay => self.relay_negotiations.load(Ordering::Relaxed),
+                    PathState::Unreachable => self.unreachable_negotiations.load(Ordering::Relaxed),
+                };
+                PathStateCount {
+                    state,
+                    count: count as usize,
+                }
+            })
+            .collect()
     }
 
     fn record_hole_punch_nat_suppression_strategies(

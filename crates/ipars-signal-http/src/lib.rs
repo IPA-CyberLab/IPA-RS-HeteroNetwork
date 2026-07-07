@@ -620,6 +620,11 @@ mod tests {
             signal_path_state_count(&metrics, ipars_types::PathState::DirectPublic),
             1
         );
+        assert_eq!(metrics.path_negotiation_state_counts.len(), 5);
+        assert_eq!(
+            signal_path_state_count(&metrics, ipars_types::PathState::Relay),
+            0
+        );
 
         let response = app
             .oneshot(
@@ -653,6 +658,7 @@ mod tests {
         assert!(
             body.contains("ipars_signal_path_negotiation_state_total{state=\"DIRECT_PUBLIC\"} 1")
         );
+        assert!(body.contains("ipars_signal_path_negotiation_state_total{state=\"RELAY\"} 0"));
         Ok(())
     }
 
