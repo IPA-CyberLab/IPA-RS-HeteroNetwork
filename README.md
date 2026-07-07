@@ -40,7 +40,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
 - agent peer-map applier that converts active or pinned control-plane peers into WireGuard peer configs and route plans, and prunes idle or stale peers plus their previously applied routes after the cluster idle timeout or peer-map removal
 - `iparsd agent --apply-peer-map` continuous peer-map polling for fetching `/v1/peers/{node_id}` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `relay probe`, `path status`, `path activity`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, validated HTTP API-backed agent/control-plane status, peer, route, relay, path query, activation, and path probe operations when URLs are provided, and a relay admission plus bidirectional UDP dataplane probe for operator validation
+- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `relay probe`, `path status`, `path activity`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, validated HTTP API-backed agent/control-plane status, peer, route, relay, path query, activation, and path probe operations when URLs are provided, and an optional-Bearer-auth relay admission plus bidirectional UDP dataplane probe for operator validation
 - Docker Compose manifest with service healthchecks, file-backed agent join-token secret, host-network agent loopback wiring, env-driven Docker route, route backend, WireGuard backend/userspace lifecycle, explicit relay advertisement plus relay admission auth/abuse-control settings, relay forwarder endpoint/bind/namespace/supervisor wiring, discovery-only Docker API socket binding, gated Compose smoke coverage, and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
@@ -172,7 +172,7 @@ ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root --role edge --tag edge --bootstrap https://203.0.113.10:8443 --signal-bootstrap https://203.0.113.10:9443 --stun-bootstrap udp://203.0.113.10:3478 --relay-bootstrap udp://203.0.113.10:51820 --allowed-route 10.42.0.0/16 --allow-relay --max-uses 7 --ttl-seconds 86400
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status --relay-url http://127.0.0.1:9580
-ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820
+ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret>
 ipars path status --agent-url http://127.0.0.1:9780
 ipars path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path activity --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --pin

@@ -43,6 +43,7 @@ const DEFAULT_LOCAL_RELAY_UDP: &str = "127.0.0.1:51820";
 const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
 const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -253,6 +254,8 @@ struct RelayStatusArgs {
 struct RelayProbeArgs {
     #[arg(long, env = "IPARS_RELAY_URL")]
     relay_url: Option<String>,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
+    relay_admission_bearer_token: Option<String>,
     #[arg(long, env = "IPARS_RELAY_UDP", default_value = DEFAULT_LOCAL_RELAY_UDP)]
     relay_udp: SocketAddr,
     #[arg(long, default_value = "probe-left")]
@@ -1899,6 +1902,7 @@ struct RelayProbeDirectionOutput {
 async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
     validate_relay_probe_args(&args)?;
     let relay_url = defaulted_relay_url(args.relay_url.as_deref());
+    let relay_admission_bearer_token = args.relay_admission_bearer_token.as_deref();
     let left = validated_node_id(&args.left_node_id, "--left-node-id")?;
     let right = validated_node_id(&args.right_node_id, "--right-node-id")?;
     anyhow::ensure!(
@@ -1928,7 +1932,7 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
         "left and right probe sockets resolved to the same local address {left_addr}"
     );
 
-    let admission: RelayAdmissionResponse = post_json(
+    let admission: RelayAdmissionResponse = post_json_with_bearer(
         relay_url,
         "/v1/sessions",
         "relay session admission",
@@ -1938,6 +1942,7 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
             left_addr,
             right_addr,
         },
+        relay_admission_bearer_token,
     )
     .await?;
 
@@ -2014,6 +2019,25 @@ fn validate_relay_probe_args(args: &RelayProbeArgs) -> anyhow::Result<()> {
         args.payload.len() <= MAX_RELAY_PROBE_PAYLOAD_BYTES,
         "--payload exceeds {MAX_RELAY_PROBE_PAYLOAD_BYTES} bytes"
     );
+    if let Some(token) = args.relay_admission_bearer_token.as_deref() {
+        validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn validate_relay_admission_bearer_token(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes");
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        anyhow::bail!("{label} must not contain whitespace or control characters");
+    }
     Ok(())
 }
 
@@ -2230,10 +2254,26 @@ where
     Request: Serialize + ?Sized,
     Response: DeserializeOwned,
 {
+    post_json_with_bearer(base_url, path, label, request, None).await
+}
+
+async fn post_json_with_bearer<Request, Response>(
+    base_url: &str,
+    path: &str,
+    label: &str,
+    request: &Request,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<Response>
+where
+    Request: Serialize + ?Sized,
+    Response: DeserializeOwned,
+{
     let url = api_url(base_url, path, label)?;
-    let response = reqwest::Client::new()
-        .post(&url)
-        .json(request)
+    let mut request_builder = reqwest::Client::new().post(&url).json(request);
+    if let Some(token) = bearer_token {
+        request_builder = request_builder.bearer_auth(token);
+    }
+    let response = request_builder
         .send()
         .await
         .with_context(|| format!("failed to send {label} request to {url}"))?
@@ -9398,6 +9438,8 @@ fi
             "probe",
             "--relay-url",
             "http://127.0.0.1:9580",
+            "--relay-admission-bearer-token",
+            "cluster-relay-secret",
             "--relay-udp",
             "127.0.0.1:51820",
             "--left-node-id",
@@ -9421,6 +9463,10 @@ fi
         };
 
         assert_eq!(args.relay_url.as_deref(), Some("http://127.0.0.1:9580"));
+        assert_eq!(
+            args.relay_admission_bearer_token.as_deref(),
+            Some("cluster-relay-secret")
+        );
         assert_eq!(args.relay_udp, "127.0.0.1:51820".parse()?);
         assert_eq!(args.left_node_id, "left-a");
         assert_eq!(args.right_node_id, "right-b");
@@ -9471,6 +9517,16 @@ fi
             Err(error) => error,
         };
         assert!(error.to_string().contains("--timeout-ms must be between"));
+
+        args.timeout_ms = DEFAULT_RELAY_PROBE_TIMEOUT_MS;
+        args.relay_admission_bearer_token = Some("bad token".to_string());
+        let error = match validate_relay_probe_args(&args) {
+            Ok(_) => anyhow::bail!("whitespace-bearing bearer token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--relay-admission-bearer-token must not contain whitespace"));
         Ok(())
     }
 

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str = "compose-relay-admission-secret";
+
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
     if std::env::var("IPARS_RUN_DOCKER_COMPOSE_SMOKE")
@@ -56,6 +58,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         issuer_node_id: &issuer_node_id,
         issuer_public_key: &issuer_public_key,
         join_token: &join_token,
+        relay_admission_bearer_token: COMPOSE_RELAY_ADMISSION_BEARER_TOKEN,
         ports: ComposeOverridePorts {
             control_plane: control_plane_port,
             signal: signal_port,
@@ -281,6 +284,16 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("IPARS_AGENT_JOIN_TOKEN:"),
         "rendered smoke Compose config did not include the inline join token override"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_RELAY_ADMISSION_BEARER_TOKEN),
+        "rendered smoke Compose config did not require relay admission Bearer auth"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_RELAY_ADMISSION_BEARER_TOKEN),
+        "rendered smoke Compose config did not pass the relay admission Bearer token to the agent"
+    );
 
     drop(tcp_ports);
     drop(udp_ports);
@@ -334,6 +347,7 @@ struct ComposeOverrideConfig<'a> {
     issuer_node_id: &'a str,
     issuer_public_key: &'a str,
     join_token: &'a str,
+    relay_admission_bearer_token: &'a str,
     ports: ComposeOverridePorts,
 }
 
@@ -387,6 +401,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
   relay:
     cap_add: !reset []
     devices: !reset []
+    environment:
+      IPARS_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
     ports:
       - "{relay_udp_port}:51820/udp"
       - "{relay_http_port}:9580"
@@ -409,6 +425,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
       IPARS_AGENT_RELAY_MAX_SESSIONS: "10000"
       IPARS_AGENT_RELAY_MAX_MBPS: "1000"
+      IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
     command:
       - agent
       - --listen
@@ -430,6 +447,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
         issuer_node_id = config.issuer_node_id,
         issuer_public_key = config.issuer_public_key,
         join_token = yaml_single_quoted(config.join_token),
+        relay_admission_bearer_token = yaml_single_quoted(config.relay_admission_bearer_token),
         control_plane_port = config.ports.control_plane,
         signal_port = config.ports.signal,
         stun_port = config.ports.stun,
@@ -675,6 +693,16 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
         &["status_after_probe", "dataplane", "payload_bytes_forwarded"],
         2,
     )?;
+    ensure_json_u64_at_least_at(
+        &probe,
+        &["status_after_probe", "admission_success_count"],
+        1,
+    )?;
+    ensure_json_u64_equals_at(
+        &probe,
+        &["status_after_probe", "admission_failure_count"],
+        0,
+    )?;
 
     wait_for_json(
         compose,
@@ -683,6 +711,7 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
         "http://127.0.0.1:9580/v1/status",
         |value| {
             ensure_json_u64_at_least(value, "admission_success_count", 1)?;
+            ensure_json_u64_equals(value, "admission_failure_count", 0)?;
             ensure_json_u64_at_least_at(value, &["capability", "active_sessions"], 1)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_received"], 2)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_forwarded"], 2)?;
@@ -787,11 +816,30 @@ fn ensure_json_u64_at_least(value: &Value, field: &str, minimum: u64) -> Result<
     Ok(())
 }
 
+fn ensure_json_u64_equals(value: &Value, field: &str, expected: u64) -> Result<()> {
+    let actual = json_u64_field(value, field)?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {field} to equal {expected}, got {actual}: {value}"
+    );
+    Ok(())
+}
+
 fn ensure_json_u64_at_least_at(value: &Value, path: &[&str], minimum: u64) -> Result<()> {
     let actual = json_u64_field_at(value, path)?;
     anyhow::ensure!(
         actual >= minimum,
         "expected JSON field {} to be at least {minimum}, got {actual}: {value}",
+        path.join(".")
+    );
+    Ok(())
+}
+
+fn ensure_json_u64_equals_at(value: &Value, path: &[&str], expected: u64) -> Result<()> {
+    let actual = json_u64_field_at(value, path)?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {} to equal {expected}, got {actual}: {value}",
         path.join(".")
     );
     Ok(())
