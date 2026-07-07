@@ -13334,6 +13334,14 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Dns),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Consul),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Vault),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(

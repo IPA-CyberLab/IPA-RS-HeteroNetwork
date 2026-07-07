@@ -434,6 +434,7 @@ pub struct AgentRuntime {
     packet_flow_application_etcd_count: AtomicU64,
     packet_flow_application_zookeeper_count: AtomicU64,
     packet_flow_application_consul_count: AtomicU64,
+    packet_flow_application_vault_count: AtomicU64,
     packet_flow_application_postgres_count: AtomicU64,
     packet_flow_application_mysql_count: AtomicU64,
     packet_flow_application_mssql_count: AtomicU64,
@@ -1016,6 +1017,7 @@ impl AgentRuntime {
             packet_flow_application_etcd_count: AtomicU64::new(0),
             packet_flow_application_zookeeper_count: AtomicU64::new(0),
             packet_flow_application_consul_count: AtomicU64::new(0),
+            packet_flow_application_vault_count: AtomicU64::new(0),
             packet_flow_application_postgres_count: AtomicU64::new(0),
             packet_flow_application_mysql_count: AtomicU64::new(0),
             packet_flow_application_mssql_count: AtomicU64::new(0),
@@ -1717,6 +1719,7 @@ impl AgentRuntime {
                 &self.packet_flow_application_zookeeper_count
             }
             AgentPacketFlowApplication::Consul => &self.packet_flow_application_consul_count,
+            AgentPacketFlowApplication::Vault => &self.packet_flow_application_vault_count,
             AgentPacketFlowApplication::Postgres => &self.packet_flow_application_postgres_count,
             AgentPacketFlowApplication::Mysql => &self.packet_flow_application_mysql_count,
             AgentPacketFlowApplication::MsSql => &self.packet_flow_application_mssql_count,
@@ -5955,6 +5958,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(consul_match.peer, peer_b_id);
+        let vault_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 40)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(8200),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(vault_match.peer, peer_b_id);
         let mssql_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 36)),
@@ -6132,8 +6149,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 18);
-        assert_eq!(metrics.packet_flow_match_count, 16);
+        assert_eq!(metrics.packet_flow_observation_count, 19);
+        assert_eq!(metrics.packet_flow_match_count, 17);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6145,7 +6162,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            16
+            17
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6172,6 +6189,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::ZooKeeper), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Consul), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Vault), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::MsSql), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Oracle), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Prometheus), 1);
