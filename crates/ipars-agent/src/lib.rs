@@ -5995,6 +5995,21 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(dhcp_match.peer, peer_b_id);
+        let dhcpv6_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 57)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    source_port: Some(546),
+                    destination_port: Some(547),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(dhcpv6_match.peer, peer_b_id);
 
         assert!(
             runtime
@@ -6464,8 +6479,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 35);
-        assert_eq!(metrics.packet_flow_match_count, 33);
+        assert_eq!(metrics.packet_flow_observation_count, 36);
+        assert_eq!(metrics.packet_flow_match_count, 34);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6477,7 +6492,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            33
+            34
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6496,7 +6511,7 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
-        assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
         assert_eq!(
             application_count(AgentPacketFlowApplication::KubernetesApi),

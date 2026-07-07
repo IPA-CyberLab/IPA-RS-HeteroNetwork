@@ -2082,7 +2082,10 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Dns;
             }
-            if (self.involves_port(67) || self.involves_port(68))
+            if (self.involves_port(67)
+                || self.involves_port(68)
+                || self.involves_port(546)
+                || self.involves_port(547))
                 && protocol_is(self.protocol, TransportProtocol::Udp)
             {
                 return AgentPacketFlowApplication::Dhcp;
@@ -2313,8 +2316,11 @@ pub mod api {
                 return Some(AgentPacketFlowApplication::Dns);
             }
             if protocol_is(self.protocol, TransportProtocol::Udp)
-                && (self.involves_port(67) || self.involves_port(68))
-                && dhcp_payload(payload)
+                && (self.involves_port(67)
+                    || self.involves_port(68)
+                    || self.involves_port(546)
+                    || self.involves_port(547))
+                && (dhcp_payload(payload) || dhcpv6_payload(payload))
             {
                 return Some(AgentPacketFlowApplication::Dhcp);
             }
@@ -2928,6 +2934,60 @@ pub mod api {
             return false;
         }
         payload.len() < 240 || payload.get(236..240) == Some(&[99, 130, 83, 99][..])
+    }
+
+    fn dhcpv6_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 {
+            return false;
+        }
+        match payload[0] {
+            1..=11 | 14 => {
+                if payload[1..4].iter().all(|byte| *byte == 0) {
+                    return false;
+                }
+                dhcpv6_options_payload(payload, 4, false)
+            }
+            12 | 13 => {
+                if payload.len() < 34 || payload[1] > 32 {
+                    return false;
+                }
+                if payload[18..34].iter().all(|byte| *byte == 0) {
+                    return false;
+                }
+                dhcpv6_options_payload(payload, 34, true)
+            }
+            _ => false,
+        }
+    }
+
+    fn dhcpv6_options_payload(
+        payload: &[u8],
+        mut offset: usize,
+        require_relay_message: bool,
+    ) -> bool {
+        let mut option_count = 0_usize;
+        let mut relay_message_seen = false;
+        while offset < payload.len() {
+            if payload.len() - offset < 4 {
+                return payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            }
+            let option_code = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+            let option_len =
+                u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]) as usize;
+            let Some(value_offset) = offset.checked_add(4) else {
+                return false;
+            };
+            let Some(next_offset) = value_offset.checked_add(option_len) else {
+                return false;
+            };
+            if next_offset > payload.len() {
+                return payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            }
+            option_count += 1;
+            relay_message_seen |= option_code == 9 && option_len > 0;
+            offset = next_offset;
+        }
+        option_count > 0 && (!require_relay_message || relay_message_seen)
     }
 
     fn dns_question_payload(payload: &[u8]) -> bool {
@@ -8123,6 +8183,28 @@ mod tests {
             api::AgentPacketFlowApplication::Dhcp
         );
 
+        let dhcpv6_client = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(546),
+            destination_port: Some(547),
+            ..Default::default()
+        };
+        assert_eq!(
+            dhcpv6_client.application(),
+            api::AgentPacketFlowApplication::Dhcp
+        );
+
+        let dhcpv6_server = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(547),
+            destination_port: Some(546),
+            ..Default::default()
+        };
+        assert_eq!(
+            dhcpv6_server.application(),
+            api::AgentPacketFlowApplication::Dhcp
+        );
+
         let https = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(443),
@@ -9044,6 +9126,13 @@ mod tests {
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
+        let observation_for_dhcpv6_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(546),
+            destination_port: Some(547),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
         let dns_query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
             b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l', b'o', b'c',
@@ -9083,6 +9172,13 @@ mod tests {
         dhcp_discover_prefix[28..34].copy_from_slice(&[0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
         assert_eq!(
             observation_for_dhcp_payload(&dhcp_discover_prefix).application(),
+            api::AgentPacketFlowApplication::Dhcp
+        );
+        let dhcpv6_solicit = vec![
+            1, 0x12, 0x34, 0x56, 0, 1, 0, 10, 0, 1, 0, 1, 0x12, 0x34, 0x56, 0x78, 0x02, 0x00,
+        ];
+        assert_eq!(
+            observation_for_dhcpv6_payload(&dhcpv6_solicit).application(),
             api::AgentPacketFlowApplication::Dhcp
         );
 
