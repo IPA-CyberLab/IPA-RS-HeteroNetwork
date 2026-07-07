@@ -13411,6 +13411,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Kerberos),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Ntp),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(

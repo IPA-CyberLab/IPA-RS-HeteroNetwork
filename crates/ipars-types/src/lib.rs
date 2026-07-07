@@ -1739,6 +1739,7 @@ pub mod api {
         Nfs,
         Rdp,
         Kerberos,
+        Ntp,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1774,7 +1775,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 42] = [
+        pub const ALL: [Self; 43] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1785,6 +1786,7 @@ pub mod api {
             Self::Nfs,
             Self::Rdp,
             Self::Kerberos,
+            Self::Ntp,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1831,6 +1833,7 @@ pub mod api {
                 Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
                 Self::Kerberos => "kerberos",
+                Self::Ntp => "ntp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2103,6 +2106,12 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Kerberos;
             }
+            if self.involves_port(123) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::Ntp;
+            }
+            if self.involves_port(4460) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Ntp;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2276,6 +2285,10 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Udp) && wireguard_payload(payload) {
                 return Some(AgentPacketFlowApplication::WireGuard);
             }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp)) && ntp_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Ntp);
+            }
             if matches!(
                 self.protocol,
                 None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
@@ -2361,6 +2374,7 @@ pub mod api {
             | AgentPacketFlowApplication::Syslog
             | AgentPacketFlowApplication::Snmp
             | AgentPacketFlowApplication::Kerberos
+            | AgentPacketFlowApplication::Ntp
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3155,6 +3169,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Kerberos);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ntp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ntske")
+            || tls_sni_hostname_has_label_prefix(hostname, b"chrony")
+        {
+            return Some(AgentPacketFlowApplication::Ntp);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -3369,6 +3389,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"kerberos-udp")
         {
             return Some(AgentPacketFlowApplication::Kerberos);
+        }
+        if protocol.eq_ignore_ascii_case(b"ntp")
+            || protocol.eq_ignore_ascii_case(b"ntske")
+            || protocol.eq_ignore_ascii_case(b"ntske/1")
+        {
+            return Some(AgentPacketFlowApplication::Ntp);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -3795,6 +3821,23 @@ pub mod api {
             len = len.checked_shl(8)?.checked_add(*byte as usize)?;
         }
         Some((len, offset + 1 + length_bytes))
+    }
+
+    fn ntp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 48 {
+            return false;
+        }
+        let version = (payload[0] >> 3) & 0x07;
+        let mode = payload[0] & 0x07;
+        if !(3..=4).contains(&version) || !matches!(mode, 3 | 4 | 5) {
+            return false;
+        }
+        let stratum = payload[1];
+        if mode == 3 {
+            stratum == 0
+        } else {
+            stratum <= 16
+        }
     }
 
     fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -7917,6 +7960,20 @@ mod tests {
             api::AgentPacketFlowApplication::Kerberos
         );
 
+        let ntp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(123),
+            ..Default::default()
+        };
+        assert_eq!(ntp.application(), api::AgentPacketFlowApplication::Ntp);
+
+        let nts_ke = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(4460),
+            ..Default::default()
+        };
+        assert_eq!(nts_ke.application(), api::AgentPacketFlowApplication::Ntp);
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -8778,6 +8835,26 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let mut ntp_client_request = vec![0_u8; 48];
+        ntp_client_request[0] = 0x23;
+        assert_eq!(
+            observation_for_udp_payload(&ntp_client_request).application(),
+            api::AgentPacketFlowApplication::Ntp
+        );
+        let mut ntp_server_response = ntp_client_request.clone();
+        ntp_server_response[0] = 0x24;
+        ntp_server_response[1] = 2;
+        assert_eq!(
+            observation_for_udp_payload(&ntp_server_response).application(),
+            api::AgentPacketFlowApplication::Ntp
+        );
+        let mut invalid_ntp_version = ntp_client_request.clone();
+        invalid_ntp_version[0] = 0x03;
+        assert_eq!(
+            observation_for_udp_payload(&invalid_ntp_version).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -9127,6 +9204,7 @@ mod tests {
                 "kerberos-kdc.identity.svc",
                 api::AgentPacketFlowApplication::Kerberos,
             ),
+            ("ntp-server.time.svc", api::AgentPacketFlowApplication::Ntp),
             (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
@@ -9245,6 +9323,10 @@ mod tests {
             (
                 &[b"kerberos".as_slice()][..],
                 api::AgentPacketFlowApplication::Kerberos,
+            ),
+            (
+                &[b"ntske/1".as_slice()][..],
+                api::AgentPacketFlowApplication::Ntp,
             ),
         ] {
             assert_eq!(
@@ -10755,6 +10837,14 @@ mod tests {
         let tcp_kerberos_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"kerberos"}"#)?;
         tcp_kerberos_hint.validate_transport_metadata()?;
+
+        let udp_ntp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"ntp"}"#)?;
+        udp_ntp_hint.validate_transport_metadata()?;
+
+        let tcp_ntp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"ntp"}"#)?;
+        tcp_ntp_hint.validate_transport_metadata()?;
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
