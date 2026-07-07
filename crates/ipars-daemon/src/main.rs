@@ -2334,6 +2334,7 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
 }
 
 fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    ensure_runtime_command_path_is_absolute(path)?;
     if program_ready_in_path(program, path) {
         Ok(())
     } else {
@@ -2341,6 +2342,23 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
             "missing required Linux runtime command `{program}` in PATH; expected an executable regular file"
         );
     }
+}
+
+fn ensure_runtime_command_path_is_absolute(path: Option<&OsStr>) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+    for directory in std::env::split_paths(path) {
+        anyhow::ensure!(
+            !directory.as_os_str().is_empty() && directory.is_absolute(),
+            "Linux runtime command PATH entry `{}` must be an absolute directory",
+            directory.display()
+        );
+    }
+    Ok(())
 }
 
 fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
@@ -16865,6 +16883,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(symlink_error
             .to_string()
             .contains("expected an executable regular file"));
+
+        let relative_bin = PathBuf::from("relative-bin");
+        let relative_error = match ensure_program_in_path("ip", Some(relative_bin.as_os_str())) {
+            Ok(()) => anyhow::bail!("unexpected successful relative PATH command preflight"),
+            Err(error) => error,
+        };
+        assert!(relative_error
+            .to_string()
+            .contains("must be an absolute directory"));
+
+        let empty_path_error = match ensure_program_in_path("ip", Some(OsStr::new(":"))) {
+            Ok(()) => anyhow::bail!("unexpected successful empty PATH command preflight"),
+            Err(error) => error,
+        };
+        assert!(empty_path_error
+            .to_string()
+            .contains("must be an absolute directory"));
 
         let userspace_link = base.join("wireguard-go-link");
         std::os::unix::fs::symlink(&executable, &userspace_link)?;
