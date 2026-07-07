@@ -1668,6 +1668,9 @@ mod tests {
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"ipsec\"}} 0"
         )));
         assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"gre\"}} 0"
+        )));
+        assert!(body.contains(&format!(
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"vxlan\"}} 0"
         )));
         assert!(body.contains(&format!(

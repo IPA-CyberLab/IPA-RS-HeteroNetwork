@@ -66,13 +66,13 @@ use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
 use ipars_types::ebpf::{
     PacketFlowEvent, PACKET_FLOW_CONNTRACK_ASSURED, PACKET_FLOW_CONNTRACK_UNREPLIED,
     PACKET_FLOW_EVENT_VERSION, PACKET_FLOW_IP_FAMILY_IPV4, PACKET_FLOW_IP_FAMILY_IPV6,
-    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_TCP, PACKET_FLOW_PROTOCOL_UDP,
-    PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_RINGBUF_MAP, PACKET_FLOW_TCP_STATE_CLOSE,
-    PACKET_FLOW_TCP_STATE_CLOSE_WAIT, PACKET_FLOW_TCP_STATE_ESTABLISHED,
-    PACKET_FLOW_TCP_STATE_FIN_WAIT, PACKET_FLOW_TCP_STATE_LAST_ACK, PACKET_FLOW_TCP_STATE_LISTEN,
-    PACKET_FLOW_TCP_STATE_SYN_RECV, PACKET_FLOW_TCP_STATE_SYN_SENT,
-    PACKET_FLOW_TCP_STATE_SYN_SENT2, PACKET_FLOW_TCP_STATE_TIME_WAIT,
-    PACKET_FLOW_TCP_STATE_UNKNOWN,
+    PACKET_FLOW_PROTOCOL_ESP, PACKET_FLOW_PROTOCOL_GRE, PACKET_FLOW_PROTOCOL_ICMP,
+    PACKET_FLOW_PROTOCOL_TCP, PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN,
+    PACKET_FLOW_RINGBUF_MAP, PACKET_FLOW_TCP_STATE_CLOSE, PACKET_FLOW_TCP_STATE_CLOSE_WAIT,
+    PACKET_FLOW_TCP_STATE_ESTABLISHED, PACKET_FLOW_TCP_STATE_FIN_WAIT,
+    PACKET_FLOW_TCP_STATE_LAST_ACK, PACKET_FLOW_TCP_STATE_LISTEN, PACKET_FLOW_TCP_STATE_SYN_RECV,
+    PACKET_FLOW_TCP_STATE_SYN_SENT, PACKET_FLOW_TCP_STATE_SYN_SENT2,
+    PACKET_FLOW_TCP_STATE_TIME_WAIT, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpointKind,
@@ -10158,6 +10158,8 @@ fn transport_protocol_number(protocol: TransportProtocol) -> u8 {
         TransportProtocol::Icmp => 1,
         TransportProtocol::Tcp => 6,
         TransportProtocol::Udp => 17,
+        TransportProtocol::Gre => 47,
+        TransportProtocol::Esp => 50,
     }
 }
 
@@ -10530,6 +10532,8 @@ fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtoc
         PACKET_FLOW_PROTOCOL_ICMP => Some(TransportProtocol::Icmp),
         PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
         PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
+        PACKET_FLOW_PROTOCOL_GRE => Some(TransportProtocol::Gre),
+        PACKET_FLOW_PROTOCOL_ESP => Some(TransportProtocol::Esp),
         _ => anyhow::bail!("unsupported eBPF packet-flow protocol code {value}"),
     };
     Ok(protocol)
@@ -11098,6 +11102,8 @@ fn transport_protocol_from_ip_number(number: u8) -> Option<TransportProtocol> {
         1 => Some(TransportProtocol::Icmp),
         6 => Some(TransportProtocol::Tcp),
         17 => Some(TransportProtocol::Udp),
+        47 => Some(TransportProtocol::Gre),
+        50 => Some(TransportProtocol::Esp),
         _ => None,
     }
 }
@@ -11451,6 +11457,8 @@ fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProto
         "tcp" => Some(TransportProtocol::Tcp),
         "udp" => Some(TransportProtocol::Udp),
         "icmp" | "icmpv6" => Some(TransportProtocol::Icmp),
+        "gre" => Some(TransportProtocol::Gre),
+        "esp" => Some(TransportProtocol::Esp),
         _ => None,
     }
 }
@@ -13369,6 +13377,10 @@ mod tests {
         );
         assert_eq!(
             application_delta.get(&AgentPacketFlowApplication::Ipsec),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Gre),
             Some(&0)
         );
         assert_eq!(
@@ -15389,6 +15401,28 @@ mod tests {
             "100.64.0.11".parse::<IpAddr>()?
         );
         assert_eq!(unknown_source_flow.observation.source, None);
+
+        let mut gre_event = event;
+        gre_event[2] = PACKET_FLOW_PROTOCOL_GRE;
+        gre_event[3] = PACKET_FLOW_TCP_STATE_UNKNOWN;
+        gre_event[6..10].fill(0);
+        let gre_flow = parse_ebpf_ringbuf_packet_flow_event(&gre_event)?;
+        assert_eq!(gre_flow.observation.protocol, Some(TransportProtocol::Gre));
+        assert_eq!(
+            gre_flow.observation.application(),
+            AgentPacketFlowApplication::Gre
+        );
+        assert_eq!(gre_flow.observation.source_port, None);
+        assert_eq!(gre_flow.observation.destination_port, None);
+
+        let mut esp_event = gre_event;
+        esp_event[2] = PACKET_FLOW_PROTOCOL_ESP;
+        let esp_flow = parse_ebpf_ringbuf_packet_flow_event(&esp_event)?;
+        assert_eq!(esp_flow.observation.protocol, Some(TransportProtocol::Esp));
+        assert_eq!(
+            esp_flow.observation.application(),
+            AgentPacketFlowApplication::Ipsec
+        );
         Ok(())
     }
 
@@ -15875,6 +15909,26 @@ mod tests {
         assert_eq!(
             conntrack_paths(Some(PathBuf::from("/tmp/conntrack"))),
             vec![PathBuf::from("/tmp/conntrack")]
+        );
+    }
+
+    #[test]
+    fn conntrack_protocol_mapping_includes_tunnel_protocols() {
+        assert_eq!(
+            transport_protocol_from_ip_number(47),
+            Some(TransportProtocol::Gre)
+        );
+        assert_eq!(
+            transport_protocol_from_ip_number(50),
+            Some(TransportProtocol::Esp)
+        );
+        assert_eq!(
+            transport_protocol_from_conntrack_token("gre"),
+            Some(TransportProtocol::Gre)
+        );
+        assert_eq!(
+            transport_protocol_from_conntrack_token("esp"),
+            Some(TransportProtocol::Esp)
         );
     }
 

@@ -862,6 +862,8 @@ pub enum TransportProtocol {
     Tcp,
     Udp,
     Icmp,
+    Gre,
+    Esp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1777,6 +1779,7 @@ pub mod api {
         Elasticsearch,
         Ike,
         Ipsec,
+        Gre,
         Vxlan,
         Geneve,
         WireGuard,
@@ -1784,7 +1787,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 52] = [
+        pub const ALL: [Self; 53] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1833,6 +1836,7 @@ pub mod api {
             Self::Elasticsearch,
             Self::Ike,
             Self::Ipsec,
+            Self::Gre,
             Self::Vxlan,
             Self::Geneve,
             Self::WireGuard,
@@ -1889,6 +1893,7 @@ pub mod api {
                 Self::Elasticsearch => "elasticsearch",
                 Self::Ike => "ike",
                 Self::Ipsec => "ipsec",
+                Self::Gre => "gre",
                 Self::Vxlan => "vxlan",
                 Self::Geneve => "geneve",
                 Self::WireGuard => "wireguard",
@@ -2029,6 +2034,12 @@ pub mod api {
             }
             if self.protocol == Some(TransportProtocol::Icmp) {
                 return AgentPacketFlowApplication::Icmp;
+            }
+            if self.protocol == Some(TransportProtocol::Esp) {
+                return AgentPacketFlowApplication::Ipsec;
+            }
+            if self.protocol == Some(TransportProtocol::Gre) {
+                return AgentPacketFlowApplication::Gre;
             }
             if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
                 return AgentPacketFlowApplication::WireGuard;
@@ -2481,12 +2492,22 @@ pub mod api {
             AgentPacketFlowApplication::WireGuard
             | AgentPacketFlowApplication::Dhcp
             | AgentPacketFlowApplication::Ike
-            | AgentPacketFlowApplication::Ipsec
             | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Vxlan
             | AgentPacketFlowApplication::Geneve => {
                 require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
                     protocol == TransportProtocol::Udp
+                })
+            }
+            AgentPacketFlowApplication::Ipsec => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "UDP or ESP",
+                |protocol| matches!(protocol, TransportProtocol::Udp | TransportProtocol::Esp),
+            ),
+            AgentPacketFlowApplication::Gre => {
+                require_packet_flow_application_protocol(protocol, application, "GRE", |protocol| {
+                    protocol == TransportProtocol::Gre
                 })
             }
             AgentPacketFlowApplication::Dns
@@ -2951,7 +2972,12 @@ pub mod api {
             Some(TransportProtocol::Udp) => dns_message_payload(payload),
             Some(TransportProtocol::Tcp) => dns_tcp_payload(payload),
             None => dns_message_payload(payload) || dns_tcp_payload(payload),
-            Some(TransportProtocol::Any | TransportProtocol::Icmp) => false,
+            Some(
+                TransportProtocol::Any
+                | TransportProtocol::Icmp
+                | TransportProtocol::Gre
+                | TransportProtocol::Esp,
+            ) => false,
         }
     }
 
@@ -4303,7 +4329,12 @@ pub mod api {
                     payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
                 ) || kerberos_tcp_payload(payload)
             }
-            Some(TransportProtocol::Any | TransportProtocol::Icmp) => false,
+            Some(
+                TransportProtocol::Any
+                | TransportProtocol::Icmp
+                | TransportProtocol::Gre
+                | TransportProtocol::Esp,
+            ) => false,
         }
     }
 
@@ -8348,6 +8379,21 @@ mod tests {
             api::AgentPacketFlowApplication::WireGuard
         );
 
+        let native_esp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Esp),
+            ..Default::default()
+        };
+        assert_eq!(
+            native_esp.application(),
+            api::AgentPacketFlowApplication::Ipsec
+        );
+
+        let gre = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Gre),
+            ..Default::default()
+        };
+        assert_eq!(gre.application(), api::AgentPacketFlowApplication::Gre);
+
         let dhcp_client = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             source_port: Some(68),
@@ -11676,6 +11722,14 @@ mod tests {
         };
         assert!(error.contains("port metadata requires TCP or UDP protocol"));
 
+        let gre_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","destination_port":47}"#)?;
+        let error = match gre_with_port.validate_transport_metadata() {
+            Ok(()) => return Err("GRE observation with port metadata should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+
         let application_without_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"application":"postgres"}"#)?;
         application_without_protocol.validate_transport_metadata()?;
@@ -11732,13 +11786,29 @@ mod tests {
             serde_json::from_str(r#"{"protocol":"udp","application":"ipsec"}"#)?;
         udp_ipsec_hint.validate_transport_metadata()?;
 
+        let esp_ipsec_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"esp","application":"ipsec"}"#)?;
+        esp_ipsec_hint.validate_transport_metadata()?;
+
         let tcp_ipsec_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ipsec"}"#)?;
         let error = match tcp_ipsec_hint.validate_transport_metadata() {
             Ok(()) => return Err("TCP IPsec hint should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("application hint ipsec requires UDP protocol"));
+        assert!(error.contains("application hint ipsec requires UDP or ESP protocol"));
+
+        let gre_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"gre"}"#)?;
+        gre_hint.validate_transport_metadata()?;
+
+        let tcp_gre_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"gre"}"#)?;
+        let error = match tcp_gre_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP GRE hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint gre requires GRE protocol"));
 
         let udp_vxlan_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"vxlan"}"#)?;

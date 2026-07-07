@@ -470,6 +470,7 @@ pub struct AgentRuntime {
     packet_flow_application_elasticsearch_count: AtomicU64,
     packet_flow_application_ike_count: AtomicU64,
     packet_flow_application_ipsec_count: AtomicU64,
+    packet_flow_application_gre_count: AtomicU64,
     packet_flow_application_vxlan_count: AtomicU64,
     packet_flow_application_geneve_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
@@ -1094,6 +1095,7 @@ impl AgentRuntime {
             packet_flow_application_elasticsearch_count: AtomicU64::new(0),
             packet_flow_application_ike_count: AtomicU64::new(0),
             packet_flow_application_ipsec_count: AtomicU64::new(0),
+            packet_flow_application_gre_count: AtomicU64::new(0),
             packet_flow_application_vxlan_count: AtomicU64::new(0),
             packet_flow_application_geneve_count: AtomicU64::new(0),
             packet_flow_application_wireguard_count: AtomicU64::new(0),
@@ -1823,6 +1825,7 @@ impl AgentRuntime {
             }
             AgentPacketFlowApplication::Ike => &self.packet_flow_application_ike_count,
             AgentPacketFlowApplication::Ipsec => &self.packet_flow_application_ipsec_count,
+            AgentPacketFlowApplication::Gre => &self.packet_flow_application_gre_count,
             AgentPacketFlowApplication::Vxlan => &self.packet_flow_application_vxlan_count,
             AgentPacketFlowApplication::Geneve => &self.packet_flow_application_geneve_count,
             AgentPacketFlowApplication::WireGuard => &self.packet_flow_application_wireguard_count,
@@ -6084,6 +6087,32 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(ipsec_match.peer, peer_b_id);
+        let native_esp_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 63)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Esp),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(native_esp_match.peer, peer_b_id);
+        let gre_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 64)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Gre),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(gre_match.peer, peer_b_id);
 
         assert!(
             runtime
@@ -6567,8 +6596,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 41);
-        assert_eq!(metrics.packet_flow_match_count, 39);
+        assert_eq!(metrics.packet_flow_observation_count, 43);
+        assert_eq!(metrics.packet_flow_match_count, 41);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6580,7 +6609,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            39
+            41
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6601,7 +6630,8 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Ike), 1);
-        assert_eq!(application_count(AgentPacketFlowApplication::Ipsec), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Ipsec), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::Gre), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Vxlan), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Geneve), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
