@@ -6943,11 +6943,12 @@ async fn agent_requested_routes(args: &AgentArgs, node_id: NodeId) -> anyhow::Re
 }
 
 fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<Route> {
+    let mut cidrs = cidrs;
+    cidrs.sort();
     cidrs
         .into_iter()
-        .enumerate()
-        .map(|(index, cidr)| Route {
-            id: format!("docker-{index}"),
+        .map(|cidr| Route {
+            id: docker_route_id(&cidr),
             cidr,
             advertised_by: node_id.clone(),
             via: Some(node_id.clone()),
@@ -6955,6 +6956,37 @@ fn docker_advertised_routes(node_id: &NodeId, cidrs: Vec<ipnet::IpNet>) -> Vec<R
             tags: Default::default(),
         })
         .collect()
+}
+
+fn docker_route_id(cidr: &ipnet::IpNet) -> String {
+    match cidr {
+        ipnet::IpNet::V4(network) => {
+            let octets = network.network().octets();
+            format!(
+                "docker-v4-{}-{}-{}-{}-{}",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                network.prefix_len()
+            )
+        }
+        ipnet::IpNet::V6(network) => {
+            let segments = network.network().segments();
+            format!(
+                "docker-v6-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{}",
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                segments[4],
+                segments[5],
+                segments[6],
+                segments[7],
+                network.prefix_len()
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -21235,7 +21267,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let routes =
             docker_advertised_routes(&NodeId::from_string("node-a"), intent.container_cidrs);
         assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0].id, "docker-0");
+        assert_eq!(routes[0].id, "docker-v4-172-18-0-0-16");
+        assert_eq!(routes[1].id, "docker-v6-fd00-18-0-0-0-0-0-0-64");
         assert_eq!(routes[0].via, Some(NodeId::from_string("node-a")));
 
         let _ = std::fs::remove_dir_all(&base);
@@ -21453,16 +21486,48 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             let routes = agent_requested_routes(&args, node_id.clone()).await?;
 
             assert_eq!(routes.len(), 2);
-            assert_eq!(routes[0].id, "docker-0");
+            assert_eq!(routes[0].id, "docker-v4-172-18-0-0-16");
             assert_eq!(routes[0].cidr, "172.18.0.0/16".parse::<ipnet::IpNet>()?);
             assert_eq!(routes[0].advertised_by, node_id);
             assert_eq!(routes[0].via, Some(NodeId::from_string("node-a")));
-            assert_eq!(routes[1].id, "docker-1");
+            assert_eq!(routes[1].id, "docker-v4-172-19-0-0-16");
             assert_eq!(routes[1].cidr, "172.19.0.0/16".parse::<ipnet::IpNet>()?);
             return Ok(());
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn docker_advertised_routes_use_stable_cidr_derived_ids() -> anyhow::Result<()> {
+        let node_id = NodeId::from_string("node-a");
+        let routes = docker_advertised_routes(
+            &node_id,
+            vec![
+                "172.19.0.0/16".parse()?,
+                "fd00:18::/64".parse()?,
+                "172.18.0.0/16".parse()?,
+            ],
+        );
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "docker-v4-172-18-0-0-16",
+                "docker-v4-172-19-0-0-16",
+                "docker-v6-fd00-18-0-0-0-0-0-0-64",
+            ]
+        );
+        assert_eq!(routes[0].cidr, "172.18.0.0/16".parse::<ipnet::IpNet>()?);
+        assert_eq!(routes[1].cidr, "172.19.0.0/16".parse::<ipnet::IpNet>()?);
+        assert_eq!(routes[2].cidr, "fd00:18::/64".parse::<ipnet::IpNet>()?);
+        assert!(routes
+            .iter()
+            .all(|route| route.advertised_by == node_id && route.via == Some(node_id.clone())));
+        Ok(())
     }
 
     #[test]
