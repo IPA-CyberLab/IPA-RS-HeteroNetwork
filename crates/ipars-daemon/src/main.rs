@@ -7215,6 +7215,17 @@ fn validate_docker_api_socket_path(path: &Path, label: &str) -> anyhow::Result<(
     if value.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
     }
+    validate_docker_api_socket_path_components(value, label)?;
+    Ok(())
+}
+
+fn validate_docker_api_socket_path_components(value: &str, label: &str) -> anyhow::Result<()> {
+    if value
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        anyhow::bail!("{label} must not contain '.' or '..' path components");
+    }
     Ok(())
 }
 
@@ -22066,6 +22077,61 @@ exec sleep 60
             };
         assert!(rootless_error
             .contains("XDG_RUNTIME_DIR/docker.sock must be an absolute Unix socket path"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_socket_resolution_rejects_dot_components() -> anyhow::Result<()> {
+        let explicit_error = match resolve_docker_api_socket(
+            Some(Path::new("/run/user/1000/../docker.sock")),
+            None,
+            None,
+            |_| false,
+        ) {
+            Ok(path) => anyhow::bail!("dot-component explicit socket should be rejected: {path:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            explicit_error
+                .contains("--docker-api-socket must not contain '.' or '..' path components"),
+            "unexpected explicit socket error: {explicit_error}"
+        );
+
+        let docker_host_error = match resolve_docker_api_socket(
+            None,
+            Some(OsStr::new("unix:///tmp/../docker.sock")),
+            None,
+            |_| false,
+        ) {
+            Ok(path) => {
+                anyhow::bail!("dot-component DOCKER_HOST socket should be rejected: {path:?}")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            docker_host_error.contains(
+                "DOCKER_HOST unix:// socket path must not contain '.' or '..' path components"
+            ),
+            "unexpected DOCKER_HOST socket error: {docker_host_error}"
+        );
+
+        let rootless_error = match resolve_docker_api_socket(
+            None,
+            None,
+            Some(OsStr::new("/run/user/1000/..")),
+            |path| path == Path::new("/run/user/1000/../docker.sock"),
+        ) {
+            Ok(path) => {
+                anyhow::bail!("dot-component XDG runtime socket should be rejected: {path:?}")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            rootless_error.contains(
+                "XDG_RUNTIME_DIR/docker.sock must not contain '.' or '..' path components"
+            ),
+            "unexpected XDG runtime socket error: {rootless_error}"
+        );
         Ok(())
     }
 

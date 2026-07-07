@@ -4037,7 +4037,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string());
     }
     if args.docker_discover_networks {
-        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute dot-component-free non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
@@ -4096,7 +4096,7 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
         "docker_socket=/var/run/docker.sock".to_string()
     };
     let mut command = format!(
-        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; case \"$docker_socket\" in */../*|*/..|*/./*|*/.) echo \"Docker API socket path must not contain '.' or '..' path components\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
     );
     for network in &args.docker_networks {
         command.push_str("; ");
@@ -4184,6 +4184,17 @@ fn validate_docker_api_socket_path(path: &Path) -> anyhow::Result<()> {
         .context("--docker-api-socket must be valid UTF-8")?;
     if value.chars().any(char::is_control) {
         anyhow::bail!("--docker-api-socket must not contain control characters");
+    }
+    validate_docker_api_socket_path_components(value, "--docker-api-socket")?;
+    Ok(())
+}
+
+fn validate_docker_api_socket_path_components(value: &str, label: &str) -> anyhow::Result<()> {
+    if value
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        anyhow::bail!("{label} must not contain '.' or '..' path components");
     }
     Ok(())
 }
@@ -9792,6 +9803,8 @@ fi
         assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
         assert!(plan.commands[0]
             .contains("Docker API socket path must be an absolute Unix socket path"));
+        assert!(plan.commands[0]
+            .contains("Docker API socket path must not contain '.' or '..' path components"));
         assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
         Ok(())
     }
@@ -10061,6 +10074,18 @@ fi
         assert!(relative_api_socket
             .to_string()
             .contains("--docker-api-socket must be an absolute Unix socket path"));
+
+        let dot_component_api_socket = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/../docker.sock")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("dot-component Docker API socket path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(dot_component_api_socket
+            .to_string()
+            .contains("--docker-api-socket must not contain '.' or '..' path components"));
 
         let inactive_api_socket = match docker_install_plan(DockerInstallArgs {
             docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
