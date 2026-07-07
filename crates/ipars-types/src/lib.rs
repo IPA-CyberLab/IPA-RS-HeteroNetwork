@@ -1731,6 +1731,7 @@ pub mod api {
     pub enum AgentPacketFlowApplication {
         Unknown,
         Dns,
+        Dhcp,
         Http,
         Https,
         Ssh,
@@ -1778,9 +1779,10 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 46] = [
+        pub const ALL: [Self; 47] = [
             Self::Unknown,
             Self::Dns,
+            Self::Dhcp,
             Self::Http,
             Self::Https,
             Self::Ssh,
@@ -1831,6 +1833,7 @@ pub mod api {
             match self {
                 Self::Unknown => "unknown",
                 Self::Dns => "dns",
+                Self::Dhcp => "dhcp",
                 Self::Http => "http",
                 Self::Https => "https",
                 Self::Ssh => "ssh",
@@ -2079,6 +2082,11 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Dns;
             }
+            if (self.involves_port(67) || self.involves_port(68))
+                && protocol_is(self.protocol, TransportProtocol::Udp)
+            {
+                return AgentPacketFlowApplication::Dhcp;
+            }
             if self.involves_port(80) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Http;
             }
@@ -2305,6 +2313,12 @@ pub mod api {
                 return Some(AgentPacketFlowApplication::Dns);
             }
             if protocol_is(self.protocol, TransportProtocol::Udp)
+                && (self.involves_port(67) || self.involves_port(68))
+                && dhcp_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Dhcp);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Udp)
                 && self.involves_port(443)
                 && quic_long_header_payload(payload)
             {
@@ -2399,7 +2413,7 @@ pub mod api {
                 "ICMP",
                 |protocol| protocol == TransportProtocol::Icmp,
             ),
-            AgentPacketFlowApplication::WireGuard => {
+            AgentPacketFlowApplication::WireGuard | AgentPacketFlowApplication::Dhcp => {
                 require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
                     protocol == TransportProtocol::Udp
                 })
@@ -2889,6 +2903,31 @@ pub mod api {
             return false;
         }
         dns_question_payload(payload)
+    }
+
+    fn dhcp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 44 || !matches!(payload[0], 1 | 2) {
+            return false;
+        }
+        let hardware_len = payload[2] as usize;
+        if hardware_len == 0 || hardware_len > 16 || payload[3] > 16 {
+            return false;
+        }
+        if payload[4..8].iter().all(|byte| *byte == 0) {
+            return false;
+        }
+        let flags = u16::from_be_bytes([payload[10], payload[11]]);
+        if flags & 0x7fff != 0 {
+            return false;
+        }
+        let client_hardware_end = 28 + hardware_len;
+        if payload[28..client_hardware_end]
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return false;
+        }
+        payload.len() < 240 || payload.get(236..240) == Some(&[99, 130, 83, 99][..])
     }
 
     fn dns_question_payload(payload: &[u8]) -> bool {
@@ -8062,6 +8101,28 @@ mod tests {
             api::AgentPacketFlowApplication::WireGuard
         );
 
+        let dhcp_client = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(68),
+            destination_port: Some(67),
+            ..Default::default()
+        };
+        assert_eq!(
+            dhcp_client.application(),
+            api::AgentPacketFlowApplication::Dhcp
+        );
+
+        let dhcp_server = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(67),
+            destination_port: Some(68),
+            ..Default::default()
+        };
+        assert_eq!(
+            dhcp_server.application(),
+            api::AgentPacketFlowApplication::Dhcp
+        );
+
         let https = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(443),
@@ -8976,6 +9037,13 @@ mod tests {
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
+        let observation_for_dhcp_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(68),
+            destination_port: Some(67),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
         let dns_query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
             b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l', b'o', b'c',
@@ -9004,6 +9072,18 @@ mod tests {
         assert_eq!(
             malformed_dns_like.application(),
             api::AgentPacketFlowApplication::Unknown
+        );
+
+        let mut dhcp_discover_prefix = vec![0_u8; 44];
+        dhcp_discover_prefix[0] = 1;
+        dhcp_discover_prefix[1] = 1;
+        dhcp_discover_prefix[2] = 6;
+        dhcp_discover_prefix[4..8].copy_from_slice(&0x3903_f326_u32.to_be_bytes());
+        dhcp_discover_prefix[10..12].copy_from_slice(&0x8000_u16.to_be_bytes());
+        dhcp_discover_prefix[28..34].copy_from_slice(&[0x02, 0x00, 0x5e, 0x10, 0x00, 0x01]);
+        assert_eq!(
+            observation_for_dhcp_payload(&dhcp_discover_prefix).application(),
+            api::AgentPacketFlowApplication::Dhcp
         );
 
         let snmp_get_request = vec![
@@ -11100,6 +11180,18 @@ mod tests {
         let tcp_dns_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"dns"}"#)?;
         tcp_dns_hint.validate_transport_metadata()?;
+
+        let udp_dhcp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"dhcp"}"#)?;
+        udp_dhcp_hint.validate_transport_metadata()?;
+
+        let tcp_dhcp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"dhcp"}"#)?;
+        let error = match tcp_dhcp_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP DHCP hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint dhcp requires UDP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;

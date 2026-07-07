@@ -424,6 +424,7 @@ pub struct AgentRuntime {
     packet_flow_classification_closed_count: AtomicU64,
     packet_flow_application_unknown_count: AtomicU64,
     packet_flow_application_dns_count: AtomicU64,
+    packet_flow_application_dhcp_count: AtomicU64,
     packet_flow_application_http_count: AtomicU64,
     packet_flow_application_https_count: AtomicU64,
     packet_flow_application_ssh_count: AtomicU64,
@@ -1042,6 +1043,7 @@ impl AgentRuntime {
             packet_flow_classification_closed_count: AtomicU64::new(0),
             packet_flow_application_unknown_count: AtomicU64::new(0),
             packet_flow_application_dns_count: AtomicU64::new(0),
+            packet_flow_application_dhcp_count: AtomicU64::new(0),
             packet_flow_application_http_count: AtomicU64::new(0),
             packet_flow_application_https_count: AtomicU64::new(0),
             packet_flow_application_ssh_count: AtomicU64::new(0),
@@ -1755,6 +1757,7 @@ impl AgentRuntime {
         match application {
             AgentPacketFlowApplication::Unknown => &self.packet_flow_application_unknown_count,
             AgentPacketFlowApplication::Dns => &self.packet_flow_application_dns_count,
+            AgentPacketFlowApplication::Dhcp => &self.packet_flow_application_dhcp_count,
             AgentPacketFlowApplication::Http => &self.packet_flow_application_http_count,
             AgentPacketFlowApplication::Https => &self.packet_flow_application_https_count,
             AgentPacketFlowApplication::Ssh => &self.packet_flow_application_ssh_count,
@@ -5977,6 +5980,22 @@ mod tests {
         assert!(route_match.pinned);
         assert!(runtime.should_connect_peer(&peer_b).await);
 
+        let dhcp_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 56)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    source_port: Some(68),
+                    destination_port: Some(67),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(dhcp_match.peer, peer_b_id);
+
         assert!(
             runtime
                 .record_packet_flow_activity(
@@ -6445,8 +6464,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 34);
-        assert_eq!(metrics.packet_flow_match_count, 32);
+        assert_eq!(metrics.packet_flow_observation_count, 35);
+        assert_eq!(metrics.packet_flow_match_count, 33);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6458,7 +6477,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            32
+            33
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6477,6 +6496,7 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
         assert_eq!(
             application_count(AgentPacketFlowApplication::KubernetesApi),
