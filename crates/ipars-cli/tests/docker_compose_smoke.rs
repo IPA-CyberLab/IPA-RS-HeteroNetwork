@@ -32,13 +32,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         path: temp_dir.clone(),
     };
 
-    let tcp_ports = reserve_tcp_ports(5)?;
+    let tcp_ports = reserve_tcp_ports(6)?;
     let udp_ports = reserve_udp_ports(3)?;
     let control_plane_port = tcp_ports.ports[0];
     let signal_port = tcp_ports.ports[1];
     let relay_http_port = tcp_ports.ports[2];
     let agent_port = tcp_ports.ports[3];
     let stun_http_port = tcp_ports.ports[4];
+    let agent_b_port = tcp_ports.ports[5];
     let stun_port = udp_ports.ports[0];
     let stun_alternate_port = udp_ports.ports[1];
     let relay_udp_port = udp_ports.ports[2];
@@ -54,6 +55,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
 
     let override_path = temp_dir.join("compose.override.yaml");
     let override_config = ComposeOverrideConfig {
+        repo_root: &repo_root,
         cluster_id: &cluster_id,
         issuer_node_id: &issuer_node_id,
         issuer_public_key: &issuer_public_key,
@@ -68,6 +70,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             relay_udp: relay_udp_port,
             relay_http: relay_http_port,
             agent: agent_port,
+            agent_b: agent_b_port,
         },
     };
     fs::write(&override_path, compose_override(&override_config))
@@ -310,9 +313,17 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             "stun",
             "relay",
             "agent",
+            "agent-b",
         ],
     )?;
-    assert_compose_service_apis(&compose, &ComposeApiPorts { agent: agent_port })?;
+    let agent_nodes = assert_compose_service_apis(
+        &compose,
+        &ComposeApiPorts {
+            agent: agent_port,
+            agent_b: agent_b_port,
+        },
+    )?;
+    assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
@@ -345,6 +356,7 @@ fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
 }
 
 struct ComposeOverrideConfig<'a> {
+    repo_root: &'a Path,
     cluster_id: &'a str,
     issuer_node_id: &'a str,
     issuer_public_key: &'a str,
@@ -362,10 +374,17 @@ struct ComposeOverridePorts {
     relay_udp: u16,
     relay_http: u16,
     agent: u16,
+    agent_b: u16,
 }
 
 struct ComposeApiPorts {
     agent: u16,
+    agent_b: u16,
+}
+
+struct ComposeAgentNodes {
+    agent: String,
+    agent_b: String,
 }
 
 fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
@@ -444,7 +463,53 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       timeout: 3s
       retries: 6
       start_period: 10s
+
+  agent-b:
+    build:
+      context: {repo_root}
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    network_mode: host
+    volumes:
+      - agent-b-data:/var/lib/ipars
+    environment:
+      IPARS_ROLE: agent
+      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+    command:
+      - agent
+      - --listen
+      - 0.0.0.0:{agent_b_port}
+      - --state-path
+      - /var/lib/ipars/agent-b.json
+      - --runtime-backend
+      - dry-run
+      - --stun-server
+      - 127.0.0.1:{stun_port}
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      signal:
+        condition: service_healthy
+      stun:
+        condition: service_healthy
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{agent_b_port}/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  agent-b-data:
 "#,
+        repo_root = yaml_single_quoted(&config.repo_root.display().to_string()),
         cluster_id = config.cluster_id,
         issuer_node_id = config.issuer_node_id,
         issuer_public_key = config.issuer_public_key,
@@ -458,6 +523,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
         relay_udp_port = config.ports.relay_udp,
         relay_http_port = config.ports.relay_http,
         agent_port = config.ports.agent,
+        agent_b_port = config.ports.agent_b,
     )
 }
 
@@ -582,15 +648,18 @@ fn assert_compose_services_running(compose: &ComposeProject, expected: &[&str]) 
     Ok(())
 }
 
-fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts) -> Result<()> {
+fn assert_compose_service_apis(
+    compose: &ComposeProject,
+    ports: &ComposeApiPorts,
+) -> Result<ComposeAgentNodes> {
     let control_plane_metrics = wait_for_json(
         compose,
         "control-plane metrics",
         "control-plane",
         "http://127.0.0.1:8443/v1/metrics",
         |value| {
-            ensure_json_u64_at_least(value, "node_count", 1)?;
-            ensure_json_u64_at_least(value, "vpn_pool_allocated_count", 1)?;
+            ensure_json_u64_at_least(value, "node_count", 2)?;
+            ensure_json_u64_at_least(value, "vpn_pool_allocated_count", 2)?;
             Ok(())
         },
     )?;
@@ -605,8 +674,8 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
         "signal",
         "http://127.0.0.1:9443/v1/metrics",
         |value| {
-            ensure_json_u64_at_least(value, "node_count", 1)?;
-            ensure_json_u64_at_least(value, "node_upsert_count", 1)?;
+            ensure_json_u64_at_least(value, "node_count", 2)?;
+            ensure_json_u64_at_least(value, "node_upsert_count", 2)?;
             Ok(())
         },
     )?;
@@ -636,11 +705,26 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
         },
     )?;
 
-    wait_for_json(
+    let agent = assert_compose_agent_status(compose, "agent", ports.agent)?;
+    let agent_b = assert_compose_agent_status(compose, "agent-b", ports.agent_b)?;
+    anyhow::ensure!(
+        agent != agent_b,
+        "Compose smoke agents unexpectedly registered the same node_id {agent:?}"
+    );
+
+    Ok(ComposeAgentNodes { agent, agent_b })
+}
+
+fn assert_compose_agent_status(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+) -> Result<String> {
+    let status = wait_for_json(
         compose,
-        "agent status",
-        "agent",
-        &format!("http://127.0.0.1:{}/v1/status", ports.agent),
+        &format!("{service} status"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/status"),
         |value| {
             ensure_json_string_nonempty(value, "node_id")?;
             ensure_json_string_nonempty(value, "identity_public_key")?;
@@ -659,6 +743,54 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
         },
     )?;
 
+    json_string_required(&status, "node_id")
+}
+
+fn assert_compose_control_plane_peer_maps(
+    compose: &ComposeProject,
+    nodes: &ComposeAgentNodes,
+) -> Result<()> {
+    wait_for_json(
+        compose,
+        "control-plane peer map for agent",
+        "control-plane",
+        &format!("http://127.0.0.1:8443/v1/peers/{}", nodes.agent),
+        |value| ensure_peer_map_contains(value, &nodes.agent_b),
+    )?;
+    wait_for_json(
+        compose,
+        "control-plane peer map for agent-b",
+        "control-plane",
+        &format!("http://127.0.0.1:8443/v1/peers/{}", nodes.agent_b),
+        |value| ensure_peer_map_contains(value, &nodes.agent),
+    )?;
+    wait_for_json(
+        compose,
+        "control-plane metrics after two-agent peer maps",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "peer_map_visible_count", 2)?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn ensure_peer_map_contains(value: &Value, expected_node_id: &str) -> Result<()> {
+    let peers = value
+        .get("peers")
+        .and_then(Value::as_array)
+        .context("peer map missing peers array")?;
+    let peer_ids = peers
+        .iter()
+        .map(|peer| json_string_required(peer, "node_id"))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        peer_ids.iter().any(|node_id| node_id == expected_node_id),
+        "peer map did not include expected node {expected_node_id}: {value}"
+    );
     Ok(())
 }
 
@@ -1063,6 +1195,12 @@ fn parse_compose_ps(stdout: &[u8]) -> Result<Vec<Value>> {
 
 fn json_string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
+}
+
+fn json_string_required(value: &Value, field: &str) -> Result<String> {
+    json_string_field(value, &[field])
+        .map(ToString::to_string)
+        .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))
 }
 
 fn compose_diagnostics(compose: &ComposeProject) -> String {
