@@ -34,6 +34,8 @@ const ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
 const ASYMMETRIC_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_snat_network_namespaces";
 const SIGNAL_PLAN_TEST_NAME: &str = "udp_hole_puncher_uses_signal_plan_between_network_namespaces";
+const SIGNAL_PLAN_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namespaces";
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -268,6 +270,61 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
     let _ = fs::remove_file(ready_a);
     let _ = fs::remove_file(ready_b);
     Ok(())
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping signal-plan fixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    let topology = TwoSidedSnatTopology {
+        private_second_octet: 250,
+        public_third_octet: 8,
+        left_bind_port: 40101,
+        right_bind_port: 40102,
+        left_reflexive_port: 50101,
+        right_reflexive_port: 50102,
+        left_snat_port: Some(50101),
+        right_snat_port: Some(50102),
+        expect_hole_punch_success: true,
+    };
+    let plan_json = signal_plan_json(
+        "node-a",
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            topology.left_reflexive_port,
+        ),
+        "node-b",
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            topology.right_reflexive_port,
+        ),
+    )
+    .await?;
+
+    run_two_sided_snat_hole_punch_topology_with_signal_plan(
+        SIGNAL_PLAN_NAT_TEST_NAME,
+        "signat",
+        topology,
+        plan_json.as_str(),
+    )
 }
 
 #[tokio::test]
@@ -584,6 +641,24 @@ fn run_two_sided_snat_hole_punch_topology(
     label: &str,
     topology: TwoSidedSnatTopology,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_two_sided_snat_hole_punch_topology_with_plan(test_name, label, topology, None)
+}
+
+fn run_two_sided_snat_hole_punch_topology_with_signal_plan(
+    test_name: &str,
+    label: &str,
+    topology: TwoSidedSnatTopology,
+    plan_json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_two_sided_snat_hole_punch_topology_with_plan(test_name, label, topology, Some(plan_json))
+}
+
+fn run_two_sided_snat_hole_punch_topology_with_plan(
+    test_name: &str,
+    label: &str,
+    topology: TwoSidedSnatTopology,
+    plan_json: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let suffix = unique_suffix()?;
     let left_namespace = format!("ipars-hp-left-{suffix}");
     let left_nat_namespace = format!("ipars-hp-lnat-{suffix}");
@@ -696,46 +771,45 @@ fn run_two_sided_snat_hole_punch_topology(
         "nat-duplex-timeout"
     };
 
-    let left = spawn_child(
-        test_name,
-        &left_namespace,
-        [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-            ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
-            (
-                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
-                source_reflexive.as_str(),
-            ),
-            (
-                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
-                target_reflexive.as_str(),
-            ),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
-            ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
-            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
-        ],
-    )?;
-    let right = spawn_child(
-        test_name,
-        &right_namespace,
-        [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-            ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
-            (
-                "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
-                source_reflexive.as_str(),
-            ),
-            (
-                "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
-                target_reflexive.as_str(),
-            ),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
-            ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
-            ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
-        ],
-    )?;
+    let mut left_env = vec![
+        ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
+        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+        ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            source_reflexive.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            target_reflexive.as_str(),
+        ),
+        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+        ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
+        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+    ];
+    let mut right_env = vec![
+        ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
+        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+        ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            source_reflexive.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            target_reflexive.as_str(),
+        ),
+        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+        ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
+        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+    ];
+    if let Some(plan_json) = plan_json {
+        left_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
+        right_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
+    }
+
+    let left = spawn_child(test_name, &left_namespace, left_env)?;
+    let right = spawn_child(test_name, &right_namespace, right_env)?;
     wait_for_file(&left_ready)?;
     wait_for_file(&right_ready)?;
     fs::write(&start_file, b"start")?;
@@ -1000,12 +1074,16 @@ async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::E
     fs::write(&ready_file, b"ready")?;
     wait_for_file(&start_file)?;
 
-    let plan = SignalHolePunchPlanResponse {
-        key: PeerPathKey::new(NodeId::from_string("node-a"), NodeId::from_string("node-b")),
-        source_reflexive: Some(reflexive_candidate_addr("node-a", source_reflexive)),
-        target_reflexive: Some(reflexive_candidate_addr("node-b", target_reflexive)),
-        start_after_millis: 0,
-        expires_at: Utc::now() + ChronoDuration::seconds(10),
+    let plan = if let Ok(plan_json) = std::env::var("IPARS_HOLE_PUNCH_PLAN_JSON") {
+        serde_json::from_str::<SignalHolePunchPlanResponse>(&plan_json)?
+    } else {
+        SignalHolePunchPlanResponse {
+            key: PeerPathKey::new(NodeId::from_string("node-a"), NodeId::from_string("node-b")),
+            source_reflexive: Some(reflexive_candidate_addr("node-a", source_reflexive)),
+            target_reflexive: Some(reflexive_candidate_addr("node-b", target_reflexive)),
+            start_after_millis: 0,
+            expires_at: Utc::now() + ChronoDuration::seconds(10),
+        }
     };
 
     let sent = UdpHolePuncher::new(bind)
@@ -1217,11 +1295,14 @@ fn enable_snat_namespace(
     command_dynamic("ip", &args)
 }
 
-fn spawn_child<const N: usize>(
+fn spawn_child<'a, I>(
     test_name: &str,
     namespace: &str,
-    envs: [(&str, &str); N],
-) -> Result<Child, Box<dyn std::error::Error>> {
+    envs: I,
+) -> Result<Child, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
     let mut command = Command::new("ip");
     command
         .args(["netns", "exec", namespace])
