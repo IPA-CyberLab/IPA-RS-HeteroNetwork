@@ -859,10 +859,12 @@ pub struct AclRule {
 #[serde(rename_all = "snake_case")]
 pub enum TransportProtocol {
     Any,
+    IpInIp,
     Tcp,
     Udp,
     Sctp,
     Icmp,
+    Ipv6Encap,
     Gre,
     Esp,
     Ah,
@@ -1784,6 +1786,7 @@ pub mod api {
         Elasticsearch,
         Ike,
         Ipsec,
+        IpTunnel,
         Gre,
         Vxlan,
         Geneve,
@@ -1792,7 +1795,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 53] = [
+        pub const ALL: [Self; 54] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1841,6 +1844,7 @@ pub mod api {
             Self::Elasticsearch,
             Self::Ike,
             Self::Ipsec,
+            Self::IpTunnel,
             Self::Gre,
             Self::Vxlan,
             Self::Geneve,
@@ -1898,6 +1902,7 @@ pub mod api {
                 Self::Elasticsearch => "elasticsearch",
                 Self::Ike => "ike",
                 Self::Ipsec => "ipsec",
+                Self::IpTunnel => "ip_tunnel",
                 Self::Gre => "gre",
                 Self::Vxlan => "vxlan",
                 Self::Geneve => "geneve",
@@ -2047,6 +2052,12 @@ pub mod api {
                 Some(TransportProtocol::Esp | TransportProtocol::Ah)
             ) {
                 return AgentPacketFlowApplication::Ipsec;
+            }
+            if matches!(
+                self.protocol,
+                Some(TransportProtocol::IpInIp | TransportProtocol::Ipv6Encap)
+            ) {
+                return AgentPacketFlowApplication::IpTunnel;
             }
             if self.protocol == Some(TransportProtocol::Gre) {
                 return AgentPacketFlowApplication::Gre;
@@ -2520,6 +2531,17 @@ pub mod api {
                     )
                 },
             ),
+            AgentPacketFlowApplication::IpTunnel => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "IP-in-IP or IPv6 encapsulation",
+                |protocol| {
+                    matches!(
+                        protocol,
+                        TransportProtocol::IpInIp | TransportProtocol::Ipv6Encap
+                    )
+                },
+            ),
             AgentPacketFlowApplication::Gre => {
                 require_packet_flow_application_protocol(protocol, application, "GRE", |protocol| {
                     protocol == TransportProtocol::Gre
@@ -2989,8 +3011,10 @@ pub mod api {
             None => dns_message_payload(payload) || dns_tcp_payload(payload),
             Some(
                 TransportProtocol::Any
+                | TransportProtocol::IpInIp
                 | TransportProtocol::Icmp
                 | TransportProtocol::Sctp
+                | TransportProtocol::Ipv6Encap
                 | TransportProtocol::Gre
                 | TransportProtocol::Esp
                 | TransportProtocol::Ah,
@@ -4348,8 +4372,10 @@ pub mod api {
             }
             Some(
                 TransportProtocol::Any
+                | TransportProtocol::IpInIp
                 | TransportProtocol::Icmp
                 | TransportProtocol::Sctp
+                | TransportProtocol::Ipv6Encap
                 | TransportProtocol::Gre
                 | TransportProtocol::Esp
                 | TransportProtocol::Ah,
@@ -8416,6 +8442,24 @@ mod tests {
             api::AgentPacketFlowApplication::Ipsec
         );
 
+        let ip_in_ip = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::IpInIp),
+            ..Default::default()
+        };
+        assert_eq!(
+            ip_in_ip.application(),
+            api::AgentPacketFlowApplication::IpTunnel
+        );
+
+        let ipv6_encap = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Ipv6Encap),
+            ..Default::default()
+        };
+        assert_eq!(
+            ipv6_encap.application(),
+            api::AgentPacketFlowApplication::IpTunnel
+        );
+
         let gre = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Gre),
             ..Default::default()
@@ -11779,6 +11823,16 @@ mod tests {
         };
         assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
 
+        let ip_tunnel_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"ip_in_ip","destination_port":4}"#)?;
+        let error = match ip_tunnel_with_port.validate_transport_metadata() {
+            Ok(()) => {
+                return Err("IP-in-IP observation with port metadata should be rejected".into());
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
+
         let application_without_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"application":"postgres"}"#)?;
         application_without_protocol.validate_transport_metadata()?;
@@ -11842,6 +11896,24 @@ mod tests {
         let ah_ipsec_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"ah","application":"ipsec"}"#)?;
         ah_ipsec_hint.validate_transport_metadata()?;
+
+        let ip_tunnel_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"ip_in_ip","application":"ip_tunnel"}"#)?;
+        ip_tunnel_hint.validate_transport_metadata()?;
+
+        let ipv6_tunnel_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"ipv6_encap","application":"ip_tunnel"}"#)?;
+        ipv6_tunnel_hint.validate_transport_metadata()?;
+
+        let tcp_ip_tunnel_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"ip_tunnel"}"#)?;
+        let error = match tcp_ip_tunnel_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP IP tunnel hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains(
+            "application hint ip_tunnel requires IP-in-IP or IPv6 encapsulation protocol"
+        ));
 
         let tcp_ipsec_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ipsec"}"#)?;

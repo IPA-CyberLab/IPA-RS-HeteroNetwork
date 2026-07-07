@@ -67,9 +67,10 @@ use ipars_types::ebpf::{
     PacketFlowEvent, PACKET_FLOW_CONNTRACK_ASSURED, PACKET_FLOW_CONNTRACK_UNREPLIED,
     PACKET_FLOW_EVENT_VERSION, PACKET_FLOW_IP_FAMILY_IPV4, PACKET_FLOW_IP_FAMILY_IPV6,
     PACKET_FLOW_PROTOCOL_AH, PACKET_FLOW_PROTOCOL_ESP, PACKET_FLOW_PROTOCOL_GRE,
-    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_ICMPV6, PACKET_FLOW_PROTOCOL_SCTP,
-    PACKET_FLOW_PROTOCOL_TCP, PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN,
-    PACKET_FLOW_RINGBUF_MAP, PACKET_FLOW_TCP_STATE_CLOSE, PACKET_FLOW_TCP_STATE_CLOSE_WAIT,
+    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_ICMPV6, PACKET_FLOW_PROTOCOL_IPIP,
+    PACKET_FLOW_PROTOCOL_IPV6_ENCAP, PACKET_FLOW_PROTOCOL_SCTP, PACKET_FLOW_PROTOCOL_TCP,
+    PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_RINGBUF_MAP,
+    PACKET_FLOW_TCP_STATE_CLOSE, PACKET_FLOW_TCP_STATE_CLOSE_WAIT,
     PACKET_FLOW_TCP_STATE_ESTABLISHED, PACKET_FLOW_TCP_STATE_FIN_WAIT,
     PACKET_FLOW_TCP_STATE_LAST_ACK, PACKET_FLOW_TCP_STATE_LISTEN, PACKET_FLOW_TCP_STATE_SYN_RECV,
     PACKET_FLOW_TCP_STATE_SYN_SENT, PACKET_FLOW_TCP_STATE_SYN_SENT2,
@@ -10156,10 +10157,12 @@ impl From<&PacketFlowRecord> for PacketFlowFingerprint {
 fn transport_protocol_number(protocol: TransportProtocol) -> u8 {
     match protocol {
         TransportProtocol::Any => 0,
+        TransportProtocol::IpInIp => 4,
         TransportProtocol::Icmp => 1,
         TransportProtocol::Tcp => 6,
         TransportProtocol::Udp => 17,
         TransportProtocol::Sctp => 132,
+        TransportProtocol::Ipv6Encap => 41,
         TransportProtocol::Gre => 47,
         TransportProtocol::Esp => 50,
         TransportProtocol::Ah => 51,
@@ -10533,8 +10536,10 @@ fn ebpf_packet_flow_protocol(value: u8) -> anyhow::Result<Option<TransportProtoc
     let protocol = match value {
         PACKET_FLOW_PROTOCOL_UNKNOWN => None,
         PACKET_FLOW_PROTOCOL_ICMP | PACKET_FLOW_PROTOCOL_ICMPV6 => Some(TransportProtocol::Icmp),
+        PACKET_FLOW_PROTOCOL_IPIP => Some(TransportProtocol::IpInIp),
         PACKET_FLOW_PROTOCOL_TCP => Some(TransportProtocol::Tcp),
         PACKET_FLOW_PROTOCOL_UDP => Some(TransportProtocol::Udp),
+        PACKET_FLOW_PROTOCOL_IPV6_ENCAP => Some(TransportProtocol::Ipv6Encap),
         PACKET_FLOW_PROTOCOL_SCTP => Some(TransportProtocol::Sctp),
         PACKET_FLOW_PROTOCOL_GRE => Some(TransportProtocol::Gre),
         PACKET_FLOW_PROTOCOL_ESP => Some(TransportProtocol::Esp),
@@ -11105,8 +11110,10 @@ fn parse_conntrack_proto_tuple(
 fn transport_protocol_from_ip_number(number: u8) -> Option<TransportProtocol> {
     match number {
         1 => Some(TransportProtocol::Icmp),
+        4 => Some(TransportProtocol::IpInIp),
         6 => Some(TransportProtocol::Tcp),
         17 => Some(TransportProtocol::Udp),
+        41 => Some(TransportProtocol::Ipv6Encap),
         132 => Some(TransportProtocol::Sctp),
         47 => Some(TransportProtocol::Gre),
         50 => Some(TransportProtocol::Esp),
@@ -11462,9 +11469,11 @@ fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
 
 fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProtocol> {
     match token {
+        "ipip" | "ipencap" => Some(TransportProtocol::IpInIp),
         "tcp" => Some(TransportProtocol::Tcp),
         "udp" => Some(TransportProtocol::Udp),
         "sctp" => Some(TransportProtocol::Sctp),
+        "ipv6-encap" | "ipv6_encap" => Some(TransportProtocol::Ipv6Encap),
         "icmp" | "icmpv6" | "ipv6-icmp" => Some(TransportProtocol::Icmp),
         "gre" => Some(TransportProtocol::Gre),
         "esp" => Some(TransportProtocol::Esp),
@@ -15448,6 +15457,30 @@ mod tests {
             AgentPacketFlowApplication::Ipsec
         );
 
+        let mut ipip_event = gre_event;
+        ipip_event[2] = PACKET_FLOW_PROTOCOL_IPIP;
+        let ipip_flow = parse_ebpf_ringbuf_packet_flow_event(&ipip_event)?;
+        assert_eq!(
+            ipip_flow.observation.protocol,
+            Some(TransportProtocol::IpInIp)
+        );
+        assert_eq!(
+            ipip_flow.observation.application(),
+            AgentPacketFlowApplication::IpTunnel
+        );
+
+        let mut ipv6_encap_event = gre_event;
+        ipv6_encap_event[2] = PACKET_FLOW_PROTOCOL_IPV6_ENCAP;
+        let ipv6_encap_flow = parse_ebpf_ringbuf_packet_flow_event(&ipv6_encap_event)?;
+        assert_eq!(
+            ipv6_encap_flow.observation.protocol,
+            Some(TransportProtocol::Ipv6Encap)
+        );
+        assert_eq!(
+            ipv6_encap_flow.observation.application(),
+            AgentPacketFlowApplication::IpTunnel
+        );
+
         let mut sctp_event = event;
         sctp_event[2] = PACKET_FLOW_PROTOCOL_SCTP;
         sctp_event[3] = PACKET_FLOW_TCP_STATE_UNKNOWN;
@@ -15987,6 +16020,14 @@ mod tests {
             Some(TransportProtocol::Ah)
         );
         assert_eq!(
+            transport_protocol_from_ip_number(4),
+            Some(TransportProtocol::IpInIp)
+        );
+        assert_eq!(
+            transport_protocol_from_ip_number(41),
+            Some(TransportProtocol::Ipv6Encap)
+        );
+        assert_eq!(
             transport_protocol_from_ip_number(58),
             Some(TransportProtocol::Icmp)
         );
@@ -16005,6 +16046,15 @@ mod tests {
         assert_eq!(
             transport_protocol_from_conntrack_token("ah"),
             Some(TransportProtocol::Ah)
+        );
+        assert_eq!(
+            transport_protocol_from_conntrack_token("ipencap"),
+            Some(TransportProtocol::IpInIp)
+        );
+        assert_eq!(transport_protocol_from_conntrack_token("ipv6"), None);
+        assert_eq!(
+            transport_protocol_from_conntrack_token("ipv6-encap"),
+            Some(TransportProtocol::Ipv6Encap)
         );
         assert_eq!(
             transport_protocol_from_conntrack_token("ipv6-icmp"),
