@@ -1114,6 +1114,58 @@ mod tests {
     }
 
     #[test]
+    fn direct_public_is_used_when_ipv6_direct_is_disabled() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy {
+            allow_ipv6_direct: false,
+            ..ClusterPolicy::default()
+        });
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate(),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "state=DirectPublic"));
+    }
+
+    #[test]
+    fn nat_traversal_is_not_used_when_policy_disables_it() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy {
+            allow_nat_traversal: false,
+            ..ClusterPolicy::default()
+        });
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![candidate(EndpointCandidateKind::StunReflexive)]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
     fn stale_ipv6_candidate_is_not_used_for_direct_path() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
         let response = coordinator.negotiate(
@@ -1318,6 +1370,37 @@ mod tests {
 
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_does_not_use_relay_fallback_when_policy_disables_it(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            allow_relay_fallback: false,
+            ..ClusterPolicy::default()
+        });
+        registry.upsert_node(source(Vec::new())).await?;
+        registry.upsert_node(target(Vec::new())).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert_eq!(response.relay_candidates.len(), 1);
+        let metrics = registry.metrics().await;
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        assert_eq!(signal_path_state_count(&metrics, PathState::Relay), 0);
         Ok(())
     }
 
