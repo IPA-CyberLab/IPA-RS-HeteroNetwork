@@ -4166,6 +4166,11 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
             "--rootless cannot be combined with Docker route or discovery settings because docker/compose.rootless.yaml removes NET_ADMIN and /dev/net/tun; remove Docker route flags or run a rootful route-provider agent for Docker container CIDR reachability"
         );
     }
+    if args.relay_forwarder_netns.is_some() {
+        anyhow::bail!(
+            "--rootless cannot be combined with --relay-forwarder-netns because docker/compose.rootless.yaml removes the CAP_SYS_ADMIN and host namespace access required for namespaced relay forwarders"
+        );
+    }
     Ok(())
 }
 
@@ -9656,6 +9661,23 @@ fi
             .notes
             .iter()
             .any(|note| note.contains("rootful route-provider agent")));
+
+        let namespaced_forwarder = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            relay_forwarder_netns: Some("relay-fw".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!(
+                "rootless namespaced relay forwarder should be rejected before Compose rendering"
+            ),
+            Err(error) => error,
+        };
+        assert!(namespaced_forwarder
+            .to_string()
+            .contains("--rootless cannot be combined with --relay-forwarder-netns"));
         Ok(())
     }
 
