@@ -1776,6 +1776,7 @@ pub mod api {
         MongoDb,
         Elasticsearch,
         Ike,
+        Ipsec,
         Vxlan,
         Geneve,
         WireGuard,
@@ -1783,7 +1784,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 51] = [
+        pub const ALL: [Self; 52] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1831,6 +1832,7 @@ pub mod api {
             Self::MongoDb,
             Self::Elasticsearch,
             Self::Ike,
+            Self::Ipsec,
             Self::Vxlan,
             Self::Geneve,
             Self::WireGuard,
@@ -1886,6 +1888,7 @@ pub mod api {
                 Self::MongoDb => "mongodb",
                 Self::Elasticsearch => "elasticsearch",
                 Self::Ike => "ike",
+                Self::Ipsec => "ipsec",
                 Self::Vxlan => "vxlan",
                 Self::Geneve => "geneve",
                 Self::WireGuard => "wireguard",
@@ -2360,6 +2363,12 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Ike);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp)
+                && self.involves_port(4500)
+                && ipsec_nat_t_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Ipsec);
+            }
             if protocol_is(self.protocol, TransportProtocol::Udp) && vxlan_payload(payload) {
                 return Some(AgentPacketFlowApplication::Vxlan);
             }
@@ -2472,6 +2481,7 @@ pub mod api {
             AgentPacketFlowApplication::WireGuard
             | AgentPacketFlowApplication::Dhcp
             | AgentPacketFlowApplication::Ike
+            | AgentPacketFlowApplication::Ipsec
             | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Vxlan
             | AgentPacketFlowApplication::Geneve => {
@@ -3835,6 +3845,7 @@ pub mod api {
     const WIREGUARD_COOKIE_REPLY_LEN: usize = 64;
     const WIREGUARD_TRANSPORT_KEEPALIVE_LEN: usize = 32;
     const IKE_HEADER_LEN: usize = 28;
+    const IPSEC_ESP_HEADER_LEN: usize = 8;
     const IKE_NAT_T_NON_ESP_MARKER: [u8; 4] = [0, 0, 0, 0];
     const VXLAN_HEADER_LEN: usize = 8;
     const GENEVE_HEADER_LEN: usize = 8;
@@ -3872,6 +3883,18 @@ pub mod api {
         packet_len <= payload.len()
             || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
                 && packet_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
+    fn ipsec_nat_t_payload(payload: &[u8]) -> bool {
+        if payload.len() < IPSEC_ESP_HEADER_LEN
+            || payload.starts_with(&IKE_NAT_T_NON_ESP_MARKER)
+            || payload == [0xff]
+        {
+            return false;
+        }
+        let spi = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let sequence = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        spi != 0 && sequence != 0
     }
 
     fn ethernet_frame_payload(payload: &[u8], offset: usize) -> bool {
@@ -9075,6 +9098,14 @@ mod tests {
             payload
         }
 
+        fn ipsec_nat_t_esp_packet() -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+            payload.extend_from_slice(&1_u32.to_be_bytes());
+            payload.extend_from_slice(&[0xa5; 16]);
+            payload
+        }
+
         fn postgres_frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
             let mut payload = vec![tag];
             let length = (body.len() as u32) + 4;
@@ -9527,6 +9558,20 @@ mod tests {
         ike_wrong_version[17] = 0x10;
         assert_eq!(
             observation_for_udp_payload(&ike_wrong_version).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let ipsec_nat_t_payload = ipsec_nat_t_esp_packet();
+        assert_eq!(
+            observation_for_ike_payload(&ipsec_nat_t_payload, 4500).application(),
+            api::AgentPacketFlowApplication::Ipsec
+        );
+        assert_eq!(
+            observation_for_udp_payload(&ipsec_nat_t_payload).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let ipsec_nat_t_keepalive = vec![0xff];
+        assert_eq!(
+            observation_for_udp_payload(&ipsec_nat_t_keepalive).application(),
             api::AgentPacketFlowApplication::Unknown
         );
 
@@ -11682,6 +11727,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint ike requires UDP protocol"));
+
+        let udp_ipsec_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"ipsec"}"#)?;
+        udp_ipsec_hint.validate_transport_metadata()?;
+
+        let tcp_ipsec_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"ipsec"}"#)?;
+        let error = match tcp_ipsec_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP IPsec hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint ipsec requires UDP protocol"));
 
         let udp_vxlan_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"vxlan"}"#)?;
