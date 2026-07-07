@@ -1003,6 +1003,7 @@ struct RuntimePreflightChecks {
     ebpf_object: fn(&Path) -> anyhow::Result<()>,
     ebpf_tracepoint: fn(&EbpfTracepointAttachSpec) -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
+    relay_forwarder_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
     docker_api_socket: fn(&Path) -> anyhow::Result<()>,
     conntrack_procfs_path: fn(&Path) -> anyhow::Result<()>,
@@ -1021,6 +1022,7 @@ impl RuntimePreflightChecks {
             ebpf_object: ensure_ebpf_object_file_ready,
             ebpf_tracepoint: ensure_ebpf_tracepoint_ready,
             linux_netns: ensure_linux_netns_ready,
+            relay_forwarder_netns: ensure_relay_forwarder_netns_ready,
             netlink: ensure_netlink_protocol_ready,
             docker_api_socket: ensure_docker_api_socket_ready,
             conntrack_procfs_path: ensure_conntrack_procfs_path_ready,
@@ -1251,7 +1253,7 @@ fn preflight_agent_runtime_with_path_and_checks(
             .or(args.linux_netns.as_deref())
             .context("relay forwarder namespace preflight requested without --relay-forwarder-netns or --linux-netns")?;
         let namespace = LinuxNetworkNamespace::from_name(namespace_name)?;
-        (checks.linux_netns)(&namespace)?;
+        (checks.relay_forwarder_netns)(&namespace)?;
     }
 
     tracing::info!(
@@ -2805,6 +2807,15 @@ fn ensure_linux_netns_ready(namespace: &LinuxNetworkNamespace) -> anyhow::Result
         );
     }
     Ok(())
+}
+
+fn ensure_relay_forwarder_netns_ready(namespace: &LinuxNetworkNamespace) -> anyhow::Result<()> {
+    ensure_process_in_netns(namespace).with_context(|| {
+        format!(
+            "relay forwarder namespace `{}` is not active in the current process",
+            namespace.name()
+        )
+    })
 }
 
 fn current_process_netns_path() -> Option<PathBuf> {
@@ -17840,6 +17851,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ebpf_object: preflight_noop_ebpf_object,
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
+            relay_forwarder_netns: preflight_noop_netns,
             netlink,
             docker_api_socket: preflight_noop_path,
             conntrack_procfs_path: preflight_noop_path,
@@ -17861,6 +17873,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ebpf_object: preflight_noop_ebpf_object,
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
             linux_netns: preflight_noop_netns,
+            relay_forwarder_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
             docker_api_socket: preflight_noop_path,
             conntrack_procfs_path: preflight_noop_path,
@@ -17940,7 +17953,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(cap_error.to_string().contains("blocked test CAP_SYS_ADMIN"));
 
             let mut namespace_checks = test_preflight_checks(preflight_noop_netlink);
-            namespace_checks.linux_netns = preflight_fail_linux_netns;
+            namespace_checks.relay_forwarder_netns = preflight_fail_linux_netns;
             let namespace_error = match preflight_agent_runtime_with_path_and_checks(
                 &args,
                 Some(OsStr::new("")),
@@ -17982,7 +17995,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.cap_sys_admin);
 
             let mut checks = test_preflight_checks(preflight_noop_netlink);
-            checks.linux_netns = preflight_fail_linux_netns;
+            checks.relay_forwarder_netns = preflight_fail_linux_netns;
             let error = match preflight_agent_runtime_with_path_and_checks(
                 &args,
                 Some(OsStr::new("")),
