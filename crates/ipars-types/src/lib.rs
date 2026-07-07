@@ -2785,6 +2785,12 @@ pub mod api {
             if influxdb_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::InfluxDb);
             }
+            if kubelet_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Kubelet);
+            }
+            if docker_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::DockerApi);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -2927,6 +2933,94 @@ pub mod api {
 
     fn kubernetes_http_api_path(path: &[u8]) -> bool {
         const PREFIXES: [&[u8]; 4] = [b"/api/v1", b"/apis", b"/openapi/v2", b"/openapi/v3"];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn kubelet_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 10] = [
+            b"/pods",
+            b"/runningpods",
+            b"/stats",
+            b"/metrics/cadvisor",
+            b"/metrics/resource",
+            b"/metrics/probes",
+            b"/metrics/slis",
+            b"/configz",
+            b"/checkpoint",
+            b"/containerLogs",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn docker_http_api_path(path: &[u8]) -> bool {
+        docker_http_api_path_without_version(path)
+            || docker_api_versioned_path(path)
+                .map(docker_http_api_path_without_version)
+                .unwrap_or(false)
+    }
+
+    fn docker_api_versioned_path(path: &[u8]) -> Option<&[u8]> {
+        let mut offset = 0;
+        if path.get(offset) != Some(&b'/') || path.get(offset + 1) != Some(&b'v') {
+            return None;
+        }
+        offset += 2;
+        let first_digit = offset;
+        while path.get(offset).is_some_and(u8::is_ascii_digit) {
+            offset += 1;
+        }
+        if offset == first_digit {
+            return None;
+        }
+        let mut has_dot = false;
+        while path.get(offset) == Some(&b'.') {
+            has_dot = true;
+            offset += 1;
+            let component_start = offset;
+            while path.get(offset).is_some_and(u8::is_ascii_digit) {
+                offset += 1;
+            }
+            if offset == component_start {
+                return None;
+            }
+        }
+        if !has_dot {
+            return None;
+        }
+        (path.get(offset) == Some(&b'/')).then_some(&path[offset..])
+    }
+
+    fn docker_http_api_path_without_version(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 22] = [
+            b"/_ping",
+            b"/auth",
+            b"/build",
+            b"/commit",
+            b"/configs",
+            b"/containers",
+            b"/distribution",
+            b"/events",
+            b"/exec",
+            b"/images",
+            b"/info",
+            b"/networks",
+            b"/nodes",
+            b"/plugins",
+            b"/secrets",
+            b"/services",
+            b"/session",
+            b"/swarm",
+            b"/system",
+            b"/tasks",
+            b"/version",
+            b"/volumes",
+        ];
 
         PREFIXES
             .iter()
@@ -10340,6 +10434,34 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"GET /metrics HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Prometheus
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /metrics/cadvisor HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Kubelet
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /stats/summary HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Kubelet
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /pods HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Kubelet
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1.43/containers/json HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::DockerApi
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1.43/exec/abc/start HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::DockerApi
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /_ping HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::DockerApi
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1alpha/containers/json HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
             observation_for_payload(b"POST /v1/traces HTTP/1.1\r\n").application(),
