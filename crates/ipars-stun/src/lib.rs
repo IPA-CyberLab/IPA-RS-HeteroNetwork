@@ -1,4 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -173,6 +175,57 @@ pub struct BindingStunServer {
 
 pub type EchoStunServer = BindingStunServer;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StunServerMetricsSnapshot {
+    pub binding_request_count: u64,
+    pub binding_response_count: u64,
+    pub invalid_packet_count: u64,
+    pub socket_receive_error_count: u64,
+    pub socket_send_error_count: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct StunServerStats {
+    binding_request_count: AtomicU64,
+    binding_response_count: AtomicU64,
+    invalid_packet_count: AtomicU64,
+    socket_receive_error_count: AtomicU64,
+    socket_send_error_count: AtomicU64,
+}
+
+impl StunServerStats {
+    pub fn snapshot(&self) -> StunServerMetricsSnapshot {
+        StunServerMetricsSnapshot {
+            binding_request_count: self.binding_request_count.load(Ordering::Relaxed),
+            binding_response_count: self.binding_response_count.load(Ordering::Relaxed),
+            invalid_packet_count: self.invalid_packet_count.load(Ordering::Relaxed),
+            socket_receive_error_count: self.socket_receive_error_count.load(Ordering::Relaxed),
+            socket_send_error_count: self.socket_send_error_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_binding_request(&self) {
+        self.binding_request_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_binding_response(&self) {
+        self.binding_response_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_invalid_packet(&self) {
+        self.invalid_packet_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_socket_receive_error(&self) {
+        self.socket_receive_error_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_socket_send_error(&self) {
+        self.socket_send_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl BindingStunServer {
     pub async fn bind(addr: SocketAddr) -> Result<Self, StunError> {
         Ok(Self {
@@ -185,20 +238,52 @@ impl BindingStunServer {
     }
 
     pub async fn serve_once(&self) -> Result<(), StunError> {
+        self.serve_once_inner(None).await
+    }
+
+    pub async fn serve_once_with_stats(&self, stats: &StunServerStats) -> Result<(), StunError> {
+        self.serve_once_inner(Some(stats)).await
+    }
+
+    async fn serve_once_inner(&self, stats: Option<&StunServerStats>) -> Result<(), StunError> {
         let mut buffer = [0_u8; 1500];
-        let (len, peer) = self.socket.recv_from(&mut buffer).await?;
-        let request = decode_binding_request(&buffer[..len])?;
-        let response = encode_binding_success_response_with_attrs(
-            request.transaction_id,
+        let (len, peer) = match self.socket.recv_from(&mut buffer).await {
+            Ok(packet) => packet,
+            Err(error) => {
+                if let Some(stats) = stats {
+                    stats.record_socket_receive_error();
+                }
+                return Err(error.into());
+            }
+        };
+        respond_to_binding_request(
+            &self.socket,
+            &buffer[..len],
             peer,
             Some(self.socket.local_addr()?),
             None,
-        )?;
-        self.socket.send_to(&response, peer).await?;
-        Ok(())
+            stats,
+        )
+        .await
     }
 
-    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+    pub async fn serve(self, shutdown: watch::Receiver<bool>) -> Result<(), StunError> {
+        self.serve_inner(shutdown, None).await
+    }
+
+    pub async fn serve_with_stats(
+        self,
+        shutdown: watch::Receiver<bool>,
+        stats: Arc<StunServerStats>,
+    ) -> Result<(), StunError> {
+        self.serve_inner(shutdown, Some(stats)).await
+    }
+
+    async fn serve_inner(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        stats: Option<Arc<StunServerStats>>,
+    ) -> Result<(), StunError> {
         let mut buffer = [0_u8; 1500];
         loop {
             tokio::select! {
@@ -208,20 +293,66 @@ impl BindingStunServer {
                     }
                 }
                 packet = self.socket.recv_from(&mut buffer) => {
-                    let (len, peer) = packet?;
-                    if let Ok(request) = decode_binding_request(&buffer[..len]) {
-                        let response = encode_binding_success_response_with_attrs(
-                            request.transaction_id,
+                    let (len, peer) = match packet {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            if let Some(stats) = stats.as_deref() {
+                                stats.record_socket_receive_error();
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    respond_to_binding_request(
+                        &self.socket,
+                        &buffer[..len],
                             peer,
                             Some(self.socket.local_addr()?),
                             None,
-                        )?;
-                        self.socket.send_to(&response, peer).await?;
-                    }
+                        stats.as_deref(),
+                    )
+                    .await?;
                 }
             }
         }
     }
+}
+
+async fn respond_to_binding_request(
+    response_socket: &UdpSocket,
+    request_bytes: &[u8],
+    peer: SocketAddr,
+    response_origin: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
+    stats: Option<&StunServerStats>,
+) -> Result<(), StunError> {
+    let request = match decode_binding_request(request_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            if let Some(stats) = stats {
+                stats.record_invalid_packet();
+            }
+            return Ok(());
+        }
+    };
+    if let Some(stats) = stats {
+        stats.record_binding_request();
+    }
+    let response = encode_binding_success_response_with_attrs(
+        request.transaction_id,
+        peer,
+        response_origin,
+        other_address,
+    )?;
+    if let Err(error) = response_socket.send_to(&response, peer).await {
+        if let Some(stats) = stats {
+            stats.record_socket_send_error();
+        }
+        return Err(error.into());
+    }
+    if let Some(stats) = stats {
+        stats.record_binding_response();
+    }
+    Ok(())
 }
 
 pub struct Rfc5780StunServer {
@@ -1005,6 +1136,42 @@ mod tests {
 
         shutdown_tx.send(true)?;
         server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binding_server_stats_count_valid_and_invalid_packets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let stats = Arc::new(StunServerStats::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_stats = stats.clone();
+        let server_task =
+            tokio::spawn(async move { server.serve_with_stats(shutdown_rx, server_stats).await });
+
+        let invalid_sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        invalid_sender
+            .send_to(b"not-a-stun-binding-request", server_addr)
+            .await?;
+
+        let candidate = UdpStunProbe
+            .probe(
+                NodeId::from_string("node-a"),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                server_addr,
+            )
+            .await?;
+        assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.binding_request_count, 1);
+        assert_eq!(snapshot.binding_response_count, 1);
+        assert_eq!(snapshot.invalid_packet_count, 1);
+        assert_eq!(snapshot.socket_receive_error_count, 0);
+        assert_eq!(snapshot.socket_send_error_count, 0);
         Ok(())
     }
 

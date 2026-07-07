@@ -46,7 +46,7 @@ use ipars_route_manager::{
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
-use ipars_stun::BindingStunServer;
+use ipars_stun::{BindingStunServer, StunServerMetricsSnapshot, StunServerStats};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
     AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
@@ -2885,7 +2885,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Signal(args) => {
             run_signal(args, otel_metrics_enabled, otel_metrics_interval).await
         }
-        Command::Stun(args) => run_stun(args).await,
+        Command::Stun(args) => run_stun(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Relay(args) => run_relay(args, otel_metrics_enabled, otel_metrics_interval).await,
         Command::Agent(args) => run_agent(*args, otel_metrics_enabled, otel_metrics_interval).await,
     }
@@ -3071,19 +3071,160 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     )
 }
 
-async fn run_stun(args: StunArgs) -> anyhow::Result<()> {
+async fn run_stun(
+    args: StunArgs,
+    otel_metrics_enabled: bool,
+    otel_metrics_interval: Duration,
+) -> anyhow::Result<()> {
     let server = BindingStunServer::bind(args.listen).await?;
     let listen = server.local_addr()?;
     tracing::info!(%listen, "stun listening");
+    let stats = Arc::new(StunServerStats::default());
+    let otel_metrics_task = otel_metrics_enabled.then(|| {
+        start_stun_otel_metrics_export(
+            stats.clone(),
+            listen,
+            otel_metrics_interval.max(Duration::from_secs(1)),
+        )
+    });
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_task = tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = shutdown_tx.send(true);
     });
-    let result = server.serve(shutdown_rx).await;
+    let result = server.serve_with_stats(shutdown_rx, stats).await;
     shutdown_task.abort();
+    if let Some(task) = otel_metrics_task {
+        task.abort();
+    }
     result?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StunOtelSnapshot {
+    binding_request_count: u64,
+    binding_response_count: u64,
+    invalid_packet_count: u64,
+    socket_receive_error_count: u64,
+    socket_send_error_count: u64,
+}
+
+impl From<&StunServerMetricsSnapshot> for StunOtelSnapshot {
+    fn from(snapshot: &StunServerMetricsSnapshot) -> Self {
+        Self {
+            binding_request_count: snapshot.binding_request_count,
+            binding_response_count: snapshot.binding_response_count,
+            invalid_packet_count: snapshot.invalid_packet_count,
+            socket_receive_error_count: snapshot.socket_receive_error_count,
+            socket_send_error_count: snapshot.socket_send_error_count,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StunOtelMetrics {
+    server_active: Gauge<u64>,
+    binding_requests: Counter<u64>,
+    binding_responses: Counter<u64>,
+    invalid_packets: Counter<u64>,
+    socket_receive_errors: Counter<u64>,
+    socket_send_errors: Counter<u64>,
+}
+
+impl StunOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("iparsd.stun");
+        Self {
+            server_active: meter
+                .u64_gauge("ipars.stun.server.active")
+                .with_description("STUN server process active state.")
+                .build(),
+            binding_requests: meter
+                .u64_counter("ipars.stun.binding_requests")
+                .with_description("Valid STUN Binding requests received by the server.")
+                .build(),
+            binding_responses: meter
+                .u64_counter("ipars.stun.binding_responses")
+                .with_description("STUN Binding success responses sent by the server.")
+                .build(),
+            invalid_packets: meter
+                .u64_counter("ipars.stun.invalid_packets")
+                .with_description("Malformed or unsupported STUN packets received by the server.")
+                .build(),
+            socket_receive_errors: meter
+                .u64_counter("ipars.stun.socket_receive_errors")
+                .with_description("STUN server UDP receive errors.")
+                .build(),
+            socket_send_errors: meter
+                .u64_counter("ipars.stun.socket_send_errors")
+                .with_description("STUN server UDP send errors.")
+                .build(),
+        }
+    }
+
+    fn record_status(
+        &self,
+        listen: SocketAddr,
+        snapshot: &StunServerMetricsSnapshot,
+        previous: Option<&StunOtelSnapshot>,
+    ) {
+        let listen = listen.to_string();
+        let attrs = [KeyValue::new("listen", listen)];
+        self.server_active.record(1, &attrs);
+        self.binding_requests.add(
+            counter_delta(
+                snapshot.binding_request_count,
+                previous.map(|previous| previous.binding_request_count),
+            ),
+            &attrs,
+        );
+        self.binding_responses.add(
+            counter_delta(
+                snapshot.binding_response_count,
+                previous.map(|previous| previous.binding_response_count),
+            ),
+            &attrs,
+        );
+        self.invalid_packets.add(
+            counter_delta(
+                snapshot.invalid_packet_count,
+                previous.map(|previous| previous.invalid_packet_count),
+            ),
+            &attrs,
+        );
+        self.socket_receive_errors.add(
+            counter_delta(
+                snapshot.socket_receive_error_count,
+                previous.map(|previous| previous.socket_receive_error_count),
+            ),
+            &attrs,
+        );
+        self.socket_send_errors.add(
+            counter_delta(
+                snapshot.socket_send_error_count,
+                previous.map(|previous| previous.socket_send_error_count),
+            ),
+            &attrs,
+        );
+    }
+}
+
+fn start_stun_otel_metrics_export(
+    stats: Arc<StunServerStats>,
+    listen: SocketAddr,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let metrics = StunOtelMetrics::new();
+        let mut previous = None;
+        loop {
+            let snapshot = stats.snapshot();
+            metrics.record_status(listen, &snapshot, previous.as_ref());
+            previous = Some(StunOtelSnapshot::from(&snapshot));
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -11893,6 +12034,89 @@ mod tests {
         assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 3);
         assert_eq!(cli.observability.log_filter, "ipars=debug");
         assert_eq!(cli.command.component(), "agent");
+    }
+
+    #[test]
+    fn stun_command_accepts_root_observability_args() {
+        let cli = Cli::parse_from([
+            "iparsd",
+            "--otel-enabled",
+            "--otel-metrics-poll-interval-seconds",
+            "2",
+            "stun",
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+
+        let Command::Stun(args) = cli.command else {
+            panic!("expected stun command");
+        };
+        assert!(cli.observability.otel_active());
+        assert_eq!(cli.observability.otel_metrics_poll_interval_seconds, 2);
+        assert_eq!(args.listen, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn stun_otel_snapshot_copies_server_metrics() {
+        let snapshot = StunServerMetricsSnapshot {
+            binding_request_count: 7,
+            binding_response_count: 6,
+            invalid_packet_count: 2,
+            socket_receive_error_count: 1,
+            socket_send_error_count: 3,
+        };
+
+        assert_eq!(
+            StunOtelSnapshot::from(&snapshot),
+            StunOtelSnapshot {
+                binding_request_count: 7,
+                binding_response_count: 6,
+                invalid_packet_count: 2,
+                socket_receive_error_count: 1,
+                socket_send_error_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn stun_otel_delta_records_first_snapshot_and_handles_counter_reset() {
+        let previous = StunOtelSnapshot {
+            binding_request_count: 10,
+            binding_response_count: 8,
+            invalid_packet_count: 3,
+            socket_receive_error_count: 2,
+            socket_send_error_count: 1,
+        };
+        let current = StunServerMetricsSnapshot {
+            binding_request_count: 12,
+            binding_response_count: 9,
+            invalid_packet_count: 1,
+            socket_receive_error_count: 2,
+            socket_send_error_count: 4,
+        };
+
+        assert_eq!(counter_delta(current.binding_request_count, None), 12);
+        assert_eq!(
+            counter_delta(
+                current.binding_request_count,
+                Some(previous.binding_request_count),
+            ),
+            2
+        );
+        assert_eq!(
+            counter_delta(
+                current.invalid_packet_count,
+                Some(previous.invalid_packet_count)
+            ),
+            0
+        );
+        assert_eq!(
+            counter_delta(
+                current.socket_send_error_count,
+                Some(previous.socket_send_error_count),
+            ),
+            3
+        );
     }
 
     #[test]
