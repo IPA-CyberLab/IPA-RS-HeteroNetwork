@@ -954,6 +954,18 @@ fn assert_compose_agent_packet_flow_prometheus_metrics(
         1.0,
     )?;
     ensure_prometheus_sample_at_least(&metrics, "ipars_agent_observed_peer_vpn_ips", node_id, 1.0)?;
+    ensure_prometheus_sample_with_labels_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_classified_by_lifecycle_total",
+        &[("node_id", node_id), ("classification", "assured")],
+        1.0,
+    )?;
+    ensure_prometheus_sample_with_labels_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_classified_by_application_total",
+        &[("node_id", node_id), ("application", "wireguard")],
+        1.0,
+    )?;
     ensure_prometheus_sample_at_least(&metrics, "ipars_agent_active_peers", node_id, 1.0)?;
     ensure_prometheus_sample_at_least(&metrics, "ipars_agent_pinned_peers", node_id, 1.0)?;
     Ok(())
@@ -1631,10 +1643,21 @@ fn ensure_prometheus_sample_at_least(
     node_id: &str,
     minimum: f64,
 ) -> Result<()> {
-    let prefix = format!(
-        "{metric}{{node_id=\"{}\"}} ",
-        prometheus_label_value(node_id)
-    );
+    ensure_prometheus_sample_with_labels_at_least(text, metric, &[("node_id", node_id)], minimum)
+}
+
+fn ensure_prometheus_sample_with_labels_at_least(
+    text: &str,
+    metric: &str,
+    labels: &[(&str, &str)],
+    minimum: f64,
+) -> Result<()> {
+    let rendered_labels = labels
+        .iter()
+        .map(|(name, value)| format!("{name}=\"{}\"", prometheus_label_value(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let prefix = format!("{metric}{{{rendered_labels}}} ");
     for line in text.lines() {
         let Some(value) = line.strip_prefix(&prefix) else {
             continue;
@@ -1645,11 +1668,11 @@ fn ensure_prometheus_sample_at_least(
             .with_context(|| format!("Prometheus sample {metric} was not numeric: {line:?}"))?;
         anyhow::ensure!(
             actual >= minimum,
-            "expected Prometheus sample {metric} for node {node_id} to be at least {minimum}, got {actual}:\n{text}"
+            "expected Prometheus sample {metric} with labels {labels:?} to be at least {minimum}, got {actual}:\n{text}"
         );
         return Ok(());
     }
-    anyhow::bail!("Prometheus sample {metric} for node {node_id} was missing:\n{text}")
+    anyhow::bail!("Prometheus sample {metric} with labels {labels:?} was missing:\n{text}")
 }
 
 fn prometheus_label_value(value: &str) -> String {
