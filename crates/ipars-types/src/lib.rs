@@ -1755,6 +1755,7 @@ pub mod api {
         Prometheus,
         OpenTelemetry,
         Syslog,
+        Snmp,
         Jaeger,
         Loki,
         Tempo,
@@ -1772,7 +1773,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 40] = [
+        pub const ALL: [Self; 41] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1799,6 +1800,7 @@ pub mod api {
             Self::Prometheus,
             Self::OpenTelemetry,
             Self::Syslog,
+            Self::Snmp,
             Self::Jaeger,
             Self::Loki,
             Self::Tempo,
@@ -1843,6 +1845,7 @@ pub mod api {
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Syslog => "syslog",
+                Self::Snmp => "snmp",
                 Self::Jaeger => "jaeger",
                 Self::Loki => "loki",
                 Self::Tempo => "tempo",
@@ -2156,6 +2159,17 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Syslog;
             }
+            if (self.involves_port(161)
+                || self.involves_port(162)
+                || self.involves_port(10161)
+                || self.involves_port(10162))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Snmp;
+            }
             if (self.involves_port(5778)
                 || self.involves_port(14250)
                 || self.involves_port(14268)
@@ -2251,6 +2265,13 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Udp) && wireguard_payload(payload) {
                 return Some(AgentPacketFlowApplication::WireGuard);
             }
+            if matches!(
+                self.protocol,
+                None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+            ) && snmp_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Snmp);
+            }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
             }
@@ -2324,6 +2345,7 @@ pub mod api {
             | AgentPacketFlowApplication::Jaeger
             | AgentPacketFlowApplication::Nfs
             | AgentPacketFlowApplication::Syslog
+            | AgentPacketFlowApplication::Snmp
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3092,6 +3114,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Syslog);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"snmp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"snmptrap")
+        {
+            return Some(AgentPacketFlowApplication::Snmp);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -3232,6 +3259,15 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"rsyslog")
         {
             return Some(AgentPacketFlowApplication::Syslog);
+        }
+        if protocol.eq_ignore_ascii_case(b"snmp")
+            || protocol.eq_ignore_ascii_case(b"snmp-tls")
+            || protocol.eq_ignore_ascii_case(b"snmptls")
+            || protocol.eq_ignore_ascii_case(b"snmp-dtls")
+            || protocol.eq_ignore_ascii_case(b"snmpdtls")
+            || protocol.eq_ignore_ascii_case(b"snmptrap")
+        {
+            return Some(AgentPacketFlowApplication::Snmp);
         }
         if protocol.eq_ignore_ascii_case(b"nfs")
             || protocol.eq_ignore_ascii_case(b"nfs4")
@@ -3731,6 +3767,163 @@ pub mod api {
             len = len.checked_shl(8)?.checked_add(*byte as usize)?;
         }
         Some((len, offset + 1 + length_bytes))
+    }
+
+    fn snmp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 10 || payload[0] != 0x30 {
+            return false;
+        }
+        let Some((message_len, message_offset)) = ber_length(payload, 1) else {
+            return false;
+        };
+        if !(6..=16_777_216).contains(&message_len) {
+            return false;
+        }
+        let Some(message_end) = message_offset.checked_add(message_len) else {
+            return false;
+        };
+        if message_end > payload.len() && payload.len() < PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return false;
+        }
+
+        let Some((version_len, version_offset)) =
+            snmp_element(payload, message_offset, message_end, 0x02)
+        else {
+            return false;
+        };
+        if !(1..=4).contains(&version_len) {
+            return false;
+        }
+        let Some(version_end) = version_offset.checked_add(version_len) else {
+            return false;
+        };
+        if version_end > payload.len() || version_end > message_end {
+            return false;
+        }
+        let Some(version) = snmp_nonnegative_integer(payload, version_offset, version_len) else {
+            return false;
+        };
+        if version > 3 {
+            return false;
+        }
+
+        match version {
+            0..=2 => snmp_community_message(payload, version_end, message_end),
+            3 => snmp_v3_message(payload, version_end, message_end),
+            _ => false,
+        }
+    }
+
+    fn snmp_community_message(payload: &[u8], offset: usize, message_end: usize) -> bool {
+        let Some((community_len, community_offset)) =
+            snmp_element(payload, offset, message_end, 0x04)
+        else {
+            return false;
+        };
+        if community_len > 255 {
+            return false;
+        }
+        let Some(pdu_offset) = community_offset.checked_add(community_len) else {
+            return false;
+        };
+        if pdu_offset > payload.len() || pdu_offset > message_end {
+            return false;
+        }
+        snmp_pdu(payload, pdu_offset, message_end)
+    }
+
+    fn snmp_v3_message(payload: &[u8], offset: usize, message_end: usize) -> bool {
+        let Some((header_len, header_offset)) = snmp_element(payload, offset, message_end, 0x30)
+        else {
+            return false;
+        };
+        if !(1..=65_535).contains(&header_len) {
+            return false;
+        }
+        let Some(security_offset) = header_offset.checked_add(header_len) else {
+            return false;
+        };
+        if security_offset > payload.len() || security_offset > message_end {
+            return false;
+        }
+
+        let Some((security_len, security_content_offset)) =
+            snmp_element(payload, security_offset, message_end, 0x04)
+        else {
+            return false;
+        };
+        if security_len > 65_535 {
+            return false;
+        }
+        let Some(scoped_pdu_offset) = security_content_offset.checked_add(security_len) else {
+            return false;
+        };
+        if scoped_pdu_offset > payload.len() || scoped_pdu_offset > message_end {
+            return false;
+        }
+
+        let Some(&scoped_pdu_tag) = payload.get(scoped_pdu_offset) else {
+            return false;
+        };
+        if !matches!(scoped_pdu_tag, 0x30 | 0x04) {
+            return false;
+        }
+        let Some((scoped_pdu_len, scoped_pdu_content_offset)) =
+            snmp_element(payload, scoped_pdu_offset, message_end, scoped_pdu_tag)
+        else {
+            return false;
+        };
+        scoped_pdu_len > 0
+            && scoped_pdu_content_offset <= payload.len()
+            && scoped_pdu_content_offset <= message_end
+    }
+
+    fn snmp_pdu(payload: &[u8], offset: usize, message_end: usize) -> bool {
+        let Some(&tag) = payload.get(offset) else {
+            return false;
+        };
+        if !(0xa0..=0xa8).contains(&tag) {
+            return false;
+        }
+        let Some((pdu_len, pdu_content_offset)) = snmp_element(payload, offset, message_end, tag)
+        else {
+            return false;
+        };
+        (1..=16_777_216).contains(&pdu_len)
+            && pdu_content_offset <= payload.len()
+            && pdu_content_offset <= message_end
+    }
+
+    fn snmp_element(
+        payload: &[u8],
+        offset: usize,
+        message_end: usize,
+        expected_tag: u8,
+    ) -> Option<(usize, usize)> {
+        if offset >= message_end || payload.get(offset) != Some(&expected_tag) {
+            return None;
+        }
+        let (len, content_offset) = ber_length(payload, offset.checked_add(1)?)?;
+        let content_end = content_offset.checked_add(len)?;
+        if content_offset > message_end || content_end > message_end {
+            return None;
+        }
+        if content_offset > payload.len() {
+            return None;
+        }
+        Some((len, content_offset))
+    }
+
+    fn snmp_nonnegative_integer(payload: &[u8], offset: usize, len: usize) -> Option<u32> {
+        let value = payload.get(offset..offset.checked_add(len)?)?;
+        if value.is_empty() || value[0] & 0x80 != 0 {
+            return None;
+        }
+        let mut integer = 0_u32;
+        for byte in value {
+            integer = integer.checked_shl(8)?.checked_add(*byte as u32)?;
+        }
+        Some(integer)
     }
 
     fn smb_payload(payload: &[u8]) -> bool {
@@ -7758,6 +7951,43 @@ mod tests {
             api::AgentPacketFlowApplication::Syslog
         );
 
+        let snmp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(161),
+            ..Default::default()
+        };
+        assert_eq!(snmp.application(), api::AgentPacketFlowApplication::Snmp);
+
+        let snmptrap = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(162),
+            ..Default::default()
+        };
+        assert_eq!(
+            snmptrap.application(),
+            api::AgentPacketFlowApplication::Snmp
+        );
+
+        let snmp_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(10161),
+            ..Default::default()
+        };
+        assert_eq!(
+            snmp_tls.application(),
+            api::AgentPacketFlowApplication::Snmp
+        );
+
+        let snmptrap_dtls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(10162),
+            ..Default::default()
+        };
+        assert_eq!(
+            snmptrap_dtls.application(),
+            api::AgentPacketFlowApplication::Snmp
+        );
+
         let jaeger_collector = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(14268),
@@ -8334,6 +8564,26 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let snmp_get_request = vec![
+            0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c',
+            0xa0, 0x19, 0x02, 0x04, 0, 0, 0, 1, 0x02, 0x01, 0, 0x02, 0x01, 0, 0x30, 0x0b,
+            0x30, 0x09, 0x06, 0x05, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x05, 0x00,
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&snmp_get_request).application(),
+            api::AgentPacketFlowApplication::Snmp
+        );
+        assert_eq!(
+            observation_for_payload(&snmp_get_request).application(),
+            api::AgentPacketFlowApplication::Snmp
+        );
+        let mut invalid_snmp_pdu_tag = snmp_get_request.clone();
+        invalid_snmp_pdu_tag[13] = 0x30;
+        assert_eq!(
+            observation_for_udp_payload(&invalid_snmp_pdu_tag).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -8591,6 +8841,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Syslog,
             ),
             (
+                "snmp-manager.ops.svc",
+                api::AgentPacketFlowApplication::Snmp,
+            ),
+            (
                 "kafka-broker.messaging.svc",
                 api::AgentPacketFlowApplication::Kafka,
             ),
@@ -8730,6 +8984,10 @@ mod tests {
             (
                 &[b"syslog-tls".as_slice()][..],
                 api::AgentPacketFlowApplication::Syslog,
+            ),
+            (
+                &[b"snmp-tls".as_slice()][..],
+                api::AgentPacketFlowApplication::Snmp,
             ),
             (
                 &[b"nfsv4".as_slice()][..],
@@ -10276,6 +10534,14 @@ mod tests {
         let tcp_syslog_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"syslog"}"#)?;
         tcp_syslog_hint.validate_transport_metadata()?;
+
+        let udp_snmp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"snmp"}"#)?;
+        udp_snmp_hint.validate_transport_metadata()?;
+
+        let tcp_snmp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"snmp"}"#)?;
+        tcp_snmp_hint.validate_transport_metadata()?;
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;

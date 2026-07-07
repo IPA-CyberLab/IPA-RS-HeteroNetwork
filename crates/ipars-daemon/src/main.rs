@@ -13403,6 +13403,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Syslog),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Snmp),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(
