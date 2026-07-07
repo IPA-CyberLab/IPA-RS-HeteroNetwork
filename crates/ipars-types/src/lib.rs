@@ -1736,6 +1736,7 @@ pub mod api {
         Ssh,
         Ldap,
         Smb,
+        Nfs,
         Rdp,
         KubernetesApi,
         Etcd,
@@ -1770,7 +1771,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 38] = [
+        pub const ALL: [Self; 39] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1778,6 +1779,7 @@ pub mod api {
             Self::Ssh,
             Self::Ldap,
             Self::Smb,
+            Self::Nfs,
             Self::Rdp,
             Self::KubernetesApi,
             Self::Etcd,
@@ -1820,6 +1822,7 @@ pub mod api {
                 Self::Ssh => "ssh",
                 Self::Ldap => "ldap",
                 Self::Smb => "smb",
+                Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
@@ -2072,6 +2075,14 @@ pub mod api {
             if self.involves_port(445) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Smb;
             }
+            if self.involves_port(2049)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Nfs;
+            }
             if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Rdp;
             }
@@ -2287,6 +2298,7 @@ pub mod api {
             | AgentPacketFlowApplication::Consul
             | AgentPacketFlowApplication::Nomad
             | AgentPacketFlowApplication::Jaeger
+            | AgentPacketFlowApplication::Nfs
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3068,6 +3080,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"nfs") {
+            return Some(AgentPacketFlowApplication::Nfs);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"rdp") {
             return Some(AgentPacketFlowApplication::Rdp);
         }
@@ -3181,6 +3196,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"influx")
         {
             return Some(AgentPacketFlowApplication::InfluxDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"nfs")
+            || protocol.eq_ignore_ascii_case(b"nfs4")
+            || protocol.eq_ignore_ascii_case(b"nfsv4")
+        {
+            return Some(AgentPacketFlowApplication::Nfs);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7475,6 +7496,20 @@ mod tests {
         };
         assert_eq!(smb.application(), api::AgentPacketFlowApplication::Smb);
 
+        let nfs_tcp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2049),
+            ..Default::default()
+        };
+        assert_eq!(nfs_tcp.application(), api::AgentPacketFlowApplication::Nfs);
+
+        let nfs_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(2049),
+            ..Default::default()
+        };
+        assert_eq!(nfs_udp.application(), api::AgentPacketFlowApplication::Nfs);
+
         let rdp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(3389),
@@ -8564,6 +8599,7 @@ mod tests {
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
+            ("nfs-files.storage.svc", api::AgentPacketFlowApplication::Nfs),
             ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
             ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
         ] {
@@ -8610,6 +8646,10 @@ mod tests {
             (
                 &[b"influxdb-http".as_slice()][..],
                 api::AgentPacketFlowApplication::InfluxDb,
+            ),
+            (
+                &[b"nfsv4".as_slice()][..],
+                api::AgentPacketFlowApplication::Nfs,
             ),
             (
                 &[b"kafka".as_slice()][..],

@@ -13370,6 +13370,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::InfluxDb),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Nfs),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(
