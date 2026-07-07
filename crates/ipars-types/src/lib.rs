@@ -1740,6 +1740,7 @@ pub mod api {
         KubernetesApi,
         Etcd,
         ZooKeeper,
+        Consul,
         Postgres,
         Mysql,
         MsSql,
@@ -1761,7 +1762,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 29] = [
+        pub const ALL: [Self; 30] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1773,6 +1774,7 @@ pub mod api {
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
+            Self::Consul,
             Self::Postgres,
             Self::Mysql,
             Self::MsSql,
@@ -1806,6 +1808,7 @@ pub mod api {
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
+                Self::Consul => "consul",
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
                 Self::MsSql => "mssql",
@@ -1985,6 +1988,22 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::ZooKeeper;
+            }
+            if (self.involves_port(8300)
+                || self.involves_port(8500)
+                || self.involves_port(8501)
+                || self.involves_port(8502))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Consul;
+            }
+            if (self.involves_port(8301) || self.involves_port(8302))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Consul;
             }
             if self.involves_port(53)
                 && matches!(
@@ -2185,6 +2204,7 @@ pub mod api {
             }
             AgentPacketFlowApplication::Dns
             | AgentPacketFlowApplication::Https
+            | AgentPacketFlowApplication::Consul
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -2377,6 +2397,9 @@ pub mod api {
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if consul_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Consul);
+            }
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
             }
@@ -2438,6 +2461,34 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn consul_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 19] = [
+            b"/v1/acl",
+            b"/v1/agent",
+            b"/v1/catalog",
+            b"/v1/config",
+            b"/v1/connect",
+            b"/v1/coordinate",
+            b"/v1/discovery-chain",
+            b"/v1/event",
+            b"/v1/exported-services",
+            b"/v1/health",
+            b"/v1/intention",
+            b"/v1/kv",
+            b"/v1/operator",
+            b"/v1/partition",
+            b"/v1/peering",
+            b"/v1/query",
+            b"/v1/session",
+            b"/v1/status",
+            b"/v1/txn",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn dns_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -2662,6 +2713,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::ZooKeeper);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"consul") {
+            return Some(AgentPacketFlowApplication::Consul);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
         }
@@ -2795,6 +2849,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"zab")
         {
             return Some(AgentPacketFlowApplication::ZooKeeper);
+        }
+        if protocol.eq_ignore_ascii_case(b"consul")
+            || protocol.eq_ignore_ascii_case(b"consul-rpc")
+            || protocol.eq_ignore_ascii_case(b"consul-grpc")
+        {
+            return Some(AgentPacketFlowApplication::Consul);
         }
         if protocol.eq_ignore_ascii_case(b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
@@ -6454,6 +6514,11 @@ pub mod api {
         prefixes.iter().any(|prefix| path.starts_with(prefix))
     }
 
+    fn path_starts_with_api_prefix(path: &[u8], prefix: &[u8]) -> bool {
+        path.starts_with(prefix)
+            && matches!(path.get(prefix.len()), None | Some(b'/') | Some(b'?'))
+    }
+
     fn path_contains_any(path: &[u8], needles: &[&[u8]]) -> bool {
         needles
             .iter()
@@ -7118,6 +7183,26 @@ mod tests {
             api::AgentPacketFlowApplication::ZooKeeper
         );
 
+        let consul_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8500),
+            ..Default::default()
+        };
+        assert_eq!(
+            consul_api.application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+
+        let consul_gossip = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(8301),
+            ..Default::default()
+        };
+        assert_eq!(
+            consul_gossip.application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+
         let postgres = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(5432),
@@ -7772,6 +7857,19 @@ mod tests {
             api::AgentPacketFlowApplication::Elasticsearch
         );
         assert_eq!(
+            observation_for_payload(b"GET /v1/agent/self HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/catalog/services?dc=dc1 HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/agency HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
                 .application(),
             api::AgentPacketFlowApplication::Https
@@ -7833,6 +7931,10 @@ mod tests {
             (
                 "zookeeper-0.control.svc",
                 api::AgentPacketFlowApplication::ZooKeeper,
+            ),
+            (
+                "consul-server.control.svc",
+                api::AgentPacketFlowApplication::Consul,
             ),
             (
                 "cassandra-seed.db.svc",
@@ -7924,6 +8026,10 @@ mod tests {
             (
                 &[b"zookeeper".as_slice()][..],
                 api::AgentPacketFlowApplication::ZooKeeper,
+            ),
+            (
+                &[b"consul-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Consul,
             ),
             (
                 &[b"nats".as_slice()][..],
