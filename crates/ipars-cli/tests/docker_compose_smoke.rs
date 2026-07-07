@@ -323,6 +323,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
+    assert_compose_agent_packet_flow_lazy_connect(&compose, &agent_nodes, &api_ports)?;
     assert_compose_agent_lazy_connect_paths(&compose, &agent_nodes, &api_ports)?;
     assert_compose_signal_path_negotiation_metrics(&compose)?;
     assert_compose_control_plane_path_state(&compose, &agent_nodes)?;
@@ -849,6 +850,115 @@ fn assert_compose_agent_lazy_connect_paths(
     Ok(())
 }
 
+fn assert_compose_agent_packet_flow_lazy_connect(
+    compose: &ComposeProject,
+    nodes: &ComposeAgentNodes,
+    ports: &ComposeApiPorts,
+) -> Result<()> {
+    assert_compose_agent_packet_flow(compose, "agent", ports.agent, &nodes.agent, &nodes.agent_b)?;
+    assert_compose_agent_packet_flow(
+        compose,
+        "agent-b",
+        ports.agent_b,
+        &nodes.agent_b,
+        &nodes.agent,
+    )?;
+    assert_compose_agent_path(compose, "agent", ports.agent, &nodes.agent, &nodes.agent_b)?;
+    assert_compose_agent_path(
+        compose,
+        "agent-b",
+        ports.agent_b,
+        &nodes.agent_b,
+        &nodes.agent,
+    )?;
+    Ok(())
+}
+
+fn assert_compose_agent_packet_flow(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    local: &str,
+    remote: &str,
+) -> Result<()> {
+    let destination = compose_agent_peer_vpn_ip(compose, service, port, remote)?;
+    let body = serde_json::json!({
+        "destination": destination,
+        "source": "192.0.2.10",
+        "protocol": "udp",
+        "source_port": 50000,
+        "destination_port": 51820,
+        "detector": "compose-smoke",
+        "application": "wire_guard",
+        "conntrack_status": ["assured"],
+        "pin": true,
+    })
+    .to_string();
+    let response = compose_exec_post_json(
+        compose,
+        service,
+        &format!("http://127.0.0.1:{port}/v1/packet-flow"),
+        &body,
+    )?;
+    ensure_json_string_equals(&response, "destination", &destination)?;
+    ensure_json_field_absent_or_null(&response, &["filtered_reason"])?;
+    ensure_json_string_equals_at(&response, &["matched", "peer"], remote)?;
+    ensure_json_string_equals_at(&response, &["matched", "kind"], "peer_vpn_ip")?;
+    ensure_json_bool_equals_at(&response, &["matched", "pinned"], true)?;
+    ensure_json_string_equals_at(&response, &["observation", "source"], "192.0.2.10")?;
+    ensure_json_string_equals_at(&response, &["observation", "protocol"], "udp")?;
+    ensure_json_string_equals_at(&response, &["observation", "detector"], "compose-smoke")?;
+    ensure_json_string_equals_at(&response, &["observation", "application"], "wire_guard")?;
+
+    wait_for_json(
+        compose,
+        &format!("{service} packet-flow lazy-connect metrics"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/metrics"),
+        |value| {
+            ensure_json_string_equals(value, "node_id", local)?;
+            ensure_json_u64_at_least(value, "packet_flow_observation_count", 1)?;
+            ensure_json_u64_at_least(value, "packet_flow_match_count", 1)?;
+            ensure_json_u64_at_least_at(value, &["lazy_connect", "observed_peer_vpn_ip_count"], 1)?;
+            ensure_json_u64_at_least_at(value, &["lazy_connect", "active_peer_count"], 1)?;
+            ensure_json_u64_at_least_at(value, &["lazy_connect", "pinned_peer_count"], 1)?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn compose_agent_peer_vpn_ip(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    expected_node_id: &str,
+) -> Result<String> {
+    let peer_map = wait_for_json(
+        compose,
+        &format!("{service} peer map for packet-flow destination"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/peers"),
+        |value| ensure_peer_map_contains(value, expected_node_id),
+    )?;
+    peer_map_peer_string(&peer_map, expected_node_id, "vpn_ip")
+}
+
+fn peer_map_peer_string(value: &Value, expected_node_id: &str, field: &str) -> Result<String> {
+    let peers = value
+        .get("peers")
+        .and_then(Value::as_array)
+        .context("peer map missing peers array")?;
+    for peer in peers {
+        let node_id = json_string_required(peer, "node_id")?;
+        if node_id == expected_node_id {
+            return json_string_required(peer, field);
+        }
+    }
+    anyhow::bail!("peer map did not include expected node {expected_node_id}: {value}")
+}
+
 fn assert_compose_agent_peer_activity(
     compose: &ComposeProject,
     service: &str,
@@ -1346,6 +1456,30 @@ fn ensure_json_bool_equals(value: &Value, field: &str, expected: bool) -> Result
     Ok(())
 }
 
+fn ensure_json_bool_equals_at(value: &Value, path: &[&str], expected: bool) -> Result<()> {
+    let field = path.join(".");
+    let actual = json_value_at(value, path)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("JSON field {field} was missing or not a boolean: {value}"))?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {field} to equal {expected}, got {actual}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_field_absent_or_null(value: &Value, path: &[&str]) -> Result<()> {
+    let Some(actual) = json_value_at(value, path) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        actual.is_null(),
+        "expected JSON field {} to be absent or null, got {actual}: {value}",
+        path.join(".")
+    );
+    Ok(())
+}
+
 fn ensure_json_count_array_total_at_least(value: &Value, field: &str, minimum: u64) -> Result<()> {
     let counts = value
         .get(field)
@@ -1398,6 +1532,16 @@ fn json_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
 fn ensure_json_string_equals(value: &Value, field: &str, expected: &str) -> Result<()> {
     let actual = json_string_field(value, &[field])
         .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {field} to equal {expected:?}, got {actual:?}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_string_equals_at(value: &Value, path: &[&str], expected: &str) -> Result<()> {
+    let field = path.join(".");
+    let actual = json_string_required_at(value, path)?;
     anyhow::ensure!(
         actual == expected,
         "expected JSON field {field} to equal {expected:?}, got {actual:?}: {value}"
