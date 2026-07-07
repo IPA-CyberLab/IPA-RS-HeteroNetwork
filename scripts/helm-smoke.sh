@@ -99,6 +99,16 @@ assert_rendered_contains release-scoping "name: edge-ipars-agent-api"
 assert_rendered_contains release-scoping 'app.kubernetes.io/instance: "edge"'
 assert_rendered_absent release-scoping "name: ipars-agent"
 
+template_release_ok name-overrides edge \
+  --set-string nameOverride=agent \
+  --set-string fullnameOverride=fixed-ipars \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP
+
+assert_rendered_contains name-overrides "name: fixed-ipars"
+assert_rendered_contains name-overrides "name: fixed-ipars-agent"
+assert_rendered_absent name-overrides "name: edge-ipars"
+
 template_ok agent-api \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP
@@ -378,6 +388,10 @@ template_fails cluster-signal-url-invalid-port \
 template_fails cluster-stun-endpoint-unspecified \
   "cluster.stunEndpoint value \"0.0.0.0:3478\" must not use an unspecified address" \
   --set-string cluster.stunEndpoint=0.0.0.0:3478
+
+template_fails name-override-invalid \
+  "nameOverride \"Bad_Name\" must be a DNS label of at most 53 bytes" \
+  --set-string nameOverride=Bad_Name
 
 template_fails relay-forwarder-netns-without-sys-admin \
   "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" \

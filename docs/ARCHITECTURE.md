@@ -196,6 +196,7 @@ Service discovery and its RBAC-only namespace/selector settings are rejected whe
 Agent API NetworkPolicy ingress rules follow the configured `agent.apiService.targetPort` value, and relay NetworkPolicy ingress rules follow the configured relay target ports, keeping CIDR allowlists aligned when operators override Service ports.
 
 `ipars k8s install` rejects Service type, targetPort, or LoadBalancer source-range overrides for inactive agent API or relay Services before emitting Helm values, matching the chart's direct-value inactive exposure checks.
+It also validates and emits Helm `nameOverride` and `fullnameOverride` through `--chart-name-override` and `--chart-fullname-override`, so operator-selected resource names use the same DNS-label constraints in direct chart rendering and CLI-generated plans.
 
 Direct Helm values for agent and relay Service and target ports, NodePorts, LoadBalancer health-check NodePorts, session-affinity timeouts, peer-map cadence, relay-forwarder supervision limits, relay advertisement capacity, Kubernetes route intervals, probe/lifecycle/scheduling fields, and rollout/PodDisruptionBudget integer-or-percent values are validated as bounded non-negative integers or bounded integer-percentage values before template `int` conversion, preventing non-numeric strings, fractional values, oversized numeric values, or empty required numeric fields from being silently coerced during rendering.
 

@@ -418,6 +418,10 @@ struct K8sInstallArgs {
     namespace: String,
     #[arg(long, default_value = "charts/ipars")]
     chart: PathBuf,
+    #[arg(long = "chart-name-override", value_parser = parse_kubernetes_chart_name_override)]
+    chart_name_override: Option<String>,
+    #[arg(long = "chart-fullname-override", value_parser = parse_kubernetes_chart_name_override)]
+    chart_fullname_override: Option<String>,
     #[arg(long, default_value = "ipars-join-token")]
     join_token_secret: String,
     #[arg(long, default_value = "token")]
@@ -2052,6 +2056,11 @@ fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_chart_name_override(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_label_with_max(value, "chart name override", 53)?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_http_api_base_url(value: &str) -> Result<String, String> {
     normalize_kubernetes_http_api_base_url(value, "Kubernetes cluster HTTP endpoint URL")
         .map_err(|error| error.to_string())
@@ -2304,6 +2313,36 @@ fn validate_kubernetes_dns_subdomain(value: &str, label: &str) -> Result<(), Str
                 "{label} `{value}` must be a DNS subdomain using lowercase ASCII letters, digits, and '-' with alphanumeric label edges"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_dns_label_with_max(
+    value: &str,
+    label: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{label} exceeds {max_bytes} bytes"));
+    }
+    let valid_body = value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let valid_edges = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !valid_body || !valid_edges {
+        return Err(format!(
+            "{label} `{value}` must be a DNS label using lowercase ASCII letters, digits, and '-' with alphanumeric edges"
+        ));
     }
     Ok(())
 }
@@ -3553,6 +3592,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_secret,
         args.join_token_key
     );
+    append_k8s_chart_metadata_values(&mut helm_command, &args);
     append_k8s_cluster_values(&mut helm_command, &args);
     append_k8s_image_values(&mut helm_command, &args);
     append_k8s_service_account_values(&mut helm_command, &args);
@@ -3949,6 +3989,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Chart nameOverride and fullnameOverride values map directly to Helm chart metadata and must remain Kubernetes DNS labels".to_string(),
             "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
@@ -3958,6 +3999,15 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn append_k8s_chart_metadata_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(name_override) = args.chart_name_override.as_deref() {
+        append_helm_set_string(command, "nameOverride", name_override);
+    }
+    if let Some(fullname_override) = args.chart_fullname_override.as_deref() {
+        append_helm_set_string(command, "fullnameOverride", fullname_override);
+    }
 }
 
 fn append_k8s_cluster_values(command: &mut String, args: &K8sInstallArgs) {
@@ -4385,6 +4435,14 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
 fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_helm_release_name(&args.release).map_err(anyhow::Error::msg)?;
     validate_kubernetes_namespace(&args.namespace)?;
+    if let Some(name_override) = args.chart_name_override.as_deref() {
+        validate_kubernetes_dns_label_with_max(name_override, "--chart-name-override", 53)
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(fullname_override) = args.chart_fullname_override.as_deref() {
+        validate_kubernetes_dns_label_with_max(fullname_override, "--chart-fullname-override", 53)
+            .map_err(anyhow::Error::msg)?;
+    }
     validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
         .map_err(anyhow::Error::msg)?;
     validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
@@ -8593,6 +8651,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -9032,6 +9092,27 @@ mod tests {
     }
 
     #[test]
+    fn k8s_install_plan_wires_chart_metadata_overrides() -> anyhow::Result<()> {
+        assert!(parse_kubernetes_chart_name_override("edge-ipars").is_ok());
+        assert!(parse_kubernetes_chart_name_override("Edge").is_err());
+
+        let mut args = base_k8s_install_args();
+        args.chart_name_override = Some("edge-agent".to_string());
+        args.chart_fullname_override = Some("edge-ipars-agent".to_string());
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(helm.contains("--set-string nameOverride=edge-agent"));
+        assert!(helm.contains("--set-string fullnameOverride=edge-ipars-agent"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("Chart nameOverride and fullnameOverride")));
+        Ok(())
+    }
+
+    #[test]
     fn k8s_install_validates_relay_advertisement_endpoints() -> anyhow::Result<()> {
         let parsed = Cli::try_parse_from([
             "ipars",
@@ -9233,8 +9314,12 @@ mod tests {
         let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/daemonset.yaml")
             .canonicalize()?;
+        let values_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/values.yaml")
+            .canonicalize()?;
         let helpers = std::fs::read_to_string(helpers_path)?;
         let daemonset = std::fs::read_to_string(daemonset_path)?;
+        let values = std::fs::read_to_string(values_path)?;
 
         assert!(helpers.contains("define \"ipars.validateChartMetadata\""));
         assert!(helpers.contains("define \"ipars.validateDnsLabelWithMax\""));
@@ -9248,6 +9333,8 @@ mod tests {
         assert!(helpers.contains("contains $name .Release.Name"));
         assert!(helpers.contains("printf \"%s-%s\" .Release.Name $name"));
         assert!(helpers.contains(".Values.fullnameOverride | trunc 53"));
+        assert!(values.contains("nameOverride: \"\""));
+        assert!(values.contains("fullnameOverride: \"\""));
         assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
         Ok(())
     }
@@ -9939,6 +10026,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -10800,6 +10889,22 @@ mod tests {
         };
         assert!(error.contains("Kubernetes namespace"));
 
+        let mut invalid_name_override = base_k8s_install_args();
+        invalid_name_override.chart_name_override = Some("Edge".to_string());
+        let error = match k8s_install_plan(invalid_name_override) {
+            Ok(_) => panic!("invalid chart name override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--chart-name-override"));
+
+        let mut invalid_fullname_override = base_k8s_install_args();
+        invalid_fullname_override.chart_fullname_override = Some("-edge-ipars".to_string());
+        let error = match k8s_install_plan(invalid_fullname_override) {
+            Ok(_) => panic!("invalid chart fullname override should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--chart-fullname-override"));
+
         let mut invalid_secret = base_k8s_install_args();
         invalid_secret.join_token_secret = "bad secret".to_string();
         let error = match k8s_install_plan(invalid_secret) {
@@ -11032,6 +11137,10 @@ mod tests {
             "edge",
             "--namespace",
             "edge-system",
+            "--chart-name-override",
+            "edge-agent",
+            "--chart-fullname-override",
+            "edge-ipars-agent",
             "--join-token-secret",
             "edge-token",
             "--join-token-key",
@@ -11223,6 +11332,11 @@ mod tests {
         {
             assert_eq!(args.release, "edge");
             assert_eq!(args.namespace, "edge-system");
+            assert_eq!(args.chart_name_override.as_deref(), Some("edge-agent"));
+            assert_eq!(
+                args.chart_fullname_override.as_deref(),
+                Some("edge-ipars-agent")
+            );
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
             assert_eq!(
@@ -11476,6 +11590,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -11625,6 +11741,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -13039,6 +13157,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -13175,6 +13295,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -13445,6 +13567,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -13586,6 +13710,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
@@ -13722,6 +13848,8 @@ mod tests {
             release: "edge".to_string(),
             namespace: "edge-system".to_string(),
             chart: PathBuf::from("charts/ipars"),
+            chart_name_override: None,
+            chart_fullname_override: None,
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
             cluster_control_plane_url: None,
