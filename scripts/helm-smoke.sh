@@ -35,6 +35,17 @@ template_fails() {
   fi
 }
 
+assert_rendered_contains() {
+  local name="$1"
+  local expected="$2"
+  local rendered="/tmp/ipars-helm-${name}.yaml"
+  if ! grep -Fq "$expected" "$rendered"; then
+    echo "Helm template output for ${name} did not include expected content: ${expected}" >&2
+    cat "$rendered" >&2
+    exit 1
+  fi
+}
+
 helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
@@ -49,6 +60,30 @@ template_ok relay-service \
   --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
   --set agent.relayService.enabled=true \
   --set agent.relayService.type=ClusterIP
+
+template_ok service-traffic-controls \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.apiService.internalTrafficPolicy=Local \
+  --set agent.apiService.trafficDistribution=PreferSameNode \
+  --set agent.apiService.sessionAffinity=ClientIP \
+  --set agent.apiService.sessionAffinityTimeoutSeconds=600 \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=ClusterIP \
+  --set agent.relayService.internalTrafficPolicy=Cluster \
+  --set agent.relayService.trafficDistribution=PreferClose \
+  --set agent.relayService.sessionAffinity=ClientIP \
+  --set agent.relayService.sessionAffinityTimeoutSeconds=900
+
+assert_rendered_contains service-traffic-controls "internalTrafficPolicy: Local"
+assert_rendered_contains service-traffic-controls "trafficDistribution: PreferSameNode"
+assert_rendered_contains service-traffic-controls "timeoutSeconds: 600"
+assert_rendered_contains service-traffic-controls "internalTrafficPolicy: Cluster"
+assert_rendered_contains service-traffic-controls "trafficDistribution: PreferClose"
+assert_rendered_contains service-traffic-controls "timeoutSeconds: 900"
 
 template_ok network-policy \
   --set agent.apiService.enabled=true \
