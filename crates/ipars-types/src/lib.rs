@@ -1739,6 +1739,7 @@ pub mod api {
         Rdp,
         KubernetesApi,
         Etcd,
+        ZooKeeper,
         Postgres,
         Mysql,
         MsSql,
@@ -1760,7 +1761,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 28] = [
+        pub const ALL: [Self; 29] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1771,6 +1772,7 @@ pub mod api {
             Self::Rdp,
             Self::KubernetesApi,
             Self::Etcd,
+            Self::ZooKeeper,
             Self::Postgres,
             Self::Mysql,
             Self::MsSql,
@@ -1803,6 +1805,7 @@ pub mod api {
                 Self::Rdp => "rdp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
+                Self::ZooKeeper => "zookeeper",
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
                 Self::MsSql => "mssql",
@@ -1975,6 +1978,14 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Etcd;
             }
+            if (self.involves_port(2181)
+                || self.involves_port(2182)
+                || self.involves_port(2888)
+                || self.involves_port(3888))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::ZooKeeper;
+            }
             if self.involves_port(53)
                 && matches!(
                     self.protocol,
@@ -2118,6 +2129,9 @@ pub mod api {
                 .or_else(|| ldap_payload(payload).then_some(AgentPacketFlowApplication::Ldap))
                 .or_else(|| smb_payload(payload).then_some(AgentPacketFlowApplication::Smb))
                 .or_else(|| rdp_payload(payload).then_some(AgentPacketFlowApplication::Rdp))
+                .or_else(|| {
+                    zookeeper_payload(payload).then_some(AgentPacketFlowApplication::ZooKeeper)
+                })
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -2643,6 +2657,11 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"etcd") {
             return Some(AgentPacketFlowApplication::Etcd);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"zookeeper")
+            || tls_sni_hostname_has_label_prefix(hostname, b"zk")
+        {
+            return Some(AgentPacketFlowApplication::ZooKeeper);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
         }
@@ -2770,6 +2789,12 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"etcd") {
             return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if protocol.eq_ignore_ascii_case(b"zookeeper")
+            || protocol.eq_ignore_ascii_case(b"zk")
+            || protocol.eq_ignore_ascii_case(b"zab")
+        {
+            return Some(AgentPacketFlowApplication::ZooKeeper);
         }
         if protocol.eq_ignore_ascii_case(b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
@@ -3423,6 +3448,70 @@ pub mod api {
 
     fn rdp_x224_data_tpdu(payload: &[u8], x224_len: usize) -> bool {
         x224_len == 2 && payload.len() >= 7 && payload[6] & 0x7f == 0
+    }
+
+    fn zookeeper_payload(payload: &[u8]) -> bool {
+        zookeeper_four_letter_command(payload) || zookeeper_connect_request(payload)
+    }
+
+    fn zookeeper_four_letter_command(payload: &[u8]) -> bool {
+        let command = match payload {
+            [a, b, c, d] => [*a, *b, *c, *d],
+            [a, b, c, d, b'\n'] => [*a, *b, *c, *d],
+            [a, b, c, d, b'\r', b'\n'] => [*a, *b, *c, *d],
+            _ => return false,
+        };
+        zookeeper_known_four_letter_command(&command)
+    }
+
+    fn zookeeper_known_four_letter_command(command: &[u8; 4]) -> bool {
+        let commands: [&[u8; 4]; 17] = [
+            b"ruok", b"stat", b"srvr", b"mntr", b"conf", b"cons", b"dump", b"envi", b"wchs",
+            b"wchc", b"wchp", b"isro", b"srst", b"crst", b"dirs", b"gtmk", b"stmk",
+        ];
+        commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(*known))
+    }
+
+    fn zookeeper_connect_request(payload: &[u8]) -> bool {
+        if payload.len() < 33 {
+            return false;
+        }
+        let Some(frame_len) = read_u32_be(payload, 0).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(frame_end) = 4_usize.checked_add(frame_len) else {
+            return false;
+        };
+        if !(29..=4096).contains(&frame_len) || payload.len() != frame_end {
+            return false;
+        }
+        let Some(protocol_version) = read_u32_be(payload, 4) else {
+            return false;
+        };
+        if protocol_version != 0 {
+            return false;
+        }
+        let Some(timeout_ms) = read_u32_be(payload, 16) else {
+            return false;
+        };
+        if !(1..=3_600_000).contains(&timeout_ms) {
+            return false;
+        }
+        let Some(passwd_len) = read_u32_be(payload, 28).map(|value| value as usize) else {
+            return false;
+        };
+        if passwd_len > 64 {
+            return false;
+        }
+        let Some(read_only_offset) = 32_usize.checked_add(passwd_len) else {
+            return false;
+        };
+        if read_only_offset.checked_add(1) != Some(frame_end) {
+            return false;
+        }
+        matches!(payload.get(read_only_offset).copied(), Some(0 | 1))
     }
 
     fn postgres_payload(payload: &[u8]) -> bool {
@@ -7019,6 +7108,16 @@ mod tests {
         };
         assert_eq!(etcd.application(), api::AgentPacketFlowApplication::Etcd);
 
+        let zookeeper = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2181),
+            ..Default::default()
+        };
+        assert_eq!(
+            zookeeper.application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+
         let postgres = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(5432),
@@ -7277,6 +7376,20 @@ mod tests {
             let length = (body.len() as u32) + 4;
             payload.extend_from_slice(&length.to_be_bytes());
             payload.extend_from_slice(body);
+            payload
+        }
+
+        fn zookeeper_connect_packet(timeout_ms: u32, password: &[u8], read_only: bool) -> Vec<u8> {
+            let frame_len = 29 + password.len();
+            let mut payload = Vec::with_capacity(4 + frame_len);
+            payload.extend_from_slice(&(frame_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(&timeout_ms.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(&(password.len() as u32).to_be_bytes());
+            payload.extend_from_slice(password);
+            payload.push(u8::from(read_only));
             payload
         }
 
@@ -7718,6 +7831,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Amqp,
             ),
             (
+                "zookeeper-0.control.svc",
+                api::AgentPacketFlowApplication::ZooKeeper,
+            ),
+            (
                 "cassandra-seed.db.svc",
                 api::AgentPacketFlowApplication::Cassandra,
             ),
@@ -7803,6 +7920,10 @@ mod tests {
             (
                 &[b"kafka".as_slice()][..],
                 api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                &[b"zookeeper".as_slice()][..],
+                api::AgentPacketFlowApplication::ZooKeeper,
             ),
             (
                 &[b"nats".as_slice()][..],
@@ -8187,6 +8308,33 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x01]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"ruok").application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        assert_eq!(
+            observation_for_payload(b"stat\r\n").application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        assert_eq!(
+            observation_for_payload(b"confused").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let zookeeper_connect = zookeeper_connect_packet(30_000, &[], false);
+        assert_eq!(
+            observation_for_payload(&zookeeper_connect).application(),
+            api::AgentPacketFlowApplication::ZooKeeper
+        );
+        let invalid_zookeeper_version = {
+            let mut payload = zookeeper_connect.clone();
+            payload[4] = 0xff;
+            payload[5] = 0xff;
+            payload
+        };
+        assert_eq!(
+            observation_for_payload(&invalid_zookeeper_version).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
