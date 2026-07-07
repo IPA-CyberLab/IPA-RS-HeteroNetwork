@@ -25,8 +25,8 @@ use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
     JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse, StunMetricsResponse,
+    RelayDataplaneDropReason, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse, StunMetricsResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -215,6 +215,10 @@ struct LoadReport {
     daemon_failover_relay_udp_packets_received: usize,
     daemon_failover_relay_udp_payload_bytes_sent: u64,
     daemon_failover_relay_udp_payload_bytes_received: u64,
+    relay_dataplane_datagrams_received_reported: u64,
+    relay_dataplane_datagrams_forwarded_reported: u64,
+    relay_dataplane_datagrams_dropped_reported: u64,
+    relay_dataplane_invalid_session_credential_drops_reported: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
     relay_available_sessions_reported: usize,
@@ -891,6 +895,34 @@ impl LoadReport {
                 self.relay_udp_payload_bytes_received
             );
         }
+        if self.relay_dataplane_datagrams_forwarded_reported
+            < self.relay_udp_packets_received as u64
+        {
+            bail!(
+                "{context} relay dataplane reported {} forwarded datagrams, below received valid packets {}",
+                self.relay_dataplane_datagrams_forwarded_reported,
+                self.relay_udp_packets_received
+            );
+        }
+        if self.relay_dataplane_invalid_session_credential_drops_reported == 0
+            || self.relay_dataplane_datagrams_dropped_reported
+                < self.relay_dataplane_invalid_session_credential_drops_reported
+        {
+            bail!(
+                "{context} relay dataplane did not report invalid credential abuse drops: dropped={}, invalid_credential={}",
+                self.relay_dataplane_datagrams_dropped_reported,
+                self.relay_dataplane_invalid_session_credential_drops_reported
+            );
+        }
+        let minimum_datagrams_received = self.relay_udp_packets_received as u64
+            + self.relay_dataplane_datagrams_dropped_reported;
+        if self.relay_dataplane_datagrams_received_reported < minimum_datagrams_received {
+            bail!(
+                "{context} relay dataplane reported {} received datagrams, below forwarded valid packets plus drops {}",
+                self.relay_dataplane_datagrams_received_reported,
+                minimum_datagrams_received
+            );
+        }
         if self.relay_udp_sessions != self.active_pair_count
             || self.relay_active_sessions_reported != self.active_pair_count
         {
@@ -1118,6 +1150,14 @@ impl LoadReport {
                 != self.daemon_failover_relay_udp_payload_bytes_sent
             || measurement.failover_relay_udp_payload_bytes_received
                 != self.daemon_failover_relay_udp_payload_bytes_received
+            || measurement.relay_dataplane_datagrams_received_reported
+                != self.relay_dataplane_datagrams_received_reported
+            || measurement.relay_dataplane_datagrams_forwarded_reported
+                != self.relay_dataplane_datagrams_forwarded_reported
+            || measurement.relay_dataplane_datagrams_dropped_reported
+                != self.relay_dataplane_datagrams_dropped_reported
+            || measurement.relay_dataplane_invalid_session_credential_drops_reported
+                != self.relay_dataplane_invalid_session_credential_drops_reported
             || measurement.relay_forwarded_bytes_reported != self.relay_forwarded_bytes_reported
             || measurement.relay_active_sessions_reported != self.relay_active_sessions_reported
             || measurement.control_plane_failover_checked
@@ -1126,11 +1166,15 @@ impl LoadReport {
                 != self.daemon_control_plane_failover_survivor_endpoints
         {
             bail!(
-                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
+                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, dataplane drops {}/{}, invalid credential drops {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
                 measurement.relay_udp_packets_received,
                 self.relay_udp_packets_received,
                 measurement.failover_relay_udp_packets_received,
                 self.daemon_failover_relay_udp_packets_received,
+                measurement.relay_dataplane_datagrams_dropped_reported,
+                self.relay_dataplane_datagrams_dropped_reported,
+                measurement.relay_dataplane_invalid_session_credential_drops_reported,
+                self.relay_dataplane_invalid_session_credential_drops_reported,
                 measurement.relay_forwarded_bytes_reported,
                 self.relay_forwarded_bytes_reported,
                 measurement.relay_active_sessions_reported,
@@ -1810,6 +1854,10 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_failover_relay_udp_packets_received: 0,
         daemon_failover_relay_udp_payload_bytes_sent: 0,
         daemon_failover_relay_udp_payload_bytes_received: 0,
+        relay_dataplane_datagrams_received_reported: 0,
+        relay_dataplane_datagrams_forwarded_reported: 0,
+        relay_dataplane_datagrams_dropped_reported: 0,
+        relay_dataplane_invalid_session_credential_drops_reported: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -2042,6 +2090,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_failover_relay_udp_packets_received: 0,
         daemon_failover_relay_udp_payload_bytes_sent: 0,
         daemon_failover_relay_udp_payload_bytes_received: 0,
+        relay_dataplane_datagrams_received_reported: 0,
+        relay_dataplane_datagrams_forwarded_reported: 0,
+        relay_dataplane_datagrams_dropped_reported: 0,
+        relay_dataplane_invalid_session_credential_drops_reported: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -2159,6 +2211,7 @@ async fn run_relay_udp_scenario(
     let mut packets_received = 0;
     let mut payload_bytes_sent = 0_u64;
     let mut payload_bytes_received = 0_u64;
+    let mut first_admission = None;
     for pair_index in 0..scenario.active_pair_count {
         let admission: RelayAdmissionResponse = post_json(
             &client,
@@ -2172,6 +2225,7 @@ async fn run_relay_udp_scenario(
             "relay session admission",
         )
         .await?;
+        first_admission.get_or_insert_with(|| admission.clone());
 
         for packet_index in 0..options.packets_per_session {
             let payload = relay_payload(pair_index, packet_index, options.payload_bytes);
@@ -2194,12 +2248,23 @@ async fn run_relay_udp_scenario(
             payload_bytes_received = payload_bytes_received.saturating_add(len as u64);
         }
     }
+    if let Some(admission) = &first_admission {
+        send_invalid_relay_session_credential_datagram(
+            &left_socket,
+            services.udp_addr,
+            admission,
+            options.payload_bytes,
+        )
+        .await?;
+    }
     let relay_elapsed = relay_started.elapsed();
     let relay_millis = relay_elapsed.as_millis();
-    let status: RelayStatusResponse = get_json(
+    let expected_invalid_credential_drops = u64::from(first_admission.is_some());
+    let status = wait_for_relay_status_with_invalid_credential_drop(
         &client,
-        format!("{}/v1/status", services.http_url),
-        "relay status",
+        &services.http_url,
+        expected_invalid_credential_drops,
+        Duration::from_secs(2),
     )
     .await?;
     let metrics = get_text(
@@ -2248,6 +2313,11 @@ async fn run_relay_udp_scenario(
         daemon_failover_relay_udp_packets_received: 0,
         daemon_failover_relay_udp_payload_bytes_sent: 0,
         daemon_failover_relay_udp_payload_bytes_received: 0,
+        relay_dataplane_datagrams_received_reported: status.dataplane.datagrams_received,
+        relay_dataplane_datagrams_forwarded_reported: status.dataplane.datagrams_forwarded,
+        relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
+        relay_dataplane_invalid_session_credential_drops_reported:
+            relay_invalid_session_credential_drops(&status),
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -2345,6 +2415,61 @@ async fn run_relay_udp_scenario(
         signal_millis: 0,
         relay_millis,
     })
+}
+
+async fn send_invalid_relay_session_credential_datagram(
+    socket: &UdpSocket,
+    relay_addr: SocketAddr,
+    admission: &RelayAdmissionResponse,
+    payload_bytes: usize,
+) -> anyhow::Result<()> {
+    let payload = relay_payload(0, 0, payload_bytes);
+    let datagram = encode_relay_datagram(
+        &admission.session_id,
+        "ipars-load-invalid-session-token",
+        &payload,
+    )?;
+    socket
+        .send_to(&datagram, relay_addr)
+        .await
+        .context("failed to send invalid relay credential probe")?;
+    Ok(())
+}
+
+async fn wait_for_relay_status_with_invalid_credential_drop(
+    client: &reqwest::Client,
+    relay_http_url: &str,
+    expected_invalid_credential_drops: u64,
+    timeout: Duration,
+) -> anyhow::Result<RelayStatusResponse> {
+    let started_at = Instant::now();
+    loop {
+        let status: RelayStatusResponse = get_json(
+            client,
+            format!("{relay_http_url}/v1/status"),
+            "relay status",
+        )
+        .await?;
+        if relay_invalid_session_credential_drops(&status) >= expected_invalid_credential_drops {
+            return Ok(status);
+        }
+        if started_at.elapsed() >= timeout {
+            bail!(
+                "relay status did not report {expected_invalid_credential_drops} invalid credential drops before timeout; latest drops={:?}",
+                status.dataplane.drops_by_reason
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn relay_invalid_session_credential_drops(status: &RelayStatusResponse) -> u64 {
+    status
+        .dataplane
+        .drops_by_reason
+        .get(&RelayDataplaneDropReason::InvalidSessionCredential)
+        .copied()
+        .unwrap_or_default()
 }
 
 async fn run_daemon_scenario(
@@ -2540,14 +2665,25 @@ async fn run_daemon_scenario(
             relay_payload_bytes_received = relay_payload_bytes_received.saturating_add(len as u64);
         }
     }
+    if let Some(admission) = relay_admissions.first() {
+        send_invalid_relay_session_credential_datagram(
+            &left_socket,
+            services.relay_udp_addr,
+            admission,
+            relay_options.payload_bytes,
+        )
+        .await?;
+    }
     services.ensure_running(DaemonRuntimePhase::RelayMeasurement)?;
     let relay_elapsed = relay_started.elapsed();
     let relay_millis = relay_elapsed.as_millis();
     services.write_manifest(DaemonRuntimePhase::FinalMetrics)?;
-    let status: RelayStatusResponse = get_json(
+    let expected_invalid_credential_drops = u64::from(!relay_admissions.is_empty());
+    let status = wait_for_relay_status_with_invalid_credential_drop(
         &client,
-        format!("{}/v1/status", services.relay_http_url),
-        "daemon relay status",
+        &services.relay_http_url,
+        expected_invalid_credential_drops,
+        agent_readiness_timeout,
     )
     .await?;
     let metrics = get_text(
@@ -2775,6 +2911,11 @@ async fn run_daemon_scenario(
         failover_relay_udp_packets_received,
         failover_relay_udp_payload_bytes_sent,
         failover_relay_udp_payload_bytes_received,
+        relay_dataplane_datagrams_received_reported: status.dataplane.datagrams_received,
+        relay_dataplane_datagrams_forwarded_reported: status.dataplane.datagrams_forwarded,
+        relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
+        relay_dataplane_invalid_session_credential_drops_reported:
+            relay_invalid_session_credential_drops(&status),
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         control_plane_failover_checked: failover_checked,
@@ -2816,6 +2957,11 @@ async fn run_daemon_scenario(
         daemon_failover_relay_udp_packets_received: failover_relay_udp_packets_received,
         daemon_failover_relay_udp_payload_bytes_sent: failover_relay_udp_payload_bytes_sent,
         daemon_failover_relay_udp_payload_bytes_received: failover_relay_udp_payload_bytes_received,
+        relay_dataplane_datagrams_received_reported: status.dataplane.datagrams_received,
+        relay_dataplane_datagrams_forwarded_reported: status.dataplane.datagrams_forwarded,
+        relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
+        relay_dataplane_invalid_session_credential_drops_reported:
+            relay_invalid_session_credential_drops(&status),
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -3420,6 +3566,10 @@ struct DaemonRuntimeManifestMeasurement {
     failover_relay_udp_packets_received: usize,
     failover_relay_udp_payload_bytes_sent: u64,
     failover_relay_udp_payload_bytes_received: u64,
+    relay_dataplane_datagrams_received_reported: u64,
+    relay_dataplane_datagrams_forwarded_reported: u64,
+    relay_dataplane_datagrams_dropped_reported: u64,
+    relay_dataplane_invalid_session_credential_drops_reported: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
     control_plane_failover_checked: bool,
@@ -9513,6 +9663,12 @@ mod tests {
         report.daemon_failover_relay_udp_payload_bytes_sent = report.active_pair_count as u64 * 64;
         report.daemon_failover_relay_udp_payload_bytes_received =
             report.daemon_failover_relay_udp_payload_bytes_sent;
+        report.relay_dataplane_datagrams_received_reported =
+            report.relay_udp_packets_received as u64 + 1;
+        report.relay_dataplane_datagrams_forwarded_reported =
+            report.relay_udp_packets_received as u64;
+        report.relay_dataplane_datagrams_dropped_reported = 1;
+        report.relay_dataplane_invalid_session_credential_drops_reported = 1;
         report.relay_forwarded_bytes_reported = report.relay_udp_payload_bytes_received;
         report.relay_udp_sessions = report.active_pair_count;
         report.relay_active_sessions_reported = report.active_pair_count;
@@ -9893,6 +10049,10 @@ mod tests {
             failover_relay_udp_packets_received: 6,
             failover_relay_udp_payload_bytes_sent: 384,
             failover_relay_udp_payload_bytes_received: 384,
+            relay_dataplane_datagrams_received_reported: 7,
+            relay_dataplane_datagrams_forwarded_reported: 6,
+            relay_dataplane_datagrams_dropped_reported: 1,
+            relay_dataplane_invalid_session_credential_drops_reported: 1,
             relay_forwarded_bytes_reported: 384,
             relay_active_sessions_reported: 6,
             control_plane_failover_checked: true,
@@ -9965,6 +10125,14 @@ mod tests {
                     .daemon_failover_relay_udp_payload_bytes_sent,
                 failover_relay_udp_payload_bytes_received: report
                     .daemon_failover_relay_udp_payload_bytes_received,
+                relay_dataplane_datagrams_received_reported: report
+                    .relay_dataplane_datagrams_received_reported,
+                relay_dataplane_datagrams_forwarded_reported: report
+                    .relay_dataplane_datagrams_forwarded_reported,
+                relay_dataplane_datagrams_dropped_reported: report
+                    .relay_dataplane_datagrams_dropped_reported,
+                relay_dataplane_invalid_session_credential_drops_reported: report
+                    .relay_dataplane_invalid_session_credential_drops_reported,
                 relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
                 relay_active_sessions_reported: report.relay_active_sessions_reported,
                 control_plane_failover_checked: report.daemon_control_plane_failover_checked,
