@@ -40,6 +40,8 @@ const SIGNAL_PLAN_NAT_TEST_NAME: &str =
     "udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namespaces";
 const SIGNAL_PLAN_MIXED_PORT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_uses_signal_plan_across_mixed_port_snat_network_namespaces";
+const SIGNAL_PLAN_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
+    "udp_hole_puncher_does_not_traverse_signal_plan_address_port_dependent_snat_network_namespaces";
 const SIGNAL_PLAN_ONE_SIDED_NAT_TEST_NAME: &str =
     "udp_hole_puncher_uses_signal_plan_across_one_sided_public_peer_snat_network_namespaces";
 const SIGNAL_PLAN_ONE_SIDED_PORT_PRESERVING_NAT_TEST_NAME: &str =
@@ -442,6 +444,61 @@ async fn udp_hole_puncher_uses_signal_plan_across_mixed_port_snat_network_namesp
     run_two_sided_snat_hole_punch_topology_with_signal_plan(
         SIGNAL_PLAN_MIXED_PORT_NAT_TEST_NAME,
         "sigmixednat",
+        topology,
+        plan_json.as_str(),
+    )
+}
+
+#[tokio::test]
+async fn udp_hole_puncher_does_not_traverse_signal_plan_address_port_dependent_snat_network_namespaces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+        return run_child(&role).await;
+    }
+
+    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping signal-plan address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    require_command("iptables")?;
+    require_command("sysctl")?;
+
+    let topology = TwoSidedSnatTopology {
+        private_second_octet: 250,
+        public_third_octet: 14,
+        left_bind_port: 40101,
+        right_bind_port: 40102,
+        left_reflexive_port: 50101,
+        right_reflexive_port: 50102,
+        left_snat_port: Some(51101),
+        right_snat_port: Some(51102),
+        expect_hole_punch_success: false,
+    };
+    let plan_json = signal_plan_json(
+        "node-a",
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            topology.left_reflexive_port,
+        ),
+        "node-b",
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            topology.right_reflexive_port,
+        ),
+    )
+    .await?;
+
+    run_two_sided_snat_hole_punch_topology_with_signal_plan(
+        SIGNAL_PLAN_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME,
+        "sigapdnat",
         topology,
         plan_json.as_str(),
     )
