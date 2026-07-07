@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -43,6 +43,7 @@ static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static DAEMON_MANIFEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const DAEMON_LOG_TAIL_BYTES: usize = 8192;
 const DAEMON_LOG_TAIL_LINES: usize = 40;
+const MAX_DAEMON_RUNTIME_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
 const DAEMON_CONTROL_PLANE_SQLITE_FILE: &str = "control-plane.sqlite";
 const DAEMON_JOIN_TOKEN_FILE_SUFFIX: &str = ".join-token.json";
@@ -1004,12 +1005,11 @@ impl LoadReport {
             0o600,
             "retained manifest",
         )?;
-        let manifest_bytes = std::fs::read(manifest_path).with_context(|| {
-            format!(
-                "daemon load scenario retained manifest {} is not readable",
-                manifest_path.display()
-            )
-        })?;
+        let manifest_bytes = read_bounded_regular_file(
+            manifest_path,
+            "daemon load scenario retained manifest",
+            MAX_DAEMON_RUNTIME_MANIFEST_BYTES,
+        )?;
         let manifest: DaemonRuntimeManifest = serde_json::from_slice(&manifest_bytes)
             .context("failed to parse daemon load scenario retained runtime manifest")?;
 
@@ -1571,6 +1571,48 @@ fn validate_daemon_retained_path_mode(
         let _ = (path, metadata, expected_mode, label);
     }
     Ok(())
+}
+
+fn read_bounded_regular_file(path: &Path, label: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("{label} {} is not accessible", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} {} is not a regular file", path.display());
+    }
+    if metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        );
+    }
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("{label} {} is not readable", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("{label} {} cannot be inspected after open", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} {} is not a regular file", path.display());
+    }
+    if metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        );
+    }
+
+    let mut bytes = Vec::new();
+    let mut reader = file.take(max_bytes + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("{label} {} is not readable", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{label} {} exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        );
+    }
+    Ok(bytes)
 }
 
 fn expected_daemon_retained_runtime_entries() -> BTreeSet<String> {
@@ -4264,10 +4306,9 @@ fn daemon_children_log_summary(children: &[DaemonChild]) -> String {
 }
 
 fn daemon_log_tail(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read daemon log {}", path.display()))?;
-    let start = bytes.len().saturating_sub(DAEMON_LOG_TAIL_BYTES);
-    let text = String::from_utf8_lossy(&bytes[start..]);
+    let bytes = daemon_log_tail_bytes(path)
+        .with_context(|| format!("failed to read daemon log tail {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines = text
         .lines()
         .rev()
@@ -4277,19 +4318,47 @@ fn daemon_log_tail(path: &Path) -> anyhow::Result<String> {
     Ok(lines.join("\n"))
 }
 
+fn daemon_log_tail_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect daemon log {}", path.display()))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        bail!("daemon log {} is not a regular file", path.display());
+    }
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open daemon log {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect daemon log {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("daemon log {} is not a regular file", path.display());
+    }
+    let start = metadata.len().saturating_sub(DAEMON_LOG_TAIL_BYTES as u64);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek daemon log {}", path.display()))?;
+    let mut bytes = Vec::new();
+    let mut reader = file.take(DAEMON_LOG_TAIL_BYTES as u64);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read daemon log tail {}", path.display()))?;
+    Ok(bytes)
+}
+
 struct DaemonLogDiagnostics {
     bytes: u64,
     tail_sha256: String,
 }
 
 fn daemon_log_diagnostics(path: &Path) -> Option<DaemonLogDiagnostics> {
-    let bytes = std::fs::read(path).ok()?;
-    let start = bytes.len().saturating_sub(DAEMON_LOG_TAIL_BYTES);
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let bytes = daemon_log_tail_bytes(path).ok()?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes[start..]);
+    hasher.update(&bytes);
     let tail_sha256 = format!("{:x}", hasher.finalize());
     Some(DaemonLogDiagnostics {
-        bytes: bytes.len() as u64,
+        bytes: metadata.len(),
         tail_sha256,
     })
 }
@@ -6323,6 +6392,95 @@ mod tests {
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
         report.validate_success()?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_retained_manifest_reader_rejects_oversized_and_symlinked_files() -> anyhow::Result<()>
+    {
+        let base = daemon_runtime_dir()?;
+        std::fs::create_dir_all(&base)?;
+        let manifest = base.join("manifest.json");
+        let oversized = base.join("oversized-manifest.json");
+        std::fs::write(&manifest, b"{\"phase\":\"completed\"}")?;
+        assert_eq!(
+            read_bounded_regular_file(
+                &manifest,
+                "daemon load scenario retained manifest",
+                MAX_DAEMON_RUNTIME_MANIFEST_BYTES,
+            )?,
+            b"{\"phase\":\"completed\"}"
+        );
+
+        std::fs::write(
+            &oversized,
+            vec![b'{'; MAX_DAEMON_RUNTIME_MANIFEST_BYTES as usize + 1],
+        )?;
+        let error = match read_bounded_regular_file(
+            &oversized,
+            "daemon load scenario retained manifest",
+            MAX_DAEMON_RUNTIME_MANIFEST_BYTES,
+        ) {
+            Ok(_) => bail!("oversized retained manifest should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds maximum size"));
+
+        #[cfg(unix)]
+        {
+            let link = base.join("manifest-link.json");
+            std::os::unix::fs::symlink(&manifest, &link)?;
+            let error = match read_bounded_regular_file(
+                &link,
+                "daemon load scenario retained manifest",
+                MAX_DAEMON_RUNTIME_MANIFEST_BYTES,
+            ) {
+                Ok(_) => bail!("symlinked retained manifest should be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("is not a regular file"));
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_log_diagnostics_hashes_only_bounded_tail() -> anyhow::Result<()> {
+        let base = daemon_runtime_dir()?;
+        std::fs::create_dir_all(&base)?;
+        let log_path = base.join("0000-control-plane-0.log");
+        let mut contents = Vec::new();
+        contents.extend_from_slice(b"first-line\n");
+        contents.extend(std::iter::repeat_n(b'x', DAEMON_LOG_TAIL_BYTES * 2));
+        contents.extend_from_slice(b"\nfinal-line\n");
+        std::fs::write(&log_path, &contents)?;
+
+        let tail = daemon_log_tail(&log_path)?;
+        assert!(tail.contains("final-line"));
+        assert!(!tail.contains("first-line"));
+
+        let diagnostics =
+            daemon_log_diagnostics(&log_path).context("log diagnostics should be available")?;
+        assert_eq!(diagnostics.bytes, contents.len() as u64);
+        let expected_tail = &contents[contents.len() - DAEMON_LOG_TAIL_BYTES..];
+        let mut hasher = Sha256::new();
+        hasher.update(expected_tail);
+        assert_eq!(diagnostics.tail_sha256, format!("{:x}", hasher.finalize()));
+
+        #[cfg(unix)]
+        {
+            let link = base.join("log-link");
+            std::os::unix::fs::symlink(&log_path, &link)?;
+            let error = match daemon_log_tail(&link) {
+                Ok(_) => bail!("symlinked daemon log should be rejected"),
+                Err(error) => error,
+            };
+            assert!(format!("{error:#}").contains("not a regular file"));
+            assert!(daemon_log_diagnostics(&link).is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 
