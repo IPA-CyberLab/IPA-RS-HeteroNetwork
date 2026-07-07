@@ -110,6 +110,7 @@ const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
+const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -6723,17 +6724,15 @@ impl DockerApiNetworkDiscovery {
     }
 
     async fn discover_intent(&self) -> anyhow::Result<DockerNetworkIntent> {
-        let networks: Vec<DockerApiNetwork> = self
+        let response = self
             .client
             .get(docker_api_networks_url(&self.api_version))
             .send()
             .await
             .context("failed to query Docker networks")?
             .error_for_status()
-            .context("Docker networks API returned an error")?
-            .json()
-            .await
-            .context("failed to decode Docker networks response")?;
+            .context("Docker networks API returned an error")?;
+        let networks = read_docker_api_networks_response(response).await?;
         let discovered = docker_discovered_routes(&networks, &self.network_filters)?;
         let container_namespace = self
             .container_namespace
@@ -6747,6 +6746,35 @@ impl DockerApiNetworkDiscovery {
             expose_host_routes: self.expose_host_routes,
         })
     }
+}
+
+async fn read_docker_api_networks_response(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<DockerApiNetwork>> {
+    if let Some(length) = response.content_length() {
+        ensure_docker_api_networks_response_size(length)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read Docker networks response")?
+    {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        ensure_docker_api_networks_response_size(next_len)?;
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("failed to decode Docker networks response")
+}
+
+fn ensure_docker_api_networks_response_size(size: u64) -> anyhow::Result<()> {
+    if size > MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES {
+        anyhow::bail!(
+            "Docker networks API response exceeds maximum size of {} bytes",
+            MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn docker_route_source(args: &AgentArgs) -> anyhow::Result<DockerRouteSource> {
@@ -20641,6 +20669,63 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(routes[0].id, "docker-0");
         assert_eq!(routes[0].via, Some(NodeId::from_string("node-a")));
 
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn docker_api_discovery_rejects_oversized_network_response() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let base = unique_test_dir("docker-api-oversized-response")?;
+        let socket_path = base.join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES + 1
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let client = reqwest::Client::builder()
+            .unix_socket(socket_path.clone())
+            .build()
+            .context("failed to build test Docker API client")?;
+        let discovery = DockerApiNetworkDiscovery {
+            client,
+            api_version: "v1.43".to_string(),
+            network_filters: Vec::new(),
+            container_namespace: None,
+            host_interface: "docker0".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            expose_host_routes: true,
+        };
+
+        let error = match discovery.discover_intent().await {
+            Ok(intent) => {
+                anyhow::bail!("oversized Docker networks response should be rejected: {intent:?}")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Docker networks API response exceeds maximum size"));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized Docker API response server")???;
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
