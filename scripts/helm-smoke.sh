@@ -68,6 +68,21 @@ helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
 
+template_ok cluster-endpoints \
+  --set-string cluster.controlPlaneUrl=https://control.example.com:8443 \
+  --set-string cluster.signalUrl=https://signal.example.com:9443 \
+  --set-string cluster.stunEndpoint=203.0.113.53:3478
+
+assert_rendered_contains cluster-endpoints "- --control-plane-url"
+assert_rendered_contains cluster-endpoints '"https://control.example.com:8443"'
+assert_rendered_contains cluster-endpoints "- --signal-url"
+assert_rendered_contains cluster-endpoints '"https://signal.example.com:9443"'
+assert_rendered_contains cluster-endpoints "- --stun-server"
+assert_rendered_contains cluster-endpoints '"203.0.113.53:3478"'
+assert_rendered_contains cluster-endpoints "name: IPARS_CONTROL_PLANE_URL"
+assert_rendered_contains cluster-endpoints "name: IPARS_SIGNAL_URL"
+assert_rendered_contains cluster-endpoints "name: IPARS_STUN_ENDPOINT"
+
 template_release_ok release-scoping edge \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP \
@@ -351,6 +366,18 @@ template_fails relay-cluster-external-traffic-policy-without-ack \
   --set agent.relayService.type=NodePort \
   --set agent.relayService.exposureAcknowledged=true \
   --set agent.relayService.externalTrafficPolicy=Cluster
+
+template_fails cluster-control-plane-url-userinfo \
+  "cluster.controlPlaneUrl must not include userinfo" \
+  --set-string cluster.controlPlaneUrl=https://user:pass@control.example.com:8443
+
+template_fails cluster-signal-url-invalid-port \
+  "cluster.signalUrl port must be between 1 and 65535" \
+  --set-string cluster.signalUrl=https://signal.example.com:99999
+
+template_fails cluster-stun-endpoint-unspecified \
+  "cluster.stunEndpoint value \"0.0.0.0:3478\" must not use an unspecified address" \
+  --set-string cluster.stunEndpoint=0.0.0.0:3478
 
 template_fails relay-forwarder-netns-without-sys-admin \
   "agent.relayForwarder.netns requires agent.privileged=true or SYS_ADMIN in agent.securityContext.capabilities.add" \
