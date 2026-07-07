@@ -1752,6 +1752,7 @@ pub mod api {
         Prometheus,
         OpenTelemetry,
         Jaeger,
+        Loki,
         Grpc,
         Kafka,
         Nats,
@@ -1765,7 +1766,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 33] = [
+        pub const ALL: [Self; 34] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1789,6 +1790,7 @@ pub mod api {
             Self::Prometheus,
             Self::OpenTelemetry,
             Self::Jaeger,
+            Self::Loki,
             Self::Grpc,
             Self::Kafka,
             Self::Nats,
@@ -1826,6 +1828,7 @@ pub mod api {
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Jaeger => "jaeger",
+                Self::Loki => "loki",
                 Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
@@ -2106,6 +2109,11 @@ pub mod api {
                 && matches!(self.protocol, None | Some(TransportProtocol::Udp))
             {
                 return AgentPacketFlowApplication::Jaeger;
+            }
+            if (self.involves_port(3100) || self.involves_port(9095))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Loki;
             }
             if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Grpc;
@@ -2429,6 +2437,9 @@ pub mod api {
             return Some(application);
         }
         if let Some(path) = http_request_path(payload) {
+            if loki_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Loki);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -2528,6 +2539,10 @@ pub mod api {
         PREFIXES
             .iter()
             .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn loki_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/loki/api/v1")
     }
 
     fn consul_http_api_path(path: &[u8]) -> bool {
@@ -2860,6 +2875,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"jaeger") {
             return Some(AgentPacketFlowApplication::Jaeger);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"loki") {
+            return Some(AgentPacketFlowApplication::Loki);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
             return Some(AgentPacketFlowApplication::Grpc);
         }
@@ -3018,6 +3036,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"jaeger-thrift")
         {
             return Some(AgentPacketFlowApplication::Jaeger);
+        }
+        if protocol.eq_ignore_ascii_case(b"loki")
+            || protocol.eq_ignore_ascii_case(b"loki-grpc")
+            || protocol.eq_ignore_ascii_case(b"loki-http")
+        {
+            return Some(AgentPacketFlowApplication::Loki);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7474,6 +7498,13 @@ mod tests {
             api::AgentPacketFlowApplication::Jaeger
         );
 
+        let loki = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3100),
+            ..Default::default()
+        };
+        assert_eq!(loki.application(), api::AgentPacketFlowApplication::Loki);
+
         let grpc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(50051),
@@ -8144,6 +8175,19 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"GET /loki/api/v1/query?query=up HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Loki
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /loki/api/v1/push HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Loki
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /loki/api/v1ish/query HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8158,6 +8202,10 @@ mod tests {
             (
                 "jaeger-collector.observability.svc",
                 api::AgentPacketFlowApplication::Jaeger,
+            ),
+            (
+                "loki-gateway.observability.svc",
+                api::AgentPacketFlowApplication::Loki,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8274,6 +8322,10 @@ mod tests {
             (
                 &[b"jaeger-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::Jaeger,
+            ),
+            (
+                &[b"loki-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Loki,
             ),
             (
                 &[b"kafka".as_slice()][..],
