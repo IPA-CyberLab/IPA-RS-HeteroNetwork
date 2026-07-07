@@ -368,6 +368,48 @@ struct DockerInstallArgs {
     relay_forwarder_crash_cooldown_seconds: u64,
 }
 
+#[derive(Debug, Args, Clone, Default)]
+struct K8sProbeArgs {
+    #[arg(long = "agent-liveness-path", value_parser = parse_kubernetes_http_probe_path)]
+    liveness_path: Option<String>,
+    #[arg(long = "agent-liveness-initial-delay-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    liveness_initial_delay_seconds: Option<u32>,
+    #[arg(long = "agent-liveness-period-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    liveness_period_seconds: Option<u32>,
+    #[arg(long = "agent-liveness-timeout-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    liveness_timeout_seconds: Option<u32>,
+    #[arg(long = "agent-liveness-failure-threshold", value_parser = parse_kubernetes_non_negative_i32)]
+    liveness_failure_threshold: Option<u32>,
+    #[arg(long = "agent-readiness-path", value_parser = parse_kubernetes_http_probe_path)]
+    readiness_path: Option<String>,
+    #[arg(long = "agent-readiness-initial-delay-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    readiness_initial_delay_seconds: Option<u32>,
+    #[arg(long = "agent-readiness-period-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    readiness_period_seconds: Option<u32>,
+    #[arg(long = "agent-readiness-timeout-seconds", value_parser = parse_kubernetes_non_negative_i32)]
+    readiness_timeout_seconds: Option<u32>,
+    #[arg(long = "agent-readiness-failure-threshold", value_parser = parse_kubernetes_non_negative_i32)]
+    readiness_failure_threshold: Option<u32>,
+}
+
+impl K8sProbeArgs {
+    fn liveness_configured(&self) -> bool {
+        self.liveness_path.is_some()
+            || self.liveness_initial_delay_seconds.is_some()
+            || self.liveness_period_seconds.is_some()
+            || self.liveness_timeout_seconds.is_some()
+            || self.liveness_failure_threshold.is_some()
+    }
+
+    fn readiness_configured(&self) -> bool {
+        self.readiness_path.is_some()
+            || self.readiness_initial_delay_seconds.is_some()
+            || self.readiness_period_seconds.is_some()
+            || self.readiness_timeout_seconds.is_some()
+            || self.readiness_failure_threshold.is_some()
+    }
+}
+
 #[derive(Debug, Args)]
 struct K8sInstallArgs {
     #[arg(long, default_value = "ipars")]
@@ -474,6 +516,8 @@ struct K8sInstallArgs {
     disable_agent_liveness_probe: bool,
     #[arg(long = "disable-agent-readiness-probe", default_value_t = false)]
     disable_agent_readiness_probe: bool,
+    #[command(flatten)]
+    agent_probes: K8sProbeArgs,
     #[arg(long = "agent-termination-grace-period-seconds", value_parser = parse_kubernetes_non_negative_i64)]
     agent_termination_grace_period_seconds: Option<u64>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
@@ -2002,6 +2046,11 @@ fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_http_probe_path(value: &str) -> Result<String, String> {
+    validate_kubernetes_http_probe_path(value, "probe HTTP path")?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_daemonset_update_strategy(value: &str) -> Result<String, String> {
     match value {
         "RollingUpdate" | "OnDelete" => Ok(value.to_string()),
@@ -2329,6 +2378,47 @@ fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(),
         .is_some_and(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(format!("{label} must end with a digit or suffix letter"));
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_http_probe_path(path: &str, label: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if !path.starts_with('/') {
+        return Err(format!("{label} `{path}` must be absolute"));
+    }
+    if path.len() > 256 {
+        return Err(format!("{label} `{path}` exceeds 256 bytes"));
+    }
+    if !path.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'%'
+                    | b'-'
+            )
+    }) {
+        return Err(format!(
+            "{label} `{path}` must contain only HTTP path-safe ASCII characters"
+        ));
     }
     Ok(())
 }
@@ -3965,6 +4055,32 @@ fn append_k8s_relay_forwarder_values(command: &mut String, args: &K8sInstallArgs
     }
 }
 
+fn append_k8s_probe_values(
+    command: &mut String,
+    prefix: &str,
+    path: Option<&str>,
+    initial_delay_seconds: Option<u32>,
+    period_seconds: Option<u32>,
+    timeout_seconds: Option<u32>,
+    failure_threshold: Option<u32>,
+) {
+    if let Some(path) = path {
+        append_helm_set_string(command, &format!("{prefix}.path"), path);
+    }
+    if let Some(seconds) = initial_delay_seconds {
+        command.push_str(&format!(" --set {prefix}.initialDelaySeconds={seconds}"));
+    }
+    if let Some(seconds) = period_seconds {
+        command.push_str(&format!(" --set {prefix}.periodSeconds={seconds}"));
+    }
+    if let Some(seconds) = timeout_seconds {
+        command.push_str(&format!(" --set {prefix}.timeoutSeconds={seconds}"));
+    }
+    if let Some(threshold) = failure_threshold {
+        command.push_str(&format!(" --set {prefix}.failureThreshold={threshold}"));
+    }
+}
+
 fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_agent_peer_map {
         command.push_str(" --set agent.peerMap.enabled=false");
@@ -3999,6 +4115,24 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if args.disable_agent_readiness_probe {
         command.push_str(" --set agent.probes.readiness.enabled=false");
     }
+    append_k8s_probe_values(
+        command,
+        "agent.probes.liveness",
+        args.agent_probes.liveness_path.as_deref(),
+        args.agent_probes.liveness_initial_delay_seconds,
+        args.agent_probes.liveness_period_seconds,
+        args.agent_probes.liveness_timeout_seconds,
+        args.agent_probes.liveness_failure_threshold,
+    );
+    append_k8s_probe_values(
+        command,
+        "agent.probes.readiness",
+        args.agent_probes.readiness_path.as_deref(),
+        args.agent_probes.readiness_initial_delay_seconds,
+        args.agent_probes.readiness_period_seconds,
+        args.agent_probes.readiness_timeout_seconds,
+        args.agent_probes.readiness_failure_threshold,
+    );
     if args.agent_privileged {
         command.push_str(" --set agent.privileged=true");
     }
@@ -5095,6 +5229,24 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if let Some(host_path_type) = args.agent_state_host_path_type.as_deref() {
         parse_kubernetes_host_path_type(host_path_type).map_err(anyhow::Error::msg)?;
     }
+    validate_k8s_probe_config(
+        "agent liveness probe",
+        args.disable_agent_liveness_probe,
+        args.agent_probes.liveness_configured(),
+        args.agent_probes.liveness_path.as_deref(),
+        args.agent_probes.liveness_period_seconds,
+        args.agent_probes.liveness_timeout_seconds,
+        args.agent_probes.liveness_failure_threshold,
+    )?;
+    validate_k8s_probe_config(
+        "agent readiness probe",
+        args.disable_agent_readiness_probe,
+        args.agent_probes.readiness_configured(),
+        args.agent_probes.readiness_path.as_deref(),
+        args.agent_probes.readiness_period_seconds,
+        args.agent_probes.readiness_timeout_seconds,
+        args.agent_probes.readiness_failure_threshold,
+    )?;
     if let Some(seconds) = args.agent_termination_grace_period_seconds {
         if seconds > KUBERNETES_INT64_MAX {
             anyhow::bail!("--agent-termination-grace-period-seconds must be a non-negative int64");
@@ -5120,6 +5272,33 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     ] {
         if let Some(quantity) = quantity {
             validate_kubernetes_resource_quantity(quantity, label).map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_k8s_probe_config(
+    label: &str,
+    disabled: bool,
+    configured: bool,
+    path: Option<&str>,
+    period_seconds: Option<u32>,
+    timeout_seconds: Option<u32>,
+    failure_threshold: Option<u32>,
+) -> anyhow::Result<()> {
+    if disabled && configured {
+        anyhow::bail!("{label} settings require the probe to be enabled");
+    }
+    if let Some(path) = path {
+        validate_kubernetes_http_probe_path(path, label).map_err(anyhow::Error::msg)?;
+    }
+    for (field, value) in [
+        ("period seconds", period_seconds),
+        ("timeout seconds", timeout_seconds),
+        ("failure threshold", failure_threshold),
+    ] {
+        if value == Some(0) {
+            anyhow::bail!("{label} {field} must be greater than zero");
         }
     }
     Ok(())
@@ -8399,6 +8578,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -9700,6 +9880,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -10202,6 +10383,48 @@ mod tests {
         assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
         assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+        assert!(parse_kubernetes_http_probe_path("healthz").is_err());
+
+        let mut probe_config = base_k8s_install_args();
+        probe_config.agent_probes.liveness_path = Some("/livez".to_string());
+        probe_config.agent_probes.liveness_initial_delay_seconds = Some(15);
+        probe_config.agent_probes.liveness_period_seconds = Some(20);
+        probe_config.agent_probes.liveness_timeout_seconds = Some(2);
+        probe_config.agent_probes.liveness_failure_threshold = Some(5);
+        probe_config.agent_probes.readiness_path = Some("/readyz".to_string());
+        probe_config.agent_probes.readiness_initial_delay_seconds = Some(3);
+        probe_config.agent_probes.readiness_period_seconds = Some(4);
+        probe_config.agent_probes.readiness_timeout_seconds = Some(1);
+        probe_config.agent_probes.readiness_failure_threshold = Some(2);
+        let plan = k8s_install_plan(probe_config)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set-string agent.probes.liveness.path=/livez"));
+        assert!(helm.contains("--set agent.probes.liveness.initialDelaySeconds=15"));
+        assert!(helm.contains("--set agent.probes.liveness.periodSeconds=20"));
+        assert!(helm.contains("--set agent.probes.liveness.timeoutSeconds=2"));
+        assert!(helm.contains("--set agent.probes.liveness.failureThreshold=5"));
+        assert!(helm.contains("--set-string agent.probes.readiness.path=/readyz"));
+        assert!(helm.contains("--set agent.probes.readiness.initialDelaySeconds=3"));
+        assert!(helm.contains("--set agent.probes.readiness.periodSeconds=4"));
+        assert!(helm.contains("--set agent.probes.readiness.timeoutSeconds=1"));
+        assert!(helm.contains("--set agent.probes.readiness.failureThreshold=2"));
+
+        let mut disabled_probe_config = base_k8s_install_args();
+        disabled_probe_config.disable_agent_liveness_probe = true;
+        disabled_probe_config.agent_probes.liveness_path = Some("/livez".to_string());
+        let error = match k8s_install_plan(disabled_probe_config) {
+            Ok(_) => panic!("disabled liveness probe should reject liveness settings"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent liveness probe settings require the probe to be enabled"));
+
+        let mut zero_probe_period = base_k8s_install_args();
+        zero_probe_period.agent_probes.readiness_period_seconds = Some(0);
+        let error = match k8s_install_plan(zero_probe_period) {
+            Ok(_) => panic!("zero readiness period should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent readiness probe period seconds must be greater than zero"));
 
         let mut unsafe_host_path = base_k8s_install_args();
         unsafe_host_path.agent_state_host_path = Some("/etc/ipars".to_string());
@@ -11173,6 +11396,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -11318,6 +11542,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -12728,6 +12953,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -12860,6 +13086,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -13126,6 +13353,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -13263,6 +13491,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -13395,6 +13624,7 @@ mod tests {
             agent_state_host_path_type: None,
             disable_agent_liveness_probe: false,
             disable_agent_readiness_probe: false,
+            agent_probes: K8sProbeArgs::default(),
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
