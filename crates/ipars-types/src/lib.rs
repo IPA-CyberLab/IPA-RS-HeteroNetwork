@@ -1751,6 +1751,7 @@ pub mod api {
         Nfs,
         Rdp,
         Vnc,
+        Ftp,
         Smtp,
         Imap,
         Pop3,
@@ -1810,7 +1811,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 67] = [
+        pub const ALL: [Self; 68] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1822,6 +1823,7 @@ pub mod api {
             Self::Nfs,
             Self::Rdp,
             Self::Vnc,
+            Self::Ftp,
             Self::Smtp,
             Self::Imap,
             Self::Pop3,
@@ -1893,6 +1895,7 @@ pub mod api {
                 Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
                 Self::Vnc => "vnc",
+                Self::Ftp => "ftp",
                 Self::Smtp => "smtp",
                 Self::Imap => "imap",
                 Self::Pop3 => "pop3",
@@ -2244,6 +2247,14 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Vnc;
             }
+            if (self.involves_port(20)
+                || self.involves_port(21)
+                || self.involves_port(989)
+                || self.involves_port(990))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Ftp;
+            }
             if (self.involves_port(25) || self.involves_port(465) || self.involves_port(587))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
@@ -2567,6 +2578,7 @@ pub mod api {
                 .or_else(|| smtp_payload(payload).then_some(AgentPacketFlowApplication::Smtp))
                 .or_else(|| imap_payload(payload).then_some(AgentPacketFlowApplication::Imap))
                 .or_else(|| pop3_payload(payload).then_some(AgentPacketFlowApplication::Pop3))
+                .or_else(|| ftp_payload(payload).then_some(AgentPacketFlowApplication::Ftp))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -3926,6 +3938,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Vnc);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ftp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ftps")
+        {
+            return Some(AgentPacketFlowApplication::Ftp);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smtp")
             || tls_sni_hostname_has_label_prefix(hostname, b"mx")
         {
@@ -4087,6 +4104,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"nfsv4")
         {
             return Some(AgentPacketFlowApplication::Nfs);
+        }
+        if protocol.eq_ignore_ascii_case(b"ftp")
+            || protocol.eq_ignore_ascii_case(b"ftps")
+            || protocol.eq_ignore_ascii_case(b"ftp-tls")
+        {
+            return Some(AgentPacketFlowApplication::Ftp);
         }
         if protocol.eq_ignore_ascii_case(b"smtp")
             || protocol.eq_ignore_ascii_case(b"esmtp")
@@ -5779,6 +5802,60 @@ pub mod api {
             || command.eq_ignore_ascii_case(b"TOP")
             || command.eq_ignore_ascii_case(b"UIDL")
             || command.eq_ignore_ascii_case(b"QUIT")
+    }
+
+    fn ftp_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.is_empty() {
+            return false;
+        }
+        if line.len() >= 5
+            && line[0..3].iter().all(u8::is_ascii_digit)
+            && matches!(line[3], b' ' | b'-')
+            && (ascii_contains_ignore_case(line, b"FTP")
+                || ascii_contains_ignore_case(line, b"FTPS"))
+        {
+            return true;
+        }
+        let Some((command, _)) = split_ascii_token(line) else {
+            return false;
+        };
+        ftp_known_command(command)
+    }
+
+    fn ftp_known_command(command: &[u8]) -> bool {
+        command.eq_ignore_ascii_case(b"ACCT")
+            || command.eq_ignore_ascii_case(b"ALLO")
+            || command.eq_ignore_ascii_case(b"APPE")
+            || command.eq_ignore_ascii_case(b"CDUP")
+            || command.eq_ignore_ascii_case(b"CWD")
+            || command.eq_ignore_ascii_case(b"EPRT")
+            || command.eq_ignore_ascii_case(b"EPSV")
+            || command.eq_ignore_ascii_case(b"FEAT")
+            || command.eq_ignore_ascii_case(b"MLSD")
+            || command.eq_ignore_ascii_case(b"MLST")
+            || command.eq_ignore_ascii_case(b"MODE")
+            || command.eq_ignore_ascii_case(b"OPTS")
+            || command.eq_ignore_ascii_case(b"PASV")
+            || command.eq_ignore_ascii_case(b"PBSZ")
+            || command.eq_ignore_ascii_case(b"PORT")
+            || command.eq_ignore_ascii_case(b"PROT")
+            || command.eq_ignore_ascii_case(b"PWD")
+            || command.eq_ignore_ascii_case(b"REST")
+            || command.eq_ignore_ascii_case(b"RNFR")
+            || command.eq_ignore_ascii_case(b"RNTO")
+            || command.eq_ignore_ascii_case(b"SITE")
+            || command.eq_ignore_ascii_case(b"SMNT")
+            || command.eq_ignore_ascii_case(b"STOR")
+            || command.eq_ignore_ascii_case(b"STOU")
+            || command.eq_ignore_ascii_case(b"STRU")
+            || command.eq_ignore_ascii_case(b"SYST")
+            || command.eq_ignore_ascii_case(b"TYPE")
+            || command.eq_ignore_ascii_case(b"XCUP")
+            || command.eq_ignore_ascii_case(b"XCWD")
+            || command.eq_ignore_ascii_case(b"XMKD")
+            || command.eq_ignore_ascii_case(b"XPWD")
+            || command.eq_ignore_ascii_case(b"XRMD")
     }
 
     fn first_ascii_line(payload: &[u8]) -> &[u8] {
@@ -9701,6 +9778,20 @@ mod tests {
         };
         assert_eq!(vnc.application(), api::AgentPacketFlowApplication::Vnc);
 
+        let ftp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(21),
+            ..Default::default()
+        };
+        assert_eq!(ftp.application(), api::AgentPacketFlowApplication::Ftp);
+
+        let ftps = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(990),
+            ..Default::default()
+        };
+        assert_eq!(ftps.application(), api::AgentPacketFlowApplication::Ftp);
+
         let smtp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(587),
@@ -11621,6 +11712,10 @@ mod tests {
             ),
             ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
             ("vnc-console.ops.svc", api::AgentPacketFlowApplication::Vnc),
+            (
+                "ftp-files.storage.svc",
+                api::AgentPacketFlowApplication::Ftp,
+            ),
             ("smtp-relay.mail.svc", api::AgentPacketFlowApplication::Smtp),
             (
                 "imap-mailbox.mail.svc",
@@ -11691,6 +11786,10 @@ mod tests {
             (
                 &[b"rfb".as_slice()][..],
                 api::AgentPacketFlowApplication::Vnc,
+            ),
+            (
+                &[b"ftps".as_slice()][..],
+                api::AgentPacketFlowApplication::Ftp,
             ),
             (
                 &[b"submission".as_slice()][..],
@@ -12143,6 +12242,22 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"RFB 003.009\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"220 FTP server ready\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"PASV\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"STOR backup.tar\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"220 service ready\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
