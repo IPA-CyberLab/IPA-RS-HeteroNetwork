@@ -861,6 +861,7 @@ pub enum TransportProtocol {
     Any,
     Tcp,
     Udp,
+    Sctp,
     Icmp,
     Gre,
     Esp,
@@ -1990,12 +1991,14 @@ pub mod api {
 
             let protocol_has_ports = matches!(
                 self.protocol,
-                Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+                Some(TransportProtocol::Tcp | TransportProtocol::Udp | TransportProtocol::Sctp)
             );
             if !protocol_has_ports
                 && (self.source_port.is_some() || self.destination_port.is_some())
             {
-                return Err("packet-flow port metadata requires TCP or UDP protocol".to_string());
+                return Err(
+                    "packet-flow port metadata requires TCP, UDP, or SCTP protocol".to_string(),
+                );
             }
 
             Ok(())
@@ -2987,6 +2990,7 @@ pub mod api {
             Some(
                 TransportProtocol::Any
                 | TransportProtocol::Icmp
+                | TransportProtocol::Sctp
                 | TransportProtocol::Gre
                 | TransportProtocol::Esp
                 | TransportProtocol::Ah,
@@ -4345,6 +4349,7 @@ pub mod api {
             Some(
                 TransportProtocol::Any
                 | TransportProtocol::Icmp
+                | TransportProtocol::Sctp
                 | TransportProtocol::Gre
                 | TransportProtocol::Esp
                 | TransportProtocol::Ah,
@@ -11697,6 +11702,11 @@ mod tests {
             serde_json::from_str(r#"{"protocol":"udp","destination_port":53}"#)?;
         udp_with_port.validate_transport_metadata()?;
 
+        let sctp_with_port: api::AgentPacketFlowObservation = serde_json::from_str(
+            r#"{"protocol":"sctp","source_port":5000,"destination_port":5001}"#,
+        )?;
+        sctp_with_port.validate_transport_metadata()?;
+
         let usable_source: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"source":"192.0.2.10"}"#)?;
         usable_source.validate_transport_metadata()?;
@@ -11737,13 +11747,21 @@ mod tests {
         };
         assert!(error.contains("TCP state requires TCP protocol"));
 
+        let sctp_with_tcp_state: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"sctp","tcp_state":"established"}"#)?;
+        let error = match sctp_with_tcp_state.validate_transport_metadata() {
+            Ok(()) => return Err("SCTP observation with TCP state should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("TCP state requires TCP protocol"));
+
         let icmp_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"icmp","destination_port":8}"#)?;
         let error = match icmp_with_port.validate_transport_metadata() {
             Ok(()) => return Err("ICMP observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
 
         let gre_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"gre","destination_port":47}"#)?;
@@ -11751,7 +11769,7 @@ mod tests {
             Ok(()) => return Err("GRE observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
 
         let ah_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"ah","destination_port":51}"#)?;
@@ -11759,7 +11777,7 @@ mod tests {
             Ok(()) => return Err("AH observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP or UDP protocol"));
+        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
 
         let application_without_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"application":"postgres"}"#)?;

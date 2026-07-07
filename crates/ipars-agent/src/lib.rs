@@ -6113,6 +6113,21 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(native_ah_match.peer, peer_b_id);
+        let sctp_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 66)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Sctp),
+                    source_port: Some(5000),
+                    destination_port: Some(5001),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(sctp_match.peer, peer_b_id);
         let gre_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 64)),
@@ -6609,8 +6624,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 44);
-        assert_eq!(metrics.packet_flow_match_count, 42);
+        assert_eq!(metrics.packet_flow_observation_count, 45);
+        assert_eq!(metrics.packet_flow_match_count, 43);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6622,7 +6637,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            42
+            43
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6640,7 +6655,7 @@ mod tests {
                 .map(|entry| entry.count)
                 .unwrap_or(0)
         };
-        assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 3);
         assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Ike), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Ipsec), 3);
