@@ -6505,8 +6505,17 @@ pub mod api {
     }
 
     fn mysql_payload(payload: &[u8]) -> bool {
-        mysql_initial_handshake_payload(payload) || mysql_command_packet_payload(payload)
+        mysql_initial_handshake_payload(payload)
+            || mysql_client_handshake_payload(payload)
+            || mysql_command_packet_payload(payload)
     }
+
+    const MYSQL_CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+    const MYSQL_CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+    const MYSQL_CLIENT_SSL: u32 = 0x0000_0800;
+    const MYSQL_CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+    const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
     const MYSQL_MAX_PACKET_PAYLOAD_LEN: usize = 16_777_215;
     const MYSQL_MAX_PACKET_SEQUENCE_ID: u8 = 64;
@@ -6640,6 +6649,183 @@ pub mod api {
 
     fn mysql_server_version_byte(byte: &u8) -> bool {
         matches!(*byte, 0x20..=0x7e)
+    }
+
+    fn mysql_client_handshake_payload(payload: &[u8]) -> bool {
+        if payload.len() < 36 {
+            return false;
+        }
+        let Some(payload_len) = mysql_packet_payload_len(payload, 0) else {
+            return false;
+        };
+        let Some(&sequence_id) = payload.get(3) else {
+            return false;
+        };
+        if !(1..=4).contains(&sequence_id) || payload_len < 32 {
+            return false;
+        }
+        let Some(packet_end) = 4_usize.checked_add(payload_len) else {
+            return false;
+        };
+        if payload.len() > packet_end {
+            return false;
+        }
+        let Some(body) = mysql_observed_packet_body(payload, 0, payload_len) else {
+            return false;
+        };
+        mysql_client_handshake_body(body, payload_len)
+    }
+
+    fn mysql_client_handshake_body(body: &[u8], payload_len: usize) -> bool {
+        if body.len() < 32 {
+            return false;
+        }
+        let Some(client_flags) = read_u32_le(body, 0) else {
+            return false;
+        };
+        if client_flags & MYSQL_CLIENT_PROTOCOL_41 == 0
+            || body[8] == 0
+            || body[9..32].iter().any(|byte| *byte != 0)
+        {
+            return false;
+        }
+        if payload_len == 32 {
+            return client_flags & MYSQL_CLIENT_SSL != 0;
+        }
+        let username_offset = 32;
+        let Some(username_end) =
+            mysql_client_null_terminated_field(body, username_offset, payload_len)
+        else {
+            return payload_len > body.len()
+                && mysql_client_text_field(&body[username_offset..], 320, false);
+        };
+        if !mysql_client_text_field(&body[username_offset..username_end - 1], 320, false) {
+            return false;
+        }
+        mysql_client_auth_response_payload(body, username_end, client_flags, payload_len)
+    }
+
+    fn mysql_client_auth_response_payload(
+        body: &[u8],
+        offset: usize,
+        client_flags: u32,
+        payload_len: usize,
+    ) -> bool {
+        let auth_end = if client_flags & MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+            let Some((auth_len, auth_offset)) = mysql_length_encoded_integer(body, offset) else {
+                return payload_len > body.len();
+            };
+            let Some(auth_end) = auth_offset.checked_add(auth_len) else {
+                return false;
+            };
+            if auth_end > payload_len {
+                return false;
+            }
+            if body.len() < auth_end {
+                return true;
+            }
+            auth_end
+        } else if client_flags & MYSQL_CLIENT_SECURE_CONNECTION != 0 {
+            let Some(&auth_len) = body.get(offset) else {
+                return payload_len > body.len();
+            };
+            let Some(auth_offset) = offset.checked_add(1) else {
+                return false;
+            };
+            let Some(auth_end) = auth_offset.checked_add(auth_len as usize) else {
+                return false;
+            };
+            if auth_end > payload_len {
+                return false;
+            }
+            if body.len() < auth_end {
+                return true;
+            }
+            auth_end
+        } else {
+            let Some(auth_end) = mysql_client_null_terminated_field(body, offset, payload_len)
+            else {
+                return payload_len > body.len();
+            };
+            auth_end
+        };
+
+        mysql_client_handshake_tail_payload(body, auth_end, client_flags, payload_len)
+    }
+
+    fn mysql_client_handshake_tail_payload(
+        body: &[u8],
+        mut offset: usize,
+        client_flags: u32,
+        payload_len: usize,
+    ) -> bool {
+        if client_flags & MYSQL_CLIENT_CONNECT_WITH_DB != 0 {
+            let Some(database_end) = mysql_client_null_terminated_field(body, offset, payload_len)
+            else {
+                return payload_len > body.len();
+            };
+            if !mysql_client_text_field(&body[offset..database_end - 1], 1024, false) {
+                return false;
+            }
+            offset = database_end;
+        }
+        if client_flags & MYSQL_CLIENT_PLUGIN_AUTH != 0 {
+            let Some(plugin_end) = mysql_client_null_terminated_field(body, offset, payload_len)
+            else {
+                return payload_len > body.len();
+            };
+            if !mysql_client_plugin_name(&body[offset..plugin_end - 1]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mysql_client_null_terminated_field(
+        body: &[u8],
+        offset: usize,
+        payload_len: usize,
+    ) -> Option<usize> {
+        if offset >= payload_len {
+            return None;
+        }
+        let tail = body.get(offset..)?;
+        let terminator = tail.iter().position(|byte| *byte == 0)?;
+        let end = offset.checked_add(terminator)?.checked_add(1)?;
+        (end <= payload_len).then_some(end)
+    }
+
+    fn mysql_client_text_field(value: &[u8], max: usize, allow_empty: bool) -> bool {
+        (allow_empty || !value.is_empty())
+            && value.len() <= max
+            && value
+                .iter()
+                .all(|byte| !byte.is_ascii_control() && *byte != 0x7f)
+    }
+
+    fn mysql_client_plugin_name(value: &[u8]) -> bool {
+        mysql_client_text_field(value, 128, false)
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    }
+
+    fn mysql_length_encoded_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        let first = *payload.get(offset)?;
+        match first {
+            0x00..=0xfa => Some((first as usize, offset.checked_add(1)?)),
+            0xfc => read_u16_le(payload, offset.checked_add(1)?)
+                .map(|value| (value as usize, offset + 3)),
+            0xfd => read_u24_le(payload, offset.checked_add(1)?).map(|value| (value, offset + 4)),
+            0xfe => {
+                let bytes = payload.get(offset.checked_add(1)?..offset.checked_add(9)?)?;
+                let value = u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                (value <= usize::MAX as u64).then_some((value as usize, offset + 9))
+            }
+            _ => None,
+        }
     }
 
     fn mysql_command_packet_body(payload_len: usize, body: &[u8]) -> bool {
@@ -9653,6 +9839,13 @@ pub mod api {
 mod tests {
     use super::*;
 
+    const MYSQL_CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+    const MYSQL_CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+    const MYSQL_CLIENT_SSL: u32 = 0x0000_0800;
+    const MYSQL_CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+    const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
     #[test]
     fn endpoint_candidate_ipv6_kind_requires_ipv6_address() {
         let mut candidate = EndpointCandidate {
@@ -11083,6 +11276,54 @@ mod tests {
             body.extend_from_slice(b"ijklmnopqrst");
             body.push(0);
             mysql_packet(0, &body)
+        }
+
+        fn mysql_client_handshake_response_packet(
+            sequence_id: u8,
+            client_flags: u32,
+            username: &[u8],
+            auth_response: &[u8],
+            database: Option<&[u8]>,
+            plugin: Option<&[u8]>,
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&client_flags.to_le_bytes());
+            body.extend_from_slice(&16_777_216_u32.to_le_bytes());
+            body.push(45);
+            body.extend_from_slice(&[0; 23]);
+            body.extend_from_slice(username);
+            body.push(0);
+            if client_flags & MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+                body.push(auth_response.len() as u8);
+                body.extend_from_slice(auth_response);
+            } else if client_flags & MYSQL_CLIENT_SECURE_CONNECTION != 0 {
+                body.push(auth_response.len() as u8);
+                body.extend_from_slice(auth_response);
+            } else {
+                body.extend_from_slice(auth_response);
+                body.push(0);
+            }
+            if client_flags & MYSQL_CLIENT_CONNECT_WITH_DB != 0 {
+                body.extend_from_slice(database.unwrap_or(b"app"));
+                body.push(0);
+            }
+            if client_flags & MYSQL_CLIENT_PLUGIN_AUTH != 0 {
+                body.extend_from_slice(plugin.unwrap_or(b"caching_sha2_password"));
+                body.push(0);
+            }
+            mysql_packet(sequence_id, &body)
+        }
+
+        fn mysql_ssl_request_packet() -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                &(MYSQL_CLIENT_PROTOCOL_41 | MYSQL_CLIENT_SSL | MYSQL_CLIENT_SECURE_CONNECTION)
+                    .to_le_bytes(),
+            );
+            body.extend_from_slice(&16_777_216_u32.to_le_bytes());
+            body.push(45);
+            body.extend_from_slice(&[0; 23]);
+            mysql_packet(1, &body)
         }
 
         fn mssql_tds_packet(packet_type: u8, body: &[u8]) -> Vec<u8> {
@@ -13055,6 +13296,66 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mysql_handshake_packet(b"8.0.36")).application(),
             api::AgentPacketFlowApplication::Mysql
+        );
+        let mysql_client_flags = MYSQL_CLIENT_PROTOCOL_41
+            | MYSQL_CLIENT_SECURE_CONNECTION
+            | MYSQL_CLIENT_PLUGIN_AUTH
+            | MYSQL_CLIENT_CONNECT_WITH_DB;
+        assert_eq!(
+            observation_for_payload(&mysql_client_handshake_response_packet(
+                1,
+                mysql_client_flags,
+                b"app_user",
+                b"01234567890123456789",
+                Some(b"app_db"),
+                Some(b"caching_sha2_password"),
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mysql_lenenc_client_flags =
+            mysql_client_flags | MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+        assert_eq!(
+            observation_for_payload(&mysql_client_handshake_response_packet(
+                1,
+                mysql_lenenc_client_flags,
+                b"app_user",
+                b"01234567890123456789012345678901",
+                Some(b"app_db"),
+                Some(b"mysql_native_password"),
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_ssl_request_packet()).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mut invalid_mysql_client_filler = mysql_client_handshake_response_packet(
+            1,
+            mysql_client_flags,
+            b"app_user",
+            b"01234567890123456789",
+            Some(b"app_db"),
+            Some(b"caching_sha2_password"),
+        );
+        invalid_mysql_client_filler[4 + 9] = 1;
+        assert_eq!(
+            observation_for_payload(&invalid_mysql_client_filler).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let missing_protocol_41_flags = mysql_client_flags & !MYSQL_CLIENT_PROTOCOL_41;
+        assert_eq!(
+            observation_for_payload(&mysql_client_handshake_response_packet(
+                1,
+                missing_protocol_41_flags,
+                b"app_user",
+                b"01234567890123456789",
+                Some(b"app_db"),
+                Some(b"caching_sha2_password"),
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut invalid_mysql_handshake_filler = mysql_handshake_packet(b"8.0.36");
         invalid_mysql_handshake_filler[4 + 1 + b"8.0.36".len() + 1 + 4 + 8] = 1;
