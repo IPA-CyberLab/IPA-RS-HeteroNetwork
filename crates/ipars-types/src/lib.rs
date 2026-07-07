@@ -1753,6 +1753,7 @@ pub mod api {
         Vnc,
         Ftp,
         Tftp,
+        Rsync,
         Smtp,
         Imap,
         Pop3,
@@ -1812,7 +1813,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 69] = [
+        pub const ALL: [Self; 70] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1826,6 +1827,7 @@ pub mod api {
             Self::Vnc,
             Self::Ftp,
             Self::Tftp,
+            Self::Rsync,
             Self::Smtp,
             Self::Imap,
             Self::Pop3,
@@ -1899,6 +1901,7 @@ pub mod api {
                 Self::Vnc => "vnc",
                 Self::Ftp => "ftp",
                 Self::Tftp => "tftp",
+                Self::Rsync => "rsync",
                 Self::Smtp => "smtp",
                 Self::Imap => "imap",
                 Self::Pop3 => "pop3",
@@ -2261,6 +2264,9 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Ftp;
             }
+            if self.involves_port(873) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Rsync;
+            }
             if (self.involves_port(25) || self.involves_port(465) || self.involves_port(587))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
@@ -2588,6 +2594,7 @@ pub mod api {
                 .or_else(|| imap_payload(payload).then_some(AgentPacketFlowApplication::Imap))
                 .or_else(|| pop3_payload(payload).then_some(AgentPacketFlowApplication::Pop3))
                 .or_else(|| ftp_payload(payload).then_some(AgentPacketFlowApplication::Ftp))
+                .or_else(|| rsync_payload(payload).then_some(AgentPacketFlowApplication::Rsync))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -3953,6 +3960,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Ftp);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"rsync")
+            || tls_sni_hostname_has_label_prefix(hostname, b"rsyncd")
+        {
+            return Some(AgentPacketFlowApplication::Rsync);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smtp")
             || tls_sni_hostname_has_label_prefix(hostname, b"mx")
         {
@@ -4120,6 +4132,9 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"ftp-tls")
         {
             return Some(AgentPacketFlowApplication::Ftp);
+        }
+        if protocol.eq_ignore_ascii_case(b"rsync") || protocol.eq_ignore_ascii_case(b"rsyncd") {
+            return Some(AgentPacketFlowApplication::Rsync);
         }
         if protocol.eq_ignore_ascii_case(b"smtp")
             || protocol.eq_ignore_ascii_case(b"esmtp")
@@ -5866,6 +5881,20 @@ pub mod api {
             || command.eq_ignore_ascii_case(b"XMKD")
             || command.eq_ignore_ascii_case(b"XPWD")
             || command.eq_ignore_ascii_case(b"XRMD")
+    }
+
+    fn rsync_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.len() < b"@RSYNCD: 1".len() || !ascii_starts_with_ignore_case(line, b"@RSYNCD:") {
+            return false;
+        }
+        let version = trim_ascii_space(&line[b"@RSYNCD:".len()..]);
+        !version.is_empty()
+            && version.len() <= 16
+            && version.iter().any(|byte| byte.is_ascii_digit())
+            && version
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b'.')
     }
 
     fn tftp_payload(payload: &[u8]) -> bool {
@@ -9876,6 +9905,13 @@ mod tests {
         };
         assert_eq!(ftps.application(), api::AgentPacketFlowApplication::Ftp);
 
+        let rsync = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(873),
+            ..Default::default()
+        };
+        assert_eq!(rsync.application(), api::AgentPacketFlowApplication::Rsync);
+
         let smtp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(587),
@@ -11816,6 +11852,10 @@ mod tests {
                 "ftp-files.storage.svc",
                 api::AgentPacketFlowApplication::Ftp,
             ),
+            (
+                "rsync-files.storage.svc",
+                api::AgentPacketFlowApplication::Rsync,
+            ),
             ("smtp-relay.mail.svc", api::AgentPacketFlowApplication::Smtp),
             (
                 "imap-mailbox.mail.svc",
@@ -11890,6 +11930,10 @@ mod tests {
             (
                 &[b"ftps".as_slice()][..],
                 api::AgentPacketFlowApplication::Ftp,
+            ),
+            (
+                &[b"rsync".as_slice()][..],
+                api::AgentPacketFlowApplication::Rsync,
             ),
             (
                 &[b"submission".as_slice()][..],
@@ -12358,6 +12402,18 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"220 service ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: 31.0\n").application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: beta\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNC: 31.0\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
