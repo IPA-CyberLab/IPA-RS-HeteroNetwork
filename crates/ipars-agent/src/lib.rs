@@ -481,6 +481,7 @@ pub struct AgentRuntime {
     packet_flow_application_rdp_count: AtomicU64,
     packet_flow_application_vnc_count: AtomicU64,
     packet_flow_application_ftp_count: AtomicU64,
+    packet_flow_application_tftp_count: AtomicU64,
     packet_flow_application_smtp_count: AtomicU64,
     packet_flow_application_imap_count: AtomicU64,
     packet_flow_application_pop3_count: AtomicU64,
@@ -1122,6 +1123,7 @@ impl AgentRuntime {
             packet_flow_application_rdp_count: AtomicU64::new(0),
             packet_flow_application_vnc_count: AtomicU64::new(0),
             packet_flow_application_ftp_count: AtomicU64::new(0),
+            packet_flow_application_tftp_count: AtomicU64::new(0),
             packet_flow_application_smtp_count: AtomicU64::new(0),
             packet_flow_application_imap_count: AtomicU64::new(0),
             packet_flow_application_pop3_count: AtomicU64::new(0),
@@ -1873,6 +1875,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Rdp => &self.packet_flow_application_rdp_count,
             AgentPacketFlowApplication::Vnc => &self.packet_flow_application_vnc_count,
             AgentPacketFlowApplication::Ftp => &self.packet_flow_application_ftp_count,
+            AgentPacketFlowApplication::Tftp => &self.packet_flow_application_tftp_count,
             AgentPacketFlowApplication::Smtp => &self.packet_flow_application_smtp_count,
             AgentPacketFlowApplication::Imap => &self.packet_flow_application_imap_count,
             AgentPacketFlowApplication::Pop3 => &self.packet_flow_application_pop3_count,
@@ -7191,39 +7194,69 @@ mod tests {
         runtime.observe_peer_map_for_lazy_connect(&[peer]).await;
 
         let payloads = [
-            (AgentPacketFlowApplication::Nats, b"PING\r\n".to_vec()),
+            (
+                AgentPacketFlowApplication::Nats,
+                TransportProtocol::Tcp,
+                b"PING\r\n".to_vec(),
+            ),
             (
                 AgentPacketFlowApplication::Mqtt,
+                TransportProtocol::Tcp,
                 mqtt_connect_packet(b"agent-a"),
             ),
             (
                 AgentPacketFlowApplication::Amqp,
+                TransportProtocol::Tcp,
                 b"AMQP\0\0\x09\x01".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::Cassandra,
+                TransportProtocol::Tcp,
                 cassandra_startup_frame(),
             ),
-            (AgentPacketFlowApplication::MongoDb, mongodb_op_msg()),
-            (AgentPacketFlowApplication::Vnc, b"RFB 003.008\n".to_vec()),
-            (AgentPacketFlowApplication::Ftp, b"PASV\r\n".to_vec()),
+            (
+                AgentPacketFlowApplication::MongoDb,
+                TransportProtocol::Tcp,
+                mongodb_op_msg(),
+            ),
+            (
+                AgentPacketFlowApplication::Vnc,
+                TransportProtocol::Tcp,
+                b"RFB 003.008\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Ftp,
+                TransportProtocol::Tcp,
+                b"PASV\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Tftp,
+                TransportProtocol::Udp,
+                b"\0\x01boot.ipxe\0octet\0".to_vec(),
+            ),
             (
                 AgentPacketFlowApplication::Smtp,
+                TransportProtocol::Tcp,
                 b"EHLO edge-node.example\r\n".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::Imap,
+                TransportProtocol::Tcp,
                 b"A001 UID FETCH 42 BODY[]\r\n".to_vec(),
             ),
-            (AgentPacketFlowApplication::Pop3, b"USER agent\r\n".to_vec()),
+            (
+                AgentPacketFlowApplication::Pop3,
+                TransportProtocol::Tcp,
+                b"USER agent\r\n".to_vec(),
+            ),
         ];
 
-        for (index, (_application, payload_prefix)) in payloads.iter().enumerate() {
+        for (index, (_application, protocol, payload_prefix)) in payloads.iter().enumerate() {
             let matched = runtime
                 .record_packet_flow_observation(
                     IpAddr::V4(Ipv4Addr::new(10, 52, 7, 10 + index as u8)),
                     AgentPacketFlowObservation {
-                        protocol: Some(TransportProtocol::Tcp),
+                        protocol: Some(*protocol),
                         destination_port: Some(30_000 + index as u16),
                         payload_prefix: payload_prefix.clone(),
                         ..Default::default()
@@ -7241,7 +7274,7 @@ mod tests {
         assert_eq!(metrics.packet_flow_match_count, payloads.len() as u64);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
 
-        for (application, _payload_prefix) in payloads {
+        for (application, _protocol, _payload_prefix) in payloads {
             let count = metrics
                 .packet_flow_application_counts
                 .iter()

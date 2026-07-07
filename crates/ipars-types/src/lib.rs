@@ -1752,6 +1752,7 @@ pub mod api {
         Rdp,
         Vnc,
         Ftp,
+        Tftp,
         Smtp,
         Imap,
         Pop3,
@@ -1811,7 +1812,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 68] = [
+        pub const ALL: [Self; 69] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1824,6 +1825,7 @@ pub mod api {
             Self::Rdp,
             Self::Vnc,
             Self::Ftp,
+            Self::Tftp,
             Self::Smtp,
             Self::Imap,
             Self::Pop3,
@@ -1896,6 +1898,7 @@ pub mod api {
                 Self::Rdp => "rdp",
                 Self::Vnc => "vnc",
                 Self::Ftp => "ftp",
+                Self::Tftp => "tftp",
                 Self::Smtp => "smtp",
                 Self::Imap => "imap",
                 Self::Pop3 => "pop3",
@@ -2206,6 +2209,9 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Dhcp;
             }
+            if self.involves_port(69) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::Tftp;
+            }
             if (self.involves_port(4789) || self.involves_port(8472))
                 && protocol_is(self.protocol, TransportProtocol::Udp)
             {
@@ -2486,6 +2492,9 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Dhcp);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && tftp_payload(payload) {
+                return Some(AgentPacketFlowApplication::Tftp);
+            }
             if protocol_is(self.protocol, TransportProtocol::Udp)
                 && (self.involves_port(500) || self.involves_port(4500))
                 && ike_payload(payload)
@@ -2630,6 +2639,7 @@ pub mod api {
             | AgentPacketFlowApplication::Ike
             | AgentPacketFlowApplication::Stun
             | AgentPacketFlowApplication::Bfd
+            | AgentPacketFlowApplication::Tftp
             | AgentPacketFlowApplication::Vxlan
             | AgentPacketFlowApplication::Geneve => {
                 require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
@@ -5856,6 +5866,73 @@ pub mod api {
             || command.eq_ignore_ascii_case(b"XMKD")
             || command.eq_ignore_ascii_case(b"XPWD")
             || command.eq_ignore_ascii_case(b"XRMD")
+    }
+
+    fn tftp_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 {
+            return false;
+        }
+        let Some(opcode) = read_u16_be(payload, 0) else {
+            return false;
+        };
+        if !matches!(opcode, 1 | 2) {
+            return false;
+        }
+
+        let mut offset = 2_usize;
+        let Some((filename, next_offset)) = tftp_zstring(payload, offset) else {
+            return false;
+        };
+        if filename.is_empty() || filename.len() > 255 || !tftp_token(filename) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((mode, next_offset)) = tftp_zstring(payload, offset) else {
+            return false;
+        };
+        if !tftp_mode(mode) {
+            return false;
+        }
+        offset = next_offset;
+
+        while offset < payload.len() {
+            let Some((option_name, next_offset)) = tftp_zstring(payload, offset) else {
+                return false;
+            };
+            if option_name.is_empty() || !tftp_token(option_name) {
+                return false;
+            }
+            let Some((option_value, value_offset)) = tftp_zstring(payload, next_offset) else {
+                return false;
+            };
+            if option_value.is_empty() || !tftp_token(option_value) {
+                return false;
+            }
+            offset = value_offset;
+        }
+        true
+    }
+
+    fn tftp_zstring(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        if offset >= payload.len() {
+            return None;
+        }
+        let nul = payload[offset..].iter().position(|byte| *byte == 0)?;
+        let end = offset.checked_add(nul)?;
+        Some((&payload[offset..end], end.checked_add(1)?))
+    }
+
+    fn tftp_mode(mode: &[u8]) -> bool {
+        mode.eq_ignore_ascii_case(b"netascii")
+            || mode.eq_ignore_ascii_case(b"octet")
+            || mode.eq_ignore_ascii_case(b"mail")
+    }
+
+    fn tftp_token(token: &[u8]) -> bool {
+        token
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
     }
 
     fn first_ascii_line(payload: &[u8]) -> &[u8] {
@@ -9685,6 +9762,13 @@ mod tests {
             api::AgentPacketFlowApplication::Dhcp
         );
 
+        let tftp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(69),
+            ..Default::default()
+        };
+        assert_eq!(tftp.application(), api::AgentPacketFlowApplication::Tftp);
+
         let vxlan = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(4789),
@@ -10899,6 +10983,22 @@ mod tests {
         assert_eq!(
             observation_for_dhcpv6_payload(&dhcpv6_solicit).application(),
             api::AgentPacketFlowApplication::Dhcp
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\0\x01pxelinux.0\0octet\0").application(),
+            api::AgentPacketFlowApplication::Tftp
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\0\x02startup.cfg\0netascii\0timeout\05\0").application(),
+            api::AgentPacketFlowApplication::Tftp
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\0\x01pxelinux.0\0binary\0").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"\0\x01pxelinux.0\0octet\0").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
 
         let vxlan_payload = vxlan_frame([0x00, 0x12, 0x34]);
