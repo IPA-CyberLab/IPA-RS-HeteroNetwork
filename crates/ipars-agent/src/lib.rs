@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -61,6 +62,7 @@ const MAX_LINUX_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_COMMAND_ARG_BYTES: usize = 128 * 1024;
 const MAX_LINUX_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
 const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
+const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -147,8 +149,7 @@ impl FileAgentStateStore {
 
     pub fn load(&self) -> Result<AgentNodeState, AgentError> {
         ensure_private_agent_state_parent(&self.path)?;
-        ensure_private_agent_state_file(&self.path)?;
-        let bytes = std::fs::read(&self.path)?;
+        let bytes = read_private_agent_state_file(&self.path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -172,9 +173,52 @@ impl FileAgentStateStore {
     }
 }
 
-fn ensure_private_agent_state_file(path: &Path) -> Result<(), AgentError> {
+fn read_private_agent_state_file(path: &Path) -> Result<Vec<u8>, AgentError> {
     let metadata = std::fs::symlink_metadata(path)?;
-    validate_private_agent_state_metadata(path, &metadata)
+    validate_private_agent_state_metadata(path, &metadata)?;
+    ensure_private_agent_state_file_size(path, metadata.len())?;
+
+    let mut file = open_private_agent_state_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    ensure_private_agent_state_file_size(path, metadata.len())?;
+
+    let mut bytes = Vec::new();
+    let mut reader = file.by_ref().take(MAX_AGENT_STATE_FILE_BYTES + 1);
+    reader.read_to_end(&mut bytes)?;
+    ensure_private_agent_state_file_size(path, bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_private_agent_state_file(path: &Path) -> Result<std::fs::File, AgentError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_private_agent_state_file(path: &Path) -> Result<std::fs::File, AgentError> {
+    Ok(std::fs::File::open(path)?)
+}
+
+fn ensure_private_agent_state_file_size(path: &Path, size: u64) -> Result<(), AgentError> {
+    if size > MAX_AGENT_STATE_FILE_BYTES {
+        return Err(AgentError::InsecureStatePath(format!(
+            "{} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_AGENT_STATE_FILE_BYTES
+        )));
+    }
+    Ok(())
 }
 
 fn agent_state_parent(path: &Path) -> Option<&Path> {
@@ -7122,6 +7166,32 @@ mod tests {
             let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn file_state_store_rejects_oversized_state_file() -> Result<(), AgentError> {
+        let dir = temp_state_dir("state-oversized");
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let path = dir.join("state.json");
+        std::fs::write(&path, vec![b'{'; MAX_AGENT_STATE_FILE_BYTES as usize + 1])?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        let error = match FileAgentStateStore::new(&path).load() {
+            Ok(_) => panic!("oversized state file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds maximum size"));
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
