@@ -1,0 +1,128 @@
+# Operations Runbook
+
+This runbook covers the current operational path for a Linux-first IPA-RS deployment.
+
+## Bootstrap A Public Node
+
+Generate an issuer key, bootstrap services, and a first join token:
+
+```bash
+ipars init \
+  --public-endpoint 203.0.113.10:51820 \
+  --issuer-private-key-path ./issuer.key \
+  --issuer-key-id root \
+  --allowed-route 100.64.0.0/10 \
+  --allow-relay \
+  --unlimited-uses \
+  --spawn-daemons \
+  --daemon-state-dir ./ipars-state
+```
+
+Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd.
+
+## Join Nodes
+
+Use file-backed tokens for agents:
+
+```bash
+iparsd agent \
+  --join-token-path /etc/ipars/join.token \
+  --state-path /var/lib/ipars/agent.json \
+  --runtime-backend linux-command \
+  --apply-peer-map
+```
+
+For validation without host route mutation:
+
+```bash
+iparsd agent \
+  --join-token-path /etc/ipars/join.token \
+  --state-path /var/lib/ipars/agent.json \
+  --runtime-backend dry-run
+```
+
+## Docker
+
+The base Compose stack starts PostgreSQL, control plane, signal, STUN, relay, and agent services. Docker Engine API access is not mounted into the agent unless the discovery override is used.
+
+```bash
+docker compose -f docker/compose.yaml up -d --build --wait
+```
+
+For route discovery through Docker Engine bridge networks, use the install plan:
+
+```bash
+ipars docker install \
+  --project-name ipars \
+  --compose-file docker/compose.yaml \
+  --docker-discover-networks \
+  --docker-network ipars_default
+```
+
+Run the repeatable Compose smoke with:
+
+```bash
+scripts/docker-smoke.sh
+```
+
+## Kubernetes
+
+The Helm chart deploys a node-underlay VPN agent, not a CNI. It can advertise Kubernetes Service/API routes through a route-provider agent and optional RBAC-backed Service discovery.
+
+```bash
+ipars k8s install \
+  --release ipars \
+  --namespace ipars-system \
+  --join-token-secret ipars-join-token \
+  --join-token-key token
+```
+
+Render and validate common chart modes with:
+
+```bash
+scripts/helm-smoke.sh
+```
+
+## Health Checks
+
+Common probes:
+
+```bash
+ipars status --agent-url http://127.0.0.1:9780
+ipars status --control-plane-url http://127.0.0.1:8443
+ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars path status --agent-url http://127.0.0.1:9780
+ipars relay status --relay-url http://127.0.0.1:9580
+```
+
+Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
+
+## Failure Behavior
+
+- Existing WireGuard data-plane state and relay sessions continue when the control plane is unavailable.
+- New joins, peer-map refreshes, policy changes, route changes, and key rotations require a reachable control plane.
+- Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop.
+- Signal failure prevents new path negotiation and hole-punch planning; existing selected paths remain in local runtime state until they expire or are replaced.
+- Relay failure causes affected relay paths to renew or renegotiate. If direct candidates are available, path scoring can promote back to direct.
+- Redundant control-plane instances can share durable SQL state. The load harness verifies peer-map, path-state, relay-candidate, and existing relay dataplane survival after one control-plane process is stopped.
+
+## Smoke Gates
+
+Use these before publishing an operational change:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+scripts/helm-smoke.sh
+scripts/docker-smoke.sh
+IPARS_LOAD_SMOKE_BUILD_DAEMON=1 scripts/load-smoke.sh
+```
+
+Privileged Linux hosts can also run:
+
+```bash
+scripts/netns-smoke.sh
+```
+
+That suite requires network namespace creation privileges and may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.

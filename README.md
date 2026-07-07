@@ -44,7 +44,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - Docker Compose manifest with service healthchecks, file-backed agent join-token secret, host-network agent loopback wiring, env-driven Docker route, route backend, WireGuard backend/userspace lifecycle, explicit relay advertisement plus relay admission auth/abuse-control settings, relay forwarder endpoint/bind/namespace/supervisor wiring, discovery-only Docker API socket binding, gated Compose smoke coverage, and Helm chart starting points
 - architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete target design and implementation roadmap.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/LOAD_TEST_PLAN.md](docs/LOAD_TEST_PLAN.md), and [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for the target design, runbooks, load plan, and current completion gap.
 
 ## Build
 
