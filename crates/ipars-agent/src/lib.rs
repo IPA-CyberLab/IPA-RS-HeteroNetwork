@@ -486,6 +486,7 @@ pub struct AgentRuntime {
     packet_flow_application_smtp_count: AtomicU64,
     packet_flow_application_imap_count: AtomicU64,
     packet_flow_application_pop3_count: AtomicU64,
+    packet_flow_application_sip_count: AtomicU64,
     packet_flow_application_kerberos_count: AtomicU64,
     packet_flow_application_ntp_count: AtomicU64,
     packet_flow_application_radius_count: AtomicU64,
@@ -1130,6 +1131,7 @@ impl AgentRuntime {
             packet_flow_application_smtp_count: AtomicU64::new(0),
             packet_flow_application_imap_count: AtomicU64::new(0),
             packet_flow_application_pop3_count: AtomicU64::new(0),
+            packet_flow_application_sip_count: AtomicU64::new(0),
             packet_flow_application_kerberos_count: AtomicU64::new(0),
             packet_flow_application_ntp_count: AtomicU64::new(0),
             packet_flow_application_radius_count: AtomicU64::new(0),
@@ -1884,6 +1886,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Smtp => &self.packet_flow_application_smtp_count,
             AgentPacketFlowApplication::Imap => &self.packet_flow_application_imap_count,
             AgentPacketFlowApplication::Pop3 => &self.packet_flow_application_pop3_count,
+            AgentPacketFlowApplication::Sip => &self.packet_flow_application_sip_count,
             AgentPacketFlowApplication::Kerberos => &self.packet_flow_application_kerberos_count,
             AgentPacketFlowApplication::Ntp => &self.packet_flow_application_ntp_count,
             AgentPacketFlowApplication::Radius => &self.packet_flow_application_radius_count,
@@ -6789,6 +6792,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(bgp_match.peer, peer_b_id);
+        let sip_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 78)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(5060),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(sip_match.peer, peer_b_id);
         let bfd_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 60)),
@@ -7008,8 +7025,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 56);
-        assert_eq!(metrics.packet_flow_match_count, 54);
+        assert_eq!(metrics.packet_flow_observation_count, 57);
+        assert_eq!(metrics.packet_flow_match_count, 55);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -7021,7 +7038,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            54
+            55
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -7085,6 +7102,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Radius), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Tacacs), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Bgp), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Sip), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Bfd), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Jaeger), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Loki), 1);
@@ -7274,6 +7292,11 @@ mod tests {
                 AgentPacketFlowApplication::Pop3,
                 TransportProtocol::Tcp,
                 b"USER agent\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Sip,
+                TransportProtocol::Udp,
+                b"REGISTER sip:edge.example SIP/2.0\r\n".to_vec(),
             ),
         ];
 

@@ -1757,6 +1757,7 @@ pub mod api {
         Smtp,
         Imap,
         Pop3,
+        Sip,
         Kerberos,
         Ntp,
         Radius,
@@ -1815,7 +1816,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 71] = [
+        pub const ALL: [Self; 72] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1833,6 +1834,7 @@ pub mod api {
             Self::Smtp,
             Self::Imap,
             Self::Pop3,
+            Self::Sip,
             Self::Kerberos,
             Self::Ntp,
             Self::Radius,
@@ -1908,6 +1910,7 @@ pub mod api {
                 Self::Smtp => "smtp",
                 Self::Imap => "imap",
                 Self::Pop3 => "pop3",
+                Self::Sip => "sip",
                 Self::Kerberos => "kerberos",
                 Self::Ntp => "ntp",
                 Self::Radius => "radius",
@@ -2294,6 +2297,24 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Pop3;
             }
+            if self.involves_port(5060)
+                && matches!(
+                    self.protocol,
+                    None | Some(
+                        TransportProtocol::Tcp | TransportProtocol::Udp | TransportProtocol::Sctp
+                    )
+                )
+            {
+                return AgentPacketFlowApplication::Sip;
+            }
+            if self.involves_port(5061)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp | TransportProtocol::Sctp)
+                )
+            {
+                return AgentPacketFlowApplication::Sip;
+            }
             if (self.involves_port(88) || self.involves_port(464))
                 && matches!(
                     self.protocol,
@@ -2572,6 +2593,15 @@ pub mod api {
             if kerberos_payload(payload, self.protocol) {
                 return Some(AgentPacketFlowApplication::Kerberos);
             }
+            if matches!(
+                self.protocol,
+                None | Some(TransportProtocol::Tcp)
+                    | Some(TransportProtocol::Udp)
+                    | Some(TransportProtocol::Sctp)
+            ) && sip_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Sip);
+            }
             if protocol_is(self.protocol, TransportProtocol::Tcp) && tacacs_payload(payload) {
                 return Some(AgentPacketFlowApplication::Tacacs);
             }
@@ -2692,6 +2722,17 @@ pub mod api {
                     protocol == TransportProtocol::Gre
                 })
             }
+            AgentPacketFlowApplication::Sip => require_packet_flow_application_protocol(
+                protocol,
+                application,
+                "TCP, UDP, or SCTP",
+                |protocol| {
+                    matches!(
+                        protocol,
+                        TransportProtocol::Tcp | TransportProtocol::Udp | TransportProtocol::Sctp
+                    )
+                },
+            ),
             AgentPacketFlowApplication::Dns
             | AgentPacketFlowApplication::Https
             | AgentPacketFlowApplication::Consul
@@ -3996,6 +4037,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Pop3);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"sip")
+            || tls_sni_hostname_has_label_prefix(hostname, b"sips")
+        {
+            return Some(AgentPacketFlowApplication::Sip);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"ssh") {
             return Some(AgentPacketFlowApplication::Ssh);
         }
@@ -4165,6 +4211,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"pop3") || protocol.eq_ignore_ascii_case(b"pop") {
             return Some(AgentPacketFlowApplication::Pop3);
+        }
+        if protocol.eq_ignore_ascii_case(b"sip") || protocol.eq_ignore_ascii_case(b"sips") {
+            return Some(AgentPacketFlowApplication::Sip);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -5848,6 +5897,64 @@ pub mod api {
             || command.eq_ignore_ascii_case(b"TOP")
             || command.eq_ignore_ascii_case(b"UIDL")
             || command.eq_ignore_ascii_case(b"QUIT")
+    }
+
+    fn sip_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.is_empty() {
+            return false;
+        }
+        if ascii_starts_with_ignore_case(line, b"SIP/2.0 ") {
+            let Some(status) = line.get(8..11) else {
+                return false;
+            };
+            return status.iter().all(u8::is_ascii_digit)
+                && line.get(11).is_none_or(|byte| byte.is_ascii_whitespace());
+        }
+
+        let Some((method, rest)) = split_ascii_token(line) else {
+            return false;
+        };
+        if !sip_known_method(method) {
+            return false;
+        }
+        let Some((uri, version_tail)) = split_ascii_token(trim_ascii_space(rest)) else {
+            return false;
+        };
+        if !sip_request_uri(uri) {
+            return false;
+        }
+        let Some((version, trailing)) = split_ascii_token(trim_ascii_space(version_tail)) else {
+            return false;
+        };
+        version.eq_ignore_ascii_case(b"SIP/2.0") && trim_ascii_space(trailing).is_empty()
+    }
+
+    fn sip_known_method(method: &[u8]) -> bool {
+        method.eq_ignore_ascii_case(b"INVITE")
+            || method.eq_ignore_ascii_case(b"ACK")
+            || method.eq_ignore_ascii_case(b"BYE")
+            || method.eq_ignore_ascii_case(b"CANCEL")
+            || method.eq_ignore_ascii_case(b"OPTIONS")
+            || method.eq_ignore_ascii_case(b"REGISTER")
+            || method.eq_ignore_ascii_case(b"PRACK")
+            || method.eq_ignore_ascii_case(b"SUBSCRIBE")
+            || method.eq_ignore_ascii_case(b"NOTIFY")
+            || method.eq_ignore_ascii_case(b"PUBLISH")
+            || method.eq_ignore_ascii_case(b"INFO")
+            || method.eq_ignore_ascii_case(b"REFER")
+            || method.eq_ignore_ascii_case(b"MESSAGE")
+            || method.eq_ignore_ascii_case(b"UPDATE")
+    }
+
+    fn sip_request_uri(uri: &[u8]) -> bool {
+        uri == b"*"
+            || ((ascii_starts_with_ignore_case(uri, b"sip:")
+                || ascii_starts_with_ignore_case(uri, b"sips:"))
+                && uri.len() <= 256
+                && uri
+                    .iter()
+                    .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace()))
     }
 
     fn ftp_payload(payload: &[u8]) -> bool {
@@ -9974,6 +10081,27 @@ mod tests {
         };
         assert_eq!(pop3.application(), api::AgentPacketFlowApplication::Pop3);
 
+        let sip_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(5060),
+            ..Default::default()
+        };
+        assert_eq!(sip_udp.application(), api::AgentPacketFlowApplication::Sip);
+
+        let sip_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(5061),
+            ..Default::default()
+        };
+        assert_eq!(sip_tls.application(), api::AgentPacketFlowApplication::Sip);
+
+        let sip_sctp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Sctp),
+            destination_port: Some(5060),
+            ..Default::default()
+        };
+        assert_eq!(sip_sctp.application(), api::AgentPacketFlowApplication::Sip);
+
         let kerberos_kdc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(88),
@@ -11910,6 +12038,7 @@ mod tests {
                 "pop3-mailbox.mail.svc",
                 api::AgentPacketFlowApplication::Pop3,
             ),
+            ("sip-proxy.voice.svc", api::AgentPacketFlowApplication::Sip),
             ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
         ] {
             assert_eq!(
@@ -11991,6 +12120,10 @@ mod tests {
             (
                 &[b"pop3".as_slice()][..],
                 api::AgentPacketFlowApplication::Pop3,
+            ),
+            (
+                &[b"sips".as_slice()][..],
+                api::AgentPacketFlowApplication::Sip,
             ),
             (
                 &[b"kafka".as_slice()][..],
@@ -12500,6 +12633,27 @@ mod tests {
         assert_eq!(
             observation_for_payload(b"USER agent\r\n").application(),
             api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"INVITE sip:alice@example.com SIP/2.0\r\n").application(),
+            api::AgentPacketFlowApplication::Sip
+        );
+        assert_eq!(
+            observation_for_payload(b"SIP/2.0 200 OK\r\n").application(),
+            api::AgentPacketFlowApplication::Sip
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"REGISTER sips:edge@example.com SIP/2.0\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Sip
+        );
+        assert_eq!(
+            observation_for_payload(b"INVITE mailto:alice@example.com SIP/2.0\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"INVITE sip:alice@example.com HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(b"ruok").application(),
@@ -13786,6 +13940,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint openvpn requires TCP or UDP protocol"));
+
+        let udp_sip_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"sip"}"#)?;
+        udp_sip_hint.validate_transport_metadata()?;
+
+        let tcp_sip_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"sip"}"#)?;
+        tcp_sip_hint.validate_transport_metadata()?;
+
+        let sctp_sip_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"sctp","application":"sip"}"#)?;
+        sctp_sip_hint.validate_transport_metadata()?;
+
+        let gre_sip_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"sip"}"#)?;
+        let error = match gre_sip_hint.validate_transport_metadata() {
+            Ok(()) => return Err("GRE SIP hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint sip requires TCP, UDP, or SCTP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
