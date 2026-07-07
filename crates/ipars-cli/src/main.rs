@@ -33,6 +33,9 @@ const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const SANITIZED_INIT_DAEMON_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
 const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
 const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
@@ -1239,18 +1242,27 @@ fn spawn_init_daemon(binary: &Path, spec: &InitDaemonSpec) -> anyhow::Result<Chi
             spec.log_path.display()
         )
     })?;
-    ProcessCommand::new(binary)
+    let mut command = ProcessCommand::new(binary);
+    configure_init_daemon_process(&mut command);
+    command
         .args(&spec.args)
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn {} using {}",
-                spec.service,
-                binary.display()
-            )
-        })
+        .stderr(Stdio::from(log));
+    command.spawn().with_context(|| {
+        format!(
+            "failed to spawn {} using {}",
+            spec.service,
+            binary.display()
+        )
+    })
+}
+
+fn configure_init_daemon_process(command: &mut ProcessCommand) {
+    command
+        .env_clear()
+        .env("PATH", SANITIZED_INIT_DAEMON_PATH)
+        .env("LANG", SANITIZED_INIT_DAEMON_LOCALE)
+        .env("LC_ALL", SANITIZED_INIT_DAEMON_LOCALE);
 }
 
 fn prepare_init_daemon_directory(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -8501,6 +8513,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let _ = std::fs::remove_dir_all(&symlink_dir_target);
         let _ = std::fs::remove_file(&symlink_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_daemon_process_uses_sanitized_environment() -> anyhow::Result<()> {
+        let temp_dir = temp_path("spawn-env-hardening");
+        std::fs::create_dir_all(&temp_dir)?;
+        let status_path = temp_dir.join("env.status");
+        let status_arg = status_path.display().to_string();
+        let shell_script = r#"
+if test "${PATH:-}" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" &&
+   test "${LANG:-}" = "C" &&
+   test "${LC_ALL:-}" = "C" &&
+   test -z "${HOME+x}" &&
+   test -z "${IPARS_ISSUER_PRIVATE_KEY+x}" &&
+   test -z "${IPARS_ISSUER_PRIVATE_KEY_PATH+x}" &&
+   test -z "${LD_PRELOAD+x}"; then
+    printf 'ok\n' > "$1"
+else
+    {
+        printf 'PATH=%s\n' "${PATH-<unset>}"
+        printf 'LANG=%s\n' "${LANG-<unset>}"
+        printf 'LC_ALL=%s\n' "${LC_ALL-<unset>}"
+        printf 'HOME=%s\n' "${HOME-<unset>}"
+        printf 'IPARS_ISSUER_PRIVATE_KEY=%s\n' "${IPARS_ISSUER_PRIVATE_KEY-<unset>}"
+        printf 'IPARS_ISSUER_PRIVATE_KEY_PATH=%s\n' "${IPARS_ISSUER_PRIVATE_KEY_PATH-<unset>}"
+        printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-<unset>}"
+    } > "$1"
+    exit 1
+fi
+"#;
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .env("HOME", "/tmp/ipars-parent-home")
+            .env("IPARS_ISSUER_PRIVATE_KEY", "secret-signing-key")
+            .env("IPARS_ISSUER_PRIVATE_KEY_PATH", "/tmp/issuer.key")
+            .env("LD_PRELOAD", "/tmp/injected.so");
+        configure_init_daemon_process(&mut command);
+        let status = command
+            .arg("-c")
+            .arg(shell_script)
+            .arg("ipars-init-env")
+            .arg(&status_arg)
+            .status()
+            .context("failed to run sanitized init daemon environment test child")?;
+        let output = std::fs::read_to_string(&status_path)
+            .with_context(|| format!("failed to read {}", status_path.display()))?;
+        assert!(
+            status.success(),
+            "init daemon process inherited unexpected environment:\n{output}"
+        );
+        assert_eq!(output.trim(), "ok");
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 

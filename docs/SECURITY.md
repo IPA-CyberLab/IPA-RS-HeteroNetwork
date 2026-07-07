@@ -68,6 +68,7 @@ Implemented controls:
 
 - Terminate TLS at a reverse proxy, load balancer, or Kubernetes Ingress before exposing control-plane, signal, relay admission, or agent APIs outside a private deployment network.
 - Store issuer private keys outside the control-plane process where possible; pass only issuer public keys to redundant control-plane instances.
+- When using `ipars init --spawn-daemons`, spawned bootstrap services receive a cleared environment with only a fixed system `PATH` and `C` locale so issuer-key environment variables are not propagated.
 - Prefer file-backed join tokens through `--join-token-path` or Kubernetes Secrets over command-line token arguments.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
