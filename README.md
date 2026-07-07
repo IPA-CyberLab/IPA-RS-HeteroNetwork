@@ -61,6 +61,14 @@ IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_p
 IPARS_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallback
 ```
 
+For a repeatable privileged namespace suite with preflight checks, run:
+
+```bash
+scripts/netns-smoke.sh
+```
+
+It verifies temporary namespace creation before running the route, WireGuard when `wg` is installed, hole-punch, and relay-fallback namespace tests. Set `IPARS_NETNS_SMOKE_SKIP_WIREGUARD=1` to skip the WireGuard case on hosts without kernel WireGuard support.
+
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include a signal-registry generated `DIRECT_NAT_TRAVERSAL` plan executed by the UDP puncher across direct-routed namespaces, fixed-port and port-preserving one-sided public-peer SNAT, IP-only, fixed-port, and mixed port-preserving/fixed-port endpoint-independent two-sided SNAT topologies, plus an address/port-dependent SNAT non-traversal case where advertised STUN reflexive ports differ from peer-destination mappings. Always-on NAT classification and signal tests also cover address-dependent mapping from same-port, different-address STUN probes and keep that strategy on coordinated hole punching when filtering evidence permits it. They require `iptables` plus `sysctl` when the gated tests are enabled.
 
 Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit and builds the repository image. The smoke generates a signed join token, verifies the bundled Compose Docker API socket render plus multi-network/rootless/relay-forwarder environment rendering, starts PostgreSQL/control-plane/signal/STUN/relay/agent with `docker compose up --wait`, and uses an agent `dry-run` runtime override so the test does not mutate host routes:
