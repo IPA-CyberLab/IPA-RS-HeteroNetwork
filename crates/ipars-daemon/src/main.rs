@@ -143,6 +143,8 @@ const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+const MAX_PROC_SYSCTL_FLAG_BYTES: u64 = 64;
+const MAX_PROC_SELF_STATUS_BYTES: u64 = 64 * 1024;
 const MAX_EBPF_TRACEPOINT_ID_BYTES: usize = 64;
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
     "/sys/kernel/tracing/events",
@@ -2887,14 +2889,10 @@ fn ensure_proc_sysctl_enabled_if_known(
 }
 
 fn proc_sysctl_flag(path: &Path) -> anyhow::Result<Option<bool>> {
-    let value = match std::fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to read Linux runtime sysctl `{}`", path.display())
-            })
-        }
+    let Some(value) =
+        read_optional_bounded_utf8_file(path, "Linux runtime sysctl", MAX_PROC_SYSCTL_FLAG_BYTES)?
+    else {
+        return Ok(None);
     };
     match value.trim() {
         "0" => Ok(Some(false)),
@@ -2908,21 +2906,50 @@ fn proc_sysctl_flag(path: &Path) -> anyhow::Result<Option<bool>> {
 }
 
 fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
-    let status = match std::fs::read_to_string("/proc/self/status") {
-        Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(status) = read_process_status_file(Path::new("/proc/self/status"))? else {
+        return Ok(None);
     };
     process_status_has_capability(&status, bit)
 }
 
 fn process_has_any_capability(bits: &[u8]) -> anyhow::Result<Option<bool>> {
-    let status = match std::fs::read_to_string("/proc/self/status") {
-        Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(status) = read_process_status_file(Path::new("/proc/self/status"))? else {
+        return Ok(None);
     };
     process_status_has_any_capability(&status, bits)
+}
+
+fn read_process_status_file(path: &Path) -> anyhow::Result<Option<String>> {
+    read_optional_bounded_utf8_file(path, "Linux process status", MAX_PROC_SELF_STATUS_BYTES)
+}
+
+fn read_optional_bounded_utf8_file(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Option<String>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open {label} `{}`", path.display()))
+        }
+    };
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} `{}`", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "{label} `{}` exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        );
+    }
+    let value = String::from_utf8(bytes)
+        .with_context(|| format!("{label} `{}` is not valid UTF-8", path.display()))?;
+    Ok(Some(value))
 }
 
 fn process_status_has_capability(status: &str, bit: u8) -> anyhow::Result<Option<bool>> {
@@ -18943,9 +18970,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let enabled = base.join("enabled");
         let disabled = base.join("disabled");
         let invalid = base.join("invalid");
+        let oversized = base.join("oversized");
         std::fs::write(&enabled, "1\n")?;
         std::fs::write(&disabled, "0\n")?;
         std::fs::write(&invalid, "2\n")?;
+        std::fs::write(
+            &oversized,
+            vec![b'1'; MAX_PROC_SYSCTL_FLAG_BYTES as usize + 1],
+        )?;
 
         assert_eq!(proc_sysctl_flag(&enabled)?, Some(true));
         assert_eq!(proc_sysctl_flag(&disabled)?, Some(false));
@@ -18955,6 +18987,11 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Err(error) => error,
         };
         assert!(error.to_string().contains("unsupported boolean value"));
+        let error = match proc_sysctl_flag(&oversized) {
+            Ok(_) => anyhow::bail!("unexpected successful oversized sysctl read"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds maximum size"));
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
@@ -18993,6 +19030,32 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             process_status_has_capability("Name:\tiparsd\n", CAP_NET_RAW_BIT)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn process_status_file_reader_bounds_proc_status_input() -> anyhow::Result<()> {
+        let base = unique_test_dir("process-status-reader")?;
+        let status_path = base.join("status");
+        let oversized_path = base.join("oversized-status");
+        std::fs::write(&status_path, "Name:\tiparsd\nCapEff:\t0000000000003000\n")?;
+        std::fs::write(
+            &oversized_path,
+            vec![b'N'; MAX_PROC_SELF_STATUS_BYTES as usize + 1],
+        )?;
+
+        let status = read_process_status_file(&status_path)?.context("missing test status")?;
+        assert_eq!(
+            process_status_has_capability(&status, CAP_NET_ADMIN_BIT)?,
+            Some(true)
+        );
+        assert!(read_process_status_file(&base.join("missing"))?.is_none());
+        let error = match read_process_status_file(&oversized_path) {
+            Ok(_) => anyhow::bail!("unexpected successful oversized process status read"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds maximum size"));
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 
