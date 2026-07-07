@@ -7033,6 +7033,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_flow_payload_prefix_metrics_cover_messaging_and_database_protocols(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fn mqtt_connect_packet(client_id: &[u8]) -> Vec<u8> {
+            let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id);
+            let mut payload = vec![0x10, body.len() as u8];
+            payload.extend_from_slice(&body);
+            payload
+        }
+
+        fn cassandra_startup_frame() -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&1_u16.to_be_bytes());
+            body.extend_from_slice(&(b"CQL_VERSION".len() as u16).to_be_bytes());
+            body.extend_from_slice(b"CQL_VERSION");
+            body.extend_from_slice(&(b"3.0.0".len() as u16).to_be_bytes());
+            body.extend_from_slice(b"3.0.0");
+
+            let mut frame = vec![0x04, 0, 0, 0, 0x01];
+            frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&body);
+            frame
+        }
+
+        fn mongodb_op_msg() -> Vec<u8> {
+            let mut body = 0_u32.to_le_bytes().to_vec();
+            body.push(0);
+            body.extend_from_slice(&[5, 0, 0, 0, 0]);
+
+            let length = (16 + body.len()) as u32;
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&1_u32.to_le_bytes());
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+            payload.extend_from_slice(&2013_u32.to_le_bytes());
+            payload.extend_from_slice(&body);
+            payload
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-payload");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 80)),
+            "wg-peer-payload",
+            Vec::new(),
+            vec![Route {
+                id: "payload-route".to_string(),
+                cidr: "10.52.0.0/16".parse()?,
+                advertised_by: peer_id.clone(),
+                via: None,
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+        runtime.observe_peer_map_for_lazy_connect(&[peer]).await;
+
+        let payloads = [
+            (AgentPacketFlowApplication::Nats, b"PING\r\n".to_vec()),
+            (
+                AgentPacketFlowApplication::Mqtt,
+                mqtt_connect_packet(b"agent-a"),
+            ),
+            (
+                AgentPacketFlowApplication::Amqp,
+                b"AMQP\0\0\x09\x01".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Cassandra,
+                cassandra_startup_frame(),
+            ),
+            (AgentPacketFlowApplication::MongoDb, mongodb_op_msg()),
+        ];
+
+        for (index, (_application, payload_prefix)) in payloads.iter().enumerate() {
+            let matched = runtime
+                .record_packet_flow_observation(
+                    IpAddr::V4(Ipv4Addr::new(10, 52, 7, 10 + index as u8)),
+                    AgentPacketFlowObservation {
+                        protocol: Some(TransportProtocol::Tcp),
+                        destination_port: Some(30_000 + index as u16),
+                        payload_prefix: payload_prefix.clone(),
+                        ..Default::default()
+                    },
+                    Utc::now(),
+                    false,
+                )
+                .await
+                .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
+            assert_eq!(matched.peer, peer_id);
+        }
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, payloads.len() as u64);
+        assert_eq!(metrics.packet_flow_match_count, payloads.len() as u64);
+        assert_eq!(metrics.packet_flow_unmatched_count, 0);
+
+        for (application, _payload_prefix) in payloads {
+            let count = metrics
+                .packet_flow_application_counts
+                .iter()
+                .find(|entry| entry.application == application)
+                .map(|entry| entry.count)
+                .unwrap_or(0);
+            assert_eq!(
+                count, 1,
+                "{application:?} should be counted from payload prefix"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn packet_flow_ignores_routes_advertised_by_other_nodes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = AgentRuntime::new(
