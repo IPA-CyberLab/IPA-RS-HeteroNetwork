@@ -13346,6 +13346,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Nomad),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Jaeger),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(

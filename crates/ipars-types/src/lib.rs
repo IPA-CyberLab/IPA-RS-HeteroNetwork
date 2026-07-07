@@ -1751,6 +1751,7 @@ pub mod api {
         Memcached,
         Prometheus,
         OpenTelemetry,
+        Jaeger,
         Grpc,
         Kafka,
         Nats,
@@ -1764,7 +1765,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 32] = [
+        pub const ALL: [Self; 33] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1787,6 +1788,7 @@ pub mod api {
             Self::Memcached,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Jaeger,
             Self::Grpc,
             Self::Kafka,
             Self::Nats,
@@ -1823,6 +1825,7 @@ pub mod api {
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Jaeger => "jaeger",
                 Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
@@ -2090,6 +2093,20 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
             }
+            if (self.involves_port(5778)
+                || self.involves_port(14250)
+                || self.involves_port(14268)
+                || self.involves_port(14269)
+                || self.involves_port(16686))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Jaeger;
+            }
+            if (self.involves_port(6831) || self.involves_port(6832))
+                && matches!(self.protocol, None | Some(TransportProtocol::Udp))
+            {
+                return AgentPacketFlowApplication::Jaeger;
+            }
             if self.involves_port(50051) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Grpc;
             }
@@ -2230,6 +2247,7 @@ pub mod api {
             | AgentPacketFlowApplication::Https
             | AgentPacketFlowApplication::Consul
             | AgentPacketFlowApplication::Nomad
+            | AgentPacketFlowApplication::Jaeger
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -2422,6 +2440,9 @@ pub mod api {
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if jaeger_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Jaeger);
+            }
             if consul_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Consul);
             }
@@ -2492,6 +2513,21 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn jaeger_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 6] = [
+            b"/api/archive",
+            b"/api/dependencies",
+            b"/api/operations",
+            b"/api/services",
+            b"/api/traces",
+            b"/jaeger/api/traces",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn consul_http_api_path(path: &[u8]) -> bool {
@@ -2821,6 +2857,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::OpenTelemetry);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"jaeger") {
+            return Some(AgentPacketFlowApplication::Jaeger);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
             return Some(AgentPacketFlowApplication::Grpc);
         }
@@ -2973,6 +3012,12 @@ pub mod api {
             || tls_alpn_protocol_has_token(protocol, b"otlp")
         {
             return Some(AgentPacketFlowApplication::OpenTelemetry);
+        }
+        if protocol.eq_ignore_ascii_case(b"jaeger")
+            || protocol.eq_ignore_ascii_case(b"jaeger-grpc")
+            || protocol.eq_ignore_ascii_case(b"jaeger-thrift")
+        {
+            return Some(AgentPacketFlowApplication::Jaeger);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -7409,6 +7454,26 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
 
+        let jaeger_collector = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(14268),
+            ..Default::default()
+        };
+        assert_eq!(
+            jaeger_collector.application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+
+        let jaeger_agent = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(6831),
+            ..Default::default()
+        };
+        assert_eq!(
+            jaeger_agent.application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+
         let grpc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(50051),
@@ -8067,6 +8132,18 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
         assert_eq!(
+            observation_for_payload(b"GET /api/traces?service=agent HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/services HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Jaeger
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/tracer HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni(
                 "elasticsearch-master.logging.svc"
             ))
@@ -8077,6 +8154,10 @@ mod tests {
             (
                 "grpc-api.default.svc",
                 api::AgentPacketFlowApplication::Grpc,
+            ),
+            (
+                "jaeger-collector.observability.svc",
+                api::AgentPacketFlowApplication::Jaeger,
             ),
             (
                 "kafka-broker.messaging.svc",
@@ -8189,6 +8270,10 @@ mod tests {
             (
                 &[b"otlp-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::OpenTelemetry,
+            ),
+            (
+                &[b"jaeger-grpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Jaeger,
             ),
             (
                 &[b"kafka".as_slice()][..],
