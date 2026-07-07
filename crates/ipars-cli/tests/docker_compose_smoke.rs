@@ -313,6 +313,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
     )?;
     assert_compose_service_apis(&compose, &ComposeApiPorts { agent: agent_port })?;
+    assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
 
     Ok(())
@@ -660,6 +661,43 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
     Ok(())
 }
 
+fn assert_compose_relay_admission_auth_required(compose: &ComposeProject) -> Result<()> {
+    let status = compose_exec_http_status(
+        compose,
+        "relay",
+        "POST",
+        "http://127.0.0.1:9580/v1/sessions",
+        Some(
+            r#"{"left":"compose-unauth-left","right":"compose-unauth-right","left_addr":"127.0.0.1:31001","right_addr":"127.0.0.1:31002"}"#,
+        ),
+        "unauthenticated relay admission",
+    )?;
+    anyhow::ensure!(
+        status == 401,
+        "unauthenticated relay admission returned HTTP {status}, expected 401"
+    );
+
+    wait_for_json(
+        compose,
+        "relay status after unauthenticated admission",
+        "relay",
+        "http://127.0.0.1:9580/v1/status",
+        |value| {
+            ensure_json_u64_at_least(value, "admission_attempt_count", 1)?;
+            ensure_json_u64_at_least(value, "admission_failure_count", 1)?;
+            ensure_json_u64_equals(value, "admission_success_count", 0)?;
+            ensure_json_u64_at_least_at(
+                value,
+                &["admission_failures_by_reason", "unauthorized"],
+                1,
+            )?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
 fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
     let probe = compose_exec_ipars_json(
         compose,
@@ -698,10 +736,19 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
         &["status_after_probe", "admission_success_count"],
         1,
     )?;
-    ensure_json_u64_equals_at(
+    ensure_json_u64_at_least_at(
         &probe,
         &["status_after_probe", "admission_failure_count"],
-        0,
+        1,
+    )?;
+    ensure_json_u64_at_least_at(
+        &probe,
+        &[
+            "status_after_probe",
+            "admission_failures_by_reason",
+            "unauthorized",
+        ],
+        1,
     )?;
 
     wait_for_json(
@@ -711,7 +758,12 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
         "http://127.0.0.1:9580/v1/status",
         |value| {
             ensure_json_u64_at_least(value, "admission_success_count", 1)?;
-            ensure_json_u64_equals(value, "admission_failure_count", 0)?;
+            ensure_json_u64_at_least(value, "admission_failure_count", 1)?;
+            ensure_json_u64_at_least_at(
+                value,
+                &["admission_failures_by_reason", "unauthorized"],
+                1,
+            )?;
             ensure_json_u64_at_least_at(value, &["capability", "active_sessions"], 1)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_received"], 2)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_forwarded"], 2)?;
@@ -783,6 +835,54 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
     })
 }
 
+fn compose_exec_http_status(
+    compose: &ComposeProject,
+    service: &str,
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    label: &str,
+) -> Result<u16> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "-sS",
+        "--max-time",
+        "5",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-X",
+        method,
+    ]);
+    if let Some(body) = body {
+        command.args([
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            body,
+        ]);
+    }
+    command.arg(url);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose exec {service} curl {url}"))?;
+    ensure_success(
+        &format!("docker compose exec {service} curl {label}"),
+        &output,
+    )?;
+    let status = std::str::from_utf8(&output.stdout)
+        .with_context(|| format!("{label} HTTP status output was not UTF-8"))?
+        .trim();
+    status
+        .parse::<u16>()
+        .with_context(|| format!("{label} HTTP status output was not a status code: {status:?}"))
+}
+
 fn compose_exec_ipars_json(
     compose: &ComposeProject,
     service: &str,
@@ -830,16 +930,6 @@ fn ensure_json_u64_at_least_at(value: &Value, path: &[&str], minimum: u64) -> Re
     anyhow::ensure!(
         actual >= minimum,
         "expected JSON field {} to be at least {minimum}, got {actual}: {value}",
-        path.join(".")
-    );
-    Ok(())
-}
-
-fn ensure_json_u64_equals_at(value: &Value, path: &[&str], expected: u64) -> Result<()> {
-    let actual = json_u64_field_at(value, path)?;
-    anyhow::ensure!(
-        actual == expected,
-        "expected JSON field {} to equal {expected}, got {actual}: {value}",
         path.join(".")
     );
     Ok(())
