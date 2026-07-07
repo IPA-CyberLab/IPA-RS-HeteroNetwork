@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-/home/coder/.cargo/bin/cargo}"
 suffix="$$-$(date +%s%N)"
 probe_netns="ipars-smoke-probe-${suffix}"
+probe_netns_path="/var/run/netns/${probe_netns}"
 preflight_stderr="/tmp/ipars-netns-smoke-preflight-${suffix}.stderr"
 
 cleanup() {
@@ -20,6 +21,10 @@ require_command() {
   fi
 }
 
+probe_netns_is_listed() {
+  ip netns list | awk '{print $1}' | grep -Fx -- "${probe_netns}" >/dev/null
+}
+
 preflight_netns() {
   require_command ip
   require_command iptables
@@ -30,8 +35,28 @@ preflight_netns() {
     cat "${preflight_stderr}" >&2
     exit 1
   fi
+  if ! probe_netns_is_listed; then
+    echo "temporary network namespace ${probe_netns} was created but is missing from 'ip netns list'" >&2
+    exit 1
+  fi
+  if [[ ! -e "${probe_netns_path}" ]]; then
+    echo "temporary network namespace entry ${probe_netns_path} was not created" >&2
+    exit 1
+  fi
+  if [[ -L "${probe_netns_path}" ]]; then
+    echo "temporary network namespace entry ${probe_netns_path} must not be a symlink" >&2
+    exit 1
+  fi
   ip -n "${probe_netns}" link set lo up
   cleanup
+  if probe_netns_is_listed; then
+    echo "temporary network namespace ${probe_netns} remained listed after cleanup" >&2
+    exit 1
+  fi
+  if [[ -e "${probe_netns_path}" ]]; then
+    echo "temporary network namespace entry ${probe_netns_path} remained after cleanup" >&2
+    exit 1
+  fi
   trap - EXIT
 }
 
