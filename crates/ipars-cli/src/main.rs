@@ -41,6 +41,8 @@ const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
 const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
 const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
+const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
+const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 
@@ -3825,7 +3827,6 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let environment = docker_install_environment(&args);
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
-        "net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
     ];
     if args.rootless {
@@ -3833,21 +3834,14 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "Rootless Docker Engine for Compose services that cannot receive host kernel capabilities"
                 .to_string(),
         );
+        prerequisites.push(
+            "A userspace WireGuard implementation launched by --userspace-wireguard-command"
+                .to_string(),
+        );
     } else {
+        prerequisites.push("net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string());
         prerequisites.push("/dev/net/tun available on agent/relay hosts".to_string());
         prerequisites.push("CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string());
-    }
-    if args.rootless && args.docker_discover_networks {
-        prerequisites.push(
-            "Rootless Docker Engine with a reachable user Docker socket for network discovery"
-                .to_string(),
-        );
-    }
-    if args.rootless {
-        prerequisites.push(
-            "A userspace WireGuard implementation started before the agent and exposing the configured interface through wg(8)"
-                .to_string(),
-        );
     }
     if args.docker_discover_networks {
         prerequisites
@@ -3863,29 +3857,33 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "CAP_SYS_ADMIN and a host /var/run/netns bind mount for relay forwarder namespace placement".to_string(),
         );
     }
-    let mut notes = vec![
-        "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
+    let mut notes = Vec::new();
+    if args.rootless {
+        notes.push("The rootless agent service runs with host networking for colocated service access, but Docker route application is disabled because docker/compose.rootless.yaml removes Linux capabilities and /dev/net/tun mounts".to_string());
+    } else {
+        notes.push("The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string());
+    }
+    notes.extend([
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
-        "Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
-        "Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string(),
-    ];
+    ]);
+    if !args.rootless {
+        notes.push("Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string());
+        notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string());
+    }
     if args.docker_discover_networks {
         notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
-        if args.userspace_wireguard_command.is_some() {
-            notes.push("Rootless Docker network discovery uses the user socket, selects the userspace-command WireGuard backend, and starts the configured userspace WireGuard process before peer-map sync".to_string());
-        } else {
-            notes.push("Rootless Docker network discovery uses the user socket and selects the userspace-command WireGuard backend; set --userspace-wireguard-command or pre-create the configured userspace WireGuard interface before peer-map sync starts".to_string());
-        }
+        notes.push("Rootless Docker install plans select the userspace-command WireGuard backend and start the configured userspace WireGuard process before peer-map sync".to_string());
+        notes.push("Use a separate rootful route-provider agent for Docker container CIDR reachability; rootless install plans reject Docker route and Docker API discovery settings instead of emitting an unusable route loop".to_string());
     } else {
-        notes.push("Rootless Docker discovery is supported by combining the user Docker socket with IPARS_AGENT_WIREGUARD_BACKEND=userspace-command and an operator-managed userspace WireGuard interface".to_string());
+        notes.push("For rootless Docker container CIDR reachability, run a separate rootful route-provider agent or an equivalent userspace routing layer instead of the rootless Compose override".to_string());
     }
     if args.relay_forwarder_netns.is_some() {
         notes.push("Relay forwarder namespace placement keeps the base Compose service least-privileged; add CAP_SYS_ADMIN and bind-mount the host /var/run/netns directory when enabling IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string());
@@ -3958,6 +3956,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     )?;
     validate_docker_userspace_wireguard_args(args)?;
     validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
+    validate_rootless_docker_install_args(args)?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
     }
@@ -3968,6 +3967,32 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     }
     validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
     validate_docker_network_filters(&args.docker_networks)?;
+    Ok(())
+}
+
+fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    if !args.rootless {
+        return Ok(());
+    }
+    if args.userspace_wireguard_command.is_none() {
+        anyhow::bail!(
+            "--rootless requires --userspace-wireguard-command because the rootless Compose override cannot create kernel WireGuard devices"
+        );
+    }
+    let has_docker_route_settings = args.docker_discover_networks
+        || !args.docker_networks.is_empty()
+        || args.docker_api_socket.is_some()
+        || args.docker_container_namespace.is_some()
+        || !args.docker_container_cidrs.is_empty()
+        || args.docker_host_interface != DEFAULT_DOCKER_HOST_INTERFACE
+        || args.disable_docker_expose_host_routes
+        || args.docker_route_interval_seconds != DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS
+        || args.route_backend != "command";
+    if has_docker_route_settings {
+        anyhow::bail!(
+            "--rootless cannot be combined with Docker route or discovery settings because docker/compose.rootless.yaml removes NET_ADMIN and /dev/net/tun; remove Docker route flags or run a rootful route-provider agent for Docker container CIDR reachability"
+        );
+    }
     Ok(())
 }
 
@@ -4270,54 +4295,79 @@ fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
 }
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
+    let apply_docker_routes = !args.rootless;
     let mut environment = vec![
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
-            value: "true".to_string(),
-        },
-        InstallEnvironment {
-            name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
-            value: (!args.disable_docker_expose_host_routes).to_string(),
-        },
-        InstallEnvironment {
-            name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
-            value: args.docker_route_interval_seconds.to_string(),
-        },
-        InstallEnvironment {
-            name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
-            value: args.route_backend.clone(),
+            value: apply_docker_routes.to_string(),
         },
         InstallEnvironment {
             name: "IPARS_STUN_ALTERNATE_LISTEN".to_string(),
             value: DEFAULT_STUN_ALTERNATE_LISTEN.to_string(),
         },
     ];
-    if args.docker_discover_networks {
+    if apply_docker_routes {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
-            value: "true".to_string(),
+            name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+            value: (!args.disable_docker_expose_host_routes).to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_API_SOCKET".to_string(),
-            value: "/run/ipars/docker.sock".to_string(),
+            name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+            value: args.docker_route_interval_seconds.to_string(),
         });
-    }
-    if !args.docker_networks.is_empty() {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_NETWORKS".to_string(),
-            value: args.docker_networks.join(","),
+            name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
+            value: args.route_backend.clone(),
         });
-    }
-    if let Some(socket) = args.docker_api_socket.as_ref() {
+        if args.docker_discover_networks {
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                value: "true".to_string(),
+            });
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_API_SOCKET".to_string(),
+                value: "/run/ipars/docker.sock".to_string(),
+            });
+        }
+        if !args.docker_networks.is_empty() {
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_NETWORKS".to_string(),
+                value: args.docker_networks.join(","),
+            });
+        }
+        if let Some(socket) = args.docker_api_socket.as_ref() {
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
+                value: socket.display().to_string(),
+            });
+        }
+        let container_namespace = args
+            .docker_container_namespace
+            .clone()
+            .unwrap_or_else(|| "compose-default".to_string());
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
-            value: socket.display().to_string(),
+            name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+            value: container_namespace,
         });
-    } else if args.rootless && args.docker_discover_networks {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
-            value: "${XDG_RUNTIME_DIR}/docker.sock".to_string(),
+            name: "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+            value: args.docker_host_interface.clone(),
         });
+        if !args.docker_discover_networks {
+            let container_cidrs = if args.docker_container_cidrs.is_empty() {
+                "172.18.0.0/16".to_string()
+            } else {
+                args.docker_container_cidrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+                value: container_cidrs,
+            });
+        }
     }
     if args.rootless || args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
@@ -4350,33 +4400,6 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         });
     }
     append_docker_relay_forwarder_environment(&mut environment, args);
-    let container_namespace = args
-        .docker_container_namespace
-        .clone()
-        .unwrap_or_else(|| "compose-default".to_string());
-    environment.push(InstallEnvironment {
-        name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
-        value: container_namespace,
-    });
-    environment.push(InstallEnvironment {
-        name: "IPARS_DOCKER_HOST_INTERFACE".to_string(),
-        value: args.docker_host_interface.clone(),
-    });
-    if !args.docker_discover_networks {
-        let container_cidrs = if args.docker_container_cidrs.is_empty() {
-            "172.18.0.0/16".to_string()
-        } else {
-            args.docker_container_cidrs
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
-            value: container_cidrs,
-        });
-    }
     environment
 }
 
@@ -9148,19 +9171,20 @@ mod tests {
     }
 
     #[test]
-    fn docker_install_plan_exports_rootless_multi_network_settings() -> anyhow::Result<()> {
+    fn docker_install_plan_exports_rootless_userspace_settings_without_docker_routes(
+    ) -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
-            docker_discover_networks: true,
-            docker_networks: vec!["edge_default".to_string(), "edge_apps".to_string()],
+            docker_discover_networks: false,
+            docker_networks: Vec::new(),
             docker_api_socket: None,
-            docker_container_namespace: Some("compose-edge".to_string()),
-            docker_host_interface: "br-edge".to_string(),
+            docker_container_namespace: None,
+            docker_host_interface: DEFAULT_DOCKER_HOST_INTERFACE.to_string(),
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
-            docker_route_interval_seconds: 60,
+            docker_route_interval_seconds: DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS,
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: vec!["ipars0".to_string()],
@@ -9185,22 +9209,24 @@ mod tests {
         assert!(plan
             .prerequisites
             .iter()
+            .any(|requirement| requirement.contains("userspace WireGuard")));
+        assert!(!plan
+            .prerequisites
+            .iter()
             .any(|requirement| requirement.contains("Docker API access")));
         assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_APPLY_DOCKER_ROUTES"),
+            Some("false")
+        );
+        assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_DISCOVER_NETWORKS"),
-            Some("true")
+            None
         );
-        assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET"),
-            Some("/run/ipars/docker.sock")
-        );
-        assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
-            Some("edge_default,edge_apps")
-        );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_NETWORKS"), None);
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
-            Some("${XDG_RUNTIME_DIR}/docker.sock")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
@@ -9230,27 +9256,19 @@ mod tests {
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
-            Some("compose-edge")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_HOST_INTERFACE"),
-            Some("br-edge")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
             None
         );
-        assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
-        assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
-        assert!(plan.commands[0].contains("case \"$docker_socket\" in /*)"));
-        assert!(plan.commands[0]
-            .contains("Docker API socket path must be an absolute Unix socket path"));
-        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
-        assert!(plan.commands[0].contains("XDG_RUNTIME_DIR"));
-        assert!(plan.commands[0].contains("docker --host"));
         assert_eq!(
-            plan.commands[1],
-            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml -f docker/compose.docker-discovery.yaml config"
+            plan.commands[0],
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml config"
         );
         assert!(plan
             .notes
@@ -9259,11 +9277,11 @@ mod tests {
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("IPARS_DOCKER_API_SOCKET_HOST")));
+            .any(|note| note.contains("Docker route application is disabled")));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("socket preflight command")));
+            .any(|note| note.contains("rootful route-provider agent")));
         Ok(())
     }
 
@@ -9849,28 +9867,45 @@ mod tests {
     }
 
     #[test]
-    fn docker_install_plan_rootless_static_routes_do_not_export_socket() -> anyhow::Result<()> {
-        let plan = docker_install_plan(DockerInstallArgs {
+    fn docker_install_plan_rejects_rootless_docker_route_settings() -> anyhow::Result<()> {
+        let static_routes = match docker_install_plan(DockerInstallArgs {
             rootless: true,
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
             ..docker_install_test_args()
-        })?;
+        }) {
+            Ok(_) => anyhow::bail!("rootless static Docker routes should be rejected"),
+            Err(error) => error,
+        };
+        assert!(static_routes
+            .to_string()
+            .contains("--rootless cannot be combined with Docker route or discovery settings"));
 
-        assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
-            None
-        );
-        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
-        assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
-            Some("userspace-command")
-        );
-        assert_eq!(
-            plan.commands[0],
-            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml config"
-        );
-        assert!(!plan.commands[0].contains("docker --host"));
+        let discovery = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string()],
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless Docker discovery should be rejected"),
+            Err(error) => error,
+        };
+        assert!(discovery
+            .to_string()
+            .contains("--rootless cannot be combined with Docker route or discovery settings"));
+
+        let missing_userspace = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless plan without userspace WireGuard should be rejected"),
+            Err(error) => error,
+        };
+        assert!(missing_userspace
+            .to_string()
+            .contains("--rootless requires --userspace-wireguard-command"));
         Ok(())
     }
 
