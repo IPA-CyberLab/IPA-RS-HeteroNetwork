@@ -1742,6 +1742,7 @@ pub mod api {
         ZooKeeper,
         Consul,
         Vault,
+        Nomad,
         Postgres,
         Mysql,
         MsSql,
@@ -1763,7 +1764,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 31] = [
+        pub const ALL: [Self; 32] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1777,6 +1778,7 @@ pub mod api {
             Self::ZooKeeper,
             Self::Consul,
             Self::Vault,
+            Self::Nomad,
             Self::Postgres,
             Self::Mysql,
             Self::MsSql,
@@ -1812,6 +1814,7 @@ pub mod api {
                 Self::ZooKeeper => "zookeeper",
                 Self::Consul => "consul",
                 Self::Vault => "vault",
+                Self::Nomad => "nomad",
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
                 Self::MsSql => "mssql",
@@ -2013,6 +2016,19 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Vault;
             }
+            if (self.involves_port(4646) || self.involves_port(4647))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Nomad;
+            }
+            if self.involves_port(4648)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Nomad;
+            }
             if self.involves_port(53)
                 && matches!(
                     self.protocol,
@@ -2213,6 +2229,7 @@ pub mod api {
             AgentPacketFlowApplication::Dns
             | AgentPacketFlowApplication::Https
             | AgentPacketFlowApplication::Consul
+            | AgentPacketFlowApplication::Nomad
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -2411,6 +2428,9 @@ pub mod api {
             if vault_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Vault);
             }
+            if nomad_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Nomad);
+            }
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
             }
@@ -2495,6 +2515,39 @@ pub mod api {
             b"/v1/session",
             b"/v1/status",
             b"/v1/txn",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn nomad_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 24] = [
+            b"/v1/allocation",
+            b"/v1/allocations",
+            b"/v1/alloc",
+            b"/v1/client/allocation",
+            b"/v1/csi",
+            b"/v1/deployment",
+            b"/v1/deployments",
+            b"/v1/evaluation",
+            b"/v1/evaluations",
+            b"/v1/job",
+            b"/v1/jobs",
+            b"/v1/namespace",
+            b"/v1/namespaces",
+            b"/v1/node",
+            b"/v1/nodes",
+            b"/v1/plugin",
+            b"/v1/plugins",
+            b"/v1/quota",
+            b"/v1/quotas",
+            b"/v1/scaling",
+            b"/v1/search",
+            b"/v1/var",
+            b"/v1/variables",
+            b"/v1/volumes",
         ];
 
         PREFIXES
@@ -2756,6 +2809,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"vault") {
             return Some(AgentPacketFlowApplication::Vault);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"nomad") {
+            return Some(AgentPacketFlowApplication::Nomad);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
         }
@@ -2901,6 +2957,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"vault-api")
         {
             return Some(AgentPacketFlowApplication::Vault);
+        }
+        if protocol.eq_ignore_ascii_case(b"nomad")
+            || protocol.eq_ignore_ascii_case(b"nomad-rpc")
+            || protocol.eq_ignore_ascii_case(b"nomad-serf")
+        {
+            return Some(AgentPacketFlowApplication::Nomad);
         }
         if protocol.eq_ignore_ascii_case(b"prometheus") {
             return Some(AgentPacketFlowApplication::Prometheus);
@@ -7259,6 +7321,26 @@ mod tests {
             api::AgentPacketFlowApplication::Vault
         );
 
+        let nomad_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(4646),
+            ..Default::default()
+        };
+        assert_eq!(
+            nomad_api.application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+
+        let nomad_serf = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(4648),
+            ..Default::default()
+        };
+        assert_eq!(
+            nomad_serf.application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+
         let postgres = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(5432),
@@ -7938,6 +8020,19 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"GET /v1/jobs HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/allocations?namespace=default HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v1/jobber HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
                 .application(),
             api::AgentPacketFlowApplication::Https
@@ -8007,6 +8102,10 @@ mod tests {
             (
                 "vault-active.secrets.svc",
                 api::AgentPacketFlowApplication::Vault,
+            ),
+            (
+                "nomad-server.scheduler.svc",
+                api::AgentPacketFlowApplication::Nomad,
             ),
             (
                 "cassandra-seed.db.svc",
@@ -8106,6 +8205,10 @@ mod tests {
             (
                 &[b"vault".as_slice()][..],
                 api::AgentPacketFlowApplication::Vault,
+            ),
+            (
+                &[b"nomad-rpc".as_slice()][..],
+                api::AgentPacketFlowApplication::Nomad,
             ),
             (
                 &[b"nats".as_slice()][..],

@@ -1664,6 +1664,9 @@ mod tests {
         assert!(body.contains(&format!(
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"vault\"}} 0"
         )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"nomad\"}} 0"
+        )));
 
         let paths_response = app
             .clone()
