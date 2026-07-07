@@ -360,4 +360,12 @@ template_fails relay-forwarder-netns-without-sys-admin \
   --set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820 \
   --set-string agent.relayForwarder.netns=relay-fw
 
+template_fails agent-state-hostpath-sensitive-system-path \
+  "agent.state.hostPath must not be a sensitive system path" \
+  --set-string agent.state.hostPath=/etc/ipars
+
+template_fails agent-state-mountpath-sensitive-system-path \
+  "agent.state.mountPath must not be a sensitive system path" \
+  --set-string agent.state.mountPath=/proc/ipars
+
 echo "Helm smoke checks passed using ${helm_image}"

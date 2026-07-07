@@ -4569,6 +4569,46 @@ fn validate_kubernetes_absolute_path(path: &str, label: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn validate_kubernetes_agent_state_host_path(path: &str) -> Result<(), String> {
+    validate_kubernetes_absolute_path(path, "agent state host path")?;
+    validate_kubernetes_path_not_sensitive(
+        path,
+        "agent state host path",
+        &[
+            "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/root", "/run",
+            "/sbin", "/sys", "/tmp", "/usr", "/var/run", "/var/tmp",
+        ],
+    )
+}
+
+fn validate_kubernetes_agent_state_mount_path(path: &str) -> Result<(), String> {
+    validate_kubernetes_absolute_path(path, "agent state mount path")?;
+    validate_kubernetes_path_not_sensitive(
+        path,
+        "agent state mount path",
+        &[
+            "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/root", "/sbin",
+            "/sys", "/usr",
+        ],
+    )
+}
+
+fn validate_kubernetes_path_not_sensitive(
+    path: &str,
+    label: &str,
+    disallowed_prefixes: &[&str],
+) -> Result<(), String> {
+    if disallowed_prefixes
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        return Err(format!(
+            "{label} `{path}` must not be a sensitive system path; choose a dedicated IPARS state directory such as /var/lib/ipars or /opt/ipars/state"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_kubernetes_seccomp_localhost_profile(profile: &str) -> Result<(), String> {
     if profile.is_empty() {
         return Err("seccomp localhost profile must not be empty".to_string());
@@ -5047,12 +5087,10 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
         }
     }
     if let Some(host_path) = args.agent_state_host_path.as_deref() {
-        validate_kubernetes_absolute_path(host_path, "agent state host path")
-            .map_err(anyhow::Error::msg)?;
+        validate_kubernetes_agent_state_host_path(host_path).map_err(anyhow::Error::msg)?;
     }
     if let Some(mount_path) = args.agent_state_mount_path.as_deref() {
-        validate_kubernetes_absolute_path(mount_path, "agent state mount path")
-            .map_err(anyhow::Error::msg)?;
+        validate_kubernetes_agent_state_mount_path(mount_path).map_err(anyhow::Error::msg)?;
     }
     if let Some(host_path_type) = args.agent_state_host_path_type.as_deref() {
         parse_kubernetes_host_path_type(host_path_type).map_err(anyhow::Error::msg)?;
@@ -9102,6 +9140,24 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chart_validates_agent_state_paths() -> anyhow::Result<()> {
+        let daemonset_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates/daemonset.yaml")
+            .canonicalize()?;
+        let daemonset = std::fs::read_to_string(daemonset_path)?;
+
+        assert!(daemonset.contains("agent.state.hostPath must be an absolute host path"));
+        assert!(daemonset.contains("agent.state.mountPath must be an absolute container path"));
+        assert!(daemonset.contains("agent.state.hostPath must not be a sensitive system path"));
+        assert!(daemonset.contains("agent.state.mountPath must not be a sensitive system path"));
+        assert!(daemonset.contains("(hasPrefix \"/etc/\" $agentStateHostPath)"));
+        assert!(daemonset.contains("(hasPrefix \"/proc/\" $agentStateMountPath)"));
+        assert!(daemonset.contains("(eq $agentStateHostPath \"/var/run\")"));
+        assert!(!daemonset.contains("(hasPrefix \"/run/\" $agentStateMountPath)"));
+        Ok(())
+    }
+
+    #[test]
     fn bundled_chart_validates_daemon_socket_addresses() -> anyhow::Result<()> {
         let helpers_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../charts/ipars/templates/_helpers.tpl")
@@ -10146,6 +10202,24 @@ mod tests {
         assert!(parse_kubernetes_absolute_path("relative/ipars").is_err());
         assert!(parse_kubernetes_host_path_type("File").is_err());
         assert!(parse_kubernetes_resource_quantity("100 m").is_err());
+
+        let mut unsafe_host_path = base_k8s_install_args();
+        unsafe_host_path.agent_state_host_path = Some("/etc/ipars".to_string());
+        let error = match k8s_install_plan(unsafe_host_path) {
+            Ok(_) => panic!("sensitive host state path should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent state host path"));
+        assert!(error.contains("sensitive system path"));
+
+        let mut unsafe_mount_path = base_k8s_install_args();
+        unsafe_mount_path.agent_state_mount_path = Some("/proc/ipars".to_string());
+        let error = match k8s_install_plan(unsafe_mount_path) {
+            Ok(_) => panic!("sensitive container state mount path should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent state mount path"));
+        assert!(error.contains("sensitive system path"));
 
         let mut duplicate_pod_annotation = base_k8s_install_args();
         duplicate_pod_annotation.agent_pod_annotations = vec![
