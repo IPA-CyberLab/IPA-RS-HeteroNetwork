@@ -6586,7 +6586,10 @@ pub mod api {
     }
 
     fn postgres_query_message_payload(body: &[u8]) -> bool {
-        body.len() >= 2 && body.last() == Some(&0) && postgres_nonempty_cstring(body, 0)
+        if body.len() < 2 || body.last() != Some(&0) {
+            return false;
+        }
+        postgres_sql_statement(&body[..body.len() - 1])
     }
 
     fn postgres_parse_message_payload(body: &[u8]) -> bool {
@@ -6596,7 +6599,9 @@ pub mod api {
         let Some(after_query) = postgres_cstring_end(body, after_statement_name) else {
             return false;
         };
-        if after_query <= after_statement_name + 1 {
+        if after_query <= after_statement_name + 1
+            || !postgres_sql_statement(&body[after_statement_name..after_query - 1])
+        {
             return false;
         }
         let Some(parameter_count) = read_u16_be(body, after_query).map(|count| count as usize)
@@ -6607,6 +6612,101 @@ pub mod api {
             .checked_add(2)
             .and_then(|offset| offset.checked_add(parameter_count.checked_mul(4)?))
             == Some(body.len())
+    }
+
+    fn postgres_sql_statement(statement: &[u8]) -> bool {
+        if statement.is_empty()
+            || statement.len() > 8192
+            || !statement
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\t' | b'\n' | b'\r'))
+        {
+            return false;
+        }
+        let Some(statement) = postgres_sql_statement_start(statement) else {
+            return false;
+        };
+        const KEYWORDS: &[&[u8]] = &[
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"MERGE",
+            b"COPY",
+            b"VALUES",
+            b"CALL",
+            b"DO",
+            b"WITH",
+            b"TABLE",
+            b"SET",
+            b"RESET",
+            b"SHOW",
+            b"BEGIN",
+            b"START",
+            b"COMMIT",
+            b"END",
+            b"ROLLBACK",
+            b"SAVEPOINT",
+            b"RELEASE",
+            b"PREPARE",
+            b"EXECUTE",
+            b"DEALLOCATE",
+            b"DECLARE",
+            b"FETCH",
+            b"MOVE",
+            b"CLOSE",
+            b"LISTEN",
+            b"NOTIFY",
+            b"UNLISTEN",
+            b"LOAD",
+            b"DISCARD",
+            b"CHECKPOINT",
+            b"VACUUM",
+            b"ANALYZE",
+            b"EXPLAIN",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"COMMENT",
+            b"GRANT",
+            b"REVOKE",
+            b"LOCK",
+            b"CLUSTER",
+            b"REINDEX",
+            b"REFRESH",
+            b"IMPORT",
+        ];
+        KEYWORDS
+            .iter()
+            .any(|keyword| starts_ascii_keyword(statement, keyword))
+    }
+
+    fn postgres_sql_statement_start(mut statement: &[u8]) -> Option<&[u8]> {
+        loop {
+            statement = statement.trim_ascii_start();
+            if statement.is_empty() {
+                return None;
+            }
+            if statement.starts_with(b";") {
+                statement = &statement[1..];
+                continue;
+            }
+            if statement.starts_with(b"--") {
+                let newline = statement.iter().position(|byte| *byte == b'\n')?;
+                statement = &statement[newline + 1..];
+                continue;
+            }
+            if statement.starts_with(b"/*") {
+                let comment_end = statement
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map(|offset| offset + 2)?;
+                statement = &statement[comment_end..];
+                continue;
+            }
+            return Some(statement);
+        }
     }
 
     fn postgres_bind_message_payload(body: &[u8]) -> bool {
@@ -13736,6 +13836,19 @@ mod tests {
             observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1\0")).application(),
             api::AgentPacketFlowApplication::Postgres
         );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(
+                b'Q',
+                b"/* ipars */\nWITH probe AS (SELECT 1) SELECT * FROM probe\0",
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'Q', b"hello postgres\0"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mut parse_body = Vec::new();
         parse_body.push(0);
         parse_body.extend_from_slice(b"SELECT $1\0");
@@ -13744,6 +13857,15 @@ mod tests {
         assert_eq!(
             observation_for_payload(&postgres_frontend_message(b'P', &parse_body)).application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+        let mut invalid_parse_body = Vec::new();
+        invalid_parse_body.push(0);
+        invalid_parse_body.extend_from_slice(b"hello postgres\0");
+        invalid_parse_body.extend_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'P', &invalid_parse_body))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let bind_body =
             postgres_bind_message_body(b"", b"prepared", &[0], &[Some(b"42"), None], &[0]);
