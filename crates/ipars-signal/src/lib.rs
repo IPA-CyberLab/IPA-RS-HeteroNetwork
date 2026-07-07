@@ -607,13 +607,14 @@ impl SignalCoordinator {
                 }),
             ..PathMetrics::default()
         };
+        let cost = path_candidate_cost(usable_state, &source_candidates, &target_candidates);
 
         SignalPathResponse {
             key: PeerPathKey::new(request.source, request.target),
             target_candidates,
             relay_candidates,
             preferred_state: usable_state,
-            score: PathScore::calculate(usable_state, &metrics, true, 0),
+            score: PathScore::calculate(usable_state, &metrics, true, cost),
         }
     }
 
@@ -939,6 +940,40 @@ fn compare_relay_load(
     left_scaled.cmp(&right_scaled)
 }
 
+fn path_candidate_cost(
+    state: PathState,
+    source_candidates: &[EndpointCandidate],
+    target_candidates: &[EndpointCandidate],
+) -> u32 {
+    match state {
+        PathState::DirectIpv6 => {
+            endpoint_kind_min_cost(source_candidates, EndpointCandidateKind::Ipv6).saturating_add(
+                endpoint_kind_min_cost(target_candidates, EndpointCandidateKind::Ipv6),
+            )
+        }
+        PathState::DirectPublic => {
+            endpoint_kind_min_cost(target_candidates, EndpointCandidateKind::PublicUdp)
+        }
+        PathState::DirectNatTraversal => {
+            endpoint_kind_min_cost(source_candidates, EndpointCandidateKind::StunReflexive)
+                .saturating_add(endpoint_kind_min_cost(
+                    target_candidates,
+                    EndpointCandidateKind::StunReflexive,
+                ))
+        }
+        PathState::Relay | PathState::Unreachable => 0,
+    }
+}
+
+fn endpoint_kind_min_cost(candidates: &[EndpointCandidate], kind: EndpointCandidateKind) -> u32 {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.kind == kind)
+        .map(|candidate| candidate.cost)
+        .min()
+        .unwrap_or(0)
+}
+
 fn health_report_is_fresh(
     health: &NodeHealth,
     now: chrono::DateTime<Utc>,
@@ -989,6 +1024,13 @@ mod tests {
         }
     }
 
+    fn candidate_with_cost(kind: EndpointCandidateKind, cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            cost,
+            ..candidate(kind)
+        }
+    }
+
     fn ipv6_candidate() -> EndpointCandidate {
         EndpointCandidate {
             addr: SocketAddr::new(
@@ -996,6 +1038,13 @@ mod tests {
                 51820,
             ),
             ..candidate(EndpointCandidateKind::Ipv6)
+        }
+    }
+
+    fn ipv6_candidate_with_cost(cost: u32) -> EndpointCandidate {
+        EndpointCandidate {
+            cost,
+            ..ipv6_candidate()
         }
     }
 
@@ -1147,6 +1196,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_public_score_uses_lowest_target_public_candidate_cost() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![candidate(EndpointCandidateKind::StunReflexive)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_with_cost(EndpointCandidateKind::PublicUdp, 50),
+                candidate_with_cost(EndpointCandidateKind::PublicUdp, 7),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=7"));
+    }
+
+    #[test]
     fn direct_ipv6_is_preferred_when_both_nodes_have_ipv6_candidates() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
         let response = coordinator.negotiate(
@@ -1166,6 +1242,34 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::DirectIpv6);
+    }
+
+    #[test]
+    fn direct_ipv6_score_uses_lowest_source_and_target_ipv6_candidate_costs() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![ipv6_candidate_with_cost(40), ipv6_candidate_with_cost(3)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate(EndpointCandidateKind::PublicUdp),
+                ipv6_candidate_with_cost(50),
+                ipv6_candidate_with_cost(9),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectIpv6);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=12"));
     }
 
     #[test]
@@ -1350,6 +1454,36 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::Unreachable);
+    }
+
+    #[test]
+    fn nat_traversal_score_uses_lowest_source_and_target_reflexive_candidate_costs() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![
+                    candidate_with_cost(EndpointCandidateKind::StunReflexive, 80),
+                    candidate_with_cost(EndpointCandidateKind::StunReflexive, 4),
+                ],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![
+                candidate_with_cost(EndpointCandidateKind::StunReflexive, 70),
+                candidate_with_cost(EndpointCandidateKind::StunReflexive, 6),
+            ]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "cost=10"));
     }
 
     #[test]
