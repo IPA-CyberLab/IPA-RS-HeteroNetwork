@@ -4588,21 +4588,12 @@ impl AgentOtelMetrics {
             self.relay_admission_failures
                 .add(relay_admission_failure_delta, &node_attrs);
         }
-        for reason_count in &metrics.relay_admission_failure_reason_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .relay_admission_failure_reason_counts
-                    .get(&reason_count.reason)
-                    .copied()
-            });
-            let delta = counter_delta(reason_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("reason", reason_count.reason.as_str()),
-                ];
-                self.relay_admission_failures_by_reason.add(delta, &attrs);
-            }
+        for (reason, delta) in agent_relay_admission_failure_reason_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.relay_admission_failures_by_reason.add(delta, &attrs);
         }
 
         let path_probe_delta = counter_delta(
@@ -4652,21 +4643,12 @@ impl AgentOtelMetrics {
             self.packet_flow_filtered
                 .add(packet_flow_filtered_delta, &node_attrs);
         }
-        for reason_count in &metrics.packet_flow_filtered_reason_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_filtered_reason_counts
-                    .get(&reason_count.reason)
-                    .copied()
-            });
-            let delta = counter_delta(reason_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("reason", reason_count.reason.as_str()),
-                ];
-                self.packet_flow_filtered_by_reason.add(delta, &attrs);
-            }
+        for (reason, delta) in agent_packet_flow_filtered_reason_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("reason", reason.as_str()),
+            ];
+            self.packet_flow_filtered_by_reason.add(delta, &attrs);
         }
         let packet_flow_duplicate_suppression_delta = counter_delta(
             metrics.packet_flow_duplicate_suppression_count,
@@ -4676,58 +4658,30 @@ impl AgentOtelMetrics {
             self.packet_flow_duplicate_suppressions
                 .add(packet_flow_duplicate_suppression_delta, &node_attrs);
         }
-        for source_count in &metrics.packet_flow_duplicate_suppression_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_duplicate_suppression_counts
-                    .get(&source_count.source)
-                    .copied()
-            });
-            let delta = counter_delta(source_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("source", source_count.source.as_str()),
-                ];
-                self.packet_flow_duplicate_suppressions_by_source
-                    .add(delta, &attrs);
-            }
+        for (source, delta) in
+            agent_packet_flow_duplicate_suppression_source_delta(metrics, previous)
+        {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("source", source.as_str()),
+            ];
+            self.packet_flow_duplicate_suppressions_by_source
+                .add(delta, &attrs);
         }
-        for classification_count in &metrics.packet_flow_classification_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_classification_counts
-                    .get(&classification_count.classification)
-                    .copied()
-            });
-            let delta = counter_delta(classification_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new(
-                        "classification",
-                        classification_count.classification.as_str(),
-                    ),
-                ];
-                self.packet_flow_classified_by_lifecycle.add(delta, &attrs);
-            }
+        for (classification, delta) in agent_packet_flow_classification_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("classification", classification.as_str()),
+            ];
+            self.packet_flow_classified_by_lifecycle.add(delta, &attrs);
         }
-        for application_count in &metrics.packet_flow_application_counts {
-            let previous_count = previous.and_then(|previous| {
-                previous
-                    .packet_flow_application_counts
-                    .get(&application_count.application)
-                    .copied()
-            });
-            let delta = counter_delta(application_count.count, previous_count);
-            if delta > 0 {
-                let attrs = [
-                    KeyValue::new("node_id", node_id.clone()),
-                    KeyValue::new("application", application_count.application.as_str()),
-                ];
-                self.packet_flow_classified_by_application
-                    .add(delta, &attrs);
-            }
+        for (application, delta) in agent_packet_flow_application_delta(metrics, previous) {
+            let attrs = [
+                KeyValue::new("node_id", node_id.clone()),
+                KeyValue::new("application", application.as_str()),
+            ];
+            self.packet_flow_classified_by_application
+                .add(delta, &attrs);
         }
 
         for state in [
@@ -4831,6 +4785,122 @@ impl AgentOtelMetrics {
                 );
         }
     }
+}
+
+fn agent_relay_admission_failure_reason_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentRelayAdmissionFailureReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for reason in AgentRelayAdmissionFailureReason::ALL {
+        let current_count = metrics
+            .relay_admission_failure_reason_counts
+            .iter()
+            .find(|entry| entry.reason == reason)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .relay_admission_failure_reason_counts
+                .get(&reason)
+                .copied()
+        });
+        delta_by_reason.insert(reason, counter_delta(current_count, previous_count));
+    }
+    delta_by_reason
+}
+
+fn agent_packet_flow_filtered_reason_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowDropReason, u64> {
+    let mut delta_by_reason = BTreeMap::new();
+    for reason in AgentPacketFlowDropReason::ALL {
+        let current_count = metrics
+            .packet_flow_filtered_reason_counts
+            .iter()
+            .find(|entry| entry.reason == reason)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_filtered_reason_counts
+                .get(&reason)
+                .copied()
+        });
+        delta_by_reason.insert(reason, counter_delta(current_count, previous_count));
+    }
+    delta_by_reason
+}
+
+fn agent_packet_flow_duplicate_suppression_source_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowDuplicateSource, u64> {
+    let mut delta_by_source = BTreeMap::new();
+    for source in AgentPacketFlowDuplicateSource::ALL {
+        let current_count = metrics
+            .packet_flow_duplicate_suppression_counts
+            .iter()
+            .find(|entry| entry.source == source)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_duplicate_suppression_counts
+                .get(&source)
+                .copied()
+        });
+        delta_by_source.insert(source, counter_delta(current_count, previous_count));
+    }
+    delta_by_source
+}
+
+fn agent_packet_flow_classification_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowClassification, u64> {
+    let mut delta_by_classification = BTreeMap::new();
+    for classification in AgentPacketFlowClassification::ALL {
+        let current_count = metrics
+            .packet_flow_classification_counts
+            .iter()
+            .find(|entry| entry.classification == classification)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_classification_counts
+                .get(&classification)
+                .copied()
+        });
+        delta_by_classification
+            .insert(classification, counter_delta(current_count, previous_count));
+    }
+    delta_by_classification
+}
+
+fn agent_packet_flow_application_delta(
+    metrics: &AgentMetricsResponse,
+    previous: Option<&AgentOtelSnapshot>,
+) -> BTreeMap<AgentPacketFlowApplication, u64> {
+    let mut delta_by_application = BTreeMap::new();
+    for application in AgentPacketFlowApplication::ALL {
+        let current_count = metrics
+            .packet_flow_application_counts
+            .iter()
+            .find(|entry| entry.application == application)
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        let previous_count = previous.and_then(|previous| {
+            previous
+                .packet_flow_application_counts
+                .get(&application)
+                .copied()
+        });
+        delta_by_application.insert(application, counter_delta(current_count, previous_count));
+    }
+    delta_by_application
 }
 
 fn agent_forwarder_deltas(
@@ -12414,6 +12484,63 @@ mod tests {
         }
     }
 
+    fn agent_metrics_with_category_counts(
+        forwarder: AgentRelayForwarderMetrics,
+    ) -> AgentMetricsResponse {
+        AgentMetricsResponse {
+            node_id: NodeId::from_string("node-a"),
+            candidate_count: 2,
+            path_count: 1,
+            relay_session_count: 1,
+            relay_admission_attempt_count: 3,
+            relay_admission_success_count: 2,
+            relay_admission_failure_count: 1,
+            relay_admission_failure_reason_counts: vec![AgentRelayAdmissionFailureReasonCount {
+                reason: AgentRelayAdmissionFailureReason::Rejected,
+                count: 1,
+            }],
+            relay_forwarder_count: 1,
+            relay_forwarders: vec![forwarder],
+            path_change_event_count: 1,
+            path_state_counts: vec![PathStateCount {
+                state: PathState::Relay,
+                count: 1,
+            }],
+            lazy_connect: LazyConnectMetrics {
+                active_peer_count: 1,
+                pinned_peer_count: 1,
+                observed_peer_vpn_ip_count: 1,
+                observed_route_peer_count: 1,
+                observed_route_count: 2,
+            },
+            path_probe_record_count: 4,
+            peer_activity_record_count: 2,
+            packet_flow_observation_count: 3,
+            packet_flow_match_count: 2,
+            packet_flow_unmatched_count: 1,
+            packet_flow_filtered_count: 3,
+            packet_flow_filtered_reason_counts: vec![AgentPacketFlowDropReasonCount {
+                reason: AgentPacketFlowDropReason::Multicast,
+                count: 3,
+            }],
+            packet_flow_duplicate_suppression_count: 5,
+            packet_flow_duplicate_suppression_counts: vec![AgentPacketFlowDuplicateSourceCount {
+                source: AgentPacketFlowDuplicateSource::EbpfRingbuf,
+                count: 5,
+            }],
+            packet_flow_classification_counts: vec![AgentPacketFlowClassificationCount {
+                classification: AgentPacketFlowClassification::Established,
+                count: 2,
+            }],
+            packet_flow_application_counts: vec![AgentPacketFlowApplicationCount {
+                application: AgentPacketFlowApplication::WireGuard,
+                count: 2,
+            }],
+            userspace_wireguard_process: None,
+            generated_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn agent_otel_delta_records_first_forwarder_snapshot_as_counter_increment() {
         let mut current = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
@@ -12551,58 +12678,7 @@ mod tests {
     #[test]
     fn agent_otel_delta_skips_unchanged_forwarders() {
         let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
-        let metrics = AgentMetricsResponse {
-            node_id: NodeId::from_string("node-a"),
-            candidate_count: 2,
-            path_count: 1,
-            relay_session_count: 1,
-            relay_admission_attempt_count: 3,
-            relay_admission_success_count: 2,
-            relay_admission_failure_count: 1,
-            relay_admission_failure_reason_counts: vec![AgentRelayAdmissionFailureReasonCount {
-                reason: AgentRelayAdmissionFailureReason::Rejected,
-                count: 1,
-            }],
-            relay_forwarder_count: 1,
-            relay_forwarders: vec![forwarder],
-            path_change_event_count: 1,
-            path_state_counts: vec![PathStateCount {
-                state: PathState::Relay,
-                count: 1,
-            }],
-            lazy_connect: LazyConnectMetrics {
-                active_peer_count: 1,
-                pinned_peer_count: 1,
-                observed_peer_vpn_ip_count: 1,
-                observed_route_peer_count: 1,
-                observed_route_count: 2,
-            },
-            path_probe_record_count: 4,
-            peer_activity_record_count: 2,
-            packet_flow_observation_count: 3,
-            packet_flow_match_count: 2,
-            packet_flow_unmatched_count: 1,
-            packet_flow_filtered_count: 3,
-            packet_flow_filtered_reason_counts: vec![AgentPacketFlowDropReasonCount {
-                reason: AgentPacketFlowDropReason::Multicast,
-                count: 3,
-            }],
-            packet_flow_duplicate_suppression_count: 5,
-            packet_flow_duplicate_suppression_counts: vec![AgentPacketFlowDuplicateSourceCount {
-                source: AgentPacketFlowDuplicateSource::EbpfRingbuf,
-                count: 5,
-            }],
-            packet_flow_classification_counts: vec![AgentPacketFlowClassificationCount {
-                classification: AgentPacketFlowClassification::Established,
-                count: 2,
-            }],
-            packet_flow_application_counts: vec![AgentPacketFlowApplicationCount {
-                application: AgentPacketFlowApplication::WireGuard,
-                count: 2,
-            }],
-            userspace_wireguard_process: None,
-            generated_at: Utc::now(),
-        };
+        let metrics = agent_metrics_with_category_counts(forwarder);
         let previous = AgentOtelSnapshot::from(&metrics);
 
         assert_eq!(
@@ -12618,6 +12694,106 @@ mod tests {
             Some(&5)
         );
         assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
+    }
+
+    #[test]
+    fn agent_otel_category_deltas_zero_fill_all_known_labels() {
+        let forwarder = agent_forwarder_metrics("peer-a", "relay-a", 5, 500, 620, 3, 300);
+        let metrics = agent_metrics_with_category_counts(forwarder);
+
+        let relay_admission_delta = agent_relay_admission_failure_reason_delta(&metrics, None);
+        assert_eq!(
+            relay_admission_delta.len(),
+            AgentRelayAdmissionFailureReason::ALL.len()
+        );
+        assert_eq!(
+            relay_admission_delta.get(&AgentRelayAdmissionFailureReason::Rejected),
+            Some(&1)
+        );
+        assert_eq!(
+            relay_admission_delta.get(&AgentRelayAdmissionFailureReason::Unavailable),
+            Some(&0)
+        );
+
+        let filtered_delta = agent_packet_flow_filtered_reason_delta(&metrics, None);
+        assert_eq!(filtered_delta.len(), AgentPacketFlowDropReason::ALL.len());
+        assert_eq!(
+            filtered_delta.get(&AgentPacketFlowDropReason::Multicast),
+            Some(&3)
+        );
+        assert_eq!(
+            filtered_delta.get(&AgentPacketFlowDropReason::NoOverlayMatch),
+            Some(&0)
+        );
+
+        let duplicate_delta = agent_packet_flow_duplicate_suppression_source_delta(&metrics, None);
+        assert_eq!(
+            duplicate_delta.len(),
+            AgentPacketFlowDuplicateSource::ALL.len()
+        );
+        assert_eq!(
+            duplicate_delta.get(&AgentPacketFlowDuplicateSource::EbpfRingbuf),
+            Some(&5)
+        );
+        assert_eq!(
+            duplicate_delta.get(&AgentPacketFlowDuplicateSource::ProcNetConntrack),
+            Some(&0)
+        );
+
+        let classification_delta = agent_packet_flow_classification_delta(&metrics, None);
+        assert_eq!(
+            classification_delta.len(),
+            AgentPacketFlowClassification::ALL.len()
+        );
+        assert_eq!(
+            classification_delta.get(&AgentPacketFlowClassification::Established),
+            Some(&2)
+        );
+        assert_eq!(
+            classification_delta.get(&AgentPacketFlowClassification::Closed),
+            Some(&0)
+        );
+
+        let application_delta = agent_packet_flow_application_delta(&metrics, None);
+        assert_eq!(
+            application_delta.len(),
+            AgentPacketFlowApplication::ALL.len()
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::WireGuard),
+            Some(&2)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Dns),
+            Some(&0)
+        );
+
+        let previous = AgentOtelSnapshot::from(&metrics);
+        assert!(
+            agent_relay_admission_failure_reason_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_filtered_reason_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_duplicate_suppression_source_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_classification_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(
+            agent_packet_flow_application_delta(&metrics, Some(&previous))
+                .values()
+                .all(|count| *count == 0)
+        );
     }
 
     async fn insert_dead_forwarder(
