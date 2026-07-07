@@ -2540,8 +2540,8 @@ fn ensure_runtime_parent_directory_safe(
         );
     } else {
         anyhow::ensure!(
-            mode & 0o022 == 0 || mode & 0o1000 != 0,
-            "{label} ancestor {} must not be group- or world-writable unless it has the sticky bit",
+            mode & 0o022 == 0,
+            "{label} ancestor {} must not be group- or world-writable",
             directory.display()
         );
     }
@@ -17368,7 +17368,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     fn runtime_preflight_rejects_unsafe_path_program_entries() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = unique_test_dir("runtime-command-preflight")?;
+        let base = unique_trusted_test_dir("runtime-command-preflight")?;
 
         let executable_bin = base.join("executable-bin");
         std::fs::create_dir(&executable_bin)?;
@@ -17526,6 +17526,31 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             };
         assert!(writable_ancestor_error.to_string().contains("ancestor"));
         assert!(writable_ancestor_error
+            .to_string()
+            .contains("must not be group- or world-writable"));
+
+        let sticky_ancestor_bin = base.join("sticky-ancestor-bin");
+        std::fs::create_dir(&sticky_ancestor_bin)?;
+        std::fs::set_permissions(
+            &sticky_ancestor_bin,
+            std::fs::Permissions::from_mode(0o1777),
+        )?;
+        let sticky_nested_bin = sticky_ancestor_bin.join("bin");
+        std::fs::create_dir(&sticky_nested_bin)?;
+        std::fs::set_permissions(&sticky_nested_bin, std::fs::Permissions::from_mode(0o755))?;
+        let sticky_nested_command = sticky_nested_bin.join("ip");
+        std::fs::write(&sticky_nested_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(
+            &sticky_nested_command,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let sticky_ancestor_error =
+            match ensure_program_in_path("ip", Some(sticky_nested_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful sticky ancestor preflight"),
+                Err(error) => error,
+            };
+        assert!(sticky_ancestor_error.to_string().contains("ancestor"));
+        assert!(sticky_ancestor_error
             .to_string()
             .contains("must not be group- or world-writable"));
 
@@ -17830,9 +17855,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.cap_sys_admin);
             assert!(needs.linux_netns);
 
-            let base = unique_test_dir("namespaced-userspace-preflight")?;
+            let base = unique_trusted_test_dir("namespaced-userspace-preflight")?;
             let bin = base.join("bin");
             std::fs::create_dir(&bin)?;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
             for program in ["ip", "wg", "wireguard-go"] {
                 let path = bin.join(program);
                 std::fs::write(&path, b"#!/bin/sh\n")?;
@@ -19524,6 +19550,24 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn unique_trusted_test_dir(name: &str) -> anyhow::Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
+        std::fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
+        let path = root.join(format!(
+            "ipars-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
 
