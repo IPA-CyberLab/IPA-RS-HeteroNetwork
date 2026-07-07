@@ -16613,6 +16613,22 @@ mod tests {
             .contains("packet-flow detector must not contain control characters")));
 
         let error = match parse_ebpf_jsonl_packet_flow_bytes(
+            b"{\"destination\":\"100.64.0.13\",\"detector\":\" ebpf-jsonl\"}\n",
+            &mut EbpfJsonlReadCursor::default(),
+            EbpfJsonlReadLimits {
+                max_bytes: 4096,
+                max_line_bytes: 512,
+                max_flows: 16,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("eBPF JSONL detector whitespace should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.chain().any(|cause| cause
+            .to_string()
+            .contains("packet-flow detector must not contain leading or trailing whitespace")));
+
+        let error = match parse_ebpf_jsonl_packet_flow_bytes(
             b"{\"destination\":\"100.64.0.13\",\"source\":\"127.0.0.1\"}\n",
             &mut EbpfJsonlReadCursor::default(),
             EbpfJsonlReadLimits {

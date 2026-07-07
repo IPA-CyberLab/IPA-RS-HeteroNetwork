@@ -2841,6 +2841,11 @@ pub mod api {
         if detector.trim().is_empty() {
             return Err("packet-flow detector must not be empty".to_string());
         }
+        if detector.trim() != detector {
+            return Err(
+                "packet-flow detector must not contain leading or trailing whitespace".to_string(),
+            );
+        }
         if detector.chars().any(char::is_control) {
             return Err("packet-flow detector must not contain control characters".to_string());
         }
@@ -13737,6 +13742,16 @@ mod tests {
             .contains("packet-flow detector must not be empty"));
 
         let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(
+            r#"{"detector":" ebpf-jsonl"}"#,
+        ) {
+            Ok(_) => return Err("detector with leading whitespace should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("packet-flow detector must not contain leading or trailing whitespace"));
+
+        let error = match serde_json::from_str::<api::AgentPacketFlowObservation>(
             "{\"detector\":\"ebpf-jsonl\\nspoof\"}",
         ) {
             Ok(_) => return Err("detector with control characters should be rejected".into()),
@@ -13807,6 +13822,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("packet-flow detector must not contain control characters"));
+
+        let whitespace_detector = api::AgentPacketFlowObservation {
+            detector: Some("proc-net-conntrack ".to_string()),
+            ..Default::default()
+        };
+        let error = match whitespace_detector.validate_transport_metadata() {
+            Ok(()) => return Err("direct detector whitespace should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("packet-flow detector must not contain leading or trailing whitespace")
+        );
 
         let oversized_payload = api::AgentPacketFlowObservation {
             payload_prefix: vec![0; api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES + 1],
