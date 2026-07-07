@@ -2786,6 +2786,9 @@ pub mod api {
             if etcd_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Etcd);
             }
+            if kubernetes_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::KubernetesApi);
+            }
             if jaeger_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Jaeger);
             }
@@ -2900,6 +2903,14 @@ pub mod api {
             b"/v3/maintenance",
             b"/v3/watch",
         ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn kubernetes_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 4] = [b"/api/v1", b"/apis", b"/openapi/v2", b"/openapi/v3"];
 
         PREFIXES
             .iter()
@@ -10361,6 +10372,23 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"GET /v3/kvs HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v1/namespaces/default/pods HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /apis/apps/v1/deployments HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /openapi/v3/apis/apps/v1 HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/v1beta HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
