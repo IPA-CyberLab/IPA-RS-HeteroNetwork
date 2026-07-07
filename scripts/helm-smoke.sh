@@ -116,6 +116,39 @@ template_ok pod-runtime \
 assert_rendered_contains pod-runtime 'schedulerName: "ipars-scheduler"'
 assert_rendered_contains pod-runtime 'runtimeClassName: "ipars-runtime"'
 
+template_ok pod-security-context \
+  --set agent.podSecurityContext.runAsUser=1000 \
+  --set agent.podSecurityContext.runAsGroup=1000 \
+  --set agent.podSecurityContext.runAsNonRoot=true \
+  --set agent.podSecurityContext.fsGroup=2000 \
+  --set-string agent.podSecurityContext.fsGroupChangePolicy=OnRootMismatch \
+  --set 'agent.podSecurityContext.supplementalGroups[0]=2001' \
+  --set 'agent.podSecurityContext.supplementalGroups[1]=2002'
+
+assert_rendered_contains pod-security-context "securityContext:"
+assert_rendered_contains pod-security-context "runAsUser: 1000"
+assert_rendered_contains pod-security-context "runAsGroup: 1000"
+assert_rendered_contains pod-security-context "runAsNonRoot: true"
+assert_rendered_contains pod-security-context "fsGroup: 2000"
+assert_rendered_contains pod-security-context 'fsGroupChangePolicy: "OnRootMismatch"'
+assert_rendered_contains pod-security-context "supplementalGroups:"
+assert_rendered_contains pod-security-context "- 2001"
+assert_rendered_contains pod-security-context "- 2002"
+
+template_fails pod-security-context-root-nonroot \
+  "agent.podSecurityContext.runAsNonRoot=true cannot be used with runAsUser=0" \
+  --set agent.podSecurityContext.runAsUser=0 \
+  --set agent.podSecurityContext.runAsNonRoot=true
+
+template_fails pod-security-context-fsgroup-policy-without-fsgroup \
+  "agent.podSecurityContext.fsGroupChangePolicy requires agent.podSecurityContext.fsGroup" \
+  --set-string agent.podSecurityContext.fsGroupChangePolicy=OnRootMismatch
+
+template_fails pod-security-context-duplicate-supplemental-group \
+  "agent.podSecurityContext.supplementalGroups entry 2001 must not be repeated" \
+  --set 'agent.podSecurityContext.supplementalGroups[0]=2001' \
+  --set 'agent.podSecurityContext.supplementalGroups[1]=2001'
+
 template_ok node-affinity \
   --set-string 'agent.nodeAffinity.required.matchExpressions[0].key=node-role.kubernetes.io/worker' \
   --set-string 'agent.nodeAffinity.required.matchExpressions[0].operator=Exists' \

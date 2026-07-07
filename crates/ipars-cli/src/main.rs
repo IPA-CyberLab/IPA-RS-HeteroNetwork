@@ -454,6 +454,18 @@ struct K8sInstallArgs {
     agent_seccomp_profile: Option<String>,
     #[arg(long = "agent-seccomp-localhost-profile", value_parser = parse_kubernetes_seccomp_localhost_profile)]
     agent_seccomp_localhost_profile: Option<String>,
+    #[arg(long = "agent-run-as-user", value_parser = parse_kubernetes_non_negative_i64)]
+    agent_run_as_user: Option<u64>,
+    #[arg(long = "agent-run-as-group", value_parser = parse_kubernetes_non_negative_i64)]
+    agent_run_as_group: Option<u64>,
+    #[arg(long = "agent-run-as-non-root", default_value_t = false)]
+    agent_run_as_non_root: bool,
+    #[arg(long = "agent-fs-group", value_parser = parse_kubernetes_non_negative_i64)]
+    agent_fs_group: Option<u64>,
+    #[arg(long = "agent-fs-group-change-policy", value_parser = parse_kubernetes_fs_group_change_policy)]
+    agent_fs_group_change_policy: Option<String>,
+    #[arg(long = "agent-supplemental-group", value_parser = parse_kubernetes_non_negative_i64)]
+    agent_supplemental_groups: Vec<u64>,
     #[arg(long, default_value_t = false)]
     kubernetes_discover_services: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -1864,6 +1876,15 @@ fn parse_kubernetes_seccomp_profile_type(value: &str) -> Result<String, String> 
         "RuntimeDefault" | "Localhost" | "Unconfined" => Ok(value.to_string()),
         _ => Err(format!(
             "seccomp profile type must be RuntimeDefault, Localhost, or Unconfined; got {value}"
+        )),
+    }
+}
+
+fn parse_kubernetes_fs_group_change_policy(value: &str) -> Result<String, String> {
+    match value {
+        "Always" | "OnRootMismatch" => Ok(value.to_string()),
+        _ => Err(format!(
+            "fsGroupChangePolicy must be Always or OnRootMismatch; got {value}"
         )),
     }
 }
@@ -4914,6 +4935,30 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
             localhost_profile,
         );
     }
+    if let Some(uid) = args.agent_run_as_user {
+        command.push_str(&format!(" --set agent.podSecurityContext.runAsUser={uid}"));
+    }
+    if let Some(gid) = args.agent_run_as_group {
+        command.push_str(&format!(" --set agent.podSecurityContext.runAsGroup={gid}"));
+    }
+    if args.agent_run_as_non_root {
+        command.push_str(" --set agent.podSecurityContext.runAsNonRoot=true");
+    }
+    if let Some(group) = args.agent_fs_group {
+        command.push_str(&format!(" --set agent.podSecurityContext.fsGroup={group}"));
+    }
+    if let Some(policy) = args.agent_fs_group_change_policy.as_deref() {
+        append_helm_set_string(
+            command,
+            "agent.podSecurityContext.fsGroupChangePolicy",
+            policy,
+        );
+    }
+    for (index, group) in args.agent_supplemental_groups.iter().enumerate() {
+        command.push_str(&format!(
+            " --set 'agent.podSecurityContext.supplementalGroups[{index}]={group}'"
+        ));
+    }
     append_helm_literal_list(
         command,
         "agent.securityContext.capabilities.add",
@@ -6107,6 +6152,36 @@ fn validate_k8s_agent_security_context(args: &K8sInstallArgs) -> anyhow::Result<
             anyhow::bail!(
                 "--agent-seccomp-localhost-profile requires --agent-seccomp-profile Localhost"
             );
+        }
+    }
+
+    for (flag, value) in [
+        ("--agent-run-as-user", args.agent_run_as_user),
+        ("--agent-run-as-group", args.agent_run_as_group),
+        ("--agent-fs-group", args.agent_fs_group),
+    ] {
+        if let Some(value) = value {
+            if value > KUBERNETES_INT64_MAX {
+                anyhow::bail!("{flag} must be a non-negative Kubernetes int64");
+            }
+        }
+    }
+    if args.agent_run_as_non_root && args.agent_run_as_user == Some(0) {
+        anyhow::bail!("--agent-run-as-non-root cannot be used with --agent-run-as-user 0");
+    }
+    if let Some(policy) = args.agent_fs_group_change_policy.as_deref() {
+        parse_kubernetes_fs_group_change_policy(policy).map_err(anyhow::Error::msg)?;
+        if args.agent_fs_group.is_none() {
+            anyhow::bail!("--agent-fs-group-change-policy requires --agent-fs-group");
+        }
+    }
+    let mut supplemental_groups = BTreeSet::new();
+    for group in &args.agent_supplemental_groups {
+        if *group > KUBERNETES_INT64_MAX {
+            anyhow::bail!("--agent-supplemental-group must be a non-negative Kubernetes int64");
+        }
+        if !supplemental_groups.insert(*group) {
+            anyhow::bail!("--agent-supplemental-group `{group}` must not be repeated");
         }
     }
 
@@ -9506,6 +9581,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -10907,6 +10988,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -11207,6 +11294,12 @@ mod tests {
         args.agent_read_only_root_filesystem = true;
         args.agent_seccomp_profile = Some("Localhost".to_string());
         args.agent_seccomp_localhost_profile = Some("profiles/ipars-agent.json".to_string());
+        args.agent_run_as_user = Some(1000);
+        args.agent_run_as_group = Some(1000);
+        args.agent_run_as_non_root = true;
+        args.agent_fs_group = Some(2000);
+        args.agent_fs_group_change_policy = Some("OnRootMismatch".to_string());
+        args.agent_supplemental_groups = vec![2001, 2002];
 
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
@@ -11217,6 +11310,14 @@ mod tests {
         assert!(helm.contains(
             "--set-string agent.securityContext.seccompProfile.localhostProfile=profiles/ipars-agent.json"
         ));
+        assert!(helm.contains("--set agent.podSecurityContext.runAsUser=1000"));
+        assert!(helm.contains("--set agent.podSecurityContext.runAsGroup=1000"));
+        assert!(helm.contains("--set agent.podSecurityContext.runAsNonRoot=true"));
+        assert!(helm.contains("--set agent.podSecurityContext.fsGroup=2000"));
+        assert!(helm
+            .contains("--set-string agent.podSecurityContext.fsGroupChangePolicy=OnRootMismatch"));
+        assert!(helm.contains("--set 'agent.podSecurityContext.supplementalGroups[0]=2001'"));
+        assert!(helm.contains("--set 'agent.podSecurityContext.supplementalGroups[1]=2002'"));
         assert!(helm.contains(
             "--set 'agent.securityContext.capabilities.add={NET_ADMIN,NET_RAW,SYS_TIME}'"
         ));
@@ -11270,6 +11371,31 @@ mod tests {
         };
         assert!(error.contains("--agent-seccomp-localhost-profile"));
 
+        let mut non_root_with_root_uid = base_k8s_install_args();
+        non_root_with_root_uid.agent_run_as_user = Some(0);
+        non_root_with_root_uid.agent_run_as_non_root = true;
+        let error = match k8s_install_plan(non_root_with_root_uid) {
+            Ok(_) => panic!("runAsNonRoot should reject runAsUser=0"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-run-as-non-root"));
+
+        let mut missing_fs_group = base_k8s_install_args();
+        missing_fs_group.agent_fs_group_change_policy = Some("OnRootMismatch".to_string());
+        let error = match k8s_install_plan(missing_fs_group) {
+            Ok(_) => panic!("fsGroupChangePolicy should require fsGroup"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-fs-group-change-policy"));
+
+        let mut duplicate_supplemental_group = base_k8s_install_args();
+        duplicate_supplemental_group.agent_supplemental_groups = vec![2001, 2001];
+        let error = match k8s_install_plan(duplicate_supplemental_group) {
+            Ok(_) => panic!("duplicate supplemental groups should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--agent-supplemental-group"));
+
         assert!(Cli::try_parse_from([
             "ipars",
             "k8s",
@@ -11292,6 +11418,14 @@ mod tests {
             "install",
             "--agent-seccomp-localhost-profile",
             "../profile.json",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-fs-group-change-policy",
+            "Eventually",
         ])
         .is_err());
 
@@ -12255,6 +12389,19 @@ mod tests {
             "--agent-read-only-root-filesystem",
             "--agent-seccomp-profile",
             "RuntimeDefault",
+            "--agent-run-as-user",
+            "1000",
+            "--agent-run-as-group",
+            "1000",
+            "--agent-run-as-non-root",
+            "--agent-fs-group",
+            "2000",
+            "--agent-fs-group-change-policy",
+            "OnRootMismatch",
+            "--agent-supplemental-group",
+            "2001",
+            "--agent-supplemental-group",
+            "2002",
             "--kubernetes-discover-services",
             "--kubernetes-discover-api-server",
             "false",
@@ -12473,6 +12620,15 @@ mod tests {
                 Some("RuntimeDefault")
             );
             assert_eq!(args.agent_seccomp_localhost_profile, None);
+            assert_eq!(args.agent_run_as_user, Some(1000));
+            assert_eq!(args.agent_run_as_group, Some(1000));
+            assert!(args.agent_run_as_non_root);
+            assert_eq!(args.agent_fs_group, Some(2000));
+            assert_eq!(
+                args.agent_fs_group_change_policy.as_deref(),
+                Some("OnRootMismatch")
+            );
+            assert_eq!(args.agent_supplemental_groups, vec![2001, 2002]);
             assert!(args.kubernetes_discover_services);
             assert!(!args.kubernetes_discover_api_server);
             assert_eq!(
@@ -12799,6 +12955,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -12959,6 +13121,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -14384,6 +14552,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -14531,6 +14705,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -14812,6 +14992,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -14964,6 +15150,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -15111,6 +15303,12 @@ mod tests {
             agent_read_only_root_filesystem: false,
             agent_seccomp_profile: None,
             agent_seccomp_localhost_profile: None,
+            agent_run_as_user: None,
+            agent_run_as_group: None,
+            agent_run_as_non_root: false,
+            agent_fs_group: None,
+            agent_fs_group_change_policy: None,
+            agent_supplemental_groups: Vec::new(),
             kubernetes_discover_services: false,
             kubernetes_discover_api_server: true,
             kubernetes_api_server_cidrs: Vec::new(),
@@ -15352,6 +15550,15 @@ mod tests {
         );
         assert!(parse_kubernetes_session_affinity_timeout_seconds("0").is_err());
         assert!(parse_kubernetes_session_affinity_timeout_seconds("86401").is_err());
+        assert_eq!(
+            parse_kubernetes_fs_group_change_policy("OnRootMismatch"),
+            Ok("OnRootMismatch".to_string())
+        );
+        assert_eq!(
+            parse_kubernetes_fs_group_change_policy("Always"),
+            Ok("Always".to_string())
+        );
+        assert!(parse_kubernetes_fs_group_change_policy("Sometimes").is_err());
         assert_eq!(
             parse_kubernetes_label_pair("ipars.io/role=agent"),
             Ok(KeyValueArg {

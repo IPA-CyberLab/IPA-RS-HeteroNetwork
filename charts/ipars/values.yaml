@@ -65,6 +65,13 @@ agent:
         - NET_ADMIN
         - NET_RAW
       drop: []
+  podSecurityContext:
+    runAsUser: ""
+    runAsGroup: ""
+    runAsNonRoot: ""
+    fsGroup: ""
+    fsGroupChangePolicy: ""
+    supplementalGroups: []
   podLabels: {}
   podAnnotations: {}
   priorityClassName: ""

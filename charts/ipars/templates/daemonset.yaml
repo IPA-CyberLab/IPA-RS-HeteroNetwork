@@ -32,6 +32,11 @@
 {{- $agentReadOnlyRootFilesystem := printf "%v" .Values.agent.securityContext.readOnlyRootFilesystem -}}
 {{- $agentSeccompProfileType := .Values.agent.securityContext.seccompProfile.type -}}
 {{- $agentSeccompLocalhostProfile := .Values.agent.securityContext.seccompProfile.localhostProfile -}}
+{{- $agentRunAsUser := printf "%v" .Values.agent.podSecurityContext.runAsUser -}}
+{{- $agentRunAsGroup := printf "%v" .Values.agent.podSecurityContext.runAsGroup -}}
+{{- $agentRunAsNonRoot := printf "%v" .Values.agent.podSecurityContext.runAsNonRoot -}}
+{{- $agentFsGroup := printf "%v" .Values.agent.podSecurityContext.fsGroup -}}
+{{- $agentFsGroupChangePolicy := printf "%v" .Values.agent.podSecurityContext.fsGroupChangePolicy -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
@@ -47,6 +52,7 @@
 {{- include "ipars.validateBoolean" (dict "path" "agent.routeProvider" "value" .Values.agent.routeProvider) -}}
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
+{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.podSecurityContext.runAsNonRoot" "value" .Values.agent.podSecurityContext.runAsNonRoot) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- if hasKey .Values.serviceExposure "apiServer" -}}
@@ -254,6 +260,27 @@
 {{- end -}}
 {{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsUser" "value" $agentRunAsUser) -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsGroup" "value" $agentRunAsGroup) -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.fsGroup" "value" $agentFsGroup) -}}
+{{- if and (eq $agentRunAsNonRoot "true") (eq $agentRunAsUser "0") -}}
+{{- fail "agent.podSecurityContext.runAsNonRoot=true cannot be used with runAsUser=0" -}}
+{{- end -}}
+{{- if and (ne $agentFsGroupChangePolicy "") (not (or (eq $agentFsGroupChangePolicy "Always") (eq $agentFsGroupChangePolicy "OnRootMismatch"))) -}}
+{{- fail "agent.podSecurityContext.fsGroupChangePolicy must be Always, OnRootMismatch, or empty" -}}
+{{- end -}}
+{{- if and (ne $agentFsGroupChangePolicy "") (eq $agentFsGroup "") -}}
+{{- fail "agent.podSecurityContext.fsGroupChangePolicy requires agent.podSecurityContext.fsGroup" -}}
+{{- end -}}
+{{- $agentSupplementalGroups := dict -}}
+{{- range $index, $group := .Values.agent.podSecurityContext.supplementalGroups -}}
+{{- $groupValue := printf "%v" $group -}}
+{{- include "ipars.validateNonNegativeInt64" (dict "path" (printf "agent.podSecurityContext.supplementalGroups[%d]" $index) "value" $groupValue) -}}
+{{- if hasKey $agentSupplementalGroups $groupValue -}}
+{{- fail (printf "agent.podSecurityContext.supplementalGroups entry %s must not be repeated" $groupValue) -}}
+{{- end -}}
+{{- $_ := set $agentSupplementalGroups $groupValue true -}}
 {{- end -}}
 {{- if not (or (eq $agentDnsPolicy "ClusterFirstWithHostNet") (eq $agentDnsPolicy "ClusterFirst") (eq $agentDnsPolicy "Default") (eq $agentDnsPolicy "None")) -}}
 {{- fail "agent.dnsPolicy must be ClusterFirstWithHostNet, ClusterFirst, Default, or None" -}}
@@ -695,6 +722,30 @@ spec:
       {{- end }}
       {{- if .Values.agent.runtimeClassName }}
       runtimeClassName: {{ .Values.agent.runtimeClassName | quote }}
+      {{- end }}
+      {{- if or (ne $agentRunAsUser "") (ne $agentRunAsGroup "") (ne $agentRunAsNonRoot "") (ne $agentFsGroup "") (ne $agentFsGroupChangePolicy "") .Values.agent.podSecurityContext.supplementalGroups }}
+      securityContext:
+        {{- if ne $agentRunAsUser "" }}
+        runAsUser: {{ int64 $agentRunAsUser }}
+        {{- end }}
+        {{- if ne $agentRunAsGroup "" }}
+        runAsGroup: {{ int64 $agentRunAsGroup }}
+        {{- end }}
+        {{- if ne $agentRunAsNonRoot "" }}
+        runAsNonRoot: {{ $agentRunAsNonRoot }}
+        {{- end }}
+        {{- if ne $agentFsGroup "" }}
+        fsGroup: {{ int64 $agentFsGroup }}
+        {{- end }}
+        {{- if ne $agentFsGroupChangePolicy "" }}
+        fsGroupChangePolicy: {{ $agentFsGroupChangePolicy | quote }}
+        {{- end }}
+        {{- with .Values.agent.podSecurityContext.supplementalGroups }}
+        supplementalGroups:
+          {{- range . }}
+          - {{ int64 . }}
+          {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.agent.nodeSelector }}
       nodeSelector:
