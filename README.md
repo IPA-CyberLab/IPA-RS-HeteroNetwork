@@ -143,7 +143,7 @@ For a repeatable lightweight load harness check, run:
 scripts/load-smoke.sh
 ```
 
-It covers 3/10/1000-node in-memory scenarios plus 3-node HTTP and relay-UDP scenarios, and can include daemon transport when `IPARS_LOAD_SMOKE_DAEMON_BIN` points at an `iparsd` binary.
+It covers 3/10/1000-node in-memory scenarios plus 3-node HTTP and relay-UDP scenarios, validates the generated report identity fields, and can include daemon transport when `IPARS_LOAD_SMOKE_DAEMON_BIN` points at an `iparsd` binary or when `IPARS_LOAD_SMOKE_BUILD_DAEMON=1` should build `target/debug/iparsd` first.
 
 The in-process eBPF packet-flow detector uses a separately built BPF object. Build it with a nightly Rust toolchain, `rust-src`, and `bpf-linker`:
 
