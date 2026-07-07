@@ -268,6 +268,45 @@ template_fails relay-unrestricted-load-balancer-with-source-ranges \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24'
 
+template_fails agent-api-external-ip-reuses-load-balancer-ip \
+  "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string agent.apiService.loadBalancerIP=198.51.100.20 \
+  --set-string 'agent.apiService.externalIPs[0]=198.51.100.20'
+
+template_fails relay-load-balancer-reuses-agent-api-load-balancer-ip \
+  "agent.relayService.loadBalancerIP \"198.51.100.21\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string agent.apiService.loadBalancerIP=198.51.100.21 \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string agent.relayService.loadBalancerIP=198.51.100.21
+
+template_fails relay-external-ip-reuses-agent-api-external-ip \
+  "agent.relayService.externalIPs entry \"198.51.100.22\" must not reuse fixed external IP assigned by agent.apiService.externalIPs" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set-string 'agent.apiService.externalIPs[0]=198.51.100.22' \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=ClusterIP \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set-string 'agent.relayService.externalIPs[0]=198.51.100.22'
+
 template_fails host-network-policy-without-ack \
   "networkPolicy with agent.hostNetwork=true requires networkPolicy.acknowledgeHostNetwork=true" \
   --set agent.apiService.enabled=true \
