@@ -4098,6 +4098,9 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
     let mut command = format!(
         "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; case \"$docker_socket\" in */../*|*/..|*/./*|*/.) echo \"Docker API socket path must not contain '.' or '..' path components\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
     );
+    if !args.docker_networks.is_empty() {
+        command.push_str("; docker_discovered_subnets=''");
+    }
     for network in &args.docker_networks {
         command.push_str("; ");
         command.push_str(&docker_network_filter_preflight_command(network));
@@ -4108,7 +4111,7 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
 fn docker_network_filter_preflight_command(network: &str) -> String {
     let network = shell_word(network);
     format!(
-        "docker_network={network}; docker_network_driver=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_DRIVER_TEMPLATE} 2>/dev/null) || {{ echo \"Docker network filter $docker_network was not found\" >&2; exit 1; }}; if [ \"$docker_network_driver\" != \"bridge\" ]; then echo \"Docker network filter $docker_network is not a bridge network\" >&2; exit 1; fi; docker_network_subnets=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_SUBNETS_TEMPLATE} 2>/dev/null) || exit 1; if [ -z \"$docker_network_subnets\" ]; then echo \"Docker network filter $docker_network has no IPAM subnets\" >&2; exit 1; fi"
+        "docker_network={network}; docker_network_driver=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_DRIVER_TEMPLATE} 2>/dev/null) || {{ echo \"Docker network filter $docker_network was not found\" >&2; exit 1; }}; if [ \"$docker_network_driver\" != \"bridge\" ]; then echo \"Docker network filter $docker_network is not a bridge network\" >&2; exit 1; fi; docker_network_subnets=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_SUBNETS_TEMPLATE} 2>/dev/null) || exit 1; if [ -z \"$docker_network_subnets\" ]; then echo \"Docker network filter $docker_network has no IPAM subnets\" >&2; exit 1; fi; for docker_network_subnet in $docker_network_subnets; do case \" $docker_discovered_subnets \" in *\" $docker_network_subnet \"*) echo \"Docker network filters expose duplicate IPAM subnet $docker_network_subnet\" >&2; exit 1;; esac; docker_discovered_subnets=\"${{docker_discovered_subnets}}${{docker_network_subnet}} \"; done"
     )
 }
 
@@ -9823,6 +9826,7 @@ fi
         );
         assert!(plan.commands[0].contains("docker_network=edge_default"));
         assert!(plan.commands[0].contains("docker_network=edge_backend"));
+        assert!(plan.commands[0].contains("docker_discovered_subnets=''"));
         assert!(
             plan.commands[0].contains("network inspect \"$docker_network\" --format '{{.Driver}}'")
         );
@@ -9832,6 +9836,9 @@ fi
         assert!(plan.commands[0].contains("was not found"));
         assert!(plan.commands[0].contains("is not a bridge network"));
         assert!(plan.commands[0].contains("has no IPAM subnets"));
+        assert!(plan.commands[0].contains(
+            "Docker network filters expose duplicate IPAM subnet $docker_network_subnet"
+        ));
         Ok(())
     }
 
