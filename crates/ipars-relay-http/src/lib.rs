@@ -7,7 +7,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipars_relay::{RelayError, RelayService};
-use ipars_types::api::{RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse};
+use ipars_types::api::{
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayStatusResponse,
+};
 use ipars_types::HealthState;
 use serde::Serialize;
 
@@ -220,7 +223,12 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
         &mut body,
         "# TYPE ipars_relay_admission_failures_by_reason_total counter"
     );
-    for (reason, count) in &status.admission_failures_by_reason {
+    for reason in RelayAdmissionFailureReason::ALL {
+        let count = status
+            .admission_failures_by_reason
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
         prometheus_line!(
             &mut body,
             "ipars_relay_admission_failures_by_reason_total{{relay_node=\"{relay_node}\",reason=\"{}\"}} {count}",
@@ -300,7 +308,13 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
         &mut body,
         "# TYPE ipars_relay_datagrams_dropped_by_reason_total counter"
     );
-    for (reason, count) in &status.dataplane.drops_by_reason {
+    for reason in RelayDataplaneDropReason::ALL {
+        let count = status
+            .dataplane
+            .drops_by_reason
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
         prometheus_line!(
             &mut body,
             "ipars_relay_datagrams_dropped_by_reason_total{{relay_node=\"{relay_node}\",reason=\"{}\"}} {count}",
@@ -449,7 +463,7 @@ mod tests {
     use axum::http::{header, Request};
     use ipars_types::api::{
         RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-        RelayStatusResponse,
+        RelayDataplaneDropReason, RelayStatusResponse,
     };
     use ipars_types::{NodeId, RelayCapability};
     use tower::ServiceExt;
@@ -511,8 +525,28 @@ mod tests {
         assert_eq!(response.admission_attempt_count, 1);
         assert_eq!(response.admission_success_count, 1);
         assert_eq!(response.admission_failure_count, 0);
-        assert!(response.admission_failures_by_reason.is_empty());
+        assert_eq!(
+            response.admission_failures_by_reason.len(),
+            RelayAdmissionFailureReason::ALL.len()
+        );
+        assert_eq!(
+            response
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::Unauthorized),
+            Some(&0)
+        );
         assert_eq!(response.dataplane.datagrams_received, 0);
+        assert_eq!(
+            response.dataplane.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        assert_eq!(
+            response
+                .dataplane
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&0)
+        );
 
         let table = relay.table();
         let malformed = table
@@ -547,8 +581,17 @@ mod tests {
         assert!(body.contains("ipars_relay_admission_success_total{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_admission_failures_total{relay_node=\"relay-a\"} 0"));
         assert!(body.contains("ipars_relay_admission_failures_by_reason_total"));
+        assert!(body.contains(
+            "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"unauthorized\"} 0"
+        ));
+        assert!(body.contains(
+            "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"internal_error\"} 0"
+        ));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
         assert!(body.contains("ipars_relay_datagrams_dropped_total{relay_node=\"relay-a\"} 1"));
+        assert!(body.contains(
+            "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"unknown_session\"} 0"
+        ));
         assert!(body.contains(
             "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"malformed_frame\"} 1"
         ));

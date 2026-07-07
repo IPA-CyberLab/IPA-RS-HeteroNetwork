@@ -1357,6 +1357,17 @@ pub mod api {
     }
 
     impl RelayDataplaneDropReason {
+        pub const ALL: [Self; 8] = [
+            Self::AdmissionDenied,
+            Self::UnknownSession,
+            Self::SessionExpired,
+            Self::InvalidSessionCredential,
+            Self::RateLimited,
+            Self::MalformedFrame,
+            Self::FrameTooLarge,
+            Self::SocketError,
+        ];
+
         pub fn as_str(self) -> &'static str {
             match self {
                 Self::AdmissionDenied => "admission_denied",
@@ -1384,6 +1395,16 @@ pub mod api {
     }
 
     impl RelayAdmissionFailureReason {
+        pub const ALL: [Self; 7] = [
+            Self::Unauthorized,
+            Self::AdmissionDenied,
+            Self::NodeSessionLimitExceeded,
+            Self::RateLimited,
+            Self::InvalidSessionCredential,
+            Self::SocketError,
+            Self::InternalError,
+        ];
+
         pub fn as_str(self) -> &'static str {
             match self {
                 Self::Unauthorized => "unauthorized",

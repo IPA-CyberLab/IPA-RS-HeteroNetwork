@@ -470,6 +470,24 @@ fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFai
     }
 }
 
+fn zero_filled_admission_failure_reasons(
+    observed: BTreeMap<RelayAdmissionFailureReason, u64>,
+) -> BTreeMap<RelayAdmissionFailureReason, u64> {
+    RelayAdmissionFailureReason::ALL
+        .into_iter()
+        .map(|reason| (reason, observed.get(&reason).copied().unwrap_or_default()))
+        .collect()
+}
+
+fn zero_filled_dataplane_metrics(mut metrics: RelayDataplaneMetrics) -> RelayDataplaneMetrics {
+    let observed = metrics.drops_by_reason;
+    metrics.drops_by_reason = RelayDataplaneDropReason::ALL
+        .into_iter()
+        .map(|reason| (reason, observed.get(&reason).copied().unwrap_or_default()))
+        .collect();
+    metrics
+}
+
 fn validate_relay_session_admission(
     admission: &RelaySessionAdmission,
     session_id: &RelaySessionId,
@@ -777,9 +795,11 @@ impl RelayService {
             admission_attempt_count: self.admission_attempts.load(Ordering::Relaxed),
             admission_success_count: self.admission_successes.load(Ordering::Relaxed),
             admission_failure_count: self.admission_failures.load(Ordering::Relaxed),
-            admission_failures_by_reason: self.admission_failures_by_reason(),
+            admission_failures_by_reason: zero_filled_admission_failure_reasons(
+                self.admission_failures_by_reason(),
+            ),
             max_sessions_per_node: self.max_sessions_per_node,
-            dataplane: table.dataplane_metrics(),
+            dataplane: zero_filled_dataplane_metrics(table.dataplane_metrics()),
         }
     }
 
@@ -1329,6 +1349,41 @@ mod tests {
         let status = service.status().await;
 
         assert_eq!(status.capability.active_sessions, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_status_zero_fills_reason_metrics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+
+        let status = service.status().await;
+
+        assert_eq!(
+            status.admission_failures_by_reason.len(),
+            RelayAdmissionFailureReason::ALL.len()
+        );
+        for reason in RelayAdmissionFailureReason::ALL {
+            assert_eq!(
+                status.admission_failures_by_reason.get(&reason),
+                Some(&0),
+                "{reason:?} should be zero-filled"
+            );
+        }
+        assert_eq!(
+            status.dataplane.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        for reason in RelayDataplaneDropReason::ALL {
+            assert_eq!(
+                status.dataplane.drops_by_reason.get(&reason),
+                Some(&0),
+                "{reason:?} should be zero-filled"
+            );
+        }
         Ok(())
     }
 

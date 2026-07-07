@@ -869,7 +869,10 @@ impl LoadReport {
         if self.relay_admission_attempts_reported != self.active_pair_count as u64
             || self.relay_admission_successes_reported != self.active_pair_count as u64
             || self.relay_admission_failures_reported != 0
-            || !self.relay_admission_failures_by_reason_reported.is_empty()
+            || self
+                .relay_admission_failures_by_reason_reported
+                .values()
+                .any(|count| *count != 0)
         {
             bail!(
                 "{context} relay admission mismatch: attempts={}, successes={}, failures={}, failures_by_reason={:?}",
@@ -6004,6 +6007,22 @@ fn identity_for_index(index: usize) -> IdentityKeyPair {
 mod tests {
     use super::*;
 
+    fn assert_zero_filled_relay_admission_failure_reasons(report: &LoadReport) {
+        assert_eq!(
+            report.relay_admission_failures_by_reason_reported.len(),
+            RelayAdmissionFailureReason::ALL.len()
+        );
+        for reason in RelayAdmissionFailureReason::ALL {
+            assert_eq!(
+                report
+                    .relay_admission_failures_by_reason_reported
+                    .get(&reason),
+                Some(&0),
+                "{reason:?} should be zero-filled"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn load_harness_runs_three_node_scenario() -> anyhow::Result<()> {
         let report = run_in_memory_scenario(Scenario::from_name(ScenarioName::Three)).await?;
@@ -6071,9 +6090,7 @@ mod tests {
         assert_eq!(report.relay_admission_attempts_reported, 6);
         assert_eq!(report.relay_admission_successes_reported, 6);
         assert_eq!(report.relay_admission_failures_reported, 0);
-        assert!(report
-            .relay_admission_failures_by_reason_reported
-            .is_empty());
+        assert_zero_filled_relay_admission_failure_reasons(&report);
         assert_eq!(report.relay_http_requests, 8);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
@@ -8835,9 +8852,7 @@ mod tests {
             report.active_pair_count as u64
         );
         assert_eq!(report.relay_admission_failures_reported, 0);
-        assert!(report
-            .relay_admission_failures_by_reason_reported
-            .is_empty());
+        assert_zero_filled_relay_admission_failure_reasons(&report);
         report.validate_success()?;
         std::fs::remove_dir_all(runtime_dir)?;
         Ok(())
