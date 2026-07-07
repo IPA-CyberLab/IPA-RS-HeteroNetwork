@@ -30,16 +30,16 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         path: temp_dir.clone(),
     };
 
-    let tcp_ports = free_tcp_ports(5)?;
-    let udp_ports = free_udp_ports(3)?;
-    let control_plane_port = tcp_ports[0];
-    let signal_port = tcp_ports[1];
-    let relay_http_port = tcp_ports[2];
-    let agent_port = tcp_ports[3];
-    let stun_http_port = tcp_ports[4];
-    let stun_port = udp_ports[0];
-    let stun_alternate_port = udp_ports[1];
-    let relay_udp_port = udp_ports[2];
+    let tcp_ports = reserve_tcp_ports(5)?;
+    let udp_ports = reserve_udp_ports(3)?;
+    let control_plane_port = tcp_ports.ports[0];
+    let signal_port = tcp_ports.ports[1];
+    let relay_http_port = tcp_ports.ports[2];
+    let agent_port = tcp_ports.ports[3];
+    let stun_http_port = tcp_ports.ports[4];
+    let stun_port = udp_ports.ports[0];
+    let stun_alternate_port = udp_ports.ports[1];
+    let relay_udp_port = udp_ports.ports[2];
 
     let init = generated_init_output(relay_udp_port)?;
     let cluster_id = json_string(&init, "cluster_id")?;
@@ -282,6 +282,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered smoke Compose config did not include the inline join token override"
     );
 
+    drop(tcp_ports);
+    drop(udp_ports);
     run_compose_with_diagnostics(
         &compose,
         ["up", "-d", "--build", "--wait", "--wait-timeout", "180"],
@@ -661,28 +663,45 @@ fn unique_suffix() -> Result<String> {
     Ok(format!("{}-{millis}", std::process::id()))
 }
 
-fn free_tcp_ports(count: usize) -> Result<Vec<u16>> {
+struct ReservedPorts<T> {
+    ports: Vec<u16>,
+    _sockets: Vec<T>,
+}
+
+fn reserve_tcp_ports(count: usize) -> Result<ReservedPorts<TcpListener>> {
     let mut ports = BTreeSet::new();
+    let mut listeners = Vec::new();
     let max_attempts = count.saturating_mul(16).max(16);
     for _ in 0..max_attempts {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral TCP port")?;
-        ports.insert(listener.local_addr()?.port());
+        if ports.insert(listener.local_addr()?.port()) {
+            listeners.push(listener);
+        }
         if ports.len() == count {
-            return Ok(ports.into_iter().collect());
+            return Ok(ReservedPorts {
+                ports: ports.into_iter().collect(),
+                _sockets: listeners,
+            });
         }
     }
     anyhow::bail!("failed to allocate {count} distinct ephemeral TCP ports")
 }
 
-fn free_udp_ports(count: usize) -> Result<Vec<u16>> {
+fn reserve_udp_ports(count: usize) -> Result<ReservedPorts<UdpSocket>> {
     let mut ports = BTreeSet::new();
+    let mut sockets = Vec::new();
     let max_attempts = count.saturating_mul(16).max(16);
     for _ in 0..max_attempts {
         let socket = UdpSocket::bind("127.0.0.1:0").context("failed to bind ephemeral UDP port")?;
-        ports.insert(socket.local_addr()?.port());
+        if ports.insert(socket.local_addr()?.port()) {
+            sockets.push(socket);
+        }
         if ports.len() == count {
-            return Ok(ports.into_iter().collect());
+            return Ok(ReservedPorts {
+                ports: ports.into_iter().collect(),
+                _sockets: sockets,
+            });
         }
     }
     anyhow::bail!("failed to allocate {count} distinct ephemeral UDP ports")
