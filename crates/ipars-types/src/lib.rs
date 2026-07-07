@@ -1741,6 +1741,7 @@ pub mod api {
         Etcd,
         Postgres,
         Mysql,
+        MsSql,
         Redis,
         Memcached,
         Prometheus,
@@ -1758,7 +1759,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 26] = [
+        pub const ALL: [Self; 27] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1771,6 +1772,7 @@ pub mod api {
             Self::Etcd,
             Self::Postgres,
             Self::Mysql,
+            Self::MsSql,
             Self::Redis,
             Self::Memcached,
             Self::Prometheus,
@@ -1801,6 +1803,7 @@ pub mod api {
                 Self::Etcd => "etcd",
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
+                Self::MsSql => "mssql",
                 Self::Redis => "redis",
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
@@ -2003,6 +2006,9 @@ pub mod api {
             if self.involves_port(3306) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Mysql;
             }
+            if self.involves_port(1433) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::MsSql;
+            }
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
             }
@@ -2108,6 +2114,7 @@ pub mod api {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
                 .or_else(|| mysql_payload(payload).then_some(AgentPacketFlowApplication::Mysql))
+                .or_else(|| mssql_tds_payload(payload).then_some(AgentPacketFlowApplication::MsSql))
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
                 .or_else(|| {
                     memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
@@ -2679,6 +2686,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Mysql);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"mssql")
+            || tls_sni_hostname_has_label_prefix(hostname, b"sqlserver")
+            || tls_sni_hostname_has_label_prefix(hostname, b"sql-server")
+        {
+            return Some(AgentPacketFlowApplication::MsSql);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -2795,6 +2808,12 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"mysql") || protocol.eq_ignore_ascii_case(b"mariadb") {
             return Some(AgentPacketFlowApplication::Mysql);
+        }
+        if protocol.eq_ignore_ascii_case(b"mssql")
+            || protocol.eq_ignore_ascii_case(b"sqlserver")
+            || protocol.eq_ignore_ascii_case(b"tds")
+        {
+            return Some(AgentPacketFlowApplication::MsSql);
         }
         if protocol.eq_ignore_ascii_case(b"redis") || protocol.eq_ignore_ascii_case(b"valkey") {
             return Some(AgentPacketFlowApplication::Redis);
@@ -3698,6 +3717,209 @@ pub mod api {
             && args
                 .iter()
                 .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
+    }
+
+    fn mssql_tds_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            if payload.len().saturating_sub(offset) < 8 {
+                return packet_count > 0;
+            }
+            match mssql_tds_packet(payload, offset) {
+                Some(MsSqlTdsPacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MsSqlTdsPacketParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        packet_count > 0
+    }
+
+    enum MsSqlTdsPacketParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn mssql_tds_packet(payload: &[u8], offset: usize) -> Option<MsSqlTdsPacketParse> {
+        let packet_type = *payload.get(offset)?;
+        let status = *payload.get(offset.checked_add(1)?)?;
+        let length = read_u16_be(payload, offset.checked_add(2)?)? as usize;
+        let packet_id = *payload.get(offset.checked_add(6)?)?;
+        let window = *payload.get(offset.checked_add(7)?)?;
+        if !mssql_tds_packet_type(packet_type)
+            || !mssql_tds_status(status)
+            || !(8..=65_535).contains(&length)
+            || packet_id > 128
+            || window > 1
+        {
+            return None;
+        }
+        let packet_end = offset.checked_add(length)?;
+        let body_offset = offset.checked_add(8)?;
+        let observed_body_end = payload.len().min(packet_end);
+        let body = payload.get(body_offset..observed_body_end)?;
+        if !mssql_tds_packet_body(packet_type, body, length - 8, payload.len() < packet_end) {
+            return None;
+        }
+        if payload.len() < packet_end {
+            Some(MsSqlTdsPacketParse::Incomplete)
+        } else {
+            Some(MsSqlTdsPacketParse::Complete(packet_end))
+        }
+    }
+
+    fn mssql_tds_packet_type(packet_type: u8) -> bool {
+        matches!(packet_type, 0x01 | 0x10 | 0x12)
+    }
+
+    fn mssql_tds_status(status: u8) -> bool {
+        status & !0x1f == 0
+    }
+
+    fn mssql_tds_packet_body(
+        packet_type: u8,
+        body: &[u8],
+        declared_body_len: usize,
+        incomplete: bool,
+    ) -> bool {
+        match packet_type {
+            0x01 => mssql_sql_batch_body(body, incomplete),
+            0x10 => mssql_login7_body(body, declared_body_len, incomplete),
+            0x12 => mssql_prelogin_body(body, declared_body_len, incomplete),
+            _ => false,
+        }
+    }
+
+    fn mssql_prelogin_body(body: &[u8], declared_body_len: usize, incomplete: bool) -> bool {
+        if declared_body_len < 6 {
+            return false;
+        }
+        let mut offset = 0_usize;
+        let mut seen_tokens = 0_u16;
+        let mut value_ranges = [(0_usize, 0_usize); 16];
+        let mut token_count = 0_usize;
+        loop {
+            let Some(&token) = body.get(offset) else {
+                return incomplete && token_count > 0;
+            };
+            if token == 0xff {
+                let Some(value_table_end) = offset.checked_add(1) else {
+                    return false;
+                };
+                return token_count > 0
+                    && value_ranges[..token_count]
+                        .iter()
+                        .all(|(value_offset, value_len)| {
+                            *value_offset >= value_table_end
+                                && value_offset
+                                    .checked_add(*value_len)
+                                    .is_some_and(|end| end <= declared_body_len)
+                        });
+            }
+            if token > 0x07 {
+                return false;
+            }
+            let token_bit = 1_u16 << u32::from(token);
+            if seen_tokens & token_bit != 0 {
+                return false;
+            }
+            let Some(value_offset_offset) = offset.checked_add(1) else {
+                return false;
+            };
+            let Some(value_offset) =
+                read_u16_be(body, value_offset_offset).map(|value| value as usize)
+            else {
+                return incomplete && token_count > 0;
+            };
+            let Some(value_len_offset) = offset.checked_add(3) else {
+                return false;
+            };
+            let Some(value_len) = read_u16_be(body, value_len_offset).map(|value| value as usize)
+            else {
+                return incomplete && token_count > 0;
+            };
+            if value_offset < 6 || value_offset > declared_body_len {
+                return false;
+            }
+            if value_offset
+                .checked_add(value_len)
+                .is_none_or(|end| end > declared_body_len)
+            {
+                return false;
+            }
+            seen_tokens |= token_bit;
+            value_ranges[token_count] = (value_offset, value_len);
+            token_count += 1;
+            if token_count > 16 {
+                return false;
+            }
+            offset += 5;
+        }
+    }
+
+    fn mssql_login7_body(body: &[u8], declared_body_len: usize, incomplete: bool) -> bool {
+        if declared_body_len < 36 {
+            return false;
+        }
+        if body.len() < 4 {
+            return incomplete;
+        }
+        let Some(login_len) = read_u32_le(body, 0).map(|value| value as usize) else {
+            return false;
+        };
+        login_len == declared_body_len && login_len >= 36 && login_len <= 65_527
+    }
+
+    fn mssql_sql_batch_body(body: &[u8], incomplete: bool) -> bool {
+        if body.is_empty() {
+            return incomplete;
+        }
+        let statement = trim_utf16le_ascii_space(body);
+        if statement.is_empty() {
+            return false;
+        }
+        let keywords: [&[u8]; 31] = [
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"MERGE",
+            b"EXEC",
+            b"EXECUTE",
+            b"DECLARE",
+            b"SET",
+            b"USE",
+            b"BEGIN",
+            b"COMMIT",
+            b"ROLLBACK",
+            b"SAVE",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"WITH",
+            b"GRANT",
+            b"REVOKE",
+            b"BACKUP",
+            b"RESTORE",
+            b"DBCC",
+            b"PRINT",
+            b"RAISERROR",
+            b"THROW",
+            b"WAITFOR",
+            b"IF",
+            b"WHILE",
+            b"OPEN",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| starts_utf16le_ascii_keyword(statement, keyword))
     }
 
     fn redis_payload(payload: &[u8]) -> bool {
@@ -5955,6 +6177,58 @@ pub mod api {
         &payload[start..end]
     }
 
+    fn trim_utf16le_ascii_space(payload: &[u8]) -> &[u8] {
+        if payload.len() < 2 {
+            return &[];
+        }
+        let mut start = 0_usize;
+        while start + 1 < payload.len()
+            && payload[start + 1] == 0
+            && payload[start].is_ascii_whitespace()
+        {
+            start += 2;
+        }
+        let mut end = payload.len() & !1;
+        while end >= start + 2 && payload[end - 1] == 0 && payload[end - 2].is_ascii_whitespace() {
+            end -= 2;
+        }
+        let candidate = &payload[start..end];
+        if candidate.is_empty()
+            || !candidate.chunks_exact(2).all(|chunk| {
+                chunk[1] == 0 && (!chunk[0].is_ascii_control() || chunk[0].is_ascii_whitespace())
+            })
+        {
+            return &[];
+        }
+        candidate
+    }
+
+    fn starts_utf16le_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
+        let keyword_bytes = keyword.len().checked_mul(2).unwrap_or(usize::MAX);
+        if keyword.is_empty() || payload.len() < keyword_bytes {
+            return false;
+        }
+        for (index, expected) in keyword.iter().enumerate() {
+            let offset = index * 2;
+            let Some((&byte, &zero)) = payload.get(offset).zip(payload.get(offset + 1)) else {
+                return false;
+            };
+            if zero != 0 || !byte.eq_ignore_ascii_case(expected) {
+                return false;
+            }
+        }
+        if payload.len() == keyword_bytes {
+            return true;
+        }
+        let Some((&byte, &zero)) = payload
+            .get(keyword_bytes)
+            .zip(payload.get(keyword_bytes + 1))
+        else {
+            return true;
+        };
+        zero == 0 && !byte.is_ascii_alphanumeric() && byte != b'_'
+    }
+
     fn path_starts_with_any(path: &[u8], prefixes: &[&[u8]]) -> bool {
         prefixes.iter().any(|prefix| path.starts_with(prefix))
     }
@@ -6630,6 +6904,13 @@ mod tests {
         };
         assert_eq!(mysql.application(), api::AgentPacketFlowApplication::Mysql);
 
+        let mssql = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1433),
+            ..Default::default()
+        };
+        assert_eq!(mssql.application(), api::AgentPacketFlowApplication::MsSql);
+
         let redis = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(6379),
@@ -6889,6 +7170,31 @@ mod tests {
             body.extend_from_slice(b"ijklmnopqrst");
             body.push(0);
             mysql_packet(0, &body)
+        }
+
+        fn mssql_tds_packet(packet_type: u8, body: &[u8]) -> Vec<u8> {
+            let length = 8 + body.len();
+            let mut payload = vec![
+                packet_type,
+                0x01,
+                ((length >> 8) & 0xff) as u8,
+                (length & 0xff) as u8,
+                0,
+                0,
+                1,
+                0,
+            ];
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn utf16le_ascii(value: &[u8]) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(value.len() * 2);
+            for byte in value {
+                payload.push(*byte);
+                payload.push(0);
+            }
+            payload
         }
 
         fn memcached_binary_request(
@@ -7271,6 +7577,14 @@ mod tests {
                 api::AgentPacketFlowApplication::Mysql,
             ),
             (
+                "mssql-primary.db.svc",
+                api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
+                "sqlserver-primary.db.svc",
+                api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
                 "redis-cache.cache.svc",
                 api::AgentPacketFlowApplication::Redis,
             ),
@@ -7332,6 +7646,10 @@ mod tests {
             (
                 &[b"postgresql".as_slice()][..],
                 api::AgentPacketFlowApplication::Postgres,
+            ),
+            (
+                &[b"mssql".as_slice()][..],
+                api::AgentPacketFlowApplication::MsSql,
             ),
             (
                 &[b"valkey".as_slice()][..],
@@ -7801,6 +8119,29 @@ mod tests {
                 &[0x03, b'S', b'E', b'L', b'E', b'C', b'T', 0]
             ))
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mssql_prelogin = mssql_tds_packet(
+            0x12,
+            &[
+                0x00, 0x00, 0x06, 0x00, 0x06, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        );
+        assert_eq!(
+            observation_for_payload(&mssql_prelogin).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
+        let mssql_sql_batch = mssql_tds_packet(0x01, &utf16le_ascii(b"SELECT 1"));
+        assert_eq!(
+            observation_for_payload(&mssql_sql_batch).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
+        let invalid_mssql_status = vec![
+            0x12, 0xe0, 0x00, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0xff,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            observation_for_payload(&invalid_mssql_status).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
