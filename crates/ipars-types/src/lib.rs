@@ -2597,6 +2597,13 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Udp) && wireguard_payload(payload) {
                 return Some(AgentPacketFlowApplication::WireGuard);
             }
+            if matches!(
+                self.protocol,
+                None | Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+            ) && openvpn_payload(payload, self.protocol)
+            {
+                return Some(AgentPacketFlowApplication::OpenVpn);
+            }
             if matches!(self.protocol, None | Some(TransportProtocol::Udp)) && ntp_payload(payload)
             {
                 return Some(AgentPacketFlowApplication::Ntp);
@@ -4613,6 +4620,8 @@ pub mod api {
     const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
     const IPARS_RELAY_FRAME_MAGIC_V1: &[u8] = b"IPARS-RLY1";
     const IPARS_RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
+    const OPENVPN_CONTROL_MIN_LEN: usize = 14;
+    const OPENVPN_MAX_ACKED_PACKET_IDS: usize = 32;
 
     fn ike_payload(payload: &[u8]) -> bool {
         let payload = payload
@@ -4786,6 +4795,107 @@ pub mod api {
             }
             _ => false,
         }
+    }
+
+    fn openvpn_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
+        match protocol {
+            None => openvpn_datagram_payload(payload) || openvpn_tcp_payload(payload),
+            Some(TransportProtocol::Udp) => openvpn_datagram_payload(payload),
+            Some(TransportProtocol::Tcp) => openvpn_tcp_payload(payload),
+            Some(
+                TransportProtocol::Any
+                | TransportProtocol::IpInIp
+                | TransportProtocol::Icmp
+                | TransportProtocol::Sctp
+                | TransportProtocol::Ipv6Encap
+                | TransportProtocol::Gre
+                | TransportProtocol::Esp
+                | TransportProtocol::Ah,
+            ) => false,
+        }
+    }
+
+    fn openvpn_datagram_payload(payload: &[u8]) -> bool {
+        openvpn_plain_control_packet(payload, false)
+    }
+
+    fn openvpn_tcp_payload(payload: &[u8]) -> bool {
+        let Some(packet_len) = read_u16_be(payload, 0).map(|len| len as usize) else {
+            return false;
+        };
+        if !(OPENVPN_CONTROL_MIN_LEN..=65_535).contains(&packet_len) {
+            return false;
+        }
+        let available = payload.len().saturating_sub(2);
+        let observed_len = available.min(packet_len);
+        if observed_len < OPENVPN_CONTROL_MIN_LEN {
+            return false;
+        }
+        let Some(observed) = payload.get(2..2 + observed_len) else {
+            return false;
+        };
+        let truncated = available < packet_len;
+        if truncated && payload.len() < PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return false;
+        }
+        openvpn_plain_control_packet(observed, truncated)
+    }
+
+    fn openvpn_plain_control_packet(payload: &[u8], allow_truncated: bool) -> bool {
+        if payload.len() < OPENVPN_CONTROL_MIN_LEN {
+            return false;
+        }
+        let opcode = payload[0] >> 3;
+        if !matches!(opcode, 3 | 4 | 5 | 7 | 8 | 10 | 11) {
+            return false;
+        }
+        if payload[1..9].iter().all(|byte| *byte == 0) {
+            return false;
+        }
+
+        let ack_count = payload[9] as usize;
+        if ack_count > OPENVPN_MAX_ACKED_PACKET_IDS {
+            return false;
+        }
+        if matches!(opcode, 3 | 4 | 11) && ack_count == 0 {
+            return false;
+        }
+        let Some(ack_list_len) = ack_count.checked_mul(4) else {
+            return false;
+        };
+        let Some(ack_list_end) = 10_usize.checked_add(ack_list_len) else {
+            return false;
+        };
+        if ack_list_end > payload.len() {
+            return allow_truncated && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+        }
+
+        let mut offset = ack_list_end;
+        if ack_count > 0 {
+            let Some(peer_session_end) = offset.checked_add(8) else {
+                return false;
+            };
+            if peer_session_end > payload.len() {
+                return allow_truncated && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            }
+            if payload[offset..peer_session_end]
+                .iter()
+                .all(|byte| *byte == 0)
+            {
+                return false;
+            }
+            offset = peer_session_end;
+        }
+
+        if opcode == 5 {
+            return ack_count > 0;
+        }
+
+        let Some(packet_id_end) = offset.checked_add(4) else {
+            return false;
+        };
+        packet_id_end <= payload.len()
+            || (allow_truncated && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
     }
 
     fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
@@ -10808,6 +10918,36 @@ mod tests {
             payload
         }
 
+        fn openvpn_plain_control(
+            opcode: u8,
+            acked_packet_ids: &[u32],
+            packet_id: Option<u32>,
+        ) -> Vec<u8> {
+            let mut payload = vec![opcode << 3];
+            payload.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+            payload.push(acked_packet_ids.len() as u8);
+            for packet_id in acked_packet_ids {
+                payload.extend_from_slice(&packet_id.to_be_bytes());
+            }
+            if !acked_packet_ids.is_empty() {
+                payload.extend_from_slice(&0x8070_6050_4030_2010_u64.to_be_bytes());
+            }
+            if let Some(packet_id) = packet_id {
+                payload.extend_from_slice(&packet_id.to_be_bytes());
+            }
+            payload
+        }
+
+        fn openvpn_hard_reset_client_v2() -> Vec<u8> {
+            openvpn_plain_control(7, &[], Some(0))
+        }
+
+        fn openvpn_tcp_record(packet: &[u8]) -> Vec<u8> {
+            let mut payload = (packet.len() as u16).to_be_bytes().to_vec();
+            payload.extend_from_slice(packet);
+            payload
+        }
+
         fn stun_message(message_type: u16) -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&message_type.to_be_bytes());
@@ -12565,6 +12705,35 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&wireguard_message(2, 92)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let openvpn_reset = openvpn_hard_reset_client_v2();
+        assert_eq!(
+            observation_for_udp_payload(&openvpn_reset).application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+        assert_eq!(
+            observation_for_payload(&openvpn_tcp_record(&openvpn_reset)).application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+        assert_eq!(
+            observation_for_udp_payload(&openvpn_plain_control(5, &[0], None)).application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+        assert_eq!(
+            observation_for_udp_payload(&openvpn_plain_control(4, &[0], Some(1))).application(),
+            api::AgentPacketFlowApplication::OpenVpn
+        );
+        let mut openvpn_zero_session = openvpn_reset.clone();
+        openvpn_zero_session[1..9].fill(0);
+        assert_eq!(
+            observation_for_udp_payload(&openvpn_zero_session).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut openvpn_data_packet = openvpn_reset.clone();
+        openvpn_data_packet[0] = 6 << 3;
+        assert_eq!(
+            observation_for_udp_payload(&openvpn_data_packet).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
