@@ -2337,13 +2337,34 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
 
 fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
     ensure_runtime_command_path_is_absolute(path)?;
-    if program_ready_in_path(program, path) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "missing required Linux runtime command `{program}` in PATH; expected an executable regular file"
-        );
+    let Some(path) = path else {
+        anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
+    };
+    if path.is_empty() {
+        anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
     }
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(program);
+        match candidate.symlink_metadata() {
+            Ok(_) => {
+                ensure_runtime_executable_file(
+                    &candidate,
+                    &format!("required Linux runtime command `{program}`"),
+                )?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect Linux runtime command `{program}` at {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
 }
 
 fn ensure_runtime_command_path_is_absolute(path: Option<&OsStr>) -> anyhow::Result<()> {
@@ -2371,39 +2392,65 @@ fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::
             program_path.is_absolute(),
             "configured userspace WireGuard command `{program}` must be a bare command name or an absolute path"
         );
-        if is_executable_file(program_path) {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "configured userspace WireGuard command `{program}` is not an executable file"
+        return ensure_runtime_executable_file(
+            program_path,
+            &format!("configured userspace WireGuard command `{program}`"),
         );
     }
     ensure_program_in_path(program, path)
 }
 
-fn program_ready_in_path(program: &str, path: Option<&OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    std::env::split_paths(path).any(|directory| is_executable_file(&directory.join(program)))
-}
-
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    path.symlink_metadata()
-        .map(|metadata| {
-            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
-        })
-        .unwrap_or(false)
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("failed to inspect {label} at {}", path.display()))?;
+    let mode = metadata.permissions().mode();
+    anyhow::ensure!(
+        metadata.file_type().is_file() && mode & 0o111 != 0,
+        "{label} at {} expected an executable regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "{label} at {} must not be group- or world-writable",
+        path.display()
+    );
+    let parent = path.parent().with_context(|| {
+        format!(
+            "failed to locate parent directory for {label} at {}",
+            path.display()
+        )
+    })?;
+    let parent_metadata = parent
+        .metadata()
+        .with_context(|| format!("failed to inspect parent directory {}", parent.display()))?;
+    anyhow::ensure!(
+        parent_metadata.is_dir(),
+        "{label} parent {} must be a directory",
+        parent.display()
+    );
+    anyhow::ensure!(
+        parent_metadata.permissions().mode() & 0o022 == 0,
+        "{label} parent {} must not be group- or world-writable",
+        parent.display()
+    );
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.symlink_metadata()
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
+fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("failed to inspect {label} at {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "{label} at {} expected an executable regular file",
+        path.display()
+    );
+    Ok(())
 }
 
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
@@ -16854,6 +16901,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let executable_bin = base.join("executable-bin");
         std::fs::create_dir(&executable_bin)?;
+        std::fs::set_permissions(&executable_bin, std::fs::Permissions::from_mode(0o755))?;
         let executable = executable_bin.join("ip");
         std::fs::write(&executable, b"#!/bin/sh\n")?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
@@ -16861,6 +16909,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let non_executable_bin = base.join("non-executable-bin");
         std::fs::create_dir(&non_executable_bin)?;
+        std::fs::set_permissions(&non_executable_bin, std::fs::Permissions::from_mode(0o755))?;
         let non_executable = non_executable_bin.join("ip");
         std::fs::write(&non_executable, b"#!/bin/sh\n")?;
         std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644))?;
@@ -16875,6 +16924,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let directory_bin = base.join("directory-bin");
         std::fs::create_dir(&directory_bin)?;
+        std::fs::set_permissions(&directory_bin, std::fs::Permissions::from_mode(0o755))?;
         std::fs::create_dir(directory_bin.join("ip"))?;
         let directory_error = match ensure_program_in_path("ip", Some(directory_bin.as_os_str())) {
             Ok(()) => anyhow::bail!("unexpected successful directory command preflight"),
@@ -16886,6 +16936,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let symlink_bin = base.join("symlink-bin");
         std::fs::create_dir(&symlink_bin)?;
+        std::fs::set_permissions(&symlink_bin, std::fs::Permissions::from_mode(0o755))?;
         std::os::unix::fs::symlink(&executable, symlink_bin.join("ip"))?;
         let symlink_error = match ensure_program_in_path("ip", Some(symlink_bin.as_os_str())) {
             Ok(()) => anyhow::bail!("unexpected successful symlink command preflight"),
@@ -16894,6 +16945,42 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(symlink_error
             .to_string()
             .contains("expected an executable regular file"));
+
+        let writable_command_bin = base.join("writable-command-bin");
+        std::fs::create_dir(&writable_command_bin)?;
+        std::fs::set_permissions(
+            &writable_command_bin,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let writable_command = writable_command_bin.join("ip");
+        std::fs::write(&writable_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&writable_command, std::fs::Permissions::from_mode(0o775))?;
+        let writable_command_error =
+            match ensure_program_in_path("ip", Some(writable_command_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful writable command preflight"),
+                Err(error) => error,
+            };
+        assert!(writable_command_error
+            .to_string()
+            .contains("must not be group- or world-writable"));
+
+        let writable_parent_bin = base.join("writable-parent-bin");
+        std::fs::create_dir(&writable_parent_bin)?;
+        std::fs::set_permissions(&writable_parent_bin, std::fs::Permissions::from_mode(0o777))?;
+        let writable_parent_command = writable_parent_bin.join("ip");
+        std::fs::write(&writable_parent_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(
+            &writable_parent_command,
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        let writable_parent_error =
+            match ensure_program_in_path("ip", Some(writable_parent_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful writable parent preflight"),
+                Err(error) => error,
+            };
+        assert!(writable_parent_error
+            .to_string()
+            .contains("must not be group- or world-writable"));
 
         let relative_bin = PathBuf::from("relative-bin");
         let relative_error = match ensure_program_in_path("ip", Some(relative_bin.as_os_str())) {
@@ -16912,6 +16999,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .to_string()
             .contains("must be an absolute directory"));
 
+        let empty_lookup_error = match ensure_program_in_path("ip", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful empty PATH command lookup"),
+            Err(error) => error,
+        };
+        assert!(empty_lookup_error
+            .to_string()
+            .contains("missing required Linux runtime command `ip`"));
+
         let userspace_link = base.join("wireguard-go-link");
         std::os::unix::fs::symlink(&executable, &userspace_link)?;
         let userspace_link = userspace_link.display().to_string();
@@ -16924,7 +17019,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             };
         assert!(userspace_error
             .to_string()
-            .contains("is not an executable file"));
+            .contains("expected an executable regular file"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
