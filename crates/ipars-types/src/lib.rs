@@ -1742,6 +1742,7 @@ pub mod api {
         Postgres,
         Mysql,
         MsSql,
+        Oracle,
         Redis,
         Memcached,
         Prometheus,
@@ -1759,7 +1760,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 27] = [
+        pub const ALL: [Self; 28] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1773,6 +1774,7 @@ pub mod api {
             Self::Postgres,
             Self::Mysql,
             Self::MsSql,
+            Self::Oracle,
             Self::Redis,
             Self::Memcached,
             Self::Prometheus,
@@ -1804,6 +1806,7 @@ pub mod api {
                 Self::Postgres => "postgres",
                 Self::Mysql => "mysql",
                 Self::MsSql => "mssql",
+                Self::Oracle => "oracle",
                 Self::Redis => "redis",
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
@@ -2009,6 +2012,11 @@ pub mod api {
             if self.involves_port(1433) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::MsSql;
             }
+            if (self.involves_port(1521) || self.involves_port(2484))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Oracle;
+            }
             if self.involves_port(6379) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Redis;
             }
@@ -2115,6 +2123,9 @@ pub mod api {
                 })
                 .or_else(|| mysql_payload(payload).then_some(AgentPacketFlowApplication::Mysql))
                 .or_else(|| mssql_tds_payload(payload).then_some(AgentPacketFlowApplication::MsSql))
+                .or_else(|| {
+                    oracle_tns_payload(payload).then_some(AgentPacketFlowApplication::Oracle)
+                })
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
                 .or_else(|| {
                     memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
@@ -2692,6 +2703,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::MsSql);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"oracle")
+            || tls_sni_hostname_has_label_prefix(hostname, b"oracledb")
+            || tls_sni_hostname_has_label_prefix(hostname, b"tns")
+        {
+            return Some(AgentPacketFlowApplication::Oracle);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -2814,6 +2831,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"tds")
         {
             return Some(AgentPacketFlowApplication::MsSql);
+        }
+        if protocol.eq_ignore_ascii_case(b"oracle")
+            || protocol.eq_ignore_ascii_case(b"oracle-tns")
+            || protocol.eq_ignore_ascii_case(b"tns")
+        {
+            return Some(AgentPacketFlowApplication::Oracle);
         }
         if protocol.eq_ignore_ascii_case(b"redis") || protocol.eq_ignore_ascii_case(b"valkey") {
             return Some(AgentPacketFlowApplication::Redis);
@@ -3920,6 +3943,108 @@ pub mod api {
         keywords
             .iter()
             .any(|keyword| starts_utf16le_ascii_keyword(statement, keyword))
+    }
+
+    fn oracle_tns_payload(payload: &[u8]) -> bool {
+        oracle_tns_connect_packet(payload)
+    }
+
+    fn oracle_tns_connect_packet(payload: &[u8]) -> bool {
+        if payload.len() < 34 {
+            return false;
+        }
+        let Some(packet_len) = read_u16_be(payload, 0).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(packet_checksum) = read_u16_be(payload, 2) else {
+            return false;
+        };
+        let Some(&packet_type) = payload.get(4) else {
+            return false;
+        };
+        let Some(&reserved) = payload.get(5) else {
+            return false;
+        };
+        let Some(header_checksum) = read_u16_be(payload, 6) else {
+            return false;
+        };
+        if !(34..=65_535).contains(&packet_len)
+            || payload.len() > packet_len
+            || packet_checksum != 0
+            || packet_type != 0x01
+            || reserved != 0
+            || header_checksum != 0
+        {
+            return false;
+        }
+        let Some(version) = read_u16_be(payload, 8) else {
+            return false;
+        };
+        let Some(compatible_version) = read_u16_be(payload, 10) else {
+            return false;
+        };
+        if !(0x0100..=0x2000).contains(&version)
+            || !(0x0100..=version).contains(&compatible_version)
+        {
+            return false;
+        }
+        let Some(sdu) = read_u16_be(payload, 14) else {
+            return false;
+        };
+        let Some(tdu) = read_u16_be(payload, 16) else {
+            return false;
+        };
+        let Some(marker) = read_u16_be(payload, 22) else {
+            return false;
+        };
+        if !(512..=65_535).contains(&sdu) || !(512..=65_535).contains(&tdu) || marker != 1 {
+            return false;
+        }
+        let Some(connect_data_len) = read_u16_be(payload, 24).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(connect_data_offset) = read_u16_be(payload, 26).map(|value| value as usize) else {
+            return false;
+        };
+        if connect_data_len == 0
+            || connect_data_offset < 34
+            || connect_data_offset >= packet_len
+            || connect_data_offset
+                .checked_add(connect_data_len)
+                .is_none_or(|end| end > packet_len)
+            || payload.len() <= connect_data_offset
+        {
+            return false;
+        }
+        let connect_data_end = connect_data_offset + connect_data_len;
+        let observed_end = payload.len().min(connect_data_end);
+        let Some(connect_data) = payload.get(connect_data_offset..observed_end) else {
+            return false;
+        };
+        oracle_tns_connect_descriptor(connect_data)
+    }
+
+    fn oracle_tns_connect_descriptor(payload: &[u8]) -> bool {
+        let descriptor = trim_ascii_space(payload);
+        if descriptor.len() < 12 || descriptor.first() != Some(&b'(') {
+            return false;
+        }
+        if !descriptor
+            .iter()
+            .all(|byte| {
+                matches!(*byte, b'\t' | b'\n' | b'\r') || (0x20..=0x7e).contains(byte)
+            })
+        {
+            return false;
+        }
+        let has_description = ascii_contains_ignore_case(descriptor, b"(DESCRIPTION");
+        let has_connect_data = ascii_contains_ignore_case(descriptor, b"(CONNECT_DATA");
+        let has_service = ascii_contains_ignore_case(descriptor, b"(SERVICE_NAME")
+            || ascii_contains_ignore_case(descriptor, b"(SID")
+            || ascii_contains_ignore_case(descriptor, b"(INSTANCE_NAME");
+        let has_address = ascii_contains_ignore_case(descriptor, b"(ADDRESS")
+            && ascii_contains_ignore_case(descriptor, b"(PROTOCOL=TCP");
+        has_description && (has_connect_data || has_service || has_address)
     }
 
     fn redis_payload(payload: &[u8]) -> bool {
@@ -6164,6 +6289,13 @@ pub mod api {
             .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
     }
 
+    fn ascii_contains_ignore_case(payload: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && payload
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
     fn trim_ascii_space(payload: &[u8]) -> &[u8] {
         let start = payload
             .iter()
@@ -6911,6 +7043,13 @@ mod tests {
         };
         assert_eq!(mssql.application(), api::AgentPacketFlowApplication::MsSql);
 
+        let oracle = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(1521),
+            ..Default::default()
+        };
+        assert_eq!(oracle.application(), api::AgentPacketFlowApplication::Oracle);
+
         let redis = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(6379),
@@ -7194,6 +7333,32 @@ mod tests {
                 payload.push(*byte);
                 payload.push(0);
             }
+            payload
+        }
+
+        fn oracle_tns_connect_packet(descriptor: &[u8]) -> Vec<u8> {
+            let connect_data_offset = 34_usize;
+            let length = connect_data_offset + descriptor.len();
+            let mut payload = Vec::with_capacity(length);
+            payload.extend_from_slice(&(length as u16).to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.push(0x01);
+            payload.push(0);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&0x0136_u16.to_be_bytes());
+            payload.extend_from_slice(&0x012c_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&8192_u16.to_be_bytes());
+            payload.extend_from_slice(&32767_u16.to_be_bytes());
+            payload.extend_from_slice(&0x7f08_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&1_u16.to_be_bytes());
+            payload.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
+            payload.extend_from_slice(&(connect_data_offset as u16).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.push(0);
+            payload.push(0);
+            payload.extend_from_slice(descriptor);
             payload
         }
 
@@ -7585,6 +7750,14 @@ mod tests {
                 api::AgentPacketFlowApplication::MsSql,
             ),
             (
+                "oracle-listener.db.svc",
+                api::AgentPacketFlowApplication::Oracle,
+            ),
+            (
+                "oracledb-primary.db.svc",
+                api::AgentPacketFlowApplication::Oracle,
+            ),
+            (
                 "redis-cache.cache.svc",
                 api::AgentPacketFlowApplication::Redis,
             ),
@@ -7650,6 +7823,10 @@ mod tests {
             (
                 &[b"mssql".as_slice()][..],
                 api::AgentPacketFlowApplication::MsSql,
+            ),
+            (
+                &[b"oracle-tns".as_slice()][..],
+                api::AgentPacketFlowApplication::Oracle,
             ),
             (
                 &[b"valkey".as_slice()][..],
@@ -8142,6 +8319,28 @@ mod tests {
         ];
         assert_eq!(
             observation_for_payload(&invalid_mssql_status).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let oracle_descriptor =
+            b"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=x)))";
+        let oracle_connect = oracle_tns_connect_packet(oracle_descriptor);
+        assert!(oracle_connect.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
+        assert_eq!(
+            observation_for_payload(&oracle_connect).application(),
+            api::AgentPacketFlowApplication::Oracle
+        );
+        let invalid_oracle_type = {
+            let mut payload = oracle_connect.clone();
+            payload[4] = 0x06;
+            payload
+        };
+        assert_eq!(
+            observation_for_payload(&invalid_oracle_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_oracle_descriptor = oracle_tns_connect_packet(b"(NOT_ORACLE=1)");
+        assert_eq!(
+            observation_for_payload(&invalid_oracle_descriptor).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
