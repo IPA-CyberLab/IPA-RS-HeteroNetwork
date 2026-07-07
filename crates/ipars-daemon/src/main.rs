@@ -141,6 +141,8 @@ const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
+const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const MAX_PROC_SYSCTL_FLAG_BYTES: u64 = 64;
@@ -6342,13 +6344,7 @@ async fn start_userspace_wireguard_process(
         return Ok(None);
     };
     let label = runtime_command_label(&command.program, &command.args);
-    let mut child = tokio::process::Command::new(&command.program)
-        .args(&command.args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+    let mut child = spawn_userspace_wireguard_process(&command)
         .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
     let pid = child.id();
     runtime
@@ -6400,6 +6396,23 @@ async fn start_userspace_wireguard_process(
         shutdown: Some(shutdown),
         task,
     }))
+}
+
+fn spawn_userspace_wireguard_process(
+    command: &LinuxCommand,
+) -> anyhow::Result<tokio::process::Child> {
+    let child = tokio::process::Command::new(&command.program)
+        .args(&command.args)
+        .env_clear()
+        .env("PATH", SANITIZED_RUNTIME_COMMAND_PATH)
+        .env("LANG", SANITIZED_RUNTIME_COMMAND_LOCALE)
+        .env("LC_ALL", SANITIZED_RUNTIME_COMMAND_LOCALE)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    Ok(child)
 }
 
 async fn cleanup_unready_userspace_wireguard_process(
@@ -18616,6 +18629,60 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn userspace_wireguard_process_spawn_uses_sanitized_environment() -> anyhow::Result<()> {
+        let temp_dir = unique_test_dir("userspace-wg-env")?;
+        let status_path = temp_dir.join("env.status");
+        let pid_path = temp_dir.join("child.pid");
+        let status_arg = status_path.display().to_string();
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"
+if test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" &&
+   test "${LANG:-}" = "C" &&
+   test "${LC_ALL:-}" = "C" &&
+   test -z "${HOME+x}" &&
+   test -z "${LD_PRELOAD+x}"; then
+    printf 'ok\n' > "$1"
+else
+    {
+        printf 'PATH=%s\n' "${PATH-<unset>}"
+        printf 'LANG=%s\n' "${LANG-<unset>}"
+        printf 'LC_ALL=%s\n' "${LC_ALL-<unset>}"
+        printf 'HOME=%s\n' "${HOME-<unset>}"
+        printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-<unset>}"
+    } > "$1"
+fi
+printf '%s\n' "$$" > "$2"
+exec sleep 60
+"#;
+        let command = LinuxCommand::new(
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                shell_script.to_string(),
+                "ipars-userspace-wg-env".to_string(),
+                status_arg,
+                pid_arg,
+            ],
+        );
+        let mut child = spawn_userspace_wireguard_process(&command)?;
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
+        let status = std::fs::read_to_string(&status_path)
+            .with_context(|| format!("failed to read {}", status_path.display()))?;
+        stop_userspace_wireguard_child(&mut child, "env-test", Duration::from_secs(1)).await;
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "userspace WireGuard env test child process {pid} was left running"
+        );
+        assert_eq!(
+            status.trim(),
+            "ok",
+            "userspace WireGuard process inherited unexpected environment:\n{status}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[tokio::test]
