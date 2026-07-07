@@ -624,6 +624,16 @@ fn validate_linux_interface_name(name: &str) -> Result<(), String> {
     if name.len() > 15 {
         return Err(format!("linux interface name `{name}` exceeds 15 bytes"));
     }
+    if matches!(name, "." | "..") {
+        return Err(format!(
+            "linux interface name `{name}` must not be '.' or '..'"
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(format!(
+            "linux interface name `{name}` must not start with '-'"
+        ));
+    }
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -1999,6 +2009,8 @@ mod tests {
         let manager = DryRunLinuxRouteManager;
         let cases = [
             ("", "linux interface name cannot be empty", "10.42.0.0/16"),
+            (".", "must not be '.' or '..'", "10.42.0.0/16"),
+            ("-ipars0", "must not start with '-'", "10.42.0.0/16"),
             (
                 "bad interface",
                 "must contain only ASCII letters",

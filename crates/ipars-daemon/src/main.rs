@@ -2002,6 +2002,12 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 15 {
         anyhow::bail!("linux interface name `{name}` exceeds 15 bytes");
     }
+    if matches!(name, "." | "..") {
+        anyhow::bail!("linux interface name `{name}` must not be '.' or '..'");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("linux interface name `{name}` must not start with '-'");
+    }
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -19303,27 +19309,33 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
     #[test]
     fn runtime_preflight_validates_linux_interface_name() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from([
-            "iparsd",
-            "agent",
-            "--runtime-backend",
-            "dry-run",
-            "--wireguard-interface",
-            "invalid/name",
-        ])?;
+        for (interface, expected) in [
+            ("invalid/name", "must contain only ASCII letters"),
+            (".", "must not be '.' or '..'"),
+            ("-ipars0", "must not start with '-'"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                &format!("--wireguard-interface={interface}"),
+            ])?;
 
-        if let Command::Agent(args) = cli.command {
+            let Command::Agent(args) = cli.command else {
+                anyhow::bail!("expected agent command");
+            };
             let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
-                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Ok(()) => anyhow::bail!("unexpected successful preflight for {interface}"),
                 Err(error) => error,
             };
-            assert!(error
-                .to_string()
-                .contains("must contain only ASCII letters"));
-            return Ok(());
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error}"
+            );
         }
 
-        Err(anyhow::anyhow!("expected agent command"))
+        Ok(())
     }
 
     #[test]

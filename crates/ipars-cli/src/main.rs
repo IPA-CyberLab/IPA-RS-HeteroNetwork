@@ -4244,6 +4244,12 @@ fn validate_linux_interface_name(name: &str) -> anyhow::Result<()> {
     if name.len() > 15 {
         anyhow::bail!("linux interface name `{name}` exceeds 15 bytes");
     }
+    if matches!(name, "." | "..") {
+        anyhow::bail!("linux interface name `{name}` must not be '.' or '..'");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!("linux interface name `{name}` must not start with '-'");
+    }
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -9666,6 +9672,24 @@ mod tests {
         assert!(invalid_host_interface
             .to_string()
             .contains("linux interface name"));
+
+        for interface in [".", "..", "-docker0"] {
+            let invalid_special_interface = match docker_install_plan(DockerInstallArgs {
+                docker_host_interface: interface.to_string(),
+                ..docker_install_test_args()
+            }) {
+                Ok(_) => {
+                    anyhow::bail!("special Docker host interface {interface} should be rejected")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                invalid_special_interface
+                    .to_string()
+                    .contains("linux interface name"),
+                "unexpected error for {interface}: {invalid_special_interface}"
+            );
+        }
 
         let invalid_namespace = match docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
