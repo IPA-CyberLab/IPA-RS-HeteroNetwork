@@ -1800,6 +1800,7 @@ pub mod api {
         Kafka,
         Nats,
         Mqtt,
+        Coap,
         Amqp,
         Cassandra,
         MongoDb,
@@ -1817,7 +1818,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 73] = [
+        pub const ALL: [Self; 74] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1878,6 +1879,7 @@ pub mod api {
             Self::Kafka,
             Self::Nats,
             Self::Mqtt,
+            Self::Coap,
             Self::Amqp,
             Self::Cassandra,
             Self::MongoDb,
@@ -1955,6 +1957,7 @@ pub mod api {
                 Self::Kafka => "kafka",
                 Self::Nats => "nats",
                 Self::Mqtt => "mqtt",
+                Self::Coap => "coap",
                 Self::Amqp => "amqp",
                 Self::Cassandra => "cassandra",
                 Self::MongoDb => "mongodb",
@@ -2483,6 +2486,14 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Mqtt;
             }
+            if (self.involves_port(5683) || self.involves_port(5684))
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Coap;
+            }
             if (self.involves_port(5671) || self.involves_port(5672))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
@@ -2634,6 +2645,10 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Bfd);
             }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp)) && coap_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Coap);
+            }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
             }
@@ -2765,6 +2780,7 @@ pub mod api {
             | AgentPacketFlowApplication::Radius
             | AgentPacketFlowApplication::Memcached
             | AgentPacketFlowApplication::OpenVpn
+            | AgentPacketFlowApplication::Coap
             | AgentPacketFlowApplication::IparsRelay => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3840,6 +3856,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Turn);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"coap")
+            || tls_sni_hostname_has_label_prefix(hostname, b"coaps")
+        {
+            return Some(AgentPacketFlowApplication::Coap);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kubernetes")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-apiserver")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
@@ -4121,6 +4142,13 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"stun.turn")
         {
             return Some(AgentPacketFlowApplication::Turn);
+        }
+        if protocol.eq_ignore_ascii_case(b"coap")
+            || protocol.eq_ignore_ascii_case(b"coaps")
+            || protocol.eq_ignore_ascii_case(b"coap+tcp")
+            || protocol.eq_ignore_ascii_case(b"coaps+tcp")
+        {
+            return Some(AgentPacketFlowApplication::Coap);
         }
         if protocol.eq_ignore_ascii_case(b"kubernetes")
             || protocol.eq_ignore_ascii_case(b"kube-apiserver")
@@ -4699,6 +4727,29 @@ pub mod api {
 
     fn stun_method(message_type: u16) -> u16 {
         (message_type & 0x000f) | ((message_type & 0x00e0) >> 1) | ((message_type & 0x3e00) >> 2)
+    }
+
+    fn coap_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 {
+            return false;
+        }
+        let version = payload[0] >> 6;
+        let token_len = (payload[0] & 0x0f) as usize;
+        if version != 1 || token_len > 8 {
+            return false;
+        }
+        let Some(header_len) = 4_usize.checked_add(token_len) else {
+            return false;
+        };
+        if header_len > payload.len() {
+            return false;
+        }
+        let code_class = payload[1] >> 5;
+        let code_detail = payload[1] & 0x1f;
+        matches!(
+            (code_class, code_detail),
+            (0, 1..=5) | (2, 1..=31) | (4, 0..=31) | (5, 0..=31)
+        )
     }
 
     fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
@@ -9878,6 +9929,13 @@ mod tests {
         };
         assert_eq!(turns.application(), api::AgentPacketFlowApplication::Turn);
 
+        let coaps = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(5684),
+            ..Default::default()
+        };
+        assert_eq!(coaps.application(), api::AgentPacketFlowApplication::Coap);
+
         let wireguard = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             source_port: Some(51820),
@@ -10753,6 +10811,10 @@ mod tests {
             stun_message(0x0003)
         }
 
+        fn coap_get_request() -> Vec<u8> {
+            vec![0x40, 0x01, 0x12, 0x34]
+        }
+
         fn ipars_relay_datagram() -> Vec<u8> {
             let session_id = b"session-a";
             let token = b"token-a";
@@ -11214,6 +11276,14 @@ mod tests {
         assert_eq!(
             observation_for_udp_payload(&turn_allocate_request()).application(),
             api::AgentPacketFlowApplication::Turn
+        );
+        assert_eq!(
+            observation_for_udp_payload(&coap_get_request()).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x80, 0x01, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut malformed_stun = stun_binding_request();
         malformed_stun[4] = 0;
@@ -11795,6 +11865,14 @@ mod tests {
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_alpn(&[b"stun.turn"])).application(),
             api::AgentPacketFlowApplication::Turn
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("coaps.edge.example")).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"coap+tcp"])).application(),
+            api::AgentPacketFlowApplication::Coap
         );
         let kubernetes_sni = tls_client_hello_with_sni("kubernetes.default.svc.cluster.local");
         assert!(kubernetes_sni.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
@@ -14052,6 +14130,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint turn requires TCP or UDP protocol"));
+
+        let udp_coap_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"coap"}"#)?;
+        udp_coap_hint.validate_transport_metadata()?;
+
+        let tcp_coap_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"coap"}"#)?;
+        tcp_coap_hint.validate_transport_metadata()?;
+
+        let gre_coap_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"coap"}"#)?;
+        let error = match gre_coap_hint.validate_transport_metadata() {
+            Ok(()) => return Err("GRE CoAP hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint coap requires TCP or UDP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
