@@ -55,8 +55,9 @@ use ipars_types::api::{
     ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
     NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneMetrics, RelayStatusResponse, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -3974,15 +3975,13 @@ fn relay_dataplane_delta(
     previous: Option<&RelayDataplaneMetrics>,
 ) -> RelayDataplaneMetrics {
     let mut drops_by_reason = BTreeMap::new();
-    for (reason, current_count) in &current.drops_by_reason {
+    for reason in RelayDataplaneDropReason::ALL {
+        let current_count = current.drops_by_reason.get(&reason).copied().unwrap_or(0);
         let previous_count = previous
-            .and_then(|previous| previous.drops_by_reason.get(reason))
+            .and_then(|previous| previous.drops_by_reason.get(&reason))
             .copied()
             .unwrap_or(0);
-        let delta = current_count.saturating_sub(previous_count);
-        if delta > 0 {
-            drops_by_reason.insert(*reason, delta);
-        }
+        drops_by_reason.insert(reason, current_count.saturating_sub(previous_count));
     }
     RelayDataplaneMetrics {
         datagrams_received: counter_delta(
@@ -4018,15 +4017,13 @@ fn relay_admission_failure_reason_delta(
     previous: Option<&BTreeMap<RelayAdmissionFailureReason, u64>>,
 ) -> BTreeMap<RelayAdmissionFailureReason, u64> {
     let mut delta_by_reason = BTreeMap::new();
-    for (reason, current_count) in current {
+    for reason in RelayAdmissionFailureReason::ALL {
+        let current_count = current.get(&reason).copied().unwrap_or(0);
         let previous_count = previous
-            .and_then(|previous| previous.get(reason))
+            .and_then(|previous| previous.get(&reason))
             .copied()
             .unwrap_or(0);
-        let delta = current_count.saturating_sub(previous_count);
-        if delta > 0 {
-            delta_by_reason.insert(*reason, delta);
-        }
+        delta_by_reason.insert(reason, current_count.saturating_sub(previous_count));
     }
     delta_by_reason
 }
@@ -11344,7 +11341,7 @@ mod tests {
         AgentMetricsResponse, AgentPacketFlowApplicationCount, AgentPacketFlowClassificationCount,
         AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSourceCount,
         AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, LazyConnectMetrics,
-        PathStateCount, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+        PathStateCount, RelayAdmissionResponse, RelayDataplaneMetrics,
     };
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
@@ -12272,6 +12269,16 @@ mod tests {
                 .get(&RelayDataplaneDropReason::MalformedFrame),
             Some(&2)
         );
+        assert_eq!(
+            delta.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::UnknownSession),
+            Some(&0)
+        );
     }
 
     #[test]
@@ -12325,6 +12332,16 @@ mod tests {
                 .get(&RelayDataplaneDropReason::RateLimited),
             Some(&4)
         );
+        assert_eq!(
+            delta.drops_by_reason.len(),
+            RelayDataplaneDropReason::ALL.len()
+        );
+        assert_eq!(
+            delta
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::SessionExpired),
+            Some(&0)
+        );
     }
 
     #[test]
@@ -12346,7 +12363,11 @@ mod tests {
             delta.get(&RelayAdmissionFailureReason::InvalidSessionCredential),
             Some(&1)
         );
-        assert!(!delta.contains_key(&RelayAdmissionFailureReason::AdmissionDenied));
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&0)
+        );
+        assert_eq!(delta.len(), RelayAdmissionFailureReason::ALL.len());
     }
 
     fn agent_forwarder_metrics(
