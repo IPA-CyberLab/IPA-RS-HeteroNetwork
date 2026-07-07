@@ -79,10 +79,19 @@ services:
       - stun
       - --listen
       - 0.0.0.0:3478
+      - --http-listen
+      - 0.0.0.0:3479
     environment:
       IPARS_ROLE: stun
     ports:
       - "3478:3478/udp"
+      - "3479:3479"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3479/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
 
   relay:
     build:
@@ -175,7 +184,7 @@ services:
       signal:
         condition: service_healthy
       stun:
-        condition: service_started
+        condition: service_healthy
       relay:
         condition: service_healthy
     healthcheck:

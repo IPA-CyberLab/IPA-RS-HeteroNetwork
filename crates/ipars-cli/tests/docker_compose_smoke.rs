@@ -34,6 +34,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let relay_http_port = free_tcp_port()?;
     let agent_port = free_tcp_port()?;
     let stun_port = free_udp_port()?;
+    let stun_http_port = free_tcp_port()?;
     let relay_udp_port = free_udp_port()?;
 
     let init = generated_init_output(relay_udp_port)?;
@@ -55,6 +56,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             control_plane: control_plane_port,
             signal: signal_port,
             stun: stun_port,
+            stun_http: stun_http_port,
             relay_udp: relay_udp_port,
             relay_http: relay_http_port,
             agent: agent_port,
@@ -318,6 +320,7 @@ struct ComposeOverridePorts {
     control_plane: u16,
     signal: u16,
     stun: u16,
+    stun_http: u16,
     relay_udp: u16,
     relay_http: u16,
     agent: u16,
@@ -352,6 +355,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
   stun:
     ports:
       - "{stun_port}:3478/udp"
+      - "{stun_http_port}:3479"
 
   relay:
     cap_add: !reset []
@@ -402,6 +406,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
         control_plane_port = config.ports.control_plane,
         signal_port = config.ports.signal,
         stun_port = config.ports.stun,
+        stun_http_port = config.ports.stun_http,
         relay_udp_port = config.ports.relay_udp,
         relay_http_port = config.ports.relay_http,
         agent_port = config.ports.agent,

@@ -1300,6 +1300,17 @@ pub mod api {
         pub generated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StunMetricsResponse {
+        pub listen: SocketAddr,
+        pub binding_request_count: u64,
+        pub binding_response_count: u64,
+        pub invalid_packet_count: u64,
+        pub socket_receive_error_count: u64,
+        pub socket_send_error_count: u64,
+        pub generated_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalPathRequest {
         pub source: NodeId,

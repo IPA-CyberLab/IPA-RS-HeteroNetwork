@@ -118,6 +118,8 @@ struct InitArgs {
     signal_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:3478")]
     stun_listen: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:3479")]
+    stun_http_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:51820")]
     relay_udp_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:9580")]
@@ -968,6 +970,8 @@ fn init_daemon_specs(
                 "stun".to_string(),
                 "--listen".to_string(),
                 args.stun_listen.to_string(),
+                "--http-listen".to_string(),
+                args.stun_http_listen.to_string(),
             ],
             log_path: log_dir.join("stun.log"),
         },
@@ -5759,6 +5763,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
@@ -6395,6 +6400,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
+            stun_http_listen: SocketAddr::from(([0, 0, 0, 0], 3479)),
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
@@ -6447,6 +6453,7 @@ mod tests {
             control_plane_database_url: None,
             signal_listen: "127.0.0.1:19443".parse()?,
             stun_listen: "0.0.0.0:13478".parse()?,
+            stun_http_listen: "127.0.0.1:13479".parse()?,
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
             relay_admission_url: None,
@@ -6494,6 +6501,15 @@ mod tests {
         assert!(control_plane.command.iter().any(|value| {
             value.starts_with("sqlite://") && value.ends_with("control-plane.sqlite?mode=rwc")
         }));
+
+        let stun = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "stun")
+            .context("expected stun daemon command")?;
+        assert!(stun.command.contains(&"stun".to_string()));
+        assert!(stun.command.contains(&"0.0.0.0:13478".to_string()));
+        assert!(stun.command.contains(&"127.0.0.1:13479".to_string()));
 
         let relay = output
             .daemon_commands
@@ -7550,6 +7566,9 @@ mod tests {
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose.contains("--http-listen"));
+        assert!(compose.contains("0.0.0.0:3479"));
+        assert!(compose.contains("127.0.0.1:3479/healthz"));
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"));
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_BIND"));
         assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"));
