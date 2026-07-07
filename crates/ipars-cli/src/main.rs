@@ -578,6 +578,8 @@ struct K8sInstallArgs {
     disable_agent_startup_probe: bool,
     #[command(flatten)]
     agent_probes: K8sProbeArgs,
+    #[arg(long = "agent-pre-stop-sleep-seconds", value_parser = parse_kubernetes_positive_i32)]
+    agent_pre_stop_sleep_seconds: Option<u32>,
     #[arg(long = "agent-termination-grace-period-seconds", value_parser = parse_kubernetes_non_negative_i64)]
     agent_termination_grace_period_seconds: Option<u64>,
     #[arg(long = "agent-resource-request-cpu", value_parser = parse_kubernetes_resource_quantity)]
@@ -2528,6 +2530,10 @@ fn parse_kubernetes_positive_i32_u32(value: &str, label: &str) -> Result<u32, St
         ));
     }
     Ok(parsed)
+}
+
+fn parse_kubernetes_positive_i32(value: &str) -> Result<u32, String> {
+    parse_kubernetes_positive_i32_u32(value, "value")
 }
 
 fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
@@ -4689,7 +4695,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Chart nameOverride and fullnameOverride values map directly to Helm chart metadata and must remain Kubernetes DNS labels".to_string(),
             "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP liveness/readiness/startup probes, pod labels, annotations, priority class, scheduler/runtime class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP liveness/readiness/startup probes, preStop lifecycle sleep, pod labels, annotations, priority class, scheduler/runtime class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
@@ -5152,6 +5158,11 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     if let Some(seconds) = args.agent_termination_grace_period_seconds {
         command.push_str(&format!(
             " --set agent.terminationGracePeriodSeconds={seconds}"
+        ));
+    }
+    if let Some(seconds) = args.agent_pre_stop_sleep_seconds {
+        command.push_str(&format!(
+            " --set agent.lifecycle.preStopSleepSeconds={seconds}"
         ));
     }
     if let Some(cpu) = args.agent_resource_request_cpu.as_deref() {
@@ -6324,6 +6335,9 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
         if seconds > KUBERNETES_INT64_MAX {
             anyhow::bail!("--agent-termination-grace-period-seconds must be a non-negative int64");
         }
+    }
+    if args.agent_pre_stop_sleep_seconds == Some(0) {
+        anyhow::bail!("--agent-pre-stop-sleep-seconds must be greater than zero");
     }
     for (label, quantity) in [
         (
@@ -9673,6 +9687,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -10705,6 +10720,11 @@ mod tests {
             "ipars.validateNonNegativeInt64\" (dict \"path\" \"agent.terminationGracePeriodSeconds\""
         ));
         assert!(daemonset.contains(
+            "\"agent.lifecycle.preStopSleepSeconds\" \"value\" $agentPreStopSleepSeconds \"max\" 2147483647"
+        ));
+        assert!(daemonset
+            .contains("agent.lifecycle.preStopSleepSeconds must be greater than zero when set"));
+        assert!(daemonset.contains(
             "ipars.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
         ));
         assert!(daemonset.contains("agent.topologySpreadConstraints[%d]"));
@@ -11082,6 +11102,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -11620,6 +11641,7 @@ mod tests {
             node_taints_policy: Some("Honor".to_string()),
         }];
         args.agent_termination_grace_period_seconds = Some(45);
+        args.agent_pre_stop_sleep_seconds = Some(20);
         args.disable_agent_service_account_token = true;
         args.agent_dns_policy = Some("Default".to_string());
         args.agent_state_host_path = Some("/opt/ipars/state".to_string());
@@ -11717,6 +11739,7 @@ mod tests {
         assert!(helm.contains("--set agent.probes.readiness.enabled=false"));
         assert!(helm.contains("--set agent.probes.startup.enabled=false"));
         assert!(helm.contains("--set agent.terminationGracePeriodSeconds=45"));
+        assert!(helm.contains("--set agent.lifecycle.preStopSleepSeconds=20"));
         assert!(helm.contains("--set-string agent.resources.requests.cpu=100m"));
         assert!(helm.contains("--set-string agent.resources.requests.memory=128Mi"));
         assert!(helm.contains("--set-string agent.resources.limits.cpu=500m"));
@@ -12009,6 +12032,14 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("termination-grace-period"));
+
+        let mut invalid_pre_stop = base_k8s_install_args();
+        invalid_pre_stop.agent_pre_stop_sleep_seconds = Some(0);
+        let error = match k8s_install_plan(invalid_pre_stop) {
+            Ok(_) => panic!("zero preStop sleep should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent-pre-stop-sleep-seconds"));
 
         let mut invalid_token_automount = base_k8s_install_args();
         invalid_token_automount.disable_agent_service_account_token = true;
@@ -12548,6 +12579,8 @@ mod tests {
             "--disable-agent-startup-probe",
             "--agent-termination-grace-period-seconds",
             "45",
+            "--agent-pre-stop-sleep-seconds",
+            "20",
             "--agent-resource-request-cpu",
             "100m",
             "--agent-resource-request-memory",
@@ -12887,6 +12920,7 @@ mod tests {
             assert!(args.disable_agent_readiness_probe);
             assert!(args.disable_agent_startup_probe);
             assert_eq!(args.agent_termination_grace_period_seconds, Some(45));
+            assert_eq!(args.agent_pre_stop_sleep_seconds, Some(20));
             assert_eq!(args.agent_resource_request_cpu.as_deref(), Some("100m"));
             assert_eq!(args.agent_resource_request_memory.as_deref(), Some("128Mi"));
             assert_eq!(args.agent_resource_limit_cpu.as_deref(), Some("500m"));
@@ -13083,6 +13117,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -13250,6 +13285,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -14682,6 +14718,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -14836,6 +14873,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -15124,6 +15162,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -15283,6 +15322,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,
@@ -15437,6 +15477,7 @@ mod tests {
             disable_agent_readiness_probe: false,
             disable_agent_startup_probe: false,
             agent_probes: K8sProbeArgs::default(),
+            agent_pre_stop_sleep_seconds: None,
             agent_termination_grace_period_seconds: None,
             agent_resource_request_cpu: None,
             agent_resource_request_memory: None,

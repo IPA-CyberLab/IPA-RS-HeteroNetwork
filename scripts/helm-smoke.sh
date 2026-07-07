@@ -156,6 +156,22 @@ assert_rendered_contains pod-health-probes 'path: "/startupz"'
 assert_rendered_contains pod-health-probes "initialDelaySeconds: 0"
 assert_rendered_contains pod-health-probes "failureThreshold: 30"
 
+template_ok pod-lifecycle \
+  --set agent.lifecycle.preStopSleepSeconds=20 \
+  --set agent.terminationGracePeriodSeconds=60
+
+assert_rendered_contains pod-lifecycle "lifecycle:"
+assert_rendered_contains pod-lifecycle "preStop:"
+assert_rendered_contains pod-lifecycle "command:"
+assert_rendered_contains pod-lifecycle "- /bin/sh"
+assert_rendered_contains pod-lifecycle "- -c"
+assert_rendered_contains pod-lifecycle '- "sleep 20"'
+assert_rendered_contains pod-lifecycle "terminationGracePeriodSeconds: 60"
+
+template_fails pod-lifecycle-zero \
+  "agent.lifecycle.preStopSleepSeconds must be greater than zero when set" \
+  --set agent.lifecycle.preStopSleepSeconds=0
+
 template_fails pod-startup-probe-string-enabled \
   "agent.probes.startup.enabled must be true or false" \
   --set-string agent.probes.startup.enabled=false

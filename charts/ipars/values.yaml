@@ -59,6 +59,8 @@ agent:
       periodSeconds: 5
       timeoutSeconds: 1
       failureThreshold: 30
+  lifecycle:
+    preStopSleepSeconds: ""
   terminationGracePeriodSeconds: ""
   privileged: false
   securityContext:

@@ -88,6 +88,7 @@
 {{- $agentLivenessProbeEnabled := printf "%v" .Values.agent.probes.liveness.enabled -}}
 {{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
 {{- $agentStartupProbeEnabled := printf "%v" .Values.agent.probes.startup.enabled -}}
+{{- $agentPreStopSleepSeconds := printf "%v" .Values.agent.lifecycle.preStopSleepSeconds -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.probes.startup.enabled" "value" .Values.agent.probes.startup.enabled) -}}
@@ -336,6 +337,10 @@
 {{- if lt (int $failureThreshold) 1 -}}
 {{- fail (printf "agent.probes.%s.failureThreshold must be greater than zero" $probeName) -}}
 {{- end -}}
+{{- end -}}
+{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.lifecycle.preStopSleepSeconds" "value" $agentPreStopSleepSeconds "max" 2147483647) -}}
+{{- if eq $agentPreStopSleepSeconds "0" -}}
+{{- fail "agent.lifecycle.preStopSleepSeconds must be greater than zero when set" -}}
 {{- end -}}
 {{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
@@ -1145,6 +1150,15 @@ spec:
               memory: {{ .Values.agent.resources.limits.memory | quote }}
               {{- end }}
             {{- end }}
+          {{- end }}
+          {{- if ne $agentPreStopSleepSeconds "" }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - {{ printf "sleep %d" (int $agentPreStopSleepSeconds) | quote }}
           {{- end }}
           {{- if eq $agentLivenessProbeEnabled "true" }}
           livenessProbe:
