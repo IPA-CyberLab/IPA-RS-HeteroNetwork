@@ -36,6 +36,7 @@ const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
 const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
+const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 
 #[derive(Debug, Parser)]
@@ -2781,11 +2782,18 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let environment = docker_install_environment(&args);
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
-        "/dev/net/tun available on agent/relay hosts".to_string(),
-        "CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string(),
         "net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
     ];
+    if args.rootless {
+        prerequisites.push(
+            "Rootless Docker Engine for Compose services that cannot receive host kernel capabilities"
+                .to_string(),
+        );
+    } else {
+        prerequisites.push("/dev/net/tun available on agent/relay hosts".to_string());
+        prerequisites.push("CAP_NET_ADMIN and CAP_NET_RAW for host dataplane mutation".to_string());
+    }
     if args.rootless && args.docker_discover_networks {
         prerequisites.push(
             "Rootless Docker Engine with a reachable user Docker socket for network discovery"
@@ -2826,6 +2834,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
+        notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
         if args.userspace_wireguard_command.is_some() {
             notes.push("Rootless Docker network discovery uses the user socket, selects the userspace-command WireGuard backend, and starts the configured userspace WireGuard process before peer-map sync".to_string());
         } else {
@@ -2863,6 +2872,9 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
 
 fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
     let mut files = vec![args.compose_file.display().to_string()];
+    if args.rootless {
+        files.push(DOCKER_ROOTLESS_COMPOSE_FILE.to_string());
+    }
     if args.docker_discover_networks {
         files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
     }
@@ -7480,7 +7492,7 @@ mod tests {
         assert!(plan.commands[0].contains("docker --host"));
         assert_eq!(
             plan.commands[1],
-            "docker compose -p edge -f ops/compose.yaml -f docker/compose.docker-discovery.yaml config"
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml -f docker/compose.docker-discovery.yaml config"
         );
         assert!(plan
             .notes
@@ -7507,6 +7519,10 @@ mod tests {
             .join("../../docker/compose.docker-discovery.yaml")
             .canonicalize()?;
         let discovery_compose = std::fs::read_to_string(discovery_compose_path)?;
+        let rootless_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless.yaml")
+            .canonicalize()?;
+        let rootless_compose = std::fs::read_to_string(rootless_compose_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
@@ -7551,6 +7567,8 @@ mod tests {
         assert!(discovery_compose.contains(
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
+        assert!(rootless_compose.contains("cap_add: !reset []"));
+        assert!(rootless_compose.contains("devices: !reset []"));
         Ok(())
     }
 
@@ -8083,6 +8101,10 @@ mod tests {
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
             Some("userspace-command")
+        );
+        assert_eq!(
+            plan.commands[0],
+            "docker compose -p edge -f ops/compose.yaml -f docker/compose.rootless.yaml config"
         );
         assert!(!plan.commands[0].contains("docker --host"));
         Ok(())

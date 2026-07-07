@@ -88,6 +88,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         project_name: format!("ipars-config-{}", unique_suffix()?),
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.rootless.yaml"),
             PathBuf::from("docker/compose.docker-discovery.yaml"),
         ],
         docker_socket,
@@ -223,6 +224,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         rendered.contains("target: /run/ipars/docker.sock"),
         "rendered Docker discovery Compose config did not mount the Docker API socket"
+    );
+    anyhow::ensure!(
+        !rendered.contains("cap_add"),
+        "rendered rootless Compose config unexpectedly kept Linux capability additions"
+    );
+    anyhow::ensure!(
+        !rendered.contains("/dev/net/tun"),
+        "rendered rootless Compose config unexpectedly kept the TUN device mount"
     );
 
     let compose = ComposeProject {
