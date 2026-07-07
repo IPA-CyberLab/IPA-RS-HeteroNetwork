@@ -3,7 +3,7 @@ use std::fs;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -299,6 +299,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             "agent",
         ],
     )?;
+    assert_compose_service_apis(&compose, &ComposeApiPorts { agent: agent_port })?;
 
     Ok(())
 }
@@ -343,6 +344,10 @@ struct ComposeOverridePorts {
     stun_http: u16,
     relay_udp: u16,
     relay_http: u16,
+    agent: u16,
+}
+
+struct ComposeApiPorts {
     agent: u16,
 }
 
@@ -553,6 +558,191 @@ fn assert_compose_services_running(compose: &ComposeProject, expected: &[&str]) 
             );
         }
     }
+    Ok(())
+}
+
+fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts) -> Result<()> {
+    let control_plane_metrics = wait_for_json(
+        compose,
+        "control-plane metrics",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "node_count", 1)?;
+            ensure_json_u64_at_least(value, "vpn_pool_allocated_count", 1)?;
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        json_string_field(&control_plane_metrics, &["cluster_id"]).is_some(),
+        "control-plane metrics did not include cluster_id: {control_plane_metrics}"
+    );
+
+    wait_for_json(
+        compose,
+        "signal metrics",
+        "signal",
+        "http://127.0.0.1:9443/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "node_count", 1)?;
+            ensure_json_u64_at_least(value, "node_upsert_count", 1)?;
+            Ok(())
+        },
+    )?;
+
+    wait_for_json(
+        compose,
+        "STUN metrics",
+        "stun",
+        "http://127.0.0.1:3479/v1/metrics",
+        |value| {
+            ensure_json_string_contains(value, "listen", "3478")?;
+            ensure_json_string_contains(value, "alternate_listen", "3480")?;
+            Ok(())
+        },
+    )?;
+
+    wait_for_json(
+        compose,
+        "relay status",
+        "relay",
+        "http://127.0.0.1:9580/v1/status",
+        |value| {
+            ensure_json_string_equals(value, "relay_node", "relay-dev")?;
+            ensure_json_string_equals(value, "health", "healthy")?;
+            ensure_json_u64_at_least(value, "admission_attempt_count", 0)?;
+            Ok(())
+        },
+    )?;
+
+    wait_for_json(
+        compose,
+        "agent status",
+        "agent",
+        &format!("http://127.0.0.1:{}/v1/status", ports.agent),
+        |value| {
+            ensure_json_string_nonempty(value, "node_id")?;
+            ensure_json_string_nonempty(value, "identity_public_key")?;
+            ensure_json_string_nonempty(value, "wireguard_public_key")?;
+            let candidate_count = json_u64_field(value, "candidate_count")?;
+            let candidates = value
+                .get("candidates")
+                .and_then(Value::as_array)
+                .context("agent status missing candidates array")?;
+            anyhow::ensure!(
+                candidate_count == candidates.len() as u64,
+                "agent status candidate_count {candidate_count} did not match candidates array length {}: {value}",
+                candidates.len()
+            );
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn wait_for_json<F>(
+    compose: &ComposeProject,
+    label: &str,
+    service: &str,
+    url: &str,
+    mut validate: F,
+) -> Result<Value>
+where
+    F: FnMut(&Value) -> Result<()>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match compose_exec_json(compose, service, url).and_then(|value| {
+            validate(&value)?;
+            Ok(value)
+        }) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let error = error.to_string();
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "{label} from service {service} at {url} did not satisfy expectations: {error}\n{}",
+                        compose_diagnostics(compose)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Result<Value> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "-fsS",
+        "--max-time",
+        "5",
+        "-H",
+        "Accept: application/json",
+        url,
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose exec {service} curl {url}"))?;
+    ensure_success(
+        &format!("docker compose exec {service} curl {url}"),
+        &output,
+    )?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse JSON from docker compose exec {service} curl {url}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn ensure_json_u64_at_least(value: &Value, field: &str, minimum: u64) -> Result<()> {
+    let actual = json_u64_field(value, field)?;
+    anyhow::ensure!(
+        actual >= minimum,
+        "expected JSON field {field} to be at least {minimum}, got {actual}: {value}"
+    );
+    Ok(())
+}
+
+fn json_u64_field(value: &Value, field: &str) -> Result<u64> {
+    value.get(field).and_then(Value::as_u64).with_context(|| {
+        format!("JSON field {field} was missing or not an unsigned integer: {value}")
+    })
+}
+
+fn ensure_json_string_equals(value: &Value, field: &str, expected: &str) -> Result<()> {
+    let actual = json_string_field(value, &[field])
+        .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {field} to equal {expected:?}, got {actual:?}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_string_contains(value: &Value, field: &str, expected: &str) -> Result<()> {
+    let actual = json_string_field(value, &[field])
+        .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))?;
+    anyhow::ensure!(
+        actual.contains(expected),
+        "expected JSON field {field} to contain {expected:?}, got {actual:?}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_string_nonempty(value: &Value, field: &str) -> Result<()> {
+    let actual = json_string_field(value, &[field])
+        .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))?;
+    anyhow::ensure!(
+        !actual.is_empty(),
+        "expected JSON field {field} to be non-empty: {value}"
+    );
     Ok(())
 }
 
