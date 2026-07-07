@@ -109,6 +109,7 @@ const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -7407,12 +7408,7 @@ impl KubernetesApiRouteDiscovery {
             .or_else(default_kubernetes_service_account_ca_cert);
         let mut client = reqwest::Client::builder().default_headers(headers);
         if let Some(ca_cert_path) = ca_cert_path.as_deref() {
-            let ca = std::fs::read(ca_cert_path).with_context(|| {
-                format!(
-                    "failed to read Kubernetes CA certificate from {}",
-                    ca_cert_path.display()
-                )
-            })?;
+            let ca = read_kubernetes_ca_certificate(ca_cert_path)?;
             client = client.add_root_certificate(
                 reqwest::Certificate::from_pem(&ca)
                     .context("failed to parse Kubernetes CA certificate")?,
@@ -7595,6 +7591,53 @@ fn kubernetes_service_port(service_port: Option<&OsStr>) -> anyhow::Result<u16> 
 fn default_kubernetes_service_account_ca_cert() -> Option<PathBuf> {
     let path = PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
     path.exists().then_some(path)
+}
+
+fn read_kubernetes_ca_certificate(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open Kubernetes CA certificate from {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect Kubernetes CA certificate from {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Kubernetes CA certificate path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    ensure_kubernetes_ca_certificate_size(metadata.len(), path)?;
+
+    let mut ca = Vec::new();
+    let mut reader = file.by_ref().take(MAX_KUBERNETES_CA_CERT_BYTES + 1);
+    reader.read_to_end(&mut ca).with_context(|| {
+        format!(
+            "failed to read Kubernetes CA certificate from {}",
+            path.display()
+        )
+    })?;
+    ensure_kubernetes_ca_certificate_size(ca.len() as u64, path)?;
+    if ca.is_empty() {
+        anyhow::bail!("Kubernetes CA certificate at {} is empty", path.display());
+    }
+    Ok(ca)
+}
+
+fn ensure_kubernetes_ca_certificate_size(size: u64, path: &Path) -> anyhow::Result<()> {
+    if size > MAX_KUBERNETES_CA_CERT_BYTES {
+        anyhow::bail!(
+            "Kubernetes CA certificate file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_KUBERNETES_CA_CERT_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn read_kubernetes_service_account_token(path: &Path) -> anyhow::Result<String> {
@@ -19697,6 +19740,48 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         )?;
         let oversized_error = match read_kubernetes_service_account_token(&oversized_path) {
             Ok(_) => anyhow::bail!("oversized service account token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(oversized_error.contains("exceeds maximum size"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_ca_certificate_reader_validates_input() -> anyhow::Result<()> {
+        let base = unique_test_dir("kubernetes-ca-certificate")?;
+        let ca_path = base.join("ca.crt");
+        std::fs::write(&ca_path, b"-----BEGIN CERTIFICATE-----\nfixture\n")?;
+        assert_eq!(
+            read_kubernetes_ca_certificate(&ca_path)?,
+            b"-----BEGIN CERTIFICATE-----\nfixture\n".to_vec()
+        );
+
+        let directory = base.join("ca-dir");
+        std::fs::create_dir(&directory)?;
+        let directory_error = match read_kubernetes_ca_certificate(&directory) {
+            Ok(_) => anyhow::bail!("directory Kubernetes CA certificate should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(directory_error.contains("must resolve to a regular file"));
+
+        let empty_path = base.join("empty-ca.crt");
+        std::fs::write(&empty_path, b"")?;
+        let empty_error = match read_kubernetes_ca_certificate(&empty_path) {
+            Ok(_) => anyhow::bail!("empty Kubernetes CA certificate should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(empty_error.contains("Kubernetes CA certificate at"));
+        assert!(empty_error.contains("is empty"));
+
+        let oversized_path = base.join("oversized-ca.crt");
+        std::fs::write(
+            &oversized_path,
+            vec![b'x'; MAX_KUBERNETES_CA_CERT_BYTES as usize + 1],
+        )?;
+        let oversized_error = match read_kubernetes_ca_certificate(&oversized_path) {
+            Ok(_) => anyhow::bail!("oversized Kubernetes CA certificate should be rejected"),
             Err(error) => error.to_string(),
         };
         assert!(oversized_error.contains("exceeds maximum size"));
