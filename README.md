@@ -74,6 +74,12 @@ The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuar
 Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit and builds the repository image. The smoke generates a signed join token, verifies the bundled Compose Docker API socket render plus multi-network/rootless/relay-forwarder environment rendering, starts PostgreSQL/control-plane/signal/STUN/relay/agent with `docker compose up --wait`, and uses an agent `dry-run` runtime override so the test does not mutate host routes:
 
 ```bash
+scripts/docker-smoke.sh
+```
+
+The runner preflights `docker`, Docker daemon reachability, and the `docker compose` CLI before enabling the gated test. To invoke the test directly:
+
+```bash
 IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
 ```
 
