@@ -7119,8 +7119,18 @@ fn docker_discovered_routes(
     let mut matched_filters = BTreeSet::new();
     let mut bridge_matched_filters = BTreeSet::new();
     let mut subnet_matched_filters = BTreeSet::new();
+    let mut filter_matches = BTreeMap::<String, BTreeSet<String>>::new();
     for network in networks {
         let matching_filters = docker_network_matching_filters(network, filters);
+        if !matching_filters.is_empty() {
+            let identity = docker_network_identity(network);
+            for filter in &matching_filters {
+                filter_matches
+                    .entry((*filter).clone())
+                    .or_default()
+                    .insert(identity.clone());
+            }
+        }
         if filters.is_empty() {
             if network.driver != "bridge" {
                 continue;
@@ -7172,6 +7182,15 @@ fn docker_discovered_routes(
         }
     }
     if !requested_filters.is_empty() {
+        if let Some((filter, matches)) =
+            filter_matches.iter().find(|(_, matches)| matches.len() > 1)
+        {
+            anyhow::bail!(
+                "Docker network discovery filter `{filter}` matched multiple Docker networks: {}",
+                matches.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+
         let missing_filters = requested_filters
             .difference(&matched_filters)
             .cloned()
@@ -7214,6 +7233,14 @@ fn docker_discovered_routes(
         network_names: network_names.into_iter().collect(),
         cidrs,
     })
+}
+
+fn docker_network_identity(network: &DockerApiNetwork) -> String {
+    if network.id.is_empty() {
+        network.name.clone()
+    } else {
+        format!("{} ({})", network.name, network.id)
+    }
 }
 
 fn docker_network_matches(network: &DockerApiNetwork, filters: &[String]) -> bool {
@@ -21059,6 +21086,34 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         assert_eq!(by_id.network_names, vec!["compose_default".to_string()]);
         assert_eq!(by_id.cidrs, vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_ambiguous_network_filters() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network(
+                "compose_default",
+                "compose_extra",
+                "bridge",
+                &["172.19.0.0/16"],
+            ),
+        ];
+
+        let error = match docker_discovered_routes(&networks, &["compose_default".to_string()]) {
+            Ok(_) => anyhow::bail!("ambiguous Docker network filter should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("matched multiple Docker networks"));
+        assert!(error.contains("compose_default"));
+        assert!(error.contains("compose_extra"));
         Ok(())
     }
 
