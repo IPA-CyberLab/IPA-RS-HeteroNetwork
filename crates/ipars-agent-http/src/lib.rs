@@ -9,7 +9,8 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
-    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentPacketFlowDropReason,
+    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentPacketFlowApplication,
+    AgentPacketFlowClassification, AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource,
     AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
@@ -1037,12 +1038,12 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "# TYPE ipars_agent_packet_flow_duplicate_suppressions_by_source_total counter"
     );
-    for source_count in &metrics.packet_flow_duplicate_suppression_counts {
+    for source in AgentPacketFlowDuplicateSource::ALL {
         prometheus_line!(
             &mut body,
             "ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{node_id}\",source=\"{}\"}} {}",
-            source_count.source.as_str(),
-            source_count.count
+            source.as_str(),
+            packet_flow_duplicate_source_count(metrics, source)
         );
     }
     prometheus_line!(
@@ -1053,12 +1054,12 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "# TYPE ipars_agent_packet_flow_filtered_by_reason_total counter"
     );
-    for reason_count in &metrics.packet_flow_filtered_reason_counts {
+    for reason in AgentPacketFlowDropReason::ALL {
         prometheus_line!(
             &mut body,
             "ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{node_id}\",reason=\"{}\"}} {}",
-            reason_count.reason.as_str(),
-            reason_count.count
+            reason.as_str(),
+            packet_flow_drop_reason_count(metrics, reason)
         );
     }
     prometheus_line!(
@@ -1069,12 +1070,12 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "# TYPE ipars_agent_packet_flow_classified_by_lifecycle_total counter"
     );
-    for classification_count in &metrics.packet_flow_classification_counts {
+    for classification in AgentPacketFlowClassification::ALL {
         prometheus_line!(
             &mut body,
             "ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{node_id}\",classification=\"{}\"}} {}",
-            classification_count.classification.as_str(),
-            classification_count.count
+            classification.as_str(),
+            packet_flow_classification_count(metrics, classification)
         );
     }
     prometheus_line!(
@@ -1085,12 +1086,12 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         &mut body,
         "# TYPE ipars_agent_packet_flow_classified_by_application_total counter"
     );
-    for application_count in &metrics.packet_flow_application_counts {
+    for application in AgentPacketFlowApplication::ALL {
         prometheus_line!(
             &mut body,
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{node_id}\",application=\"{}\"}} {}",
-            application_count.application.as_str(),
-            application_count.count
+            application.as_str(),
+            packet_flow_application_count(metrics, application)
         );
     }
     prometheus_line!(
@@ -1098,15 +1099,78 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
         "# HELP ipars_agent_path_state_count Number of peer paths by selected state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_path_state_count gauge");
-    for state_count in &metrics.path_state_counts {
+    for state in [
+        PathState::DirectPublic,
+        PathState::DirectIpv6,
+        PathState::DirectNatTraversal,
+        PathState::Relay,
+        PathState::Unreachable,
+    ] {
         prometheus_line!(
             &mut body,
             "ipars_agent_path_state_count{{node_id=\"{node_id}\",state=\"{}\"}} {}",
-            path_state_label(state_count.state),
-            state_count.count
+            path_state_label(state),
+            path_state_count(metrics, state)
         );
     }
     body
+}
+
+fn packet_flow_duplicate_source_count(
+    metrics: &AgentMetricsResponse,
+    source: AgentPacketFlowDuplicateSource,
+) -> u64 {
+    metrics
+        .packet_flow_duplicate_suppression_counts
+        .iter()
+        .find(|entry| entry.source == source)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn packet_flow_drop_reason_count(
+    metrics: &AgentMetricsResponse,
+    reason: AgentPacketFlowDropReason,
+) -> u64 {
+    metrics
+        .packet_flow_filtered_reason_counts
+        .iter()
+        .find(|entry| entry.reason == reason)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn packet_flow_classification_count(
+    metrics: &AgentMetricsResponse,
+    classification: AgentPacketFlowClassification,
+) -> u64 {
+    metrics
+        .packet_flow_classification_counts
+        .iter()
+        .find(|entry| entry.classification == classification)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn packet_flow_application_count(
+    metrics: &AgentMetricsResponse,
+    application: AgentPacketFlowApplication,
+) -> u64 {
+    metrics
+        .packet_flow_application_counts
+        .iter()
+        .find(|entry| entry.application == application)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
+}
+
+fn path_state_count(metrics: &AgentMetricsResponse, state: PathState) -> usize {
+    metrics
+        .path_state_counts
+        .iter()
+        .find(|entry| entry.state == state)
+        .map(|entry| entry.count)
+        .unwrap_or(0)
 }
 
 fn path_state_label(state: PathState) -> &'static str {
@@ -1195,8 +1259,8 @@ mod tests {
         AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
         AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowMatchKind,
         AgentPacketFlowObservation, AgentRelayAdmissionFailureReason,
-        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap, RelayMap,
-        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, LazyConnectMetrics,
+        PeerMap, RelayMap, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
@@ -1230,6 +1294,88 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ))
+    }
+
+    #[test]
+    fn prometheus_metrics_zero_fill_packet_flow_and_path_labels() {
+        let node_id = NodeId::from_string("node-zero-fill");
+        let metrics = AgentMetricsResponse {
+            node_id: node_id.clone(),
+            candidate_count: 0,
+            peer_map_synced: false,
+            peer_map_peer_count: 0,
+            peer_map_route_count: 0,
+            peer_map_generated_at: None,
+            path_count: 0,
+            relay_session_count: 0,
+            relay_admission_attempt_count: 0,
+            relay_admission_success_count: 0,
+            relay_admission_failure_count: 0,
+            relay_admission_failure_reason_counts: Vec::new(),
+            relay_forwarder_count: 0,
+            relay_forwarders: Vec::new(),
+            path_change_event_count: 0,
+            path_state_counts: Vec::new(),
+            lazy_connect: LazyConnectMetrics {
+                active_peer_count: 0,
+                pinned_peer_count: 0,
+                observed_peer_vpn_ip_count: 0,
+                observed_route_peer_count: 0,
+                observed_route_count: 0,
+            },
+            path_probe_record_count: 0,
+            peer_activity_record_count: 0,
+            packet_flow_observation_count: 0,
+            packet_flow_match_count: 0,
+            packet_flow_unmatched_count: 0,
+            packet_flow_filtered_count: 0,
+            packet_flow_filtered_reason_counts: Vec::new(),
+            packet_flow_duplicate_suppression_count: 0,
+            packet_flow_duplicate_suppression_counts: Vec::new(),
+            packet_flow_classification_counts: Vec::new(),
+            packet_flow_application_counts: Vec::new(),
+            userspace_wireguard_process: None,
+            generated_at: Utc::now(),
+        };
+        let body = render_prometheus_metrics(&metrics);
+        let prometheus_node_id = prometheus_label(node_id.as_str());
+
+        for source in AgentPacketFlowDuplicateSource::ALL {
+            assert!(body.contains(&format!(
+                "ipars_agent_packet_flow_duplicate_suppressions_by_source_total{{node_id=\"{prometheus_node_id}\",source=\"{}\"}} 0",
+                source.as_str()
+            )));
+        }
+        for reason in AgentPacketFlowDropReason::ALL {
+            assert!(body.contains(&format!(
+                "ipars_agent_packet_flow_filtered_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"{}\"}} 0",
+                reason.as_str()
+            )));
+        }
+        for classification in AgentPacketFlowClassification::ALL {
+            assert!(body.contains(&format!(
+                "ipars_agent_packet_flow_classified_by_lifecycle_total{{node_id=\"{prometheus_node_id}\",classification=\"{}\"}} 0",
+                classification.as_str()
+            )));
+        }
+        for application in AgentPacketFlowApplication::ALL {
+            assert!(body.contains(&format!(
+                "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"{}\"}} 0",
+                application.as_str()
+            )));
+        }
+        for state in [
+            PathState::DirectPublic,
+            PathState::DirectIpv6,
+            PathState::DirectNatTraversal,
+            PathState::Relay,
+            PathState::Unreachable,
+        ] {
+            assert!(body.contains(&format!(
+                "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"{}\"}} 0",
+                path_state_label(state)
+            )));
+        }
     }
 
     #[derive(Clone)]
