@@ -506,6 +506,10 @@ struct K8sInstallArgs {
     agent_pod_annotations: Vec<KeyValueArg>,
     #[arg(long = "agent-priority-class", value_parser = parse_kubernetes_priority_class_name)]
     agent_priority_class: Option<String>,
+    #[arg(long = "agent-scheduler-name", value_parser = parse_kubernetes_scheduler_name)]
+    agent_scheduler_name: Option<String>,
+    #[arg(long = "agent-runtime-class", value_parser = parse_kubernetes_runtime_class_name)]
+    agent_runtime_class: Option<String>,
     #[arg(long = "agent-node-selector", value_parser = parse_kubernetes_label_pair)]
     agent_node_selectors: Vec<KeyValueArg>,
     #[arg(long = "agent-node-affinity-required", value_parser = parse_kubernetes_node_affinity_required_arg)]
@@ -2487,6 +2491,16 @@ fn parse_kubernetes_positive_i32_u32(value: &str, label: &str) -> Result<u32, St
 
 fn parse_kubernetes_priority_class_name(value: &str) -> Result<String, String> {
     validate_kubernetes_dns_subdomain(value, "priorityClassName")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_scheduler_name(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_subdomain(value, "schedulerName")?;
+    Ok(value.to_string())
+}
+
+fn parse_kubernetes_runtime_class_name(value: &str) -> Result<String, String> {
+    validate_kubernetes_dns_subdomain(value, "runtimeClassName")?;
     Ok(value.to_string())
 }
 
@@ -4634,7 +4648,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Chart nameOverride and fullnameOverride values map directly to Helm chart metadata and must remain Kubernetes DNS labels".to_string(),
             "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
-            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
+            "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, scheduler/runtime class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
             "Service type, ClusterIP/clusterIPs, NodePort, LoadBalancer class/IP, externalIPs, LoadBalancer node-port allocation, source range, traffic policy/distribution, and annotation flags map directly to the chart's agent.apiService and agent.relayService values".to_string(),
             "NetworkPolicy CIDR allowlists select the agent pods and restrict ingress to the configured agent API and relay listener ports; source IP visibility still depends on Service traffic policy and the cluster network plugin".to_string(),
@@ -4926,6 +4940,12 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     }
     if let Some(priority_class) = args.agent_priority_class.as_deref() {
         append_helm_set_string(command, "agent.priorityClassName", priority_class);
+    }
+    if let Some(scheduler_name) = args.agent_scheduler_name.as_deref() {
+        append_helm_set_string(command, "agent.schedulerName", scheduler_name);
+    }
+    if let Some(runtime_class) = args.agent_runtime_class.as_deref() {
+        append_helm_set_string(command, "agent.runtimeClassName", runtime_class);
     }
     for selector in &args.agent_node_selectors {
         append_helm_set_string(
@@ -6104,6 +6124,14 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_kubernetes_annotation_args("--agent-pod-annotation", &args.agent_pod_annotations)?;
     if let Some(priority_class) = args.agent_priority_class.as_deref() {
         validate_kubernetes_dns_subdomain(priority_class, "agent priority class")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(scheduler_name) = args.agent_scheduler_name.as_deref() {
+        validate_kubernetes_dns_subdomain(scheduler_name, "agent scheduler name")
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(runtime_class) = args.agent_runtime_class.as_deref() {
+        validate_kubernetes_dns_subdomain(runtime_class, "agent runtime class")
             .map_err(anyhow::Error::msg)?;
     }
     for selector in &args.agent_node_selectors {
@@ -9502,6 +9530,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -10150,6 +10180,8 @@ mod tests {
         assert!(values.contains("nodeAffinity:"));
         assert!(values.contains("podAffinity:"));
         assert!(values.contains("podAntiAffinity:"));
+        assert!(values.contains("schedulerName: \"\""));
+        assert!(values.contains("runtimeClassName: \"\""));
         assert!(values.contains("topologySpreadConstraints: []"));
         assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
         assert!(helpers.contains("define \"ipars.validateNodeSelectorExpression\""));
@@ -10157,6 +10189,10 @@ mod tests {
         assert!(daemonset.contains("agent.nodeAffinity.required.matchExpressions[%d]"));
         assert!(daemonset.contains("agent.podAffinity.required[%d]"));
         assert!(daemonset.contains("podAntiAffinity:"));
+        assert!(daemonset.contains("schedulerName: {{ .Values.agent.schedulerName | quote }}"));
+        assert!(
+            daemonset.contains("runtimeClassName: {{ .Values.agent.runtimeClassName | quote }}")
+        );
         assert!(daemonset.contains("preferredDuringSchedulingIgnoredDuringExecution"));
         Ok(())
     }
@@ -10895,6 +10931,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -11339,6 +11377,8 @@ mod tests {
             value: "true".to_string(),
         }];
         args.agent_priority_class = Some("ipars-agent-critical".to_string());
+        args.agent_scheduler_name = Some("ipars-scheduler".to_string());
+        args.agent_runtime_class = Some("ipars-runtime".to_string());
         args.agent_node_selectors = vec![KeyValueArg {
             key: "kubernetes.io/os".to_string(),
             value: "linux".to_string(),
@@ -11422,6 +11462,8 @@ mod tests {
         assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
         assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
         assert!(helm.contains("--set-string 'agent.nodeSelector.kubernetes\\.io/os=linux'"));
+        assert!(helm.contains("--set-string agent.schedulerName=ipars-scheduler"));
+        assert!(helm.contains("--set-string agent.runtimeClassName=ipars-runtime"));
         assert!(helm.contains(
             "--set-string 'agent.nodeAffinity.required.matchExpressions[0].key=node-role.kubernetes.io/worker'"
         ));
@@ -11690,6 +11732,22 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("agent priority class"));
+
+        let mut invalid_scheduler = base_k8s_install_args();
+        invalid_scheduler.agent_scheduler_name = Some("system/scheduler".to_string());
+        let error = match k8s_install_plan(invalid_scheduler) {
+            Ok(_) => panic!("invalid scheduler name should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent scheduler name"));
+
+        let mut invalid_runtime_class = base_k8s_install_args();
+        invalid_runtime_class.agent_runtime_class = Some("Runtime_Class".to_string());
+        let error = match k8s_install_plan(invalid_runtime_class) {
+            Ok(_) => panic!("invalid runtime class should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("agent runtime class"));
 
         let mut invalid_toleration = base_k8s_install_args();
         invalid_toleration.agent_tolerations = vec![KubernetesTolerationArg {
@@ -12233,6 +12291,10 @@ mod tests {
             "prometheus.io/scrape=true",
             "--agent-priority-class",
             "ipars-agent-critical",
+            "--agent-scheduler-name",
+            "ipars-scheduler",
+            "--agent-runtime-class",
+            "ipars-runtime",
             "--agent-node-selector",
             "kubernetes.io/os=linux",
             "--agent-node-affinity-required",
@@ -12467,6 +12529,11 @@ mod tests {
                 args.agent_priority_class.as_deref(),
                 Some("ipars-agent-critical")
             );
+            assert_eq!(
+                args.agent_scheduler_name.as_deref(),
+                Some("ipars-scheduler")
+            );
+            assert_eq!(args.agent_runtime_class.as_deref(), Some("ipars-runtime"));
             assert_eq!(
                 args.agent_node_selectors,
                 vec![KeyValueArg {
@@ -12756,6 +12823,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -12914,6 +12983,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -14337,6 +14408,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -14482,6 +14555,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -14761,6 +14836,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -14911,6 +14988,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -15056,6 +15135,8 @@ mod tests {
             agent_pod_labels: Vec::new(),
             agent_pod_annotations: Vec::new(),
             agent_priority_class: None,
+            agent_scheduler_name: None,
+            agent_runtime_class: None,
             agent_node_selectors: Vec::new(),
             agent_node_affinity_required: Vec::new(),
             agent_node_affinity_preferred: Vec::new(),
@@ -15438,6 +15519,16 @@ mod tests {
             Ok("ipars-agent-critical".to_string())
         );
         assert!(parse_kubernetes_priority_class_name("system/node-critical").is_err());
+        assert_eq!(
+            parse_kubernetes_scheduler_name("ipars-scheduler"),
+            Ok("ipars-scheduler".to_string())
+        );
+        assert!(parse_kubernetes_scheduler_name("system/scheduler").is_err());
+        assert_eq!(
+            parse_kubernetes_runtime_class_name("ipars-runtime"),
+            Ok("ipars-runtime".to_string())
+        );
+        assert!(parse_kubernetes_runtime_class_name("Runtime_Class").is_err());
         assert_eq!(
             parse_kubernetes_resource_quantity("128Mi"),
             Ok("128Mi".to_string())

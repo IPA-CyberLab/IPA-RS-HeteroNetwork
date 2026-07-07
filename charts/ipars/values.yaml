@@ -68,6 +68,8 @@ agent:
   podLabels: {}
   podAnnotations: {}
   priorityClassName: ""
+  schedulerName: ""
+  runtimeClassName: ""
   nodeSelector: {}
   nodeAffinity:
     required:

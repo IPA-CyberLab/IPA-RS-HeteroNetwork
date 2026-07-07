@@ -109,6 +109,13 @@ assert_rendered_contains name-overrides "name: fixed-ipars"
 assert_rendered_contains name-overrides "name: fixed-ipars-agent"
 assert_rendered_absent name-overrides "name: edge-ipars"
 
+template_ok pod-runtime \
+  --set-string agent.schedulerName=ipars-scheduler \
+  --set-string agent.runtimeClassName=ipars-runtime
+
+assert_rendered_contains pod-runtime 'schedulerName: "ipars-scheduler"'
+assert_rendered_contains pod-runtime 'runtimeClassName: "ipars-runtime"'
+
 template_ok node-affinity \
   --set-string 'agent.nodeAffinity.required.matchExpressions[0].key=node-role.kubernetes.io/worker' \
   --set-string 'agent.nodeAffinity.required.matchExpressions[0].operator=Exists' \
@@ -454,6 +461,14 @@ template_fails cluster-stun-endpoint-unspecified \
 template_fails name-override-invalid \
   "nameOverride \"Bad_Name\" must be a DNS label of at most 53 bytes" \
   --set-string nameOverride=Bad_Name
+
+template_fails scheduler-name-invalid \
+  "agent.schedulerName must be a Kubernetes DNS subdomain" \
+  --set-string agent.schedulerName=system/scheduler
+
+template_fails runtime-class-invalid \
+  "agent.runtimeClassName must be a Kubernetes DNS subdomain" \
+  --set-string agent.runtimeClassName=Runtime_Class
 
 template_fails node-affinity-in-without-values \
   "agent.nodeAffinity.required.matchExpressions[0].values is required when operator is In" \

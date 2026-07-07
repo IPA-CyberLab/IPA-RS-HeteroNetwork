@@ -311,6 +311,16 @@
 {{- fail "agent.priorityClassName must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
 {{- end -}}
+{{- if .Values.agent.schedulerName -}}
+{{- if or (gt (len .Values.agent.schedulerName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.schedulerName)) -}}
+{{- fail "agent.schedulerName must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.agent.runtimeClassName -}}
+{{- if or (gt (len .Values.agent.runtimeClassName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.runtimeClassName)) -}}
+{{- fail "agent.runtimeClassName must be a Kubernetes DNS subdomain" -}}
+{{- end -}}
+{{- end -}}
 {{- range $key, $value := .Values.agent.podLabels -}}
 {{- include "ipars.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
 {{- include "ipars.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
@@ -679,6 +689,12 @@ spec:
       {{- end }}
       {{- if .Values.agent.priorityClassName }}
       priorityClassName: {{ .Values.agent.priorityClassName | quote }}
+      {{- end }}
+      {{- if .Values.agent.schedulerName }}
+      schedulerName: {{ .Values.agent.schedulerName | quote }}
+      {{- end }}
+      {{- if .Values.agent.runtimeClassName }}
+      runtimeClassName: {{ .Values.agent.runtimeClassName | quote }}
       {{- end }}
       {{- with .Values.agent.nodeSelector }}
       nodeSelector:
