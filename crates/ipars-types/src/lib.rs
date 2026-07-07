@@ -2770,6 +2770,9 @@ pub mod api {
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if etcd_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Etcd);
+            }
             if jaeger_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Jaeger);
             }
@@ -2854,6 +2857,27 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn etcd_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 12] = [
+            b"/v2/keys",
+            b"/v2/machines",
+            b"/v2/members",
+            b"/v2/stats",
+            b"/v3/auth",
+            b"/v3/cluster",
+            b"/v3/election",
+            b"/v3/kv",
+            b"/v3/lease",
+            b"/v3/lock",
+            b"/v3/maintenance",
+            b"/v3/watch",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn jaeger_http_api_path(path: &[u8]) -> bool {
@@ -10277,6 +10301,18 @@ mod tests {
             )
             .application(),
             api::AgentPacketFlowApplication::OpenTelemetry
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v3/kv/range HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v2/machines HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /v3/kvs HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
             observation_for_payload(b"GET /index/_search HTTP/1.1\r\n").application(),
