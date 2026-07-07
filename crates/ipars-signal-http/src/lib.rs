@@ -111,6 +111,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     let mut body = String::new();
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_metrics_generated_timestamp_seconds Unix timestamp of the signal metrics snapshot."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_metrics_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_metrics_generated_timestamp_seconds {}",
+        metrics.generated_at.timestamp().max(0)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_nodes Number of nodes registered with the signal service."
     );
     prometheus_line!(&mut body, "# TYPE ipars_signal_nodes gauge");
@@ -637,6 +650,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("ipars_signal_metrics_generated_timestamp_seconds "));
         assert!(body.contains("ipars_signal_nodes 2"));
         assert!(body.contains("ipars_signal_stale_nat_classifications 0"));
         assert!(body.contains("ipars_signal_fresh_low_confidence_nat_classifications 0"));

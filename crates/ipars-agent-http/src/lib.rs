@@ -362,6 +362,19 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     let mut body = String::new();
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_metrics_generated_timestamp_seconds Unix timestamp of the agent metrics snapshot."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_metrics_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_metrics_generated_timestamp_seconds{{node_id=\"{node_id}\"}} {}",
+        metrics.generated_at.timestamp().max(0)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_candidates Number of endpoint candidates currently known."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_candidates gauge");
@@ -1818,6 +1831,7 @@ mod tests {
         );
         let body = axum::body::to_bytes(prometheus_response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_agent_metrics_generated_timestamp_seconds"));
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("ipars_agent_peer_map_synced"));
         assert!(body.contains("ipars_agent_peer_map_peers"));
@@ -1876,6 +1890,9 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_agent_metrics_generated_timestamp_seconds{{node_id=\"{prometheus_node_id}\"}} "
+        )));
         assert!(body.contains(&format!(
             "ipars_agent_peer_map_synced{{node_id=\"{prometheus_node_id}\"}} 1"
         )));

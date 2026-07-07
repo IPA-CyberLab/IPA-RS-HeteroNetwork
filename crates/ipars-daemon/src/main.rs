@@ -3440,6 +3440,19 @@ fn render_stun_prometheus_metrics(metrics: &StunMetricsResponse) -> String {
     let mut body = String::new();
     prometheus_line!(
         &mut body,
+        "# HELP ipars_stun_metrics_generated_timestamp_seconds Unix timestamp of the STUN metrics snapshot."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_stun_metrics_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_stun_metrics_generated_timestamp_seconds{{listen=\"{listen}\"}} {}",
+        metrics.generated_at.timestamp().max(0)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_stun_server_active STUN server process active state."
     );
     prometheus_line!(&mut body, "# TYPE ipars_stun_server_active gauge");
@@ -13003,6 +13016,7 @@ mod tests {
 
     #[test]
     fn stun_prometheus_metrics_render_all_server_counters() {
+        let generated_at = Utc::now();
         let metrics = StunMetricsResponse {
             listen: SocketAddr::from(([127, 0, 0, 1], 3478)),
             alternate_listen: Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
@@ -13011,11 +13025,15 @@ mod tests {
             invalid_packet_count: 2,
             socket_receive_error_count: 1,
             socket_send_error_count: 3,
-            generated_at: Utc::now(),
+            generated_at,
         };
 
         let rendered = render_stun_prometheus_metrics(&metrics);
 
+        assert!(rendered.contains(&format!(
+            "ipars_stun_metrics_generated_timestamp_seconds{{listen=\"127.0.0.1:3478\"}} {}",
+            generated_at.timestamp()
+        )));
         assert!(rendered.contains("ipars_stun_server_active{listen=\"127.0.0.1:3478\"} 1"));
         assert!(rendered.contains(
             "ipars_stun_rfc5780_alternate_server_active{listen=\"127.0.0.1:3478\",alternate_listen=\"127.0.0.1:3480\"} 1"

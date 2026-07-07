@@ -249,6 +249,19 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     let mut body = String::new();
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_metrics_generated_timestamp_seconds Unix timestamp of the control-plane metrics snapshot."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_metrics_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_metrics_generated_timestamp_seconds{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.generated_at.timestamp().max(0)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_nodes Number of registered nodes."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_nodes gauge");
@@ -997,6 +1010,7 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_control_plane_metrics_generated_timestamp_seconds"));
         assert!(body.contains("ipars_control_plane_nodes"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
@@ -1016,6 +1030,9 @@ mod tests {
         assert!(body.contains("ipars_control_plane_peer_map_routes_acl_denied"));
         assert!(body.contains("ipars_control_plane_node_health"));
         let prometheus_cluster_id = prometheus_label(cluster_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_control_plane_metrics_generated_timestamp_seconds{{cluster_id=\"{prometheus_cluster_id}\"}} "
+        )));
         assert!(body.contains(&format!(
             "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"DIRECT_NAT_TRAVERSAL\"}} 1"
         )));
