@@ -26,7 +26,7 @@ use ipars_types::api::{
     JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
     RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
     RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse,
-    SignalPathRequest, SignalPathResponse,
+    SignalPathRequest, SignalPathResponse, StunMetricsResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -200,6 +200,7 @@ struct LoadReport {
     control_plane_http_requests: usize,
     signal_http_requests: usize,
     relay_http_requests: usize,
+    stun_http_requests: usize,
     relay_udp_sessions: usize,
     relay_packets_per_session: usize,
     relay_payload_bytes_per_packet: usize,
@@ -302,10 +303,24 @@ struct LoadReport {
     daemon_signal_healthy_nodes: usize,
     daemon_signal_degraded_nodes: usize,
     daemon_signal_unhealthy_nodes: usize,
+    daemon_stun: DaemonStunReport,
     registration_millis: u128,
     peer_map_millis: u128,
     signal_millis: u128,
     relay_millis: u128,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DaemonStunReport {
+    metrics_endpoints: usize,
+    listen_matches_expected: bool,
+    alternate_listen_matches_expected: bool,
+    prometheus_alternate_listener_reported: bool,
+    binding_requests_reported: u64,
+    binding_responses_reported: u64,
+    invalid_packets_reported: u64,
+    socket_receive_errors_reported: u64,
+    socket_send_errors_reported: u64,
 }
 
 #[tokio::main]
@@ -722,6 +737,52 @@ impl LoadReport {
                         self.node_count
                     );
                 }
+                if self.stun_http_requests != 2 {
+                    bail!(
+                        "daemon load scenario checked {} STUN HTTP endpoints, expected 2 metrics requests",
+                        self.stun_http_requests
+                    );
+                }
+                if self.daemon_stun.metrics_endpoints != 1 {
+                    bail!(
+                        "daemon load scenario checked {} STUN metrics endpoints, expected 1",
+                        self.daemon_stun.metrics_endpoints
+                    );
+                }
+                if !self.daemon_stun.listen_matches_expected
+                    || !self.daemon_stun.alternate_listen_matches_expected
+                    || !self.daemon_stun.prometheus_alternate_listener_reported
+                {
+                    bail!(
+                        "daemon load scenario STUN listener metrics mismatch: listen={}, alternate={}, prometheus_alternate={}",
+                        self.daemon_stun.listen_matches_expected,
+                        self.daemon_stun.alternate_listen_matches_expected,
+                        self.daemon_stun.prometheus_alternate_listener_reported
+                    );
+                }
+                if self.daemon_stun.binding_requests_reported < self.node_count as u64
+                    || self.daemon_stun.binding_responses_reported < self.node_count as u64
+                    || self.daemon_stun.binding_responses_reported
+                        > self.daemon_stun.binding_requests_reported
+                {
+                    bail!(
+                        "daemon load scenario STUN binding counters mismatch: requests={}, responses={}, expected at least {} successful startup probes",
+                        self.daemon_stun.binding_requests_reported,
+                        self.daemon_stun.binding_responses_reported,
+                        self.node_count
+                    );
+                }
+                if self.daemon_stun.invalid_packets_reported != 0
+                    || self.daemon_stun.socket_receive_errors_reported != 0
+                    || self.daemon_stun.socket_send_errors_reported != 0
+                {
+                    bail!(
+                        "daemon load scenario STUN error counters are nonzero: invalid={}, recv_errors={}, send_errors={}",
+                        self.daemon_stun.invalid_packets_reported,
+                        self.daemon_stun.socket_receive_errors_reported,
+                        self.daemon_stun.socket_send_errors_reported
+                    );
+                }
                 self.validate_daemon_retained_manifest()?;
             }
         }
@@ -1106,6 +1167,11 @@ impl LoadReport {
         validate_daemon_manifest_http_endpoint(
             &manifest.relay_http_url,
             "relay HTTP URL",
+            &mut seen_http_endpoints,
+        )?;
+        validate_daemon_manifest_http_endpoint(
+            &manifest.stun_http_url,
+            "STUN HTTP URL",
             &mut seen_http_endpoints,
         )?;
         for (index, url) in manifest.agent_urls.iter().enumerate() {
@@ -1688,6 +1754,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         control_plane_http_requests: 0,
         signal_http_requests: 0,
         relay_http_requests: 0,
+        stun_http_requests: 0,
         relay_udp_sessions: 0,
         relay_packets_per_session: 0,
         relay_payload_bytes_per_packet: 0,
@@ -1790,6 +1857,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
         daemon_signal_unhealthy_nodes: 0,
+        daemon_stun: DaemonStunReport::default(),
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -1918,6 +1986,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         control_plane_http_requests: nodes.len() * 2 + scenario.relay_count + 1,
         signal_http_requests: nodes.len() + scenario.active_pair_count,
         relay_http_requests: 0,
+        stun_http_requests: 0,
         relay_udp_sessions: 0,
         relay_packets_per_session: 0,
         relay_payload_bytes_per_packet: 0,
@@ -2020,6 +2089,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
         daemon_signal_unhealthy_nodes: 0,
+        daemon_stun: DaemonStunReport::default(),
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -2122,6 +2192,7 @@ async fn run_relay_udp_scenario(
         control_plane_http_requests: 0,
         signal_http_requests: 0,
         relay_http_requests: scenario.active_pair_count + 2,
+        stun_http_requests: 0,
         relay_udp_sessions: status.capability.active_sessions as usize,
         relay_packets_per_session: options.packets_per_session,
         relay_payload_bytes_per_packet: options.payload_bytes,
@@ -2224,6 +2295,7 @@ async fn run_relay_udp_scenario(
         daemon_signal_healthy_nodes: 0,
         daemon_signal_degraded_nodes: 0,
         daemon_signal_unhealthy_nodes: 0,
+        daemon_stun: DaemonStunReport::default(),
         registration_millis: 0,
         peer_map_millis: 0,
         signal_millis: 0,
@@ -2454,6 +2526,24 @@ async fn run_daemon_scenario(
         "daemon signal metrics",
     )
     .await?;
+    let stun_metrics: StunMetricsResponse = get_json(
+        &client,
+        format!("{}/v1/metrics", services.stun_http_url),
+        "daemon STUN metrics",
+    )
+    .await?;
+    let stun_prometheus = get_text(
+        &client,
+        format!("{}/metrics", services.stun_http_url),
+        "daemon STUN Prometheus metrics",
+    )
+    .await?;
+    let daemon_stun = daemon_stun_report(
+        &stun_metrics,
+        &stun_prometheus,
+        services.stun_addr,
+        services.stun_alternate_addr,
+    );
     services.ensure_running(DaemonRuntimePhase::FinalMetrics)?;
     let daemon_relay_count = daemon_relay_agent_count(scenario, agent_processes);
     let daemon_route_provider_count = daemon_route_provider_agent_count(scenario, agent_processes);
@@ -2670,6 +2760,7 @@ async fn run_daemon_scenario(
         control_plane_http_requests,
         signal_http_requests: peer_records.len() + active_pair_count + 1,
         relay_http_requests: active_pair_count + 2,
+        stun_http_requests: 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
         relay_packets_per_session: relay_options.packets_per_session,
         relay_payload_bytes_per_packet: relay_options.payload_bytes,
@@ -2782,6 +2873,7 @@ async fn run_daemon_scenario(
         daemon_signal_healthy_nodes: signal_metrics.healthy_node_count,
         daemon_signal_degraded_nodes: signal_metrics.degraded_node_count,
         daemon_signal_unhealthy_nodes: signal_metrics.unhealthy_node_count,
+        daemon_stun,
         registration_millis,
         peer_map_millis,
         signal_millis,
@@ -3206,6 +3298,9 @@ struct DaemonProcessGroup {
     signal_url: String,
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
+    stun_http_url: String,
+    stun_addr: SocketAddr,
+    stun_alternate_addr: SocketAddr,
     agent_urls: Vec<String>,
     runtime_dir: PathBuf,
     manifest_seed: DaemonRuntimeManifestSeed,
@@ -3245,6 +3340,7 @@ struct DaemonRuntimeManifest {
     control_plane_urls: Vec<String>,
     signal_url: String,
     relay_http_url: String,
+    stun_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_addr: SocketAddr,
     stun_alternate_addr: SocketAddr,
@@ -3326,6 +3422,7 @@ struct DaemonRuntimeManifestSeed {
     control_plane_urls: Vec<String>,
     signal_url: String,
     relay_http_url: String,
+    stun_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_addr: SocketAddr,
     stun_alternate_addr: SocketAddr,
@@ -3363,6 +3460,7 @@ impl DaemonRuntimeManifestSeed {
                 control_plane_urls: self.control_plane_urls.clone(),
                 signal_url: self.signal_url.clone(),
                 relay_http_url: self.relay_http_url.clone(),
+                stun_http_url: self.stun_http_url.clone(),
                 relay_udp_addr: self.relay_udp_addr,
                 stun_addr: self.stun_addr,
                 stun_alternate_addr: self.stun_alternate_addr,
@@ -3436,6 +3534,7 @@ impl DaemonProcessGroup {
         let control_addrs = reserve_tcp_addrs(options.control_plane_processes).await?;
         let signal_addr = reserve_tcp_addr().await?;
         let relay_http_addr = reserve_tcp_addr().await?;
+        let stun_http_addr = reserve_tcp_addr().await?;
         let relay_udp_addr = reserve_udp_addr().await?;
         let stun_addr = reserve_udp_addr().await?;
         let stun_alternate_addr = reserve_udp_addr().await?;
@@ -3448,6 +3547,7 @@ impl DaemonProcessGroup {
             .context("at least one daemon control-plane URL is required")?;
         let signal_url = format!("http://{signal_addr}");
         let relay_http_url = format!("http://{relay_http_addr}");
+        let stun_http_url = format!("http://{stun_http_addr}");
         let mut agent_urls = Vec::with_capacity(options.agent_processes);
         let manifest_seed = DaemonRuntimeManifestSeed {
             scenario: scenario.name,
@@ -3468,6 +3568,7 @@ impl DaemonProcessGroup {
             control_plane_urls: control_plane_urls.clone(),
             signal_url: signal_url.clone(),
             relay_http_url: relay_http_url.clone(),
+            stun_http_url: stun_http_url.clone(),
             relay_udp_addr,
             stun_addr,
             stun_alternate_addr,
@@ -3565,7 +3666,7 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.children,
         )?;
-        let stun_args = daemon_stun_args(stun_addr, stun_alternate_addr);
+        let stun_args = daemon_stun_args(stun_addr, stun_alternate_addr, stun_http_addr);
         startup.children.push(spawn_iparsd(
             &manifest_seed.iparsd_binary.path,
             &stun_args,
@@ -3595,6 +3696,19 @@ impl DaemonProcessGroup {
             &client,
             format!("{relay_http_url}/healthz"),
             "relay",
+            &mut startup.children,
+            DaemonHttpReadinessManifestContext {
+                manifest_seed: &manifest_seed,
+                phase: DaemonRuntimePhase::ServiceStartup,
+                agent_urls: &agent_urls,
+                timeout: options.http_readiness_timeout,
+            },
+        )
+        .await?;
+        wait_for_http_ok_or_manifest_failure(
+            &client,
+            format!("{stun_http_url}/healthz"),
+            "stun",
             &mut startup.children,
             DaemonHttpReadinessManifestContext {
                 manifest_seed: &manifest_seed,
@@ -3730,6 +3844,9 @@ impl DaemonProcessGroup {
             signal_url,
             relay_http_url,
             relay_udp_addr,
+            stun_http_url,
+            stun_addr,
+            stun_alternate_addr,
             agent_urls,
             runtime_dir,
             manifest_seed,
@@ -3910,13 +4027,19 @@ impl Drop for DaemonStartupGuard {
     }
 }
 
-fn daemon_stun_args(stun_addr: SocketAddr, stun_alternate_addr: SocketAddr) -> Vec<String> {
+fn daemon_stun_args(
+    stun_addr: SocketAddr,
+    stun_alternate_addr: SocketAddr,
+    stun_http_addr: SocketAddr,
+) -> Vec<String> {
     vec![
         "stun".to_string(),
         "--listen".to_string(),
         stun_addr.to_string(),
         "--alternate-listen".to_string(),
         stun_alternate_addr.to_string(),
+        "--http-listen".to_string(),
+        stun_http_addr.to_string(),
     ]
 }
 
@@ -5754,6 +5877,29 @@ fn prometheus_metric_u64(body: &str, metric_name: &str) -> anyhow::Result<u64> {
     bail!("metric {metric_name} was not present in relay metrics response")
 }
 
+fn daemon_stun_report(
+    metrics: &StunMetricsResponse,
+    prometheus: &str,
+    expected_listen: SocketAddr,
+    expected_alternate_listen: SocketAddr,
+) -> DaemonStunReport {
+    let expected_alternate_label = format!("alternate_listen=\"{expected_alternate_listen}\"");
+    DaemonStunReport {
+        metrics_endpoints: 1,
+        listen_matches_expected: metrics.listen == expected_listen,
+        alternate_listen_matches_expected: metrics.alternate_listen
+            == Some(expected_alternate_listen),
+        prometheus_alternate_listener_reported: prometheus
+            .contains("ipars_stun_rfc5780_alternate_server_active")
+            && prometheus.contains(&expected_alternate_label),
+        binding_requests_reported: metrics.binding_request_count,
+        binding_responses_reported: metrics.binding_response_count,
+        invalid_packets_reported: metrics.invalid_packet_count,
+        socket_receive_errors_reported: metrics.socket_receive_error_count,
+        socket_send_errors_reported: metrics.socket_send_error_count,
+    }
+}
+
 fn relay_payload(pair_index: usize, packet_index: usize, payload_bytes: usize) -> Vec<u8> {
     let mut payload = vec![0_u8; payload_bytes];
     for (offset, byte) in payload.iter_mut().enumerate() {
@@ -6246,6 +6392,34 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("relay candidate mismatch"));
+
+        let mut missing_daemon_stun_metrics = daemon_report.clone();
+        missing_daemon_stun_metrics.daemon_stun.metrics_endpoints = 0;
+        let error = match missing_daemon_stun_metrics.validate_success() {
+            Ok(_) => bail!("daemon report with missing STUN metrics should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("STUN metrics endpoints"));
+
+        let mut missing_daemon_stun_probe = daemon_report.clone();
+        missing_daemon_stun_probe
+            .daemon_stun
+            .binding_responses_reported = 0;
+        let error = match missing_daemon_stun_probe.validate_success() {
+            Ok(_) => bail!("daemon report with missing STUN probes should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("STUN binding counters"));
+
+        let mut missing_daemon_stun_alternate = daemon_report.clone();
+        missing_daemon_stun_alternate
+            .daemon_stun
+            .prometheus_alternate_listener_reported = false;
+        let error = match missing_daemon_stun_alternate.validate_success() {
+            Ok(_) => bail!("daemon report without STUN alternate listener should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("STUN listener metrics"));
 
         let mut retained_manifest = daemon_report.clone();
         let (retained_runtime_dir, retained_manifest_path) =
@@ -7993,8 +8167,9 @@ mod tests {
     fn daemon_stun_args_enable_rfc5780_alternate_listener() {
         let stun_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34_780);
         let stun_alternate_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34_781);
+        let stun_http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34_782);
 
-        let args = daemon_stun_args(stun_addr, stun_alternate_addr);
+        let args = daemon_stun_args(stun_addr, stun_alternate_addr, stun_http_addr);
 
         assert_eq!(
             args,
@@ -8004,6 +8179,8 @@ mod tests {
                 "127.0.0.1:34780".to_string(),
                 "--alternate-listen".to_string(),
                 "127.0.0.1:34781".to_string(),
+                "--http-listen".to_string(),
+                "127.0.0.1:34782".to_string(),
             ]
         );
     }
@@ -8910,6 +9087,16 @@ mod tests {
         assert!(report.daemon_signal_healthy_nodes >= 2);
         assert_eq!(report.daemon_signal_degraded_nodes, 0);
         assert_eq!(report.daemon_signal_unhealthy_nodes, 0);
+        assert_eq!(report.stun_http_requests, 2);
+        assert_eq!(report.daemon_stun.metrics_endpoints, 1);
+        assert!(report.daemon_stun.listen_matches_expected);
+        assert!(report.daemon_stun.alternate_listen_matches_expected);
+        assert!(report.daemon_stun.prometheus_alternate_listener_reported);
+        assert!(report.daemon_stun.binding_requests_reported >= report.node_count as u64);
+        assert!(report.daemon_stun.binding_responses_reported >= report.node_count as u64);
+        assert_eq!(report.daemon_stun.invalid_packets_reported, 0);
+        assert_eq!(report.daemon_stun.socket_receive_errors_reported, 0);
+        assert_eq!(report.daemon_stun.socket_send_errors_reported, 0);
         assert_eq!(report.relay_udp_packets_sent, report.active_pair_count);
         assert_eq!(report.relay_udp_packets_received, report.active_pair_count);
         assert_eq!(
@@ -9026,6 +9213,18 @@ mod tests {
         report.relay_e2e_only_reported = true;
         report.relay_admission_attempts_reported = report.active_pair_count as u64;
         report.relay_admission_successes_reported = report.active_pair_count as u64;
+        report.stun_http_requests = 2;
+        report.daemon_stun = DaemonStunReport {
+            metrics_endpoints: 1,
+            listen_matches_expected: true,
+            alternate_listen_matches_expected: true,
+            prometheus_alternate_listener_reported: true,
+            binding_requests_reported: report.node_count as u64,
+            binding_responses_reported: report.node_count as u64,
+            invalid_packets_reported: 0,
+            socket_receive_errors_reported: 0,
+            socket_send_errors_reported: 0,
+        };
         report.daemon_processes = 8;
         report.daemon_http_readiness_timeout_seconds = 5;
         report.daemon_agent_readiness_timeout_seconds = 15;
@@ -9285,6 +9484,9 @@ mod tests {
             signal_url: "http://127.0.0.1:1".to_string(),
             relay_http_url: "http://127.0.0.1:1".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            stun_http_url: "http://127.0.0.1:1".to_string(),
+            stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2),
             agent_urls: Vec::new(),
             runtime_dir,
             manifest_seed,
@@ -9303,6 +9505,7 @@ mod tests {
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
             relay_http_url: "http://127.0.0.1:31003".to_string(),
+            stun_http_url: "http://127.0.0.1:31004".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
             stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31007),
@@ -9325,6 +9528,7 @@ mod tests {
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
             relay_http_url: "http://127.0.0.1:31003".to_string(),
+            stun_http_url: "http://127.0.0.1:31004".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31004),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31005),
             stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31007),
@@ -9463,6 +9667,7 @@ mod tests {
                 .collect(),
             signal_url: "http://127.0.0.1:32000".to_string(),
             relay_http_url: "http://127.0.0.1:32001".to_string(),
+            stun_http_url: "http://127.0.0.1:32002".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_002),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_003),
             stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_004),
