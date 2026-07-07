@@ -313,6 +313,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
     )?;
     assert_compose_service_apis(&compose, &ComposeApiPorts { agent: agent_port })?;
+    assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
 
@@ -654,6 +655,57 @@ fn assert_compose_service_apis(compose: &ComposeProject, ports: &ComposeApiPorts
                 "agent status candidate_count {candidate_count} did not match candidates array length {}: {value}",
                 candidates.len()
             );
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn assert_compose_stun_dataplane(compose: &ComposeProject) -> Result<()> {
+    let primary = compose_exec_ipars_json(
+        compose,
+        "stun",
+        &[
+            "stun",
+            "probe",
+            "--stun-server",
+            "127.0.0.1:3478",
+            "--local-bind",
+            "127.0.0.1:0",
+        ],
+        "STUN primary UDP probe",
+    )?;
+    ensure_json_string_equals(&primary, "stun_server", "127.0.0.1:3478")?;
+    ensure_json_string_nonempty(&primary, "local_addr")?;
+    ensure_json_string_nonempty(&primary, "reflexive_addr")?;
+
+    let alternate = compose_exec_ipars_json(
+        compose,
+        "stun",
+        &[
+            "stun",
+            "probe",
+            "--stun-server",
+            "127.0.0.1:3480",
+            "--local-bind",
+            "127.0.0.1:0",
+        ],
+        "STUN alternate UDP probe",
+    )?;
+    ensure_json_string_equals(&alternate, "stun_server", "127.0.0.1:3480")?;
+    ensure_json_string_nonempty(&alternate, "local_addr")?;
+    ensure_json_string_nonempty(&alternate, "reflexive_addr")?;
+
+    wait_for_json(
+        compose,
+        "STUN metrics after UDP probes",
+        "stun",
+        "http://127.0.0.1:3479/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "binding_request_count", 2)?;
+            ensure_json_u64_at_least(value, "binding_response_count", 2)?;
+            ensure_json_u64_equals(value, "socket_send_error_count", 0)?;
             Ok(())
         },
     )?;

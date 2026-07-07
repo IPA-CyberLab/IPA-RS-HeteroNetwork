@@ -95,6 +95,7 @@ ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path status --agent-url http://127.0.0.1:9780
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret>
+ipars stun probe --stun-server 127.0.0.1:3478
 ```
 
 Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.

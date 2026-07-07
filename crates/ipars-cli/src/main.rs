@@ -9,6 +9,7 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
+use ipars_stun::UdpStunProbe;
 use ipars_types::api::{
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
@@ -19,7 +20,8 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
-    NodeId, PathMetrics, PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
+    NatProbeObservation, NodeId, PathMetrics, PathState, Role, Route, SignedJoinToken, Tag,
+    TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -40,6 +42,7 @@ const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
 const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
 const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
 const DEFAULT_LOCAL_RELAY_UDP: &str = "127.0.0.1:51820";
+const DEFAULT_LOCAL_STUN_UDP: &str = "127.0.0.1:3478";
 const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
 const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -80,6 +83,10 @@ enum Command {
     Relay {
         #[command(subcommand)]
         command: RelayCommand,
+    },
+    Stun {
+        #[command(subcommand)]
+        command: StunCommand,
     },
     Path {
         #[command(subcommand)]
@@ -270,6 +277,19 @@ struct RelayProbeArgs {
     payload: String,
     #[arg(long, default_value_t = DEFAULT_RELAY_PROBE_TIMEOUT_MS)]
     timeout_ms: u64,
+}
+
+#[derive(Debug, Subcommand)]
+enum StunCommand {
+    Probe(StunProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct StunProbeArgs {
+    #[arg(long, env = "IPARS_STUN_SERVER", default_value = DEFAULT_LOCAL_STUN_UDP)]
+    stun_server: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:0")]
+    local_bind: SocketAddr,
 }
 
 #[derive(Debug, Subcommand)]
@@ -984,6 +1004,9 @@ async fn main() -> anyhow::Result<()> {
                 None => print_json(&relay_status(defaulted_relay_url(None)).await?)?,
             },
             RelayCommand::Probe(args) => print_json(&relay_probe(args).await?)?,
+        },
+        Command::Stun { command } => match command {
+            StunCommand::Probe(args) => print_json(&stun_probe(args).await?)?,
         },
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
@@ -1874,6 +1897,31 @@ async fn agent_routes(agent_url: &str) -> anyhow::Result<RoutesOutput> {
 
 async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
     get_json(relay_url, "/v1/status", "relay status").await
+}
+
+async fn stun_probe(args: StunProbeArgs) -> anyhow::Result<NatProbeObservation> {
+    validate_stun_probe_args(&args)?;
+    UdpStunProbe
+        .observe_binding(args.local_bind, args.stun_server)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to complete STUN Binding probe from {} to {}",
+                args.local_bind, args.stun_server
+            )
+        })
+}
+
+fn validate_stun_probe_args(args: &StunProbeArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        endpoint_addr_is_usable(args.stun_server),
+        "--stun-server must be a usable UDP socket address"
+    );
+    anyhow::ensure!(
+        !args.local_bind.ip().is_multicast(),
+        "--local-bind must not use a multicast address"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -8927,6 +8975,7 @@ fi
             "http://127.0.0.1:9580/v1/status"
         );
         assert_eq!(DEFAULT_LOCAL_RELAY_UDP, "127.0.0.1:51820");
+        assert_eq!(DEFAULT_LOCAL_STUN_UDP, "127.0.0.1:3478");
         Ok(())
     }
 
@@ -9527,6 +9576,59 @@ fi
         assert!(error
             .to_string()
             .contains("--relay-admission-bearer-token must not contain whitespace"));
+        Ok(())
+    }
+
+    #[test]
+    fn stun_probe_args_build_udp_probe() -> anyhow::Result<()> {
+        let stun = Cli::try_parse_from([
+            "ipars",
+            "stun",
+            "probe",
+            "--stun-server",
+            "127.0.0.1:3478",
+            "--local-bind",
+            "0.0.0.0:0",
+        ])?;
+        let Command::Stun {
+            command: StunCommand::Probe(args),
+        } = stun.command
+        else {
+            anyhow::bail!("expected stun probe command");
+        };
+
+        assert_eq!(args.stun_server, "127.0.0.1:3478".parse()?);
+        assert_eq!(args.local_bind, "0.0.0.0:0".parse()?);
+        validate_stun_probe_args(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stun_probe_rejects_unusable_server_and_multicast_bind() -> anyhow::Result<()> {
+        let stun =
+            Cli::try_parse_from(["ipars", "stun", "probe", "--stun-server", "0.0.0.0:3478"])?;
+        let Command::Stun {
+            command: StunCommand::Probe(mut args),
+        } = stun.command
+        else {
+            anyhow::bail!("expected stun probe command");
+        };
+
+        let error = match validate_stun_probe_args(&args) {
+            Ok(_) => anyhow::bail!("unusable STUN server should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--stun-server must be a usable"));
+
+        args.stun_server = "127.0.0.1:3478".parse()?;
+        args.local_bind = "224.0.0.1:0".parse()?;
+        let error = match validate_stun_probe_args(&args) {
+            Ok(_) => anyhow::bail!("multicast local bind should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--local-bind must not use a multicast"));
         Ok(())
     }
 
