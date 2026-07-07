@@ -33,6 +33,8 @@ const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
+const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -887,7 +889,7 @@ async fn main() -> anyhow::Result<()> {
                 (None, Some(control_plane_url)) => {
                     print_json(&control_plane_status(control_plane_url).await?)?
                 }
-                (None, None) => print_json(&StaticStatus::status())?,
+                (None, None) => print_json(&agent_status(defaulted_agent_url(None)).await?)?,
                 (Some(_), Some(_)) => unreachable!("clap prevents conflicting status URLs"),
             }
         }
@@ -913,7 +915,7 @@ async fn main() -> anyhow::Result<()> {
             command: RelayCommand::Status(args),
         } => match args.relay_url.as_deref() {
             Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
-            None => print_json(&StaticStatus::relay())?,
+            None => print_json(&relay_status(defaulted_relay_url(None)).await?)?,
         },
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
@@ -924,20 +926,14 @@ async fn main() -> anyhow::Result<()> {
                 None if args.node_id.is_some() => {
                     anyhow::bail!("ipars path status requires --control-plane-url with --node-id")
                 }
-                None => print_json(&StaticStatus::path())?,
+                None => print_json(&path_status(defaulted_agent_url(None)).await?)?,
             },
             PathCommand::Activity(args) => {
-                let agent_url = args
-                    .agent_url
-                    .as_deref()
-                    .context("ipars path activity requires --agent-url or IPARS_AGENT_URL")?;
+                let agent_url = defaulted_agent_url(args.agent_url.as_deref());
                 print_json(&path_activity(agent_url, &args).await?)?
             }
             PathCommand::Probe(args) => {
-                let agent_url = args
-                    .agent_url
-                    .as_deref()
-                    .context("ipars path probe requires --agent-url or IPARS_AGENT_URL")?;
+                let agent_url = defaulted_agent_url(args.agent_url.as_deref());
                 print_json(&path_probe(agent_url, &args).await?)?
             }
         },
@@ -1639,6 +1635,14 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
 
 async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
     get_json(agent_url, "/v1/status", "agent status").await
+}
+
+fn defaulted_agent_url(agent_url: Option<&str>) -> &str {
+    agent_url.unwrap_or(DEFAULT_LOCAL_AGENT_URL)
+}
+
+fn defaulted_relay_url(relay_url: Option<&str>) -> &str {
+    relay_url.unwrap_or(DEFAULT_LOCAL_RELAY_URL)
 }
 
 #[derive(Debug, Serialize)]
@@ -7187,14 +7191,6 @@ struct StaticStatus<'a> {
 }
 
 impl StaticStatus<'static> {
-    fn status() -> Self {
-        Self {
-            subsystem: "agent",
-            status: "not_connected",
-            detail: "daemon RPC wiring is the next implementation milestone",
-        }
-    }
-
     fn peers() -> Self {
         Self {
             subsystem: "peer_map",
@@ -7208,22 +7204,6 @@ impl StaticStatus<'static> {
             subsystem: "routes",
             status: "empty",
             detail: "routes are installed by the route-manager daemon",
-        }
-    }
-
-    fn relay() -> Self {
-        Self {
-            subsystem: "relay",
-            status: "not_running",
-            detail: "relay daemon wiring is the next implementation milestone",
-        }
-    }
-
-    fn path() -> Self {
-        Self {
-            subsystem: "path_state",
-            status: "empty",
-            detail: "path state is created lazily on first flow or pinned peer",
         }
     }
 }
@@ -8220,6 +8200,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must not include a query or fragment"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_status_defaults_match_daemon_http_listeners() -> anyhow::Result<()> {
+        assert_eq!(defaulted_agent_url(None), "http://127.0.0.1:9780");
+        assert_eq!(
+            defaulted_agent_url(Some("http://127.0.0.1:19780")),
+            "http://127.0.0.1:19780"
+        );
+        assert_eq!(
+            api_url(defaulted_agent_url(None), "/v1/status", "agent status")?,
+            "http://127.0.0.1:9780/v1/status"
+        );
+        assert_eq!(defaulted_relay_url(None), "http://127.0.0.1:9580");
+        assert_eq!(
+            defaulted_relay_url(Some("http://127.0.0.1:19580")),
+            "http://127.0.0.1:19580"
+        );
+        assert_eq!(
+            api_url(defaulted_relay_url(None), "/v1/status", "relay status")?,
+            "http://127.0.0.1:9580/v1/status"
+        );
         Ok(())
     }
 
