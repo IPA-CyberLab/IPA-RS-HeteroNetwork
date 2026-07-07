@@ -45,6 +45,9 @@ const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
 const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
+const DOCKER_NETWORK_DRIVER_TEMPLATE: &str = "'{{.Driver}}'";
+const DOCKER_NETWORK_SUBNETS_TEMPLATE: &str =
+    "'{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}} {{end}}{{end}}'";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars")]
@@ -3955,8 +3958,20 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
     } else {
         "docker_socket=/var/run/docker.sock".to_string()
     };
-    format!(
+    let mut command = format!(
         "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+    );
+    for network in &args.docker_networks {
+        command.push_str("; ");
+        command.push_str(&docker_network_filter_preflight_command(network));
+    }
+    command
+}
+
+fn docker_network_filter_preflight_command(network: &str) -> String {
+    let network = shell_word(network);
+    format!(
+        "docker_network={network}; docker_network_driver=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_DRIVER_TEMPLATE} 2>/dev/null) || {{ echo \"Docker network filter $docker_network was not found\" >&2; exit 1; }}; if [ \"$docker_network_driver\" != \"bridge\" ]; then echo \"Docker network filter $docker_network is not a bridge network\" >&2; exit 1; fi; docker_network_subnets=$(docker --host \"unix://$docker_socket\" network inspect \"$docker_network\" --format {DOCKER_NETWORK_SUBNETS_TEMPLATE} 2>/dev/null) || exit 1; if [ -z \"$docker_network_subnets\" ]; then echo \"Docker network filter $docker_network has no IPAM subnets\" >&2; exit 1; fi"
     )
 }
 
@@ -9468,6 +9483,32 @@ mod tests {
         assert!(plan.commands[0]
             .contains("Docker API socket path must be an absolute Unix socket path"));
         assert!(plan.commands[0].contains("docker --host \"unix://$docker_socket\""));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_preflights_requested_docker_networks() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string(), "edge_backend".to_string()],
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
+            Some("edge_default,edge_backend")
+        );
+        assert!(plan.commands[0].contains("docker_network=edge_default"));
+        assert!(plan.commands[0].contains("docker_network=edge_backend"));
+        assert!(
+            plan.commands[0].contains("network inspect \"$docker_network\" --format '{{.Driver}}'")
+        );
+        assert!(plan.commands[0].contains(
+            "network inspect \"$docker_network\" --format '{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}} {{end}}{{end}}'"
+        ));
+        assert!(plan.commands[0].contains("was not found"));
+        assert!(plan.commands[0].contains("is not a bridge network"));
+        assert!(plan.commands[0].contains("has no IPAM subnets"));
         Ok(())
     }
 
