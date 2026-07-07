@@ -6557,23 +6557,50 @@ pub mod api {
     }
 
     fn postgres_frontend_message_payload(payload: &[u8]) -> bool {
-        if payload.len() < 5 {
-            return false;
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            match postgres_frontend_message_frame(payload, offset) {
+                Some(PostgresFrontendMessageParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(PostgresFrontendMessageParse::Incomplete) => {
+                    return frame_count > 0
+                        && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+                }
+                None => return false,
+            }
         }
-        let Some(length) = read_u32_be(payload, 1).map(|length| length as usize) else {
-            return false;
-        };
+        frame_count > 0
+    }
+
+    enum PostgresFrontendMessageParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn postgres_frontend_message_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<PostgresFrontendMessageParse> {
+        if payload.len().saturating_sub(offset) < 5 {
+            return Some(PostgresFrontendMessageParse::Incomplete);
+        }
+        let tag = *payload.get(offset)?;
+        let length = read_u32_be(payload, offset.checked_add(1)?).map(|length| length as usize)?;
         if !(4..=10_000).contains(&length) {
-            return false;
+            return None;
         }
-        let Some(frame_end) = 1_usize.checked_add(length) else {
-            return false;
-        };
-        let Some(frame) = payload.get(..frame_end) else {
-            return false;
+        let frame_end = offset.checked_add(1)?.checked_add(length)?;
+        let Some(frame) = payload.get(offset..frame_end) else {
+            return Some(PostgresFrontendMessageParse::Incomplete);
         };
         let body = &frame[5..];
-        match payload[0] {
+        let valid = match tag {
             b'Q' => postgres_query_message_payload(body),
             b'P' => postgres_parse_message_payload(body),
             b'B' => postgres_bind_message_payload(body),
@@ -6582,7 +6609,8 @@ pub mod api {
             b'p' => postgres_password_message_payload(body),
             b'H' | b'S' | b'X' => body.is_empty(),
             _ => false,
-        }
+        };
+        valid.then_some(PostgresFrontendMessageParse::Complete(frame_end))
     }
 
     fn postgres_query_message_payload(body: &[u8]) -> bool {
@@ -13843,6 +13871,18 @@ mod tests {
             ))
             .application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+        let mut postgres_query_then_sync = postgres_frontend_message(b'Q', b"SELECT 1\0");
+        postgres_query_then_sync.extend_from_slice(&postgres_frontend_message(b'S', b""));
+        assert_eq!(
+            observation_for_payload(&postgres_query_then_sync).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let mut postgres_query_with_trailing_junk = postgres_frontend_message(b'Q', b"SELECT 1\0");
+        postgres_query_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&postgres_query_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&postgres_frontend_message(b'Q', b"hello postgres\0"))
