@@ -1750,6 +1750,9 @@ pub mod api {
         Smb,
         Nfs,
         Rdp,
+        Smtp,
+        Imap,
+        Pop3,
         Kerberos,
         Ntp,
         Radius,
@@ -1806,7 +1809,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 63] = [
+        pub const ALL: [Self; 66] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1817,6 +1820,9 @@ pub mod api {
             Self::Smb,
             Self::Nfs,
             Self::Rdp,
+            Self::Smtp,
+            Self::Imap,
+            Self::Pop3,
             Self::Kerberos,
             Self::Ntp,
             Self::Radius,
@@ -1884,6 +1890,9 @@ pub mod api {
                 Self::Smb => "smb",
                 Self::Nfs => "nfs",
                 Self::Rdp => "rdp",
+                Self::Smtp => "smtp",
+                Self::Imap => "imap",
+                Self::Pop3 => "pop3",
                 Self::Kerberos => "kerberos",
                 Self::Ntp => "ntp",
                 Self::Radius => "radius",
@@ -2227,6 +2236,21 @@ pub mod api {
             if self.involves_port(3389) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Rdp;
             }
+            if (self.involves_port(25) || self.involves_port(465) || self.involves_port(587))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Smtp;
+            }
+            if (self.involves_port(143) || self.involves_port(993))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Imap;
+            }
+            if (self.involves_port(110) || self.involves_port(995))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Pop3;
+            }
             if (self.involves_port(88) || self.involves_port(464))
                 && matches!(
                     self.protocol,
@@ -2531,6 +2555,9 @@ pub mod api {
                 .or_else(|| {
                     zookeeper_payload(payload).then_some(AgentPacketFlowApplication::ZooKeeper)
                 })
+                .or_else(|| smtp_payload(payload).then_some(AgentPacketFlowApplication::Smtp))
+                .or_else(|| imap_payload(payload).then_some(AgentPacketFlowApplication::Imap))
+                .or_else(|| pop3_payload(payload).then_some(AgentPacketFlowApplication::Pop3))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -3885,6 +3912,19 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"rdp") {
             return Some(AgentPacketFlowApplication::Rdp);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"smtp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"mx")
+        {
+            return Some(AgentPacketFlowApplication::Smtp);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"imap") {
+            return Some(AgentPacketFlowApplication::Imap);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"pop3")
+            || tls_sni_hostname_has_label_prefix(hostname, b"pop")
+        {
+            return Some(AgentPacketFlowApplication::Pop3);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"ssh") {
             return Some(AgentPacketFlowApplication::Ssh);
         }
@@ -4033,6 +4073,18 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"nfsv4")
         {
             return Some(AgentPacketFlowApplication::Nfs);
+        }
+        if protocol.eq_ignore_ascii_case(b"smtp")
+            || protocol.eq_ignore_ascii_case(b"esmtp")
+            || protocol.eq_ignore_ascii_case(b"submission")
+        {
+            return Some(AgentPacketFlowApplication::Smtp);
+        }
+        if protocol.eq_ignore_ascii_case(b"imap") || protocol.eq_ignore_ascii_case(b"imap4") {
+            return Some(AgentPacketFlowApplication::Imap);
+        }
+        if protocol.eq_ignore_ascii_case(b"pop3") || protocol.eq_ignore_ascii_case(b"pop") {
+            return Some(AgentPacketFlowApplication::Pop3);
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
@@ -5546,6 +5598,171 @@ pub mod api {
 
     fn rdp_x224_data_tpdu(payload: &[u8], x224_len: usize) -> bool {
         x224_len == 2 && payload.len() >= 7 && payload[6] & 0x7f == 0
+    }
+
+    fn smtp_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.is_empty() {
+            return false;
+        }
+        if line.len() >= 5
+            && line.starts_with(b"220")
+            && line.get(3).is_some_and(|byte| byte.is_ascii_whitespace())
+            && (ascii_contains_ignore_case(line, b"SMTP")
+                || ascii_contains_ignore_case(line, b"ESMTP"))
+        {
+            return true;
+        }
+        ascii_starts_with_ignore_case(line, b"EHLO ")
+            || ascii_starts_with_ignore_case(line, b"HELO ")
+            || ascii_starts_with_ignore_case(line, b"MAIL FROM:")
+            || ascii_starts_with_ignore_case(line, b"RCPT TO:")
+            || smtp_line_command(line, b"DATA")
+            || smtp_line_command(line, b"RSET")
+            || smtp_line_command(line, b"NOOP")
+            || smtp_line_command(line, b"QUIT")
+            || smtp_line_command(line, b"STARTTLS")
+            || ascii_starts_with_ignore_case(line, b"AUTH ")
+            || ascii_starts_with_ignore_case(line, b"VRFY ")
+            || ascii_starts_with_ignore_case(line, b"EXPN ")
+    }
+
+    fn smtp_line_command(line: &[u8], command: &[u8]) -> bool {
+        line.eq_ignore_ascii_case(command)
+            || line
+                .get(command.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+                && line
+                    .get(..command.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(command))
+    }
+
+    fn imap_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.is_empty() {
+            return false;
+        }
+        if ascii_starts_with_ignore_case(line, b"* OK")
+            || ascii_starts_with_ignore_case(line, b"* PREAUTH")
+            || ascii_starts_with_ignore_case(line, b"* BYE")
+        {
+            return ascii_contains_ignore_case(line, b"IMAP");
+        }
+
+        let Some((tag, rest)) = split_ascii_token(line) else {
+            return false;
+        };
+        if tag.is_empty()
+            || tag.len() > 32
+            || !tag
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+        {
+            return false;
+        }
+        let Some((command, tail)) = split_ascii_token(trim_ascii_space(rest)) else {
+            return false;
+        };
+        if command.eq_ignore_ascii_case(b"UID") {
+            let Some((uid_command, _)) = split_ascii_token(trim_ascii_space(tail)) else {
+                return false;
+            };
+            return imap_known_uid_command(uid_command);
+        }
+        imap_known_command(command)
+    }
+
+    fn imap_known_command(command: &[u8]) -> bool {
+        command.eq_ignore_ascii_case(b"CAPABILITY")
+            || command.eq_ignore_ascii_case(b"NOOP")
+            || command.eq_ignore_ascii_case(b"LOGOUT")
+            || command.eq_ignore_ascii_case(b"STARTTLS")
+            || command.eq_ignore_ascii_case(b"AUTHENTICATE")
+            || command.eq_ignore_ascii_case(b"LOGIN")
+            || command.eq_ignore_ascii_case(b"SELECT")
+            || command.eq_ignore_ascii_case(b"EXAMINE")
+            || command.eq_ignore_ascii_case(b"CREATE")
+            || command.eq_ignore_ascii_case(b"DELETE")
+            || command.eq_ignore_ascii_case(b"RENAME")
+            || command.eq_ignore_ascii_case(b"SUBSCRIBE")
+            || command.eq_ignore_ascii_case(b"UNSUBSCRIBE")
+            || command.eq_ignore_ascii_case(b"LIST")
+            || command.eq_ignore_ascii_case(b"LSUB")
+            || command.eq_ignore_ascii_case(b"STATUS")
+            || command.eq_ignore_ascii_case(b"APPEND")
+            || command.eq_ignore_ascii_case(b"CHECK")
+            || command.eq_ignore_ascii_case(b"CLOSE")
+            || command.eq_ignore_ascii_case(b"EXPUNGE")
+            || command.eq_ignore_ascii_case(b"SEARCH")
+            || command.eq_ignore_ascii_case(b"FETCH")
+            || command.eq_ignore_ascii_case(b"STORE")
+            || command.eq_ignore_ascii_case(b"COPY")
+            || command.eq_ignore_ascii_case(b"MOVE")
+            || command.eq_ignore_ascii_case(b"IDLE")
+    }
+
+    fn imap_known_uid_command(command: &[u8]) -> bool {
+        command.eq_ignore_ascii_case(b"FETCH")
+            || command.eq_ignore_ascii_case(b"SEARCH")
+            || command.eq_ignore_ascii_case(b"STORE")
+            || command.eq_ignore_ascii_case(b"COPY")
+            || command.eq_ignore_ascii_case(b"MOVE")
+            || command.eq_ignore_ascii_case(b"EXPUNGE")
+    }
+
+    fn pop3_payload(payload: &[u8]) -> bool {
+        let line = first_ascii_line(payload);
+        if line.is_empty() {
+            return false;
+        }
+        if (ascii_starts_with_ignore_case(line, b"+OK")
+            || ascii_starts_with_ignore_case(line, b"-ERR"))
+            && ascii_contains_ignore_case(line, b"POP3")
+        {
+            return true;
+        }
+        let Some((command, _)) = split_ascii_token(line) else {
+            return false;
+        };
+        pop3_known_command(command)
+    }
+
+    fn pop3_known_command(command: &[u8]) -> bool {
+        command.eq_ignore_ascii_case(b"USER")
+            || command.eq_ignore_ascii_case(b"PASS")
+            || command.eq_ignore_ascii_case(b"APOP")
+            || command.eq_ignore_ascii_case(b"AUTH")
+            || command.eq_ignore_ascii_case(b"CAPA")
+            || command.eq_ignore_ascii_case(b"STLS")
+            || command.eq_ignore_ascii_case(b"STAT")
+            || command.eq_ignore_ascii_case(b"LIST")
+            || command.eq_ignore_ascii_case(b"RETR")
+            || command.eq_ignore_ascii_case(b"DELE")
+            || command.eq_ignore_ascii_case(b"NOOP")
+            || command.eq_ignore_ascii_case(b"RSET")
+            || command.eq_ignore_ascii_case(b"TOP")
+            || command.eq_ignore_ascii_case(b"UIDL")
+            || command.eq_ignore_ascii_case(b"QUIT")
+    }
+
+    fn first_ascii_line(payload: &[u8]) -> &[u8] {
+        let line_end = payload
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .unwrap_or(payload.len());
+        trim_ascii_space(&payload[..line_end])
+    }
+
+    fn split_ascii_token(line: &[u8]) -> Option<(&[u8], &[u8])> {
+        let line = trim_ascii_space(line);
+        if line.is_empty() {
+            return None;
+        }
+        let token_end = line
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        Some((&line[..token_end], &line[token_end..]))
     }
 
     fn zookeeper_payload(payload: &[u8]) -> bool {
@@ -8481,6 +8698,12 @@ pub mod api {
                 .any(|window| window.eq_ignore_ascii_case(needle))
     }
 
+    fn ascii_starts_with_ignore_case(payload: &[u8], prefix: &[u8]) -> bool {
+        payload
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }
+
     fn trim_ascii_space(payload: &[u8]) -> &[u8] {
         let start = payload
             .iter()
@@ -9434,6 +9657,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(rdp.application(), api::AgentPacketFlowApplication::Rdp);
+
+        let smtp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(587),
+            ..Default::default()
+        };
+        assert_eq!(smtp.application(), api::AgentPacketFlowApplication::Smtp);
+
+        let imap = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(993),
+            ..Default::default()
+        };
+        assert_eq!(imap.application(), api::AgentPacketFlowApplication::Imap);
+
+        let pop3 = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(995),
+            ..Default::default()
+        };
+        assert_eq!(pop3.application(), api::AgentPacketFlowApplication::Pop3);
 
         let kerberos_kdc = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
@@ -11333,6 +11577,15 @@ mod tests {
                 api::AgentPacketFlowApplication::Nfs,
             ),
             ("rdp-admin.ops.svc", api::AgentPacketFlowApplication::Rdp),
+            ("smtp-relay.mail.svc", api::AgentPacketFlowApplication::Smtp),
+            (
+                "imap-mailbox.mail.svc",
+                api::AgentPacketFlowApplication::Imap,
+            ),
+            (
+                "pop3-mailbox.mail.svc",
+                api::AgentPacketFlowApplication::Pop3,
+            ),
             ("ssh-bastion.ops.svc", api::AgentPacketFlowApplication::Ssh),
         ] {
             assert_eq!(
@@ -11390,6 +11643,18 @@ mod tests {
             (
                 &[b"nfsv4".as_slice()][..],
                 api::AgentPacketFlowApplication::Nfs,
+            ),
+            (
+                &[b"submission".as_slice()][..],
+                api::AgentPacketFlowApplication::Smtp,
+            ),
+            (
+                &[b"imap4".as_slice()][..],
+                api::AgentPacketFlowApplication::Imap,
+            ),
+            (
+                &[b"pop3".as_slice()][..],
+                api::AgentPacketFlowApplication::Pop3,
             ),
             (
                 &[b"kafka".as_slice()][..],
@@ -11815,6 +12080,42 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0x03, 0x00, 0x00, 0x07, 0x02, 0xf0, 0x01]).application(),
             api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"220 mx.example ESMTP ready\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"EHLO edge-node.example\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"MAIL FROM:<agent@example.test>\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"220 service ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"* OK [CAPABILITY IMAP4rev1 UIDPLUS] ready\r\n").application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
+            observation_for_payload(b"A001 UID FETCH 42 BODY[]\r\n").application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
+            observation_for_payload(b"* OK ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"+OK POP3 server ready\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"USER agent\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
         );
         assert_eq!(
             observation_for_payload(b"ruok").application(),

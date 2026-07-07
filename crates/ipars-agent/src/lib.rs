@@ -479,6 +479,9 @@ pub struct AgentRuntime {
     packet_flow_application_smb_count: AtomicU64,
     packet_flow_application_nfs_count: AtomicU64,
     packet_flow_application_rdp_count: AtomicU64,
+    packet_flow_application_smtp_count: AtomicU64,
+    packet_flow_application_imap_count: AtomicU64,
+    packet_flow_application_pop3_count: AtomicU64,
     packet_flow_application_kerberos_count: AtomicU64,
     packet_flow_application_ntp_count: AtomicU64,
     packet_flow_application_radius_count: AtomicU64,
@@ -1115,6 +1118,9 @@ impl AgentRuntime {
             packet_flow_application_smb_count: AtomicU64::new(0),
             packet_flow_application_nfs_count: AtomicU64::new(0),
             packet_flow_application_rdp_count: AtomicU64::new(0),
+            packet_flow_application_smtp_count: AtomicU64::new(0),
+            packet_flow_application_imap_count: AtomicU64::new(0),
+            packet_flow_application_pop3_count: AtomicU64::new(0),
             packet_flow_application_kerberos_count: AtomicU64::new(0),
             packet_flow_application_ntp_count: AtomicU64::new(0),
             packet_flow_application_radius_count: AtomicU64::new(0),
@@ -1861,6 +1867,9 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Smb => &self.packet_flow_application_smb_count,
             AgentPacketFlowApplication::Nfs => &self.packet_flow_application_nfs_count,
             AgentPacketFlowApplication::Rdp => &self.packet_flow_application_rdp_count,
+            AgentPacketFlowApplication::Smtp => &self.packet_flow_application_smtp_count,
+            AgentPacketFlowApplication::Imap => &self.packet_flow_application_imap_count,
+            AgentPacketFlowApplication::Pop3 => &self.packet_flow_application_pop3_count,
             AgentPacketFlowApplication::Kerberos => &self.packet_flow_application_kerberos_count,
             AgentPacketFlowApplication::Ntp => &self.packet_flow_application_ntp_count,
             AgentPacketFlowApplication::Radius => &self.packet_flow_application_radius_count,
@@ -7190,6 +7199,15 @@ mod tests {
                 cassandra_startup_frame(),
             ),
             (AgentPacketFlowApplication::MongoDb, mongodb_op_msg()),
+            (
+                AgentPacketFlowApplication::Smtp,
+                b"EHLO edge-node.example\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Imap,
+                b"A001 UID FETCH 42 BODY[]\r\n".to_vec(),
+            ),
+            (AgentPacketFlowApplication::Pop3, b"USER agent\r\n".to_vec()),
         ];
 
         for (index, (_application, payload_prefix)) in payloads.iter().enumerate() {
