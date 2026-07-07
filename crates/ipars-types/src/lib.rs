@@ -1757,6 +1757,8 @@ pub mod api {
         Bgp,
         Bfd,
         KubernetesApi,
+        Kubelet,
+        DockerApi,
         Etcd,
         ZooKeeper,
         Consul,
@@ -1797,7 +1799,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 54] = [
+        pub const ALL: [Self; 56] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1815,6 +1817,8 @@ pub mod api {
             Self::Bgp,
             Self::Bfd,
             Self::KubernetesApi,
+            Self::Kubelet,
+            Self::DockerApi,
             Self::Etcd,
             Self::ZooKeeper,
             Self::Consul,
@@ -1873,6 +1877,8 @@ pub mod api {
                 Self::Bgp => "bgp",
                 Self::Bfd => "bfd",
                 Self::KubernetesApi => "kubernetes_api",
+                Self::Kubelet => "kubelet",
+                Self::DockerApi => "docker_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
                 Self::Consul => "consul",
@@ -2075,6 +2081,16 @@ pub mod api {
             }
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
+            }
+            if (self.involves_port(10250) || self.involves_port(10255))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Kubelet;
+            }
+            if (self.involves_port(2375) || self.involves_port(2376))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::DockerApi;
             }
             if (self.involves_port(2379) || self.involves_port(2380))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
@@ -3374,6 +3390,15 @@ pub mod api {
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
         {
             return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"kubelet") {
+            return Some(AgentPacketFlowApplication::Kubelet);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"docker")
+            || tls_sni_hostname_has_label_prefix(hostname, b"dockerd")
+            || tls_sni_hostname_has_label_prefix(hostname, b"docker-api")
+        {
+            return Some(AgentPacketFlowApplication::DockerApi);
         }
         if tls_sni_hostname_has_label_prefix(hostname, b"etcd") {
             return Some(AgentPacketFlowApplication::Etcd);
@@ -8807,6 +8832,24 @@ mod tests {
             kubernetes_api.application(),
             api::AgentPacketFlowApplication::KubernetesApi
         );
+        let kubelet = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(10250),
+            ..Default::default()
+        };
+        assert_eq!(
+            kubelet.application(),
+            api::AgentPacketFlowApplication::Kubelet
+        );
+        let docker_api = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2376),
+            ..Default::default()
+        };
+        assert_eq!(
+            docker_api.application(),
+            api::AgentPacketFlowApplication::DockerApi
+        );
 
         let wireguard = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
@@ -10442,6 +10485,16 @@ mod tests {
         assert_eq!(
             observation_for_payload(&kubernetes_sni).application(),
             api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("kubelet.worker-a.local"))
+                .application(),
+            api::AgentPacketFlowApplication::Kubelet
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("docker-api.node-a.local"))
+                .application(),
+            api::AgentPacketFlowApplication::DockerApi
         );
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("etcd-0.kube-system.svc"))
