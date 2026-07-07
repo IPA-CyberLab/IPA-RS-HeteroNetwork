@@ -1769,6 +1769,7 @@ pub mod api {
         IparsAgent,
         IparsRelay,
         Stun,
+        Turn,
         KubernetesApi,
         Kubelet,
         DockerApi,
@@ -1816,7 +1817,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 72] = [
+        pub const ALL: [Self; 73] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1846,6 +1847,7 @@ pub mod api {
             Self::IparsAgent,
             Self::IparsRelay,
             Self::Stun,
+            Self::Turn,
             Self::KubernetesApi,
             Self::Kubelet,
             Self::DockerApi,
@@ -1922,6 +1924,7 @@ pub mod api {
                 Self::IparsAgent => "ipars_agent",
                 Self::IparsRelay => "ipars_relay",
                 Self::Stun => "stun",
+                Self::Turn => "turn",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Kubelet => "kubelet",
                 Self::DockerApi => "docker_api",
@@ -2150,6 +2153,14 @@ pub mod api {
             }
             if self.involves_port(3478) && protocol_is(self.protocol, TransportProtocol::Udp) {
                 return AgentPacketFlowApplication::Stun;
+            }
+            if self.involves_port(5349)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp | TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Turn;
             }
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
@@ -2555,6 +2566,13 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Udp) && relay_frame_payload(payload) {
                 return Some(AgentPacketFlowApplication::IparsRelay);
             }
+            if matches!(
+                self.protocol,
+                None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+            ) && turn_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Turn);
+            }
             if matches!(self.protocol, None | Some(TransportProtocol::Udp)) && stun_payload(payload)
             {
                 return Some(AgentPacketFlowApplication::Stun);
@@ -2735,6 +2753,7 @@ pub mod api {
             ),
             AgentPacketFlowApplication::Dns
             | AgentPacketFlowApplication::Https
+            | AgentPacketFlowApplication::Turn
             | AgentPacketFlowApplication::Consul
             | AgentPacketFlowApplication::Nomad
             | AgentPacketFlowApplication::Jaeger
@@ -3815,6 +3834,12 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Stun);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"turn")
+            || tls_sni_hostname_has_label_prefix(hostname, b"turns")
+            || tls_sni_hostname_has_label_prefix(hostname, b"turnserver")
+        {
+            return Some(AgentPacketFlowApplication::Turn);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kubernetes")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-apiserver")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
@@ -4090,6 +4115,12 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"ipars-stun") || protocol.eq_ignore_ascii_case(b"stun") {
             return Some(AgentPacketFlowApplication::Stun);
+        }
+        if protocol.eq_ignore_ascii_case(b"turn")
+            || protocol.eq_ignore_ascii_case(b"turns")
+            || protocol.eq_ignore_ascii_case(b"stun.turn")
+        {
+            return Some(AgentPacketFlowApplication::Turn);
         }
         if protocol.eq_ignore_ascii_case(b"kubernetes")
             || protocol.eq_ignore_ascii_case(b"kube-apiserver")
@@ -4651,6 +4682,23 @@ pub mod api {
         STUN_HEADER_LEN
             .checked_add(message_len)
             .is_some_and(|end| end <= payload.len())
+    }
+
+    fn turn_payload(payload: &[u8]) -> bool {
+        if !stun_payload(payload) {
+            return false;
+        }
+        let Some(message_type) = read_u16_be(payload, 0) else {
+            return false;
+        };
+        matches!(
+            stun_method(message_type),
+            0x0003 | 0x0004 | 0x0006 | 0x0007 | 0x0008 | 0x0009 | 0x000a | 0x000b | 0x000c
+        )
+    }
+
+    fn stun_method(message_type: u16) -> u16 {
+        (message_type & 0x000f) | ((message_type & 0x00e0) >> 1) | ((message_type & 0x3e00) >> 2)
     }
 
     fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
@@ -9823,6 +9871,13 @@ mod tests {
         };
         assert_eq!(stun.application(), api::AgentPacketFlowApplication::Stun);
 
+        let turns = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(5349),
+            ..Default::default()
+        };
+        assert_eq!(turns.application(), api::AgentPacketFlowApplication::Turn);
+
         let wireguard = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             source_port: Some(51820),
@@ -10681,13 +10736,21 @@ mod tests {
             payload
         }
 
-        fn stun_binding_request() -> Vec<u8> {
+        fn stun_message(message_type: u16) -> Vec<u8> {
             let mut payload = Vec::new();
-            payload.extend_from_slice(&0x0001_u16.to_be_bytes());
+            payload.extend_from_slice(&message_type.to_be_bytes());
             payload.extend_from_slice(&0_u16.to_be_bytes());
             payload.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
             payload.extend_from_slice(&[0xa5; 12]);
             payload
+        }
+
+        fn stun_binding_request() -> Vec<u8> {
+            stun_message(0x0001)
+        }
+
+        fn turn_allocate_request() -> Vec<u8> {
+            stun_message(0x0003)
         }
 
         fn ipars_relay_datagram() -> Vec<u8> {
@@ -11147,6 +11210,10 @@ mod tests {
         assert_eq!(
             observation_for_udp_payload(&stun_binding_request()).application(),
             api::AgentPacketFlowApplication::Stun
+        );
+        assert_eq!(
+            observation_for_udp_payload(&turn_allocate_request()).application(),
+            api::AgentPacketFlowApplication::Turn
         );
         let mut malformed_stun = stun_binding_request();
         malformed_stun[4] = 0;
@@ -11719,6 +11786,15 @@ mod tests {
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_alpn(&[b"ipars-stun"])).application(),
             api::AgentPacketFlowApplication::Stun
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("turn-relay.public.example"))
+                .application(),
+            api::AgentPacketFlowApplication::Turn
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"stun.turn"])).application(),
+            api::AgentPacketFlowApplication::Turn
         );
         let kubernetes_sni = tls_client_hello_with_sni("kubernetes.default.svc.cluster.local");
         assert!(kubernetes_sni.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
@@ -13960,6 +14036,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint sip requires TCP, UDP, or SCTP protocol"));
+
+        let udp_turn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"turn"}"#)?;
+        udp_turn_hint.validate_transport_metadata()?;
+
+        let tcp_turn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"turn"}"#)?;
+        tcp_turn_hint.validate_transport_metadata()?;
+
+        let gre_turn_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"turn"}"#)?;
+        let error = match gre_turn_hint.validate_transport_metadata() {
+            Ok(()) => return Err("GRE TURN hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint turn requires TCP or UDP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;
