@@ -1759,6 +1759,8 @@ pub mod api {
         KubernetesApi,
         Kubelet,
         DockerApi,
+        Cri,
+        Containerd,
         Etcd,
         ZooKeeper,
         Consul,
@@ -1799,7 +1801,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 56] = [
+        pub const ALL: [Self; 58] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1819,6 +1821,8 @@ pub mod api {
             Self::KubernetesApi,
             Self::Kubelet,
             Self::DockerApi,
+            Self::Cri,
+            Self::Containerd,
             Self::Etcd,
             Self::ZooKeeper,
             Self::Consul,
@@ -1879,6 +1883,8 @@ pub mod api {
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Kubelet => "kubelet",
                 Self::DockerApi => "docker_api",
+                Self::Cri => "cri",
+                Self::Containerd => "containerd",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
                 Self::Consul => "consul",
@@ -2802,6 +2808,12 @@ pub mod api {
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if cri_grpc_path(path) {
+                return Some(AgentPacketFlowApplication::Cri);
+            }
+            if containerd_grpc_path(path) {
+                return Some(AgentPacketFlowApplication::Containerd);
+            }
             if etcd_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::Etcd);
             }
@@ -2870,6 +2882,12 @@ pub mod api {
         if contains_ascii_case_insensitive(payload, b"/zipkin.proto3.SpanService/Report") {
             return Some(AgentPacketFlowApplication::Zipkin);
         }
+        if cri_grpc_payload(payload) {
+            return Some(AgentPacketFlowApplication::Cri);
+        }
+        if containerd_grpc_payload(payload) {
+            return Some(AgentPacketFlowApplication::Containerd);
+        }
         if etcd_grpc_payload(payload) {
             return Some(AgentPacketFlowApplication::Etcd);
         }
@@ -2898,6 +2916,94 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn cri_grpc_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 8] = [
+            b"/runtime.v1.RuntimeService/",
+            b"/runtime.v1.ImageService/",
+            b"/runtime.v1alpha2.RuntimeService/",
+            b"/runtime.v1alpha2.ImageService/",
+            b"/containerd.services.runtime.v1.Runtime/",
+            b"/containerd.services.runtime.v2.Task/",
+            b"/containerd.services.sandbox.v1.Sandbox/",
+            b"/containerd.services.sandbox.v1.Controller/",
+        ];
+
+        path_starts_with_any(path, &PREFIXES)
+    }
+
+    fn cri_grpc_payload(payload: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 8] = [
+            b"/runtime.v1.RuntimeService/",
+            b"/runtime.v1.ImageService/",
+            b"/runtime.v1alpha2.RuntimeService/",
+            b"/runtime.v1alpha2.ImageService/",
+            b"/containerd.services.runtime.v1.Runtime/",
+            b"/containerd.services.runtime.v2.Task/",
+            b"/containerd.services.sandbox.v1.Sandbox/",
+            b"/containerd.services.sandbox.v1.Controller/",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| contains_ascii_case_insensitive(payload, prefix))
+    }
+
+    fn containerd_grpc_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 20] = [
+            b"/containerd.services.containers.v1.Containers/",
+            b"/containerd.services.content.v1.Content/",
+            b"/containerd.services.diff.v1.Diff/",
+            b"/containerd.services.events.v1.Events/",
+            b"/containerd.services.images.v1.Images/",
+            b"/containerd.services.introspection.v1.Introspection/",
+            b"/containerd.services.leases.v1.Leases/",
+            b"/containerd.services.namespaces.v1.Namespaces/",
+            b"/containerd.services.snapshots.v1.Snapshots/",
+            b"/containerd.services.tasks.v1.Tasks/",
+            b"/containerd.services.version.v1.Version/",
+            b"/containerd.services.transfer.v1.Transfer/",
+            b"/containerd.types.transfer.Registry/",
+            b"/containerd.services.gc.v1.GC/",
+            b"/containerd.services.healthcheck.v1.Health/",
+            b"/containerd.services.sandbox.v1.Store/",
+            b"/containerd.services.streaming.v1.Streaming/",
+            b"/containerd.services.ttrpc.v1.TTRPC/",
+            b"/containerd.services.plugins.v1.Plugins/",
+            b"/containerd.services.opt.v1.Opt/",
+        ];
+
+        path_starts_with_any(path, &PREFIXES)
+    }
+
+    fn containerd_grpc_payload(payload: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 20] = [
+            b"/containerd.services.containers.v1.Containers/",
+            b"/containerd.services.content.v1.Content/",
+            b"/containerd.services.diff.v1.Diff/",
+            b"/containerd.services.events.v1.Events/",
+            b"/containerd.services.images.v1.Images/",
+            b"/containerd.services.introspection.v1.Introspection/",
+            b"/containerd.services.leases.v1.Leases/",
+            b"/containerd.services.namespaces.v1.Namespaces/",
+            b"/containerd.services.snapshots.v1.Snapshots/",
+            b"/containerd.services.tasks.v1.Tasks/",
+            b"/containerd.services.version.v1.Version/",
+            b"/containerd.services.transfer.v1.Transfer/",
+            b"/containerd.types.transfer.Registry/",
+            b"/containerd.services.gc.v1.GC/",
+            b"/containerd.services.healthcheck.v1.Health/",
+            b"/containerd.services.sandbox.v1.Store/",
+            b"/containerd.services.streaming.v1.Streaming/",
+            b"/containerd.services.ttrpc.v1.TTRPC/",
+            b"/containerd.services.plugins.v1.Plugins/",
+            b"/containerd.services.opt.v1.Opt/",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| contains_ascii_case_insensitive(payload, prefix))
     }
 
     fn etcd_grpc_path(path: &[u8]) -> bool {
@@ -3493,6 +3599,15 @@ pub mod api {
             || tls_sni_hostname_has_label_prefix(hostname, b"docker-api")
         {
             return Some(AgentPacketFlowApplication::DockerApi);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"cri")
+            || tls_sni_hostname_has_label_prefix(hostname, b"crio")
+            || tls_sni_hostname_has_label_prefix(hostname, b"cri-o")
+        {
+            return Some(AgentPacketFlowApplication::Cri);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"containerd") {
+            return Some(AgentPacketFlowApplication::Containerd);
         }
         if tls_sni_hostname_has_label_prefix(hostname, b"etcd") {
             return Some(AgentPacketFlowApplication::Etcd);
@@ -10483,6 +10598,27 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(
+                b"POST /runtime.v1.RuntimeService/ListContainers HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Cri
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /containerd.services.content.v1.Content/Info HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Containerd
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /containerd.services.runtime.v2.Task/Get HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Cri
+        );
+        assert_eq!(
+            observation_for_payload(
                 b"POST /etcdserverpb.KV/Range HTTP/1.1\r\ncontent-type: application/grpc\r\n"
             )
             .application(),
@@ -10499,6 +10635,20 @@ mod tests {
             observation_for_payload(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0*application/grpc")
                 .application(),
             api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/runtime.v1.ImageService/ListImages"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Cri
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0/containerd.services.images.v1.Images/List"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Containerd
         );
         assert_eq!(
             observation_for_payload(
@@ -10617,6 +10767,16 @@ mod tests {
             observation_for_payload(&tls_client_hello_with_sni("docker-api.node-a.local"))
                 .application(),
             api::AgentPacketFlowApplication::DockerApi
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("crio.worker-a.local"))
+                .application(),
+            api::AgentPacketFlowApplication::Cri
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("containerd.worker-a.local"))
+                .application(),
+            api::AgentPacketFlowApplication::Containerd
         );
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("etcd-0.kube-system.svc"))

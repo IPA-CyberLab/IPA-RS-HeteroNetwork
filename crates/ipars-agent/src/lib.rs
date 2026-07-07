@@ -488,6 +488,8 @@ pub struct AgentRuntime {
     packet_flow_application_kubernetes_api_count: AtomicU64,
     packet_flow_application_kubelet_count: AtomicU64,
     packet_flow_application_docker_api_count: AtomicU64,
+    packet_flow_application_cri_count: AtomicU64,
+    packet_flow_application_containerd_count: AtomicU64,
     packet_flow_application_etcd_count: AtomicU64,
     packet_flow_application_zookeeper_count: AtomicU64,
     packet_flow_application_consul_count: AtomicU64,
@@ -1117,6 +1119,8 @@ impl AgentRuntime {
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
             packet_flow_application_kubelet_count: AtomicU64::new(0),
             packet_flow_application_docker_api_count: AtomicU64::new(0),
+            packet_flow_application_cri_count: AtomicU64::new(0),
+            packet_flow_application_containerd_count: AtomicU64::new(0),
             packet_flow_application_etcd_count: AtomicU64::new(0),
             packet_flow_application_zookeeper_count: AtomicU64::new(0),
             packet_flow_application_consul_count: AtomicU64::new(0),
@@ -1858,6 +1862,10 @@ impl AgentRuntime {
             }
             AgentPacketFlowApplication::Kubelet => &self.packet_flow_application_kubelet_count,
             AgentPacketFlowApplication::DockerApi => &self.packet_flow_application_docker_api_count,
+            AgentPacketFlowApplication::Cri => &self.packet_flow_application_cri_count,
+            AgentPacketFlowApplication::Containerd => {
+                &self.packet_flow_application_containerd_count
+            }
             AgentPacketFlowApplication::Etcd => &self.packet_flow_application_etcd_count,
             AgentPacketFlowApplication::ZooKeeper => &self.packet_flow_application_zookeeper_count,
             AgentPacketFlowApplication::Consul => &self.packet_flow_application_consul_count,
@@ -6299,6 +6307,38 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(docker_api_match.peer, peer_b_id);
+        let cri_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 70)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix:
+                        b"POST /runtime.v1.RuntimeService/ListContainers HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+                            .to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(cri_match.peer, peer_b_id);
+        let containerd_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 71)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix:
+                        b"POST /containerd.services.content.v1.Content/Info HTTP/1.1\r\ncontent-type: application/grpc\r\n"
+                            .to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(containerd_match.peer, peer_b_id);
         let postgres_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 26)),
@@ -6756,8 +6796,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 48);
-        assert_eq!(metrics.packet_flow_match_count, 46);
+        assert_eq!(metrics.packet_flow_observation_count, 50);
+        assert_eq!(metrics.packet_flow_match_count, 48);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6769,7 +6809,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            46
+            48
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6802,6 +6842,8 @@ mod tests {
         );
         assert_eq!(application_count(AgentPacketFlowApplication::Kubelet), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::DockerApi), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Cri), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Containerd), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Postgres), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::ZooKeeper), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Consul), 1);
