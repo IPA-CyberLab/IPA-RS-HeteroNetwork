@@ -1662,6 +1662,12 @@ mod tests {
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"dhcp\"}} 0"
         )));
         assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"vxlan\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"geneve\"}} 0"
+        )));
+        assert!(body.contains(&format!(
             "ipars_agent_packet_flow_classified_by_application_total{{node_id=\"{prometheus_node_id}\",application=\"consul\"}} 0"
         )));
         assert!(body.contains(&format!(

@@ -13431,6 +13431,14 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Bgp),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Vxlan),
+            Some(&0)
+        );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Geneve),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(

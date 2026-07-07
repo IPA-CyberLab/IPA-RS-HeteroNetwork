@@ -1774,12 +1774,14 @@ pub mod api {
         Cassandra,
         MongoDb,
         Elasticsearch,
+        Vxlan,
+        Geneve,
         WireGuard,
         Icmp,
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 47] = [
+        pub const ALL: [Self; 49] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1825,6 +1827,8 @@ pub mod api {
             Self::Cassandra,
             Self::MongoDb,
             Self::Elasticsearch,
+            Self::Vxlan,
+            Self::Geneve,
             Self::WireGuard,
             Self::Icmp,
         ];
@@ -1876,6 +1880,8 @@ pub mod api {
                 Self::Cassandra => "cassandra",
                 Self::MongoDb => "mongodb",
                 Self::Elasticsearch => "elasticsearch",
+                Self::Vxlan => "vxlan",
+                Self::Geneve => "geneve",
                 Self::WireGuard => "wireguard",
                 Self::Icmp => "icmp",
             }
@@ -2089,6 +2095,14 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Udp)
             {
                 return AgentPacketFlowApplication::Dhcp;
+            }
+            if (self.involves_port(4789) || self.involves_port(8472))
+                && protocol_is(self.protocol, TransportProtocol::Udp)
+            {
+                return AgentPacketFlowApplication::Vxlan;
+            }
+            if self.involves_port(6081) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::Geneve;
             }
             if self.involves_port(80) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Http;
@@ -2324,6 +2338,12 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Dhcp);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && vxlan_payload(payload) {
+                return Some(AgentPacketFlowApplication::Vxlan);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && geneve_payload(payload) {
+                return Some(AgentPacketFlowApplication::Geneve);
+            }
             if protocol_is(self.protocol, TransportProtocol::Udp)
                 && self.involves_port(443)
                 && quic_long_header_payload(payload)
@@ -2419,7 +2439,10 @@ pub mod api {
                 "ICMP",
                 |protocol| protocol == TransportProtocol::Icmp,
             ),
-            AgentPacketFlowApplication::WireGuard | AgentPacketFlowApplication::Dhcp => {
+            AgentPacketFlowApplication::WireGuard
+            | AgentPacketFlowApplication::Dhcp
+            | AgentPacketFlowApplication::Vxlan
+            | AgentPacketFlowApplication::Geneve => {
                 require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
                     protocol == TransportProtocol::Udp
                 })
@@ -3779,6 +3802,59 @@ pub mod api {
     const WIREGUARD_HANDSHAKE_RESPONSE_LEN: usize = 92;
     const WIREGUARD_COOKIE_REPLY_LEN: usize = 64;
     const WIREGUARD_TRANSPORT_KEEPALIVE_LEN: usize = 32;
+    const VXLAN_HEADER_LEN: usize = 8;
+    const GENEVE_HEADER_LEN: usize = 8;
+    const ETHERNET_HEADER_LEN: usize = 14;
+    const GENEVE_PROTOCOL_TRANSPARENT_ETHERNET: u16 = 0x6558;
+
+    fn ethernet_frame_payload(payload: &[u8], offset: usize) -> bool {
+        let Some(ethertype_offset) = offset.checked_add(12) else {
+            return false;
+        };
+        let Some(ethertype_bytes) =
+            payload.get(ethertype_offset..ethertype_offset.saturating_add(2))
+        else {
+            return false;
+        };
+        u16::from_be_bytes([ethertype_bytes[0], ethertype_bytes[1]]) >= 0x0600
+    }
+
+    fn vxlan_payload(payload: &[u8]) -> bool {
+        let minimum_len = VXLAN_HEADER_LEN + ETHERNET_HEADER_LEN;
+        if payload.len() < minimum_len {
+            return false;
+        }
+        if payload[0] != 0x08 || payload.get(1..4) != Some(&[0, 0, 0]) || payload[7] != 0 {
+            return false;
+        }
+        if payload[4..7].iter().all(|byte| *byte == 0) {
+            return false;
+        }
+        ethernet_frame_payload(payload, VXLAN_HEADER_LEN)
+    }
+
+    fn geneve_payload(payload: &[u8]) -> bool {
+        if payload.len() < GENEVE_HEADER_LEN {
+            return false;
+        }
+        if payload[0] >> 6 != 0 || payload[1] & 0x3f != 0 || payload[7] != 0 {
+            return false;
+        }
+        let option_words = (payload[0] & 0x3f) as usize;
+        let Some(header_len) = GENEVE_HEADER_LEN.checked_add(option_words.saturating_mul(4)) else {
+            return false;
+        };
+        if header_len > payload.len() {
+            return false;
+        }
+        let protocol_type = u16::from_be_bytes([payload[2], payload[3]]);
+        if protocol_type != GENEVE_PROTOCOL_TRANSPARENT_ETHERNET
+            || payload[4..7].iter().all(|byte| *byte == 0)
+        {
+            return false;
+        }
+        ethernet_frame_payload(payload, header_len)
+    }
 
     fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
         payload_len == wire_len
@@ -8205,6 +8281,33 @@ mod tests {
             api::AgentPacketFlowApplication::Dhcp
         );
 
+        let vxlan = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(4789),
+            ..Default::default()
+        };
+        assert_eq!(vxlan.application(), api::AgentPacketFlowApplication::Vxlan);
+
+        let vxlan_legacy = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(8472),
+            ..Default::default()
+        };
+        assert_eq!(
+            vxlan_legacy.application(),
+            api::AgentPacketFlowApplication::Vxlan
+        );
+
+        let geneve = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(6081),
+            ..Default::default()
+        };
+        assert_eq!(
+            geneve.application(),
+            api::AgentPacketFlowApplication::Geneve
+        );
+
         let https = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(443),
@@ -8802,6 +8905,24 @@ mod tests {
             payload
         }
 
+        fn ethernet_ipv4_frame() -> Vec<u8> {
+            vec![
+                0x02, 0x00, 0x5e, 0x10, 0x00, 0x01, 0x02, 0x00, 0x5e, 0x20, 0x00, 0x01, 0x08, 0x00,
+            ]
+        }
+
+        fn vxlan_frame(vni: [u8; 3]) -> Vec<u8> {
+            let mut payload = vec![0x08, 0, 0, 0, vni[0], vni[1], vni[2], 0];
+            payload.extend_from_slice(&ethernet_ipv4_frame());
+            payload
+        }
+
+        fn geneve_frame(vni: [u8; 3]) -> Vec<u8> {
+            let mut payload = vec![0, 0, 0x65, 0x58, vni[0], vni[1], vni[2], 0];
+            payload.extend_from_slice(&ethernet_ipv4_frame());
+            payload
+        }
+
         fn postgres_frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
             let mut payload = vec![tag];
             let length = (body.len() as u32) + 4;
@@ -9180,6 +9301,44 @@ mod tests {
         assert_eq!(
             observation_for_dhcpv6_payload(&dhcpv6_solicit).application(),
             api::AgentPacketFlowApplication::Dhcp
+        );
+
+        let vxlan_payload = vxlan_frame([0x00, 0x12, 0x34]);
+        assert_eq!(
+            observation_for_udp_payload(&vxlan_payload).application(),
+            api::AgentPacketFlowApplication::Vxlan
+        );
+        let mut vxlan_without_i_flag = vxlan_payload.clone();
+        vxlan_without_i_flag[0] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&vxlan_without_i_flag).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let vxlan_without_vni = vxlan_frame([0, 0, 0]);
+        assert_eq!(
+            observation_for_udp_payload(&vxlan_without_vni).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let geneve_payload = geneve_frame([0x00, 0x12, 0x34]);
+        assert_eq!(
+            observation_for_udp_payload(&geneve_payload).application(),
+            api::AgentPacketFlowApplication::Geneve
+        );
+        let mut geneve_with_reserved_bits = geneve_payload.clone();
+        geneve_with_reserved_bits[1] = 0x01;
+        assert_eq!(
+            observation_for_udp_payload(&geneve_with_reserved_bits).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let geneve_without_vni = geneve_frame([0, 0, 0]);
+        assert_eq!(
+            observation_for_udp_payload(&geneve_without_vni).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&vxlan_payload).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
 
         let snmp_get_request = vec![
@@ -11288,6 +11447,30 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint dhcp requires UDP protocol"));
+
+        let udp_vxlan_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"vxlan"}"#)?;
+        udp_vxlan_hint.validate_transport_metadata()?;
+
+        let tcp_vxlan_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"vxlan"}"#)?;
+        let error = match tcp_vxlan_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP VXLAN hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint vxlan requires UDP protocol"));
+
+        let udp_geneve_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"geneve"}"#)?;
+        udp_geneve_hint.validate_transport_metadata()?;
+
+        let tcp_geneve_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"geneve"}"#)?;
+        let error = match tcp_geneve_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP Geneve hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint geneve requires UDP protocol"));
 
         let udp_https_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"https"}"#)?;

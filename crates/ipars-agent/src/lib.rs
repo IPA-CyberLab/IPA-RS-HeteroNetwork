@@ -467,6 +467,8 @@ pub struct AgentRuntime {
     packet_flow_application_cassandra_count: AtomicU64,
     packet_flow_application_mongodb_count: AtomicU64,
     packet_flow_application_elasticsearch_count: AtomicU64,
+    packet_flow_application_vxlan_count: AtomicU64,
+    packet_flow_application_geneve_count: AtomicU64,
     packet_flow_application_wireguard_count: AtomicU64,
     packet_flow_application_icmp_count: AtomicU64,
 }
@@ -1086,6 +1088,8 @@ impl AgentRuntime {
             packet_flow_application_cassandra_count: AtomicU64::new(0),
             packet_flow_application_mongodb_count: AtomicU64::new(0),
             packet_flow_application_elasticsearch_count: AtomicU64::new(0),
+            packet_flow_application_vxlan_count: AtomicU64::new(0),
+            packet_flow_application_geneve_count: AtomicU64::new(0),
             packet_flow_application_wireguard_count: AtomicU64::new(0),
             packet_flow_application_icmp_count: AtomicU64::new(0),
         }
@@ -1810,6 +1814,8 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Elasticsearch => {
                 &self.packet_flow_application_elasticsearch_count
             }
+            AgentPacketFlowApplication::Vxlan => &self.packet_flow_application_vxlan_count,
+            AgentPacketFlowApplication::Geneve => &self.packet_flow_application_geneve_count,
             AgentPacketFlowApplication::WireGuard => &self.packet_flow_application_wireguard_count,
             AgentPacketFlowApplication::Icmp => &self.packet_flow_application_icmp_count,
         }
@@ -6010,6 +6016,34 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(dhcpv6_match.peer, peer_b_id);
+        let vxlan_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 58)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(4789),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(vxlan_match.peer, peer_b_id);
+        let geneve_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 59)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(6081),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(geneve_match.peer, peer_b_id);
 
         assert!(
             runtime
@@ -6479,8 +6513,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 36);
-        assert_eq!(metrics.packet_flow_match_count, 34);
+        assert_eq!(metrics.packet_flow_observation_count, 38);
+        assert_eq!(metrics.packet_flow_match_count, 36);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6492,7 +6526,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            34
+            36
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6512,6 +6546,8 @@ mod tests {
         };
         assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 2);
+        assert_eq!(application_count(AgentPacketFlowApplication::Vxlan), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Geneve), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
         assert_eq!(
             application_count(AgentPacketFlowApplication::KubernetesApi),
