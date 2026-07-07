@@ -1754,6 +1754,7 @@ pub mod api {
         Memcached,
         Prometheus,
         OpenTelemetry,
+        Syslog,
         Jaeger,
         Loki,
         Tempo,
@@ -1771,7 +1772,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 39] = [
+        pub const ALL: [Self; 40] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1797,6 +1798,7 @@ pub mod api {
             Self::Memcached,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Syslog,
             Self::Jaeger,
             Self::Loki,
             Self::Tempo,
@@ -1840,6 +1842,7 @@ pub mod api {
                 Self::Memcached => "memcached",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Syslog => "syslog",
                 Self::Jaeger => "jaeger",
                 Self::Loki => "loki",
                 Self::Tempo => "tempo",
@@ -2132,6 +2135,27 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
             }
+            if self.involves_port(514)
+                && matches!(self.protocol, None | Some(TransportProtocol::Udp))
+            {
+                return AgentPacketFlowApplication::Syslog;
+            }
+            if self.involves_port(601)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Syslog;
+            }
+            if self.involves_port(6514)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Syslog;
+            }
             if (self.involves_port(5778)
                 || self.involves_port(14250)
                 || self.involves_port(14268)
@@ -2299,6 +2323,7 @@ pub mod api {
             | AgentPacketFlowApplication::Nomad
             | AgentPacketFlowApplication::Jaeger
             | AgentPacketFlowApplication::Nfs
+            | AgentPacketFlowApplication::Syslog
             | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -3062,6 +3087,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::InfluxDb);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"syslog")
+            || tls_sni_hostname_has_label_prefix(hostname, b"rsyslog")
+        {
+            return Some(AgentPacketFlowApplication::Syslog);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"redis")
             || tls_sni_hostname_has_label_prefix(hostname, b"valkey")
         {
@@ -3196,6 +3226,12 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"influx")
         {
             return Some(AgentPacketFlowApplication::InfluxDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"syslog")
+            || protocol.eq_ignore_ascii_case(b"syslog-tls")
+            || protocol.eq_ignore_ascii_case(b"rsyslog")
+        {
+            return Some(AgentPacketFlowApplication::Syslog);
         }
         if protocol.eq_ignore_ascii_case(b"nfs")
             || protocol.eq_ignore_ascii_case(b"nfs4")
@@ -7682,6 +7718,46 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
 
+        let syslog_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(514),
+            ..Default::default()
+        };
+        assert_eq!(
+            syslog_udp.application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+
+        let syslog_conn = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(601),
+            ..Default::default()
+        };
+        assert_eq!(
+            syslog_conn.application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+
+        let syslog_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6514),
+            ..Default::default()
+        };
+        assert_eq!(
+            syslog_tls.application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+
+        let syslog_dtls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(6514),
+            ..Default::default()
+        };
+        assert_eq!(
+            syslog_dtls.application(),
+            api::AgentPacketFlowApplication::Syslog
+        );
+
         let jaeger_collector = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(14268),
@@ -8511,6 +8587,10 @@ mod tests {
                 api::AgentPacketFlowApplication::InfluxDb,
             ),
             (
+                "syslog-collector.logs.svc",
+                api::AgentPacketFlowApplication::Syslog,
+            ),
+            (
                 "kafka-broker.messaging.svc",
                 api::AgentPacketFlowApplication::Kafka,
             ),
@@ -8646,6 +8726,10 @@ mod tests {
             (
                 &[b"influxdb-http".as_slice()][..],
                 api::AgentPacketFlowApplication::InfluxDb,
+            ),
+            (
+                &[b"syslog-tls".as_slice()][..],
+                api::AgentPacketFlowApplication::Syslog,
             ),
             (
                 &[b"nfsv4".as_slice()][..],
@@ -10184,6 +10268,14 @@ mod tests {
         let udp_memcached_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"memcached"}"#)?;
         udp_memcached_hint.validate_transport_metadata()?;
+
+        let udp_syslog_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"syslog"}"#)?;
+        udp_syslog_hint.validate_transport_metadata()?;
+
+        let tcp_syslog_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"syslog"}"#)?;
+        tcp_syslog_hint.validate_transport_metadata()?;
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
