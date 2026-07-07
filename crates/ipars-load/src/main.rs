@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -982,6 +982,7 @@ impl LoadReport {
                 manifest.updated_at
             );
         }
+        validate_daemon_manifest_iparsd_binary(&manifest.iparsd_binary)?;
 
         let workload = manifest.workload;
         let expected_scenario = Scenario::from_name(self.scenario);
@@ -3201,6 +3202,7 @@ struct DaemonRuntimeManifest {
     workload: DaemonRuntimeManifestWorkload,
     measurement: Option<DaemonRuntimeManifestMeasurement>,
     runtime_dir: PathBuf,
+    iparsd_binary: DaemonBinaryIdentity,
     control_plane_urls: Vec<String>,
     signal_url: String,
     relay_http_url: String,
@@ -3245,6 +3247,13 @@ struct DaemonRuntimeManifestMeasurement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonBinaryIdentity {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonRuntimeManifestChild {
     role: String,
     pid: Option<u32>,
@@ -3268,6 +3277,7 @@ struct DaemonRuntimeManifestSeed {
     scenario: ScenarioName,
     workload: DaemonRuntimeManifestWorkload,
     runtime_dir: PathBuf,
+    iparsd_binary: DaemonBinaryIdentity,
     control_plane_urls: Vec<String>,
     signal_url: String,
     relay_http_url: String,
@@ -3303,6 +3313,7 @@ impl DaemonRuntimeManifestSeed {
                 workload: self.workload,
                 measurement,
                 runtime_dir: self.runtime_dir.clone(),
+                iparsd_binary: self.iparsd_binary.clone(),
                 control_plane_urls: self.control_plane_urls.clone(),
                 signal_url: self.signal_url.clone(),
                 relay_http_url: self.relay_http_url.clone(),
@@ -3356,9 +3367,7 @@ impl DaemonProcessGroup {
         key_id: &KeyId,
         options: DaemonLoadOptions,
     ) -> anyhow::Result<Self> {
-        if !iparsd_bin.exists() && iparsd_bin.components().count() > 1 {
-            bail!("iparsd binary does not exist at {}", iparsd_bin.display());
-        }
+        let iparsd_binary = daemon_binary_identity(iparsd_bin)?;
         let runtime_dir = daemon_runtime_dir()?;
         std::fs::create_dir_all(&runtime_dir)?;
         secure_daemon_runtime_dir(&runtime_dir)?;
@@ -3393,6 +3402,7 @@ impl DaemonProcessGroup {
                 relay_payload_bytes: options.relay_options.payload_bytes,
             },
             runtime_dir: runtime_dir.clone(),
+            iparsd_binary,
             control_plane_urls: control_plane_urls.clone(),
             signal_url: signal_url.clone(),
             relay_http_url: relay_http_url.clone(),
@@ -3412,7 +3422,7 @@ impl DaemonProcessGroup {
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
             startup.children.push(spawn_iparsd(
-                iparsd_bin,
+                &manifest_seed.iparsd_binary.path,
                 &[
                     "control-plane".to_string(),
                     "--listen".to_string(),
@@ -3451,7 +3461,7 @@ impl DaemonProcessGroup {
             .await?;
         }
         startup.children.push(spawn_iparsd(
-            iparsd_bin,
+            &manifest_seed.iparsd_binary.path,
             &[
                 "signal".to_string(),
                 "--listen".to_string(),
@@ -3466,7 +3476,7 @@ impl DaemonProcessGroup {
             &startup.children,
         )?;
         startup.children.push(spawn_iparsd(
-            iparsd_bin,
+            &manifest_seed.iparsd_binary.path,
             &[
                 "relay".to_string(),
                 "--relay-node-id".to_string(),
@@ -3493,7 +3503,7 @@ impl DaemonProcessGroup {
             &startup.children,
         )?;
         startup.children.push(spawn_iparsd(
-            iparsd_bin,
+            &manifest_seed.iparsd_binary.path,
             &[
                 "stun".to_string(),
                 "--listen".to_string(),
@@ -3604,7 +3614,7 @@ impl DaemonProcessGroup {
                 }
             }
             startup.children.push(spawn_iparsd(
-                iparsd_bin,
+                &manifest_seed.iparsd_binary.path,
                 &agent_args,
                 "agent",
                 &runtime_dir,
@@ -4075,6 +4085,145 @@ fn daemon_log_diagnostics(path: &Path) -> Option<DaemonLogDiagnostics> {
         bytes: bytes.len() as u64,
         tail_sha256,
     })
+}
+
+fn daemon_binary_identity(iparsd_bin: &Path) -> anyhow::Result<DaemonBinaryIdentity> {
+    let path = resolve_daemon_binary_path(iparsd_bin)?;
+    let (bytes, sha256) = daemon_file_sha256(&path)?;
+    if bytes == 0 {
+        bail!("iparsd binary {} is empty", path.display());
+    }
+    Ok(DaemonBinaryIdentity {
+        path,
+        bytes,
+        sha256,
+    })
+}
+
+fn resolve_daemon_binary_path(iparsd_bin: &Path) -> anyhow::Result<PathBuf> {
+    if iparsd_bin.as_os_str().is_empty() {
+        bail!("iparsd binary path must not be empty");
+    }
+    if iparsd_bin.components().count() > 1 || iparsd_bin.is_absolute() {
+        return canonical_daemon_binary_path(iparsd_bin);
+    }
+    let binary_name = iparsd_bin
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .context("iparsd binary name must be valid UTF-8")?;
+    let path_env = std::env::var_os("PATH").context("PATH is not set; cannot resolve iparsd")?;
+    let mut rejected_candidates = Vec::new();
+    for directory in std::env::split_paths(&path_env) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = directory.join(binary_name);
+        if !candidate.exists() {
+            continue;
+        }
+        match canonical_daemon_binary_path(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                rejected_candidates.push(format!("{} ({error})", candidate.display()));
+            }
+        }
+    }
+    if rejected_candidates.is_empty() {
+        bail!("iparsd binary {binary_name} was not found on PATH");
+    }
+    bail!(
+        "iparsd binary {binary_name} was found on PATH but not as an executable regular file: {}",
+        rejected_candidates.join(", ")
+    )
+}
+
+fn canonical_daemon_binary_path(path: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::symlink_metadata(path)
+        .with_context(|| format!("iparsd binary {} is not accessible", path.display()))?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("iparsd binary {} cannot be canonicalized", path.display()))?;
+    let canonical_metadata = std::fs::symlink_metadata(&canonical).with_context(|| {
+        format!(
+            "canonical iparsd binary {} is not accessible",
+            canonical.display()
+        )
+    })?;
+    if canonical_metadata.file_type().is_symlink() || !canonical_metadata.is_file() {
+        bail!(
+            "canonical iparsd binary {} must resolve to a regular file",
+            canonical.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if canonical_metadata.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "canonical iparsd binary {} is not executable",
+                canonical.display()
+            );
+        }
+    }
+    Ok(canonical)
+}
+
+fn validate_daemon_manifest_iparsd_binary(identity: &DaemonBinaryIdentity) -> anyhow::Result<()> {
+    if identity.path.as_os_str().is_empty() {
+        bail!("daemon load scenario retained manifest iparsd binary path is empty");
+    }
+    if !identity.path.is_absolute() {
+        bail!(
+            "daemon load scenario retained manifest iparsd binary path {} is not absolute",
+            identity.path.display()
+        );
+    }
+    let canonical = canonical_daemon_binary_path(&identity.path).with_context(|| {
+        format!(
+            "daemon load scenario retained manifest iparsd binary {} failed validation",
+            identity.path.display()
+        )
+    })?;
+    if canonical != identity.path {
+        bail!(
+            "daemon load scenario retained manifest iparsd binary path {} is not canonical {}",
+            identity.path.display(),
+            canonical.display()
+        );
+    }
+    let (actual_bytes, actual_sha256) = daemon_file_sha256(&identity.path)?;
+    if identity.bytes == 0 {
+        bail!("daemon load scenario retained manifest iparsd binary recorded zero bytes");
+    }
+    if identity.bytes != actual_bytes || identity.sha256 != actual_sha256 {
+        bail!(
+            "daemon load scenario retained manifest iparsd binary digest mismatch: bytes={}/{}, sha256={}/{}",
+            identity.bytes,
+            actual_bytes,
+            identity.sha256,
+            actual_sha256
+        );
+    }
+    Ok(())
+}
+
+fn daemon_file_sha256(path: &Path) -> anyhow::Result<(u64, String)> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {} for SHA-256", path.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {} for SHA-256", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
 fn sanitized_daemon_child_role(role: &str) -> String {
@@ -5762,8 +5911,26 @@ mod tests {
         assert!(error.contains("relay candidate mismatch"));
 
         let mut retained_manifest = daemon_report.clone();
+        let (retained_runtime_dir, retained_manifest_path) =
+            write_synthetic_retained_daemon_manifest(
+                &retained_manifest,
+                DaemonRuntimePhase::Completed,
+                &[
+                    "control-plane-0",
+                    "control-plane-1",
+                    "signal",
+                    "relay",
+                    "stun",
+                    "agent",
+                ],
+            )?;
+        retained_manifest.daemon_runtime_dir = Some(retained_runtime_dir.clone());
+        retained_manifest.daemon_runtime_manifest = Some(retained_manifest_path);
+        retained_manifest.validate_success()?;
+
+        let mut mismatched_iparsd_binary_digest = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
-            &retained_manifest,
+            &mismatched_iparsd_binary_digest,
             DaemonRuntimePhase::Completed,
             &[
                 "control-plane-0",
@@ -5774,11 +5941,46 @@ mod tests {
                 "agent",
             ],
         )?;
-        retained_manifest.daemon_runtime_dir = Some(runtime_dir.clone());
-        retained_manifest.daemon_runtime_manifest = Some(manifest_path);
-        retained_manifest.validate_success()?;
+        mismatched_iparsd_binary_digest.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_iparsd_binary_digest.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.iparsd_binary.sha256 = "0".repeat(64);
+        })?;
+        let error = match mismatched_iparsd_binary_digest.validate_success() {
+            Ok(_) => bail!("retained manifest with mismatched iparsd binary digest should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("iparsd binary digest mismatch"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut relative_iparsd_binary_path = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &relative_iparsd_binary_path,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        relative_iparsd_binary_path.daemon_runtime_dir = Some(runtime_dir.clone());
+        relative_iparsd_binary_path.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.iparsd_binary.path = PathBuf::from("iparsd");
+        })?;
+        let error = match relative_iparsd_binary_path.validate_success() {
+            Ok(_) => bail!("retained manifest with relative iparsd binary path should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("iparsd binary path"));
+        assert!(error.contains("not absolute"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         std::fs::write(
-            runtime_dir.join("0000-control-plane-0.log"),
+            retained_runtime_dir.join("0000-control-plane-0.log"),
             "tampered retained log\n",
         )?;
         let error = match retained_manifest.validate_success() {
@@ -5788,7 +5990,7 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("log diagnostics mismatch"));
-        std::fs::remove_dir_all(&runtime_dir)?;
+        std::fs::remove_dir_all(&retained_runtime_dir)?;
 
         let mut mismatched_manifest_measurement = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
@@ -7846,6 +8048,35 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_binary_identity_records_canonical_symlink_target() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime_dir = synthetic_runtime_dir("binary-symlink");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let target_path = runtime_dir.join("iparsd-target");
+        let mut target_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .private_on_unix()
+            .open(&target_path)?;
+        target_file.write_all(b"#!/bin/sh\nexit 0\n")?;
+        target_file.sync_all()?;
+        drop(target_file);
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o700))?;
+        let symlink_path = runtime_dir.join("iparsd-link");
+        std::os::unix::fs::symlink(&target_path, &symlink_path)?;
+
+        let identity = daemon_binary_identity(&symlink_path)?;
+
+        assert_eq!(identity.path, target_path.canonicalize()?);
+        assert_eq!(identity.bytes, "#!/bin/sh\nexit 0\n".len() as u64);
+        assert_eq!(identity.sha256.len(), 64);
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
     #[test]
     fn daemon_join_token_writer_uses_private_runtime_file() -> anyhow::Result<()> {
         let runtime_dir = std::env::temp_dir().join(format!(
@@ -8377,6 +8608,18 @@ mod tests {
         ))
     }
 
+    fn synthetic_daemon_binary_identity() -> DaemonBinaryIdentity {
+        static IDENTITY: std::sync::OnceLock<DaemonBinaryIdentity> = std::sync::OnceLock::new();
+        IDENTITY
+            .get_or_init(|| match daemon_binary_identity(Path::new("sh")) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    panic!("failed to compute synthetic daemon binary identity: {error}")
+                }
+            })
+            .clone()
+    }
+
     fn synthetic_daemon_group(runtime_dir: PathBuf, keep_runtime_dir: bool) -> DaemonProcessGroup {
         let manifest_seed = synthetic_manifest_seed(runtime_dir.clone());
         DaemonProcessGroup {
@@ -8398,6 +8641,7 @@ mod tests {
             scenario: ScenarioName::Three,
             workload: synthetic_manifest_workload(),
             runtime_dir,
+            iparsd_binary: synthetic_daemon_binary_identity(),
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
             relay_http_url: "http://127.0.0.1:31003".to_string(),
@@ -8417,6 +8661,7 @@ mod tests {
             workload: synthetic_manifest_workload(),
             measurement: None,
             runtime_dir,
+            iparsd_binary: synthetic_daemon_binary_identity(),
             control_plane_urls: vec!["http://127.0.0.1:31001".to_string()],
             signal_url: "http://127.0.0.1:31002".to_string(),
             relay_http_url: "http://127.0.0.1:31003".to_string(),
@@ -8545,6 +8790,7 @@ mod tests {
                     .daemon_control_plane_failover_survivor_endpoints,
             }),
             runtime_dir: runtime_dir.clone(),
+            iparsd_binary: synthetic_daemon_binary_identity(),
             control_plane_urls: (0..report.daemon_control_plane_processes)
                 .map(|index| format!("http://127.0.0.1:31{index:03}"))
                 .collect(),
