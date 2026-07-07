@@ -3120,6 +3120,7 @@ async fn run_stun(
         start_stun_otel_metrics_export(
             stats.clone(),
             listen,
+            alternate_listen,
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
@@ -3323,6 +3324,7 @@ impl From<&StunServerMetricsSnapshot> for StunOtelSnapshot {
 #[derive(Debug)]
 struct StunOtelMetrics {
     server_active: Gauge<u64>,
+    rfc5780_alternate_server_active: Gauge<u64>,
     binding_requests: Counter<u64>,
     binding_responses: Counter<u64>,
     invalid_packets: Counter<u64>,
@@ -3337,6 +3339,10 @@ impl StunOtelMetrics {
             server_active: meter
                 .u64_gauge("ipars.stun.server.active")
                 .with_description("STUN server process active state.")
+                .build(),
+            rfc5780_alternate_server_active: meter
+                .u64_gauge("ipars.stun.rfc5780_alternate_server.active")
+                .with_description("STUN RFC5780 alternate socket active state.")
                 .build(),
             binding_requests: meter
                 .u64_counter("ipars.stun.binding_requests")
@@ -3364,12 +3370,17 @@ impl StunOtelMetrics {
     fn record_status(
         &self,
         listen: SocketAddr,
+        alternate_listen: Option<SocketAddr>,
         snapshot: &StunServerMetricsSnapshot,
         previous: Option<&StunOtelSnapshot>,
     ) {
-        let listen = listen.to_string();
-        let attrs = [KeyValue::new("listen", listen)];
+        let labels = StunOtelStatusLabels::new(listen, alternate_listen);
+        let attrs = labels.primary_attrs();
         self.server_active.record(1, &attrs);
+        if let Some(alternate_attrs) = labels.alternate_attrs() {
+            self.rfc5780_alternate_server_active
+                .record(1, &alternate_attrs);
+        }
         self.binding_requests.add(
             counter_delta(
                 snapshot.binding_request_count,
@@ -3408,9 +3419,38 @@ impl StunOtelMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StunOtelStatusLabels {
+    listen: String,
+    alternate_listen: Option<String>,
+}
+
+impl StunOtelStatusLabels {
+    fn new(listen: SocketAddr, alternate_listen: Option<SocketAddr>) -> Self {
+        Self {
+            listen: listen.to_string(),
+            alternate_listen: alternate_listen.map(|address| address.to_string()),
+        }
+    }
+
+    fn primary_attrs(&self) -> [KeyValue; 1] {
+        [KeyValue::new("listen", self.listen.clone())]
+    }
+
+    fn alternate_attrs(&self) -> Option<[KeyValue; 2]> {
+        self.alternate_listen.as_ref().map(|alternate_listen| {
+            [
+                KeyValue::new("listen", self.listen.clone()),
+                KeyValue::new("alternate_listen", alternate_listen.clone()),
+            ]
+        })
+    }
+}
+
 fn start_stun_otel_metrics_export(
     stats: Arc<StunServerStats>,
     listen: SocketAddr,
+    alternate_listen: Option<SocketAddr>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -3418,7 +3458,7 @@ fn start_stun_otel_metrics_export(
         let mut previous = None;
         loop {
             let snapshot = stats.snapshot();
-            metrics.record_status(listen, &snapshot, previous.as_ref());
+            metrics.record_status(listen, alternate_listen, &snapshot, previous.as_ref());
             previous = Some(StunOtelSnapshot::from(&snapshot));
             tokio::time::sleep(interval).await;
         }
@@ -12353,6 +12393,32 @@ mod tests {
                 socket_send_error_count: 3,
             }
         );
+    }
+
+    #[test]
+    fn stun_otel_status_labels_include_rfc5780_alternate_listener() {
+        let labels = StunOtelStatusLabels::new(
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            Some(SocketAddr::from(([127, 0, 0, 1], 3480))),
+        );
+
+        assert_eq!(
+            labels,
+            StunOtelStatusLabels {
+                listen: "127.0.0.1:3478".to_string(),
+                alternate_listen: Some("127.0.0.1:3480".to_string()),
+            }
+        );
+        let primary_attrs = labels.primary_attrs();
+        assert_eq!(primary_attrs.len(), 1);
+        let Some(alternate_attrs) = labels.alternate_attrs() else {
+            panic!("alternate listener should produce OTLP labels");
+        };
+        assert_eq!(alternate_attrs.len(), 2);
+
+        let no_alternate =
+            StunOtelStatusLabels::new(SocketAddr::from(([127, 0, 0, 1], 3478)), None);
+        assert!(no_alternate.alternate_attrs().is_none());
     }
 
     #[test]
