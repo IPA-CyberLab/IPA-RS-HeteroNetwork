@@ -3552,6 +3552,7 @@ impl From<&StunServerMetricsSnapshot> for StunOtelSnapshot {
 struct StunOtelMetrics {
     server_active: Gauge<u64>,
     rfc5780_alternate_server_active: Gauge<u64>,
+    metrics_generated_timestamp_seconds: Gauge<u64>,
     binding_requests: Counter<u64>,
     binding_responses: Counter<u64>,
     invalid_packets: Counter<u64>,
@@ -3570,6 +3571,10 @@ impl StunOtelMetrics {
             rfc5780_alternate_server_active: meter
                 .u64_gauge("ipars.stun.rfc5780_alternate_server.active")
                 .with_description("STUN RFC5780 alternate socket active state.")
+                .build(),
+            metrics_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.stun.metrics.generated_timestamp_seconds")
+                .with_description("Unix timestamp of the STUN metrics snapshot exported to OTLP.")
                 .build(),
             binding_requests: meter
                 .u64_counter("ipars.stun.binding_requests")
@@ -3599,11 +3604,14 @@ impl StunOtelMetrics {
         listen: SocketAddr,
         alternate_listen: Option<SocketAddr>,
         snapshot: &StunServerMetricsSnapshot,
+        generated_at: chrono::DateTime<chrono::Utc>,
         previous: Option<&StunOtelSnapshot>,
     ) {
         let labels = StunOtelStatusLabels::new(listen, alternate_listen);
         let attrs = labels.primary_attrs();
         self.server_active.record(1, &attrs);
+        self.metrics_generated_timestamp_seconds
+            .record(otel_generated_timestamp_seconds(&generated_at), &attrs);
         if let Some(alternate_attrs) = labels.alternate_attrs() {
             self.rfc5780_alternate_server_active
                 .record(1, &alternate_attrs);
@@ -3685,7 +3693,13 @@ fn start_stun_otel_metrics_export(
         let mut previous = None;
         loop {
             let snapshot = stats.snapshot();
-            metrics.record_status(listen, alternate_listen, &snapshot, previous.as_ref());
+            metrics.record_status(
+                listen,
+                alternate_listen,
+                &snapshot,
+                chrono::Utc::now(),
+                previous.as_ref(),
+            );
             previous = Some(StunOtelSnapshot::from(&snapshot));
             tokio::time::sleep(interval).await;
         }
@@ -3700,6 +3714,7 @@ struct ControlPlaneOtelMetrics {
     endpoint_candidate_ttl_seconds: Gauge<u64>,
     stale_paths: Gauge<u64>,
     path_state_ttl_seconds: Gauge<u64>,
+    metrics_generated_timestamp_seconds: Gauge<u64>,
     vpn_pool_total: Gauge<u64>,
     vpn_pool_allocated: Gauge<u64>,
     vpn_pool_available: Gauge<u64>,
@@ -3747,6 +3762,12 @@ impl ControlPlaneOtelMetrics {
                 .u64_gauge("ipars.control_plane.path_state_ttl_seconds")
                 .with_description(
                     "Path-state freshness window used by control-plane status and metrics.",
+                )
+                .build(),
+            metrics_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.control_plane.metrics.generated_timestamp_seconds")
+                .with_description(
+                    "Unix timestamp of the control-plane metrics snapshot exported to OTLP.",
                 )
                 .build(),
             vpn_pool_total: meter
@@ -3819,6 +3840,10 @@ impl ControlPlaneOtelMetrics {
     fn record_status(&self, metrics: &ControlPlaneMetricsResponse) {
         let cluster_id = metrics.cluster_id.as_str().to_string();
         let cluster_attrs = [KeyValue::new("cluster_id", cluster_id.clone())];
+        self.metrics_generated_timestamp_seconds.record(
+            otel_generated_timestamp_seconds(&metrics.generated_at),
+            &cluster_attrs,
+        );
         self.nodes.record(metrics.node_count as u64, &cluster_attrs);
         self.relay_candidates
             .record(metrics.relay_candidate_count as u64, &cluster_attrs);
@@ -4015,6 +4040,7 @@ struct SignalOtelMetrics {
     endpoint_candidate_ttl_seconds: Gauge<u64>,
     nat_classification_ttl_seconds: Gauge<u64>,
     nat_classification_min_confidence_percent: Gauge<u64>,
+    metrics_generated_timestamp_seconds: Gauge<u64>,
     node_upserts: Counter<u64>,
     path_negotiations: Counter<u64>,
     path_acl_denials: Counter<u64>,
@@ -4092,6 +4118,10 @@ impl SignalOtelMetrics {
                     "Minimum NAT classification confidence percentage required by signal.",
                 )
                 .build(),
+            metrics_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.signal.metrics.generated_timestamp_seconds")
+                .with_description("Unix timestamp of the signal metrics snapshot exported to OTLP.")
+                .build(),
             node_upserts: meter
                 .u64_counter("ipars.signal.node_upserts")
                 .with_description("Signal node upsert requests handled.")
@@ -4140,6 +4170,8 @@ impl SignalOtelMetrics {
         metrics: &SignalMetricsResponse,
         previous: Option<&SignalOtelSnapshot>,
     ) {
+        self.metrics_generated_timestamp_seconds
+            .record(otel_generated_timestamp_seconds(&metrics.generated_at), &[]);
         self.nodes.record(metrics.node_count as u64, &[]);
         self.relay_candidates
             .record(metrics.relay_candidate_count as u64, &[]);
@@ -4390,6 +4422,7 @@ struct RelayOtelMetrics {
     enabled_by_policy: Gauge<u64>,
     e2e_only: Gauge<u64>,
     health: Gauge<u64>,
+    status_generated_timestamp_seconds: Gauge<u64>,
 }
 
 impl RelayOtelMetrics {
@@ -4480,16 +4513,29 @@ impl RelayOtelMetrics {
                 .u64_gauge("ipars.relay.health")
                 .with_description("Relay health state as a labeled gauge.")
                 .build(),
+            status_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.relay.status.generated_timestamp_seconds")
+                .with_description("Unix timestamp when the relay status snapshot was exported to OTLP.")
+                .build(),
         }
     }
 
-    fn record_status(&self, status: &RelayStatusResponse, previous: Option<&RelayOtelSnapshot>) {
+    fn record_status(
+        &self,
+        status: &RelayStatusResponse,
+        generated_at: chrono::DateTime<chrono::Utc>,
+        previous: Option<&RelayOtelSnapshot>,
+    ) {
         let delta = relay_dataplane_delta(
             &status.dataplane,
             previous.map(|snapshot| &snapshot.dataplane),
         );
         let relay_node = status.relay_node.as_str().to_string();
         let relay_attrs = [KeyValue::new("relay_node", relay_node.clone())];
+        self.status_generated_timestamp_seconds.record(
+            otel_generated_timestamp_seconds(&generated_at),
+            &relay_attrs,
+        );
         let admission_attempt_delta = counter_delta(
             status.admission_attempt_count,
             previous.map(|snapshot| snapshot.admission_attempt_count),
@@ -4638,6 +4684,10 @@ fn counter_delta(current: u64, previous: Option<u64>) -> u64 {
     current.saturating_sub(previous.unwrap_or(0))
 }
 
+fn otel_generated_timestamp_seconds(generated_at: &chrono::DateTime<chrono::Utc>) -> u64 {
+    generated_at.timestamp().max(0) as u64
+}
+
 fn health_label(state: HealthState) -> &'static str {
     match state {
         HealthState::Healthy => "healthy",
@@ -4665,7 +4715,7 @@ fn start_relay_otel_metrics_export(
         let mut previous = None;
         loop {
             let status = service.status().await;
-            metrics.record_status(&status, previous.as_ref());
+            metrics.record_status(&status, chrono::Utc::now(), previous.as_ref());
             previous = Some(RelayOtelSnapshot::from(&status));
             tokio::time::sleep(interval).await;
         }
@@ -4759,6 +4809,7 @@ struct AgentOtelMetrics {
     relay_forwarders: Gauge<u64>,
     userspace_wireguard_process_state: Gauge<u64>,
     path_change_events: Gauge<u64>,
+    metrics_generated_timestamp_seconds: Gauge<u64>,
     lazy_active_peers: Gauge<u64>,
     lazy_pinned_peers: Gauge<u64>,
     lazy_observed_peer_vpn_ips: Gauge<u64>,
@@ -4860,6 +4911,10 @@ impl AgentOtelMetrics {
             path_change_events: meter
                 .u64_gauge("ipars.agent.path_change_events")
                 .with_description("Retained path change events.")
+                .build(),
+            metrics_generated_timestamp_seconds: meter
+                .u64_gauge("ipars.agent.metrics.generated_timestamp_seconds")
+                .with_description("Unix timestamp of the agent metrics snapshot exported to OTLP.")
                 .build(),
             lazy_active_peers: meter
                 .u64_gauge("ipars.agent.lazy_connect.active_peers")
@@ -5151,6 +5206,10 @@ impl AgentOtelMetrics {
     fn record_status(&self, metrics: &AgentMetricsResponse, previous: Option<&AgentOtelSnapshot>) {
         let node_id = metrics.node_id.as_str().to_string();
         let node_attrs = [KeyValue::new("node_id", node_id.clone())];
+        self.metrics_generated_timestamp_seconds.record(
+            otel_generated_timestamp_seconds(&metrics.generated_at),
+            &node_attrs,
+        );
         self.candidates
             .record(metrics.candidate_count as u64, &node_attrs);
         self.peer_map_synced
@@ -12286,7 +12345,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use async_trait::async_trait;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use ipars_agent::AgentNodeState;
     use ipars_route_manager::PolicyRule;
     use ipars_types::api::{
@@ -14070,6 +14129,21 @@ mod tests {
                 .values()
                 .all(|count| *count == 0)
         );
+    }
+
+    #[test]
+    fn otel_generated_timestamp_seconds_uses_unix_seconds_and_clamps_pre_epoch() {
+        let generated_at = Utc
+            .timestamp_opt(1_725_000_123, 987_000_000)
+            .single()
+            .unwrap();
+        let pre_epoch = Utc.timestamp_opt(-1, 0).single().unwrap();
+
+        assert_eq!(
+            otel_generated_timestamp_seconds(&generated_at),
+            1_725_000_123
+        );
+        assert_eq!(otel_generated_timestamp_seconds(&pre_epoch), 0);
     }
 
     async fn insert_dead_forwarder(
