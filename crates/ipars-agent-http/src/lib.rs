@@ -1410,6 +1410,15 @@ mod tests {
         let metrics: AgentMetricsResponse = serde_json::from_slice(&body)?;
         assert_eq!(metrics.node_id, node_id);
         assert_eq!(metrics.path_count, 1);
+        assert_eq!(metrics.path_state_counts.len(), 5);
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .any(|entry| entry.state == PathState::Relay && entry.count == 1));
+        assert!(metrics
+            .path_state_counts
+            .iter()
+            .any(|entry| entry.state == PathState::DirectPublic && entry.count == 0));
         assert_eq!(metrics.relay_forwarder_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
         assert_eq!(metrics.relay_forwarders.len(), 1);
@@ -1567,6 +1576,10 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_agent_paths"));
         assert!(body.contains("state=\"RELAY\""));
+        assert!(body.contains("state=\"DIRECT_PUBLIC\""));
+        assert!(body.contains("state=\"DIRECT_IPV6\""));
+        assert!(body.contains("state=\"DIRECT_NAT_TRAVERSAL\""));
+        assert!(body.contains("state=\"UNREACHABLE\""));
         assert!(body.contains("ipars_agent_relay_forwarder_outbound_packets_total"));
         assert!(body.contains(
             "ipars_agent_relay_forwarder_outbound_dropped_unexpected_source_packets_total"
@@ -1615,6 +1628,12 @@ mod tests {
         assert!(body.contains("ipars_agent_packet_flow_classified_by_lifecycle_total"));
         assert!(body.contains("ipars_agent_packet_flow_classified_by_application_total"));
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"RELAY\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_path_state_count{{node_id=\"{prometheus_node_id}\",state=\"DIRECT_PUBLIC\"}} 0"
+        )));
         assert!(body.contains(
             &format!("ipars_agent_relay_admission_failures_by_reason_total{{node_id=\"{prometheus_node_id}\",reason=\"rejected\"}} 1")
         ));

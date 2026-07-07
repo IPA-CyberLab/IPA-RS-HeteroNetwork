@@ -1244,9 +1244,12 @@ impl AgentRuntime {
                 .map(|metrics| metrics.snapshot())
                 .collect(),
             path_change_event_count: path_change_events.len(),
-            path_state_counts: path_state_counts
+            path_state_counts: PATH_STATE_METRIC_ORDER
                 .into_iter()
-                .map(|(state, count)| PathStateCount { state, count })
+                .map(|state| PathStateCount {
+                    state,
+                    count: *path_state_counts.get(&state).unwrap_or(&0),
+                })
                 .collect(),
             lazy_connect: lazy_connect.metrics(),
             path_probe_record_count: self.path_probe_record_count.load(Ordering::Relaxed),
@@ -3273,6 +3276,13 @@ impl LazyConnectManager {
 pub struct PathSelector;
 
 const DIRECT_PROMOTION_SCORE_MARGIN: f32 = 5.0;
+const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
+    PathState::DirectPublic,
+    PathState::DirectIpv6,
+    PathState::DirectNatTraversal,
+    PathState::Relay,
+    PathState::Unreachable,
+];
 
 impl PathSelector {
     pub fn best_path(paths: &[PathRecord]) -> Option<PathRecord> {
@@ -4102,10 +4112,28 @@ mod tests {
         assert!(metrics.relay_forwarders.is_empty());
         assert_eq!(
             metrics.path_state_counts,
-            vec![PathStateCount {
-                state: PathState::DirectPublic,
-                count: 1,
-            }]
+            vec![
+                PathStateCount {
+                    state: PathState::DirectPublic,
+                    count: 1,
+                },
+                PathStateCount {
+                    state: PathState::DirectIpv6,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::DirectNatTraversal,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::Relay,
+                    count: 0,
+                },
+                PathStateCount {
+                    state: PathState::Unreachable,
+                    count: 0,
+                },
+            ]
         );
     }
 
