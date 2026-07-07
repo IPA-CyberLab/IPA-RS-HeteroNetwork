@@ -248,6 +248,12 @@ fn open_netlink_socket_in_namespace(
             ),
         )
     })?;
+    warn_if_target_netns_is_current(
+        namespace,
+        &namespace_path,
+        &current_namespace,
+        &target_namespace,
+    )?;
 
     set_thread_netns(&target_namespace)?;
     let restore_guard = ThreadNetnsRestoreGuard::new(current_namespace);
@@ -306,6 +312,49 @@ fn open_current_thread_netns() -> io::Result<File> {
             )
         })
     })
+}
+
+#[cfg(unix)]
+fn warn_if_target_netns_is_current(
+    namespace: &LinuxNetworkNamespace,
+    path: &Path,
+    current_namespace: &File,
+    target_namespace: &File,
+) -> io::Result<()> {
+    let current_metadata = current_namespace.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to stat current thread network namespace: {error}"),
+        )
+    })?;
+    let target_metadata = target_namespace.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to stat linux network namespace `{}` at {}: {error}",
+                namespace.name(),
+                path.display()
+            ),
+        )
+    })?;
+    if same_file_metadata_identity(&current_metadata, &target_metadata) {
+        tracing::warn!(
+            namespace = namespace.name(),
+            path = %path.display(),
+            "configured route-manager linux network namespace resolves to the current process namespace"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn warn_if_target_netns_is_current(
+    _namespace: &LinuxNetworkNamespace,
+    _path: &Path,
+    _current_namespace: &File,
+    _target_namespace: &File,
+) -> io::Result<()> {
+    Ok(())
 }
 
 fn inspect_linux_netns_path(namespace: &LinuxNetworkNamespace, path: &Path) -> io::Result<()> {
@@ -382,6 +431,13 @@ fn ensure_linux_netns_nsfs(namespace: &LinuxNetworkNamespace, path: &Path) -> io
 #[cfg(not(target_os = "linux"))]
 fn ensure_linux_netns_nsfs(_namespace: &LinuxNetworkNamespace, _path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_metadata_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 fn netlink_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> String {
@@ -2018,6 +2074,32 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn netns_identity_detects_same_file() -> Result<(), Box<dyn std::error::Error>> {
+        let base = route_manager_test_dir("netns-path-identity")?;
+        let target = base.join("target");
+        let current = base.join("current");
+        let other = base.join("other");
+        std::fs::write(&target, b"netns")?;
+        std::fs::hard_link(&target, &current)?;
+        std::fs::write(&other, b"other-netns")?;
+
+        let target_metadata = std::fs::metadata(&target)?;
+        let current_metadata = std::fs::metadata(&current)?;
+        let other_metadata = std::fs::metadata(&other)?;
+        assert!(same_file_metadata_identity(
+            &target_metadata,
+            &current_metadata
+        ));
+        assert!(!same_file_metadata_identity(
+            &target_metadata,
+            &other_metadata
+        ));
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
