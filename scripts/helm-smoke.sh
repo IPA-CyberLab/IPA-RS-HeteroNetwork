@@ -113,6 +113,40 @@ template_ok cluster-external-traffic-policy \
 
 assert_rendered_contains cluster-external-traffic-policy "externalTrafficPolicy: Cluster"
 
+template_ok load-balancer-source-ranges \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set-string 'agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24' \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set-string 'agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24'
+
+assert_rendered_contains load-balancer-source-ranges "type: LoadBalancer"
+assert_rendered_contains load-balancer-source-ranges "loadBalancerSourceRanges:"
+assert_rendered_contains load-balancer-source-ranges "198.51.100.0/24"
+assert_rendered_contains load-balancer-source-ranges "203.0.113.0/24"
+
+template_ok unrestricted-load-balancer \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true
+
+assert_rendered_contains unrestricted-load-balancer "type: LoadBalancer"
+assert_rendered_absent unrestricted-load-balancer "loadBalancerSourceRanges:"
+
 template_ok network-policy \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP \
@@ -163,6 +197,53 @@ template_ok relay-forwarder-netns \
 template_fails relay-service-without-advertisement \
   "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true" \
   --set agent.relayService.enabled=true
+
+template_fails agent-api-nodeport-without-exposure-ack \
+  "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=NodePort
+
+template_fails relay-nodeport-without-exposure-ack \
+  "agent.relayService external exposure requires agent.relayService.exposureAcknowledged=true" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=NodePort
+
+template_fails agent-api-load-balancer-without-source-control \
+  "agent.apiService LoadBalancer exposure requires agent.apiService.loadBalancerSourceRanges or agent.apiService.allowUnrestrictedLoadBalancer=true" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true
+
+template_fails relay-load-balancer-without-source-control \
+  "agent.relayService LoadBalancer exposure requires agent.relayService.loadBalancerSourceRanges or agent.relayService.allowUnrestrictedLoadBalancer=true" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true
+
+template_fails agent-api-unrestricted-load-balancer-with-source-ranges \
+  "agent.apiService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.apiService.loadBalancerSourceRanges" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24'
+
+template_fails relay-unrestricted-load-balancer-with-source-ranges \
+  "agent.relayService.allowUnrestrictedLoadBalancer=true cannot be combined with agent.relayService.loadBalancerSourceRanges" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.loadBalancerSourceRanges[0]=203.0.113.0/24'
 
 template_fails host-network-policy-without-ack \
   "networkPolicy with agent.hostNetwork=true requires networkPolicy.acknowledgeHostNetwork=true" \
