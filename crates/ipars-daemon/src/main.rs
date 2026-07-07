@@ -13423,6 +13423,10 @@ mod tests {
             application_delta.get(&AgentPacketFlowApplication::Tacacs),
             Some(&0)
         );
+        assert_eq!(
+            application_delta.get(&AgentPacketFlowApplication::Bgp),
+            Some(&0)
+        );
 
         let previous = AgentOtelSnapshot::from(&metrics);
         assert!(

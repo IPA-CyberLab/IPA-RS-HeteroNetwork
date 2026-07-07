@@ -1742,6 +1742,7 @@ pub mod api {
         Ntp,
         Radius,
         Tacacs,
+        Bgp,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1777,7 +1778,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 45] = [
+        pub const ALL: [Self; 46] = [
             Self::Unknown,
             Self::Dns,
             Self::Http,
@@ -1791,6 +1792,7 @@ pub mod api {
             Self::Ntp,
             Self::Radius,
             Self::Tacacs,
+            Self::Bgp,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1840,6 +1842,7 @@ pub mod api {
                 Self::Ntp => "ntp",
                 Self::Radius => "radius",
                 Self::Tacacs => "tacacs",
+                Self::Bgp => "bgp",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2134,6 +2137,9 @@ pub mod api {
             if self.involves_port(49) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Tacacs;
             }
+            if self.involves_port(179) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Bgp;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2328,6 +2334,9 @@ pub mod api {
             }
             if protocol_is(self.protocol, TransportProtocol::Tcp) && tacacs_payload(payload) {
                 return Some(AgentPacketFlowApplication::Tacacs);
+            }
+            if protocol_is(self.protocol, TransportProtocol::Tcp) && bgp_payload(payload) {
+                return Some(AgentPacketFlowApplication::Bgp);
             }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
@@ -3217,6 +3226,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Tacacs);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"bgp")
+            || tls_sni_hostname_has_label_prefix(hostname, b"bgp4")
+        {
+            return Some(AgentPacketFlowApplication::Bgp);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
         }
@@ -3447,6 +3461,9 @@ pub mod api {
             || protocol.eq_ignore_ascii_case(b"tacacs-plus")
         {
             return Some(AgentPacketFlowApplication::Tacacs);
+        }
+        if protocol.eq_ignore_ascii_case(b"bgp") || protocol.eq_ignore_ascii_case(b"bgp4") {
+            return Some(AgentPacketFlowApplication::Bgp);
         }
         if protocol.eq_ignore_ascii_case(b"smb") {
             return Some(AgentPacketFlowApplication::Smb);
@@ -3968,6 +3985,23 @@ pub mod api {
         total_len <= payload.len()
             || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
                 && total_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
+    fn bgp_payload(payload: &[u8]) -> bool {
+        const BGP_HEADER_LEN: usize = 19;
+
+        if payload.len() < BGP_HEADER_LEN || !payload[..16].iter().all(|byte| *byte == 0xff) {
+            return false;
+        }
+        let message_len = u16::from_be_bytes([payload[16], payload[17]]) as usize;
+        if !(BGP_HEADER_LEN..=4096).contains(&message_len)
+            || !matches!(payload[18], 1 | 2 | 3 | 4 | 5)
+        {
+            return false;
+        }
+        message_len <= payload.len()
+            || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
+                && message_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
     }
 
     fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -8144,6 +8178,13 @@ mod tests {
             api::AgentPacketFlowApplication::Tacacs
         );
 
+        let bgp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(179),
+            ..Default::default()
+        };
+        assert_eq!(bgp.application(), api::AgentPacketFlowApplication::Bgp);
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -9064,6 +9105,27 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let mut bgp_open = vec![0xff; 19];
+        bgp_open[16] = 0;
+        bgp_open[17] = 29;
+        bgp_open[18] = 1;
+        bgp_open.extend_from_slice(&[4, 0, 100, 0, 90, 192, 0, 2, 1, 0]);
+        assert_eq!(
+            observation_for_payload(&bgp_open).application(),
+            api::AgentPacketFlowApplication::Bgp
+        );
+        bgp_open[18] = 9;
+        assert_eq!(
+            observation_for_payload(&bgp_open).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        bgp_open[18] = 1;
+        bgp_open[0] = 0xfe;
+        assert_eq!(
+            observation_for_payload(&bgp_open).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -9423,6 +9485,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Tacacs,
             ),
             (
+                "bgp-route-provider.network.svc",
+                api::AgentPacketFlowApplication::Bgp,
+            ),
+            (
                 "smb-files.storage.svc",
                 api::AgentPacketFlowApplication::Smb,
             ),
@@ -9552,6 +9618,10 @@ mod tests {
             (
                 &[b"tacacs".as_slice()][..],
                 api::AgentPacketFlowApplication::Tacacs,
+            ),
+            (
+                &[b"bgp".as_slice()][..],
+                api::AgentPacketFlowApplication::Bgp,
             ),
         ] {
             assert_eq!(
@@ -11090,6 +11160,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint tacacs requires TCP protocol"));
+
+        let tcp_bgp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"bgp"}"#)?;
+        tcp_bgp_hint.validate_transport_metadata()?;
+
+        let udp_bgp_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"bgp"}"#)?;
+        let error = match udp_bgp_hint.validate_transport_metadata() {
+            Ok(()) => return Err("UDP BGP hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint bgp requires TCP protocol"));
 
         let tcp_wireguard_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"wire_guard"}"#)?;
