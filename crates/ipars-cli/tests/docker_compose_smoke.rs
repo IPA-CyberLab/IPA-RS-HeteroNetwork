@@ -324,6 +324,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
     assert_compose_agent_lazy_connect_paths(&compose, &agent_nodes, &api_ports)?;
+    assert_compose_signal_path_negotiation_metrics(&compose)?;
     assert_compose_control_plane_path_state(&compose, &agent_nodes)?;
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
@@ -913,6 +914,23 @@ fn ensure_agent_paths_contain(value: &Value, local: &str, remote: &str) -> Resul
     anyhow::bail!("agent paths did not include path {local}->{remote}: {value}")
 }
 
+fn assert_compose_signal_path_negotiation_metrics(compose: &ComposeProject) -> Result<()> {
+    wait_for_json(
+        compose,
+        "signal path negotiation metrics",
+        "signal",
+        "http://127.0.0.1:9443/v1/metrics",
+        |value| {
+            ensure_json_u64_at_least(value, "path_negotiation_count", 2)?;
+            ensure_json_u64_equals(value, "path_acl_denied_count", 0)?;
+            ensure_json_u64_equals(value, "relay_candidate_acl_denied_count", 0)?;
+            ensure_json_count_array_total_at_least(value, "path_negotiation_state_counts", 2)?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 fn assert_compose_control_plane_path_state(
     compose: &ComposeProject,
     nodes: &ComposeAgentNodes,
@@ -1324,6 +1342,25 @@ fn ensure_json_bool_equals(value: &Value, field: &str, expected: bool) -> Result
     anyhow::ensure!(
         actual == expected,
         "expected JSON field {field} to equal {expected}, got {actual}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_count_array_total_at_least(value: &Value, field: &str, minimum: u64) -> Result<()> {
+    let counts = value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("JSON field {field} was missing or not an array: {value}"))?;
+    let mut total = 0_u64;
+    for count in counts {
+        ensure_json_string_nonempty(count, "state")?;
+        total = total
+            .checked_add(json_u64_field(count, "count")?)
+            .with_context(|| format!("JSON field {field} count total overflowed: {value}"))?;
+    }
+    anyhow::ensure!(
+        total >= minimum,
+        "expected JSON field {field} count total to be at least {minimum}, got {total}: {value}"
     );
     Ok(())
 }
