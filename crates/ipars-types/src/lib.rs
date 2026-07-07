@@ -6515,6 +6515,7 @@ pub mod api {
     const MYSQL_CLIENT_SSL: u32 = 0x0000_0800;
     const MYSQL_CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
     const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+    const MYSQL_CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
     const MYSQL_MAX_PACKET_PAYLOAD_LEN: usize = 16_777_215;
@@ -6762,7 +6763,8 @@ pub mod api {
         if client_flags & MYSQL_CLIENT_CONNECT_WITH_DB != 0 {
             let Some(database_end) = mysql_client_null_terminated_field(body, offset, payload_len)
             else {
-                return payload_len > body.len();
+                return payload_len > body.len()
+                    && mysql_client_text_field(&body[offset..], 1024, false);
             };
             if !mysql_client_text_field(&body[offset..database_end - 1], 1024, false) {
                 return false;
@@ -6772,13 +6774,18 @@ pub mod api {
         if client_flags & MYSQL_CLIENT_PLUGIN_AUTH != 0 {
             let Some(plugin_end) = mysql_client_null_terminated_field(body, offset, payload_len)
             else {
-                return payload_len > body.len();
+                return payload_len > body.len()
+                    && mysql_client_plugin_name_prefix(&body[offset..]);
             };
             if !mysql_client_plugin_name(&body[offset..plugin_end - 1]) {
                 return false;
             }
+            offset = plugin_end;
         }
-        true
+        if client_flags & MYSQL_CLIENT_CONNECT_ATTRS != 0 {
+            return mysql_client_connection_attrs_payload(body, offset, payload_len);
+        }
+        offset == payload_len || (payload_len > body.len() && offset == body.len())
     }
 
     fn mysql_client_null_terminated_field(
@@ -6810,21 +6817,164 @@ pub mod api {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
     }
 
-    fn mysql_length_encoded_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+    fn mysql_client_plugin_name_prefix(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    }
+
+    fn mysql_client_connection_attrs_payload(
+        body: &[u8],
+        offset: usize,
+        payload_len: usize,
+    ) -> bool {
+        let Some((attrs_len, attrs_offset)) = mysql_length_encoded_integer(body, offset) else {
+            return payload_len > body.len();
+        };
+        let Some(attrs_end) = attrs_offset.checked_add(attrs_len) else {
+            return false;
+        };
+        if attrs_end > payload_len {
+            return false;
+        }
+        if body.len() < attrs_end {
+            let Some(attrs_prefix) = body.get(attrs_offset..) else {
+                return false;
+            };
+            return payload_len > body.len()
+                && attrs_prefix.len() <= attrs_len
+                && mysql_client_connection_attrs_body(attrs_prefix, true);
+        }
+        let Some(attrs) = body.get(attrs_offset..attrs_end) else {
+            return false;
+        };
+        mysql_client_connection_attrs_body(attrs, false)
+            && (attrs_end == payload_len || (payload_len > body.len() && attrs_end == body.len()))
+    }
+
+    enum MysqlLengthEncodedStringParse<'a> {
+        Complete(&'a [u8], usize),
+        Incomplete,
+    }
+
+    fn mysql_client_connection_attrs_body(payload: &[u8], incomplete: bool) -> bool {
+        let mut offset = 0_usize;
+        let mut pair_count = 0_usize;
+        while offset < payload.len() {
+            let (key, value_offset) =
+                match mysql_length_encoded_string_prefix(payload, offset, 1, 1024) {
+                    Some(MysqlLengthEncodedStringParse::Complete(value, next_offset)) => {
+                        (value, next_offset)
+                    }
+                    Some(MysqlLengthEncodedStringParse::Incomplete) => return incomplete,
+                    None => return false,
+                };
+            if !mysql_client_text_field(key, 1024, false) {
+                return false;
+            }
+            match mysql_length_encoded_string_prefix(payload, value_offset, 0, 4096) {
+                Some(MysqlLengthEncodedStringParse::Complete(value, next_offset)) => {
+                    if !mysql_client_text_field(value, 4096, true) {
+                        return false;
+                    }
+                    pair_count += 1;
+                    if pair_count > 64 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MysqlLengthEncodedStringParse::Incomplete) => return incomplete,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    fn mysql_length_encoded_string_prefix(
+        payload: &[u8],
+        offset: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<MysqlLengthEncodedStringParse<'_>> {
+        let (len, data_offset) = match mysql_length_encoded_integer_prefix(payload, offset)? {
+            MysqlLengthEncodedIntegerParse::Complete(value, next_offset) => (value, next_offset),
+            MysqlLengthEncodedIntegerParse::Incomplete => {
+                return Some(MysqlLengthEncodedStringParse::Incomplete)
+            }
+        };
+        if len < min || len > max {
+            return None;
+        }
+        let data_end = data_offset.checked_add(len)?;
+        if payload.len() < data_end {
+            let partial = payload.get(data_offset..)?;
+            return mysql_client_text_field(partial, max, min == 0)
+                .then_some(MysqlLengthEncodedStringParse::Incomplete);
+        }
+        Some(MysqlLengthEncodedStringParse::Complete(
+            payload.get(data_offset..data_end)?,
+            data_end,
+        ))
+    }
+
+    enum MysqlLengthEncodedIntegerParse {
+        Complete(usize, usize),
+        Incomplete,
+    }
+
+    fn mysql_length_encoded_integer_prefix(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<MysqlLengthEncodedIntegerParse> {
         let first = *payload.get(offset)?;
         match first {
-            0x00..=0xfa => Some((first as usize, offset.checked_add(1)?)),
-            0xfc => read_u16_le(payload, offset.checked_add(1)?)
-                .map(|value| (value as usize, offset + 3)),
-            0xfd => read_u24_le(payload, offset.checked_add(1)?).map(|value| (value, offset + 4)),
+            0x00..=0xfa => Some(MysqlLengthEncodedIntegerParse::Complete(
+                first as usize,
+                offset.checked_add(1)?,
+            )),
+            0xfc => {
+                let value_offset = offset.checked_add(1)?;
+                if payload.len().saturating_sub(value_offset) < 2 {
+                    return Some(MysqlLengthEncodedIntegerParse::Incomplete);
+                }
+                read_u16_le(payload, value_offset).map(|value| {
+                    MysqlLengthEncodedIntegerParse::Complete(value as usize, offset + 3)
+                })
+            }
+            0xfd => {
+                let value_offset = offset.checked_add(1)?;
+                if payload.len().saturating_sub(value_offset) < 3 {
+                    return Some(MysqlLengthEncodedIntegerParse::Incomplete);
+                }
+                read_u24_le(payload, value_offset)
+                    .map(|value| MysqlLengthEncodedIntegerParse::Complete(value, offset + 4))
+            }
             0xfe => {
-                let bytes = payload.get(offset.checked_add(1)?..offset.checked_add(9)?)?;
+                let value_offset = offset.checked_add(1)?;
+                if payload.len().saturating_sub(value_offset) < 8 {
+                    return Some(MysqlLengthEncodedIntegerParse::Incomplete);
+                }
+                let bytes = payload.get(value_offset..offset.checked_add(9)?)?;
                 let value = u64::from_le_bytes([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
-                (value <= usize::MAX as u64).then_some((value as usize, offset + 9))
+                (value <= usize::MAX as u64).then_some(MysqlLengthEncodedIntegerParse::Complete(
+                    value as usize,
+                    offset + 9,
+                ))
             }
             _ => None,
+        }
+    }
+
+    fn mysql_length_encoded_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        match mysql_length_encoded_integer_prefix(payload, offset)? {
+            MysqlLengthEncodedIntegerParse::Complete(value, next_offset) => {
+                Some((value, next_offset))
+            }
+            MysqlLengthEncodedIntegerParse::Incomplete => None,
         }
     }
 
@@ -9844,6 +9994,7 @@ mod tests {
     const MYSQL_CLIENT_SSL: u32 = 0x0000_0800;
     const MYSQL_CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
     const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+    const MYSQL_CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
     #[test]
@@ -11285,6 +11436,7 @@ mod tests {
             auth_response: &[u8],
             database: Option<&[u8]>,
             plugin: Option<&[u8]>,
+            attrs: Option<&[(&[u8], &[u8])]>,
         ) -> Vec<u8> {
             let mut body = Vec::new();
             body.extend_from_slice(&client_flags.to_le_bytes());
@@ -11311,7 +11463,31 @@ mod tests {
                 body.extend_from_slice(plugin.unwrap_or(b"caching_sha2_password"));
                 body.push(0);
             }
+            if client_flags & MYSQL_CLIENT_CONNECT_ATTRS != 0 {
+                let mut encoded_attrs = Vec::new();
+                for (key, value) in
+                    attrs.unwrap_or(&[(b"_client_name".as_slice(), b"ipars-test".as_slice())])
+                {
+                    mysql_lenenc_string(&mut encoded_attrs, key);
+                    mysql_lenenc_string(&mut encoded_attrs, value);
+                }
+                mysql_lenenc_string_length(&mut body, encoded_attrs.len());
+                body.extend_from_slice(&encoded_attrs);
+            }
             mysql_packet(sequence_id, &body)
+        }
+
+        fn mysql_lenenc_string(payload: &mut Vec<u8>, value: &[u8]) {
+            mysql_lenenc_string_length(payload, value.len());
+            payload.extend_from_slice(value);
+        }
+
+        fn mysql_lenenc_string_length(payload: &mut Vec<u8>, len: usize) {
+            assert!(
+                len <= 250,
+                "test helper only encodes small length-encoded strings"
+            );
+            payload.push(len as u8);
         }
 
         fn mysql_ssl_request_packet() -> Vec<u8> {
@@ -13309,6 +13485,7 @@ mod tests {
                 b"01234567890123456789",
                 Some(b"app_db"),
                 Some(b"caching_sha2_password"),
+                None,
             ))
             .application(),
             api::AgentPacketFlowApplication::Mysql
@@ -13323,6 +13500,24 @@ mod tests {
                 b"01234567890123456789012345678901",
                 Some(b"app_db"),
                 Some(b"mysql_native_password"),
+                None,
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        let mysql_attrs_client_flags = mysql_lenenc_client_flags | MYSQL_CLIENT_CONNECT_ATTRS;
+        assert_eq!(
+            observation_for_payload(&mysql_client_handshake_response_packet(
+                1,
+                mysql_attrs_client_flags,
+                b"app_user",
+                b"01234567890123456789012345678901",
+                Some(b"app_db"),
+                Some(b"mysql_native_password"),
+                Some(&[
+                    (b"_client_name".as_slice(), b"ipars-agent".as_slice()),
+                    (b"program_name".as_slice(), b"packet-flow-smoke".as_slice()),
+                ]),
             ))
             .application(),
             api::AgentPacketFlowApplication::Mysql
@@ -13338,10 +13533,39 @@ mod tests {
             b"01234567890123456789",
             Some(b"app_db"),
             Some(b"caching_sha2_password"),
+            None,
         );
         invalid_mysql_client_filler[4 + 9] = 1;
         assert_eq!(
             observation_for_payload(&invalid_mysql_client_filler).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut unflagged_mysql_client_trailing = mysql_client_handshake_response_packet(
+            1,
+            mysql_client_flags,
+            b"app_user",
+            b"01234567890123456789",
+            Some(b"app_db"),
+            Some(b"caching_sha2_password"),
+            None,
+        );
+        unflagged_mysql_client_trailing[0] += 1;
+        unflagged_mysql_client_trailing.push(0xa5);
+        assert_eq!(
+            observation_for_payload(&unflagged_mysql_client_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_client_handshake_response_packet(
+                1,
+                mysql_attrs_client_flags,
+                b"app_user",
+                b"01234567890123456789012345678901",
+                Some(b"app_db"),
+                Some(b"mysql_native_password"),
+                Some(&[(b"_client\n".as_slice(), b"ipars-agent".as_slice())]),
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let missing_protocol_41_flags = mysql_client_flags & !MYSQL_CLIENT_PROTOCOL_41;
@@ -13353,6 +13577,7 @@ mod tests {
                 b"01234567890123456789",
                 Some(b"app_db"),
                 Some(b"caching_sha2_password"),
+                None,
             ))
             .application(),
             api::AgentPacketFlowApplication::Unknown
