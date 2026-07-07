@@ -1744,6 +1744,7 @@ pub mod api {
         Radius,
         Tacacs,
         Bgp,
+        Bfd,
         KubernetesApi,
         Etcd,
         ZooKeeper,
@@ -1781,7 +1782,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 49] = [
+        pub const ALL: [Self; 50] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1797,6 +1798,7 @@ pub mod api {
             Self::Radius,
             Self::Tacacs,
             Self::Bgp,
+            Self::Bfd,
             Self::KubernetesApi,
             Self::Etcd,
             Self::ZooKeeper,
@@ -1850,6 +1852,7 @@ pub mod api {
                 Self::Radius => "radius",
                 Self::Tacacs => "tacacs",
                 Self::Bgp => "bgp",
+                Self::Bfd => "bfd",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Etcd => "etcd",
                 Self::ZooKeeper => "zookeeper",
@@ -2165,6 +2168,11 @@ pub mod api {
             if self.involves_port(179) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Bgp;
             }
+            if (self.involves_port(3784) || self.involves_port(3785) || self.involves_port(4784))
+                && protocol_is(self.protocol, TransportProtocol::Udp)
+            {
+                return AgentPacketFlowApplication::Bfd;
+            }
             if self.involves_port(5432) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Postgres;
             }
@@ -2378,6 +2386,14 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Tcp) && bgp_payload(payload) {
                 return Some(AgentPacketFlowApplication::Bgp);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp)
+                && (self.involves_port(3784)
+                    || self.involves_port(3785)
+                    || self.involves_port(4784))
+                && bfd_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Bfd);
+            }
             if !protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return None;
             }
@@ -2441,6 +2457,7 @@ pub mod api {
             ),
             AgentPacketFlowApplication::WireGuard
             | AgentPacketFlowApplication::Dhcp
+            | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Vxlan
             | AgentPacketFlowApplication::Geneve => {
                 require_packet_flow_application_protocol(protocol, application, "UDP", |protocol| {
@@ -4177,6 +4194,27 @@ pub mod api {
         message_len <= payload.len()
             || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
                 && message_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
+    fn bfd_payload(payload: &[u8]) -> bool {
+        const BFD_CONTROL_HEADER_MIN_LEN: usize = 24;
+
+        if payload.len() < BFD_CONTROL_HEADER_MIN_LEN {
+            return false;
+        }
+        if payload[0] >> 5 != 1 || payload[1] & 0x01 != 0 || payload[2] == 0 {
+            return false;
+        }
+        let packet_len = payload[3] as usize;
+        if packet_len < BFD_CONTROL_HEADER_MIN_LEN {
+            return false;
+        }
+        if payload[4..8].iter().all(|byte| *byte == 0) {
+            return false;
+        }
+        packet_len <= payload.len()
+            || (payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES
+                && packet_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
     }
 
     fn kerberos_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -8431,6 +8469,30 @@ mod tests {
         };
         assert_eq!(bgp.application(), api::AgentPacketFlowApplication::Bgp);
 
+        let bfd = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(3784),
+            ..Default::default()
+        };
+        assert_eq!(bfd.application(), api::AgentPacketFlowApplication::Bfd);
+
+        let bfd_echo = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(3785),
+            ..Default::default()
+        };
+        assert_eq!(bfd_echo.application(), api::AgentPacketFlowApplication::Bfd);
+
+        let bfd_multihop = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(4784),
+            ..Default::default()
+        };
+        assert_eq!(
+            bfd_multihop.application(),
+            api::AgentPacketFlowApplication::Bfd
+        );
+
         let etcd = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(2379),
@@ -8923,6 +8985,16 @@ mod tests {
             payload
         }
 
+        fn bfd_control_packet() -> Vec<u8> {
+            let mut payload = vec![0x20, 0xc0, 3, 24];
+            payload.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+            payload.extend_from_slice(&0x8765_4321_u32.to_be_bytes());
+            payload.extend_from_slice(&1_000_000_u32.to_be_bytes());
+            payload.extend_from_slice(&1_000_000_u32.to_be_bytes());
+            payload.extend_from_slice(&1_000_000_u32.to_be_bytes());
+            payload
+        }
+
         fn postgres_frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
             let mut payload = vec![tag];
             let length = (body.len() as u32) + 4;
@@ -9254,6 +9326,13 @@ mod tests {
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
+        let observation_for_bfd_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(49152),
+            destination_port: Some(3784),
+            payload_prefix: payload.to_vec(),
+            ..Default::default()
+        };
         let dns_query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
             b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l', b'o', b'c',
@@ -9458,6 +9537,28 @@ mod tests {
         bgp_open[0] = 0xfe;
         assert_eq!(
             observation_for_payload(&bgp_open).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let bfd_control = bfd_control_packet();
+        assert_eq!(
+            observation_for_bfd_payload(&bfd_control).application(),
+            api::AgentPacketFlowApplication::Bfd
+        );
+        assert_eq!(
+            observation_for_udp_payload(&bfd_control).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut bfd_wrong_version = bfd_control.clone();
+        bfd_wrong_version[0] = 0x40;
+        assert_eq!(
+            observation_for_udp_payload(&bfd_wrong_version).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut bfd_zero_detect_multiplier = bfd_control.clone();
+        bfd_zero_detect_multiplier[2] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&bfd_zero_detect_multiplier).application(),
             api::AgentPacketFlowApplication::Unknown
         );
 
@@ -11447,6 +11548,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint dhcp requires UDP protocol"));
+
+        let udp_bfd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"bfd"}"#)?;
+        udp_bfd_hint.validate_transport_metadata()?;
+
+        let tcp_bfd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"bfd"}"#)?;
+        let error = match tcp_bfd_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP BFD hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint bfd requires UDP protocol"));
 
         let udp_vxlan_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"vxlan"}"#)?;

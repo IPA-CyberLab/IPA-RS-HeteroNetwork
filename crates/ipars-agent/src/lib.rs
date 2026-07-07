@@ -437,6 +437,7 @@ pub struct AgentRuntime {
     packet_flow_application_radius_count: AtomicU64,
     packet_flow_application_tacacs_count: AtomicU64,
     packet_flow_application_bgp_count: AtomicU64,
+    packet_flow_application_bfd_count: AtomicU64,
     packet_flow_application_kubernetes_api_count: AtomicU64,
     packet_flow_application_etcd_count: AtomicU64,
     packet_flow_application_zookeeper_count: AtomicU64,
@@ -1058,6 +1059,7 @@ impl AgentRuntime {
             packet_flow_application_radius_count: AtomicU64::new(0),
             packet_flow_application_tacacs_count: AtomicU64::new(0),
             packet_flow_application_bgp_count: AtomicU64::new(0),
+            packet_flow_application_bfd_count: AtomicU64::new(0),
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
             packet_flow_application_etcd_count: AtomicU64::new(0),
             packet_flow_application_zookeeper_count: AtomicU64::new(0),
@@ -1774,6 +1776,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Radius => &self.packet_flow_application_radius_count,
             AgentPacketFlowApplication::Tacacs => &self.packet_flow_application_tacacs_count,
             AgentPacketFlowApplication::Bgp => &self.packet_flow_application_bgp_count,
+            AgentPacketFlowApplication::Bfd => &self.packet_flow_application_bfd_count,
             AgentPacketFlowApplication::KubernetesApi => {
                 &self.packet_flow_application_kubernetes_api_count
             }
@@ -6308,6 +6311,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(bgp_match.peer, peer_b_id);
+        let bfd_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 60)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(3784),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(bfd_match.peer, peer_b_id);
         let jaeger_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 42)),
@@ -6513,8 +6530,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 38);
-        assert_eq!(metrics.packet_flow_match_count, 36);
+        assert_eq!(metrics.packet_flow_observation_count, 39);
+        assert_eq!(metrics.packet_flow_match_count, 37);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6526,7 +6543,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            36
+            37
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6570,6 +6587,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Radius), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Tacacs), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Bgp), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Bfd), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Jaeger), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Loki), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Tempo), 1);
