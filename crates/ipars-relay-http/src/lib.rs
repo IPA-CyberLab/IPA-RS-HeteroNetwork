@@ -108,6 +108,19 @@ fn render_prometheus_metrics(status: &RelayStatusResponse) -> String {
     let mut body = String::new();
     prometheus_line!(
         &mut body,
+        "# HELP ipars_relay_status_generated_timestamp_seconds Unix timestamp of the relay status snapshot."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_relay_status_generated_timestamp_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_relay_status_generated_timestamp_seconds{{relay_node=\"{relay_node}\"}} {}",
+        status.generated_at.timestamp().max(0)
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_relay_active_sessions Number of active relay sessions."
     );
     prometheus_line!(&mut body, "# TYPE ipars_relay_active_sessions gauge");
@@ -523,6 +536,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RelayStatusResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.capability.active_sessions, 1);
+        assert!(response.generated_at <= chrono::Utc::now());
         assert_eq!(response.admission_attempt_count, 1);
         assert_eq!(response.admission_success_count, 1);
         assert_eq!(response.admission_failure_count, 0);
@@ -579,6 +593,9 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("ipars_relay_status_generated_timestamp_seconds"));
+        assert!(body
+            .contains("ipars_relay_status_generated_timestamp_seconds{relay_node=\"relay-a\"} "));
         assert!(body.contains("ipars_relay_active_sessions"));
         assert!(body.contains("ipars_relay_active_sessions{relay_node=\"relay-a\"} 1"));
         assert!(body.contains("ipars_relay_max_sessions_per_node{relay_node=\"relay-a\"} 0"));

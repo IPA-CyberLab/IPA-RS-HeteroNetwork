@@ -973,9 +973,10 @@ impl RelayService {
     }
 
     pub async fn status(&self) -> RelayStatusResponse {
+        let generated_at = Utc::now();
         let mut capability = self.capability.write().await;
         let mut table = self.table.write().await;
-        table.purge_expired(Utc::now());
+        table.purge_expired(generated_at);
         capability.active_sessions = table.session_count() as u32;
         RelayStatusResponse {
             relay_node: self.relay_node.clone(),
@@ -989,6 +990,7 @@ impl RelayService {
             ),
             max_sessions_per_node: self.max_sessions_per_node,
             dataplane: zero_filled_dataplane_metrics(table.dataplane_metrics()),
+            generated_at,
         }
     }
 

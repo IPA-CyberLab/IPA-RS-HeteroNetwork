@@ -1493,6 +1493,8 @@ pub mod api {
         pub max_sessions_per_node: Option<u32>,
         #[serde(default)]
         pub dataplane: RelayDataplaneMetrics,
+        #[serde(default = "Utc::now")]
+        pub generated_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

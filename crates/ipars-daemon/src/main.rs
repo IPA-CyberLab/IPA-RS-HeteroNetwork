@@ -4515,17 +4515,12 @@ impl RelayOtelMetrics {
                 .build(),
             status_generated_timestamp_seconds: meter
                 .u64_gauge("ipars.relay.status.generated_timestamp_seconds")
-                .with_description("Unix timestamp when the relay status snapshot was exported to OTLP.")
+                .with_description("Unix timestamp of the relay status snapshot exported to OTLP.")
                 .build(),
         }
     }
 
-    fn record_status(
-        &self,
-        status: &RelayStatusResponse,
-        generated_at: chrono::DateTime<chrono::Utc>,
-        previous: Option<&RelayOtelSnapshot>,
-    ) {
+    fn record_status(&self, status: &RelayStatusResponse, previous: Option<&RelayOtelSnapshot>) {
         let delta = relay_dataplane_delta(
             &status.dataplane,
             previous.map(|snapshot| &snapshot.dataplane),
@@ -4533,7 +4528,7 @@ impl RelayOtelMetrics {
         let relay_node = status.relay_node.as_str().to_string();
         let relay_attrs = [KeyValue::new("relay_node", relay_node.clone())];
         self.status_generated_timestamp_seconds.record(
-            otel_generated_timestamp_seconds(&generated_at),
+            otel_generated_timestamp_seconds(&status.generated_at),
             &relay_attrs,
         );
         let admission_attempt_delta = counter_delta(
@@ -4715,7 +4710,7 @@ fn start_relay_otel_metrics_export(
         let mut previous = None;
         loop {
             let status = service.status().await;
-            metrics.record_status(&status, chrono::Utc::now(), previous.as_ref());
+            metrics.record_status(&status, previous.as_ref());
             previous = Some(RelayOtelSnapshot::from(&status));
             tokio::time::sleep(interval).await;
         }
@@ -12535,6 +12530,7 @@ mod tests {
             admission_failures_by_reason: BTreeMap::new(),
             max_sessions_per_node: Some(20),
             dataplane: RelayDataplaneMetrics::default(),
+            generated_at: Utc::now(),
         }
     }
 
@@ -14905,6 +14901,7 @@ mod tests {
             admission_failures_by_reason: BTreeMap::new(),
             max_sessions_per_node: Some(20),
             dataplane: RelayDataplaneMetrics::default(),
+            generated_at: Utc::now(),
         };
 
         let refreshed = relay_capability_from_status(&advertised, &status);
