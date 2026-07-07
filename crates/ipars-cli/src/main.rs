@@ -9756,9 +9756,12 @@ fi
             "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
         ));
         assert!(discovery_compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
-        assert!(discovery_compose.contains(
-            "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
-        ));
+        assert!(discovery_compose.contains("type: bind"));
+        assert!(discovery_compose
+            .contains("source: ${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}"));
+        assert!(discovery_compose.contains("target: /run/ipars/docker.sock"));
+        assert!(discovery_compose.contains("read_only: true"));
+        assert!(discovery_compose.contains("create_host_path: false"));
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
         Ok(())

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -29,14 +30,16 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         path: temp_dir.clone(),
     };
 
-    let control_plane_port = free_tcp_port()?;
-    let signal_port = free_tcp_port()?;
-    let relay_http_port = free_tcp_port()?;
-    let agent_port = free_tcp_port()?;
-    let stun_port = free_udp_port()?;
-    let stun_alternate_port = free_udp_port()?;
-    let stun_http_port = free_tcp_port()?;
-    let relay_udp_port = free_udp_port()?;
+    let tcp_ports = free_tcp_ports(5)?;
+    let udp_ports = free_udp_ports(3)?;
+    let control_plane_port = tcp_ports[0];
+    let signal_port = tcp_ports[1];
+    let relay_http_port = tcp_ports[2];
+    let agent_port = tcp_ports[3];
+    let stun_http_port = tcp_ports[4];
+    let stun_port = udp_ports[0];
+    let stun_alternate_port = udp_ports[1];
+    let relay_udp_port = udp_ports[2];
 
     let init = generated_init_output(relay_udp_port)?;
     let cluster_id = json_string(&init, "cluster_id")?;
@@ -228,6 +231,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         rendered.contains("target: /run/ipars/docker.sock"),
         "rendered Docker discovery Compose config did not mount the Docker API socket"
+    );
+    anyhow::ensure!(
+        rendered.contains(&format!("source: {}", multi_network_compose.docker_socket.display())),
+        "rendered Docker discovery Compose config did not bind the requested host Docker API socket"
+    );
+    anyhow::ensure!(
+        rendered.contains("read_only: true"),
+        "rendered Docker discovery Compose config did not keep the Docker API socket bind read-only"
+    );
+    anyhow::ensure!(
+        rendered.contains("create_host_path: false"),
+        "rendered Docker discovery Compose config could create a missing host Docker API socket path"
     );
     anyhow::ensure!(
         !rendered.contains("cap_add"),
@@ -646,12 +661,29 @@ fn unique_suffix() -> Result<String> {
     Ok(format!("{}-{millis}", std::process::id()))
 }
 
-fn free_tcp_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral TCP port")?;
-    Ok(listener.local_addr()?.port())
+fn free_tcp_ports(count: usize) -> Result<Vec<u16>> {
+    let mut ports = BTreeSet::new();
+    let max_attempts = count.saturating_mul(16).max(16);
+    for _ in 0..max_attempts {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral TCP port")?;
+        ports.insert(listener.local_addr()?.port());
+        if ports.len() == count {
+            return Ok(ports.into_iter().collect());
+        }
+    }
+    anyhow::bail!("failed to allocate {count} distinct ephemeral TCP ports")
 }
 
-fn free_udp_port() -> Result<u16> {
-    let socket = UdpSocket::bind("127.0.0.1:0").context("failed to bind ephemeral UDP port")?;
-    Ok(socket.local_addr()?.port())
+fn free_udp_ports(count: usize) -> Result<Vec<u16>> {
+    let mut ports = BTreeSet::new();
+    let max_attempts = count.saturating_mul(16).max(16);
+    for _ in 0..max_attempts {
+        let socket = UdpSocket::bind("127.0.0.1:0").context("failed to bind ephemeral UDP port")?;
+        ports.insert(socket.local_addr()?.port());
+        if ports.len() == count {
+            return Ok(ports.into_iter().collect());
+        }
+    }
+    anyhow::bail!("failed to allocate {count} distinct ephemeral UDP ports")
 }
