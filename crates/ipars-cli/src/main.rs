@@ -422,6 +422,12 @@ struct K8sInstallArgs {
     join_token_secret: String,
     #[arg(long, default_value = "token")]
     join_token_key: String,
+    #[arg(long = "cluster-control-plane-url", value_parser = parse_kubernetes_http_api_base_url)]
+    cluster_control_plane_url: Option<String>,
+    #[arg(long = "cluster-signal-url", value_parser = parse_kubernetes_http_api_base_url)]
+    cluster_signal_url: Option<String>,
+    #[arg(long = "cluster-stun-endpoint", value_parser = parse_kubernetes_stun_endpoint)]
+    cluster_stun_endpoint: Option<String>,
     #[arg(long = "image-repository", value_parser = parse_container_image_repository)]
     image_repository: Option<String>,
     #[arg(long = "image-tag", value_parser = parse_container_image_tag)]
@@ -2046,6 +2052,16 @@ fn parse_kubernetes_resource_quantity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_http_api_base_url(value: &str) -> Result<String, String> {
+    normalize_kubernetes_http_api_base_url(value, "Kubernetes cluster HTTP endpoint URL")
+        .map_err(|error| error.to_string())
+}
+
+fn parse_kubernetes_stun_endpoint(value: &str) -> Result<String, String> {
+    validate_kubernetes_stun_endpoint(value, "Kubernetes cluster STUN endpoint")?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_http_probe_path(value: &str) -> Result<String, String> {
     validate_kubernetes_http_probe_path(value, "probe HTTP path")?;
     Ok(value.to_string())
@@ -2378,6 +2394,27 @@ fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(),
         .is_some_and(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(format!("{label} must end with a digit or suffix letter"));
+    }
+    Ok(())
+}
+
+fn normalize_kubernetes_http_api_base_url(value: &str, label: &str) -> anyhow::Result<String> {
+    let parsed =
+        reqwest::Url::parse(value).with_context(|| format!("{label} must be an absolute URL"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{label} must not include userinfo");
+    }
+    normalize_http_api_base_url(value, label)
+}
+
+fn validate_kubernetes_stun_endpoint(value: &str, label: &str) -> Result<(), String> {
+    let endpoint = value
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("{label} must be an IPv4 host:port or [IPv6]:port socket address"))?;
+    if !endpoint_addr_is_usable(endpoint) {
+        return Err(format!(
+            "{label} must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
+        ));
     }
     Ok(())
 }
@@ -3494,6 +3531,7 @@ fn append_docker_relay_forwarder_environment(
 
 fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_install_metadata(&args)?;
+    validate_k8s_cluster_endpoints(&args)?;
     validate_k8s_image_pull_secrets(&args)?;
     validate_k8s_relay_admission_bearer_token_secret(&args)?;
     validate_k8s_relay_advertisement(&args)?;
@@ -3515,6 +3553,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         args.join_token_secret,
         args.join_token_key
     );
+    append_k8s_cluster_values(&mut helm_command, &args);
     append_k8s_image_values(&mut helm_command, &args);
     append_k8s_service_account_values(&mut helm_command, &args);
     append_k8s_route_discovery_values(&mut helm_command, &args);
@@ -3910,6 +3949,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         notes: vec![
             "This chart installs a node-underlay VPN agent, not a Kubernetes CNI".to_string(),
             "Use --expose-agent-api and --expose-relay only for nodes that should publish those endpoints".to_string(),
+            "Cluster control-plane, signal, and STUN endpoint overrides map directly to chart cluster values and are validated before rendering".to_string(),
             "Image repository, tag, pull policy, and pull Secret names map to the DaemonSet container image and imagePullSecrets values for pinned or private registry deployments".to_string(),
             "ServiceAccount creation/name/annotations plus agent service-account token automounting, securityContext capability, read-only-root, and seccomp controls, DNS policy, persistent state hostPath, HTTP health probes, pod labels, annotations, priority class, node selectors, tolerations, termination grace period, resource requests/limits, and DaemonSet rollout settings map directly to chart values".to_string(),
             "Optional agent PodDisruptionBudget settings protect the DaemonSet during voluntary disruptions such as node drains".to_string(),
@@ -3918,6 +3958,18 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Relay exposure requires the public relay UDP endpoint and HTTP admission URL that peers should use".to_string(),
         ],
     })
+}
+
+fn append_k8s_cluster_values(command: &mut String, args: &K8sInstallArgs) {
+    if let Some(url) = args.cluster_control_plane_url.as_deref() {
+        append_helm_set_string(command, "cluster.controlPlaneUrl", url);
+    }
+    if let Some(url) = args.cluster_signal_url.as_deref() {
+        append_helm_set_string(command, "cluster.signalUrl", url);
+    }
+    if let Some(endpoint) = args.cluster_stun_endpoint.as_deref() {
+        append_helm_set_string(command, "cluster.stunEndpoint", endpoint);
+    }
 }
 
 fn append_k8s_image_values(command: &mut String, args: &K8sInstallArgs) {
@@ -4336,6 +4388,20 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
         .map_err(anyhow::Error::msg)?;
     validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn validate_k8s_cluster_endpoints(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(url) = args.cluster_control_plane_url.as_deref() {
+        normalize_kubernetes_http_api_base_url(url, "--cluster-control-plane-url")?;
+    }
+    if let Some(url) = args.cluster_signal_url.as_deref() {
+        normalize_kubernetes_http_api_base_url(url, "--cluster-signal-url")?;
+    }
+    if let Some(endpoint) = args.cluster_stun_endpoint.as_deref() {
+        validate_kubernetes_stun_endpoint(endpoint, "--cluster-stun-endpoint")
+            .map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 
@@ -8529,6 +8595,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -8809,6 +8878,43 @@ mod tests {
             .security
             .iter()
             .any(|requirement| requirement.contains("disabled by default")));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_cluster_endpoints() -> anyhow::Result<()> {
+        assert_eq!(
+            parse_kubernetes_http_api_base_url("https://control.example.com:8443/")
+                .map_err(anyhow::Error::msg)?,
+            "https://control.example.com:8443"
+        );
+        assert!(
+            parse_kubernetes_http_api_base_url("https://user:pass@control.example.com:8443")
+                .is_err()
+        );
+        assert!(parse_kubernetes_stun_endpoint("0.0.0.0:3478").is_err());
+
+        let mut args = base_k8s_install_args();
+        args.cluster_control_plane_url = Some("https://control.example.com:8443".to_string());
+        args.cluster_signal_url = Some("https://signal.example.com:9443".to_string());
+        args.cluster_stun_endpoint = Some("203.0.113.53:3478".to_string());
+
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+
+        assert!(
+            helm.contains("--set-string cluster.controlPlaneUrl=https://control.example.com:8443")
+        );
+        assert!(helm.contains("--set-string cluster.signalUrl=https://signal.example.com:9443"));
+        assert!(helm.contains("--set-string cluster.stunEndpoint=203.0.113.53:3478"));
+
+        let mut userinfo = base_k8s_install_args();
+        userinfo.cluster_signal_url = Some("https://user:pass@signal.example.com:9443".to_string());
+        let error = match k8s_install_plan(userinfo) {
+            Ok(_) => anyhow::bail!("cluster signal URL userinfo should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--cluster-signal-url must not include userinfo"));
         Ok(())
     }
 
@@ -9835,6 +9941,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -10927,6 +11036,12 @@ mod tests {
             "edge-token",
             "--join-token-key",
             "signed-token",
+            "--cluster-control-plane-url",
+            "https://control.example.com:8443/",
+            "--cluster-signal-url",
+            "https://signal.example.com:9443",
+            "--cluster-stun-endpoint",
+            "203.0.113.53:3478",
             "--image-repository",
             "registry.example.com/platform/ipars",
             "--image-tag",
@@ -11110,6 +11225,18 @@ mod tests {
             assert_eq!(args.namespace, "edge-system");
             assert_eq!(args.join_token_secret, "edge-token");
             assert_eq!(args.join_token_key, "signed-token");
+            assert_eq!(
+                args.cluster_control_plane_url.as_deref(),
+                Some("https://control.example.com:8443")
+            );
+            assert_eq!(
+                args.cluster_signal_url.as_deref(),
+                Some("https://signal.example.com:9443")
+            );
+            assert_eq!(
+                args.cluster_stun_endpoint.as_deref(),
+                Some("203.0.113.53:3478")
+            );
             assert_eq!(
                 args.image_repository.as_deref(),
                 Some("registry.example.com/platform/ipars")
@@ -11351,6 +11478,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -11497,6 +11627,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -12908,6 +13041,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -13041,6 +13177,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -13308,6 +13447,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -13446,6 +13588,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
@@ -13579,6 +13724,9 @@ mod tests {
             chart: PathBuf::from("charts/ipars"),
             join_token_secret: "edge-token".to_string(),
             join_token_key: "signed-token".to_string(),
+            cluster_control_plane_url: None,
+            cluster_signal_url: None,
+            cluster_stun_endpoint: None,
             image_repository: None,
             image_tag: None,
             image_pull_policy: None,
