@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, path::PathBuf};
 
 use ipars_route_manager::{
     DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetlinkRouteManager, LinuxNetworkNamespace,
@@ -300,6 +301,42 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     Ok(())
 }
 
+#[test]
+fn namespace_guard_removes_network_namespace_on_drop() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping netns lifecycle integration test; set IPARS_RUN_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    let namespace_name = unique_namespace_name()?;
+    let namespace_path = PathBuf::from("/var/run/netns").join(&namespace_name);
+    {
+        let _guard = NamespaceGuard::create(namespace_name.clone())?;
+        assert!(
+            namespace_is_listed(&namespace_name)?,
+            "created namespace should be listed by `ip netns list`"
+        );
+        let metadata = fs::symlink_metadata(&namespace_path)?;
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "created namespace entry must not be a symlink"
+        );
+    }
+
+    assert!(
+        !namespace_is_listed(&namespace_name)?,
+        "dropped namespace guard should remove namespace from `ip netns list`"
+    );
+    assert!(
+        !namespace_path.exists(),
+        "dropped namespace guard should remove {}",
+        namespace_path.display()
+    );
+    Ok(())
+}
+
 struct NamespaceGuard {
     name: String,
 }
@@ -346,6 +383,14 @@ fn command_output<const N: usize>(
     }
 
     Err(command_error(program, output).into())
+}
+
+fn namespace_is_listed(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = command_output("ip", ["netns", "list"])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|listed| listed == name))
 }
 
 fn command_error(program: &str, output: std::process::Output) -> String {
