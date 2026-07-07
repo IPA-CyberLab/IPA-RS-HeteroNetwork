@@ -3805,7 +3805,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
-            "LoadBalancer IP and externalIPs reject unspecified, loopback, link-local, multicast, and broadcast addresses".to_string(),
+            "LoadBalancer IP and externalIPs reject unspecified, loopback, link-local, multicast, broadcast, and duplicate fixed external addresses".to_string(),
             "LoadBalancer source ranges and NetworkPolicy CIDR allowlists reject unrestricted all-source CIDRs".to_string(),
             "LoadBalancer exposure requires source CIDR ranges unless --allow-unrestricted-load-balancer is set".to_string(),
             "externalTrafficPolicy=Cluster requires --allow-cluster-external-traffic-policy because source addresses may be hidden by cross-node forwarding".to_string(),
@@ -4686,19 +4686,38 @@ fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyho
     Ok(())
 }
 
-fn validate_kubernetes_external_service_ip_disjoint(
-    left_flag: &str,
-    left_ips: &[IpAddr],
-    right_flag: &str,
-    right_ips: &[IpAddr],
+fn record_kubernetes_external_service_ip(
+    assigned: &mut BTreeMap<IpAddr, &'static str>,
+    flag: &'static str,
+    ip: IpAddr,
 ) -> anyhow::Result<()> {
-    let left_ips = left_ips.iter().copied().collect::<BTreeSet<_>>();
-    for ip in right_ips {
-        if left_ips.contains(ip) {
-            anyhow::bail!(
-                "{right_flag} must not reuse external Service IP address {ip} already assigned by {left_flag}"
-            );
-        }
+    if let Some(existing_flag) = assigned.get(&ip) {
+        anyhow::bail!(
+            "{flag} must not reuse external Service IP address {ip} already assigned by {existing_flag}"
+        );
+    }
+    assigned.insert(ip, flag);
+    Ok(())
+}
+
+fn validate_kubernetes_external_service_ip_disjoint(
+    agent_api_load_balancer_ip: Option<IpAddr>,
+    agent_api_external_ips: &[IpAddr],
+    relay_load_balancer_ip: Option<IpAddr>,
+    relay_external_ips: &[IpAddr],
+) -> anyhow::Result<()> {
+    let mut assigned = BTreeMap::new();
+    if let Some(ip) = agent_api_load_balancer_ip {
+        record_kubernetes_external_service_ip(&mut assigned, "--agent-api-load-balancer-ip", ip)?;
+    }
+    for &ip in agent_api_external_ips {
+        record_kubernetes_external_service_ip(&mut assigned, "--agent-api-external-ip", ip)?;
+    }
+    if let Some(ip) = relay_load_balancer_ip {
+        record_kubernetes_external_service_ip(&mut assigned, "--relay-load-balancer-ip", ip)?;
+    }
+    for &ip in relay_external_ips {
+        record_kubernetes_external_service_ip(&mut assigned, "--relay-external-ip", ip)?;
     }
     Ok(())
 }
@@ -5471,9 +5490,9 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     )?;
     validate_kubernetes_external_service_ips("--relay-external-ip", &args.relay_external_ips)?;
     validate_kubernetes_external_service_ip_disjoint(
-        "--agent-api-external-ip",
+        args.agent_api_load_balancer_ip,
         &args.agent_api_external_ips,
-        "--relay-external-ip",
+        args.relay_load_balancer_ip,
         &args.relay_external_ips,
     )?;
     if args.agent_api_health_check_node_port.is_some()
@@ -9480,6 +9499,15 @@ mod tests {
         assert!(service_template.contains(
             "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.relayService.loadBalancerIP\""
         ));
+        assert!(service_template.contains(
+            "agent.relayService.loadBalancerIP %q must not reuse fixed external IP assigned by %s"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.externalIPs entry %q must not reuse fixed external IP assigned by %s"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.externalIPs entry %q must not reuse fixed external IP assigned by %s"
+        ));
         assert!(
             service_template.contains("agent.apiService.externalIPs entry %q must not be repeated")
         );
@@ -11648,6 +11676,66 @@ mod tests {
         };
         assert!(error.contains(
             "--relay-external-ip must not reuse external Service IP address 198.51.100.11 already assigned by --agent-api-external-ip"
+        ));
+
+        let mut duplicate_load_balancer_ip = base_k8s_install_args();
+        duplicate_load_balancer_ip.expose_agent_api = true;
+        duplicate_load_balancer_ip.allow_public_service_exposure = true;
+        duplicate_load_balancer_ip.allow_unrestricted_load_balancer = true;
+        duplicate_load_balancer_ip.agent_api_service_type = "LoadBalancer".to_string();
+        duplicate_load_balancer_ip.agent_api_load_balancer_ip = Some("198.51.100.20".parse()?);
+        duplicate_load_balancer_ip.expose_relay = true;
+        duplicate_load_balancer_ip.relay_service_type = "LoadBalancer".to_string();
+        duplicate_load_balancer_ip.relay_load_balancer_ip = Some("198.51.100.20".parse()?);
+        duplicate_load_balancer_ip.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        duplicate_load_balancer_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(duplicate_load_balancer_ip) {
+            Ok(_) => panic!("agent and relay loadBalancerIP should be disjoint"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-load-balancer-ip must not reuse external Service IP address 198.51.100.20 already assigned by --agent-api-load-balancer-ip"
+        ));
+
+        let mut agent_external_reuses_load_balancer_ip = base_k8s_install_args();
+        agent_external_reuses_load_balancer_ip.expose_agent_api = true;
+        agent_external_reuses_load_balancer_ip.allow_public_service_exposure = true;
+        agent_external_reuses_load_balancer_ip.allow_unrestricted_load_balancer = true;
+        agent_external_reuses_load_balancer_ip.agent_api_service_type = "LoadBalancer".to_string();
+        agent_external_reuses_load_balancer_ip.agent_api_load_balancer_ip =
+            Some("198.51.100.21".parse()?);
+        agent_external_reuses_load_balancer_ip.agent_api_external_ips =
+            vec!["198.51.100.21".parse()?];
+        let error = match k8s_install_plan(agent_external_reuses_load_balancer_ip) {
+            Ok(_) => panic!("agent externalIPs should not reuse agent loadBalancerIP"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-external-ip must not reuse external Service IP address 198.51.100.21 already assigned by --agent-api-load-balancer-ip"
+        ));
+
+        let mut relay_external_reuses_agent_load_balancer_ip = base_k8s_install_args();
+        relay_external_reuses_agent_load_balancer_ip.expose_agent_api = true;
+        relay_external_reuses_agent_load_balancer_ip.allow_public_service_exposure = true;
+        relay_external_reuses_agent_load_balancer_ip.allow_unrestricted_load_balancer = true;
+        relay_external_reuses_agent_load_balancer_ip.agent_api_service_type =
+            "LoadBalancer".to_string();
+        relay_external_reuses_agent_load_balancer_ip.agent_api_load_balancer_ip =
+            Some("198.51.100.22".parse()?);
+        relay_external_reuses_agent_load_balancer_ip.expose_relay = true;
+        relay_external_reuses_agent_load_balancer_ip.relay_external_ips =
+            vec!["198.51.100.22".parse()?];
+        relay_external_reuses_agent_load_balancer_ip.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_external_reuses_agent_load_balancer_ip.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(relay_external_reuses_agent_load_balancer_ip) {
+            Ok(_) => panic!("relay externalIPs should not reuse agent loadBalancerIP"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-ip must not reuse external Service IP address 198.51.100.22 already assigned by --agent-api-load-balancer-ip"
         ));
 
         let parsed = Cli::try_parse_from([

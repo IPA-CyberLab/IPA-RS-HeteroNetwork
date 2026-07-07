@@ -85,6 +85,8 @@
 {{- $relaySessionAffinityTimeoutSeconds := int $relaySessionAffinityTimeoutValue -}}
 {{- $agentApiClusterIPSet := dict -}}
 {{- $agentApiExternalIPSet := dict -}}
+{{- $agentApiFixedExternalIPSet := dict -}}
+{{- $relayFixedExternalIPSet := dict -}}
 {{- if and .Values.agent.apiService.enabled (not $agentApiServiceTypeValid) -}}
 {{- fail "agent.apiService.type must be one of ClusterIP, NodePort, or LoadBalancer" -}}
 {{- end -}}
@@ -170,15 +172,20 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerIP "") -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.loadBalancerIP" "value" $agentApiLoadBalancerIP) -}}
+{{- $_ := set $agentApiFixedExternalIPSet $agentApiLoadBalancerIP "agent.apiService.loadBalancerIP" -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
 {{- range $ip := $agentApiExternalIPs -}}
 {{- $ipValue := printf "%v" $ip -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $agentApiFixedExternalIPSet $ipValue -}}
+{{- fail (printf "agent.apiService.externalIPs entry %q must not reuse fixed external IP assigned by %s" $ipValue (index $agentApiFixedExternalIPSet $ipValue)) -}}
+{{- end -}}
 {{- if hasKey $agentApiExternalIPSet $ipValue -}}
 {{- fail (printf "agent.apiService.externalIPs entry %q must not be repeated" $ipValue) -}}
 {{- end -}}
 {{- $_ := set $agentApiExternalIPSet $ipValue true -}}
+{{- $_ := set $agentApiFixedExternalIPSet $ipValue "agent.apiService.externalIPs" -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
@@ -324,19 +331,30 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayLoadBalancerIP "") -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.loadBalancerIP" "value" $relayLoadBalancerIP) -}}
+{{- if hasKey $agentApiFixedExternalIPSet $relayLoadBalancerIP -}}
+{{- fail (printf "agent.relayService.loadBalancerIP %q must not reuse fixed external IP assigned by %s" $relayLoadBalancerIP (index $agentApiFixedExternalIPSet $relayLoadBalancerIP)) -}}
+{{- end -}}
+{{- $_ := set $relayFixedExternalIPSet $relayLoadBalancerIP "agent.relayService.loadBalancerIP" -}}
 {{- end -}}
 {{- if $relayServiceActive -}}
 {{- $relayExternalIPSet := dict -}}
 {{- range $ip := $relayExternalIPs -}}
 {{- $ipValue := printf "%v" $ip -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ipValue) -}}
+{{- if hasKey $relayFixedExternalIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q must not reuse fixed external IP assigned by %s" $ipValue (index $relayFixedExternalIPSet $ipValue)) -}}
+{{- end -}}
 {{- if hasKey $relayExternalIPSet $ipValue -}}
 {{- fail (printf "agent.relayService.externalIPs entry %q must not be repeated" $ipValue) -}}
+{{- end -}}
+{{- if hasKey $agentApiFixedExternalIPSet $ipValue -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q must not reuse fixed external IP assigned by %s" $ipValue (index $agentApiFixedExternalIPSet $ipValue)) -}}
 {{- end -}}
 {{- if hasKey $agentApiExternalIPSet $ipValue -}}
 {{- fail (printf "agent.relayService.externalIPs entry %q must not reuse agent.apiService.externalIPs" $ipValue) -}}
 {{- end -}}
 {{- $_ := set $relayExternalIPSet $ipValue true -}}
+{{- $_ := set $relayFixedExternalIPSet $ipValue "agent.relayService.externalIPs" -}}
 {{- end -}}
 {{- end -}}
 {{- if $relayServiceActive -}}
