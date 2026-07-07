@@ -571,7 +571,7 @@ impl SignalCoordinator {
             &target_candidates,
             target_nat_classification,
         );
-        let relay_candidates = relays
+        let mut relay_candidates = relays
             .iter()
             .filter(|relay| relay.node_id != request.source && relay.node_id != request.target)
             .filter(|relay| {
@@ -583,6 +583,7 @@ impl SignalCoordinator {
             })
             .cloned()
             .collect::<Vec<_>>();
+        relay_candidates.sort_by(compare_relay_candidates);
 
         let usable_state = if preferred_state == PathState::Unreachable
             && self.policy.allow_relay_fallback
@@ -906,6 +907,38 @@ fn relay_health_allows(
     health_report_is_fresh(health, now, ttl_seconds)
 }
 
+fn compare_relay_candidates(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
+    match (
+        left.relay_capability.as_ref(),
+        right.relay_capability.as_ref(),
+    ) {
+        (Some(left_capability), Some(right_capability)) => {
+            compare_relay_load(left_capability, right_capability)
+                .then_with(|| {
+                    right_capability
+                        .available_capacity()
+                        .cmp(&left_capability.available_capacity())
+                })
+                .then_with(|| right_capability.max_mbps.cmp(&left_capability.max_mbps))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.node_id.cmp(&right.node_id),
+    }
+}
+
+fn compare_relay_load(
+    left: &ipars_types::RelayCapability,
+    right: &ipars_types::RelayCapability,
+) -> std::cmp::Ordering {
+    let left_denominator = left.max_sessions.max(1) as u64;
+    let right_denominator = right.max_sessions.max(1) as u64;
+    let left_scaled = left.active_sessions as u64 * right_denominator;
+    let right_scaled = right.active_sessions as u64 * left_denominator;
+    left_scaled.cmp(&right_scaled)
+}
+
 fn health_report_is_fresh(
     health: &NodeHealth,
     now: chrono::DateTime<Utc>,
@@ -1034,6 +1067,28 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    fn relay_with_capacity(
+        node_id: &str,
+        max_sessions: u32,
+        active_sessions: u32,
+        max_mbps: u32,
+    ) -> NodeRecord {
+        let mut relay = relay();
+        relay.node_id = NodeId::from_string(node_id);
+        relay.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+            100,
+            64,
+            0,
+            node_id.bytes().fold(10u8, u8::wrapping_add),
+        )));
+        let mut capability = relay_capability();
+        capability.max_sessions = max_sessions;
+        capability.active_sessions = active_sessions;
+        capability.max_mbps = max_mbps;
+        relay.relay_capability = Some(capability);
+        relay
     }
 
     fn deny_to_tag_acl(id: &str, tag: &str) -> AclRule {
@@ -1371,6 +1426,48 @@ mod tests {
         assert_eq!(response.preferred_state, PathState::Relay);
         assert_eq!(response.relay_candidates.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn relay_candidates_are_sorted_by_load_capacity_and_bandwidth() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(Vec::new()),
+            None,
+            &[
+                relay_with_capacity("relay-busy", 10, 8, 10_000),
+                relay_with_capacity("relay-less-bandwidth", 10, 1, 1_000),
+                relay_with_capacity("relay-more-capacity", 20, 2, 500),
+                relay_with_capacity("relay-more-bandwidth", 10, 1, 2_000),
+            ],
+        );
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(
+            response
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "relay-more-capacity",
+                "relay-more-bandwidth",
+                "relay-less-bandwidth",
+                "relay-busy",
+            ]
+        );
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "relay_load=0.10"));
     }
 
     #[tokio::test]
