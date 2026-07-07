@@ -1756,6 +1756,11 @@ pub mod api {
         Tacacs,
         Bgp,
         Bfd,
+        IparsControlPlane,
+        IparsSignal,
+        IparsAgent,
+        IparsRelay,
+        Stun,
         KubernetesApi,
         Kubelet,
         DockerApi,
@@ -1801,7 +1806,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 58] = [
+        pub const ALL: [Self; 63] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1818,6 +1823,11 @@ pub mod api {
             Self::Tacacs,
             Self::Bgp,
             Self::Bfd,
+            Self::IparsControlPlane,
+            Self::IparsSignal,
+            Self::IparsAgent,
+            Self::IparsRelay,
+            Self::Stun,
             Self::KubernetesApi,
             Self::Kubelet,
             Self::DockerApi,
@@ -1880,6 +1890,11 @@ pub mod api {
                 Self::Tacacs => "tacacs",
                 Self::Bgp => "bgp",
                 Self::Bfd => "bfd",
+                Self::IparsControlPlane => "ipars_control_plane",
+                Self::IparsSignal => "ipars_signal",
+                Self::IparsAgent => "ipars_agent",
+                Self::IparsRelay => "ipars_relay",
+                Self::Stun => "stun",
                 Self::KubernetesApi => "kubernetes_api",
                 Self::Kubelet => "kubelet",
                 Self::DockerApi => "docker_api",
@@ -2076,14 +2091,29 @@ pub mod api {
             if self.protocol == Some(TransportProtocol::Gre) {
                 return AgentPacketFlowApplication::Gre;
             }
-            if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
-                return AgentPacketFlowApplication::WireGuard;
-            }
             let payload_application = self.payload_prefix_application();
             if let Some(application) = payload_application {
                 if self.payload_prefix_application_overrides_port(application) {
                     return application;
                 }
+            }
+            if self.involves_port(51820) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::WireGuard;
+            }
+            if self.involves_port(8443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::IparsControlPlane;
+            }
+            if self.involves_port(9443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::IparsSignal;
+            }
+            if self.involves_port(9780) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::IparsAgent;
+            }
+            if self.involves_port(9580) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::IparsRelay;
+            }
+            if self.involves_port(3478) && protocol_is(self.protocol, TransportProtocol::Udp) {
+                return AgentPacketFlowApplication::Stun;
             }
             if self.involves_port(6443) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::KubernetesApi;
@@ -2431,6 +2461,13 @@ pub mod api {
             if protocol_is(self.protocol, TransportProtocol::Udp) && geneve_payload(payload) {
                 return Some(AgentPacketFlowApplication::Geneve);
             }
+            if protocol_is(self.protocol, TransportProtocol::Udp) && relay_frame_payload(payload) {
+                return Some(AgentPacketFlowApplication::IparsRelay);
+            }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp)) && stun_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Stun);
+            }
             if protocol_is(self.protocol, TransportProtocol::Udp)
                 && self.involves_port(443)
                 && quic_long_header_payload(payload)
@@ -2543,6 +2580,7 @@ pub mod api {
             AgentPacketFlowApplication::WireGuard
             | AgentPacketFlowApplication::Dhcp
             | AgentPacketFlowApplication::Ike
+            | AgentPacketFlowApplication::Stun
             | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Vxlan
             | AgentPacketFlowApplication::Geneve => {
@@ -2588,7 +2626,8 @@ pub mod api {
             | AgentPacketFlowApplication::Kerberos
             | AgentPacketFlowApplication::Ntp
             | AgentPacketFlowApplication::Radius
-            | AgentPacketFlowApplication::Memcached => require_packet_flow_application_protocol(
+            | AgentPacketFlowApplication::Memcached
+            | AgentPacketFlowApplication::IparsRelay => require_packet_flow_application_protocol(
                 protocol,
                 application,
                 "TCP or UDP",
@@ -2779,6 +2818,18 @@ pub mod api {
             return Some(application);
         }
         if let Some(path) = http_request_path(payload) {
+            if ipars_control_plane_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::IparsControlPlane);
+            }
+            if ipars_signal_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::IparsSignal);
+            }
+            if ipars_agent_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::IparsAgent);
+            }
+            if ipars_relay_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::IparsRelay);
+            }
             if loki_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Loki);
             }
@@ -2916,6 +2967,40 @@ pub mod api {
                 b"/opentelemetry.proto.collector.logs.v1.LogsService/",
             ],
         )
+    }
+
+    fn ipars_control_plane_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/v1/join")
+            || path_starts_with_api_prefix(path, b"/v1/heartbeat")
+            || path_starts_with_api_prefix(path, b"/v1/policy")
+            || path_starts_with_api_prefix(path, b"/v1/tokens/revoke")
+            || (path.starts_with(b"/v1/nodes/") && path_contains_any(path, &[b"/wireguard-key"]))
+            || (path.starts_with(b"/v1/peers/") && path.len() > b"/v1/peers/".len())
+            || (path.starts_with(b"/v1/paths/")
+                && path.len() > b"/v1/paths/".len()
+                && !path_starts_with_api_prefix(path, b"/v1/paths/negotiate"))
+    }
+
+    fn ipars_signal_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/v1/paths/negotiate")
+            || path.starts_with(b"/v1/hole-punch/")
+            || (path.starts_with(b"/v1/nodes/") && path.len() > b"/v1/nodes/".len())
+    }
+
+    fn ipars_agent_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/v1/path-events")
+            || path_starts_with_api_prefix(path, b"/v1/path-probe")
+            || path_starts_with_api_prefix(path, b"/v1/stun-probe")
+            || path_starts_with_api_prefix(path, b"/v1/nat-classification")
+            || path_starts_with_api_prefix(path, b"/v1/peer-activity")
+            || path_starts_with_api_prefix(path, b"/v1/packet-flow")
+            || path_starts_with_api_prefix(path, b"/v1/wireguard-key/rotate")
+            || path == b"/v1/peers"
+            || path == b"/v1/paths"
+    }
+
+    fn ipars_relay_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/v1/sessions")
     }
 
     fn cri_grpc_path(path: &[u8]) -> bool {
@@ -3585,6 +3670,32 @@ pub mod api {
         if !tls_sni_hostname_is_valid(hostname) {
             return None;
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ipars-control-plane")
+            || tls_sni_hostname_has_label_prefix(hostname, b"ipars-control")
+            || tls_sni_hostname_has_label_prefix(hostname, b"control-plane")
+        {
+            return Some(AgentPacketFlowApplication::IparsControlPlane);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ipars-signal")
+            || tls_sni_hostname_has_label_prefix(hostname, b"signal")
+        {
+            return Some(AgentPacketFlowApplication::IparsSignal);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ipars-agent")
+            || tls_sni_hostname_has_label_prefix(hostname, b"agent")
+        {
+            return Some(AgentPacketFlowApplication::IparsAgent);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ipars-relay")
+            || tls_sni_hostname_has_label_prefix(hostname, b"relay")
+        {
+            return Some(AgentPacketFlowApplication::IparsRelay);
+        }
+        if tls_sni_hostname_has_label_prefix(hostname, b"ipars-stun")
+            || tls_sni_hostname_has_label_prefix(hostname, b"stun")
+        {
+            return Some(AgentPacketFlowApplication::Stun);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kubernetes")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-apiserver")
             || tls_sni_hostname_has_label_prefix(hostname, b"kube-api")
@@ -3806,6 +3917,23 @@ pub mod api {
     }
 
     fn tls_alpn_protocol_application(protocol: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if protocol.eq_ignore_ascii_case(b"ipars-control-plane")
+            || protocol.eq_ignore_ascii_case(b"ipars-control")
+        {
+            return Some(AgentPacketFlowApplication::IparsControlPlane);
+        }
+        if protocol.eq_ignore_ascii_case(b"ipars-signal") {
+            return Some(AgentPacketFlowApplication::IparsSignal);
+        }
+        if protocol.eq_ignore_ascii_case(b"ipars-agent") {
+            return Some(AgentPacketFlowApplication::IparsAgent);
+        }
+        if protocol.eq_ignore_ascii_case(b"ipars-relay") {
+            return Some(AgentPacketFlowApplication::IparsRelay);
+        }
+        if protocol.eq_ignore_ascii_case(b"ipars-stun") || protocol.eq_ignore_ascii_case(b"stun") {
+            return Some(AgentPacketFlowApplication::Stun);
+        }
         if protocol.eq_ignore_ascii_case(b"kubernetes")
             || protocol.eq_ignore_ascii_case(b"kube-apiserver")
             || protocol.eq_ignore_ascii_case(b"kube-api")
@@ -4221,6 +4349,10 @@ pub mod api {
     const GENEVE_HEADER_LEN: usize = 8;
     const ETHERNET_HEADER_LEN: usize = 14;
     const GENEVE_PROTOCOL_TRANSPARENT_ETHERNET: u16 = 0x6558;
+    const STUN_HEADER_LEN: usize = 20;
+    const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+    const IPARS_RELAY_FRAME_MAGIC_V1: &[u8] = b"IPARS-RLY1";
+    const IPARS_RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
 
     fn ike_payload(payload: &[u8]) -> bool {
         let payload = payload
@@ -4314,6 +4446,24 @@ pub mod api {
             return false;
         }
         ethernet_frame_payload(payload, header_len)
+    }
+
+    fn relay_frame_payload(payload: &[u8]) -> bool {
+        payload.starts_with(IPARS_RELAY_FRAME_MAGIC_V1)
+            || payload.starts_with(IPARS_RELAY_FRAME_MAGIC_V2)
+    }
+
+    fn stun_payload(payload: &[u8]) -> bool {
+        if payload.len() < STUN_HEADER_LEN || payload[0] & 0xc0 != 0 {
+            return false;
+        }
+        let message_len = read_u16_be(payload, 2).unwrap_or_default() as usize;
+        if !message_len.is_multiple_of(4) || payload.get(4..8) != Some(&STUN_MAGIC_COOKIE) {
+            return false;
+        }
+        STUN_HEADER_LEN
+            .checked_add(message_len)
+            .is_some_and(|end| end <= payload.len())
     }
 
     fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
@@ -9060,6 +9210,49 @@ mod tests {
             api::AgentPacketFlowApplication::DockerApi
         );
 
+        let ipars_control_plane = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8443),
+            ..Default::default()
+        };
+        assert_eq!(
+            ipars_control_plane.application(),
+            api::AgentPacketFlowApplication::IparsControlPlane
+        );
+        let ipars_signal = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9443),
+            ..Default::default()
+        };
+        assert_eq!(
+            ipars_signal.application(),
+            api::AgentPacketFlowApplication::IparsSignal
+        );
+        let ipars_agent = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9780),
+            ..Default::default()
+        };
+        assert_eq!(
+            ipars_agent.application(),
+            api::AgentPacketFlowApplication::IparsAgent
+        );
+        let ipars_relay = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9580),
+            ..Default::default()
+        };
+        assert_eq!(
+            ipars_relay.application(),
+            api::AgentPacketFlowApplication::IparsRelay
+        );
+        let stun = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(3478),
+            ..Default::default()
+        };
+        assert_eq!(stun.application(), api::AgentPacketFlowApplication::Stun);
+
         let wireguard = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             source_port: Some(51820),
@@ -9821,6 +10014,29 @@ mod tests {
             payload
         }
 
+        fn stun_binding_request() -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&0x0001_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+            payload.extend_from_slice(&[0xa5; 12]);
+            payload
+        }
+
+        fn ipars_relay_datagram() -> Vec<u8> {
+            let session_id = b"session-a";
+            let token = b"token-a";
+            let payload = b"opaque-wireguard-payload";
+            let mut datagram = Vec::new();
+            datagram.extend_from_slice(b"IPARS-RLY1");
+            datagram.extend_from_slice(&(session_id.len() as u16).to_be_bytes());
+            datagram.extend_from_slice(&(token.len() as u16).to_be_bytes());
+            datagram.extend_from_slice(session_id);
+            datagram.extend_from_slice(token);
+            datagram.extend_from_slice(payload);
+            datagram
+        }
+
         fn ethernet_ipv4_frame() -> Vec<u8> {
             vec![
                 0x02, 0x00, 0x5e, 0x10, 0x00, 0x01, 0x02, 0x00, 0x5e, 0x20, 0x00, 0x01, 0x08, 0x00,
@@ -10261,6 +10477,33 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        assert_eq!(
+            observation_for_udp_payload(&stun_binding_request()).application(),
+            api::AgentPacketFlowApplication::Stun
+        );
+        let mut malformed_stun = stun_binding_request();
+        malformed_stun[4] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&malformed_stun).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
+        let ipars_relay = ipars_relay_datagram();
+        assert_eq!(
+            observation_for_udp_payload(&ipars_relay).application(),
+            api::AgentPacketFlowApplication::IparsRelay
+        );
+        let relay_on_wireguard_port = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            source_port: Some(51820),
+            payload_prefix: ipars_relay,
+            ..Default::default()
+        };
+        assert_eq!(
+            relay_on_wireguard_port.application(),
+            api::AgentPacketFlowApplication::IparsRelay
+        );
+
         let mut dhcp_discover_prefix = vec![0_u8; 44];
         dhcp_discover_prefix[0] = 1;
         dhcp_discover_prefix[1] = 1;
@@ -10547,6 +10790,22 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"POST /v1/join HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsControlPlane
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/paths/negotiate HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsSignal
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/packet-flow HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsAgent
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/sessions HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsRelay
+        );
+        assert_eq!(
             observation_for_payload(b"GET /metrics HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Prometheus
         );
@@ -10751,6 +11010,32 @@ mod tests {
             observation_for_payload(&[0x16, 0x03, 0x03, 0x00, 0x31, 0x01, 0x00, 0x00])
                 .application(),
             api::AgentPacketFlowApplication::Https
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni(
+                "ipars-control-plane.public-a.example"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::IparsControlPlane
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("ipars-signal.public-a.example"))
+                .application(),
+            api::AgentPacketFlowApplication::IparsSignal
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("ipars-agent.node-a.local"))
+                .application(),
+            api::AgentPacketFlowApplication::IparsAgent
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("ipars-relay.public-a.example"))
+                .application(),
+            api::AgentPacketFlowApplication::IparsRelay
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"ipars-stun"])).application(),
+            api::AgentPacketFlowApplication::Stun
         );
         let kubernetes_sni = tls_client_hello_with_sni("kubernetes.default.svc.cluster.local");
         assert!(kubernetes_sni.len() <= api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);

@@ -485,6 +485,11 @@ pub struct AgentRuntime {
     packet_flow_application_tacacs_count: AtomicU64,
     packet_flow_application_bgp_count: AtomicU64,
     packet_flow_application_bfd_count: AtomicU64,
+    packet_flow_application_ipars_control_plane_count: AtomicU64,
+    packet_flow_application_ipars_signal_count: AtomicU64,
+    packet_flow_application_ipars_agent_count: AtomicU64,
+    packet_flow_application_ipars_relay_count: AtomicU64,
+    packet_flow_application_stun_count: AtomicU64,
     packet_flow_application_kubernetes_api_count: AtomicU64,
     packet_flow_application_kubelet_count: AtomicU64,
     packet_flow_application_docker_api_count: AtomicU64,
@@ -1116,6 +1121,11 @@ impl AgentRuntime {
             packet_flow_application_tacacs_count: AtomicU64::new(0),
             packet_flow_application_bgp_count: AtomicU64::new(0),
             packet_flow_application_bfd_count: AtomicU64::new(0),
+            packet_flow_application_ipars_control_plane_count: AtomicU64::new(0),
+            packet_flow_application_ipars_signal_count: AtomicU64::new(0),
+            packet_flow_application_ipars_agent_count: AtomicU64::new(0),
+            packet_flow_application_ipars_relay_count: AtomicU64::new(0),
+            packet_flow_application_stun_count: AtomicU64::new(0),
             packet_flow_application_kubernetes_api_count: AtomicU64::new(0),
             packet_flow_application_kubelet_count: AtomicU64::new(0),
             packet_flow_application_docker_api_count: AtomicU64::new(0),
@@ -1857,6 +1867,19 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Tacacs => &self.packet_flow_application_tacacs_count,
             AgentPacketFlowApplication::Bgp => &self.packet_flow_application_bgp_count,
             AgentPacketFlowApplication::Bfd => &self.packet_flow_application_bfd_count,
+            AgentPacketFlowApplication::IparsControlPlane => {
+                &self.packet_flow_application_ipars_control_plane_count
+            }
+            AgentPacketFlowApplication::IparsSignal => {
+                &self.packet_flow_application_ipars_signal_count
+            }
+            AgentPacketFlowApplication::IparsAgent => {
+                &self.packet_flow_application_ipars_agent_count
+            }
+            AgentPacketFlowApplication::IparsRelay => {
+                &self.packet_flow_application_ipars_relay_count
+            }
+            AgentPacketFlowApplication::Stun => &self.packet_flow_application_stun_count,
             AgentPacketFlowApplication::KubernetesApi => {
                 &self.packet_flow_application_kubernetes_api_count
             }
@@ -6335,10 +6358,80 @@ mod tests {
                 },
                 Utc::now(),
                 false,
+        )
+        .await
+        .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(containerd_match.peer, peer_b_id);
+        let ipars_control_plane_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 72)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: b"POST /v1/heartbeat HTTP/1.1\r\n".to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
             )
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
-        assert_eq!(containerd_match.peer, peer_b_id);
+        assert_eq!(ipars_control_plane_match.peer, peer_b_id);
+        let ipars_signal_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 73)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: b"POST /v1/paths/negotiate HTTP/1.1\r\n".to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(ipars_signal_match.peer, peer_b_id);
+        let ipars_agent_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 74)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: b"POST /v1/packet-flow HTTP/1.1\r\n".to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(ipars_agent_match.peer, peer_b_id);
+        let ipars_relay_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 75)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    payload_prefix: b"POST /v1/sessions HTTP/1.1\r\n".to_vec(),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(ipars_relay_match.peer, peer_b_id);
+        let stun_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 76)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(3478),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(stun_match.peer, peer_b_id);
         let postgres_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 26)),
@@ -6796,8 +6889,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 50);
-        assert_eq!(metrics.packet_flow_match_count, 48);
+        assert_eq!(metrics.packet_flow_observation_count, 55);
+        assert_eq!(metrics.packet_flow_match_count, 53);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -6809,7 +6902,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            48
+            53
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -6836,6 +6929,17 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Vxlan), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Geneve), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Https), 1);
+        assert_eq!(
+            application_count(AgentPacketFlowApplication::IparsControlPlane),
+            1
+        );
+        assert_eq!(
+            application_count(AgentPacketFlowApplication::IparsSignal),
+            1
+        );
+        assert_eq!(application_count(AgentPacketFlowApplication::IparsAgent), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::IparsRelay), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Stun), 1);
         assert_eq!(
             application_count(AgentPacketFlowApplication::KubernetesApi),
             1
