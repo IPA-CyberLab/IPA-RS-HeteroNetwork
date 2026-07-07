@@ -219,6 +219,7 @@ struct LoadReport {
     relay_dataplane_datagrams_forwarded_reported: u64,
     relay_dataplane_datagrams_dropped_reported: u64,
     relay_dataplane_invalid_session_credential_drops_reported: u64,
+    relay_dataplane_invalid_session_credential_drops_prometheus_reported: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
     relay_available_sessions_reported: usize,
@@ -914,6 +915,15 @@ impl LoadReport {
                 self.relay_dataplane_invalid_session_credential_drops_reported
             );
         }
+        if self.relay_dataplane_invalid_session_credential_drops_prometheus_reported
+            < self.relay_dataplane_invalid_session_credential_drops_reported
+        {
+            bail!(
+                "{context} relay Prometheus metrics reported {} invalid credential drops, below status drops {}",
+                self.relay_dataplane_invalid_session_credential_drops_prometheus_reported,
+                self.relay_dataplane_invalid_session_credential_drops_reported
+            );
+        }
         let minimum_datagrams_received = self.relay_udp_packets_received as u64
             + self.relay_dataplane_datagrams_dropped_reported;
         if self.relay_dataplane_datagrams_received_reported < minimum_datagrams_received {
@@ -1158,6 +1168,8 @@ impl LoadReport {
                 != self.relay_dataplane_datagrams_dropped_reported
             || measurement.relay_dataplane_invalid_session_credential_drops_reported
                 != self.relay_dataplane_invalid_session_credential_drops_reported
+            || measurement.relay_dataplane_invalid_session_credential_drops_prometheus_reported
+                != self.relay_dataplane_invalid_session_credential_drops_prometheus_reported
             || measurement.relay_forwarded_bytes_reported != self.relay_forwarded_bytes_reported
             || measurement.relay_active_sessions_reported != self.relay_active_sessions_reported
             || measurement.control_plane_failover_checked
@@ -1166,7 +1178,7 @@ impl LoadReport {
                 != self.daemon_control_plane_failover_survivor_endpoints
         {
             bail!(
-                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, dataplane drops {}/{}, invalid credential drops {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
+                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, dataplane drops {}/{}, invalid credential drops {}/{}, Prometheus invalid credential drops {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
                 measurement.relay_udp_packets_received,
                 self.relay_udp_packets_received,
                 measurement.failover_relay_udp_packets_received,
@@ -1175,6 +1187,8 @@ impl LoadReport {
                 self.relay_dataplane_datagrams_dropped_reported,
                 measurement.relay_dataplane_invalid_session_credential_drops_reported,
                 self.relay_dataplane_invalid_session_credential_drops_reported,
+                measurement.relay_dataplane_invalid_session_credential_drops_prometheus_reported,
+                self.relay_dataplane_invalid_session_credential_drops_prometheus_reported,
                 measurement.relay_forwarded_bytes_reported,
                 self.relay_forwarded_bytes_reported,
                 measurement.relay_active_sessions_reported,
@@ -1858,6 +1872,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_dataplane_datagrams_forwarded_reported: 0,
         relay_dataplane_datagrams_dropped_reported: 0,
         relay_dataplane_invalid_session_credential_drops_reported: 0,
+        relay_dataplane_invalid_session_credential_drops_prometheus_reported: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -2094,6 +2109,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_dataplane_datagrams_forwarded_reported: 0,
         relay_dataplane_datagrams_dropped_reported: 0,
         relay_dataplane_invalid_session_credential_drops_reported: 0,
+        relay_dataplane_invalid_session_credential_drops_prometheus_reported: 0,
         relay_forwarded_bytes_reported: 0,
         relay_active_sessions_reported: 0,
         relay_available_sessions_reported: 0,
@@ -2274,6 +2290,14 @@ async fn run_relay_udp_scenario(
     )
     .await?;
     let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
+    let prometheus_invalid_credential_drops = prometheus_metric_labeled_u64(
+        &metrics,
+        "ipars_relay_datagrams_dropped_by_reason_total",
+        &[(
+            "reason",
+            RelayDataplaneDropReason::InvalidSessionCredential.as_str(),
+        )],
+    )?;
     let relay_mbps = if relay_elapsed.is_zero() {
         0.0
     } else {
@@ -2318,6 +2342,8 @@ async fn run_relay_udp_scenario(
         relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
         relay_dataplane_invalid_session_credential_drops_reported:
             relay_invalid_session_credential_drops(&status),
+        relay_dataplane_invalid_session_credential_drops_prometheus_reported:
+            prometheus_invalid_credential_drops,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -2693,6 +2719,14 @@ async fn run_daemon_scenario(
     )
     .await?;
     let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
+    let prometheus_invalid_credential_drops = prometheus_metric_labeled_u64(
+        &metrics,
+        "ipars_relay_datagrams_dropped_by_reason_total",
+        &[(
+            "reason",
+            RelayDataplaneDropReason::InvalidSessionCredential.as_str(),
+        )],
+    )?;
     let relay_mbps = if relay_elapsed.is_zero() {
         0.0
     } else {
@@ -2916,6 +2950,8 @@ async fn run_daemon_scenario(
         relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
         relay_dataplane_invalid_session_credential_drops_reported:
             relay_invalid_session_credential_drops(&status),
+        relay_dataplane_invalid_session_credential_drops_prometheus_reported:
+            prometheus_invalid_credential_drops,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         control_plane_failover_checked: failover_checked,
@@ -2962,6 +2998,8 @@ async fn run_daemon_scenario(
         relay_dataplane_datagrams_dropped_reported: status.dataplane.datagrams_dropped,
         relay_dataplane_invalid_session_credential_drops_reported:
             relay_invalid_session_credential_drops(&status),
+        relay_dataplane_invalid_session_credential_drops_prometheus_reported:
+            prometheus_invalid_credential_drops,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_available_sessions_reported: status.capability.available_capacity() as usize,
@@ -3570,6 +3608,7 @@ struct DaemonRuntimeManifestMeasurement {
     relay_dataplane_datagrams_forwarded_reported: u64,
     relay_dataplane_datagrams_dropped_reported: u64,
     relay_dataplane_invalid_session_credential_drops_reported: u64,
+    relay_dataplane_invalid_session_credential_drops_prometheus_reported: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
     control_plane_failover_checked: bool,
@@ -6094,6 +6133,67 @@ fn prometheus_metric_u64(body: &str, metric_name: &str) -> anyhow::Result<u64> {
     bail!("metric {metric_name} was not present in relay metrics response")
 }
 
+fn prometheus_metric_labeled_u64(
+    body: &str,
+    metric_name: &str,
+    labels: &[(&str, &str)],
+) -> anyhow::Result<u64> {
+    let mut total = 0_u64;
+    let mut found = false;
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((sample_labels, value)) = prometheus_sample(line, metric_name) else {
+            continue;
+        };
+        if labels
+            .iter()
+            .all(|(key, value)| prometheus_labels_contain(sample_labels, key, value))
+        {
+            let parsed = value
+                .parse::<u64>()
+                .with_context(|| format!("failed to parse metric {metric_name} value"))?;
+            total = total
+                .checked_add(parsed)
+                .with_context(|| format!("metric {metric_name} value overflowed u64"))?;
+            found = true;
+        }
+    }
+
+    if found {
+        return Ok(total);
+    }
+
+    let label_summary = labels
+        .iter()
+        .map(|(key, value)| format!("{key}=\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    bail!("metric {metric_name} with labels {{{label_summary}}} was not present in relay metrics response")
+}
+
+fn prometheus_sample<'a>(line: &'a str, metric_name: &str) -> Option<(&'a str, &'a str)> {
+    let mut parts = line.split_whitespace();
+    let sample = parts.next()?;
+    let value = parts.next()?;
+    if sample == metric_name {
+        return Some(("", value));
+    }
+    let suffix = sample.strip_prefix(metric_name)?;
+    let labels = suffix.strip_prefix('{')?.strip_suffix('}')?;
+    Some((labels, value))
+}
+
+fn prometheus_labels_contain(labels: &str, key: &str, value: &str) -> bool {
+    labels.split(',').any(|label| {
+        let Some((label_key, label_value)) = label.split_once('=') else {
+            return false;
+        };
+        label_key.trim() == key && label_value.trim().trim_matches('"') == value
+    })
+}
+
 fn daemon_stun_report(
     metrics: &StunMetricsResponse,
     prometheus: &str,
@@ -6528,6 +6628,14 @@ mod tests {
         assert_eq!(report.relay_udp_payload_bytes_sent, 768);
         assert_eq!(report.relay_udp_payload_bytes_received, 768);
         assert_eq!(report.relay_forwarded_bytes_reported, 768);
+        assert_eq!(
+            report.relay_dataplane_invalid_session_credential_drops_reported,
+            1
+        );
+        assert_eq!(
+            report.relay_dataplane_invalid_session_credential_drops_prometheus_reported,
+            1
+        );
         assert_eq!(report.relay_active_sessions_reported, 6);
         assert_eq!(report.relay_available_sessions_reported, 9_994);
         assert_eq!(report.relay_max_sessions_reported, 10_000);
@@ -6542,6 +6650,29 @@ mod tests {
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
         report.validate_success()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prometheus_labeled_metric_sums_matching_samples() -> anyhow::Result<()> {
+        let body = r#"
+# HELP ipars_relay_datagrams_dropped_by_reason_total Drops by reason.
+# TYPE ipars_relay_datagrams_dropped_by_reason_total counter
+ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="invalid_session_credential"} 1
+ipars_relay_datagrams_dropped_by_reason_total{reason="invalid_session_credential",relay_node="relay-b"} 2
+ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unknown_session"} 5
+"#;
+
+        let drops = prometheus_metric_labeled_u64(
+            body,
+            "ipars_relay_datagrams_dropped_by_reason_total",
+            &[(
+                "reason",
+                RelayDataplaneDropReason::InvalidSessionCredential.as_str(),
+            )],
+        )?;
+
+        assert_eq!(drops, 3);
         Ok(())
     }
 
@@ -6708,6 +6839,15 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("relay admission mismatch"));
+
+        let mut missing_prometheus_drop = relay_report.clone();
+        missing_prometheus_drop
+            .relay_dataplane_invalid_session_credential_drops_prometheus_reported = 0;
+        let error = match missing_prometheus_drop.validate_success() {
+            Ok(_) => bail!("missing Prometheus invalid credential drop should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Prometheus metrics"));
 
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
@@ -9669,6 +9809,7 @@ mod tests {
             report.relay_udp_packets_received as u64;
         report.relay_dataplane_datagrams_dropped_reported = 1;
         report.relay_dataplane_invalid_session_credential_drops_reported = 1;
+        report.relay_dataplane_invalid_session_credential_drops_prometheus_reported = 1;
         report.relay_forwarded_bytes_reported = report.relay_udp_payload_bytes_received;
         report.relay_udp_sessions = report.active_pair_count;
         report.relay_active_sessions_reported = report.active_pair_count;
@@ -10053,6 +10194,7 @@ mod tests {
             relay_dataplane_datagrams_forwarded_reported: 6,
             relay_dataplane_datagrams_dropped_reported: 1,
             relay_dataplane_invalid_session_credential_drops_reported: 1,
+            relay_dataplane_invalid_session_credential_drops_prometheus_reported: 1,
             relay_forwarded_bytes_reported: 384,
             relay_active_sessions_reported: 6,
             control_plane_failover_checked: true,
@@ -10133,6 +10275,8 @@ mod tests {
                     .relay_dataplane_datagrams_dropped_reported,
                 relay_dataplane_invalid_session_credential_drops_reported: report
                     .relay_dataplane_invalid_session_credential_drops_reported,
+                relay_dataplane_invalid_session_credential_drops_prometheus_reported: report
+                    .relay_dataplane_invalid_session_credential_drops_prometheus_reported,
                 relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
                 relay_active_sessions_reported: report.relay_active_sessions_reported,
                 control_plane_failover_checked: report.daemon_control_plane_failover_checked,
