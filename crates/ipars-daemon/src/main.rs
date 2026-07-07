@@ -13021,6 +13021,7 @@ mod tests {
         previous.insert(RelayAdmissionFailureReason::AdmissionDenied, 1);
         let mut current = previous.clone();
         current.insert(RelayAdmissionFailureReason::Unauthorized, 5);
+        current.insert(RelayAdmissionFailureReason::InvalidAdmissionRequest, 2);
         current.insert(RelayAdmissionFailureReason::InvalidSessionCredential, 1);
 
         let delta = relay_admission_failure_reason_delta(&current, Some(&previous));
@@ -13028,6 +13029,10 @@ mod tests {
         assert_eq!(
             delta.get(&RelayAdmissionFailureReason::Unauthorized),
             Some(&3)
+        );
+        assert_eq!(
+            delta.get(&RelayAdmissionFailureReason::InvalidAdmissionRequest),
+            Some(&2)
         );
         assert_eq!(
             delta.get(&RelayAdmissionFailureReason::InvalidSessionCredential),

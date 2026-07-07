@@ -430,6 +430,7 @@ impl IntoResponse for ApiError {
             }
         };
         let status = match error {
+            RelayError::InvalidAdmissionRequest => StatusCode::BAD_REQUEST,
             RelayError::AdmissionDenied => StatusCode::FORBIDDEN,
             RelayError::NodeSessionLimitExceeded => StatusCode::FORBIDDEN,
             RelayError::UnknownSession => StatusCode::NOT_FOUND,
@@ -535,6 +536,12 @@ mod tests {
                 .get(&RelayAdmissionFailureReason::Unauthorized),
             Some(&0)
         );
+        assert_eq!(
+            response
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::InvalidAdmissionRequest),
+            Some(&0)
+        );
         assert_eq!(response.dataplane.datagrams_received, 0);
         assert_eq!(
             response.dataplane.drops_by_reason.len(),
@@ -585,6 +592,9 @@ mod tests {
             "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"unauthorized\"} 0"
         ));
         assert!(body.contains(
+            "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"invalid_admission_request\"} 0"
+        ));
+        assert!(body.contains(
             "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"internal_error\"} 0"
         ));
         assert!(body.contains("ipars_relay_datagrams_received_total"));
@@ -594,6 +604,68 @@ mod tests {
         ));
         assert!(body.contains(
             "ipars_relay_datagrams_dropped_by_reason_total{relay_node=\"relay-a\",reason=\"malformed_frame\"} 1"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_relay_rejects_unsafe_node_id_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let relay = Arc::new(RelayService::new(
+            NodeId::from_string("relay-a"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                admission_url: Some("http://203.0.113.10:9580".to_string()),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+        ));
+        let app = router(RelayHttpState::new(relay.clone()));
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&RelayAdmissionRequest {
+                        left: NodeId::from_string("left/../spoof"),
+                        right: NodeId::from_string("right"),
+                        left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                        right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let status = relay.status().await;
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::InvalidAdmissionRequest),
+            Some(&1)
+        );
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(metrics.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains(
+            "ipars_relay_admission_failures_by_reason_total{relay_node=\"relay-a\",reason=\"invalid_admission_request\"} 1"
         ));
         Ok(())
     }

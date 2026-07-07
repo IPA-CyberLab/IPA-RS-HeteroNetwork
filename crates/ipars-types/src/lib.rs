@@ -1401,6 +1401,7 @@ pub mod api {
     #[serde(rename_all = "snake_case")]
     pub enum RelayAdmissionFailureReason {
         Unauthorized,
+        InvalidAdmissionRequest,
         AdmissionDenied,
         NodeSessionLimitExceeded,
         RateLimited,
@@ -1410,8 +1411,9 @@ pub mod api {
     }
 
     impl RelayAdmissionFailureReason {
-        pub const ALL: [Self; 7] = [
+        pub const ALL: [Self; 8] = [
             Self::Unauthorized,
+            Self::InvalidAdmissionRequest,
             Self::AdmissionDenied,
             Self::NodeSessionLimitExceeded,
             Self::RateLimited,
@@ -1423,6 +1425,7 @@ pub mod api {
         pub fn as_str(self) -> &'static str {
             match self {
                 Self::Unauthorized => "unauthorized",
+                Self::InvalidAdmissionRequest => "invalid_admission_request",
                 Self::AdmissionDenied => "admission_denied",
                 Self::NodeSessionLimitExceeded => "node_session_limit_exceeded",
                 Self::RateLimited => "rate_limited",

@@ -18,6 +18,8 @@ const DEFAULT_SESSION_TTL_SECONDS: i64 = 300;
 
 #[derive(Debug, Error)]
 pub enum RelayError {
+    #[error("invalid relay admission request")]
+    InvalidAdmissionRequest,
     #[error("relay admission denied")]
     AdmissionDenied,
     #[error("relay node session limit exceeded")]
@@ -112,6 +114,7 @@ const RELAY_FRAME_MAGIC: &[u8] = b"IPARS-RLY1";
 const RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
 const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
 const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
+const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 const MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES: usize = 128 * 1024;
 
 pub fn encode_relay_datagram(
@@ -164,8 +167,8 @@ pub fn encode_relay_datagram_with_route(
         session_token.len(),
         ciphertext_payload.len(),
     )?;
-    validate_relay_node_id_size(source.as_str().len())?;
-    validate_relay_node_id_size(destination.as_str().len())?;
+    validate_relay_frame_node_id(source.as_str())?;
+    validate_relay_frame_node_id(destination.as_str())?;
 
     let mut datagram = Vec::with_capacity(
         RELAY_FRAME_MAGIC_V2.len()
@@ -513,6 +516,7 @@ fn default_session_ttl() -> chrono::Duration {
 
 fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
     match error {
+        RelayError::InvalidAdmissionRequest => RelayDataplaneDropReason::AdmissionDenied,
         RelayError::AdmissionDenied => RelayDataplaneDropReason::AdmissionDenied,
         RelayError::NodeSessionLimitExceeded => RelayDataplaneDropReason::AdmissionDenied,
         RelayError::UnknownSession => RelayDataplaneDropReason::UnknownSession,
@@ -527,6 +531,7 @@ fn relay_error_drop_reason(error: &RelayError) -> RelayDataplaneDropReason {
 
 fn relay_error_admission_failure_reason(error: &RelayError) -> RelayAdmissionFailureReason {
     match error {
+        RelayError::InvalidAdmissionRequest => RelayAdmissionFailureReason::InvalidAdmissionRequest,
         RelayError::AdmissionDenied => RelayAdmissionFailureReason::AdmissionDenied,
         RelayError::NodeSessionLimitExceeded => {
             RelayAdmissionFailureReason::NodeSessionLimitExceeded
@@ -565,6 +570,8 @@ fn validate_relay_session_admission(
     admission: &RelaySessionAdmission,
     session_id: &RelaySessionId,
 ) -> Result<(), RelayError> {
+    validate_relay_admission_node_id(&admission.left)?;
+    validate_relay_admission_node_id(&admission.right)?;
     if admission.left == admission.right || admission.left_addr == admission.right_addr {
         return Err(RelayError::AdmissionDenied);
     }
@@ -582,6 +589,32 @@ fn validate_relay_session_admission(
         return Err(RelayError::InvalidSessionCredential);
     }
     Ok(())
+}
+
+fn validate_relay_admission_node_id(node_id: &NodeId) -> Result<(), RelayError> {
+    if relay_node_id_is_valid(node_id.as_str()) {
+        Ok(())
+    } else {
+        Err(RelayError::InvalidAdmissionRequest)
+    }
+}
+
+fn validate_relay_frame_node_id(node_id: &str) -> Result<(), RelayError> {
+    if relay_node_id_is_valid(node_id) {
+        Ok(())
+    } else {
+        Err(RelayError::MalformedFrame)
+    }
+}
+
+fn relay_node_id_is_valid(node_id: &str) -> bool {
+    !node_id.is_empty()
+        && node_id.len() <= MAX_RELAY_NODE_ID_BYTES
+        && !matches!(node_id, "." | "..")
+        && !node_id.starts_with('-')
+        && node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_relay_frame_sizes(
@@ -605,9 +638,7 @@ fn validate_relay_frame_sizes(
 }
 
 fn validate_relay_node_id_size(node_id_len: usize) -> Result<(), RelayError> {
-    if node_id_len == 0
-        || node_id_len > MAX_RELAY_SESSION_ID_BYTES
-        || node_id_len > u16::MAX as usize
+    if node_id_len == 0 || node_id_len > MAX_RELAY_NODE_ID_BYTES || node_id_len > u16::MAX as usize
     {
         return Err(RelayError::FrameTooLarge);
     }
@@ -736,6 +767,8 @@ fn decode_relay_datagram_v2(datagram: &[u8]) -> Result<RelayDatagram, RelayError
         .map_err(|_| RelayError::MalformedFrame)?;
     let destination = String::from_utf8(datagram[destination_start..payload_start].to_vec())
         .map_err(|_| RelayError::MalformedFrame)?;
+    validate_relay_frame_node_id(&source)?;
+    validate_relay_frame_node_id(&destination)?;
 
     Ok(RelayDatagram {
         session_id: RelaySessionId(session_id),
@@ -1152,6 +1185,55 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_unsafe_node_id_admission() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let oversized = "x".repeat(MAX_RELAY_NODE_ID_BYTES + 1);
+
+        for node_id in [
+            "",
+            ".",
+            "..",
+            "-node",
+            "node/../a",
+            "node:a",
+            "node a",
+            "node\nspoof",
+            oversized.as_str(),
+        ] {
+            let rejected = table.admit_with_token(
+                &capability,
+                NodeId::from_string(node_id),
+                NodeId::from_string("node-b"),
+                left_addr,
+                right_addr,
+                "relay-secret".to_string(),
+            );
+            assert!(
+                matches!(rejected, Err(RelayError::InvalidAdmissionRequest)),
+                "{node_id:?} should be rejected"
+            );
+        }
+
+        let rejected_right = table.admit_with_token(
+            &capability,
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node/b"),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        );
+        assert!(matches!(
+            rejected_right,
+            Err(RelayError::InvalidAdmissionRequest)
+        ));
+        assert_eq!(table.session_count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn relay_rejects_duplicate_node_pair_admission() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -1472,10 +1554,63 @@ mod tests {
     }
 
     #[test]
+    fn relay_rejects_unsafe_route_metadata_node_ids() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
+        let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            left_addr,
+            right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let invalid_encoded = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &NodeId::from_string("left/../spoof"),
+            &right,
+            b"opaque",
+        );
+        assert!(matches!(invalid_encoded, Err(RelayError::MalformedFrame)));
+
+        let source = b"left/../spoof";
+        let destination = right.as_str().as_bytes();
+        let payload = b"opaque";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(RELAY_FRAME_MAGIC_V2);
+        raw.extend_from_slice(&(credentials.session_id.as_str().len() as u16).to_be_bytes());
+        raw.extend_from_slice(&(credentials.session_token.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&(source.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&(destination.len() as u16).to_be_bytes());
+        raw.extend_from_slice(credentials.session_id.as_str().as_bytes());
+        raw.extend_from_slice(credentials.session_token.as_bytes());
+        raw.extend_from_slice(source);
+        raw.extend_from_slice(destination);
+        raw.extend_from_slice(payload);
+
+        let rejected = table.forward_datagram_for_addr(left_addr, &raw);
+        assert!(matches!(rejected, Err(RelayError::MalformedFrame)));
+        let metrics = table.dataplane_metrics();
+        assert_eq!(
+            metrics
+                .drops_by_reason
+                .get(&RelayDataplaneDropReason::MalformedFrame),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn relay_frame_uses_length_prefixed_metadata() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
-        let left = NodeId::from_string("left\nspoof");
+        let left = NodeId::from_string("left");
         let right = NodeId::from_string("right");
         let left_addr = SocketAddr::from(([10, 0, 0, 1], 10000));
         let right_addr = SocketAddr::from(([10, 0, 0, 2], 10000));
@@ -1793,6 +1928,41 @@ mod tests {
                 .admission_failures_by_reason
                 .get(&RelayAdmissionFailureReason::AdmissionDenied),
             Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_counts_unsafe_node_id_admission_as_invalid_request(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left/../spoof"),
+                right: NodeId::from_string("right"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::InvalidAdmissionRequest)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::InvalidAdmissionRequest),
+            Some(&1)
+        );
+        assert_eq!(
+            RelayAdmissionFailureReason::InvalidAdmissionRequest.as_str(),
+            "invalid_admission_request"
         );
         Ok(())
     }

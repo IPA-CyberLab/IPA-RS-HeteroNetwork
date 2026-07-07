@@ -58,7 +58,7 @@ Implemented controls:
 - optional Bearer token protection for relay admission;
 - admission rate limits, including unauthorized attempts;
 - global and per-participating-node active session caps;
-- rejection of self-relay, duplicate active node-pair, same-endpoint, unusable endpoint, expired, malformed, oversized, or wrong-credential frames;
+- rejection of unsafe participant node IDs, self-relay, duplicate active node-pair, same-endpoint, unusable endpoint, expired, malformed, oversized, unsafe routed-frame node metadata, or wrong-credential frames;
 - per-session throughput windows;
 - cumulative admission and dataplane counters with failure reasons;
 - agent-side relay candidate ranking by utilization, remaining capacity, and bandwidth;
