@@ -316,14 +316,13 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             "agent-b",
         ],
     )?;
-    let agent_nodes = assert_compose_service_apis(
-        &compose,
-        &ComposeApiPorts {
-            agent: agent_port,
-            agent_b: agent_b_port,
-        },
-    )?;
+    let api_ports = ComposeApiPorts {
+        agent: agent_port,
+        agent_b: agent_b_port,
+    };
+    let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
+    assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
@@ -455,6 +454,9 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - /var/lib/ipars/agent.json
       - --runtime-backend
       - dry-run
+      - --apply-peer-map
+      - --peer-map-poll-interval-seconds
+      - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
     healthcheck:
@@ -488,6 +490,9 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - /var/lib/ipars/agent-b.json
       - --runtime-backend
       - dry-run
+      - --apply-peer-map
+      - --peer-map-poll-interval-seconds
+      - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
     depends_on:
@@ -775,6 +780,43 @@ fn assert_compose_control_plane_peer_maps(
         },
     )?;
 
+    Ok(())
+}
+
+fn assert_compose_agent_peer_maps(
+    compose: &ComposeProject,
+    nodes: &ComposeAgentNodes,
+    ports: &ComposeApiPorts,
+) -> Result<()> {
+    assert_compose_agent_peer_map(compose, "agent", ports.agent, &nodes.agent_b)?;
+    assert_compose_agent_peer_map(compose, "agent-b", ports.agent_b, &nodes.agent)?;
+    Ok(())
+}
+
+fn assert_compose_agent_peer_map(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    expected_node_id: &str,
+) -> Result<()> {
+    wait_for_json(
+        compose,
+        &format!("{service} peer-map metrics"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/metrics"),
+        |value| {
+            ensure_json_bool_equals(value, "peer_map_synced", true)?;
+            ensure_json_u64_at_least(value, "peer_map_peer_count", 1)?;
+            Ok(())
+        },
+    )?;
+    wait_for_json(
+        compose,
+        &format!("{service} peer map"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/peers"),
+        |value| ensure_peer_map_contains(value, expected_node_id),
+    )?;
     Ok(())
 }
 
@@ -1102,6 +1144,18 @@ fn ensure_json_u64_at_least(value: &Value, field: &str, minimum: u64) -> Result<
 
 fn ensure_json_u64_equals(value: &Value, field: &str, expected: u64) -> Result<()> {
     let actual = json_u64_field(value, field)?;
+    anyhow::ensure!(
+        actual == expected,
+        "expected JSON field {field} to equal {expected}, got {actual}: {value}"
+    );
+    Ok(())
+}
+
+fn ensure_json_bool_equals(value: &Value, field: &str, expected: bool) -> Result<()> {
+    let actual = value
+        .get(field)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("JSON field {field} was missing or not a boolean: {value}"))?;
     anyhow::ensure!(
         actual == expected,
         "expected JSON field {field} to equal {expected}, got {actual}: {value}"
