@@ -102,10 +102,10 @@ advertised route loss, missing control-plane metrics endpoint coverage, cross-co
 failed control-plane failover, missing failover survivor relay/health/path metrics or path status, missing failover relay dataplane delivery, missing failover agent runtime path state, all-unreachable path negotiation, missing agent runtime or control-plane path-status reachable paths, relay-candidate loss, relay packet
 loss, relay capacity/policy/E2E/admission counter skew,
 relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
-readiness-timeout, endpoint, `iparsd` binary path/size/SHA-256, child redacted argv/hash, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
+readiness-timeout, endpoint, `iparsd` binary path/size/SHA-256, child redacted argv/hash/lifecycle timing, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
 mismatch, duplicate, empty, role-mismatched, or serial/order-skewed retained child logs, retained file permission/owner drift across logs, manifests, and store artifacts, unexpected retained runtime artifacts, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
 instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
-records the canonical `iparsd` binary plus its byte count and SHA-256, per-child redacted argv and argv hashes, per-child log byte counts, redacted log-tail hashes, and completed relay/failover dataplane
+records the canonical `iparsd` binary plus its byte count and SHA-256, per-child redacted argv and argv hashes, per-child start/exit/runtime timing, per-child log byte counts, redacted log-tail hashes, and completed relay/failover dataplane
 measurement counters in an owner-only atomically replaced
 runtime manifest, and reports log tails
 when liveness or readiness checks fail while waiting for service health, agent registration

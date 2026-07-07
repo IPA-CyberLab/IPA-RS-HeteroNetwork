@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1145,6 +1145,11 @@ impl LoadReport {
         for child in &manifest.children {
             child_roles.push(child.role.clone());
             validate_daemon_manifest_child_command(child, &manifest.iparsd_binary.path)?;
+            validate_daemon_manifest_child_lifecycle(
+                child,
+                manifest.started_at,
+                manifest.updated_at,
+            )?;
             let Some(log_path) = &child.log_path else {
                 bail!(
                     "daemon load scenario retained manifest child {} is missing log path",
@@ -3261,6 +3266,9 @@ struct DaemonBinaryIdentity {
 struct DaemonRuntimeManifestChild {
     role: String,
     pid: Option<u32>,
+    started_at: chrono::DateTime<Utc>,
+    exited_at: Option<chrono::DateTime<Utc>>,
+    runtime_ms: Option<u64>,
     redacted_argv: Vec<String>,
     redacted_argv_sha256: String,
     log_path: Option<PathBuf>,
@@ -3341,19 +3349,31 @@ impl DaemonRuntimeManifestSeed {
 
 impl DaemonRuntimeManifestChild {
     fn from_child(child: &DaemonChild) -> Self {
-        let (state, exit_status, exit_code) = if let Some(exit) = &child.last_exit {
-            (
-                DaemonRuntimeManifestChildState::Exited,
-                Some(exit.status.clone()),
-                exit.code,
-            )
-        } else {
-            (DaemonRuntimeManifestChildState::Running, None, None)
-        };
+        let (state, exited_at, runtime_ms, exit_status, exit_code) =
+            if let Some(exit) = &child.last_exit {
+                (
+                    DaemonRuntimeManifestChildState::Exited,
+                    Some(exit.exited_at),
+                    Some(daemon_child_runtime_ms(child.started_at, exit.exited_at)),
+                    Some(exit.status.clone()),
+                    exit.code,
+                )
+            } else {
+                (
+                    DaemonRuntimeManifestChildState::Running,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
         let diagnostics = child.log_path.as_deref().and_then(daemon_log_diagnostics);
         Self {
             role: child.role.clone(),
             pid: Some(child.child.id()),
+            started_at: child.started_at,
+            exited_at,
+            runtime_ms,
             redacted_argv: child.redacted_argv.clone(),
             redacted_argv_sha256: child.redacted_argv_sha256.clone(),
             log_path: child.log_path.clone(),
@@ -3755,10 +3775,7 @@ impl DaemonProcessGroup {
         let status = child.child.wait().with_context(|| {
             format!("failed to wait for iparsd {stopped_role} during failover probe")
         })?;
-        child.last_exit = Some(DaemonChildExit {
-            status: status.to_string(),
-            code: status.code(),
-        });
+        child.last_exit = Some(daemon_child_exit(status));
         let survivor_urls = self
             .control_plane_urls
             .iter()
@@ -3864,6 +3881,7 @@ impl Drop for DaemonStartupGuard {
 struct DaemonChild {
     role: String,
     child: Child,
+    started_at: chrono::DateTime<Utc>,
     redacted_argv: Vec<String>,
     redacted_argv_sha256: String,
     log_path: Option<PathBuf>,
@@ -3874,6 +3892,7 @@ struct DaemonChild {
 struct DaemonChildExit {
     status: String,
     code: Option<i32>,
+    exited_at: chrono::DateTime<Utc>,
 }
 
 fn spawn_iparsd(
@@ -3914,6 +3933,7 @@ fn spawn_iparsd(
     Ok(DaemonChild {
         role: role.to_string(),
         child,
+        started_at: Utc::now(),
         redacted_argv,
         redacted_argv_sha256,
         log_path: Some(log_path),
@@ -3928,10 +3948,7 @@ fn kill_daemon_children(children: &mut [DaemonChild]) {
         }
         let _ = daemon_child.child.kill();
         if let Ok(status) = daemon_child.child.wait() {
-            daemon_child.last_exit = Some(DaemonChildExit {
-                status: status.to_string(),
-                code: status.code(),
-            });
+            daemon_child.last_exit = Some(daemon_child_exit(status));
         }
     }
 }
@@ -3947,10 +3964,7 @@ fn stop_daemon_children(children: &mut [DaemonChild]) -> anyhow::Result<()> {
                 daemon_child.role
             )
         })? {
-            daemon_child.last_exit = Some(DaemonChildExit {
-                status: status.to_string(),
-                code: status.code(),
-            });
+            daemon_child.last_exit = Some(daemon_child_exit(status));
             let log_tail = daemon_child
                 .log_tail()
                 .map(|tail| format!("\n{tail}"))
@@ -3974,10 +3988,7 @@ fn stop_daemon_children(children: &mut [DaemonChild]) -> anyhow::Result<()> {
                 daemon_child.role
             )
         })?;
-        daemon_child.last_exit = Some(DaemonChildExit {
-            status: status.to_string(),
-            code: status.code(),
-        });
+        daemon_child.last_exit = Some(daemon_child_exit(status));
     }
     Ok(())
 }
@@ -4014,10 +4025,7 @@ fn ensure_daemon_children_running_allowing_roles(
                 daemon_child.role
             )
         })? {
-            let exit = DaemonChildExit {
-                status: status.to_string(),
-                code: status.code(),
-            };
+            let exit = daemon_child_exit(status);
             daemon_child.last_exit = Some(exit.clone());
             let log_tail = daemon_child
                 .log_tail()
@@ -4032,6 +4040,24 @@ fn ensure_daemon_children_running_allowing_roles(
         }
     }
     Ok(())
+}
+
+fn daemon_child_exit(status: ExitStatus) -> DaemonChildExit {
+    DaemonChildExit {
+        status: status.to_string(),
+        code: status.code(),
+        exited_at: Utc::now(),
+    }
+}
+
+fn daemon_child_runtime_ms(
+    started_at: chrono::DateTime<Utc>,
+    exited_at: chrono::DateTime<Utc>,
+) -> u64 {
+    exited_at
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64
 }
 
 impl DaemonChild {
@@ -4269,6 +4295,73 @@ fn validate_daemon_manifest_child_command(
             child.redacted_argv_sha256,
             expected_sha256
         );
+    }
+    Ok(())
+}
+
+fn validate_daemon_manifest_child_lifecycle(
+    child: &DaemonRuntimeManifestChild,
+    manifest_started_at: chrono::DateTime<Utc>,
+    manifest_updated_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if child.started_at < manifest_started_at {
+        bail!(
+            "daemon load scenario retained manifest child {} started_at {} is before run started_at {}",
+            child.role,
+            child.started_at,
+            manifest_started_at
+        );
+    }
+    if child.started_at > manifest_updated_at {
+        bail!(
+            "daemon load scenario retained manifest child {} started_at {} is after manifest updated_at {}",
+            child.role,
+            child.started_at,
+            manifest_updated_at
+        );
+    }
+    match child.state {
+        DaemonRuntimeManifestChildState::Running => {
+            if child.exited_at.is_some() || child.runtime_ms.is_some() {
+                bail!(
+                    "daemon load scenario retained manifest running child {} recorded exit timing",
+                    child.role
+                );
+            }
+        }
+        DaemonRuntimeManifestChildState::Exited => {
+            let exited_at = child.exited_at.with_context(|| {
+                format!(
+                    "daemon load scenario retained manifest exited child {} is missing exited_at",
+                    child.role
+                )
+            })?;
+            if exited_at < child.started_at {
+                bail!(
+                    "daemon load scenario retained manifest child {} exited_at {} is before started_at {}",
+                    child.role,
+                    exited_at,
+                    child.started_at
+                );
+            }
+            if exited_at > manifest_updated_at {
+                bail!(
+                    "daemon load scenario retained manifest child {} exited_at {} is after manifest updated_at {}",
+                    child.role,
+                    exited_at,
+                    manifest_updated_at
+                );
+            }
+            let expected_runtime_ms = daemon_child_runtime_ms(child.started_at, exited_at);
+            if child.runtime_ms != Some(expected_runtime_ms) {
+                bail!(
+                    "daemon load scenario retained manifest child {} runtime_ms {:?} does not match timestamps {}",
+                    child.role,
+                    child.runtime_ms,
+                    expected_runtime_ms
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -6118,6 +6211,11 @@ mod tests {
         let retained_contents = std::fs::read_to_string(&retained_manifest_path)?;
         assert!(!retained_contents.contains(DAEMON_JOIN_TOKEN_FILE_SUFFIX));
         let retained_decoded: DaemonRuntimeManifest = serde_json::from_str(&retained_contents)?;
+        assert!(retained_decoded.children.iter().all(|child| {
+            child.state == DaemonRuntimeManifestChildState::Exited
+                && child.exited_at.is_some()
+                && child.runtime_ms.is_some()
+        }));
         let agent_command = retained_decoded
             .children
             .iter()
@@ -6245,6 +6343,61 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("redacted argv hash mismatch"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut missing_child_exit_timing = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &missing_child_exit_timing,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        missing_child_exit_timing.daemon_runtime_dir = Some(runtime_dir.clone());
+        missing_child_exit_timing.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[0].exited_at = None;
+        })?;
+        let error = match missing_child_exit_timing.validate_success() {
+            Ok(_) => bail!("retained manifest with missing child exit timing should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing exited_at"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut mismatched_child_runtime = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_child_runtime,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_child_runtime.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_child_runtime.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.children[0].runtime_ms = Some(
+                manifest.children[0]
+                    .runtime_ms
+                    .unwrap_or_default()
+                    .saturating_add(1),
+            );
+        })?;
+        let error = match mismatched_child_runtime.validate_success() {
+            Ok(_) => bail!("retained manifest with mismatched child runtime should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("runtime_ms"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         std::fs::write(
@@ -7698,6 +7851,7 @@ mod tests {
         group.children.push(DaemonChild {
             role: "agent".to_string(),
             child,
+            started_at: Utc::now(),
             redacted_argv: synthetic_child_redacted_argv("agent"),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256("agent"),
             log_path: Some(log_path),
@@ -7712,11 +7866,18 @@ mod tests {
         assert!(error.contains("exited before completed manifest shutdown"));
         assert!(error.contains("13"));
         assert_eq!(
-            group.children[0].last_exit,
-            Some(DaemonChildExit {
-                status: "exit status: 13".to_string(),
-                code: Some(13),
-            })
+            group.children[0]
+                .last_exit
+                .as_ref()
+                .map(|exit| exit.status.as_str()),
+            Some("exit status: 13")
+        );
+        assert_eq!(
+            group.children[0]
+                .last_exit
+                .as_ref()
+                .and_then(|exit| exit.code),
+            Some(13)
         );
         drop(group);
         std::fs::remove_dir_all(&runtime_dir)?;
@@ -7985,6 +8146,7 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "signal".to_string(),
             child,
+            started_at: Utc::now(),
             redacted_argv: synthetic_child_redacted_argv("signal"),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256("signal"),
             log_path: Some(log_path.clone()),
@@ -8059,12 +8221,14 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "agent".to_string(),
             child,
+            started_at: Utc::now(),
             redacted_argv: synthetic_child_redacted_argv("agent"),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256("agent"),
             log_path: Some(log_path.clone()),
             last_exit: Some(DaemonChildExit {
                 status: "exit status: 11".to_string(),
                 code: Some(11),
+                exited_at: Utc::now(),
             }),
         }];
         let agent_urls = vec!["http://127.0.0.1:31006".to_string()];
@@ -8270,6 +8434,7 @@ mod tests {
         let mut children = vec![DaemonChild {
             role: "synthetic".to_string(),
             child,
+            started_at: Utc::now(),
             redacted_argv: synthetic_child_redacted_argv("synthetic"),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256("synthetic"),
             log_path: Some(log_path.clone()),
@@ -8285,11 +8450,15 @@ mod tests {
                     assert!(message.contains("7"));
                     assert!(message.contains("child diagnostic line"));
                     assert_eq!(
-                        children[0].last_exit,
-                        Some(DaemonChildExit {
-                            status: "exit status: 7".to_string(),
-                            code: Some(7),
-                        })
+                        children[0]
+                            .last_exit
+                            .as_ref()
+                            .map(|exit| exit.status.as_str()),
+                        Some("exit status: 7")
+                    );
+                    assert_eq!(
+                        children[0].last_exit.as_ref().and_then(|exit| exit.code),
+                        Some(7)
                     );
                     let manifest_child = DaemonRuntimeManifestChild::from_child(&children[0]);
                     assert_eq!(
@@ -8387,6 +8556,9 @@ mod tests {
         let child = DaemonRuntimeManifestChild {
             role: "agent".to_string(),
             pid: Some(42),
+            started_at: Utc::now(),
+            exited_at: None,
+            runtime_ms: None,
             redacted_argv_sha256: daemon_argv_sha256(&argv),
             redacted_argv: argv,
             log_path: None,
@@ -8947,6 +9119,7 @@ mod tests {
         Ok(DaemonChild {
             role: role.to_string(),
             child,
+            started_at: Utc::now(),
             redacted_argv: synthetic_child_redacted_argv(role),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256(role),
             log_path: Some(log_path),
@@ -9035,6 +9208,7 @@ mod tests {
     fn synthetic_manifest(runtime_dir: PathBuf, log_path: PathBuf) -> DaemonRuntimeManifest {
         let now = Utc::now();
         let log_diagnostics = daemon_log_diagnostics(&log_path);
+        let child_started_at = now;
         DaemonRuntimeManifest {
             scenario: ScenarioName::Three,
             phase: DaemonRuntimePhase::StartupReady,
@@ -9055,6 +9229,9 @@ mod tests {
             children: vec![DaemonRuntimeManifestChild {
                 role: "control-plane-0".to_string(),
                 pid: Some(4242),
+                started_at: child_started_at,
+                exited_at: None,
+                runtime_ms: None,
                 redacted_argv: synthetic_child_redacted_argv("control-plane-0"),
                 redacted_argv_sha256: synthetic_child_redacted_argv_sha256("control-plane-0"),
                 log_path: Some(log_path),
@@ -9110,6 +9287,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir)?;
         secure_daemon_runtime_dir(&runtime_dir)?;
         let exited_roles = exited_roles.iter().copied().collect::<BTreeSet<_>>();
+        let started_at = Utc::now();
         let mut children = Vec::with_capacity(report.daemon_processes);
         for index in 0..report.daemon_control_plane_processes {
             let role = format!("control-plane-{index}");
@@ -9137,7 +9315,7 @@ mod tests {
             )?);
         }
 
-        let now = Utc::now();
+        let updated_at = Utc::now();
         let manifest = DaemonRuntimeManifest {
             scenario: report.scenario,
             phase,
@@ -9184,9 +9362,9 @@ mod tests {
                 .map(|index| format!("http://127.0.0.1:33{index:03}"))
                 .collect(),
             keep_runtime_dir: true,
-            started_at: now,
-            updated_at: now,
-            generated_at: now,
+            started_at,
+            updated_at,
+            generated_at: updated_at,
             children,
         };
         let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest)?;
@@ -9221,9 +9399,15 @@ mod tests {
         log_file.sync_all()?;
         let log_diagnostics =
             daemon_log_diagnostics(&log_path).context("synthetic manifest log was unreadable")?;
+        let started_at = Utc::now();
+        let exited_at = if exited { Some(Utc::now()) } else { None };
+        let runtime_ms = exited_at.map(|exited_at| daemon_child_runtime_ms(started_at, exited_at));
         Ok(DaemonRuntimeManifestChild {
             role: role.to_string(),
             pid: Some(40_000 + index as u32),
+            started_at,
+            exited_at,
+            runtime_ms,
             redacted_argv: synthetic_child_redacted_argv(role),
             redacted_argv_sha256: synthetic_child_redacted_argv_sha256(role),
             log_path: Some(log_path),
