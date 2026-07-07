@@ -2428,8 +2428,20 @@ fn ensure_runtime_command_path_is_absolute(path: Option<&OsStr>) -> anyhow::Resu
             "Linux runtime command PATH entry `{}` must be an absolute directory",
             directory.display()
         );
+        anyhow::ensure!(
+            !path_has_special_component(&directory),
+            "Linux runtime command PATH entry `{}` must not contain '.' or '..' components",
+            directory.display()
+        );
     }
     Ok(())
+}
+
+fn path_has_special_component(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|component| matches!(component, "." | ".."))
 }
 
 fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
@@ -17769,6 +17781,26 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(relative_error
             .to_string()
             .contains("must be an absolute directory"));
+
+        let current_component_bin = base.join(".").join("bin");
+        let current_component_error =
+            match ensure_program_in_path("ip", Some(current_component_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful current-component PATH preflight"),
+                Err(error) => error,
+            };
+        assert!(current_component_error
+            .to_string()
+            .contains("must not contain '.' or '..' components"));
+
+        let parent_component_bin = base.join("..").join("bin");
+        let parent_component_error =
+            match ensure_program_in_path("ip", Some(parent_component_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful parent-component PATH preflight"),
+                Err(error) => error,
+            };
+        assert!(parent_component_error
+            .to_string()
+            .contains("must not contain '.' or '..' components"));
 
         let empty_path_error = match ensure_program_in_path("ip", Some(OsStr::new(":"))) {
             Ok(()) => anyhow::bail!("unexpected successful empty PATH command preflight"),
