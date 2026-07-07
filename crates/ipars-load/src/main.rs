@@ -51,6 +51,9 @@ const DAEMON_AGENT_STATE_FILE_SUFFIX: &str = ".state.json";
 const DAEMON_REDACTED_ARG: &str = "<redacted>";
 const MAX_DAEMON_REDACTED_ARG_BYTES: usize = 4096;
 const MAX_DAEMON_REDACTED_ARG_COUNT: usize = 256;
+const SANITIZED_DAEMON_CHILD_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_DAEMON_CHILD_LOCALE: &str = "C";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 const MAX_DAEMON_READINESS_TIMEOUT_SECONDS: u64 = 3_600;
@@ -4316,7 +4319,9 @@ fn spawn_iparsd(
     let stderr = log_file
         .try_clone()
         .with_context(|| format!("failed to clone iparsd {role} log for stderr"))?;
-    let child = Command::new(iparsd_bin)
+    let mut command = Command::new(iparsd_bin);
+    configure_daemon_child_process(&mut command);
+    let child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -4337,6 +4342,14 @@ fn spawn_iparsd(
         log_path: Some(log_path),
         last_exit: None,
     })
+}
+
+fn configure_daemon_child_process(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", SANITIZED_DAEMON_CHILD_PATH)
+        .env("LANG", SANITIZED_DAEMON_CHILD_LOCALE)
+        .env("LC_ALL", SANITIZED_DAEMON_CHILD_LOCALE);
 }
 
 fn kill_daemon_children(children: &mut [DaemonChild]) {
@@ -9381,12 +9394,52 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
     fn daemon_spawned_child_log_is_owner_only_and_sanitized() -> anyhow::Result<()> {
         let runtime_dir = synthetic_runtime_dir("private-log");
         std::fs::create_dir_all(&runtime_dir)?;
+        let env_status_path = runtime_dir.join("env.status");
+        let env_status_arg = env_status_path.display().to_string();
+        let shell_script = r#"
+if test "${PATH:-}" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" &&
+   test "${LANG:-}" = "C" &&
+   test "${LC_ALL:-}" = "C" &&
+   test -z "${HOME+x}" &&
+   test -z "${IPARS_ISSUER_PRIVATE_KEY+x}" &&
+   test -z "${IPARS_ISSUER_PRIVATE_KEY_PATH+x}" &&
+   test -z "${LD_PRELOAD+x}"; then
+    printf 'ok\n' > "$1"
+else
+    {
+        printf 'PATH=%s\n' "${PATH-<unset>}"
+        printf 'LANG=%s\n' "${LANG-<unset>}"
+        printf 'LC_ALL=%s\n' "${LC_ALL-<unset>}"
+        printf 'HOME=%s\n' "${HOME-<unset>}"
+        printf 'IPARS_ISSUER_PRIVATE_KEY=%s\n' "${IPARS_ISSUER_PRIVATE_KEY-<unset>}"
+        printf 'IPARS_ISSUER_PRIVATE_KEY_PATH=%s\n' "${IPARS_ISSUER_PRIVATE_KEY_PATH-<unset>}"
+        printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-<unset>}"
+    } > "$1"
+    exit 1
+fi
+"#;
         let mut child = spawn_iparsd(
             Path::new("sh"),
-            &["-c".to_string(), "sleep 30".to_string()],
+            &[
+                "-c".to_string(),
+                shell_script.to_string(),
+                "ipars-load-env".to_string(),
+                env_status_arg,
+            ],
             "agent/with spaces",
             &runtime_dir,
         )?;
+        let status = child
+            .child
+            .wait()
+            .context("failed to wait for sanitized daemon child")?;
+        let env_status = std::fs::read_to_string(&env_status_path)
+            .with_context(|| format!("failed to read {}", env_status_path.display()))?;
+        assert!(
+            status.success(),
+            "daemon child inherited unexpected environment:\n{env_status}"
+        );
+        assert_eq!(env_status.trim(), "ok");
         let log_path = child
             .log_path
             .clone()
@@ -9404,8 +9457,6 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             assert_eq!(mode, 0o600);
         }
 
-        let _ = child.child.kill();
-        let _ = child.child.wait();
         std::fs::remove_dir_all(&runtime_dir)?;
         Ok(())
     }

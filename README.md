@@ -99,7 +99,7 @@ invalid inputs. Daemon transport can spawn
 multiple control-plane processes against the same SQLite store, writes signed agent join tokens into
 post-write validated owner-only regular private runtime files using the selected scenario's
 relay/route-provider distribution for the launched agent prefix and all runtime control-plane
-bootstrap URLs, and passes
+bootstrap URLs, starts child `iparsd` processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored, and passes
 `--join-token-path` so token material is not exposed through child process argv, then scrubs those
 token files after agent readiness and agent state files after child shutdown. Daemon transport
 revalidates each scrubbed secret path as a runtime-local regular non-symlink file with the expected
