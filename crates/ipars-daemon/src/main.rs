@@ -2427,16 +2427,54 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
     let parent_metadata = parent
         .metadata()
         .with_context(|| format!("failed to inspect parent directory {}", parent.display()))?;
+    ensure_runtime_parent_directory_safe(label, parent, &parent_metadata, true)?;
+    let mut ancestor = parent.parent();
+    while let Some(directory) = ancestor {
+        let metadata = directory.metadata().with_context(|| {
+            format!(
+                "failed to inspect ancestor directory {}",
+                directory.display()
+            )
+        })?;
+        ensure_runtime_parent_directory_safe(label, directory, &metadata, false)?;
+        ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_runtime_parent_directory_safe(
+    label: &str,
+    directory: &Path,
+    metadata: &std::fs::Metadata,
+    immediate_parent: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let relationship = if immediate_parent {
+        "parent"
+    } else {
+        "ancestor"
+    };
     anyhow::ensure!(
-        parent_metadata.is_dir(),
-        "{label} parent {} must be a directory",
-        parent.display()
+        metadata.is_dir(),
+        "{label} {relationship} {} must be a directory",
+        directory.display()
     );
-    anyhow::ensure!(
-        parent_metadata.permissions().mode() & 0o022 == 0,
-        "{label} parent {} must not be group- or world-writable",
-        parent.display()
-    );
+    let mode = metadata.permissions().mode();
+    if immediate_parent {
+        anyhow::ensure!(
+            mode & 0o022 == 0,
+            "{label} parent {} must not be group- or world-writable",
+            directory.display()
+        );
+    } else {
+        anyhow::ensure!(
+            mode & 0o022 == 0 || mode & 0o1000 != 0,
+            "{label} ancestor {} must not be group- or world-writable unless it has the sticky bit",
+            directory.display()
+        );
+    }
     Ok(())
 }
 
@@ -16982,6 +17020,28 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .to_string()
             .contains("must not be group- or world-writable"));
 
+        let writable_ancestor_bin = base.join("writable-ancestor-bin");
+        std::fs::create_dir(&writable_ancestor_bin)?;
+        std::fs::set_permissions(
+            &writable_ancestor_bin,
+            std::fs::Permissions::from_mode(0o777),
+        )?;
+        let nested_bin = writable_ancestor_bin.join("bin");
+        std::fs::create_dir(&nested_bin)?;
+        std::fs::set_permissions(&nested_bin, std::fs::Permissions::from_mode(0o755))?;
+        let nested_command = nested_bin.join("ip");
+        std::fs::write(&nested_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&nested_command, std::fs::Permissions::from_mode(0o755))?;
+        let writable_ancestor_error =
+            match ensure_program_in_path("ip", Some(nested_bin.as_os_str())) {
+                Ok(()) => anyhow::bail!("unexpected successful writable ancestor preflight"),
+                Err(error) => error,
+            };
+        assert!(writable_ancestor_error.to_string().contains("ancestor"));
+        assert!(writable_ancestor_error
+            .to_string()
+            .contains("must not be group- or world-writable"));
+
         let relative_bin = PathBuf::from("relative-bin");
         let relative_error = match ensure_program_in_path("ip", Some(relative_bin.as_os_str())) {
             Ok(()) => anyhow::bail!("unexpected successful relative PATH command preflight"),
@@ -17020,6 +17080,30 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(userspace_error
             .to_string()
             .contains("expected an executable regular file"));
+
+        let userspace_ancestor = base.join("userspace-writable-ancestor");
+        std::fs::create_dir(&userspace_ancestor)?;
+        std::fs::set_permissions(&userspace_ancestor, std::fs::Permissions::from_mode(0o777))?;
+        let userspace_bin = userspace_ancestor.join("bin");
+        std::fs::create_dir(&userspace_bin)?;
+        std::fs::set_permissions(&userspace_bin, std::fs::Permissions::from_mode(0o755))?;
+        let userspace_command = userspace_bin.join("wireguard-go");
+        std::fs::write(&userspace_command, b"#!/bin/sh\n")?;
+        std::fs::set_permissions(&userspace_command, std::fs::Permissions::from_mode(0o755))?;
+        let userspace_ancestor_command = userspace_command.display().to_string();
+        let userspace_ancestor_error = match ensure_runtime_program_ready(
+            userspace_ancestor_command.as_str(),
+            Some(OsStr::new("")),
+        ) {
+            Ok(()) => {
+                anyhow::bail!("unexpected successful writable ancestor userspace preflight")
+            }
+            Err(error) => error,
+        };
+        assert!(userspace_ancestor_error
+            .to_string()
+            .contains("configured userspace WireGuard command"));
+        assert!(userspace_ancestor_error.to_string().contains("ancestor"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
