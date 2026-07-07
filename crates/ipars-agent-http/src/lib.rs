@@ -17,7 +17,9 @@ use ipars_types::api::{
     RotateWireGuardKeyResponse,
 };
 use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -132,7 +134,13 @@ async fn send_wireguard_key_rotation_to_control_planes(
         let url = wireguard_key_rotation_url(control_plane_url, &request.node_id);
         match client.put(&url).json(&request).send().await {
             Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json().await {
+                Ok(response) => match read_bounded_json_response(
+                    response,
+                    MAX_CONTROL_PLANE_RESPONSE_BYTES,
+                    "control-plane WireGuard key rotation",
+                )
+                .await
+                {
                     Ok(response) => return Ok(response),
                     Err(error) => failures.push(format!("{url}: decode failed: {error}")),
                 },
@@ -145,6 +153,39 @@ async fn send_wireguard_key_rotation_to_control_planes(
         "all control-plane WireGuard key rotation endpoints failed: {}",
         failures.join("; ")
     )))
+}
+
+async fn read_bounded_json_response<T>(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<T, AgentError>
+where
+    T: DeserializeOwned,
+{
+    if let Some(length) = response.content_length() {
+        ensure_http_response_size(length, max_bytes, context)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        AgentError::ControlPlaneClient(format!("failed to read {context} response: {error}"))
+    })? {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        ensure_http_response_size(next_len, max_bytes, context)?;
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        AgentError::ControlPlaneClient(format!("failed to decode {context} response: {error}"))
+    })
+}
+
+fn ensure_http_response_size(size: u64, max_bytes: u64, context: &str) -> Result<(), AgentError> {
+    if size > max_bytes {
+        return Err(AgentError::ControlPlaneClient(format!(
+            "{context} response exceeds maximum size of {max_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn wireguard_key_rotation_url(control_plane_url: &str, node_id: &NodeId) -> String {
@@ -1185,6 +1226,86 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         Ok((format!("http://{addr}"), task))
+    }
+
+    async fn spawn_raw_http_response(
+        response: String,
+    ) -> Result<(String, tokio::task::JoinHandle<std::io::Result<()>>), Box<dyn std::error::Error>>
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    #[tokio::test]
+    async fn wireguard_key_rotation_client_rejects_oversized_control_plane_response(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_CONTROL_PLANE_RESPONSE_BYTES + 1
+        );
+        let (control_plane_url, server) = spawn_raw_http_response(response).await?;
+        let request = RotateWireGuardKeyRequest {
+            node_id: NodeId::from_string("node-a"),
+            previous_wireguard_public_key: "previous".to_string(),
+            next_wireguard_public_key: "next".to_string(),
+            node_signature: None,
+        };
+
+        let error = send_wireguard_key_rotation_to_control_planes(
+            &reqwest::Client::new(),
+            &[control_plane_url],
+            request,
+        )
+        .await
+        .expect_err("oversized WireGuard key rotation response should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("control-plane WireGuard key rotation response exceeds maximum size"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_control_plane_json_reader_rejects_oversized_chunked_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n{\"ok\"\r\n5\r\n:true\r\n1\r\n}\r\n0\r\n\r\n"
+            .to_string();
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let error = read_bounded_json_response::<serde_json::Value>(
+            response,
+            10,
+            "test control-plane JSON",
+        )
+        .await
+        .expect_err("oversized chunked control-plane body should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("test control-plane JSON response exceeds maximum size of 10 bytes"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        Ok(())
     }
 
     #[tokio::test]
