@@ -2216,6 +2216,10 @@ fn validate_docker_network_name(name: &str) -> anyhow::Result<()> {
     validate_docker_network_token(name, "Docker network name")
 }
 
+fn validate_docker_network_id(id: &str) -> anyhow::Result<()> {
+    validate_docker_network_token(id, "Docker network ID")
+}
+
 fn validate_docker_network_token(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{label} cannot be empty");
@@ -7109,6 +7113,7 @@ fn docker_discovered_routes(
     filters: &[String],
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
     let mut network_names = BTreeSet::new();
+    let mut network_ids = BTreeSet::new();
     let mut cidrs = Vec::<ipnet::IpNet>::new();
     let requested_filters = filters.iter().cloned().collect::<BTreeSet<_>>();
     let mut matched_filters = BTreeSet::new();
@@ -7133,7 +7138,20 @@ fn docker_discovered_routes(
         if !docker_network_matches(network, filters) {
             continue;
         }
+        validate_docker_network_id(&network.id)?;
         validate_docker_network_name(&network.name)?;
+        if !network_ids.insert(network.id.as_str()) {
+            anyhow::bail!(
+                "Docker network discovery returned duplicate network ID `{}`",
+                network.id
+            );
+        }
+        if network_names.contains(&network.name) {
+            anyhow::bail!(
+                "Docker network discovery returned duplicate network name `{}`",
+                network.name
+            );
+        }
         let mut found_subnet = false;
         for config in &network.ipam.config {
             let Some(subnet) = config.subnet.as_deref() else {
@@ -21347,6 +21365,61 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
 
         assert!(error.to_string().contains("Docker network name"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_invalid_or_duplicate_network_ids() -> anyhow::Result<()> {
+        let invalid_id = vec![docker_api_network(
+            "default/id",
+            "compose_default",
+            "bridge",
+            &["172.18.0.0/16"],
+        )];
+        let error = match docker_discovered_routes(&invalid_id, &[]) {
+            Ok(_) => anyhow::bail!("invalid Docker API network ID should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Docker network ID"));
+
+        let duplicate_ids = vec![
+            docker_api_network(
+                "duplicate-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network(
+                "duplicate-id",
+                "compose_extra",
+                "bridge",
+                &["172.19.0.0/16"],
+            ),
+        ];
+        let error = match docker_discovered_routes(&duplicate_ids, &[]) {
+            Ok(_) => anyhow::bail!("duplicate Docker API network IDs should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate network ID `duplicate-id`"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_duplicate_network_names() -> anyhow::Result<()> {
+        let networks = vec![
+            docker_api_network(
+                "default-id",
+                "compose_default",
+                "bridge",
+                &["172.18.0.0/16"],
+            ),
+            docker_api_network("extra-id", "compose_default", "bridge", &["172.19.0.0/16"]),
+        ];
+        let error = match docker_discovered_routes(&networks, &[]) {
+            Ok(_) => anyhow::bail!("duplicate Docker API network names should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate network name `compose_default`"));
         Ok(())
     }
 
