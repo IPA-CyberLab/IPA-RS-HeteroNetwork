@@ -323,6 +323,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
+    assert_compose_agent_lazy_connect_paths(&compose, &agent_nodes, &api_ports)?;
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
@@ -457,6 +458,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
+      - --signal-path-interval-seconds
+      - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
     healthcheck:
@@ -492,6 +495,8 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - dry-run
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
+      - "1"
+      - --signal-path-interval-seconds
       - "1"
       - --stun-server
       - 127.0.0.1:{stun_port}
@@ -820,6 +825,89 @@ fn assert_compose_agent_peer_map(
     Ok(())
 }
 
+fn assert_compose_agent_lazy_connect_paths(
+    compose: &ComposeProject,
+    nodes: &ComposeAgentNodes,
+    ports: &ComposeApiPorts,
+) -> Result<()> {
+    assert_compose_agent_peer_activity(compose, "agent", ports.agent, &nodes.agent_b)?;
+    assert_compose_agent_peer_activity(compose, "agent-b", ports.agent_b, &nodes.agent)?;
+    assert_compose_agent_path(compose, "agent", ports.agent, &nodes.agent, &nodes.agent_b)?;
+    assert_compose_agent_path(
+        compose,
+        "agent-b",
+        ports.agent_b,
+        &nodes.agent_b,
+        &nodes.agent,
+    )?;
+    Ok(())
+}
+
+fn assert_compose_agent_peer_activity(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    peer: &str,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "peer": peer,
+        "pin": true,
+    })
+    .to_string();
+    let response = compose_exec_post_json(
+        compose,
+        service,
+        &format!("http://127.0.0.1:{port}/v1/peer-activity"),
+        &body,
+    )?;
+    ensure_json_string_equals(&response, "peer", peer)?;
+    ensure_json_bool_equals(&response, "pinned", true)?;
+    Ok(())
+}
+
+fn assert_compose_agent_path(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+    local: &str,
+    remote: &str,
+) -> Result<()> {
+    wait_for_json(
+        compose,
+        &format!("{service} lazy-connect path metrics"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/metrics"),
+        |value| {
+            ensure_json_u64_at_least(value, "path_count", 1)?;
+            Ok(())
+        },
+    )?;
+    wait_for_json(
+        compose,
+        &format!("{service} lazy-connect paths"),
+        service,
+        &format!("http://127.0.0.1:{port}/v1/paths"),
+        |value| ensure_agent_paths_contain(value, local, remote),
+    )?;
+    Ok(())
+}
+
+fn ensure_agent_paths_contain(value: &Value, local: &str, remote: &str) -> Result<()> {
+    let paths = value
+        .get("paths")
+        .and_then(Value::as_array)
+        .context("agent paths response missing paths array")?;
+    for path in paths {
+        let path_local = json_string_required_at(path, &["key", "local"])?;
+        let path_remote = json_string_required_at(path, &["key", "remote"])?;
+        if path_local == local && path_remote == remote {
+            ensure_json_string_nonempty(path, "selected_state")?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("agent paths did not include path {local}->{remote}: {value}")
+}
+
 fn ensure_peer_map_contains(value: &Value, expected_node_id: &str) -> Result<()> {
     let peers = value
         .get("peers")
@@ -1061,6 +1149,44 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
     })
 }
 
+fn compose_exec_post_json(
+    compose: &ComposeProject,
+    service: &str,
+    url: &str,
+    body: &str,
+) -> Result<Value> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "-fsS",
+        "--max-time",
+        "5",
+        "-H",
+        "Accept: application/json",
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        body,
+        url,
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run docker compose exec {service} curl POST {url}"))?;
+    ensure_success(
+        &format!("docker compose exec {service} curl POST {url}"),
+        &output,
+    )?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse JSON from docker compose exec {service} curl POST {url}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
 fn compose_exec_http_status(
     compose: &ComposeProject,
     service: &str,
@@ -1253,6 +1379,14 @@ fn json_string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
 
 fn json_string_required(value: &Value, field: &str) -> Result<String> {
     json_string_field(value, &[field])
+        .map(ToString::to_string)
+        .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))
+}
+
+fn json_string_required_at(value: &Value, path: &[&str]) -> Result<String> {
+    let field = path.join(".");
+    json_value_at(value, path)
+        .and_then(Value::as_str)
         .map(ToString::to_string)
         .with_context(|| format!("JSON field {field} was missing or not a string: {value}"))
 }
