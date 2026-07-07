@@ -39,8 +39,19 @@ assert_rendered_contains() {
   local name="$1"
   local expected="$2"
   local rendered="/tmp/ipars-helm-${name}.yaml"
-  if ! grep -Fq "$expected" "$rendered"; then
+  if ! grep -Fq -- "$expected" "$rendered"; then
     echo "Helm template output for ${name} did not include expected content: ${expected}" >&2
+    cat "$rendered" >&2
+    exit 1
+  fi
+}
+
+assert_rendered_absent() {
+  local name="$1"
+  local unexpected="$2"
+  local rendered="/tmp/ipars-helm-${name}.yaml"
+  if grep -Fq -- "$unexpected" "$rendered"; then
+    echo "Helm template output for ${name} unexpectedly included content: ${unexpected}" >&2
     cat "$rendered" >&2
     exit 1
   fi
@@ -104,6 +115,23 @@ template_ok route-disabled \
   --set serviceExposure.enabled=false \
   --set serviceExposure.discoverApiServer=false \
   --set 'serviceExposure.serviceCidrs={}'
+
+template_ok namespaced-service-discovery-rbac \
+  --set serviceExposure.discoverServices=true \
+  --set serviceExposure.discoverApiServer=false \
+  --set-string 'serviceExposure.namespaces[0]=default' \
+  --set-string 'serviceExposure.namespaces[1]=platform' \
+  --set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true
+
+assert_rendered_contains namespaced-service-discovery-rbac "kind: Role"
+assert_rendered_contains namespaced-service-discovery-rbac "kind: RoleBinding"
+assert_rendered_contains namespaced-service-discovery-rbac "namespace: default"
+assert_rendered_contains namespaced-service-discovery-rbac "namespace: platform"
+assert_rendered_contains namespaced-service-discovery-rbac "- --kubernetes-discover-services"
+assert_rendered_contains namespaced-service-discovery-rbac "- --kubernetes-namespace"
+assert_rendered_contains namespaced-service-discovery-rbac "- --kubernetes-service-label-selector"
+assert_rendered_absent namespaced-service-discovery-rbac "kind: ClusterRole"
+assert_rendered_absent namespaced-service-discovery-rbac "kind: ClusterRoleBinding"
 
 template_ok relay-forwarder-netns \
   --set agent.securityContext.capabilities.add[0]=NET_ADMIN \
