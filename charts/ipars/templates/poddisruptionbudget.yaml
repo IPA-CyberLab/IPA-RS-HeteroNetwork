@@ -19,11 +19,13 @@ kind: PodDisruptionBudget
 metadata:
   name: {{ include "ipars.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   {{- if ne $pdbMinAvailable "" }}
   minAvailable: {{- if regexMatch "%$" $pdbMinAvailable }} {{ $pdbMinAvailable | quote }}{{- else }} {{ int $pdbMinAvailable }}{{- end }}
   {{- end }}

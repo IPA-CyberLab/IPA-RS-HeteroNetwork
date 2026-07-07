@@ -4,9 +4,14 @@
 
 {{- define "ipars.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- .Values.fullnameOverride | trunc 53 | trimSuffix "-" -}}
 {{- else -}}
-{{- include "ipars.name" . -}}
+{{- $name := include "ipars.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 53 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 53 | trimSuffix "-" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

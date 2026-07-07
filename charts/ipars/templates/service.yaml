@@ -536,7 +536,8 @@ kind: Service
 metadata:
   name: {{ include "ipars.fullname" . }}-agent
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: agent
   {{- with .Values.agent.apiService.annotations }}
   annotations:
@@ -599,7 +600,8 @@ spec:
       timeoutSeconds: {{ $agentApiSessionAffinityTimeoutSeconds }}
   {{- end }}
   selector:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
   ports:
     - name: http
       protocol: TCP
@@ -619,7 +621,8 @@ kind: Service
 metadata:
   name: {{ include "ipars.fullname" . }}-relay
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: relay
   {{- with .Values.agent.relayService.annotations }}
   annotations:
@@ -682,7 +685,8 @@ spec:
       timeoutSeconds: {{ $relaySessionAffinityTimeoutSeconds }}
   {{- end }}
   selector:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
   ports:
     - name: relay-udp
       protocol: UDP

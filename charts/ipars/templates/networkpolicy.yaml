@@ -58,12 +58,14 @@ kind: NetworkPolicy
 metadata:
   name: {{ include "ipars.fullname" . }}-agent-api
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: agent
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress
   ingress:
@@ -94,12 +96,14 @@ kind: NetworkPolicy
 metadata:
   name: {{ include "ipars.fullname" . }}-relay
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: relay
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress
   ingress:

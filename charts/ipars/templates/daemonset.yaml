@@ -489,7 +489,8 @@ kind: DaemonSet
 metadata:
   name: {{ include "ipars.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . }}
+    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
 spec:
   {{- if ne $agentMinReadySeconds "" }}
   minReadySeconds: {{ int $agentMinReadySeconds }}
@@ -512,11 +513,13 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . }}
+      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "ipars.name" . }}
+        app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
         {{- range $key, $value := .Values.agent.podLabels }}
         {{ $key }}: {{ $value | quote }}
         {{- end }}

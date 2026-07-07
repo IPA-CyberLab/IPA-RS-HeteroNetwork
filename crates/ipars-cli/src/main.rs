@@ -8793,7 +8793,41 @@ mod tests {
         assert!(helpers.contains("must be a DNS label of at most %d bytes"));
         assert!(helpers.contains("\"maxBytes\" 53"));
         assert!(helpers.contains("\"maxBytes\" 63"));
+        assert!(helpers.contains("contains $name .Release.Name"));
+        assert!(helpers.contains("printf \"%s-%s\" .Release.Name $name"));
+        assert!(helpers.contains(".Values.fullnameOverride | trunc 53"));
         assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_chart_scopes_release_instance_labels_and_selectors() -> anyhow::Result<()> {
+        let templates_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/ipars/templates")
+            .canonicalize()?;
+        let service_account = std::fs::read_to_string(templates_path.join("serviceaccount.yaml"))?;
+        let rbac = std::fs::read_to_string(templates_path.join("rbac.yaml"))?;
+        let daemonset = std::fs::read_to_string(templates_path.join("daemonset.yaml"))?;
+        let service_template = std::fs::read_to_string(templates_path.join("service.yaml"))?;
+        let network_policy_template =
+            std::fs::read_to_string(templates_path.join("networkpolicy.yaml"))?;
+        let pdb = std::fs::read_to_string(templates_path.join("poddisruptionbudget.yaml"))?;
+        let instance_label = "app.kubernetes.io/instance: {{ .Release.Name | quote }}";
+        let rbac_instance_label = "app.kubernetes.io/instance: {{ $root.Release.Name | quote }}";
+
+        assert!(service_account.contains(instance_label));
+        assert!(rbac.matches(rbac_instance_label).count() >= 4);
+        assert!(daemonset.matches(instance_label).count() >= 3);
+        assert!(service_template.matches(instance_label).count() >= 4);
+        assert!(network_policy_template.matches(instance_label).count() >= 4);
+        assert!(pdb.matches(instance_label).count() >= 2);
+        assert!(daemonset.contains("name: {{ include \"ipars.fullname\" . }}"));
+        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-agent"));
+        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
+        assert!(
+            network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-agent-api")
+        );
+        assert!(network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
         Ok(())
     }
 

@@ -19,6 +19,13 @@ template_ok() {
   helm_cmd template ipars /work/charts/ipars "$@" >/tmp/"ipars-helm-${name}.yaml"
 }
 
+template_release_ok() {
+  local name="$1"
+  local release="$2"
+  shift 2
+  helm_cmd template "$release" /work/charts/ipars "$@" >/tmp/"ipars-helm-${name}.yaml"
+}
+
 template_fails() {
   local name="$1"
   local expected="$2"
@@ -60,6 +67,22 @@ assert_rendered_absent() {
 helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
+
+template_release_ok release-scoping edge \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.podDisruptionBudget.enabled=true \
+  --set agent.podDisruptionBudget.maxUnavailable=1 \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.acknowledgeHostNetwork=true \
+  --set networkPolicy.agentApi.enabled=true \
+  --set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'
+
+assert_rendered_contains release-scoping "name: edge-ipars"
+assert_rendered_contains release-scoping "name: edge-ipars-agent"
+assert_rendered_contains release-scoping "name: edge-ipars-agent-api"
+assert_rendered_contains release-scoping 'app.kubernetes.io/instance: "edge"'
+assert_rendered_absent release-scoping "name: ipars-agent"
 
 template_ok agent-api \
   --set agent.apiService.enabled=true \
