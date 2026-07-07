@@ -172,12 +172,20 @@
 {{- end -}}
 {{- if and .Values.agent.apiService.enabled (ne $agentApiLoadBalancerIP "") -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.loadBalancerIP" "value" $agentApiLoadBalancerIP) -}}
+{{- $agentApiLoadBalancerIPFamily := ternary "IPv6" "IPv4" (contains ":" $agentApiLoadBalancerIP) -}}
+{{- if and $agentApiIpFamilies (not (has $agentApiLoadBalancerIPFamily $agentApiIpFamilies)) -}}
+{{- fail (printf "agent.apiService.loadBalancerIP family %s must be included in agent.apiService.ipFamilies" $agentApiLoadBalancerIPFamily) -}}
+{{- end -}}
 {{- $_ := set $agentApiFixedExternalIPSet $agentApiLoadBalancerIP "agent.apiService.loadBalancerIP" -}}
 {{- end -}}
 {{- if .Values.agent.apiService.enabled -}}
 {{- range $ip := $agentApiExternalIPs -}}
 {{- $ipValue := printf "%v" $ip -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.apiService.externalIPs" "value" $ipValue) -}}
+{{- $ipFamily := ternary "IPv6" "IPv4" (contains ":" $ipValue) -}}
+{{- if and $agentApiIpFamilies (not (has $ipFamily $agentApiIpFamilies)) -}}
+{{- fail (printf "agent.apiService.externalIPs entry %q family %s must be included in agent.apiService.ipFamilies" $ipValue $ipFamily) -}}
+{{- end -}}
 {{- if hasKey $agentApiFixedExternalIPSet $ipValue -}}
 {{- fail (printf "agent.apiService.externalIPs entry %q must not reuse fixed external IP assigned by %s" $ipValue (index $agentApiFixedExternalIPSet $ipValue)) -}}
 {{- end -}}
@@ -331,6 +339,10 @@
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayLoadBalancerIP "") -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.loadBalancerIP" "value" $relayLoadBalancerIP) -}}
+{{- $relayLoadBalancerIPFamily := ternary "IPv6" "IPv4" (contains ":" $relayLoadBalancerIP) -}}
+{{- if and $relayIpFamilies (not (has $relayLoadBalancerIPFamily $relayIpFamilies)) -}}
+{{- fail (printf "agent.relayService.loadBalancerIP family %s must be included in agent.relayService.ipFamilies" $relayLoadBalancerIPFamily) -}}
+{{- end -}}
 {{- if hasKey $agentApiFixedExternalIPSet $relayLoadBalancerIP -}}
 {{- fail (printf "agent.relayService.loadBalancerIP %q must not reuse fixed external IP assigned by %s" $relayLoadBalancerIP (index $agentApiFixedExternalIPSet $relayLoadBalancerIP)) -}}
 {{- end -}}
@@ -341,6 +353,10 @@
 {{- range $ip := $relayExternalIPs -}}
 {{- $ipValue := printf "%v" $ip -}}
 {{- include "ipars.validateExternalServiceIPAddress" (dict "path" "agent.relayService.externalIPs" "value" $ipValue) -}}
+{{- $ipFamily := ternary "IPv6" "IPv4" (contains ":" $ipValue) -}}
+{{- if and $relayIpFamilies (not (has $ipFamily $relayIpFamilies)) -}}
+{{- fail (printf "agent.relayService.externalIPs entry %q family %s must be included in agent.relayService.ipFamilies" $ipValue $ipFamily) -}}
+{{- end -}}
 {{- if hasKey $relayFixedExternalIPSet $ipValue -}}
 {{- fail (printf "agent.relayService.externalIPs entry %q must not reuse fixed external IP assigned by %s" $ipValue (index $relayFixedExternalIPSet $ipValue)) -}}
 {{- end -}}

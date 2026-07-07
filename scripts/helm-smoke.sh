@@ -307,6 +307,26 @@ template_fails relay-external-ip-reuses-agent-api-external-ip \
   --set agent.relayService.exposureAcknowledged=true \
   --set-string 'agent.relayService.externalIPs[0]=198.51.100.22'
 
+template_fails agent-api-load-balancer-ip-family-mismatch \
+  "agent.apiService.loadBalancerIP family IPv6 must be included in agent.apiService.ipFamilies" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string agent.apiService.loadBalancerIP=2001:db8::20 \
+  --set-string 'agent.apiService.ipFamilies[0]=IPv4'
+
+template_fails relay-external-ip-family-mismatch \
+  "agent.relayService.externalIPs entry \"203.0.113.23\" family IPv4 must be included in agent.relayService.ipFamilies" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=ClusterIP \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set-string 'agent.relayService.externalIPs[0]=203.0.113.23' \
+  --set-string 'agent.relayService.ipFamilies[0]=IPv6'
+
 template_fails host-network-policy-without-ack \
   "networkPolicy with agent.hostNetwork=true requires networkPolicy.acknowledgeHostNetwork=true" \
   --set agent.apiService.enabled=true \

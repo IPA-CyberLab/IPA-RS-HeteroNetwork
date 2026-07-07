@@ -4686,6 +4686,51 @@ fn validate_kubernetes_external_service_ips(flag: &str, ips: &[IpAddr]) -> anyho
     Ok(())
 }
 
+fn validate_kubernetes_service_ip_family_member(
+    flag: &str,
+    ip: IpAddr,
+    service_flag_prefix: &str,
+    families: &[String],
+) -> anyhow::Result<()> {
+    if families.is_empty() {
+        return Ok(());
+    }
+    let ip_family = kubernetes_ip_family(ip);
+    if !families.iter().any(|family| family == ip_family) {
+        anyhow::bail!(
+            "{flag} address {ip} family {ip_family} must be included in --{service_flag_prefix}-ip-family values"
+        );
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_external_service_ip_families(
+    service_flag_prefix: &str,
+    load_balancer_flag: &str,
+    load_balancer_ip: Option<IpAddr>,
+    external_ip_flag: &str,
+    external_ips: &[IpAddr],
+    families: &[String],
+) -> anyhow::Result<()> {
+    if let Some(ip) = load_balancer_ip {
+        validate_kubernetes_service_ip_family_member(
+            load_balancer_flag,
+            ip,
+            service_flag_prefix,
+            families,
+        )?;
+    }
+    for &ip in external_ips {
+        validate_kubernetes_service_ip_family_member(
+            external_ip_flag,
+            ip,
+            service_flag_prefix,
+            families,
+        )?;
+    }
+    Ok(())
+}
+
 fn record_kubernetes_external_service_ip(
     assigned: &mut BTreeMap<IpAddr, &'static str>,
     flag: &'static str,
@@ -5489,6 +5534,22 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
         &args.agent_api_external_ips,
     )?;
     validate_kubernetes_external_service_ips("--relay-external-ip", &args.relay_external_ips)?;
+    validate_kubernetes_external_service_ip_families(
+        "agent-api",
+        "--agent-api-load-balancer-ip",
+        args.agent_api_load_balancer_ip,
+        "--agent-api-external-ip",
+        &args.agent_api_external_ips,
+        &args.agent_api_ip_families,
+    )?;
+    validate_kubernetes_external_service_ip_families(
+        "relay",
+        "--relay-load-balancer-ip",
+        args.relay_load_balancer_ip,
+        "--relay-external-ip",
+        &args.relay_external_ips,
+        &args.relay_ip_families,
+    )?;
     validate_kubernetes_external_service_ip_disjoint(
         args.agent_api_load_balancer_ip,
         &args.agent_api_external_ips,
@@ -9508,6 +9569,18 @@ mod tests {
         assert!(service_template.contains(
             "agent.relayService.externalIPs entry %q must not reuse fixed external IP assigned by %s"
         ));
+        assert!(service_template.contains(
+            "agent.apiService.loadBalancerIP family %s must be included in agent.apiService.ipFamilies"
+        ));
+        assert!(service_template.contains(
+            "agent.apiService.externalIPs entry %q family %s must be included in agent.apiService.ipFamilies"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.loadBalancerIP family %s must be included in agent.relayService.ipFamilies"
+        ));
+        assert!(service_template.contains(
+            "agent.relayService.externalIPs entry %q family %s must be included in agent.relayService.ipFamilies"
+        ));
         assert!(
             service_template.contains("agent.apiService.externalIPs entry %q must not be repeated")
         );
@@ -11736,6 +11809,40 @@ mod tests {
         };
         assert!(error.contains(
             "--relay-external-ip must not reuse external Service IP address 198.51.100.22 already assigned by --agent-api-load-balancer-ip"
+        ));
+
+        let mut agent_load_balancer_ip_family_mismatch = base_k8s_install_args();
+        agent_load_balancer_ip_family_mismatch.expose_agent_api = true;
+        agent_load_balancer_ip_family_mismatch.allow_public_service_exposure = true;
+        agent_load_balancer_ip_family_mismatch.allow_unrestricted_load_balancer = true;
+        agent_load_balancer_ip_family_mismatch.agent_api_service_type = "LoadBalancer".to_string();
+        agent_load_balancer_ip_family_mismatch.agent_api_ip_families = vec!["IPv4".to_string()];
+        agent_load_balancer_ip_family_mismatch.agent_api_load_balancer_ip =
+            Some("2001:db8::23".parse()?);
+        let error = match k8s_install_plan(agent_load_balancer_ip_family_mismatch) {
+            Ok(_) => panic!("agent loadBalancerIP should match configured ipFamilies"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-load-balancer-ip address 2001:db8::23 family IPv6 must be included in --agent-api-ip-family values"
+        ));
+
+        let mut relay_external_ip_family_mismatch = base_k8s_install_args();
+        relay_external_ip_family_mismatch.expose_relay = true;
+        relay_external_ip_family_mismatch.allow_public_service_exposure = true;
+        relay_external_ip_family_mismatch.relay_service_type = "ClusterIP".to_string();
+        relay_external_ip_family_mismatch.relay_ip_families = vec!["IPv6".to_string()];
+        relay_external_ip_family_mismatch.relay_external_ips = vec!["203.0.113.23".parse()?];
+        relay_external_ip_family_mismatch.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_external_ip_family_mismatch.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(relay_external_ip_family_mismatch) {
+            Ok(_) => panic!("relay externalIPs should match configured ipFamilies"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-external-ip address 203.0.113.23 family IPv4 must be included in --relay-ip-family values"
         ));
 
         let parsed = Cli::try_parse_from([
