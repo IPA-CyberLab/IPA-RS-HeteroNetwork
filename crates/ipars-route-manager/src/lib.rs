@@ -314,6 +314,50 @@ fn open_current_thread_netns() -> io::Result<File> {
     })
 }
 
+pub fn warn_if_linux_netns_is_current(namespace: &LinuxNetworkNamespace, placement: &'static str) {
+    let path = namespace.path();
+    match linux_netns_path_matches_current(&path) {
+        Ok(true) => {
+            tracing::warn!(
+                namespace = namespace.name(),
+                placement,
+                path = %path.display(),
+                "configured linux network namespace resolves to the current process namespace"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                namespace = namespace.name(),
+                placement,
+                path = %path.display(),
+                "failed to compare configured linux network namespace with the current process namespace"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn linux_netns_path_matches_current(path: &Path) -> io::Result<bool> {
+    let current_namespace = open_current_thread_netns()?;
+    let target_namespace = File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open linux network namespace at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    same_file_identity(&current_namespace, &target_namespace)
+}
+
+#[cfg(not(unix))]
+fn linux_netns_path_matches_current(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(unix)]
 fn warn_if_target_netns_is_current(
     namespace: &LinuxNetworkNamespace,
@@ -438,6 +482,13 @@ fn same_file_metadata_identity(left: &std::fs::Metadata, right: &std::fs::Metada
     use std::os::unix::fs::MetadataExt;
 
     left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &File, right: &File) -> io::Result<bool> {
+    let left_metadata = left.metadata()?;
+    let right_metadata = right.metadata()?;
+    Ok(same_file_metadata_identity(&left_metadata, &right_metadata))
 }
 
 fn netlink_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> String {
@@ -1177,6 +1228,7 @@ where
     R: LinuxRouteCommandRunner,
 {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
+        warn_if_linux_netns_is_current(&self.namespace, "route command runner");
         self.inner.run(command.in_namespace(&self.namespace)).await
     }
 }
@@ -2100,6 +2152,19 @@ mod tests {
             &target_metadata,
             &other_metadata
         ));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn netns_current_match_treats_distinct_file_as_other_namespace(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = route_manager_test_dir("netns-path-current-match")?;
+        let path = base.join("node-a");
+        std::fs::write(&path, b"netns")?;
+
+        assert!(!linux_netns_path_matches_current(&path)?);
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }

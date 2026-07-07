@@ -15,8 +15,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_route_manager::{
-    with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
-    RouteManagerError, RoutePlan,
+    warn_if_linux_netns_is_current, with_netlink_namespace, LinuxNetlinkSocket,
+    LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan,
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
@@ -2462,6 +2462,7 @@ where
     R: LinuxCommandRunner,
 {
     async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
+        warn_if_linux_netns_is_current(&self.namespace, "agent command runner");
         self.inner.run(command.in_namespace(&self.namespace)).await
     }
 }
