@@ -57,6 +57,8 @@ const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const MAX_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const SANITIZED_SYSTEM_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_SYSTEM_COMMAND_LOCALE: &str = "C";
 const MAX_LINUX_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_COMMAND_ARG_BYTES: usize = 128 * 1024;
@@ -2389,6 +2391,10 @@ async fn collect_bounded_command_output(
     let mut child_command = Command::new(&command.program);
     child_command
         .args(&command.args)
+        .env_clear()
+        .env("PATH", SANITIZED_SYSTEM_COMMAND_PATH)
+        .env("LANG", SANITIZED_SYSTEM_COMMAND_LOCALE)
+        .env("LC_ALL", SANITIZED_SYSTEM_COMMAND_LOCALE)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -3738,6 +3744,18 @@ mod tests {
         };
 
         assert!(error.to_string().contains("wireguard-failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_uses_sanitized_environment() {
+        let runner = TimedSystemCommandRunner::new(Duration::from_secs(1));
+        let script = r#"test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" && test "${LANG:-}" = "C" && test "${LC_ALL:-}" = "C" && test -z "${HOME+x}" && test -z "${LD_PRELOAD+x}""#;
+
+        match runner.run(LinuxCommand::new("sh", ["-c", script])).await {
+            Ok(()) => {}
+            Err(error) => panic!("command environment should be sanitized: {error}"),
+        }
     }
 
     #[cfg(unix)]
