@@ -3408,6 +3408,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_fixed_addresses(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer fixed addresses; use --agent-api-load-balancer-ip, --agent-api-external-ip, --relay-load-balancer-ip, or --relay-external-ip instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3415,6 +3421,19 @@ fn validate_kubernetes_service_annotation_args(
 fn kubernetes_service_annotation_controls_source_ranges(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("source-range") || key.contains("inbound-cidr")
+}
+
+fn kubernetes_service_annotation_controls_fixed_addresses(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("load-balancer-ip")
+        || key.contains("loadbalancerip")
+        || key.contains("load-balancer-eip")
+        || key.contains("eip-allocations")
+        || key.contains("static-ip")
+        || key.contains("ip-address")
+        || key.contains("private-ipv4-address")
+        || key.contains("pip-name")
+        || key.contains("lb-ipam-ips")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -10833,6 +10852,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/load-balancer-source-ranges must not configure LoadBalancer source ranges"
         ));
 
+        let mut agent_fixed_ip_annotation = base_k8s_install_args();
+        agent_fixed_ip_annotation.expose_agent_api = true;
+        agent_fixed_ip_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "metallb.io/loadBalancerIPs".to_string(),
+            value: "198.51.100.10".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_fixed_ip_annotation) {
+            Ok(_) => panic!("agent API fixed IP annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key metallb.io/loadBalancerIPs must not configure LoadBalancer fixed addresses"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -10901,6 +10934,22 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-inbound-cidrs must not configure LoadBalancer source ranges"
+        ));
+
+        let mut relay_eip_annotation = base_k8s_install_args();
+        relay_eip_annotation.expose_relay = true;
+        relay_eip_annotation.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        relay_eip_annotation.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        relay_eip_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-eip-allocations".to_string(),
+            value: "eipalloc-0123456789abcdef0".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_eip_annotation) {
+            Ok(_) => panic!("relay EIP annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-eip-allocations must not configure LoadBalancer fixed addresses"
         ));
 
         Ok(())
@@ -11235,6 +11284,7 @@ fi
         assert!(helpers.contains("annotation value exceeds 262144 bytes"));
         assert!(helpers.contains("annotation value must not contain control characters"));
         assert!(helpers.contains("must not configure LoadBalancer source ranges"));
+        assert!(helpers.contains("must not configure LoadBalancer fixed addresses"));
         assert!(daemonset.contains(
             "ipars.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
         ));

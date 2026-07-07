@@ -571,6 +571,8 @@
 {{- $path := .path -}}
 {{- if or (contains "source-range" $key) (contains "inbound-cidr" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer source ranges; use loadBalancerSourceRanges values instead" $path .key) -}}
+{{- else if or (contains "load-balancer-ip" $key) (contains "loadbalancerip" $key) (contains "load-balancer-eip" $key) (contains "eip-allocations" $key) (contains "static-ip" $key) (contains "ip-address" $key) (contains "private-ipv4-address" $key) (contains "pip-name" $key) (contains "lb-ipam-ips" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer fixed addresses; use loadBalancerIP or externalIPs values instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
