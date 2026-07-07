@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
@@ -237,6 +237,7 @@ fn open_netlink_socket_in_namespace(
 ) -> io::Result<Socket> {
     let current_namespace = open_current_thread_netns()?;
     let namespace_path = namespace.path();
+    inspect_linux_netns_path(namespace, &namespace_path)?;
     let target_namespace = File::open(&namespace_path).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -305,6 +306,82 @@ fn open_current_thread_netns() -> io::Result<File> {
             )
         })
     })
+}
+
+fn inspect_linux_netns_path(namespace: &LinuxNetworkNamespace, path: &Path) -> io::Result<()> {
+    let symlink_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "linux network namespace `{}` does not exist at {}",
+                    namespace.name(),
+                    path.display()
+                ),
+            )
+        } else {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect linux network namespace `{}` at {}: {error}",
+                    namespace.name(),
+                    path.display()
+                ),
+            )
+        }
+    })?;
+    let file_type = symlink_metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "linux network namespace `{}` at {} must not be a symlink",
+                namespace.name(),
+                path.display()
+            ),
+        ));
+    }
+    if file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "linux network namespace `{}` at {} must be a namespace bind mount, not a directory",
+                namespace.name(),
+                path.display()
+            ),
+        ));
+    }
+    ensure_linux_netns_nsfs(namespace, path)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_netns_nsfs(namespace: &LinuxNetworkNamespace, path: &Path) -> io::Result<()> {
+    let stat = nix::sys::statfs::statfs(path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "failed to stat filesystem for linux network namespace `{}` at {}: {error}",
+                namespace.name(),
+                path.display()
+            ),
+        )
+    })?;
+    if stat.filesystem_type() == nix::sys::statfs::NSFS_MAGIC {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "linux network namespace `{}` at {} must be an nsfs namespace bind mount",
+            namespace.name(),
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_linux_netns_nsfs(_namespace: &LinuxNetworkNamespace, _path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn netlink_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> String {
@@ -1882,6 +1959,80 @@ mod tests {
             Err(RouteManagerError::InvalidNamespace(name)) if name == "-node-a"
         ));
         Ok(())
+    }
+
+    #[test]
+    fn linux_network_namespace_path_inspection_rejects_missing_and_directory(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = route_manager_test_dir("netns-path")?;
+        let missing = base.join("missing");
+        let error = match inspect_linux_netns_path(&namespace, &missing) {
+            Ok(()) => return Err("missing namespace path should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not exist"));
+
+        let directory = base.join("directory");
+        std::fs::create_dir(&directory)?;
+        let error = match inspect_linux_netns_path(&namespace, &directory) {
+            Ok(()) => return Err("namespace directory path should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a directory"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_network_namespace_path_inspection_rejects_regular_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = route_manager_test_dir("netns-path-regular")?;
+        let path = base.join("node-a");
+        std::fs::write(&path, b"netns")?;
+
+        let error = match inspect_linux_netns_path(&namespace, &path) {
+            Ok(()) => return Err("regular namespace path should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("nsfs namespace bind mount"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_network_namespace_path_inspection_rejects_symlink(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = route_manager_test_dir("netns-path-symlink")?;
+        let target = base.join("target");
+        let link = base.join("node-a");
+        std::fs::write(&target, b"netns")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match inspect_linux_netns_path(&namespace, &link) {
+            Ok(()) => return Err("symlink namespace path should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    fn route_manager_test_dir(prefix: &str) -> io::Result<PathBuf> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ipars-route-manager-{prefix}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(path)
     }
 
     #[test]
