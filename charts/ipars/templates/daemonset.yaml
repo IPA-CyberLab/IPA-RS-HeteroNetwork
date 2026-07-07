@@ -87,8 +87,10 @@
 {{- $agentStateMountPath := .Values.agent.state.mountPath -}}
 {{- $agentLivenessProbeEnabled := printf "%v" .Values.agent.probes.liveness.enabled -}}
 {{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
+{{- $agentStartupProbeEnabled := printf "%v" .Values.agent.probes.startup.enabled -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.probes.startup.enabled" "value" .Values.agent.probes.startup.enabled) -}}
 {{- $absolutePathPattern := "^/[A-Za-z0-9._/@%+=:,/-]+$" -}}
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
@@ -308,6 +310,9 @@
 {{- end -}}
 {{- if not (or (eq $agentReadinessProbeEnabled "true") (eq $agentReadinessProbeEnabled "false")) -}}
 {{- fail "agent.probes.readiness.enabled must be true or false" -}}
+{{- end -}}
+{{- if not (or (eq $agentStartupProbeEnabled "true") (eq $agentStartupProbeEnabled "false")) -}}
+{{- fail "agent.probes.startup.enabled must be true or false" -}}
 {{- end -}}
 {{- range $probeName, $probe := .Values.agent.probes -}}
 {{- $probePath := $probe.path -}}
@@ -1160,6 +1165,16 @@ spec:
             periodSeconds: {{ int .Values.agent.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ int .Values.agent.probes.readiness.timeoutSeconds }}
             failureThreshold: {{ int .Values.agent.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if eq $agentStartupProbeEnabled "true" }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.agent.probes.startup.path | quote }}
+              port: {{ $agentApiTargetPort }}
+            initialDelaySeconds: {{ int .Values.agent.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.agent.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ int .Values.agent.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ int .Values.agent.probes.startup.failureThreshold }}
           {{- end }}
           volumeMounts:
             - name: agent-state

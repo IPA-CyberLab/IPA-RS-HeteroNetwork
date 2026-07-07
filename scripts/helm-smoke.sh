@@ -135,6 +135,35 @@ assert_rendered_contains pod-security-context "supplementalGroups:"
 assert_rendered_contains pod-security-context "- 2001"
 assert_rendered_contains pod-security-context "- 2002"
 
+template_ok pod-health-probes \
+  --set-string agent.probes.liveness.path=/livez \
+  --set agent.probes.liveness.periodSeconds=20 \
+  --set-string agent.probes.readiness.path=/readyz \
+  --set agent.probes.readiness.failureThreshold=2 \
+  --set-string agent.probes.startup.path=/startupz \
+  --set agent.probes.startup.initialDelaySeconds=0 \
+  --set agent.probes.startup.periodSeconds=5 \
+  --set agent.probes.startup.failureThreshold=30
+
+assert_rendered_contains pod-health-probes "livenessProbe:"
+assert_rendered_contains pod-health-probes 'path: "/livez"'
+assert_rendered_contains pod-health-probes "periodSeconds: 20"
+assert_rendered_contains pod-health-probes "readinessProbe:"
+assert_rendered_contains pod-health-probes 'path: "/readyz"'
+assert_rendered_contains pod-health-probes "failureThreshold: 2"
+assert_rendered_contains pod-health-probes "startupProbe:"
+assert_rendered_contains pod-health-probes 'path: "/startupz"'
+assert_rendered_contains pod-health-probes "initialDelaySeconds: 0"
+assert_rendered_contains pod-health-probes "failureThreshold: 30"
+
+template_fails pod-startup-probe-string-enabled \
+  "agent.probes.startup.enabled must be true or false" \
+  --set-string agent.probes.startup.enabled=false
+
+template_fails pod-startup-probe-zero-threshold \
+  "agent.probes.startup.failureThreshold must be greater than zero" \
+  --set agent.probes.startup.failureThreshold=0
+
 template_fails pod-security-context-root-nonroot \
   "agent.podSecurityContext.runAsNonRoot=true cannot be used with runAsUser=0" \
   --set agent.podSecurityContext.runAsUser=0 \

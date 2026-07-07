@@ -52,6 +52,13 @@ agent:
       periodSeconds: 10
       timeoutSeconds: 1
       failureThreshold: 3
+    startup:
+      enabled: true
+      path: /healthz
+      initialDelaySeconds: 0
+      periodSeconds: 5
+      timeoutSeconds: 1
+      failureThreshold: 30
   terminationGracePeriodSeconds: ""
   privileged: false
   securityContext:
