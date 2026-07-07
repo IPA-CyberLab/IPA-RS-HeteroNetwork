@@ -6407,9 +6407,153 @@ pub mod api {
         if payload.len() < 8 {
             return false;
         }
-        let length = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        (8..=10_000).contains(&length) && matches!(code, 196_608 | 80_877_102 | 80_877_103)
+        let Some(length) = read_u32_be(payload, 0).map(|value| value as usize) else {
+            return false;
+        };
+        if !(8..=10_000).contains(&length) || payload.len() > length {
+            return false;
+        }
+        let Some(code) = read_u32_be(payload, 4) else {
+            return false;
+        };
+        match code {
+            196_608 => postgres_startup_parameters_payload(payload, length),
+            80_877_103 | 80_877_104 => length == 8 && payload.len() == 8,
+            80_877_102 => {
+                length == 16
+                    && payload.len() == 16
+                    && payload
+                        .get(8..16)
+                        .is_some_and(|payload| payload.iter().any(|byte| *byte != 0))
+            }
+            _ => false,
+        }
+    }
+
+    fn postgres_startup_parameters_payload(payload: &[u8], length: usize) -> bool {
+        let incomplete = length > payload.len();
+        if incomplete && payload.len() < PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return false;
+        }
+        let Some(body) = payload.get(8..) else {
+            return false;
+        };
+        if body.is_empty() {
+            return false;
+        }
+        postgres_startup_parameter_fields(body, incomplete)
+    }
+
+    fn postgres_startup_parameter_fields(payload: &[u8], incomplete: bool) -> bool {
+        let mut offset = 0_usize;
+        let mut parameter_count = 0_usize;
+        let mut saw_user = false;
+        while offset < payload.len() {
+            if payload[offset] == 0 {
+                return !incomplete && offset.checked_add(1) == Some(payload.len()) && saw_user;
+            }
+            let (key, value_offset) = match postgres_cstring_field(payload, offset, 128) {
+                Some(PostgresCStringParse::Complete { value, next_offset }) => {
+                    if !postgres_startup_parameter_key(value) {
+                        return false;
+                    }
+                    (value, next_offset)
+                }
+                Some(PostgresCStringParse::Incomplete { value }) => {
+                    return incomplete
+                        && (saw_user || postgres_startup_parameter_key_prefix(value));
+                }
+                None => return false,
+            };
+            let (value, next_offset) = match postgres_cstring_field(payload, value_offset, 1024) {
+                Some(PostgresCStringParse::Complete { value, next_offset }) => {
+                    if !postgres_startup_parameter_value(value) {
+                        return false;
+                    }
+                    (value, next_offset)
+                }
+                Some(PostgresCStringParse::Incomplete { value }) => {
+                    return incomplete
+                        && postgres_startup_parameter_value(value)
+                        && (saw_user || key.eq_ignore_ascii_case(b"user"));
+                }
+                None => return false,
+            };
+            if key.eq_ignore_ascii_case(b"user") {
+                if value.is_empty() {
+                    return false;
+                }
+                saw_user = true;
+            }
+            parameter_count += 1;
+            if parameter_count > 64 {
+                return false;
+            }
+            offset = next_offset;
+        }
+        incomplete && saw_user
+    }
+
+    enum PostgresCStringParse<'a> {
+        Complete { value: &'a [u8], next_offset: usize },
+        Incomplete { value: &'a [u8] },
+    }
+
+    fn postgres_cstring_field(
+        payload: &[u8],
+        offset: usize,
+        max_len: usize,
+    ) -> Option<PostgresCStringParse<'_>> {
+        let tail = payload.get(offset..)?;
+        if let Some(terminator) = tail.iter().position(|byte| *byte == 0) {
+            if terminator > max_len {
+                return None;
+            }
+            return Some(PostgresCStringParse::Complete {
+                value: &tail[..terminator],
+                next_offset: offset + terminator + 1,
+            });
+        }
+        if tail.len() > max_len {
+            return None;
+        }
+        Some(PostgresCStringParse::Incomplete { value: tail })
+    }
+
+    fn postgres_startup_parameter_key(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+    }
+
+    fn postgres_startup_parameter_key_prefix(value: &[u8]) -> bool {
+        const COMMON_KEYS: &[&[u8]] = &[
+            b"user",
+            b"database",
+            b"application_name",
+            b"client_encoding",
+            b"DateStyle",
+            b"TimeZone",
+            b"options",
+            b"replication",
+            b"search_path",
+        ];
+        !value.is_empty()
+            && value.len() <= 128
+            && postgres_startup_parameter_key(value)
+            && COMMON_KEYS.iter().any(|key| {
+                key.get(..value.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(value))
+            })
+    }
+
+    fn postgres_startup_parameter_value(value: &[u8]) -> bool {
+        value.len() <= 1024
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
     }
 
     fn postgres_frontend_message_payload(payload: &[u8]) -> bool {
@@ -11384,6 +11528,22 @@ mod tests {
             payload
         }
 
+        fn postgres_startup_message(params: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&196_608_u32.to_be_bytes());
+            for (key, value) in params {
+                payload.extend_from_slice(key);
+                payload.push(0);
+                payload.extend_from_slice(value);
+                payload.push(0);
+            }
+            payload.push(0);
+            let length = payload.len() as u32;
+            payload[0..4].copy_from_slice(&length.to_be_bytes());
+            payload
+        }
+
         fn zookeeper_connect_packet(timeout_ms: u32, password: &[u8], read_only: bool) -> Vec<u8> {
             let frame_len = 29 + password.len();
             let mut payload = Vec::with_capacity(4 + frame_len);
@@ -13439,6 +13599,58 @@ mod tests {
         assert_eq!(
             observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 47]).application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 8, 4, 210, 22, 48]).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 42, 0, 0, 0, 7,])
+                .application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let postgres_startup = postgres_startup_message(&[
+            (b"user".as_slice(), b"app_user".as_slice()),
+            (b"database".as_slice(), b"app_db".as_slice()),
+            (b"application_name".as_slice(), b"ipars-agent".as_slice()),
+        ]);
+        assert_eq!(
+            observation_for_payload(&postgres_startup).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let long_postgres_options = vec![b'a'; 256];
+        let truncated_postgres_startup = postgres_startup_message(&[
+            (b"user".as_slice(), b"app_user".as_slice()),
+            (b"options".as_slice(), long_postgres_options.as_slice()),
+        ]);
+        assert_eq!(
+            observation_for_payload(
+                &truncated_postgres_startup[..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES]
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let missing_postgres_user =
+            postgres_startup_message(&[(b"database".as_slice(), b"app_db".as_slice())]);
+        assert_eq!(
+            observation_for_payload(&missing_postgres_user).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_postgres_key =
+            postgres_startup_message(&[(b"user\n".as_slice(), b"app_user".as_slice())]);
+        assert_eq!(
+            observation_for_payload(&invalid_postgres_key).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut postgres_startup_with_trailing = postgres_startup.clone();
+        postgres_startup_with_trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&postgres_startup_with_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0, 0, 0, 16, 4, 210, 22, 46]).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&postgres_frontend_message(b'Q', b"SELECT 1\0")).application(),
