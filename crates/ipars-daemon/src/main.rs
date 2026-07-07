@@ -96,7 +96,7 @@ use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
@@ -112,6 +112,9 @@ const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -8612,7 +8615,13 @@ async fn register_agent(
                 continue;
             }
         };
-        match response.json().await {
+        match read_bounded_agent_json_response(
+            response,
+            MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
+            "control-plane join",
+        )
+        .await
+        {
             Ok(response) => {
                 return Ok(AgentRegistration {
                     control_plane_url,
@@ -8721,17 +8730,20 @@ async fn send_heartbeat(
     control_plane_url: &str,
     request: HeartbeatRequest,
 ) -> anyhow::Result<HeartbeatResponse> {
-    client
+    let response = client
         .post(heartbeat_url(control_plane_url))
         .json(&request)
         .send()
         .await
         .context("failed to send heartbeat request")?
         .error_for_status()
-        .context("control plane rejected heartbeat request")?
-        .json()
-        .await
-        .context("failed to decode heartbeat response")
+        .context("control plane rejected heartbeat request")?;
+    read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
+        "control-plane heartbeat",
+    )
+    .await
 }
 
 async fn heartbeat_request(
@@ -8850,17 +8862,20 @@ async fn send_signal_node_upsert(
     signal_url: &str,
     request: SignalNodeUpsertRequest,
 ) -> anyhow::Result<SignalNodeUpsertResponse> {
-    client
+    let response = client
         .put(signal_node_url(signal_url, &request.node.node_id))
         .json(&request)
         .send()
         .await
         .context("failed to send signal node upsert")?
         .error_for_status()
-        .context("signal service rejected node upsert")?
-        .json()
-        .await
-        .context("failed to decode signal node upsert response")
+        .context("signal service rejected node upsert")?;
+    read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_SIGNAL_RESPONSE_BYTES,
+        "signal node upsert",
+    )
+    .await
 }
 
 async fn signal_node_upsert_request(
@@ -9408,6 +9423,37 @@ fn ensure_agent_join_token_size(size: u64, context: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+async fn read_bounded_agent_json_response<Response>(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> anyhow::Result<Response>
+where
+    Response: DeserializeOwned,
+{
+    if let Some(length) = response.content_length() {
+        ensure_agent_http_response_size(length, max_bytes, context)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read {context} response"))?
+    {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        ensure_agent_http_response_size(next_len, max_bytes, context)?;
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).with_context(|| format!("failed to decode {context} response"))
+}
+
+fn ensure_agent_http_response_size(size: u64, max_bytes: u64, context: &str) -> anyhow::Result<()> {
+    if size > max_bytes {
+        anyhow::bail!("{context} response exceeds maximum size of {max_bytes} bytes");
+    }
+    Ok(())
+}
+
 fn agent_relay_capability(args: &AgentArgs) -> Option<RelayCapability> {
     let public_endpoint = args.relay_public_endpoint?;
     let admission_url = args.relay_admission_url.clone()?;
@@ -9481,16 +9527,20 @@ async fn fetch_relay_status(
     relay_url: &str,
 ) -> anyhow::Result<RelayStatusResponse> {
     let url = relay_status_url(relay_url);
-    client
+    let response = client
         .get(&url)
         .send()
         .await
         .with_context(|| format!("failed to send relay status request to {url}"))?
         .error_for_status()
-        .with_context(|| format!("relay status request to {url} returned an error status"))?
-        .json()
-        .await
-        .with_context(|| format!("failed to decode relay status response from {url}"))
+        .with_context(|| format!("relay status request to {url} returned an error status"))?;
+    read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
+        "relay status",
+    )
+    .await
+    .with_context(|| format!("failed to decode relay status response from {url}"))
 }
 
 fn relay_capability_from_status(
@@ -9595,10 +9645,14 @@ async fn admit_relay_session(
         .await
         .map_err(|error| AgentRelayAdmissionError::Unavailable(anyhow::Error::new(error)))?
         .error_for_status()
-        .map_err(|error| AgentRelayAdmissionError::Rejected(anyhow::Error::new(error)))?
-        .json::<RelayAdmissionResponse>()
-        .await
-        .map_err(|error| AgentRelayAdmissionError::InvalidResponse(anyhow::Error::new(error)))?;
+        .map_err(|error| AgentRelayAdmissionError::Rejected(anyhow::Error::new(error)))?;
+    let response = read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
+        "relay admission",
+    )
+    .await
+    .map_err(AgentRelayAdmissionError::InvalidResponse)?;
 
     relay_session_state_from_admission(
         peer,
@@ -9912,16 +9966,19 @@ async fn fetch_hole_punch_plan(
     signal_url: &str,
     key: &ipars_types::PeerPathKey,
 ) -> anyhow::Result<SignalHolePunchPlanResponse> {
-    client
+    let response = client
         .get(signal_hole_punch_url(signal_url, &key.local, &key.remote))
         .send()
         .await
         .context("failed to fetch hole punch plan")?
         .error_for_status()
-        .context("signal service rejected hole punch plan request")?
-        .json()
-        .await
-        .context("failed to decode hole punch plan response")
+        .context("signal service rejected hole punch plan request")?;
+    read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_SIGNAL_RESPONSE_BYTES,
+        "signal hole punch plan",
+    )
+    .await
 }
 
 async fn send_signal_path_request(
@@ -9929,17 +9986,20 @@ async fn send_signal_path_request(
     signal_url: &str,
     request: SignalPathRequest,
 ) -> anyhow::Result<SignalPathResponse> {
-    client
+    let response = client
         .post(signal_path_url(signal_url))
         .json(&request)
         .send()
         .await
         .context("failed to send signal path negotiation")?
         .error_for_status()
-        .context("signal service rejected path negotiation")?
-        .json()
-        .await
-        .context("failed to decode signal path response")
+        .context("signal service rejected path negotiation")?;
+    read_bounded_agent_json_response(
+        response,
+        MAX_AGENT_SIGNAL_RESPONSE_BYTES,
+        "signal path negotiation",
+    )
+    .await
 }
 
 async fn send_signal_path_request_to_signal_services(
@@ -11868,7 +11928,13 @@ async fn fetch_peer_map_from_control_planes(
                 continue;
             }
         };
-        match response.json::<PeerMap>().await {
+        match read_bounded_agent_json_response(
+            response,
+            MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
+            "control-plane peer map",
+        )
+        .await
+        {
             Ok(peer_map) => return Ok(peer_map),
             Err(error) => failures.push(format!("{url}: decode failed: {error}")),
         }
@@ -12387,6 +12453,107 @@ mod tests {
         let addr = listener.local_addr()?;
         drop(listener);
         Ok(format!("http://{addr}"))
+    }
+
+    async fn spawn_raw_http_response(
+        response: String,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            anyhow::ensure!(
+                request_text.starts_with("GET "),
+                "unexpected raw HTTP test request: {request_text}"
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    #[tokio::test]
+    async fn bounded_agent_json_response_reads_small_body_and_rejects_oversized_header(
+    ) -> anyhow::Result<()> {
+        let body = r#"{"accepted":true,"policy_version":7,"peer_delta_available":false}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let decoded: HeartbeatResponse = read_bounded_agent_json_response(
+            response,
+            MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
+            "test heartbeat",
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for bounded JSON test server")???;
+        assert!(decoded.accepted);
+        assert_eq!(decoded.policy_version, 7);
+        assert!(!decoded.peer_delta_available);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES + 1
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let response = reqwest::Client::new().get(&url).send().await?;
+        let error = read_bounded_agent_json_response::<HeartbeatResponse>(
+            response,
+            MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
+            "test heartbeat",
+        )
+        .await
+        .expect_err("oversized agent HTTP JSON response should be rejected");
+        assert!(error
+            .to_string()
+            .contains("test heartbeat response exceeds maximum size"));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized bounded JSON test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_fetch_rejects_oversized_control_plane_response() -> anyhow::Result<()> {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES + 1
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let error = fetch_peer_map_from_control_planes(
+            &reqwest::Client::new(),
+            &[url],
+            &NodeId::from_string("local"),
+        )
+        .await
+        .expect_err("oversized control-plane peer map response should be rejected");
+        assert!(error
+            .to_string()
+            .contains("control-plane peer map response exceeds maximum size"));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for oversized peer-map test server")???;
+        Ok(())
     }
 
     #[test]
