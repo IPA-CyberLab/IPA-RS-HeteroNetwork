@@ -83,8 +83,10 @@ services:
       - 0.0.0.0:3479
     environment:
       IPARS_ROLE: stun
+      IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}
     ports:
       - "3478:3478/udp"
+      - "3480:3480/udp"
       - "3479:3479"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3479/healthz >/dev/null"]

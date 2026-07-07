@@ -36,6 +36,7 @@ const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
 const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
+const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 
@@ -2837,6 +2838,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string(),
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
+        "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
@@ -3255,6 +3257,10 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
             value: args.route_backend.clone(),
+        },
+        InstallEnvironment {
+            name: "IPARS_STUN_ALTERNATE_LISTEN".to_string(),
+            value: DEFAULT_STUN_ALTERNATE_LISTEN.to_string(),
         },
     ];
     if args.docker_discover_networks {
@@ -7172,6 +7178,10 @@ mod tests {
             environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
             Some("command")
         );
+        assert_eq!(
+            environment_value(&plan, "IPARS_STUN_ALTERNATE_LISTEN"),
+            Some(DEFAULT_STUN_ALTERNATE_LISTEN)
+        );
         assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
@@ -7197,6 +7207,9 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("healthchecks") && note.contains("loopback URLs")));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("IPARS_STUN_ALTERNATE_LISTEN") && note.contains("alternate UDP port")
+        }));
         assert!(plan
             .notes
             .iter()
@@ -7579,6 +7592,10 @@ mod tests {
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose.contains(
+            "IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"
+        ));
+        assert!(compose.contains("\"3480:3480/udp\""));
         assert!(compose.contains("--http-listen"));
         assert!(compose.contains("0.0.0.0:3479"));
         assert!(compose.contains("127.0.0.1:3479/healthz"));
