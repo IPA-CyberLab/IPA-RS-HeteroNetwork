@@ -8597,6 +8597,15 @@ fn ensure_process_in_netns_path(
                 target_path.display()
             )
         })?;
+    ensure_relay_forwarder_current_netns_match(namespace, target_path, &report)
+}
+
+#[cfg(unix)]
+fn ensure_relay_forwarder_current_netns_match(
+    namespace: &LinuxNetworkNamespace,
+    target_path: &Path,
+    report: &LinuxNetnsPathReport,
+) -> anyhow::Result<()> {
     if report.same_as_current == Some(true) {
         return Ok(());
     }
@@ -19539,6 +19548,42 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         };
 
         assert!(format!("{error:#}").contains("must not be a symlink"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_forwarder_netns_identity_enforces_current_process() -> anyhow::Result<()> {
+        let namespace = LinuxNetworkNamespace::from_name("node-a")?;
+        let base = unique_test_dir("relay-forwarder-netns-identity")?;
+        let target = base.join("node-a");
+        let current = base.join("current");
+        std::fs::write(&target, b"netns")?;
+        std::fs::hard_link(&target, &current)?;
+
+        let same_namespace_report = LinuxNetnsPathReport {
+            same_as_current: Some(same_file_identity(&target, &current)?),
+        };
+        ensure_relay_forwarder_current_netns_match(&namespace, &target, &same_namespace_report)?;
+
+        let other = base.join("other");
+        std::fs::write(&other, b"other-netns")?;
+        let different_namespace_report = LinuxNetnsPathReport {
+            same_as_current: Some(same_file_identity(&target, &other)?),
+        };
+        let error = match ensure_relay_forwarder_current_netns_match(
+            &namespace,
+            &target,
+            &different_namespace_report,
+        ) {
+            Ok(_) => anyhow::bail!("unexpected successful relay forwarder netns mismatch check"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("current process is in a different namespace"));
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
