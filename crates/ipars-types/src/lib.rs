@@ -6616,8 +6616,55 @@ pub mod api {
         let Some(after_statement) = postgres_cstring_end(body, after_portal) else {
             return false;
         };
-        body.get(after_statement..after_statement.saturating_add(2))
-            .is_some()
+        let Some((request_format_count, after_request_formats)) =
+            postgres_format_codes_payload(body, after_statement)
+        else {
+            return false;
+        };
+        let Some(parameter_count) =
+            read_u16_be(body, after_request_formats).map(|count| count as usize)
+        else {
+            return false;
+        };
+        if !matches!(request_format_count, 0 | 1) && request_format_count != parameter_count {
+            return false;
+        }
+
+        let Some(mut offset) = after_request_formats.checked_add(2) else {
+            return false;
+        };
+        for _ in 0..parameter_count {
+            let Some(raw_len) = read_u32_be(body, offset) else {
+                return false;
+            };
+            offset += 4;
+            if raw_len == u32::MAX {
+                continue;
+            }
+            let Some(next_offset) = offset.checked_add(raw_len as usize) else {
+                return false;
+            };
+            if next_offset > body.len() {
+                return false;
+            }
+            offset = next_offset;
+        }
+
+        postgres_format_codes_payload(body, offset)
+            .is_some_and(|(_, next_offset)| next_offset == body.len())
+    }
+
+    fn postgres_format_codes_payload(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
+        let count = read_u16_be(payload, offset)? as usize;
+        let mut cursor = offset.checked_add(2)?;
+        for _ in 0..count {
+            let format_code = read_u16_be(payload, cursor)?;
+            if !matches!(format_code, 0 | 1) {
+                return None;
+            }
+            cursor = cursor.checked_add(2)?;
+        }
+        Some((count, cursor))
     }
 
     fn postgres_named_portal_or_statement_payload(body: &[u8]) -> bool {
@@ -11528,6 +11575,39 @@ mod tests {
             payload
         }
 
+        fn postgres_bind_message_body(
+            portal: &[u8],
+            statement: &[u8],
+            request_formats: &[u16],
+            params: &[Option<&[u8]>],
+            result_formats: &[u16],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(portal);
+            body.push(0);
+            body.extend_from_slice(statement);
+            body.push(0);
+            body.extend_from_slice(&(request_formats.len() as u16).to_be_bytes());
+            for format in request_formats {
+                body.extend_from_slice(&format.to_be_bytes());
+            }
+            body.extend_from_slice(&(params.len() as u16).to_be_bytes());
+            for param in params {
+                match param {
+                    Some(value) => {
+                        body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                        body.extend_from_slice(value);
+                    }
+                    None => body.extend_from_slice(&u32::MAX.to_be_bytes()),
+                }
+            }
+            body.extend_from_slice(&(result_formats.len() as u16).to_be_bytes());
+            for format in result_formats {
+                body.extend_from_slice(&format.to_be_bytes());
+            }
+            body
+        }
+
         fn postgres_startup_message(params: &[(&[u8], &[u8])]) -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&0_u32.to_be_bytes());
@@ -13664,6 +13744,37 @@ mod tests {
         assert_eq!(
             observation_for_payload(&postgres_frontend_message(b'P', &parse_body)).application(),
             api::AgentPacketFlowApplication::Postgres
+        );
+        let bind_body =
+            postgres_bind_message_body(b"", b"prepared", &[0], &[Some(b"42"), None], &[0]);
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'B', &bind_body)).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'B', b"\0prepared\0\0\x01"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let bind_bad_format_count =
+            postgres_bind_message_body(b"", b"prepared", &[0, 1], &[Some(b"42")], &[0]);
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'B', &bind_bad_format_count))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let bind_bad_format_code =
+            postgres_bind_message_body(b"", b"prepared", &[2], &[Some(b"42")], &[0]);
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'B', &bind_bad_format_code))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut bind_trailing = bind_body.clone();
+        bind_trailing.push(0);
+        assert_eq!(
+            observation_for_payload(&postgres_frontend_message(b'B', &bind_trailing)).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&postgres_frontend_message(b'D', b"Sprepared\0")).application(),
