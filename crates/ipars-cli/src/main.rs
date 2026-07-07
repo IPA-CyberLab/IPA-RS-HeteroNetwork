@@ -4217,6 +4217,32 @@ fn validate_docker_runtime_program_token(value: &str, label: &str) -> anyhow::Re
     if value.contains('/') && !Path::new(value).is_absolute() {
         anyhow::bail!("{label} must be a bare command name or an absolute path");
     }
+    validate_docker_runtime_program_name(value, label)?;
+    Ok(())
+}
+
+fn validate_docker_runtime_program_name(value: &str, label: &str) -> anyhow::Result<()> {
+    let program_name = if value.contains('/') {
+        let program_path = Path::new(value);
+        if value
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        {
+            anyhow::bail!("{label} path must not contain '.' or '..' components");
+        }
+        program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("{label} path must name an executable"))?
+    } else {
+        value
+    };
+    if matches!(program_name, "." | "..") {
+        anyhow::bail!("{label} program name must not be '.' or '..'");
+    }
+    if program_name.starts_with('-') {
+        anyhow::bail!("{label} program name must not start with '-'");
+    }
     Ok(())
 }
 
@@ -9934,6 +9960,56 @@ mod tests {
         assert!(whitespace_command
             .to_string()
             .contains("--userspace-wireguard-command must not contain whitespace"));
+
+        let option_prefixed_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("-wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => {
+                anyhow::bail!("option-prefixed userspace WireGuard command should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(option_prefixed_command
+            .to_string()
+            .contains("--userspace-wireguard-command program name must not start with '-'"));
+
+        let special_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some(".".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("special userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(special_command
+            .to_string()
+            .contains("--userspace-wireguard-command program name must not be '.' or '..'"));
+
+        let current_component_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("/usr/local/./bin/wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => {
+                anyhow::bail!("current-component userspace WireGuard command should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(current_component_command.to_string().contains(
+            "--userspace-wireguard-command path must not contain '.' or '..' components"
+        ));
+
+        let parent_component_command = match docker_install_plan(DockerInstallArgs {
+            userspace_wireguard_command: Some("/usr/local/../bin/wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => {
+                anyhow::bail!("parent-component userspace WireGuard command should be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(parent_component_command.to_string().contains(
+            "--userspace-wireguard-command path must not contain '.' or '..' components"
+        ));
 
         let oversized_command = match docker_install_plan(DockerInstallArgs {
             userspace_wireguard_command: Some(

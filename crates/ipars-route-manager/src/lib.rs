@@ -1011,21 +1011,7 @@ fn validate_system_route_command_runtime_bounds(
 }
 
 fn validate_linux_route_command(command: &LinuxRouteCommand) -> Result<(), RouteManagerError> {
-    if command.program.is_empty() {
-        return Err(RouteManagerError::Backend(
-            "invalid linux route command: program cannot be empty".to_string(),
-        ));
-    }
-    if command.program.len() > MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES {
-        return Err(RouteManagerError::Backend(format!(
-            "invalid linux route command: program exceeds {MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES} bytes"
-        )));
-    }
-    if command.program.as_bytes().contains(&0) {
-        return Err(RouteManagerError::Backend(
-            "invalid linux route command: program must not contain NUL bytes".to_string(),
-        ));
-    }
+    validate_linux_route_command_program(&command.program)?;
     if command.args.len() > MAX_LINUX_ROUTE_COMMAND_ARGS {
         return Err(RouteManagerError::Backend(format!(
             "invalid linux route command: too many arguments: {} > {MAX_LINUX_ROUTE_COMMAND_ARGS}",
@@ -1051,6 +1037,75 @@ fn validate_linux_route_command(command: &LinuxRouteCommand) -> Result<(), Route
                 "invalid linux route command: argv exceeds {MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES} bytes"
             )));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_linux_route_command_program(program: &str) -> Result<(), RouteManagerError> {
+    if program.is_empty() {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program cannot be empty".to_string(),
+        ));
+    }
+    if program.len() > MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES {
+        return Err(RouteManagerError::Backend(format!(
+            "invalid linux route command: program exceeds {MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES} bytes"
+        )));
+    }
+    if program.as_bytes().contains(&0) {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program must not contain NUL bytes".to_string(),
+        ));
+    }
+    if program.chars().any(char::is_control) {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program must not contain control characters".to_string(),
+        ));
+    }
+    if program.chars().any(char::is_whitespace) {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program must not contain whitespace".to_string(),
+        ));
+    }
+
+    let program_name = if program.contains('/') {
+        let program_path = Path::new(program);
+        if !program_path.is_absolute() {
+            return Err(RouteManagerError::Backend(
+                "invalid linux route command: program must be a bare command name or an absolute path"
+                    .to_string(),
+            ));
+        }
+        if program
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        {
+            return Err(RouteManagerError::Backend(
+                "invalid linux route command: program path must not contain '.' or '..' components"
+                    .to_string(),
+            ));
+        }
+        program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                RouteManagerError::Backend(
+                    "invalid linux route command: program path must name an executable".to_string(),
+                )
+            })?
+    } else {
+        program
+    };
+    if matches!(program_name, "." | "..") {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program name must not be '.' or '..'".to_string(),
+        ));
+    }
+    if program_name.starts_with('-') {
+        return Err(RouteManagerError::Backend(
+            "invalid linux route command: program name must not start with '-'".to_string(),
+        ));
     }
 
     Ok(())
@@ -1775,6 +1830,32 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("program cannot be empty"));
+
+        for (program, expected) in [
+            ("ip\0bad", "program must not contain NUL bytes"),
+            ("ip\nbad", "program must not contain control characters"),
+            ("ip bad", "program must not contain whitespace"),
+            (
+                "./ip",
+                "program must be a bare command name or an absolute path",
+            ),
+            ("/usr/bin/./ip", "program path must not contain"),
+            ("/usr/bin/../ip", "program path must not contain"),
+            ("/", "program path must name an executable"),
+            (".", "program name must not be '.' or '..'"),
+            ("..", "program name must not be '.' or '..'"),
+            ("-ip", "program name must not start with '-'"),
+            ("/tmp/-ip", "program name must not start with '-'"),
+        ] {
+            let error = match runner.run(LinuxRouteCommand::new(program, ["route"])).await {
+                Ok(()) => panic!("command should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {program:?}: {error}"
+            );
+        }
 
         let error = match runner
             .run(LinuxRouteCommand::new("ip", ["route\0bad".to_string()]))

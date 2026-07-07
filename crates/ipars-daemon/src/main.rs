@@ -1711,6 +1711,32 @@ fn validate_runtime_program_token(value: &str, label: &str) -> anyhow::Result<()
     if value.contains('/') && !Path::new(value).is_absolute() {
         anyhow::bail!("{label} must be a bare command name or an absolute path");
     }
+    validate_runtime_program_name(value, label)?;
+    Ok(())
+}
+
+fn validate_runtime_program_name(value: &str, label: &str) -> anyhow::Result<()> {
+    let program_name = if value.contains('/') {
+        let program_path = Path::new(value);
+        if value
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        {
+            anyhow::bail!("{label} path must not contain '.' or '..' components");
+        }
+        program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("{label} path must name an executable"))?
+    } else {
+        value
+    };
+    if matches!(program_name, "." | "..") {
+        anyhow::bail!("{label} program name must not be '.' or '..'");
+    }
+    if program_name.starts_with('-') {
+        anyhow::bail!("{label} program name must not start with '-'");
+    }
     Ok(())
 }
 
@@ -18177,13 +18203,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     #[test]
     fn userspace_wireguard_command_rejects_relative_paths() -> anyhow::Result<()> {
         for command in ["./wireguard-go", "bin/wireguard-go"] {
-            let cli = Cli::try_parse_from([
-                "iparsd",
-                "agent",
-                "--wireguard-backend",
-                "userspace-command",
-                "--userspace-wireguard-command",
-                command,
+            let cli = Cli::try_parse_from(vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                format!("--userspace-wireguard-command={command}"),
             ])?;
 
             if let Command::Agent(args) = cli.command {
@@ -18216,13 +18241,12 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     #[test]
     fn userspace_wireguard_command_rejects_whitespace() -> anyhow::Result<()> {
         for command in ["wireguard go", "/usr/local/bin/wireguard go"] {
-            let cli = Cli::try_parse_from([
-                "iparsd",
-                "agent",
-                "--wireguard-backend",
-                "userspace-command",
-                "--userspace-wireguard-command",
-                command,
+            let cli = Cli::try_parse_from(vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                format!("--userspace-wireguard-command={command}"),
             ])?;
 
             if let Command::Agent(args) = cli.command {
@@ -18246,6 +18270,71 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             Err(error) => error,
         };
         assert!(error.to_string().contains("must not contain whitespace"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn userspace_wireguard_command_rejects_special_or_option_names() -> anyhow::Result<()> {
+        for (command, expected) in [
+            (
+                ".",
+                "--userspace-wireguard-command program name must not be '.' or '..'",
+            ),
+            (
+                "..",
+                "--userspace-wireguard-command program name must not be '.' or '..'",
+            ),
+            (
+                "-wireguard-go",
+                "--userspace-wireguard-command program name must not start with '-'",
+            ),
+            (
+                "/usr/local/bin/-wireguard-go",
+                "--userspace-wireguard-command program name must not start with '-'",
+            ),
+            (
+                "/usr/local/./bin/wireguard-go",
+                "--userspace-wireguard-command path must not contain '.' or '..' components",
+            ),
+            (
+                "/usr/local/../bin/wireguard-go",
+                "--userspace-wireguard-command path must not contain '.' or '..' components",
+            ),
+            (
+                "/",
+                "--userspace-wireguard-command path must name an executable",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(vec![
+                "iparsd".to_string(),
+                "agent".to_string(),
+                "--wireguard-backend".to_string(),
+                "userspace-command".to_string(),
+                format!("--userspace-wireguard-command={command}"),
+            ])?;
+
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid userspace WireGuard command"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected error for {command}: {error}"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let error = match ensure_runtime_program_ready("-wireguard-go", Some(OsStr::new(""))) {
+            Ok(()) => anyhow::bail!("unexpected successful option-prefixed command preflight"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("configured userspace WireGuard command program name must not start"));
 
         Ok(())
     }
