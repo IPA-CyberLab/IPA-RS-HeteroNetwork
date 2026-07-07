@@ -109,6 +109,26 @@ assert_rendered_contains name-overrides "name: fixed-ipars"
 assert_rendered_contains name-overrides "name: fixed-ipars-agent"
 assert_rendered_absent name-overrides "name: edge-ipars"
 
+template_ok node-affinity \
+  --set-string 'agent.nodeAffinity.required.matchExpressions[0].key=node-role.kubernetes.io/worker' \
+  --set-string 'agent.nodeAffinity.required.matchExpressions[0].operator=Exists' \
+  --set 'agent.nodeAffinity.preferred[0].weight=75' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].key=node.kubernetes.io/instance-type' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].operator=In' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].values[0]=m7i.large' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].values[1]=m7i.xlarge'
+
+assert_rendered_contains node-affinity "affinity:"
+assert_rendered_contains node-affinity "nodeAffinity:"
+assert_rendered_contains node-affinity "requiredDuringSchedulingIgnoredDuringExecution:"
+assert_rendered_contains node-affinity 'key: "node-role.kubernetes.io/worker"'
+assert_rendered_contains node-affinity 'operator: "Exists"'
+assert_rendered_contains node-affinity "preferredDuringSchedulingIgnoredDuringExecution:"
+assert_rendered_contains node-affinity "weight: 75"
+assert_rendered_contains node-affinity 'key: "node.kubernetes.io/instance-type"'
+assert_rendered_contains node-affinity 'operator: "In"'
+assert_rendered_contains node-affinity '- "m7i.large"'
+
 template_ok topology-spread \
   --set-string 'agent.topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone' \
   --set 'agent.topologySpreadConstraints[0].maxSkew=1' \
@@ -409,6 +429,17 @@ template_fails cluster-stun-endpoint-unspecified \
 template_fails name-override-invalid \
   "nameOverride \"Bad_Name\" must be a DNS label of at most 53 bytes" \
   --set-string nameOverride=Bad_Name
+
+template_fails node-affinity-in-without-values \
+  "agent.nodeAffinity.required.matchExpressions[0].values is required when operator is In" \
+  --set-string 'agent.nodeAffinity.required.matchExpressions[0].key=kubernetes.io/os' \
+  --set-string 'agent.nodeAffinity.required.matchExpressions[0].operator=In'
+
+template_fails node-affinity-preferred-zero-weight \
+  "agent.nodeAffinity.preferred[0].weight must be between 1 and 100" \
+  --set 'agent.nodeAffinity.preferred[0].weight=0' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].key=node-role.kubernetes.io/worker' \
+  --set-string 'agent.nodeAffinity.preferred[0].matchExpressions[0].operator=Exists'
 
 template_fails topology-spread-zero-max-skew \
   "agent.topologySpreadConstraints[0].maxSkew must be greater than zero" \

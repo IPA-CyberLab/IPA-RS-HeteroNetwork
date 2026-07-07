@@ -352,6 +352,55 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateNodeSelectorExpression" -}}
+{{- $path := .path -}}
+{{- $expression := .expression -}}
+{{- if not (kindIs "map" $expression) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $expression -}}
+{{- if not (has $field (list "key" "operator" "values")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- $key := default "" $expression.key -}}
+{{- if eq $key "" -}}
+{{- fail (printf "%s.key is required" $path) -}}
+{{- end -}}
+{{- include "ipars.validateLabelKey" (dict "path" $path "key" $key) -}}
+{{- $operator := default "" $expression.operator -}}
+{{- if not (has $operator (list "In" "NotIn" "Exists" "DoesNotExist" "Gt" "Lt")) -}}
+{{- fail (printf "%s.operator must be In, NotIn, Exists, DoesNotExist, Gt, or Lt" $path) -}}
+{{- end -}}
+{{- $values := list -}}
+{{- if hasKey $expression "values" -}}
+{{- if not (kindIs "slice" $expression.values) -}}
+{{- fail (printf "%s.values must be a list" $path) -}}
+{{- end -}}
+{{- $values = $expression.values -}}
+{{- end -}}
+{{- if or (eq $operator "In") (eq $operator "NotIn") -}}
+{{- if not $values -}}
+{{- fail (printf "%s.values is required when operator is %s" $path $operator) -}}
+{{- end -}}
+{{- range $value := $values -}}
+{{- include "ipars.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
+{{- end -}}
+{{- else if or (eq $operator "Exists") (eq $operator "DoesNotExist") -}}
+{{- if $values -}}
+{{- fail (printf "%s.values must be omitted when operator is %s" $path $operator) -}}
+{{- end -}}
+{{- else -}}
+{{- if ne (len $values) 1 -}}
+{{- fail (printf "%s.values must contain exactly one integer when operator is %s" $path $operator) -}}
+{{- end -}}
+{{- $value := printf "%v" (index $values 0) -}}
+{{- if not (regexMatch "^-?([0-9]|[1-9][0-9]*)$" $value) -}}
+{{- fail (printf "%s.values entry %q must be an integer when operator is %s" $path $value $operator) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateResourceQuantity" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}

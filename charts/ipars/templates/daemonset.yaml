@@ -323,6 +323,40 @@
 {{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
 {{- include "ipars.validateLabelValue" (dict "path" "agent.nodeSelector" "value" (printf "%v" $value)) -}}
 {{- end -}}
+{{- range $index, $expression := .Values.agent.nodeAffinity.required.matchExpressions -}}
+{{- include "ipars.validateNodeSelectorExpression" (dict "path" (printf "agent.nodeAffinity.required.matchExpressions[%d]" $index) "expression" $expression) -}}
+{{- end -}}
+{{- range $index, $preference := .Values.agent.nodeAffinity.preferred -}}
+{{- $path := printf "agent.nodeAffinity.preferred[%d]" $index -}}
+{{- if not (kindIs "map" $preference) -}}
+{{- fail (printf "%s must be an object" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $preference -}}
+{{- if not (has $field (list "weight" "matchExpressions")) -}}
+{{- fail (printf "%s has unsupported field %s" $path $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $preference "weight") -}}
+{{- fail (printf "%s.weight is required" $path) -}}
+{{- end -}}
+{{- $weight := printf "%v" $preference.weight -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- if lt (int $weight) 1 -}}
+{{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
+{{- end -}}
+{{- if not (hasKey $preference "matchExpressions") -}}
+{{- fail (printf "%s.matchExpressions is required" $path) -}}
+{{- end -}}
+{{- if not (kindIs "slice" $preference.matchExpressions) -}}
+{{- fail (printf "%s.matchExpressions must be a list" $path) -}}
+{{- end -}}
+{{- if not $preference.matchExpressions -}}
+{{- fail (printf "%s.matchExpressions must not be empty" $path) -}}
+{{- end -}}
+{{- range $expressionIndex, $expression := $preference.matchExpressions -}}
+{{- include "ipars.validateNodeSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
+{{- end -}}
+{{- end -}}
 {{- range $index, $toleration := .Values.agent.tolerations -}}
 {{- $path := printf "agent.tolerations[%d]" $index -}}
 {{- $tolerationKey := default "" $toleration.key -}}
@@ -626,6 +660,43 @@ spec:
           tolerationSeconds: {{ int .tolerationSeconds }}
           {{- end }}
         {{- end }}
+      {{- end }}
+      {{- if or .Values.agent.nodeAffinity.required.matchExpressions .Values.agent.nodeAffinity.preferred }}
+      affinity:
+        nodeAffinity:
+          {{- with .Values.agent.nodeAffinity.required.matchExpressions }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                {{- range . }}
+                - key: {{ .key | quote }}
+                  operator: {{ .operator | quote }}
+                  {{- if hasKey . "values" }}
+                  values:
+                    {{- range .values }}
+                    - {{ printf "%v" . | quote }}
+                    {{- end }}
+                  {{- end }}
+                {{- end }}
+          {{- end }}
+          {{- with .Values.agent.nodeAffinity.preferred }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            {{- range . }}
+            - weight: {{ int .weight }}
+              preference:
+                matchExpressions:
+                  {{- range .matchExpressions }}
+                  - key: {{ .key | quote }}
+                    operator: {{ .operator | quote }}
+                    {{- if hasKey . "values" }}
+                    values:
+                      {{- range .values }}
+                      - {{ printf "%v" . | quote }}
+                      {{- end }}
+                    {{- end }}
+                  {{- end }}
+            {{- end }}
+          {{- end }}
       {{- end }}
       {{- with .Values.agent.topologySpreadConstraints }}
       topologySpreadConstraints:

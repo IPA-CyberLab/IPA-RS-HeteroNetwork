@@ -69,6 +69,10 @@ agent:
   podAnnotations: {}
   priorityClassName: ""
   nodeSelector: {}
+  nodeAffinity:
+    required:
+      matchExpressions: []
+    preferred: []
   tolerations: []
   topologySpreadConstraints: []
   resources:
