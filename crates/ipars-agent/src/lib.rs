@@ -90,6 +90,8 @@ pub enum AgentError {
     WireGuard(String),
     #[error("peer path does not exist: {0}")]
     MissingPeer(NodeId),
+    #[error("peer map has not been synced for node {0}")]
+    PeerMapUnavailable(NodeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +431,7 @@ pub struct AgentRuntime {
     state: RwLock<AgentNodeState>,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
+    latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
@@ -1054,6 +1057,7 @@ impl AgentRuntime {
             state: RwLock::new(state),
             candidates: tokio::sync::RwLock::new(Vec::new()),
             nat_classification: tokio::sync::RwLock::new(None),
+            latest_peer_map: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1885,6 +1889,18 @@ impl AgentRuntime {
         for peer in peers {
             lazy_connect.observe_peer(peer);
         }
+    }
+
+    pub async fn record_peer_map_snapshot(&self, peer_map: PeerMap) {
+        *self.latest_peer_map.write().await = Some(peer_map);
+    }
+
+    pub async fn peer_map_snapshot(&self) -> Result<PeerMap, AgentError> {
+        self.latest_peer_map
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AgentError::PeerMapUnavailable(self.state().node_id))
     }
 
     pub async fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
@@ -3094,15 +3110,15 @@ where
         let mut peer_routes = BTreeMap::new();
         let mut peers_applied = 0;
 
-        for peer in peer_map.peers {
+        for peer in &peer_map.peers {
             if let Some(runtime) = &self.lazy_runtime {
-                if !runtime.should_connect_peer(&peer).await {
+                if !runtime.should_connect_peer(peer).await {
                     continue;
                 }
             }
 
             let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
-            let endpoint = self.endpoint_resolver.endpoint_for_peer(&peer).await?;
+            let endpoint = self.endpoint_resolver.endpoint_for_peer(peer).await?;
             self.wireguard
                 .upsert_peer(WireGuardPeerConfig {
                     peer: peer.node_id.clone(),
@@ -3160,6 +3176,10 @@ where
             for (peer, routes) in peer_routes {
                 applied_routes.insert(peer, routes);
             }
+        }
+
+        if let Some(runtime) = &self.lazy_runtime {
+            runtime.record_peer_map_snapshot(peer_map).await;
         }
 
         Ok(PeerMapApplySummary {
@@ -5939,6 +5959,7 @@ mod tests {
         assert!(!wireguard_peers.contains_key(&inactive_peer_id));
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
         drop(wireguard_peers);
+        assert_eq!(runtime.peer_map_snapshot().await?, peer_map);
 
         runtime
             .record_peer_activity(

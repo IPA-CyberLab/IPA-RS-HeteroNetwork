@@ -154,6 +154,8 @@ struct StatusArgs {
 
 #[derive(Debug, Args)]
 struct PeersArgs {
+    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    agent_url: Option<String>,
     #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_NODE_ID")]
@@ -162,6 +164,8 @@ struct PeersArgs {
 
 #[derive(Debug, Args)]
 struct RoutesArgs {
+    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    agent_url: Option<String>,
     #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_NODE_ID")]
@@ -893,20 +897,46 @@ async fn main() -> anyhow::Result<()> {
                 (Some(_), Some(_)) => unreachable!("clap prevents conflicting status URLs"),
             }
         }
-        Command::Peers(args) => match args.control_plane_url.as_deref() {
-            Some(control_plane_url) => print_json(&peer_map(control_plane_url, &args).await?)?,
-            None if args.node_id.is_some() => {
-                anyhow::bail!("ipars peers requires --control-plane-url with --node-id")
+        Command::Peers(args) => {
+            match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
+                (Some(agent_url), None) if args.node_id.is_none() => {
+                    print_json(&agent_peer_map(agent_url).await?)?
+                }
+                (None, Some(control_plane_url)) => {
+                    print_json(&peer_map(control_plane_url, &args).await?)?
+                }
+                (None, None) if args.node_id.is_none() => {
+                    print_json(&agent_peer_map(defaulted_agent_url(None)).await?)?
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("ipars peers cannot use --node-id with --agent-url")
+                }
+                (None, None) => {
+                    anyhow::bail!("ipars peers requires --control-plane-url with --node-id")
+                }
+                (Some(_), Some(_)) => unreachable!("clap prevents conflicting peer-map URLs"),
             }
-            None => print_json(&StaticStatus::peers())?,
-        },
-        Command::Routes(args) => match args.control_plane_url.as_deref() {
-            Some(control_plane_url) => print_json(&routes(control_plane_url, &args).await?)?,
-            None if args.node_id.is_some() => {
-                anyhow::bail!("ipars routes requires --control-plane-url with --node-id")
+        }
+        Command::Routes(args) => {
+            match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
+                (Some(agent_url), None) if args.node_id.is_none() => {
+                    print_json(&agent_routes(agent_url).await?)?
+                }
+                (None, Some(control_plane_url)) => {
+                    print_json(&routes(control_plane_url, &args).await?)?
+                }
+                (None, None) if args.node_id.is_none() => {
+                    print_json(&agent_routes(defaulted_agent_url(None)).await?)?
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("ipars routes cannot use --node-id with --agent-url")
+                }
+                (None, None) => {
+                    anyhow::bail!("ipars routes requires --control-plane-url with --node-id")
+                }
+                (Some(_), Some(_)) => unreachable!("clap prevents conflicting route URLs"),
             }
-            None => print_json(&StaticStatus::routes())?,
-        },
+        }
         Command::Token { command } => match command {
             TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
@@ -1668,6 +1698,10 @@ async fn peer_map(control_plane_url: &str, args: &PeersArgs) -> anyhow::Result<P
     .await
 }
 
+async fn agent_peer_map(agent_url: &str) -> anyhow::Result<PeerMap> {
+    get_json(agent_url, "/v1/peers", "agent peer map").await
+}
+
 async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<RoutesOutput> {
     let node_id = required_node_id(args.node_id.as_deref(), "routes")?;
     let peer_map: PeerMap = get_json(
@@ -1677,6 +1711,12 @@ async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<Ro
     )
     .await?;
     Ok(routes_output(node_id, peer_map))
+}
+
+async fn agent_routes(agent_url: &str) -> anyhow::Result<RoutesOutput> {
+    let status = agent_status(agent_url).await?;
+    let peer_map = agent_peer_map(agent_url).await?;
+    Ok(routes_output(status.node_id, peer_map))
 }
 
 async fn relay_status(relay_url: &str) -> anyhow::Result<RelayStatusResponse> {
@@ -7183,31 +7223,6 @@ fn add_unique_kubernetes_node_port(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct StaticStatus<'a> {
-    subsystem: &'a str,
-    status: &'a str,
-    detail: &'a str,
-}
-
-impl StaticStatus<'static> {
-    fn peers() -> Self {
-        Self {
-            subsystem: "peer_map",
-            status: "empty",
-            detail: "peer map is supplied by the control plane after join",
-        }
-    }
-
-    fn routes() -> Self {
-        Self {
-            subsystem: "routes",
-            status: "empty",
-            detail: "routes are installed by the route-manager daemon",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ipars_crypto::verify_join_token;
@@ -8635,6 +8650,7 @@ mod tests {
             "node-a",
         ])?;
         if let Command::Peers(args) = peers.command {
+            assert_eq!(args.agent_url, None);
             assert_eq!(
                 args.control_plane_url.as_deref(),
                 Some("http://127.0.0.1:8443")
@@ -8643,6 +8659,28 @@ mod tests {
         } else {
             anyhow::bail!("expected peers command");
         }
+
+        let peers =
+            Cli::try_parse_from(["ipars", "peers", "--agent-url", "http://127.0.0.1:9780"])?;
+        if let Command::Peers(args) = peers.command {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            assert_eq!(args.control_plane_url, None);
+            assert_eq!(args.node_id, None);
+        } else {
+            anyhow::bail!("expected peers command");
+        }
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "peers",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])
+        .is_err());
 
         let routes = Cli::try_parse_from([
             "ipars",
@@ -8653,6 +8691,7 @@ mod tests {
             "node-a",
         ])?;
         if let Command::Routes(args) = routes.command {
+            assert_eq!(args.agent_url, None);
             assert_eq!(
                 args.control_plane_url.as_deref(),
                 Some("http://127.0.0.1:8443")
@@ -8661,6 +8700,28 @@ mod tests {
         } else {
             anyhow::bail!("expected routes command");
         }
+
+        let routes =
+            Cli::try_parse_from(["ipars", "routes", "--agent-url", "http://127.0.0.1:9780"])?;
+        if let Command::Routes(args) = routes.command {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+            assert_eq!(args.control_plane_url, None);
+            assert_eq!(args.node_id, None);
+        } else {
+            anyhow::bail!("expected routes command");
+        }
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "routes",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            "node-a",
+        ])
+        .is_err());
 
         let relay = Cli::try_parse_from([
             "ipars",

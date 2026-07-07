@@ -13,8 +13,8 @@ use ipars_types::api::{
     AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
-    AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -62,6 +62,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/peers", get(peers))
         .route("/v1/paths", get(paths))
         .route("/v1/path-events", get(path_events))
         .route("/v1/path-probe", post(path_probe))
@@ -216,6 +217,10 @@ async fn path_events(State(state): State<AgentHttpState>) -> Json<AgentPathEvent
         events: state.runtime.path_change_events().await,
         generated_at: chrono::Utc::now(),
     })
+}
+
+async fn peers(State(state): State<AgentHttpState>) -> Result<Json<PeerMap>, ApiError> {
+    Ok(Json(state.runtime.peer_map_snapshot().await?))
 }
 
 async fn paths(State(state): State<AgentHttpState>) -> Json<AgentPathsResponse> {
@@ -1100,7 +1105,7 @@ impl IntoResponse for ApiError {
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
             | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AgentError::MissingPeer(_) => StatusCode::NOT_FOUND,
+            AgentError::MissingPeer(_) | AgentError::PeerMapUnavailable(_) => StatusCode::NOT_FOUND,
         };
         (
             status,
@@ -1353,6 +1358,54 @@ mod tests {
                 .and_then(|process| process.pid),
             Some(4242)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_peer_map_returns_runtime_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/peers")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let peer = peer_record(
+            NodeId::from_string("peer-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 22)),
+            Vec::new(),
+        );
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer],
+            generated_at: Utc::now(),
+        };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/peers")
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: PeerMap = serde_json::from_slice(&body)?;
+        assert_eq!(response, peer_map);
         Ok(())
     }
 
