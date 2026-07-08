@@ -1988,10 +1988,17 @@ pub mod api {
     pub const PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS: usize = 8;
     pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
     const DNS_MAX_QUESTION_COUNT: u16 = 64;
+    const DNS_MAX_NAME_POINTER_DEPTH: usize = 8;
 
     enum DnsSectionParse {
         Complete(usize),
         Truncated,
+    }
+
+    struct DnsNameParse {
+        end: usize,
+        labels: usize,
+        name_len: usize,
     }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4040,7 +4047,19 @@ pub mod api {
         Some(DnsSectionParse::Complete(rr_end))
     }
 
-    fn dns_name_payload(payload: &[u8], mut offset: usize) -> Option<usize> {
+    fn dns_name_payload(payload: &[u8], offset: usize) -> Option<usize> {
+        let parsed = dns_name_payload_inner(payload, offset, 0)?;
+        (parsed.labels > 0).then_some(parsed.end)
+    }
+
+    fn dns_name_payload_inner(
+        payload: &[u8],
+        mut offset: usize,
+        pointer_depth: usize,
+    ) -> Option<DnsNameParse> {
+        if pointer_depth > DNS_MAX_NAME_POINTER_DEPTH {
+            return None;
+        }
         let mut labels = 0_usize;
         let mut name_len = 0_usize;
         loop {
@@ -4051,6 +4070,12 @@ pub mod api {
                 let pointer = read_u16_be(payload, offset)?;
                 let pointer_offset = (pointer & 0x3fff) as usize;
                 if pointer_offset >= offset {
+                    return None;
+                }
+                let target = dns_name_payload_inner(payload, pointer_offset, pointer_depth + 1)?;
+                labels += target.labels;
+                name_len += target.name_len;
+                if labels > 32 || name_len > 255 {
                     return None;
                 }
                 offset = offset.checked_add(2)?;
@@ -4086,10 +4111,11 @@ pub mod api {
             }
             offset = label_end;
         }
-        if labels == 0 {
-            return None;
-        }
-        Some(offset)
+        Some(DnsNameParse {
+            end: offset,
+            labels,
+            name_len,
+        })
     }
 
     fn tls_handshake_payload(payload: &[u8]) -> bool {
@@ -15487,12 +15513,37 @@ mod tests {
             observation_for_udp_payload(&dns_response_with_answer).application(),
             api::AgentPacketFlowApplication::Dns
         );
+        let mut dns_response_with_compressed_answer = dns_query.clone();
+        dns_response_with_compressed_answer[2] = 0x81;
+        dns_response_with_compressed_answer[3] = 0x80;
+        dns_response_with_compressed_answer[7] = 0x01;
+        dns_response_with_compressed_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 21,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_compressed_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
         let mut missing_dns_answer = dns_query.clone();
         missing_dns_answer[2] = 0x81;
         missing_dns_answer[3] = 0x80;
         missing_dns_answer[7] = 0x01;
         assert_eq!(
             observation_for_udp_payload(&missing_dns_answer).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_self_pointer_answer = dns_query.clone();
+        dns_response_self_pointer_answer[2] = 0x81;
+        dns_response_self_pointer_answer[3] = 0x80;
+        dns_response_self_pointer_answer[7] = 0x01;
+        let self_pointer =
+            0xc000_u16 | u16::try_from(dns_response_self_pointer_answer.len()).unwrap();
+        dns_response_self_pointer_answer.extend_from_slice(&self_pointer.to_be_bytes());
+        dns_response_self_pointer_answer.extend_from_slice(&[
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 22,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_self_pointer_answer).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mdns_response = vec![
@@ -15512,6 +15563,15 @@ mod tests {
         ]);
         assert_eq!(
             observation_for_udp_payload(&mdns_two_answer_response).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut mdns_two_answer_compressed_response = mdns_response.clone();
+        mdns_two_answer_compressed_response[7] = 0x02;
+        mdns_two_answer_compressed_response.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 192, 0, 2, 12,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&mdns_two_answer_compressed_response).application(),
             api::AgentPacketFlowApplication::Dns
         );
         let mut mdns_missing_second_answer = mdns_response.clone();
