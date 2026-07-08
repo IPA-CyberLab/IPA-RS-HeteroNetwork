@@ -6407,7 +6407,9 @@ pub mod api {
     }
 
     fn postgres_payload(payload: &[u8]) -> bool {
-        postgres_startup_payload(payload) || postgres_frontend_message_payload(payload)
+        postgres_startup_payload(payload)
+            || postgres_frontend_message_payload(payload)
+            || postgres_backend_message_payload(payload)
     }
 
     fn postgres_startup_payload(payload: &[u8]) -> bool {
@@ -6585,7 +6587,34 @@ pub mod api {
         frame_count > 0
     }
 
+    fn postgres_backend_message_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            match postgres_backend_message_frame(payload, offset) {
+                Some(PostgresBackendMessageParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 32 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(PostgresBackendMessageParse::Incomplete) => {
+                    return frame_count > 0
+                        && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+                }
+                None => return false,
+            }
+        }
+        frame_count > 0
+    }
+
     enum PostgresFrontendMessageParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum PostgresBackendMessageParse {
         Complete(usize),
         Incomplete,
     }
@@ -6618,6 +6647,143 @@ pub mod api {
             _ => false,
         };
         valid.then_some(PostgresFrontendMessageParse::Complete(frame_end))
+    }
+
+    fn postgres_backend_message_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<PostgresBackendMessageParse> {
+        if payload.len().saturating_sub(offset) < 5 {
+            return Some(PostgresBackendMessageParse::Incomplete);
+        }
+        let tag = *payload.get(offset)?;
+        let length = read_u32_be(payload, offset.checked_add(1)?).map(|length| length as usize)?;
+        if !(4..=10_000).contains(&length) {
+            return None;
+        }
+        let frame_end = offset.checked_add(1)?.checked_add(length)?;
+        let Some(frame) = payload.get(offset..frame_end) else {
+            return Some(PostgresBackendMessageParse::Incomplete);
+        };
+        let body = &frame[5..];
+        let valid = match tag {
+            b'R' => postgres_authentication_message_payload(body),
+            b'S' => postgres_parameter_status_message_payload(body),
+            b'K' => postgres_backend_key_data_message_payload(body),
+            b'Z' => postgres_ready_for_query_message_payload(body),
+            b'C' => postgres_command_complete_message_payload(body),
+            b'E' | b'N' => postgres_error_or_notice_message_payload(body),
+            _ => false,
+        };
+        valid.then_some(PostgresBackendMessageParse::Complete(frame_end))
+    }
+
+    fn postgres_authentication_message_payload(body: &[u8]) -> bool {
+        let Some(code) = read_u32_be(body, 0) else {
+            return false;
+        };
+        match code {
+            0 | 2 | 3 | 7 | 9 => body.len() == 4,
+            5 => body.len() == 8,
+            8 | 11 | 12 => body.len() > 4,
+            10 => postgres_sasl_mechanisms_payload(&body[4..]),
+            _ => false,
+        }
+    }
+
+    fn postgres_sasl_mechanisms_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut saw_mechanism = false;
+        while offset < payload.len() {
+            if payload[offset] == 0 {
+                return saw_mechanism && offset.checked_add(1) == Some(payload.len());
+            }
+            let Some(next_offset) = postgres_cstring_end(payload, offset) else {
+                return false;
+            };
+            let mechanism = &payload[offset..next_offset - 1];
+            if mechanism.is_empty()
+                || mechanism.len() > 64
+                || !mechanism.iter().all(|byte| byte.is_ascii_graphic())
+            {
+                return false;
+            }
+            saw_mechanism = true;
+            offset = next_offset;
+        }
+        false
+    }
+
+    fn postgres_parameter_status_message_payload(body: &[u8]) -> bool {
+        let Some(after_name) = postgres_cstring_end(body, 0) else {
+            return false;
+        };
+        let Some(after_value) = postgres_cstring_end(body, after_name) else {
+            return false;
+        };
+        let name = &body[..after_name - 1];
+        let value = &body[after_name..after_value - 1];
+        after_value == body.len()
+            && postgres_startup_parameter_key(name)
+            && postgres_startup_parameter_value(value)
+    }
+
+    fn postgres_backend_key_data_message_payload(body: &[u8]) -> bool {
+        if !(8..=260).contains(&body.len()) {
+            return false;
+        }
+        let Some(pid) = read_u32_be(body, 0) else {
+            return false;
+        };
+        pid != 0 && body[4..].iter().any(|byte| *byte != 0)
+    }
+
+    fn postgres_ready_for_query_message_payload(body: &[u8]) -> bool {
+        body.len() == 1 && matches!(body[0], b'I' | b'T' | b'E')
+    }
+
+    fn postgres_command_complete_message_payload(body: &[u8]) -> bool {
+        if body.len() < 2 || body.last() != Some(&0) {
+            return false;
+        }
+        let command = &body[..body.len() - 1];
+        command.len() <= 128
+            && command
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+            && postgres_sql_statement(command)
+    }
+
+    fn postgres_error_or_notice_message_payload(body: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut field_count = 0_usize;
+        let mut saw_message = false;
+        while offset < body.len() {
+            let field_type = body[offset];
+            offset += 1;
+            if field_type == 0 {
+                return field_count > 0 && saw_message && offset == body.len();
+            }
+            if !field_type.is_ascii_alphabetic() {
+                return false;
+            }
+            let Some(next_offset) = postgres_cstring_end(body, offset) else {
+                return false;
+            };
+            let value = &body[offset..next_offset - 1];
+            if !postgres_backend_text_field(value, false) {
+                return false;
+            }
+            if field_type == b'M' {
+                saw_message = true;
+            }
+            field_count += 1;
+            if field_count > 32 {
+                return false;
+            }
+            offset = next_offset;
+        }
+        false
     }
 
     fn postgres_query_message_payload(body: &[u8]) -> bool {
@@ -6818,6 +6984,14 @@ pub mod api {
 
     fn postgres_password_message_payload(body: &[u8]) -> bool {
         postgres_nonempty_cstring(body, 0)
+    }
+
+    fn postgres_backend_text_field(value: &[u8], allow_empty: bool) -> bool {
+        (allow_empty || !value.is_empty())
+            && value.len() <= 4096
+            && value.iter().all(|byte| {
+                byte.is_ascii_graphic() || matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
+            })
     }
 
     fn postgres_nonempty_cstring(payload: &[u8], offset: usize) -> bool {
@@ -12262,6 +12436,50 @@ mod tests {
             payload
         }
 
+        fn postgres_backend_message(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut payload = vec![tag];
+            let length = (body.len() as u32) + 4;
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(body);
+            payload
+        }
+
+        fn postgres_parameter_status(name: &[u8], value: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(value);
+            body.push(0);
+            postgres_backend_message(b'S', &body)
+        }
+
+        fn postgres_backend_key_data(pid: u32, key: &[u8]) -> Vec<u8> {
+            let mut body = pid.to_be_bytes().to_vec();
+            body.extend_from_slice(key);
+            postgres_backend_message(b'K', &body)
+        }
+
+        fn postgres_ready_for_query(status: u8) -> Vec<u8> {
+            postgres_backend_message(b'Z', &[status])
+        }
+
+        fn postgres_command_complete(command: &[u8]) -> Vec<u8> {
+            let mut body = command.to_vec();
+            body.push(0);
+            postgres_backend_message(b'C', &body)
+        }
+
+        fn postgres_error_response(fields: &[(u8, &[u8])]) -> Vec<u8> {
+            let mut body = Vec::new();
+            for (field_type, value) in fields {
+                body.push(*field_type);
+                body.extend_from_slice(value);
+                body.push(0);
+            }
+            body.push(0);
+            postgres_backend_message(b'E', &body)
+        }
+
         fn postgres_bind_message_body(
             portal: &[u8],
             statement: &[u8],
@@ -14553,6 +14771,40 @@ mod tests {
         postgres_startup_with_trailing.extend_from_slice(b"junk");
         assert_eq!(
             observation_for_payload(&postgres_startup_with_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut postgres_startup_response = postgres_backend_message(b'R', &0_u32.to_be_bytes());
+        postgres_startup_response
+            .extend_from_slice(&postgres_parameter_status(b"server_version", b"16.3"));
+        postgres_startup_response
+            .extend_from_slice(&postgres_parameter_status(b"client_encoding", b"UTF8"));
+        postgres_startup_response.extend_from_slice(&postgres_backend_key_data(
+            12_345,
+            &[0x10, 0x20, 0x30, 0x40],
+        ));
+        postgres_startup_response.extend_from_slice(&postgres_ready_for_query(b'I'));
+        assert_eq!(
+            observation_for_payload(&postgres_startup_response).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let mut postgres_query_response = postgres_command_complete(b"SELECT 1");
+        postgres_query_response.extend_from_slice(&postgres_ready_for_query(b'I'));
+        assert_eq!(
+            observation_for_payload(&postgres_query_response).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        let postgres_error = postgres_error_response(&[
+            (b'S', b"ERROR".as_slice()),
+            (b'C', b"42P01".as_slice()),
+            (b'M', b"relation does not exist".as_slice()),
+        ]);
+        assert_eq!(
+            observation_for_payload(&postgres_error).application(),
+            api::AgentPacketFlowApplication::Postgres
+        );
+        assert_eq!(
+            observation_for_payload(&postgres_error_response(&[(b'S', b"ERROR".as_slice())]))
+                .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
