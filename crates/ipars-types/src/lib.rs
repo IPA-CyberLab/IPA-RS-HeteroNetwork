@@ -3858,16 +3858,25 @@ pub mod api {
         }
         let flags = u16::from_be_bytes([payload[2], payload[3]]);
         let opcode = (flags >> 11) & 0x0f;
+        let is_response = flags & 0x8000 != 0;
         let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-        let rr_count = u16::from_be_bytes([payload[6], payload[7]]) as usize
-            + u16::from_be_bytes([payload[8], payload[9]]) as usize
-            + u16::from_be_bytes([payload[10], payload[11]]) as usize;
+        let ancount = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+        let nscount = u16::from_be_bytes([payload[8], payload[9]]) as usize;
+        let arcount = u16::from_be_bytes([payload[10], payload[11]]) as usize;
         if opcode > 5 || flags & 0x0040 != 0 {
             return false;
         }
         if qdcount > 0 {
             return match dns_question_payload(payload, qdcount, allow_truncated) {
                 Some(DnsSectionParse::Complete(question_end)) => {
+                    if opcode == 0 && !is_response && (ancount > 0 || nscount > 0) {
+                        return false;
+                    }
+                    let rr_count = if opcode == 0 && !is_response {
+                        arcount
+                    } else {
+                        ancount + nscount + arcount
+                    };
                     rr_count == 0
                         || dns_resource_records_payload(
                             payload,
@@ -3880,7 +3889,13 @@ pub mod api {
                 None => false,
             };
         }
-        flags & 0x8000 != 0 && dns_resource_records_payload(payload, 12, rr_count, allow_truncated)
+        is_response
+            && dns_resource_records_payload(
+                payload,
+                12,
+                ancount + nscount + arcount,
+                allow_truncated,
+            )
     }
 
     fn dhcp_payload(payload: &[u8]) -> bool {
@@ -15512,6 +15527,24 @@ mod tests {
         dns_query_with_bad_opt_type[opt_type_offset + 1] = 0;
         assert_eq!(
             observation_for_udp_payload(&dns_query_with_bad_opt_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_answer_section = dns_query.clone();
+        dns_query_with_answer_section[7] = 1;
+        dns_query_with_answer_section.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 23,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_answer_section).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_authority_section = dns_query.clone();
+        dns_query_with_authority_section[9] = 1;
+        dns_query_with_authority_section.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 24,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_authority_section).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_tcp_payload = (dns_query.len() as u16).to_be_bytes().to_vec();
