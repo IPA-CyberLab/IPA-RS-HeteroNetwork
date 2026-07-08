@@ -4036,10 +4036,10 @@ pub mod api {
         mut offset: usize,
         allow_truncated: bool,
     ) -> Option<DnsSectionParse> {
-        let Some(name_end) = dns_resource_record_name_payload(payload, offset) else {
+        let Some(name) = dns_resource_record_name_payload(payload, offset) else {
             return None;
         };
-        offset = name_end;
+        offset = name.end;
         let Some(rr_header_end) = offset.checked_add(10) else {
             return None;
         };
@@ -4048,17 +4048,37 @@ pub mod api {
         };
         let rr_type = u16::from_be_bytes([rr_header[0], rr_header[1]]);
         let rr_class = u16::from_be_bytes([rr_header[2], rr_header[3]]);
+        let rr_ttl = u32::from_be_bytes([rr_header[4], rr_header[5], rr_header[6], rr_header[7]]);
         let rdlength = u16::from_be_bytes([rr_header[8], rr_header[9]]) as usize;
         let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
             return None;
         };
-        if rr_type == 0 || !dns_resource_record_class_payload(rr_type, rr_class) {
+        if rr_type == 0
+            || !dns_resource_record_header_payload(rr_type, rr_class, rr_ttl, name.labels)
+        {
             return None;
         }
         if rr_end > payload.len() {
             return allow_truncated.then_some(DnsSectionParse::Truncated);
         }
         Some(DnsSectionParse::Complete(rr_end))
+    }
+
+    fn dns_resource_record_header_payload(
+        rr_type: u16,
+        rr_class: u16,
+        rr_ttl: u32,
+        owner_labels: usize,
+    ) -> bool {
+        if rr_type == 41 {
+            let edns_version = ((rr_ttl >> 16) & 0xff) as u8;
+            let edns_flags = (rr_ttl & 0xffff) as u16;
+            return owner_labels == 0
+                && dns_resource_record_class_payload(rr_type, rr_class)
+                && edns_version == 0
+                && edns_flags & !0x8000 == 0;
+        }
+        dns_resource_record_class_payload(rr_type, rr_class)
     }
 
     fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
@@ -4073,8 +4093,8 @@ pub mod api {
         dns_name_payload_with_root(payload, offset, false)
     }
 
-    fn dns_resource_record_name_payload(payload: &[u8], offset: usize) -> Option<usize> {
-        dns_name_payload_with_root(payload, offset, true)
+    fn dns_resource_record_name_payload(payload: &[u8], offset: usize) -> Option<DnsNameParse> {
+        dns_name_payload_inner(payload, offset, 0)
     }
 
     fn dns_name_payload_with_root(
@@ -15523,6 +15543,13 @@ mod tests {
             observation_for_udp_payload(&dns_query_with_opt).application(),
             api::AgentPacketFlowApplication::Dns
         );
+        let opt_type_offset = dns_query.len() + 1;
+        let mut dns_query_with_do_opt = dns_query_with_opt.clone();
+        dns_query_with_do_opt[opt_type_offset + 6] = 0x80;
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_do_opt).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
         let mut missing_dns_query_additional = dns_query.clone();
         missing_dns_query_additional[11] = 1;
         assert_eq!(
@@ -15530,7 +15557,6 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_query_with_bad_opt_type = dns_query_with_opt.clone();
-        let opt_type_offset = dns_query.len() + 1;
         dns_query_with_bad_opt_type[opt_type_offset] = 0;
         dns_query_with_bad_opt_type[opt_type_offset + 1] = 0;
         assert_eq!(
@@ -15542,6 +15568,27 @@ mod tests {
         dns_query_with_bad_opt_size[opt_type_offset + 3] = 0x01;
         assert_eq!(
             observation_for_udp_payload(&dns_query_with_bad_opt_size).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_bad_opt_version = dns_query_with_opt.clone();
+        dns_query_with_bad_opt_version[opt_type_offset + 5] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_bad_opt_version).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_bad_opt_flags = dns_query_with_opt.clone();
+        dns_query_with_bad_opt_flags[opt_type_offset + 7] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_bad_opt_flags).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_named_opt = dns_query.clone();
+        dns_query_with_named_opt[11] = 1;
+        dns_query_with_named_opt.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_named_opt).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_query_with_answer_section = dns_query.clone();
