@@ -773,20 +773,27 @@ where
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
         self.validate_heartbeat_path_relay_shape(&request)?;
-        if request
-            .path_state
-            .iter()
-            .any(|path| path.selected_state == PathState::Relay)
-        {
-            let nodes = self.store.list_nodes().await?;
-            let health_by_node = self.health_by_node(&nodes).await?;
-            self.validate_heartbeat_path_relay_eligibility(
-                &request,
-                &node,
-                &nodes,
-                &health_by_node,
-                now,
-            )?;
+        let path_nodes = if request.path_state.is_empty() {
+            None
+        } else {
+            Some(self.store.list_nodes().await?)
+        };
+        if let Some(nodes) = path_nodes.as_ref() {
+            self.validate_heartbeat_path_peers_registered(&request, nodes)?;
+            if request
+                .path_state
+                .iter()
+                .any(|path| path.selected_state == PathState::Relay)
+            {
+                let health_by_node = self.health_by_node(nodes).await?;
+                self.validate_heartbeat_path_relay_eligibility(
+                    &request,
+                    &node,
+                    nodes,
+                    &health_by_node,
+                    now,
+                )?;
+            }
         }
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
@@ -1178,6 +1185,29 @@ where
                     });
                 }
                 (_, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_heartbeat_path_peers_registered(
+        &self,
+        request: &HeartbeatRequest,
+        nodes: &[NodeRecord],
+    ) -> Result<(), ControlPlaneError> {
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        for path in &request.path_state {
+            if !node_ids.contains(&path.key.remote) {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} remote node is not registered",
+                        path.key.local, path.key.remote
+                    ),
+                });
             }
         }
         Ok(())
@@ -3440,7 +3470,10 @@ mod tests {
         let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(config, store.clone());
         plane
-            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
         let reported_at = Utc::now();
         let health = NodeHealth {
@@ -4054,6 +4087,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_rejects_path_state_for_unregistered_peer_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![path("node-a", "node-b")],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("remote node is not registered")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_rejects_future_path_state_before_persistence(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -4391,7 +4468,10 @@ mod tests {
             .register_with_claims(relay_claims, relay_request)
             .await?;
         plane
-            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
 
         let result = plane
@@ -4535,7 +4615,10 @@ mod tests {
             ))
             .await?;
         plane
-            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
 
         let result = plane
@@ -4620,7 +4703,10 @@ mod tests {
             ))
             .await?;
         plane
-            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
 
         let response = plane
@@ -4689,7 +4775,10 @@ mod tests {
             ))
             .await?;
         plane
-            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
 
         let response = plane
