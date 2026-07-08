@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1709,6 +1709,12 @@ fn validate_advertised_routes_shape(node_id: &NodeId, routes: &[Route]) -> Resul
                 route.id
             ));
         }
+        if let Some(reason) = restricted_advertised_route_cidr_reason(&route.cidr) {
+            return Err(format!(
+                "route {} must not include {reason} CIDR {}",
+                route.id, route.cidr
+            ));
+        }
         let canonical = route.cidr.trunc();
         if route.cidr != canonical {
             return Err(format!(
@@ -1724,6 +1730,82 @@ fn validate_advertised_routes_shape(node_id: &NodeId, routes: &[Route]) -> Resul
         }
     }
     Ok(())
+}
+
+fn restricted_advertised_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        IpNet::V4(network) => restricted_advertised_ipv4_route_cidr_reason(network),
+        IpNet::V6(network) => restricted_advertised_ipv6_route_cidr_reason(network),
+    }
+}
+
+fn restricted_advertised_ipv4_route_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_advertised_ipv6_route_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 fn validate_advertised_route_id(id: &str) -> Result<(), String> {
@@ -2533,6 +2615,18 @@ mod tests {
             (
                 vec![route("route-noncanonical", "10.42.1.1/24", "node-a")?],
                 "must use canonical CIDR 10.42.1.0/24",
+            ),
+            (
+                vec![route("route-unrestricted", "0.0.0.0/0", "node-a")?],
+                "must not include unrestricted CIDR 0.0.0.0/0",
+            ),
+            (
+                vec![route("route-loopback", "127.0.0.0/8", "node-a")?],
+                "must not include loopback CIDR 127.0.0.0/8",
+            ),
+            (
+                vec![route("route-ipv6-link-local", "fe80::/10", "node-a")?],
+                "must not include link-local CIDR fe80::/10",
             ),
             (
                 vec![zero_metric],
