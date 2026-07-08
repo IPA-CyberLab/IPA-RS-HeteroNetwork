@@ -6216,22 +6216,14 @@ pub mod api {
         if line.is_empty() {
             return false;
         }
-        if ascii_starts_with_ignore_case(line, b"* OK")
-            || ascii_starts_with_ignore_case(line, b"* PREAUTH")
-            || ascii_starts_with_ignore_case(line, b"* BYE")
-        {
-            return ascii_contains_ignore_case(line, b"IMAP");
+        if imap_server_response_line(line) {
+            return true;
         }
 
         let Some((tag, rest)) = split_ascii_token(line) else {
             return false;
         };
-        if tag.is_empty()
-            || tag.len() > 32
-            || !tag
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
-        {
+        if !imap_tag(tag) {
             return false;
         }
         let Some((command, tail)) = split_ascii_token(trim_ascii_space(rest)) else {
@@ -6244,6 +6236,172 @@ pub mod api {
             return imap_known_uid_command(uid_command);
         }
         imap_known_command(command)
+    }
+
+    fn imap_server_response_line(line: &[u8]) -> bool {
+        if line.len() > 1024 {
+            return false;
+        }
+        let Some((first, rest)) = split_ascii_token(line) else {
+            return false;
+        };
+        if first == b"*" {
+            return imap_untagged_response_line(trim_ascii_space(rest));
+        }
+        if !imap_tag(first) {
+            return false;
+        }
+        let Some((status, text_tail)) = split_ascii_token(trim_ascii_space(rest)) else {
+            return false;
+        };
+        imap_status_atom(status) && imap_response_text(trim_ascii_space(text_tail))
+    }
+
+    fn imap_untagged_response_line(line: &[u8]) -> bool {
+        let Some((atom, text_tail)) = split_ascii_token(line) else {
+            return false;
+        };
+        if atom.eq_ignore_ascii_case(b"CAPABILITY") {
+            return imap_capability_list(trim_ascii_space(text_tail));
+        }
+        if atom.eq_ignore_ascii_case(b"OK")
+            || atom.eq_ignore_ascii_case(b"PREAUTH")
+            || atom.eq_ignore_ascii_case(b"BYE")
+        {
+            let text = trim_ascii_space(text_tail);
+            return ascii_contains_ignore_case(text, b"IMAP") || imap_response_text(text);
+        }
+        false
+    }
+
+    fn imap_response_text(text: &[u8]) -> bool {
+        if text.is_empty() || text.len() > 512 || !imap_printable_text(text) {
+            return false;
+        }
+        if ascii_contains_ignore_case(text, b"IMAP4rev1")
+            || ascii_contains_ignore_case(text, b"IMAP4rev2")
+        {
+            return true;
+        }
+        imap_bracketed_response_code(text) || imap_command_completion_text(text)
+    }
+
+    fn imap_bracketed_response_code(text: &[u8]) -> bool {
+        if text.first() != Some(&b'[') {
+            return false;
+        }
+        let Some(close) = text.iter().position(|byte| *byte == b']') else {
+            return false;
+        };
+        let code = trim_ascii_space(&text[1..close]);
+        let Some((atom, tail)) = split_ascii_token(code) else {
+            return false;
+        };
+        if atom.eq_ignore_ascii_case(b"CAPABILITY") {
+            return imap_capability_list(trim_ascii_space(tail));
+        }
+        imap_known_response_code(atom)
+    }
+
+    fn imap_command_completion_text(text: &[u8]) -> bool {
+        let Some((command, tail)) = split_ascii_token(text) else {
+            return false;
+        };
+        if !imap_known_command(command) {
+            return false;
+        }
+        let Some((completion, _)) = split_ascii_token(trim_ascii_space(tail)) else {
+            return false;
+        };
+        completion.eq_ignore_ascii_case(b"completed")
+            || completion.eq_ignore_ascii_case(b"done")
+            || completion.eq_ignore_ascii_case(b"failed")
+    }
+
+    fn imap_capability_list(text: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut saw_imap = false;
+        let mut count = 0_usize;
+        let text = trim_ascii_space(text);
+        while offset < text.len() {
+            let rest = trim_ascii_space(&text[offset..]);
+            if rest.is_empty() {
+                break;
+            }
+            let Some((capability, tail)) = split_ascii_token(rest) else {
+                return false;
+            };
+            count += 1;
+            if count > 64 || !imap_capability_token(capability) {
+                return false;
+            }
+            saw_imap |= capability.eq_ignore_ascii_case(b"IMAP4rev1")
+                || capability.eq_ignore_ascii_case(b"IMAP4rev2");
+            offset = text.len().saturating_sub(tail.len());
+        }
+        saw_imap
+    }
+
+    fn imap_status_atom(atom: &[u8]) -> bool {
+        atom.eq_ignore_ascii_case(b"OK")
+            || atom.eq_ignore_ascii_case(b"NO")
+            || atom.eq_ignore_ascii_case(b"BAD")
+    }
+
+    fn imap_known_response_code(atom: &[u8]) -> bool {
+        atom.eq_ignore_ascii_case(b"ALERT")
+            || atom.eq_ignore_ascii_case(b"BADCHARSET")
+            || atom.eq_ignore_ascii_case(b"PARSE")
+            || atom.eq_ignore_ascii_case(b"PERMANENTFLAGS")
+            || atom.eq_ignore_ascii_case(b"READ-ONLY")
+            || atom.eq_ignore_ascii_case(b"READ-WRITE")
+            || atom.eq_ignore_ascii_case(b"TRYCREATE")
+            || atom.eq_ignore_ascii_case(b"UIDNEXT")
+            || atom.eq_ignore_ascii_case(b"UIDVALIDITY")
+            || atom.eq_ignore_ascii_case(b"APPENDUID")
+            || atom.eq_ignore_ascii_case(b"COPYUID")
+            || atom.eq_ignore_ascii_case(b"UIDNOTSTICKY")
+            || atom.eq_ignore_ascii_case(b"UNAVAILABLE")
+            || atom.eq_ignore_ascii_case(b"AUTHENTICATIONFAILED")
+            || atom.eq_ignore_ascii_case(b"AUTHORIZATIONFAILED")
+            || atom.eq_ignore_ascii_case(b"EXPIRED")
+            || atom.eq_ignore_ascii_case(b"PRIVACYREQUIRED")
+            || atom.eq_ignore_ascii_case(b"CONTACTADMIN")
+            || atom.eq_ignore_ascii_case(b"NOPERM")
+            || atom.eq_ignore_ascii_case(b"INUSE")
+            || atom.eq_ignore_ascii_case(b"EXPUNGEISSUED")
+            || atom.eq_ignore_ascii_case(b"CORRUPTION")
+            || atom.eq_ignore_ascii_case(b"SERVERBUG")
+            || atom.eq_ignore_ascii_case(b"CLIENTBUG")
+            || atom.eq_ignore_ascii_case(b"CANNOT")
+            || atom.eq_ignore_ascii_case(b"LIMIT")
+            || atom.eq_ignore_ascii_case(b"OVERQUOTA")
+            || atom.eq_ignore_ascii_case(b"ALREADYEXISTS")
+            || atom.eq_ignore_ascii_case(b"NONEXISTENT")
+            || atom.eq_ignore_ascii_case(b"NOTSAVED")
+            || atom.eq_ignore_ascii_case(b"HASCHILDREN")
+            || atom.eq_ignore_ascii_case(b"CLOSED")
+    }
+
+    fn imap_tag(tag: &[u8]) -> bool {
+        !tag.is_empty()
+            && tag.len() <= 32
+            && tag
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+    }
+
+    fn imap_capability_token(token: &[u8]) -> bool {
+        !token.is_empty()
+            && token.len() <= 128
+            && token
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(*byte, b'(' | b')' | b'[' | b']'))
+    }
+
+    fn imap_printable_text(text: &[u8]) -> bool {
+        text.iter()
+            .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
     }
 
     fn imap_known_command(command: &[u8]) -> bool {
@@ -16037,11 +16195,45 @@ mod tests {
             api::AgentPacketFlowApplication::Imap
         );
         assert_eq!(
+            observation_for_payload(b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
+            observation_for_payload(b"A001 OK [READ-WRITE] SELECT completed\r\n").application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
+            observation_for_payload(b"A002 NO [AUTHENTICATIONFAILED] Authentication failed\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
+            observation_for_payload(b"A003 OK LOGIN completed\r\n").application(),
+            api::AgentPacketFlowApplication::Imap
+        );
+        assert_eq!(
             observation_for_payload(b"A001 UID FETCH 42 BODY[]\r\n").application(),
             api::AgentPacketFlowApplication::Imap
         );
         assert_eq!(
             observation_for_payload(b"* OK ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"* CAPABILITY STARTTLS AUTH=PLAIN IDLE\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"A001 OK completed\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"A001 OK [UNKNOWN] completed\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"* FLAGS (\\Seen \\Answered)\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
