@@ -582,6 +582,12 @@ pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
     let mut seen_routes = BTreeSet::new();
     for route in &plan.routes {
         validate_route_id(&route.id).map_err(invalid_route_plan)?;
+        if route.metric == 0 {
+            return Err(invalid_route_plan(format!(
+                "route {} metric must be greater than zero",
+                route.id
+            )));
+        }
         if let Some(reason) = restricted_route_cidr_reason(&route.cidr) {
             return Err(invalid_route_plan(format!(
                 "route {} must not include {reason} CIDR {}",
@@ -2614,6 +2620,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("route ID exceeds 128 bytes"));
+
+        let mut zero_metric = route_plan()?;
+        zero_metric.routes[0].metric = 0;
+        let error = match manager.apply_routes(zero_metric).await {
+            Ok(()) => return Err("zero metric route should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidRoutePlan(ref message)
+                if message.contains("route route-a metric must be greater than zero")
+        ));
 
         let selector_cases = [
             (
