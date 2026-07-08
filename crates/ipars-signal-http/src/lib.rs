@@ -462,6 +462,10 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 format!("health report for node {node_id} is invalid: {reason}"),
             ),
+            Self::Signal(SignalError::NatClassificationInvalid { node_id, reason }) => (
+                StatusCode::BAD_REQUEST,
+                format!("NAT classification for node {node_id} is invalid: {reason}"),
+            ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
         };
         (status, Json(ErrorResponse { error })).into_response()

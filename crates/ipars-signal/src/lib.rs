@@ -45,6 +45,11 @@ pub enum SignalError {
         node_id: NodeId,
         reason: &'static str,
     },
+    #[error("NAT classification for node {node_id} is invalid: {reason}")]
+    NatClassificationInvalid {
+        node_id: NodeId,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -124,6 +129,9 @@ impl SignalRegistry {
         if let Some(health) = health.as_ref() {
             validate_health_report(&node.node_id, health, registered_at)?;
         }
+        if let Some(classification) = nat_classification.as_ref() {
+            validate_nat_classification(&node.node_id, classification, registered_at)?;
+        }
         normalize_relay_capability(&mut node);
         match nat_classification {
             Some(classification) => {
@@ -173,6 +181,9 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
         validate_endpoint_candidates(&request.source, &request.source_candidates, now)?;
+        if let Some(classification) = request.source_nat_classification.as_ref() {
+            validate_nat_classification(&request.source, classification, now)?;
+        }
         let target = self
             .get_node(&request.target)
             .await
@@ -787,6 +798,58 @@ fn validate_health_report(
                 reason: "relay_load must be a finite value between 0 and 1",
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_nat_classification(
+    node_id: &NodeId,
+    classification: &NatClassification,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), SignalError> {
+    if !timestamp_not_after_skew(
+        classification.assessed_at,
+        now,
+        Duration::from_secs(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS),
+    ) {
+        return Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason: "assessed_at is too far in the future",
+        });
+    }
+    if !classification.confidence.is_finite() || !(0.0..=1.0).contains(&classification.confidence) {
+        return Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason: "confidence must be a finite value between 0 and 1",
+        });
+    }
+    if classification.observations.iter().any(|observation| {
+        !timestamp_not_after_skew(
+            observation.observed_at,
+            now,
+            Duration::from_secs(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS),
+        )
+    }) {
+        return Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason: "NAT probe observation timestamp is too far in the future",
+        });
+    }
+    if classification
+        .filtering_observations
+        .iter()
+        .any(|observation| {
+            !timestamp_not_after_skew(
+                observation.observed_at,
+                now,
+                Duration::from_secs(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS),
+            )
+        })
+    {
+        return Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason: "NAT filtering observation timestamp is too far in the future",
+        });
     }
     Ok(())
 }
@@ -2548,6 +2611,62 @@ mod tests {
                 .await
                 .is_none());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_invalid_nat_classifications() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut future = coordinated_hole_punch_nat(0.9);
+        future.assessed_at = Utc::now() + chrono::Duration::seconds(301);
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(future))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "assessed_at is too far in the future",
+                ..
+            })
+        ));
+        assert!(registry
+            .get_node(&NodeId::from_string("node-a"))
+            .await
+            .is_none());
+
+        let mut invalid_confidence = coordinated_hole_punch_nat(f32::NAN);
+        invalid_confidence.assessed_at = Utc::now();
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(invalid_confidence))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "confidence must be a finite value between 0 and 1",
+                ..
+            })
+        ));
+
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        let mut future_request_nat = coordinated_hole_punch_nat(0.9);
+        future_request_nat.assessed_at = Utc::now() + chrono::Duration::seconds(301);
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id,
+                    target: target.node_id,
+                    source_candidates: Vec::new(),
+                    source_nat_classification: Some(future_request_nat),
+                    desired_routes: Vec::new(),
+                })
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "assessed_at is too far in the future",
+                ..
+            })
+        ));
         Ok(())
     }
 
