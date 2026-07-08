@@ -1198,7 +1198,9 @@ impl IntoResponse for ApiError {
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
             | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AgentError::PathProbeRejected(_) => StatusCode::BAD_REQUEST,
+            AgentError::PathProbeRejected(_) | AgentError::PathStateRejected(_) => {
+                StatusCode::BAD_REQUEST
+            }
             AgentError::MissingPeer(_) | AgentError::PeerMapUnavailable(_) => StatusCode::NOT_FOUND,
         };
         (
@@ -1690,7 +1692,8 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         let forwarder_metrics = Arc::new(RelayForwarderStats::new(
             NodeId::from_string("peer-a"),
             NodeId::from_string("relay-a"),

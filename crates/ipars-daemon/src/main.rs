@@ -9594,7 +9594,7 @@ async fn negotiate_signal_paths(
             )
             .await;
         }
-        runtime.upsert_path_state(record).await;
+        runtime.upsert_path_state(record).await?;
     }
     Ok(())
 }
@@ -24000,7 +24000,7 @@ exec sleep 60
             updated_at: Utc::now(),
             pinned: false,
         };
-        runtime.upsert_path_state(path.clone()).await;
+        runtime.upsert_path_state(path.clone()).await?;
 
         let identity = runtime.state().identity_key_pair()?;
         let advertised_route = Route {
@@ -24276,7 +24276,10 @@ exec sleep 60
             updated_at: Utc::now() - ChronoDuration::seconds(10),
             pinned: false,
         };
-        runtime.upsert_path_state(current).await;
+        runtime
+            .upsert_path_state(current)
+            .await
+            .expect("valid relay path state should be stored");
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -24336,7 +24339,8 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         let candidate_record = PathRecord {
             key: PeerPathKey::new(local, peer),
             selected_state: PathState::DirectNatTraversal,
@@ -24382,7 +24386,8 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -24440,7 +24445,8 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         let candidate_record = PathRecord {
             key: PeerPathKey::new(local, peer),
             selected_state: PathState::DirectNatTraversal,

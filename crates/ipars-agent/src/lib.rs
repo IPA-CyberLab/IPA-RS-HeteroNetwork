@@ -93,6 +93,8 @@ pub enum AgentError {
     WireGuard(String),
     #[error("path probe rejected: {0}")]
     PathProbeRejected(String),
+    #[error("path state rejected: {0}")]
+    PathStateRejected(String),
     #[error("peer path does not exist: {0}")]
     MissingPeer(NodeId),
     #[error("peer map has not been synced for node {0}")]
@@ -1487,12 +1489,14 @@ impl AgentRuntime {
             updated_at: recorded_at,
             pinned: request.pin,
         };
+        self.upsert_path_state(path.clone()).await?;
         self.path_probe_record_count.fetch_add(1, Ordering::Relaxed);
-        self.upsert_path_state(path.clone()).await;
         Ok(path)
     }
 
-    pub async fn upsert_path_state(&self, record: PathRecord) {
+    pub async fn upsert_path_state(&self, record: PathRecord) -> Result<(), AgentError> {
+        let local_node = self.state().node_id;
+        validate_path_record(&record, &local_node)?;
         let remote = record.key.remote.clone();
         let selected_state = record.selected_state;
         let previous = self.path_state.write().await.insert(
@@ -1515,6 +1519,7 @@ impl AgentRuntime {
         if selected_state != PathState::Relay {
             self.remove_relay_session(&remote).await;
         }
+        Ok(())
     }
 
     pub async fn upsert_relay_session(&self, session: RelaySessionState) {
@@ -2019,73 +2024,112 @@ fn validate_path_probe_request(
         .validate()
         .map_err(|error| AgentError::PathProbeRejected(error.to_string()))?;
 
-    match request.selected_state {
+    validate_path_state_shape(
+        local_node,
+        &request.peer,
+        request.selected_state,
+        request.selected_candidate.as_ref(),
+        request.relay_node.as_ref(),
+        "path probe",
+    )
+    .map_err(AgentError::PathProbeRejected)
+}
+
+fn validate_path_record(record: &PathRecord, local_node: &NodeId) -> Result<(), AgentError> {
+    if &record.key.local != local_node {
+        return Err(AgentError::PathStateRejected(format!(
+            "path state local node {} does not match runtime node {}",
+            record.key.local, local_node
+        )));
+    }
+    if &record.key.remote == local_node {
+        return Err(AgentError::PathStateRejected(
+            "path state remote node must not be the runtime node".to_string(),
+        ));
+    }
+    validate_path_state_shape(
+        local_node,
+        &record.key.remote,
+        record.selected_state,
+        record.selected_candidate.as_ref(),
+        record.relay_node.as_ref(),
+        "path state",
+    )
+    .map_err(AgentError::PathStateRejected)
+}
+
+fn validate_path_state_shape(
+    local_node: &NodeId,
+    peer: &NodeId,
+    selected_state: PathState,
+    selected_candidate: Option<&EndpointCandidate>,
+    relay_node: Option<&NodeId>,
+    context: &'static str,
+) -> Result<(), String> {
+    match selected_state {
         PathState::Relay => {
-            if request.selected_candidate.is_some() {
-                return Err(AgentError::PathProbeRejected(
-                    "relay path probe must not carry a direct selected candidate".to_string(),
+            if selected_candidate.is_some() {
+                return Err(format!(
+                    "relay {context} must not carry a direct selected candidate"
                 ));
             }
-            let relay_node = request.relay_node.as_ref().ok_or_else(|| {
-                AgentError::PathProbeRejected("relay path probe requires --relay-node".to_string())
+            let relay_node = relay_node.ok_or_else(|| {
+                if context == "path probe" {
+                    "relay path probe requires --relay-node".to_string()
+                } else {
+                    format!("relay {context} requires a relay node")
+                }
             })?;
-            if relay_node == local_node || relay_node == &request.peer {
-                return Err(AgentError::PathProbeRejected(format!(
-                    "relay path probe uses endpoint {relay_node} as relay"
-                )));
+            if relay_node == local_node || relay_node == peer {
+                return Err(format!(
+                    "relay {context} uses endpoint {relay_node} as relay"
+                ));
             }
         }
         PathState::Unreachable => {
-            if request.selected_candidate.is_some() {
-                return Err(AgentError::PathProbeRejected(
-                    "unreachable path probe must not carry a selected candidate".to_string(),
+            if selected_candidate.is_some() {
+                return Err(format!(
+                    "unreachable {context} must not carry a selected candidate"
                 ));
             }
-            if request.relay_node.is_some() {
-                return Err(AgentError::PathProbeRejected(
-                    "unreachable path probe must not carry a relay node".to_string(),
-                ));
+            if relay_node.is_some() {
+                return Err(format!("unreachable {context} must not carry a relay node"));
             }
         }
         PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
-            if request.relay_node.is_some() {
-                return Err(AgentError::PathProbeRejected(
-                    "direct path probe must not carry a relay node".to_string(),
-                ));
+            if relay_node.is_some() {
+                return Err(format!("direct {context} must not carry a relay node"));
             }
         }
     }
 
-    let Some(candidate) = request.selected_candidate.as_ref() else {
+    let Some(candidate) = selected_candidate else {
         return Ok(());
     };
-    if candidate.node_id != request.peer {
-        return Err(AgentError::PathProbeRejected(format!(
+    if &candidate.node_id != peer {
+        return Err(format!(
             "selected candidate belongs to node {} instead of path peer {}",
-            candidate.node_id, request.peer
-        )));
+            candidate.node_id, peer
+        ));
     }
     if let Err(reason) = candidate.validate_kind_address() {
-        return Err(AgentError::PathProbeRejected(format!(
+        return Err(format!(
             "selected candidate {:?} at {} is invalid: {reason}",
             candidate.kind, candidate.addr
-        )));
+        ));
     }
     if !endpoint_addr_is_usable(candidate.addr) {
-        return Err(AgentError::PathProbeRejected(format!(
+        return Err(format!(
             "selected candidate {:?} at {} is unusable",
             candidate.kind, candidate.addr
-        )));
+        ));
     }
-    if request.selected_state.is_direct()
-        && !request
-            .selected_state
-            .allows_selected_candidate_kind(candidate.kind)
+    if selected_state.is_direct() && !selected_state.allows_selected_candidate_kind(candidate.kind)
     {
-        return Err(AgentError::PathProbeRejected(format!(
-            "path probe selected state {:?} does not allow selected candidate kind {:?}",
-            request.selected_state, candidate.kind
-        )));
+        return Err(format!(
+            "{context} selected state {:?} does not allow selected candidate kind {:?}",
+            selected_state, candidate.kind
+        ));
     }
     Ok(())
 }
@@ -3991,7 +4035,7 @@ mod tests {
             key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string(peer)),
             selected_state: state,
             selected_candidate: None,
-            relay_node: None,
+            relay_node: (state == PathState::Relay).then(|| NodeId::from_string("relay-a")),
             score: PathScore {
                 value: score,
                 reasons: Vec::new(),
@@ -4770,15 +4814,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_endpoint_resolver_falls_back_when_selected_candidate_is_unusable(
+    async fn runtime_rejects_unusable_path_state_candidate(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = Arc::new(AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
-        ));
+        );
         let local_id = runtime.state().node_id.clone();
         let peer_id = NodeId::from_string("peer-a");
-        runtime
+        let error = runtime
             .upsert_path_state(PathRecord {
                 key: PeerPathKey::new(local_id, peer_id.clone()),
                 selected_state: PathState::DirectPublic,
@@ -4799,29 +4843,46 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await;
-        let peer = peer_record(
-            peer_id,
-            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
-            "wg-peer-a",
-            vec![EndpointCandidate {
-                node_id: NodeId::from_string("peer-a"),
-                kind: EndpointCandidateKind::PublicUdp,
-                addr: SocketAddr::from(([203, 0, 113, 20], 51820)),
-                observed_at: Utc::now(),
-                priority: 100,
-                cost: 10,
-                source: CandidateSource::ControlPlane,
-            }],
-            Vec::new(),
-        );
+            .await
+            .expect_err("unusable selected candidate should be rejected");
 
-        let endpoint = RuntimePeerEndpointResolver::new(runtime)
-            .endpoint_for_peer(&peer)
-            .await?;
-
-        assert_eq!(endpoint.as_deref(), Some("203.0.113.20:51820"));
+        assert!(matches!(error, AgentError::PathStateRejected(_)));
+        assert!(error.to_string().contains("selected candidate"));
+        assert!(error.to_string().contains("is unusable"));
+        assert!(runtime.path_state().await.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_path_state_not_owned_by_local_node() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let record = PathRecord {
+            key: PeerPathKey::new(
+                NodeId::from_string("other-local"),
+                NodeId::from_string("peer-a"),
+            ),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore {
+                value: 115.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let error = runtime
+            .upsert_path_state(record)
+            .await
+            .expect_err("path state owned by another node should be rejected");
+
+        assert!(matches!(error, AgentError::PathStateRejected(_)));
+        assert!(error.to_string().contains("does not match runtime node"));
+        assert!(runtime.path_state().await.is_empty());
     }
 
     #[tokio::test]
@@ -4830,11 +4891,20 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
-        let first = path("peer-a", PathState::Relay, 70.0);
-        let latest = path("peer-a", PathState::DirectPublic, 115.0);
+        let local = runtime.state().node_id;
+        let mut first = path("peer-a", PathState::Relay, 70.0);
+        first.key.local = local.clone();
+        let mut latest = path("peer-a", PathState::DirectPublic, 115.0);
+        latest.key.local = local;
 
-        runtime.upsert_path_state(first).await;
-        runtime.upsert_path_state(latest.clone()).await;
+        runtime
+            .upsert_path_state(first)
+            .await
+            .expect("valid first path state should be stored");
+        runtime
+            .upsert_path_state(latest.clone())
+            .await
+            .expect("valid latest path state should be stored");
 
         assert_eq!(runtime.path_state().await, vec![latest]);
     }
@@ -4879,7 +4949,8 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid direct path state should be stored");
 
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
@@ -4891,11 +4962,23 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
-        let first = path("peer-a", PathState::Relay, 70.0);
-        let latest = path("peer-a", PathState::DirectPublic, 115.0);
-        runtime.upsert_path_state(first.clone()).await;
-        runtime.upsert_path_state(first.clone()).await;
-        runtime.upsert_path_state(latest.clone()).await;
+        let local = runtime.state().node_id;
+        let mut first = path("peer-a", PathState::Relay, 70.0);
+        first.key.local = local.clone();
+        let mut latest = path("peer-a", PathState::DirectPublic, 115.0);
+        latest.key.local = local;
+        runtime
+            .upsert_path_state(first.clone())
+            .await
+            .expect("valid first path state should be stored");
+        runtime
+            .upsert_path_state(first.clone())
+            .await
+            .expect("duplicate unchanged path state should be accepted");
+        runtime
+            .upsert_path_state(latest.clone())
+            .await
+            .expect("valid latest path state should be stored");
 
         let events = runtime.path_change_events().await;
         assert_eq!(events.len(), 2);
@@ -5352,7 +5435,8 @@ mod tests {
                 updated_at: now,
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -6485,7 +6569,8 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await;
+            .await
+            .expect("valid relay path state should be stored");
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer_id.clone(),
