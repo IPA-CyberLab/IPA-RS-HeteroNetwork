@@ -990,6 +990,19 @@ where
                     ),
                 });
             }
+            if !timestamp_not_after_skew(
+                path.updated_at,
+                now,
+                self.config.heartbeat_signature_max_age,
+            ) {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} updated_at {} is too far in the future",
+                        path.key.local, path.key.remote, path.updated_at
+                    ),
+                });
+            }
             if path.key.local != request.node_id {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
@@ -1438,6 +1451,17 @@ fn timestamp_within_skew(
         return false;
     };
     timestamp >= now - max_skew && timestamp <= now + max_skew
+}
+
+fn timestamp_not_after_skew(
+    timestamp: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    max_skew: Duration,
+) -> bool {
+    let Ok(max_skew) = chrono::Duration::from_std(max_skew) else {
+        return false;
+    };
+    timestamp <= now + max_skew
 }
 
 fn relay_candidate_allowed(
@@ -3783,6 +3807,55 @@ mod tests {
             result,
             Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
                 if reason.contains("is repeated in heartbeat path_state")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_future_path_state_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let signed_at = Utc::now();
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.updated_at = signed_at + Duration::seconds(301);
+
+        let result = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: signed_at,
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+                signed_at,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("updated_at")
+                    && reason.contains("too far in the future")
         ));
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
