@@ -957,6 +957,12 @@ where
             });
         }
         if let Some(routes) = request.routes.as_ref() {
+            validate_advertised_routes_shape(&request.node_id, routes).map_err(|reason| {
+                ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                }
+            })?;
             for route in routes {
                 if route.advertised_by != request.node_id {
                     return Err(ControlPlaneError::NodeUpdateRejected {
@@ -1667,6 +1673,12 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
             ),
         });
     }
+    validate_advertised_routes_shape(&request.node_id, &request.requested_routes).map_err(
+        |reason| ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason,
+        },
+    )?;
     if let Some(route) = request
         .requested_routes
         .iter()
@@ -1679,6 +1691,58 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
                 route.id, route.advertised_by, request.node_id
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_advertised_routes_shape(node_id: &NodeId, routes: &[Route]) -> Result<(), String> {
+    let mut seen_route_ids = BTreeSet::new();
+    let mut seen_route_cidrs = BTreeSet::new();
+    for route in routes {
+        validate_advertised_route_id(&route.id)?;
+        if !seen_route_ids.insert(route.id.as_str()) {
+            return Err(format!("route list must not repeat route ID {}", route.id));
+        }
+        if route.metric == 0 {
+            return Err(format!(
+                "route {} metric must be greater than zero",
+                route.id
+            ));
+        }
+        let canonical = route.cidr.trunc();
+        if route.cidr != canonical {
+            return Err(format!(
+                "route {} must use canonical CIDR {canonical}, not {}",
+                route.id, route.cidr
+            ));
+        }
+        if !seen_route_cidrs.insert(route.cidr) {
+            return Err(format!(
+                "route list for node {node_id} must not repeat CIDR {}",
+                route.cidr
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_advertised_route_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("route ID cannot be empty".to_string());
+    }
+    if id.len() > 128 {
+        return Err("route ID exceeds 128 bytes".to_string());
+    }
+    if matches!(id, "." | "..") {
+        return Err("route ID must not be '.' or '..'".to_string());
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(
+            "route ID must contain only ASCII letters, digits, '.', '_', ':' or '-'".to_string(),
+        );
     }
     Ok(())
 }
@@ -2427,6 +2491,72 @@ mod tests {
             error,
             ControlPlaneError::NodeRegistrationRejected { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_invalid_route_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+
+        let mut zero_metric = route("route-zero-metric", "10.42.1.0/24", "node-a")?;
+        zero_metric.metric = 0;
+        let cases = vec![
+            (
+                vec![route("", "10.42.1.0/24", "node-a")?],
+                "route ID cannot be empty",
+            ),
+            (
+                vec![route("bad/route", "10.42.1.0/24", "node-a")?],
+                "route ID must contain only ASCII letters",
+            ),
+            (
+                vec![
+                    route("route-a", "10.42.1.0/24", "node-a")?,
+                    route("route-a", "10.42.2.0/24", "node-a")?,
+                ],
+                "must not repeat route ID route-a",
+            ),
+            (
+                vec![
+                    route("route-a", "10.42.1.0/24", "node-a")?,
+                    route("route-b", "10.42.1.0/24", "node-a")?,
+                ],
+                "must not repeat CIDR 10.42.1.0/24",
+            ),
+            (
+                vec![route("route-noncanonical", "10.42.1.1/24", "node-a")?],
+                "must use canonical CIDR 10.42.1.0/24",
+            ),
+            (
+                vec![zero_metric],
+                "route route-zero-metric metric must be greater than zero",
+            ),
+        ];
+
+        for (routes, expected) in cases {
+            let mut request = registration_request("node-a");
+            request.requested_routes = routes;
+            let error = match plane.register_with_claims(claims.clone(), request).await {
+                Ok(_) => return Err("unexpected successful route registration".into()),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(
+                    error,
+                    ControlPlaneError::NodeRegistrationRejected { ref reason, .. }
+                        if reason.contains(expected)
+                ),
+                "expected {expected}, got {error}"
+            );
+        }
         Ok(())
     }
 
@@ -3252,6 +3382,59 @@ mod tests {
             Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
                 if reason.contains("route route-unowned is advertised by node")
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_route_shape_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+
+        let mut zero_metric = route("route-zero-metric", "10.42.1.0/24", "node-a")?;
+        zero_metric.metric = 0;
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: Some("bad route shape".to_string()),
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![zero_metric]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("route route-zero-metric metric must be greater than zero")
+        ));
+        assert!(store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+            .routes
+            .is_empty());
         Ok(())
     }
 
