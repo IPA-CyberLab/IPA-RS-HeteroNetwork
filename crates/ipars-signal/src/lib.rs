@@ -807,6 +807,57 @@ fn validate_nat_classification(
     classification: &NatClassification,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), SignalError> {
+    validate_nat_addr(
+        node_id,
+        classification.local_addr,
+        "local address is unusable",
+    )?;
+    if let Some(observed_endpoint) = classification.observed_endpoint {
+        validate_nat_addr(node_id, observed_endpoint, "observed endpoint is unusable")?;
+    }
+    for observation in &classification.observations {
+        validate_nat_addr(
+            node_id,
+            observation.local_addr,
+            "NAT probe local address is unusable",
+        )?;
+        validate_nat_addr(
+            node_id,
+            observation.stun_server,
+            "NAT probe STUN server endpoint is unusable",
+        )?;
+        validate_nat_addr(
+            node_id,
+            observation.reflexive_addr,
+            "NAT probe reflexive endpoint is unusable",
+        )?;
+    }
+    for observation in &classification.filtering_observations {
+        validate_nat_addr(
+            node_id,
+            observation.local_addr,
+            "NAT filtering local address is unusable",
+        )?;
+        validate_nat_addr(
+            node_id,
+            observation.stun_server,
+            "NAT filtering STUN server endpoint is unusable",
+        )?;
+        if let Some(response_origin) = observation.response_origin {
+            validate_nat_addr(
+                node_id,
+                response_origin,
+                "NAT filtering response origin is unusable",
+            )?;
+        }
+        if let Some(other_address) = observation.other_address {
+            validate_nat_addr(
+                node_id,
+                other_address,
+                "NAT filtering other-address endpoint is unusable",
+            )?;
+        }
+    }
     if !timestamp_not_after_skew(
         classification.assessed_at,
         now,
@@ -852,6 +903,21 @@ fn validate_nat_classification(
         });
     }
     Ok(())
+}
+
+fn validate_nat_addr(
+    node_id: &NodeId,
+    addr: std::net::SocketAddr,
+    reason: &'static str,
+) -> Result<(), SignalError> {
+    if endpoint_addr_is_usable(addr) {
+        Ok(())
+    } else {
+        Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason,
+        })
+    }
 }
 
 fn timestamp_not_after_skew(
@@ -1130,8 +1196,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use ipars_types::{
-        CandidateSource, ClusterId, HealthState, NatMappingBehavior, NodeHealth, NodeId,
-        RelayCapability, Role, Tag, TokenPolicy, VpnIp,
+        CandidateSource, ClusterId, HealthState, NatFilteringObservation, NatFilteringProbeKind,
+        NatMappingBehavior, NatProbeObservation, NodeHealth, NodeId, RelayCapability, Role, Tag,
+        TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -2641,6 +2708,71 @@ mod tests {
                 .await,
             Err(SignalError::NatClassificationInvalid {
                 reason: "confidence must be a finite value between 0 and 1",
+                ..
+            })
+        ));
+
+        let mut invalid_local_addr = coordinated_hole_punch_nat(0.9);
+        invalid_local_addr.local_addr = SocketAddr::from(([0, 0, 0, 0], 50_000));
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(invalid_local_addr))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "local address is unusable",
+                ..
+            })
+        ));
+
+        let mut invalid_observed_endpoint = coordinated_hole_punch_nat(0.9);
+        invalid_observed_endpoint.observed_endpoint =
+            Some(SocketAddr::from(([0, 0, 0, 0], 50_000)));
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(invalid_observed_endpoint))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "observed endpoint is unusable",
+                ..
+            })
+        ));
+
+        let mut invalid_probe_observation = coordinated_hole_punch_nat(0.9);
+        invalid_probe_observation
+            .observations
+            .push(NatProbeObservation {
+                local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                stun_server: SocketAddr::from(([203, 0, 113, 20], 3478)),
+                reflexive_addr: SocketAddr::from(([224, 0, 0, 1], 50_000)),
+                observed_at: Utc::now(),
+            });
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(invalid_probe_observation))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "NAT probe reflexive endpoint is unusable",
+                ..
+            })
+        ));
+
+        let mut invalid_filtering_observation = coordinated_hole_punch_nat(0.9);
+        invalid_filtering_observation
+            .filtering_observations
+            .push(NatFilteringObservation {
+                local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+                stun_server: SocketAddr::from(([203, 0, 113, 20], 3478)),
+                probe: NatFilteringProbeKind::ChangeAddressAndPort,
+                response_origin: Some(SocketAddr::from(([255, 255, 255, 255], 3478))),
+                other_address: Some(SocketAddr::from(([203, 0, 113, 21], 3479))),
+                observed_at: Utc::now(),
+            });
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(invalid_filtering_observation))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "NAT filtering response origin is unusable",
                 ..
             })
         ));
