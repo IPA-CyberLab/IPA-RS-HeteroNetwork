@@ -3868,8 +3868,7 @@ pub mod api {
         if qdcount > 0 {
             return match dns_question_payload(payload, qdcount, allow_truncated) {
                 Some(DnsSectionParse::Complete(question_end)) => {
-                    flags & 0x8000 == 0
-                        || rr_count == 0
+                    rr_count == 0
                         || dns_resource_records_payload(
                             payload,
                             question_end,
@@ -4022,7 +4021,7 @@ pub mod api {
         mut offset: usize,
         allow_truncated: bool,
     ) -> Option<DnsSectionParse> {
-        let Some(name_end) = dns_name_payload(payload, offset) else {
+        let Some(name_end) = dns_resource_record_name_payload(payload, offset) else {
             return None;
         };
         offset = name_end;
@@ -4048,8 +4047,20 @@ pub mod api {
     }
 
     fn dns_name_payload(payload: &[u8], offset: usize) -> Option<usize> {
+        dns_name_payload_with_root(payload, offset, false)
+    }
+
+    fn dns_resource_record_name_payload(payload: &[u8], offset: usize) -> Option<usize> {
+        dns_name_payload_with_root(payload, offset, true)
+    }
+
+    fn dns_name_payload_with_root(
+        payload: &[u8],
+        offset: usize,
+        allow_root: bool,
+    ) -> Option<usize> {
         let parsed = dns_name_payload_inner(payload, offset, 0)?;
-        (parsed.labels > 0).then_some(parsed.end)
+        (allow_root || parsed.labels > 0).then_some(parsed.end)
     }
 
     fn dns_name_payload_inner(
@@ -15478,6 +15489,29 @@ mod tests {
                     [..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES - 1]
             )
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_opt = dns_query.clone();
+        dns_query_with_opt[11] = 1;
+        dns_query_with_opt.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_opt).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut missing_dns_query_additional = dns_query.clone();
+        missing_dns_query_additional[11] = 1;
+        assert_eq!(
+            observation_for_udp_payload(&missing_dns_query_additional).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_query_with_bad_opt_type = dns_query_with_opt.clone();
+        let opt_type_offset = dns_query.len() + 1;
+        dns_query_with_bad_opt_type[opt_type_offset] = 0;
+        dns_query_with_bad_opt_type[opt_type_offset + 1] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_bad_opt_type).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_tcp_payload = (dns_query.len() as u16).to_be_bytes().to_vec();
