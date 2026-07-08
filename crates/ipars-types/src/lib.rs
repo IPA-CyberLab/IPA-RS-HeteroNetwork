@@ -6105,20 +6105,22 @@ pub mod api {
         {
             return true;
         }
-        let Some((command, _)) = split_ascii_token(line) else {
+        let Some((command, rest)) = split_ascii_token(line) else {
             return false;
         };
-        pop3_known_command(command)
+        pop3_known_command(command, trim_ascii_space(rest))
     }
 
-    fn pop3_known_command(command: &[u8]) -> bool {
+    fn pop3_known_command(command: &[u8], rest: &[u8]) -> bool {
+        if command.eq_ignore_ascii_case(b"STAT") {
+            return rest.is_empty();
+        }
         command.eq_ignore_ascii_case(b"USER")
             || command.eq_ignore_ascii_case(b"PASS")
             || command.eq_ignore_ascii_case(b"APOP")
             || command.eq_ignore_ascii_case(b"AUTH")
             || command.eq_ignore_ascii_case(b"CAPA")
             || command.eq_ignore_ascii_case(b"STLS")
-            || command.eq_ignore_ascii_case(b"STAT")
             || command.eq_ignore_ascii_case(b"LIST")
             || command.eq_ignore_ascii_case(b"RETR")
             || command.eq_ignore_ascii_case(b"DELE")
@@ -9213,7 +9215,9 @@ pub mod api {
     }
 
     fn memcached_payload(payload: &[u8]) -> bool {
-        memcached_text_payload(payload) || memcached_binary_payload(payload)
+        memcached_text_payload(payload)
+            || memcached_text_response_payload(payload)
+            || memcached_binary_payload(payload)
     }
 
     fn memcached_text_payload(payload: &[u8]) -> bool {
@@ -9236,6 +9240,11 @@ pub mod api {
     }
 
     enum MemcachedTextCommandParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    enum MemcachedTextResponseParse {
         Complete(usize),
         Incomplete,
     }
@@ -9289,6 +9298,154 @@ pub mod api {
                 Some(MemcachedTextCommandParse::Complete(frame_end))
             }
         }
+    }
+
+    fn memcached_text_response_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut response_count = 0_usize;
+        while offset < payload.len() {
+            match memcached_text_response(payload, offset) {
+                Some(MemcachedTextResponseParse::Complete(next_offset)) => {
+                    response_count += 1;
+                    if response_count > 64 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MemcachedTextResponseParse::Incomplete) => {
+                    return response_count > 0
+                        || payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+                }
+                None => return false,
+            }
+        }
+        response_count > 0
+    }
+
+    fn memcached_text_response(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<MemcachedTextResponseParse> {
+        let (line, line_end) = match memcached_text_line(payload, offset, 4096)? {
+            MemcachedTextLineParse::Complete { line, next_offset } => (line, next_offset),
+            MemcachedTextLineParse::Incomplete => {
+                return Some(MemcachedTextResponseParse::Incomplete)
+            }
+        };
+        let fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let first = *fields.first()?;
+
+        if memcached_simple_text_response(&fields) {
+            return Some(MemcachedTextResponseParse::Complete(line_end));
+        }
+        if first.eq_ignore_ascii_case(b"VALUE") {
+            return memcached_value_response(payload, line_end, &fields);
+        }
+        if first.eq_ignore_ascii_case(b"STAT") {
+            return (fields.len() >= 3
+                && memcached_ascii_argument(fields[1])
+                && fields[2..].iter().all(|field| memcached_text_value(field)))
+            .then_some(MemcachedTextResponseParse::Complete(line_end));
+        }
+        None
+    }
+
+    enum MemcachedTextLineParse<'a> {
+        Complete { line: &'a [u8], next_offset: usize },
+        Incomplete,
+    }
+
+    fn memcached_text_line(
+        payload: &[u8],
+        offset: usize,
+        max_len: usize,
+    ) -> Option<MemcachedTextLineParse<'_>> {
+        let tail = payload.get(offset..)?;
+        let line_delimiter = tail.iter().position(|byte| matches!(*byte, b'\r' | b'\n'));
+        match line_delimiter {
+            Some(index) if tail.get(index) == Some(&b'\r') => {
+                if tail.get(index + 1).is_none() {
+                    return Some(MemcachedTextLineParse::Incomplete);
+                }
+                if tail.get(index + 1) != Some(&b'\n') || index == 0 || index > max_len {
+                    return None;
+                }
+                let line = tail.get(..index)?;
+                memcached_text_value(line).then_some(MemcachedTextLineParse::Complete {
+                    line,
+                    next_offset: offset + index + 2,
+                })
+            }
+            Some(_) => None,
+            None => (!tail.is_empty() && tail.len() <= max_len && memcached_text_value(tail))
+                .then_some(MemcachedTextLineParse::Incomplete),
+        }
+    }
+
+    fn memcached_simple_text_response(fields: &[&[u8]]) -> bool {
+        let Some(first) = fields.first().copied() else {
+            return false;
+        };
+        const SIMPLE_RESPONSES: &[&[u8]] = &[
+            b"STORED",
+            b"NOT_STORED",
+            b"EXISTS",
+            b"NOT_FOUND",
+            b"DELETED",
+            b"TOUCHED",
+            b"END",
+            b"OK",
+            b"ERROR",
+        ];
+        if SIMPLE_RESPONSES
+            .iter()
+            .any(|known| first.eq_ignore_ascii_case(known))
+        {
+            return fields.len() == 1;
+        }
+        if first.eq_ignore_ascii_case(b"VERSION") {
+            return fields.len() == 2 && memcached_ascii_argument(fields[1]);
+        }
+        if first.eq_ignore_ascii_case(b"CLIENT_ERROR")
+            || first.eq_ignore_ascii_case(b"SERVER_ERROR")
+        {
+            return fields.len() >= 2
+                && fields[1..].iter().all(|field| memcached_text_value(field));
+        }
+        fields.len() == 1 && memcached_decimal(fields[0])
+    }
+
+    fn memcached_value_response(
+        payload: &[u8],
+        line_end: usize,
+        fields: &[&[u8]],
+    ) -> Option<MemcachedTextResponseParse> {
+        if !(fields.len() == 4 || fields.len() == 5)
+            || !memcached_key(fields[1])
+            || !memcached_decimal(fields[2])
+            || (fields.len() == 5 && !memcached_decimal(fields[4]))
+        {
+            return None;
+        }
+        let bytes = memcached_decimal_value(fields[3], 1_048_576)?;
+        let data_end = line_end.checked_add(bytes)?;
+        let frame_end = data_end.checked_add(2)?;
+        if payload.len() < data_end {
+            return Some(MemcachedTextResponseParse::Incomplete);
+        }
+        if payload.len() < frame_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(MemcachedTextResponseParse::Incomplete),
+                _ => None,
+            };
+        }
+        if payload.get(data_end..frame_end)? != b"\r\n" {
+            return None;
+        }
+        Some(MemcachedTextResponseParse::Complete(frame_end))
     }
 
     fn memcached_text_command_kind(fields: &[&[u8]]) -> Option<MemcachedTextCommandKind> {
@@ -9444,6 +9601,13 @@ pub mod api {
             && field.iter().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b':' | b'.')
             })
+    }
+
+    fn memcached_text_value(field: &[u8]) -> bool {
+        !field.is_empty()
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
     }
 
     fn memcached_binary_payload(payload: &[u8]) -> bool {
@@ -16071,6 +16235,38 @@ mod tests {
             api::AgentPacketFlowApplication::Memcached
         );
         assert_eq!(
+            observation_for_payload(b"STORED\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"NOT_FOUND\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"VALUE cache-key 0 5\r\nvalue\r\nEND\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"VALUE cache-key 0 5 12345\r\nvalue\r\nEND\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"STAT pid 123\r\nSTAT uptime 456\r\nEND\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"VERSION 1.6.22\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"CLIENT_ERROR bad command line format\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(b"12345\r\n").application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
             observation_for_payload(b"set cache-key\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
@@ -16092,6 +16288,22 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"set cache-key 0 60 1048577\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"STORED extra\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"VALUE cache-key 0 5\r\nvalueX\r\nEND\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"STAT pid\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"CLIENT_ERROR\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
