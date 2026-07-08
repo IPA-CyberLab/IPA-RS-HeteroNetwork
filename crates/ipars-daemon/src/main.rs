@@ -10401,25 +10401,15 @@ fn selected_path_candidate(
     state: PathState,
     target_candidates: &[EndpointCandidate],
 ) -> Option<EndpointCandidate> {
-    let kind_rank = |candidate: &EndpointCandidate| match (state, candidate.kind) {
-        (PathState::DirectIpv6, ipars_types::EndpointCandidateKind::Ipv6) => Some(0_u8),
-        (PathState::DirectPublic, ipars_types::EndpointCandidateKind::PublicUdp) => Some(0_u8),
-        (PathState::DirectNatTraversal, ipars_types::EndpointCandidateKind::StunReflexive) => {
-            Some(0_u8)
-        }
-        (_, _) if state.is_direct() => Some(1_u8),
-        _ => None,
-    };
     target_candidates
         .iter()
-        .filter_map(|candidate| kind_rank(candidate).map(|rank| (rank, candidate)))
-        .min_by(|(left_rank, left), (right_rank, right)| {
-            left_rank
-                .cmp(right_rank)
-                .then_with(|| left.cost.cmp(&right.cost))
+        .filter(|candidate| state.allows_selected_candidate_kind(candidate.kind))
+        .min_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
                 .then_with(|| right.priority.cmp(&left.priority))
         })
-        .map(|(_, candidate)| candidate.clone())
+        .cloned()
 }
 
 async fn run_peer_map_sync_loop<S, A>(
@@ -24559,6 +24549,30 @@ exec sleep 60
                 .map(|candidate| candidate.kind),
             Some(EndpointCandidateKind::StunReflexive)
         );
+    }
+
+    #[test]
+    fn signal_path_record_does_not_select_mismatched_direct_candidate() {
+        let response = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            target_candidates: vec![
+                candidate("peer-a", EndpointCandidateKind::StunReflexive, 1),
+                candidate("peer-a", EndpointCandidateKind::LocalUdp, 10),
+                candidate("peer-a", EndpointCandidateKind::Relay, 100),
+            ],
+            relay_candidates: Vec::new(),
+            preferred_state: PathState::DirectPublic,
+            score: PathScore {
+                value: 115.0,
+                reasons: Vec::new(),
+            },
+        };
+
+        let record = signal_path_record(response, Utc::now());
+
+        assert_eq!(record.selected_state, PathState::DirectPublic);
+        assert_eq!(record.selected_candidate, None);
+        assert_eq!(record.relay_node, None);
     }
 
     #[test]
