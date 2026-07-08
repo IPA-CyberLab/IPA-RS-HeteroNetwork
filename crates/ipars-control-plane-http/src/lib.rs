@@ -615,9 +615,10 @@ mod tests {
         RotateWireGuardKeyResponse,
     };
     use ipars_types::{
-        AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, HealthState,
-        JoinTokenClaims, KeyId, NodeHealth, NodeId, PathMetrics, PathRecord, PathScore, PathState,
-        PeerPathKey, Role, Tag, TokenPolicy, TokenStatus, TransportProtocol,
+        AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
+        EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
+        NodeId, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role, Tag, TokenPolicy,
+        TokenStatus, TransportProtocol,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -683,6 +684,18 @@ mod tests {
         identity_for_node(label).node_id()
     }
 
+    fn candidate(node_id: &str) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: self::node_id(node_id),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: std::net::SocketAddr::from(([203, 0, 113, 10], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }
+    }
+
     fn signed_heartbeat(label: &str, request: HeartbeatRequest) -> HeartbeatRequest {
         signed_heartbeat_at(label, request, Utc::now())
     }
@@ -736,6 +749,90 @@ mod tests {
             },
         );
         request
+    }
+
+    #[tokio::test]
+    async fn http_heartbeat_rejects_direct_path_candidate_kind_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(std::net::Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = Arc::new(ControlPlane::new(config, store));
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert(issuer.node_id(), key_id.clone(), issuer.public_key_b64());
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            ledger,
+            key_ring,
+        ));
+        let app = router(ControlPlaneHttpState::new(plane.clone(), join_service));
+
+        let mut claims = claims(cluster_id, issuer.node_id(), key_id);
+        claims.nonce = "http-path-node".to_string();
+        plane
+            .register_with_claims(claims, registration("node-http"))
+            .await?;
+
+        let mut reported_path = path("node-http", "node-peer");
+        reported_path.selected_state = PathState::DirectPublic;
+        reported_path.selected_candidate = Some(candidate("node-peer"));
+
+        let heartbeat = signed_heartbeat(
+            "node-http",
+            HeartbeatRequest {
+                node_id: node_id("node-http"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                routes: None,
+                path_state: vec![reported_path],
+                node_signature: None,
+            },
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&heartbeat)?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("selected state DirectPublic"));
+        assert!(body.contains("selected candidate kind StunReflexive"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/paths/{}", node_id("node-http")))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let paths: ControlPlanePathsResponse = serde_json::from_slice(&body)?;
+        assert!(paths.paths.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
