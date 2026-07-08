@@ -3135,7 +3135,7 @@ pub mod api {
     }
 
     fn http_response_header_application(headers: &[u8]) -> Option<AgentPacketFlowApplication> {
-        if http_header_media_type_matches(headers, b"content-type", b"application/dns-message") {
+        if doh_http_media_type(headers) {
             return Some(AgentPacketFlowApplication::Dns);
         }
         if http_header_contains(headers, b"x-kubernetes-pf-flowschema-uid")
@@ -3289,9 +3289,16 @@ pub mod api {
         if method == b"GET" {
             return doh_get_request_path(path);
         }
-        method == b"POST"
-            && doh_endpoint_path(path)
-            && http_header_media_type_matches(headers, b"content-type", b"application/dns-message")
+        method == b"POST" && doh_endpoint_path(path) && doh_http_media_type(headers)
+    }
+
+    fn doh_http_media_type(headers: &[u8]) -> bool {
+        http_header_media_type_matches(headers, b"content-type", b"application/dns-message")
+            || http_header_media_type_matches(
+                headers,
+                b"content-type",
+                b"application/oblivious-dns-message",
+            )
     }
 
     fn doh_get_request_path(path: &[u8]) -> bool {
@@ -15949,7 +15956,21 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(
+                b"POST /dns-query?targethost=dnstarget.example&targetpath=/dns-query HTTP/2\r\nContent-Type: application/oblivious-dns-message\r\n\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message; charset=binary\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/oblivious-dns-message\r\n"
             )
             .application(),
             api::AgentPacketFlowApplication::Dns
@@ -15961,6 +15982,13 @@ mod tests {
         assert_eq!(
             observation_for_payload(
                 b"POST /dns-query HTTP/2\r\nContent-Type: application/dns-messageish\r\n\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /dns-query HTTP/2\r\nContent-Type: application/oblivious-dns-messageish\r\n\r\n"
             )
             .application(),
             api::AgentPacketFlowApplication::Http
