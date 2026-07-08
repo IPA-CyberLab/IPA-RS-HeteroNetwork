@@ -1987,6 +1987,7 @@ pub mod api {
     pub const PACKET_FLOW_DETECTOR_MAX_BYTES: usize = 64;
     pub const PACKET_FLOW_CONNTRACK_STATUS_MAX_FLAGS: usize = 8;
     pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
+    const DNS_MAX_QUESTION_COUNT: u16 = 64;
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowObservation {
@@ -3850,7 +3851,7 @@ pub mod api {
             return false;
         }
         if qdcount > 0 {
-            return dns_question_payload(payload);
+            return dns_question_payload(payload, qdcount, allow_truncated);
         }
         let rr_count = u16::from_be_bytes([payload[6], payload[7]]) as usize
             + u16::from_be_bytes([payload[8], payload[9]]) as usize
@@ -3939,21 +3940,30 @@ pub mod api {
         option_count > 0 && (!require_relay_message || relay_message_seen)
     }
 
-    fn dns_question_payload(payload: &[u8]) -> bool {
+    fn dns_question_payload(payload: &[u8], qdcount: u16, allow_truncated: bool) -> bool {
+        if qdcount > DNS_MAX_QUESTION_COUNT {
+            return false;
+        }
         let mut offset = 12_usize;
-        let Some(name_end) = dns_name_payload(payload, offset) else {
-            return false;
-        };
-        offset = name_end;
-        let Some(question_end) = offset.checked_add(4) else {
-            return false;
-        };
-        let Some(question) = payload.get(offset..question_end) else {
-            return false;
-        };
-        let qtype = u16::from_be_bytes([question[0], question[1]]);
-        let qclass = u16::from_be_bytes([question[2], question[3]]);
-        qtype != 0 && qclass != 0
+        for question_index in 0..qdcount {
+            let Some(name_end) = dns_name_payload(payload, offset) else {
+                return question_index > 0 && allow_truncated;
+            };
+            offset = name_end;
+            let Some(question_end) = offset.checked_add(4) else {
+                return false;
+            };
+            let Some(question) = payload.get(offset..question_end) else {
+                return question_index > 0 && allow_truncated;
+            };
+            let qtype = u16::from_be_bytes([question[0], question[1]]);
+            let qclass = u16::from_be_bytes([question[2], question[3]]);
+            if qtype == 0 || qclass == 0 {
+                return false;
+            }
+            offset = question_end;
+        }
+        true
     }
 
     fn dns_resource_record_payload(
@@ -15354,6 +15364,46 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(dns_udp.application(), api::AgentPacketFlowApplication::Dns);
+        let mut multi_question_dns_query = dns_query.clone();
+        multi_question_dns_query[5] = 2;
+        multi_question_dns_query.extend_from_slice(&[
+            0x03, b'a', b'p', b'i', 0x02, b'v', b'6', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00,
+            0x00, 0x1c, 0x00, 0x01,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&multi_question_dns_query).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut missing_second_dns_question = dns_query.clone();
+        missing_second_dns_question[5] = 2;
+        assert_eq!(
+            observation_for_udp_payload(&missing_second_dns_question).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut excessive_question_count_dns_query = dns_query.clone();
+        excessive_question_count_dns_query[5] = 65;
+        assert_eq!(
+            observation_for_udp_payload(&excessive_question_count_dns_query).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut truncated_second_question_dns_query = dns_query.clone();
+        truncated_second_question_dns_query[5] = 2;
+        truncated_second_question_dns_query.push(63);
+        truncated_second_question_dns_query.extend(std::iter::repeat_n(b'a', 63));
+        truncated_second_question_dns_query.push(63);
+        truncated_second_question_dns_query.resize(api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES, b'a');
+        assert_eq!(
+            observation_for_udp_payload(&truncated_second_question_dns_query).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_udp_payload(
+                &truncated_second_question_dns_query
+                    [..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES - 1]
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mut dns_tcp_payload = (dns_query.len() as u16).to_be_bytes().to_vec();
         dns_tcp_payload.extend_from_slice(&dns_query);
         assert_eq!(
