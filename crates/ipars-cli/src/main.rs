@@ -10313,6 +10313,9 @@ fi
         assert!(discovery_compose.contains("create_host_path: false"));
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
+        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND: userspace-command"));
+        assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES: \"false\""));
+        assert!(rootless_compose.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"false\""));
         Ok(())
     }
 

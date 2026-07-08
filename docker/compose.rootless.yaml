@@ -6,3 +6,7 @@ services:
   agent:
     cap_add: !reset []
     devices: !reset []
+    environment:
+      IPARS_AGENT_WIREGUARD_BACKEND: userspace-command
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"

@@ -198,8 +198,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_rendered_compose_env(
         &rendered,
         &[
-            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
-            ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
+            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
             ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
             ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
             ("IPARS_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
@@ -234,6 +234,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS", "33"),
         ],
     )?;
+    anyhow::ensure!(
+        !rendered.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES: \"true\""),
+        "rendered rootless Compose config allowed Docker route application to remain enabled"
+    );
+    anyhow::ensure!(
+        !rendered.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\""),
+        "rendered rootless Compose config allowed Docker network discovery to remain enabled"
+    );
     anyhow::ensure!(
         rendered.contains("target: /run/ipars/docker.sock"),
         "rendered Docker discovery Compose config did not mount the Docker API socket"
