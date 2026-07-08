@@ -6332,10 +6332,15 @@ pub mod api {
         let Some(opcode) = read_u16_be(payload, 0) else {
             return false;
         };
-        if !matches!(opcode, 1 | 2) {
-            return false;
+        match opcode {
+            1 | 2 => tftp_request_payload(payload),
+            5 => tftp_error_payload(payload),
+            6 => tftp_oack_payload(payload),
+            _ => false,
         }
+    }
 
+    fn tftp_request_payload(payload: &[u8]) -> bool {
         let mut offset = 2_usize;
         let Some((filename, next_offset)) = tftp_zstring(payload, offset) else {
             return false;
@@ -6353,7 +6358,12 @@ pub mod api {
         }
         offset = next_offset;
 
+        let mut option_count = 0_usize;
         while offset < payload.len() {
+            option_count += 1;
+            if option_count > 16 {
+                return false;
+            }
             let Some((option_name, next_offset)) = tftp_zstring(payload, offset) else {
                 return false;
             };
@@ -6371,6 +6381,47 @@ pub mod api {
         true
     }
 
+    fn tftp_error_payload(payload: &[u8]) -> bool {
+        let Some(error_code) = read_u16_be(payload, 2) else {
+            return false;
+        };
+        if error_code > 8 {
+            return false;
+        }
+        let Some((message, next_offset)) = tftp_zstring(payload, 4) else {
+            return false;
+        };
+        next_offset == payload.len()
+            && !message.is_empty()
+            && message.len() <= 512
+            && tftp_token(message)
+    }
+
+    fn tftp_oack_payload(payload: &[u8]) -> bool {
+        let mut offset = 2_usize;
+        let mut option_count = 0_usize;
+        while offset < payload.len() {
+            option_count += 1;
+            if option_count > 16 {
+                return false;
+            }
+            let Some((option_name, next_offset)) = tftp_zstring(payload, offset) else {
+                return false;
+            };
+            if option_name.is_empty() || !tftp_known_option(option_name) {
+                return false;
+            }
+            let Some((option_value, value_offset)) = tftp_zstring(payload, next_offset) else {
+                return false;
+            };
+            if option_value.is_empty() || !tftp_token(option_value) {
+                return false;
+            }
+            offset = value_offset;
+        }
+        option_count > 0
+    }
+
     fn tftp_zstring(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
         if offset >= payload.len() {
             return None;
@@ -6384,6 +6435,14 @@ pub mod api {
         mode.eq_ignore_ascii_case(b"netascii")
             || mode.eq_ignore_ascii_case(b"octet")
             || mode.eq_ignore_ascii_case(b"mail")
+    }
+
+    fn tftp_known_option(option: &[u8]) -> bool {
+        option.eq_ignore_ascii_case(b"blksize")
+            || option.eq_ignore_ascii_case(b"timeout")
+            || option.eq_ignore_ascii_case(b"tsize")
+            || option.eq_ignore_ascii_case(b"windowsize")
+            || option.eq_ignore_ascii_case(b"multicast")
     }
 
     fn tftp_token(token: &[u8]) -> bool {
@@ -14318,7 +14377,40 @@ mod tests {
             api::AgentPacketFlowApplication::Tftp
         );
         assert_eq!(
+            observation_for_udp_payload(b"\x00\x05\x00\x01file not found\x00").application(),
+            api::AgentPacketFlowApplication::Tftp
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x06blksize\x001024\x00timeout\x005\x00")
+                .application(),
+            api::AgentPacketFlowApplication::Tftp
+        );
+        assert_eq!(
             observation_for_udp_payload(b"\0\x01pxelinux.0\0binary\0").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x03\x00\x01payload").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x04\x00\x01").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x05\x00\x09file not found\x00").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x05\x00\x01\x00").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x05\x00\x01file not found").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(b"\x00\x06unknown\x001\x00").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
