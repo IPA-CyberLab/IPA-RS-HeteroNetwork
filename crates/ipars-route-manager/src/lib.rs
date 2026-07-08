@@ -579,9 +579,16 @@ pub fn validate_docker_network_intent(
 
 pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
     validate_linux_interface_name(&plan.interface).map_err(invalid_route_plan)?;
+    let mut seen_route_ids = BTreeSet::new();
     let mut seen_routes = BTreeSet::new();
     for route in &plan.routes {
         validate_route_id(&route.id).map_err(invalid_route_plan)?;
+        if !seen_route_ids.insert(route.id.as_str()) {
+            return Err(invalid_route_plan(format!(
+                "route plan must not repeat route ID {}",
+                route.id
+            )));
+        }
         if route.metric == 0 {
             return Err(invalid_route_plan(format!(
                 "route {} metric must be greater than zero",
@@ -2620,6 +2627,25 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("route ID exceeds 128 bytes"));
+
+        let mut duplicate_route_id = route_plan()?;
+        duplicate_route_id.routes.push(Route {
+            id: "route-a".to_string(),
+            cidr: "10.43.0.0/16".parse()?,
+            advertised_by: NodeId::from_string("peer-b"),
+            via: None,
+            metric: 100,
+            tags: Default::default(),
+        });
+        let error = match manager.apply_routes(duplicate_route_id).await {
+            Ok(()) => return Err("duplicate route ID should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidRoutePlan(ref message)
+                if message.contains("must not repeat route ID route-a")
+        ));
 
         let mut zero_metric = route_plan()?;
         zero_metric.routes[0].metric = 0;
