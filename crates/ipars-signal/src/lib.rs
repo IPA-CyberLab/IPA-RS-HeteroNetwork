@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use ipars_types::{
     EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
     NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, TransportProtocol,
 };
+use ipnet::IpNet;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -48,6 +49,12 @@ pub enum SignalError {
     #[error("NAT classification for node {node_id} is invalid: {reason}")]
     NatClassificationInvalid {
         node_id: NodeId,
+        reason: &'static str,
+    },
+    #[error("desired route {route} for target node {node_id} is invalid: {reason}")]
+    DesiredRouteInvalid {
+        node_id: NodeId,
+        route: IpNet,
         reason: &'static str,
     },
 }
@@ -188,7 +195,13 @@ impl SignalRegistry {
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
-        if !acl_allows_peer(&source_node, &target, &self.coordinator.policy) {
+        validate_desired_routes(&target, &request.desired_routes)?;
+        if !acl_allows_path(
+            &source_node,
+            &target,
+            &request.desired_routes,
+            &self.coordinator.policy,
+        ) {
             self.path_acl_denials.fetch_add(1, Ordering::Relaxed);
             let response = acl_denied_signal_path_response(request);
             self.record_path_negotiation_state(response.preferred_state);
@@ -920,6 +933,41 @@ fn validate_nat_addr(
     }
 }
 
+fn validate_desired_routes(
+    target: &NodeRecord,
+    desired_routes: &[IpNet],
+) -> Result<(), SignalError> {
+    let mut seen_routes = BTreeSet::new();
+    for route in desired_routes {
+        let canonical = route.trunc();
+        if *route != canonical {
+            return Err(SignalError::DesiredRouteInvalid {
+                node_id: target.node_id.clone(),
+                route: *route,
+                reason: "route CIDR must be canonical",
+            });
+        }
+        if !seen_routes.insert(*route) {
+            return Err(SignalError::DesiredRouteInvalid {
+                node_id: target.node_id.clone(),
+                route: *route,
+                reason: "desired routes must not repeat CIDR",
+            });
+        }
+        let advertised_by_target = target.routes.iter().any(|advertised| {
+            advertised.advertised_by == target.node_id && ipnet_contains(&advertised.cidr, route)
+        });
+        if !advertised_by_target {
+            return Err(SignalError::DesiredRouteInvalid {
+                node_id: target.node_id.clone(),
+                route: *route,
+                reason: "route is not advertised by target",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn timestamp_not_after_skew(
     timestamp: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
@@ -1000,20 +1048,52 @@ fn acl_allows_peer(source: &NodeRecord, target: &NodeRecord, policy: &ClusterPol
         return true;
     }
 
+    acl_decision(source, target, None, policy).unwrap_or(false)
+}
+
+fn acl_allows_path(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    desired_routes: &[IpNet],
+    policy: &ClusterPolicy,
+) -> bool {
+    if desired_routes.is_empty() {
+        return acl_allows_peer(source, target, policy);
+    }
+    if policy.acl_rules.is_empty() {
+        return true;
+    }
+
+    desired_routes
+        .iter()
+        .all(|route| acl_decision(source, target, Some(route), policy).unwrap_or(false))
+}
+
+fn acl_decision(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    route: Option<&IpNet>,
+    policy: &ClusterPolicy,
+) -> Option<bool> {
     let mut allowed = None;
     for rule in &policy.acl_rules {
-        if !acl_rule_matches_peer(rule, source, target) {
+        if !acl_rule_matches(rule, source, target, route) {
             continue;
         }
         match rule.action {
-            AclAction::Deny => return false,
+            AclAction::Deny => return Some(false),
             AclAction::Allow => allowed = Some(true),
         }
     }
-    allowed.unwrap_or(false)
+    allowed
 }
 
-fn acl_rule_matches_peer(rule: &AclRule, source: &NodeRecord, target: &NodeRecord) -> bool {
+fn acl_rule_matches(
+    rule: &AclRule,
+    source: &NodeRecord,
+    target: &NodeRecord,
+    route: Option<&IpNet>,
+) -> bool {
     if rule.protocol != TransportProtocol::Any {
         return false;
     }
@@ -1029,7 +1109,28 @@ fn acl_rule_matches_peer(rule: &AclRule, source: &NodeRecord, target: &NodeRecor
     if !rule.to_tags.is_empty() && rule.to_tags.is_disjoint(&target.tags) {
         return false;
     }
-    rule.routes.is_empty()
+    match route {
+        Some(route) => {
+            rule.routes.is_empty()
+                || rule
+                    .routes
+                    .iter()
+                    .any(|allowed| ipnet_contains(allowed, route))
+        }
+        None => rule.routes.is_empty(),
+    }
+}
+
+fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
+    match (outer, inner) {
+        (IpNet::V4(outer), IpNet::V4(inner)) => {
+            outer.prefix_len() <= inner.prefix_len() && outer.contains(&inner.addr())
+        }
+        (IpNet::V6(outer), IpNet::V6(inner)) => {
+            outer.prefix_len() <= inner.prefix_len() && outer.contains(&inner.addr())
+        }
+        _ => false,
+    }
 }
 
 fn nat_classifications_allow_hole_punch(
@@ -1197,8 +1298,8 @@ mod tests {
 
     use ipars_types::{
         CandidateSource, ClusterId, HealthState, NatFilteringObservation, NatFilteringProbeKind,
-        NatMappingBehavior, NatProbeObservation, NodeHealth, NodeId, RelayCapability, Role, Tag,
-        TokenPolicy, VpnIp,
+        NatMappingBehavior, NatProbeObservation, NodeHealth, NodeId, RelayCapability, Role, Route,
+        Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -1361,6 +1462,38 @@ mod tests {
             routes: Vec::new(),
             protocol: TransportProtocol::Any,
             action: AclAction::Allow,
+        }
+    }
+
+    fn allow_route_acl(id: &str, cidr: &str) -> AclRule {
+        route_acl(id, cidr, AclAction::Allow)
+    }
+
+    fn deny_route_acl(id: &str, cidr: &str) -> AclRule {
+        route_acl(id, cidr, AclAction::Deny)
+    }
+
+    fn route_acl(id: &str, cidr: &str, action: AclAction) -> AclRule {
+        AclRule {
+            id: id.to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: vec![cidr.parse().unwrap()],
+            protocol: TransportProtocol::Any,
+            action,
+        }
+    }
+
+    fn advertised_route(id: &str, cidr: &str, advertised_by: &NodeId) -> Route {
+        Route {
+            id: id.to_string(),
+            cidr: cidr.parse().unwrap(),
+            advertised_by: advertised_by.clone(),
+            via: None,
+            metric: 100,
+            tags: BTreeSet::new(),
         }
     }
 
@@ -1920,6 +2053,111 @@ mod tests {
         assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_allows_route_specific_acl_for_desired_routes() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![allow_route_acl("allow-service-routes", "10.10.0.0/16")],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut route_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        route_target.routes.push(advertised_route(
+            "service-route",
+            "10.10.0.0/16",
+            &route_target.node_id,
+        ));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(route_target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: route_target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: vec!["10.10.5.0/24".parse().unwrap()],
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert_eq!(response.target_candidates.len(), 1);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 0);
+        assert_eq!(
+            signal_path_state_count(&metrics, PathState::DirectPublic),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_denies_disallowed_desired_routes() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_route_acl("deny-admin-subnet", "10.10.5.0/24"),
+                allow_route_acl("allow-service-routes", "10.10.0.0/16"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut route_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        route_target.routes.push(advertised_route(
+            "service-route",
+            "10.10.0.0/16",
+            &route_target.node_id,
+        ));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(route_target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: route_target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: vec!["10.10.5.0/24".parse().unwrap()],
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(response.target_candidates.is_empty());
+        assert_eq!(response.score.reasons, vec!["policy_denied".to_string()]);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_acl_denied_count, 1);
+        assert_eq!(signal_path_state_count(&metrics, PathState::Unreachable), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_unadvertised_desired_routes() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let route_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(route_target.clone()).await?;
+        let requested_route = "10.99.0.0/16".parse().unwrap();
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id.clone(),
+                    target: route_target.node_id.clone(),
+                    source_candidates: source.endpoint_candidates.clone(),
+                    source_nat_classification: None,
+                    desired_routes: vec![requested_route],
+                })
+                .await,
+            Err(SignalError::DesiredRouteInvalid {
+                route,
+                reason: "route is not advertised by target",
+                ..
+            }) if route == requested_route
+        ));
         Ok(())
     }
 

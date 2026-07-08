@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
+ipnet.workspace = true
 ipars-types = { path = "../ipars-types" }
 thiserror.workspace = true
 tokio.workspace = true
