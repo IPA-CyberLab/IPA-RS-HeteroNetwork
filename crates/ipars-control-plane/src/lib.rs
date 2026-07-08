@@ -978,7 +978,18 @@ where
                 }
             }
         }
+        let mut seen_path_keys = BTreeSet::new();
         for path in &request.path_state {
+            let path_key = (path.key.local.clone(), path.key.remote.clone());
+            if !seen_path_keys.insert(path_key) {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} is repeated in heartbeat path_state",
+                        path.key.local, path.key.remote
+                    ),
+                });
+            }
             if path.key.local != request.node_id {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
@@ -3730,6 +3741,50 @@ mod tests {
             .to_string()
             .contains("selected candidate belongs to node"));
         assert!(error.to_string().contains("instead of path peer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_duplicate_path_state_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![path("node-a", "node-b"), path("node-a", "node-b")],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("is repeated in heartbeat path_state")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
     }
 
