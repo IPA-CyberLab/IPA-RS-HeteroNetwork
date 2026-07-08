@@ -22,6 +22,7 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::Relay,
     PathState::Unreachable,
 ];
+const SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS: u64 = 300;
 
 #[derive(Debug, Error)]
 pub enum SignalError {
@@ -37,6 +38,11 @@ pub enum SignalError {
         node_id: NodeId,
         kind: EndpointCandidateKind,
         addr: std::net::SocketAddr,
+        reason: &'static str,
+    },
+    #[error("health report for node {node_id} is invalid: {reason}")]
+    HealthInvalid {
+        node_id: NodeId,
         reason: &'static str,
     },
 }
@@ -113,9 +119,12 @@ impl SignalRegistry {
         nat_classification: Option<NatClassification>,
         health: Option<NodeHealth>,
     ) -> Result<SignalNodeUpsertResponse, SignalError> {
-        validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates)?;
-        normalize_relay_capability(&mut node);
         let registered_at = Utc::now();
+        validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates, registered_at)?;
+        if let Some(health) = health.as_ref() {
+            validate_health_report(&node.node_id, health, registered_at)?;
+        }
+        normalize_relay_capability(&mut node);
         match nat_classification {
             Some(classification) => {
                 self.nat_classifications
@@ -158,12 +167,12 @@ impl SignalRegistry {
         mut request: SignalPathRequest,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
+        let now = Utc::now();
         let source_node = self
             .get_node(&request.source)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.source.clone()))?;
-        validate_endpoint_candidates(&request.source, &request.source_candidates)?;
-        let now = Utc::now();
+        validate_endpoint_candidates(&request.source, &request.source_candidates, now)?;
         let target = self
             .get_node(&request.target)
             .await
@@ -707,6 +716,7 @@ impl SignalCoordinator {
 fn validate_endpoint_candidates(
     node_id: &NodeId,
     candidates: &[EndpointCandidate],
+    now: chrono::DateTime<Utc>,
 ) -> Result<(), SignalError> {
     if let Some(candidate) = candidates
         .iter()
@@ -730,7 +740,66 @@ fn validate_endpoint_candidates(
             reason,
         });
     }
+    if let Some(candidate) = candidates.iter().find(|candidate| {
+        !timestamp_not_after_skew(
+            candidate.observed_at,
+            now,
+            Duration::from_secs(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS),
+        )
+    }) {
+        return Err(SignalError::CandidateInvalid {
+            node_id: node_id.clone(),
+            kind: candidate.kind,
+            addr: candidate.addr,
+            reason: "observed_at is too far in the future",
+        });
+    }
     Ok(())
+}
+
+fn validate_health_report(
+    node_id: &NodeId,
+    health: &NodeHealth,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), SignalError> {
+    if !timestamp_not_after_skew(
+        health.last_seen_at,
+        now,
+        Duration::from_secs(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS),
+    ) {
+        return Err(SignalError::HealthInvalid {
+            node_id: node_id.clone(),
+            reason: "last_seen_at is too far in the future",
+        });
+    }
+    if let Some(latency_ms) = health.latency_ms {
+        if !latency_ms.is_finite() || latency_ms < 0.0 {
+            return Err(SignalError::HealthInvalid {
+                node_id: node_id.clone(),
+                reason: "latency_ms must be a finite non-negative value",
+            });
+        }
+    }
+    if let Some(relay_load) = health.relay_load {
+        if !relay_load.is_finite() || !(0.0..=1.0).contains(&relay_load) {
+            return Err(SignalError::HealthInvalid {
+                node_id: node_id.clone(),
+                reason: "relay_load must be a finite value between 0 and 1",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn timestamp_not_after_skew(
+    timestamp: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    max_skew: Duration,
+) -> bool {
+    let Ok(max_skew) = chrono::Duration::from_std(max_skew) else {
+        return false;
+    };
+    timestamp <= now + max_skew
 }
 
 fn fresh_stored_nat_classification(
@@ -2398,6 +2467,87 @@ mod tests {
                 .await,
             Err(SignalError::CandidateOwnerMismatch { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_future_endpoint_candidates() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut future_node = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        future_node.endpoint_candidates[0].observed_at =
+            Utc::now() + chrono::Duration::seconds(301);
+
+        assert!(matches!(
+            registry.upsert_node(future_node).await,
+            Err(SignalError::CandidateInvalid {
+                reason: "observed_at is too far in the future",
+                ..
+            })
+        ));
+        assert!(registry
+            .get_node(&NodeId::from_string("node-a"))
+            .await
+            .is_none());
+
+        let source = source(Vec::new());
+        let target = target(Vec::new());
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        let mut future_candidate = candidate(EndpointCandidateKind::StunReflexive);
+        future_candidate.observed_at = Utc::now() + chrono::Duration::seconds(301);
+
+        assert!(matches!(
+            registry
+                .negotiate(SignalPathRequest {
+                    source: source.node_id,
+                    target: target.node_id,
+                    source_candidates: vec![future_candidate],
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                })
+                .await,
+            Err(SignalError::CandidateInvalid {
+                reason: "observed_at is too far in the future",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_invalid_health_reports_before_persistence() -> Result<(), SignalError>
+    {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let mut future = healthy_health();
+        future.last_seen_at = Utc::now() + chrono::Duration::seconds(301);
+        let mut negative_latency = healthy_health();
+        negative_latency.latency_ms = Some(-1.0);
+        let mut invalid_relay_load = healthy_health();
+        invalid_relay_load.relay_load = Some(1.1);
+        let cases = [
+            (future, "last_seen_at is too far in the future"),
+            (
+                negative_latency,
+                "latency_ms must be a finite non-negative value",
+            ),
+            (
+                invalid_relay_load,
+                "relay_load must be a finite value between 0 and 1",
+            ),
+        ];
+
+        for (health, expected) in cases {
+            assert!(matches!(
+                registry
+                    .upsert_node_with_nat_and_health(relay(), None, Some(health))
+                    .await,
+                Err(SignalError::HealthInvalid { reason, .. }) if reason == expected
+            ));
+            assert!(registry
+                .get_node(&NodeId::from_string("relay-a"))
+                .await
+                .is_none());
+        }
         Ok(())
     }
 
