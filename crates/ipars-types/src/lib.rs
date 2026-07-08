@@ -4127,6 +4127,9 @@ pub mod api {
                     == Some(rdata_end)
             }
             35 => dns_naptr_rdata_payload(payload, rdata_offset, rdata_end),
+            43 => dns_ds_rdata_payload(payload, rdata_offset, rdata_end),
+            46 => dns_rrsig_rdata_payload(payload, rdata_offset, rdata_end),
+            48 => dns_dnskey_rdata_payload(payload, rdata_offset, rdata_end),
             257 => dns_caa_rdata_payload(payload, rdata_offset, rdata_end),
             _ => true,
         }
@@ -4196,6 +4199,60 @@ pub mod api {
 
     fn dns_caa_tag_payload(tag: &[u8]) -> bool {
         (1..=15).contains(&tag.len()) && tag.iter().all(u8::is_ascii_alphanumeric)
+    }
+
+    fn dns_ds_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(rdata_len) = rdata_end.checked_sub(rdata_offset) else {
+            return false;
+        };
+        if rdata_len < 5 {
+            return false;
+        }
+        let Some(&algorithm) = payload.get(rdata_offset + 2) else {
+            return false;
+        };
+        let Some(&digest_type) = payload.get(rdata_offset + 3) else {
+            return false;
+        };
+        let digest_len = rdata_len - 4;
+        algorithm != 0
+            && digest_type != 0
+            && match digest_type {
+                1 => digest_len == 20,
+                2 | 3 => digest_len == 32,
+                4 => digest_len == 48,
+                _ => digest_len > 0,
+            }
+    }
+
+    fn dns_rrsig_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(fixed_end) = rdata_offset.checked_add(18) else {
+            return false;
+        };
+        if fixed_end >= rdata_end {
+            return false;
+        }
+        let type_covered = u16::from_be_bytes([payload[rdata_offset], payload[rdata_offset + 1]]);
+        let algorithm = payload[rdata_offset + 2];
+        let labels = payload[rdata_offset + 3];
+        type_covered != 0
+            && algorithm != 0
+            && labels <= 127
+            && dns_name_payload_with_root(payload, fixed_end, true)
+                .is_some_and(|signature_offset| signature_offset < rdata_end)
+    }
+
+    fn dns_dnskey_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(rdata_len) = rdata_end.checked_sub(rdata_offset) else {
+            return false;
+        };
+        if rdata_len < 5 {
+            return false;
+        }
+        payload.get(rdata_offset + 2) == Some(&3)
+            && payload
+                .get(rdata_offset + 3)
+                .is_some_and(|algorithm| *algorithm != 0)
     }
 
     fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
@@ -15930,6 +15987,82 @@ mod tests {
         dns_response_with_bad_caa_rdata[caa_tag_offset] = b'-';
         assert_eq!(
             observation_for_udp_payload(&dns_response_with_bad_caa_rdata).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut ds_query = dns_query.clone();
+        ds_query[qtype_offset] = 0x00;
+        ds_query[qtype_offset + 1] = 0x2b;
+        let mut dns_response_with_ds_answer = ds_query.clone();
+        dns_response_with_ds_answer[2] = 0x81;
+        dns_response_with_ds_answer[3] = 0x80;
+        dns_response_with_ds_answer[7] = 0x01;
+        dns_response_with_ds_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x2b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x24, 0x12, 0x34,
+            0x0d, 0x02, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+            0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+            0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_ds_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_ds_length = dns_response_with_ds_answer.clone();
+        let ds_answer_rdlength_offset = ds_query.len() + 10;
+        dns_response_with_bad_ds_length[ds_answer_rdlength_offset + 1] = 0x23;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_ds_length).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dnskey_query = dns_query.clone();
+        dnskey_query[qtype_offset] = 0x00;
+        dnskey_query[qtype_offset + 1] = 0x30;
+        let mut dns_response_with_dnskey_answer = dnskey_query.clone();
+        dns_response_with_dnskey_answer[2] = 0x81;
+        dns_response_with_dnskey_answer[3] = 0x80;
+        dns_response_with_dnskey_answer[7] = 0x01;
+        dns_response_with_dnskey_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x0c, 0x01, 0x01,
+            0x03, 0x0d, 0xb4, 0xb4, 0xb4, 0xb4, 0xb4, 0xb4, 0xb4, 0xb4,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_dnskey_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_dnskey_protocol = dns_response_with_dnskey_answer.clone();
+        let dnskey_protocol_offset = dnskey_query.len() + 14;
+        dns_response_with_bad_dnskey_protocol[dnskey_protocol_offset] = 0x02;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_dnskey_protocol).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut rrsig_query = dns_query.clone();
+        rrsig_query[qtype_offset] = 0x00;
+        rrsig_query[qtype_offset + 1] = 0x2e;
+        let mut dns_response_with_rrsig_answer = rrsig_query.clone();
+        dns_response_with_rrsig_answer[2] = 0x81;
+        dns_response_with_rrsig_answer[3] = 0x80;
+        dns_response_with_rrsig_answer[7] = 0x01;
+        dns_response_with_rrsig_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x2e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x18, 0x00, 0x01,
+            0x0d, 0x03, 0x00, 0x00, 0x00, 0x78, 0x70, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00,
+            0x12, 0x34, 0xc0, 0x0c, 0xc3, 0xc3, 0xc3, 0xc3,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_rrsig_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_rrsig_signer = dns_response_with_rrsig_answer.clone();
+        let rrsig_signer_pointer_offset = rrsig_query.len() + 30;
+        dns_response_with_bad_rrsig_signer[rrsig_signer_pointer_offset + 1] = 0xff;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_rrsig_signer).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_with_empty_rrsig_signature = dns_response_with_rrsig_answer.clone();
+        let rrsig_answer_rdlength_offset = rrsig_query.len() + 10;
+        dns_response_with_empty_rrsig_signature[rrsig_answer_rdlength_offset + 1] = 0x14;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_empty_rrsig_signature).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
