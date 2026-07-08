@@ -581,6 +581,7 @@ pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
     validate_linux_interface_name(&plan.interface).map_err(invalid_route_plan)?;
     let mut seen_routes = BTreeSet::new();
     for route in &plan.routes {
+        validate_route_id(&route.id).map_err(invalid_route_plan)?;
         if let Some(reason) = restricted_route_cidr_reason(&route.cidr) {
             return Err(invalid_route_plan(format!(
                 "route {} must not include {reason} CIDR {}",
@@ -603,6 +604,27 @@ pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
     }
     for rule in &plan.policy_rules {
         validate_policy_rule(rule)?;
+    }
+    Ok(())
+}
+
+fn validate_route_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("route ID cannot be empty".to_string());
+    }
+    if id.len() > 128 {
+        return Err("route ID exceeds 128 bytes".to_string());
+    }
+    if matches!(id, "." | "..") {
+        return Err("route ID must not be '.' or '..'".to_string());
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(
+            "route ID must contain only ASCII letters, digits, '.', '_', ':' or '-'".to_string(),
+        );
     }
     Ok(())
 }
@@ -2519,6 +2541,34 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("must not repeat CIDR"));
+
+        let route_id_cases = [
+            ("", "route ID cannot be empty"),
+            (".", "route ID must not be '.' or '..'"),
+            ("..", "route ID must not be '.' or '..'"),
+            ("bad/route", "route ID must contain only ASCII letters"),
+            ("bad\nroute", "route ID must contain only ASCII letters"),
+        ];
+        for (route_id, expected) in route_id_cases {
+            let mut invalid_id = route_plan()?;
+            invalid_id.routes[0].id = route_id.to_string();
+            let error = match manager.apply_routes(invalid_id).await {
+                Ok(()) => return Err("invalid route ID should be rejected".into()),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error}"
+            );
+        }
+
+        let mut oversized_id = route_plan()?;
+        oversized_id.routes[0].id = "a".repeat(129);
+        let error = match manager.apply_routes(oversized_id).await {
+            Ok(()) => return Err("oversized route ID should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("route ID exceeds 128 bytes"));
 
         let mut invalid_rule = route_plan()?;
         invalid_rule.policy_rules[0].table = 0;
