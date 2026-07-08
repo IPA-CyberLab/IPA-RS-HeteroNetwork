@@ -4112,6 +4112,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Stun);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"dns")
+            || tls_sni_hostname_has_label_prefix(hostname, b"doh")
+        {
+            return Some(AgentPacketFlowApplication::Dns);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"turn")
             || tls_sni_hostname_has_label_prefix(hostname, b"turns")
             || tls_sni_hostname_has_label_prefix(hostname, b"turnserver")
@@ -4398,6 +4403,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"ipars-stun") || protocol.eq_ignore_ascii_case(b"stun") {
             return Some(AgentPacketFlowApplication::Stun);
+        }
+        if protocol.eq_ignore_ascii_case(b"dot") || protocol.eq_ignore_ascii_case(b"doq") {
+            return Some(AgentPacketFlowApplication::Dns);
         }
         if protocol.eq_ignore_ascii_case(b"turn")
             || protocol.eq_ignore_ascii_case(b"turns")
@@ -16073,6 +16081,23 @@ mod tests {
             api::AgentPacketFlowApplication::Stun
         );
         assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("dns.google")).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_sni("doh.resolver.example"))
+                .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"dot"])).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"doq"])).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("turn-relay.public.example"))
                 .application(),
             api::AgentPacketFlowApplication::Turn
@@ -16611,11 +16636,19 @@ mod tests {
             api::AgentPacketFlowApplication::Grpc
         );
         assert_eq!(
+            observation_for_payload(&tls_server_hello_with_alpn(b"doq")).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
             observation_for_payload(&tls_server_hello_with_alpn(b"x-amzn-mqtt-ca")).application(),
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
             observation_for_payload(&tls_server_hello_with_alpn(b"h2")).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        assert_eq!(
+            observation_for_payload(&tls_client_hello_with_alpn(&[b"h3"])).application(),
             api::AgentPacketFlowApplication::Https
         );
         assert_eq!(
