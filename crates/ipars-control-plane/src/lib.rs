@@ -565,7 +565,8 @@ where
         if !claims.policy.allow_join {
             return Err(ControlPlaneError::JoinDenied);
         }
-        validate_registration_request(&request)?;
+        let now = Utc::now();
+        validate_registration_request(&request, now, self.config.heartbeat_signature_max_age)?;
         for route in &request.requested_routes {
             if !route_allowed(route, &claims) {
                 return Err(ControlPlaneError::RouteDenied(route.id.clone()));
@@ -574,7 +575,6 @@ where
 
         let relay_capability =
             relay_capability_allowed(&request.node_id, request.relay_capability.clone(), &claims)?;
-        let now = Utc::now();
         let node = match self
             .insert_node_with_fresh_vpn_ip(
                 claims.clone(),
@@ -956,6 +956,21 @@ where
                 ),
             });
         }
+        if let Some(candidate) = request.candidates.iter().find(|candidate| {
+            !timestamp_not_after_skew(
+                candidate.observed_at,
+                now,
+                self.config.heartbeat_signature_max_age,
+            )
+        }) {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "candidate {:?} at {} observed_at {} is too far in the future",
+                    candidate.kind, candidate.addr, candidate.observed_at
+                ),
+            });
+        }
         if let Some(routes) = request.routes.as_ref() {
             validate_advertised_routes_shape(&request.node_id, routes).map_err(|reason| {
                 ControlPlaneError::NodeUpdateRejected {
@@ -1047,6 +1062,19 @@ where
                         reason: format!(
                             "selected candidate {:?} at {} is unusable",
                             candidate.kind, candidate.addr
+                        ),
+                    });
+                }
+                if !timestamp_not_after_skew(
+                    candidate.observed_at,
+                    now,
+                    self.config.heartbeat_signature_max_age,
+                ) {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} observed_at {} is too far in the future",
+                            candidate.kind, candidate.addr, candidate.observed_at
                         ),
                     });
                 }
@@ -1661,7 +1689,11 @@ fn validate_relay_capability_shape(capability: &RelayCapability) -> Result<(), S
     Ok(())
 }
 
-fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), ControlPlaneError> {
+fn validate_registration_request(
+    request: &RegisterNodeRequest,
+    now: chrono::DateTime<Utc>,
+    max_timestamp_skew: Duration,
+) -> Result<(), ControlPlaneError> {
     let derived_node_id =
         node_id_from_public_key_b64(&request.identity_public_key).map_err(|error| {
             ControlPlaneError::NodeRegistrationRejected {
@@ -1705,6 +1737,19 @@ fn validate_registration_request(request: &RegisterNodeRequest) -> Result<(), Co
             reason: format!(
                 "candidate {:?} at {} is invalid: {reason}",
                 candidate.kind, candidate.addr
+            ),
+        });
+    }
+    if let Some(candidate) = request
+        .candidates
+        .iter()
+        .find(|candidate| !timestamp_not_after_skew(candidate.observed_at, now, max_timestamp_skew))
+    {
+        return Err(ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "candidate {:?} at {} observed_at {} is too far in the future",
+                candidate.kind, candidate.addr, candidate.observed_at
             ),
         });
     }
@@ -2608,6 +2653,35 @@ mod tests {
             error,
             ControlPlaneError::NodeRegistrationRejected { .. }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_future_endpoint_candidate_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 30)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut request = registration_request("node-a");
+        let mut future_candidate = candidate("node-a");
+        future_candidate.observed_at = Utc::now() + Duration::seconds(301);
+        request.candidates = vec![future_candidate];
+
+        let result = plane
+            .register_with_claims(claims(cluster_id), request)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeRegistrationRejected { reason, .. })
+                if reason.contains("observed_at")
+                    && reason.contains("too far in the future")
+        ));
+        assert!(store.list_nodes().await?.is_empty());
         Ok(())
     }
 
@@ -3862,6 +3936,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_future_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let signed_at = Utc::now();
+        let mut future_candidate = candidate("node-b");
+        future_candidate.observed_at = signed_at + Duration::seconds(301);
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(future_candidate);
+
+        let result = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: signed_at,
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+                signed_at,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("selected candidate")
+                    && reason.contains("observed_at")
+                    && reason.contains("too far in the future")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_rejects_path_state_with_invalid_selected_candidate_address(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -4444,6 +4570,60 @@ mod tests {
             ControlPlaneError::NodeUpdateRejected { .. }
         ));
         assert!(error.to_string().contains("IPv6 candidates must use"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_future_endpoint_candidate_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let signed_at = Utc::now();
+        let mut future_candidate = candidate("node-a");
+        future_candidate.observed_at = signed_at + Duration::seconds(301);
+
+        let result = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: signed_at,
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: vec![future_candidate],
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                signed_at,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("observed_at")
+                    && reason.contains("too far in the future")
+        ));
+        assert!(store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or(ControlPlaneError::NodeNotFound(node_id("node-a")))?
+            .endpoint_candidates
+            .is_empty());
         Ok(())
     }
 
