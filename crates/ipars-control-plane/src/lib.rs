@@ -929,6 +929,15 @@ where
         previous_health: Option<&NodeHealth>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
+        validate_node_health_shape(
+            &request.health,
+            now,
+            self.config.heartbeat_signature_max_age,
+        )
+        .map_err(|reason| ControlPlaneError::NodeUpdateRejected {
+            node_id: request.node_id.clone(),
+            reason,
+        })?;
         if let Some(candidate) = request
             .candidates
             .iter()
@@ -1490,6 +1499,30 @@ fn timestamp_not_after_skew(
         return false;
     };
     timestamp <= now + max_skew
+}
+
+fn validate_node_health_shape(
+    health: &NodeHealth,
+    now: chrono::DateTime<Utc>,
+    max_timestamp_skew: Duration,
+) -> Result<(), String> {
+    if !timestamp_not_after_skew(health.last_seen_at, now, max_timestamp_skew) {
+        return Err(format!(
+            "health last_seen_at {} is too far in the future",
+            health.last_seen_at
+        ));
+    }
+    if let Some(latency_ms) = health.latency_ms {
+        if !latency_ms.is_finite() || latency_ms < 0.0 {
+            return Err("health latency_ms must be a finite non-negative value".to_string());
+        }
+    }
+    if let Some(relay_load) = health.relay_load {
+        if !relay_load.is_finite() || !(0.0..=1.0).contains(&relay_load) {
+            return Err("health relay_load must be a finite value between 0 and 1".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn relay_candidate_allowed(
@@ -3417,6 +3450,80 @@ mod tests {
             Some(second_health)
         );
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_health_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let signed_at = Utc::now();
+        let cases = [
+            (
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: signed_at + Duration::seconds(301),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+                "last_seen_at",
+            ),
+            (
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: signed_at,
+                    latency_ms: Some(-1.0),
+                    relay_load: None,
+                    message: None,
+                },
+                "latency_ms",
+            ),
+            (
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: signed_at,
+                    latency_ms: None,
+                    relay_load: Some(1.1),
+                    message: None,
+                },
+                "relay_load",
+            ),
+        ];
+
+        for (health, expected) in cases {
+            let result = plane
+                .heartbeat(signed_heartbeat_at(
+                    "node-a",
+                    HeartbeatRequest {
+                        node_id: node_id("node-a"),
+                        health,
+                        candidates: Vec::new(),
+                        relay_capability: None,
+                        routes: None,
+                        path_state: Vec::new(),
+                        node_signature: None,
+                    },
+                    signed_at,
+                ))
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                    if reason.contains(expected)
+            ));
+            assert!(store.get_health(&node_id("node-a")).await?.is_none());
+        }
         Ok(())
     }
 
