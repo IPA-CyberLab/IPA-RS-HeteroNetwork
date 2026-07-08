@@ -2661,6 +2661,7 @@ pub mod api {
             }
             http_payload_application(payload)
                 .or_else(|| tls_client_hello_application(payload))
+                .or_else(|| tls_server_hello_application(payload))
                 .or_else(|| {
                     tls_handshake_payload(payload).then_some(AgentPacketFlowApplication::Https)
                 })
@@ -4411,6 +4412,83 @@ pub mod api {
             return Some(AgentPacketFlowApplication::Ssh);
         }
         None
+    }
+
+    fn tls_server_hello_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if payload.len() < 9
+            || payload[0] != 0x16
+            || payload[1] != 0x03
+            || !(0x01..=0x04).contains(&payload[2])
+            || payload[5] != 0x02
+        {
+            return None;
+        }
+
+        let record_len = read_u16_be(payload, 3)? as usize;
+        if !(1..=16_384).contains(&record_len) {
+            return None;
+        }
+        let handshake_len = read_u24_be(payload, 6)?;
+        if handshake_len < 38 || handshake_len.checked_add(4)? > record_len {
+            return None;
+        }
+        let handshake_end = 9_usize.checked_add(handshake_len)?;
+        if handshake_end > payload.len() {
+            return None;
+        }
+
+        let mut offset = 9_usize.checked_add(34)?;
+        let session_id_len = *payload.get(offset)? as usize;
+        if session_id_len > 32 {
+            return None;
+        }
+        offset = offset.checked_add(1)?.checked_add(session_id_len)?;
+        if offset.checked_add(3)? > handshake_end || payload.get(offset + 2) != Some(&0) {
+            return None;
+        }
+        offset = offset.checked_add(3)?;
+        if offset == handshake_end {
+            return None;
+        }
+
+        let extensions_len = read_u16_be(payload, offset)? as usize;
+        offset = offset.checked_add(2)?;
+        let extensions_end = offset.checked_add(extensions_len)?;
+        if extensions_end != handshake_end {
+            return None;
+        }
+
+        while offset.checked_add(4)? <= extensions_end {
+            let extension_type = read_u16_be(payload, offset)?;
+            let extension_len = read_u16_be(payload, offset + 2)? as usize;
+            offset = offset.checked_add(4)?;
+            let extension_end = offset.checked_add(extension_len)?;
+            if extension_end > extensions_end {
+                return None;
+            }
+            if extension_type == 16 {
+                return tls_alpn_single_protocol_application(payload.get(offset..extension_end)?);
+            }
+            offset = extension_end;
+        }
+        None
+    }
+
+    fn tls_alpn_single_protocol_application(
+        extension: &[u8],
+    ) -> Option<AgentPacketFlowApplication> {
+        let protocol_list_len = read_u16_be(extension, 0)? as usize;
+        let protocol_list_end = 2_usize.checked_add(protocol_list_len)?;
+        if protocol_list_end != extension.len() {
+            return None;
+        }
+        let protocol_len = *extension.get(2)? as usize;
+        let protocol_offset = 3_usize;
+        let protocol_end = protocol_offset.checked_add(protocol_len)?;
+        if protocol_len == 0 || protocol_end != protocol_list_end {
+            return None;
+        }
+        tls_alpn_protocol_application(extension.get(protocol_offset..protocol_end)?)
     }
 
     fn tls_alpn_protocol_has_token(protocol: &[u8], token: &[u8]) -> bool {
@@ -13993,6 +14071,49 @@ mod tests {
             payload
         }
 
+        fn tls_server_hello_with_alpn(protocol: &[u8]) -> Vec<u8> {
+            tls_server_hello_with_alpn_protocols(&[protocol])
+        }
+
+        fn tls_server_hello_with_alpn_protocols(protocols: &[&[u8]]) -> Vec<u8> {
+            let mut protocol_list = Vec::new();
+            for protocol in protocols {
+                protocol_list.push(protocol.len() as u8);
+                protocol_list.extend_from_slice(protocol);
+            }
+
+            let mut alpn = Vec::new();
+            alpn.extend_from_slice(&(protocol_list.len() as u16).to_be_bytes());
+            alpn.extend_from_slice(&protocol_list);
+
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&16_u16.to_be_bytes());
+            extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&alpn);
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]);
+            body.extend_from_slice(&[0xa5; 32]);
+            body.push(0);
+            body.extend_from_slice(&[0x13, 0x01]);
+            body.push(0);
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions);
+
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[0x16, 0x03, 0x03]);
+            payload.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+            payload.push(0x02);
+            let handshake_len = body.len() as u32;
+            payload.extend_from_slice(&[
+                ((handshake_len >> 16) & 0xff) as u8,
+                ((handshake_len >> 8) & 0xff) as u8,
+                (handshake_len & 0xff) as u8,
+            ]);
+            payload.extend_from_slice(&body);
+            payload
+        }
+
         fn wireguard_message(message_type: u32, len: usize) -> Vec<u8> {
             let mut payload = vec![0xa5; len];
             payload[..4].copy_from_slice(&message_type.to_le_bytes());
@@ -16130,6 +16251,26 @@ mod tests {
         }
         assert_eq!(
             observation_for_payload(&tls_client_hello_with_sni("api.example.com")).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        assert_eq!(
+            observation_for_payload(&tls_server_hello_with_alpn(b"grpc")).application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(&tls_server_hello_with_alpn(b"x-amzn-mqtt-ca")).application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&tls_server_hello_with_alpn(b"h2")).application(),
+            api::AgentPacketFlowApplication::Https
+        );
+        assert_eq!(
+            observation_for_payload(&tls_server_hello_with_alpn_protocols(&[
+                b"grpc".as_slice(),
+                b"mqtt".as_slice(),
+            ]))
+            .application(),
             api::AgentPacketFlowApplication::Https
         );
         let quic = api::AgentPacketFlowObservation {
