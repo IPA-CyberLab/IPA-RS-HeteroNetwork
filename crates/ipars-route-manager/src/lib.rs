@@ -1215,15 +1215,20 @@ fn route_command_path_has_special_component(path: &Path) -> bool {
 fn ensure_trusted_linux_route_command_search_directory(
     directory: &Path,
 ) -> Result<(), RouteManagerError> {
-    let canonical = std::fs::canonicalize(directory)?;
-    let metadata = std::fs::metadata(&canonical)?;
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() {
+        return Err(RouteManagerError::Backend(format!(
+            "linux route command PATH entry {} must not be a symlink",
+            directory.display()
+        )));
+    }
     if !metadata.is_dir() {
         return Err(RouteManagerError::Backend(format!(
             "linux route command PATH entry {} must be a directory",
             directory.display()
         )));
     }
-    ensure_trusted_linux_route_command_directory_chain(&canonical, "linux route command PATH entry")
+    ensure_trusted_linux_route_command_directory_chain(directory, "linux route command PATH entry")
 }
 
 #[cfg(not(unix))]
@@ -1247,8 +1252,13 @@ fn ensure_trusted_linux_route_command_executable(
 ) -> Result<PathBuf, RouteManagerError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let canonical = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(RouteManagerError::Backend(format!(
+            "{label} at {} must not be a symlink",
+            path.display()
+        )));
+    }
     let mode = metadata.permissions().mode();
     if !metadata.is_file() || mode & 0o111 == 0 {
         return Err(RouteManagerError::Backend(format!(
@@ -1257,27 +1267,21 @@ fn ensure_trusted_linux_route_command_executable(
         )));
     }
     let effective_uid = nix::unistd::Uid::effective().as_raw();
-    ensure_trusted_linux_route_command_owner(
-        label,
-        "at",
-        &canonical,
-        metadata.uid(),
-        effective_uid,
-    )?;
+    ensure_trusted_linux_route_command_owner(label, "at", path, metadata.uid(), effective_uid)?;
     if mode & 0o022 != 0 {
         return Err(RouteManagerError::Backend(format!(
             "{label} at {} must not be group- or world-writable",
-            canonical.display()
+            path.display()
         )));
     }
-    let parent = canonical.parent().ok_or_else(|| {
+    let parent = path.parent().ok_or_else(|| {
         RouteManagerError::Backend(format!(
             "failed to locate parent directory for {label} at {}",
-            canonical.display()
+            path.display()
         ))
     })?;
     ensure_trusted_linux_route_command_directory_chain(parent, label)?;
-    Ok(canonical)
+    Ok(path.to_path_buf())
 }
 
 #[cfg(not(unix))]
@@ -1310,7 +1314,13 @@ fn ensure_trusted_linux_route_command_directory_chain(
             std::path::Component::RootDir => current.push(component.as_os_str()),
             std::path::Component::Normal(part) => {
                 current.push(part);
-                let metadata = std::fs::metadata(&current)?;
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(RouteManagerError::Backend(format!(
+                        "{label} parent {} must not be a symlink",
+                        current.display()
+                    )));
+                }
                 if !metadata.is_dir() {
                     return Err(RouteManagerError::Backend(format!(
                         "{label} parent {} must be a directory",
@@ -2058,12 +2068,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn trusted_route_test_shell() -> String {
+        for candidate in ["/usr/bin/dash", "/usr/bin/bash", "/bin/dash", "/bin/bash"] {
+            if ensure_trusted_linux_route_command_executable(Path::new(candidate), "test shell")
+                .is_ok()
+            {
+                return candidate.to_string();
+            }
+        }
+        panic!("trusted non-symlink test shell was not found");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn timed_system_route_command_runner_reports_failure_stderr() {
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+        let shell = trusted_route_test_shell();
         let error = match runner
             .run(LinuxRouteCommand::new(
-                "sh",
+                shell,
                 ["-c", "echo route-failed >&2; exit 7"],
             ))
             .await
@@ -2079,10 +2102,11 @@ mod tests {
     #[tokio::test]
     async fn timed_system_route_command_runner_uses_sanitized_environment() {
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+        let shell = trusted_route_test_shell();
         let script = r#"test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" && test "${LANG:-}" = "C" && test "${LC_ALL:-}" = "C" && test -z "${HOME+x}" && test -z "${LD_PRELOAD+x}""#;
 
         match runner
-            .run(LinuxRouteCommand::new("sh", ["-c", script]))
+            .run(LinuxRouteCommand::new(shell, ["-c", script]))
             .await
         {
             Ok(()) => {}
@@ -2195,9 +2219,49 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn timed_system_route_command_runner_rejects_symlinked_absolute_program_path(
+    ) -> Result<(), RouteManagerError> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-route-symlinked-command-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))?;
+        let program = temp_dir.join("linked-shell");
+        symlink(trusted_route_test_shell(), &program)?;
+
+        let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
+        let error = match runner
+            .run(LinuxRouteCommand::new(
+                program.to_string_lossy().to_string(),
+                ["-c", "exit 0"],
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timed_system_route_command_runner_rejects_invalid_runtime_bounds() {
+        let shell = trusted_route_test_shell();
         let error = match TimedSystemRouteCommandRunner::new(Duration::ZERO)
-            .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+            .run(LinuxRouteCommand::new(shell.clone(), ["-c", "exit 0"]))
             .await
         {
             Ok(()) => panic!("command should be rejected"),
@@ -2210,7 +2274,7 @@ mod tests {
         let error = match TimedSystemRouteCommandRunner::new(
             MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT + Duration::from_secs(1),
         )
-        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .run(LinuxRouteCommand::new(shell.clone(), ["-c", "exit 0"]))
         .await
         {
             Ok(()) => panic!("command should be rejected"),
@@ -2220,7 +2284,7 @@ mod tests {
 
         let error =
             match TimedSystemRouteCommandRunner::with_output_max_bytes(Duration::from_secs(1), 0)
-                .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+                .run(LinuxRouteCommand::new(shell.clone(), ["-c", "exit 0"]))
                 .await
             {
                 Ok(()) => panic!("command should be rejected"),
@@ -2234,7 +2298,7 @@ mod tests {
             Duration::from_secs(1),
             MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES + 1,
         )
-        .run(LinuxRouteCommand::new("sh", ["-c", "exit 0"]))
+        .run(LinuxRouteCommand::new(shell, ["-c", "exit 0"]))
         .await
         {
             Ok(()) => panic!("command should be rejected"),
@@ -2249,8 +2313,9 @@ mod tests {
     #[tokio::test]
     async fn timed_system_route_command_runner_times_out() {
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(10));
+        let shell = trusted_route_test_shell();
         let error = match runner
-            .run(LinuxRouteCommand::new("sh", ["-c", "sleep 1"]))
+            .run(LinuxRouteCommand::new(shell, ["-c", "sleep 1"]))
             .await
         {
             Ok(()) => panic!("command should time out"),
@@ -2281,8 +2346,9 @@ mod tests {
             grandchild_pid_path.display()
         );
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_millis(100));
+        let shell = trusted_route_test_shell();
         let error = match runner
-            .run(LinuxRouteCommand::new("sh", ["-c", &script]))
+            .run(LinuxRouteCommand::new(shell, ["-c", &script]))
             .await
         {
             Ok(()) => panic!("command should time out"),
@@ -2310,9 +2376,10 @@ mod tests {
     async fn timed_system_route_command_runner_truncates_failure_stderr() {
         let runner =
             TimedSystemRouteCommandRunner::with_output_max_bytes(Duration::from_secs(1), 16);
+        let shell = trusted_route_test_shell();
         let error = match runner
             .run(LinuxRouteCommand::new(
-                "sh",
+                shell,
                 ["-c", "printf '0123456789abcdefEXTRA' >&2; exit 7"],
             ))
             .await
