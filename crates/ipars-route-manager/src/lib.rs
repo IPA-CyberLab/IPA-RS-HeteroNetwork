@@ -562,12 +562,15 @@ pub fn checked_docker_route_plan(
     intent: DockerNetworkIntent,
 ) -> Result<RoutePlan, RouteManagerError> {
     validate_docker_network_intent(&intent)?;
-    Ok(docker_route_plan(intent))
+    let plan = docker_route_plan(intent);
+    validate_route_plan(&plan)?;
+    Ok(plan)
 }
 
 pub fn validate_docker_network_intent(
     intent: &DockerNetworkIntent,
 ) -> Result<(), RouteManagerError> {
+    validate_docker_container_namespace(&intent.container_namespace)?;
     validate_linux_interface_name(&intent.host_interface).map_err(invalid_docker_network_intent)?;
     validate_linux_interface_name(&intent.overlay_interface)
         .map_err(invalid_docker_network_intent)?;
@@ -644,6 +647,15 @@ fn validate_linux_interface_name(name: &str) -> Result<(), String> {
         return Err(format!(
             "linux interface name `{name}` must contain only ASCII letters, digits, '.', '_' or '-'"
         ));
+    }
+    Ok(())
+}
+
+fn validate_docker_container_namespace(name: &str) -> Result<(), RouteManagerError> {
+    if !is_valid_namespace_name(name) {
+        return Err(invalid_docker_network_intent(format!(
+            "container namespace `{name}` must be a valid linux network namespace name"
+        )));
     }
     Ok(())
 }
@@ -841,7 +853,9 @@ pub fn checked_kubernetes_route_plan(
     intent: KubernetesUnderlayIntent,
 ) -> Result<RoutePlan, RouteManagerError> {
     validate_kubernetes_underlay_intent(&intent)?;
-    Ok(kubernetes_route_plan(intent))
+    let plan = kubernetes_route_plan(intent);
+    validate_route_plan(&plan)?;
+    Ok(plan)
 }
 
 pub fn validate_kubernetes_underlay_intent(
@@ -2847,6 +2861,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_intent_rejects_invalid_container_namespace(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DryRunLinuxRouteManager;
+        let cases = [
+            "".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "-container-a".to_string(),
+            "container/a".to_string(),
+            "a".repeat(65),
+        ];
+
+        for container_namespace in cases {
+            let error = match manager
+                .apply_docker_intent(DockerNetworkIntent {
+                    container_namespace,
+                    host_interface: "eth0".to_string(),
+                    overlay_interface: "ipars0".to_string(),
+                    container_cidrs: vec!["172.18.0.0/16".parse()?],
+                    expose_host_routes: true,
+                })
+                .await
+            {
+                Ok(plan) => {
+                    return Err(
+                        format!("invalid Docker namespace should be rejected: {plan:?}").into(),
+                    );
+                }
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(
+                    error,
+                    RouteManagerError::InvalidDockerNetworkIntent(ref message)
+                        if message.contains("valid linux network namespace name")
+                ),
+                "unexpected error: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn kubernetes_intent_builds_service_and_api_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let manager = DryRunLinuxRouteManager;
@@ -3291,6 +3349,43 @@ mod tests {
                 error,
                 RouteManagerError::InvalidDockerNetworkIntent(ref message)
                     if message.contains("canonical Docker container CIDR route 172.18.0.0/16")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(runner.commands().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_route_manager_rejects_invalid_docker_namespace_before_commands(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runner = RecordingRunner::default();
+        let manager = LinuxRouteManager::new(runner.clone());
+
+        let error = match manager
+            .apply_docker_intent(DockerNetworkIntent {
+                container_namespace: "../container-a".to_string(),
+                host_interface: "eth0".to_string(),
+                overlay_interface: "ipars0".to_string(),
+                container_cidrs: vec!["172.18.0.0/16".parse()?],
+                expose_host_routes: true,
+            })
+            .await
+        {
+            Ok(plan) => {
+                return Err(format!(
+                    "invalid Docker namespace should fail before route commands: {plan:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                RouteManagerError::InvalidDockerNetworkIntent(ref message)
+                    if message.contains("valid linux network namespace name")
             ),
             "unexpected error: {error}"
         );
