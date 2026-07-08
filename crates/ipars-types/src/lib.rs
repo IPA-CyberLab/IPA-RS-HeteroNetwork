@@ -2685,6 +2685,10 @@ pub mod api {
                 .or_else(|| {
                     oracle_tns_payload(payload).then_some(AgentPacketFlowApplication::Oracle)
                 })
+                .or_else(|| {
+                    clickhouse_native_client_hello_payload(payload)
+                        .then_some(AgentPacketFlowApplication::ClickHouse)
+                })
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
                 .or_else(|| {
                     memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
@@ -7674,6 +7678,116 @@ pub mod api {
         has_description && (has_connect_data || has_service || has_address)
     }
 
+    fn clickhouse_native_client_hello_payload(payload: &[u8]) -> bool {
+        let Some((packet_type, mut offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        if packet_type != 0 {
+            return false;
+        }
+
+        let Some((client_name, next_offset)) = clickhouse_string(payload, offset, 128) else {
+            return false;
+        };
+        if !clickhouse_text_field(client_name, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((major, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if major > 100 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((minor, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if minor > 1000 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((protocol_revision, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if !(54_000..=1_000_000).contains(&protocol_revision) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((database, next_offset)) = clickhouse_string(payload, offset, 256) else {
+            return false;
+        };
+        if !clickhouse_text_field(database, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((user, next_offset)) = clickhouse_string(payload, offset, 256) else {
+            return false;
+        };
+        if !clickhouse_text_field(user, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((password, mut offset)) = clickhouse_string(payload, offset, 4096) else {
+            return false;
+        };
+        if !clickhouse_text_field(password, true) {
+            return false;
+        }
+
+        if offset == payload.len() || payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return true;
+        }
+
+        for _ in 0..2 {
+            let Some((field, next_offset)) = clickhouse_string(payload, offset, 1024) else {
+                return false;
+            };
+            if !clickhouse_text_field(field, true) {
+                return false;
+            }
+            offset = next_offset;
+            if offset == payload.len() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn clickhouse_string(payload: &[u8], offset: usize, max_len: usize) -> Option<(&[u8], usize)> {
+        let (len, value_offset) = clickhouse_uvarint(payload, offset)?;
+        let len = usize::try_from(len).ok()?;
+        if len > max_len {
+            return None;
+        }
+        let value_end = value_offset.checked_add(len)?;
+        Some((payload.get(value_offset..value_end)?, value_end))
+    }
+
+    fn clickhouse_uvarint(payload: &[u8], offset: usize) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        for (index, byte) in payload.get(offset..)?.iter().take(10).enumerate() {
+            value |= ((byte & 0x7f) as u64).checked_shl((7 * index) as u32)?;
+            if byte & 0x80 == 0 {
+                return Some((value, offset + index + 1));
+            }
+        }
+        None
+    }
+
+    fn clickhouse_text_field(value: &[u8], allow_empty: bool) -> bool {
+        (allow_empty || !value.is_empty())
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    }
+
     fn redis_payload(payload: &[u8]) -> bool {
         redis_resp_array_payload(payload) || redis_inline_command_payload(payload)
     }
@@ -11921,6 +12035,50 @@ mod tests {
             payload
         }
 
+        fn clickhouse_client_hello(
+            client_name: &[u8],
+            revision: u64,
+            database: &[u8],
+            user: &[u8],
+            password: &[u8],
+            optional_tail: &[&[u8]],
+        ) -> Vec<u8> {
+            let mut payload = clickhouse_uvarint(0);
+            payload.extend_from_slice(&clickhouse_string(client_name));
+            payload.extend_from_slice(&clickhouse_uvarint(1));
+            payload.extend_from_slice(&clickhouse_uvarint(10));
+            payload.extend_from_slice(&clickhouse_uvarint(revision));
+            payload.extend_from_slice(&clickhouse_string(database));
+            payload.extend_from_slice(&clickhouse_string(user));
+            payload.extend_from_slice(&clickhouse_string(password));
+            for field in optional_tail {
+                payload.extend_from_slice(&clickhouse_string(field));
+            }
+            payload
+        }
+
+        fn clickhouse_string(value: &[u8]) -> Vec<u8> {
+            let mut encoded = clickhouse_uvarint(value.len() as u64);
+            encoded.extend_from_slice(value);
+            encoded
+        }
+
+        fn clickhouse_uvarint(mut value: u64) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                encoded.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+            encoded
+        }
+
         fn memcached_binary_request(
             opcode: u8,
             key: &[u8],
@@ -14182,6 +14340,42 @@ mod tests {
         let invalid_oracle_descriptor = oracle_tns_connect_packet(b"(NOT_ORACLE=1)");
         assert_eq!(
             observation_for_payload(&invalid_oracle_descriptor).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_hello =
+            clickhouse_client_hello(b"Go Client", 54_451, b"default", b"default", b"secret", &[]);
+        assert_eq!(
+            observation_for_payload(&clickhouse_hello).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let clickhouse_hello_with_quota = clickhouse_client_hello(
+            b"ClickHouse Rust client",
+            54_452,
+            b"analytics",
+            b"reader",
+            b"",
+            &[b"quota-key".as_slice()],
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_hello_with_quota).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let clickhouse_old_revision =
+            clickhouse_client_hello(b"Go Client", 100, b"default", b"default", b"", &[]);
+        assert_eq!(
+            observation_for_payload(&clickhouse_old_revision).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_control_client =
+            clickhouse_client_hello(b"Go\nClient", 54_451, b"default", b"default", b"", &[]);
+        assert_eq!(
+            observation_for_payload(&clickhouse_control_client).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut clickhouse_with_trailing_junk = clickhouse_hello.clone();
+        clickhouse_with_trailing_junk.extend_from_slice(b"junk");
+        assert_eq!(
+            observation_for_payload(&clickhouse_with_trailing_junk).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(

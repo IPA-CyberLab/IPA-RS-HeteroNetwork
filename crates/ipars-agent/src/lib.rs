@@ -7608,6 +7608,40 @@ mod tests {
             payload
         }
 
+        fn clickhouse_client_hello() -> Vec<u8> {
+            fn uvarint(mut value: u64) -> Vec<u8> {
+                let mut encoded = Vec::new();
+                loop {
+                    let mut byte = (value & 0x7f) as u8;
+                    value >>= 7;
+                    if value != 0 {
+                        byte |= 0x80;
+                    }
+                    encoded.push(byte);
+                    if value == 0 {
+                        break;
+                    }
+                }
+                encoded
+            }
+
+            fn string(value: &[u8]) -> Vec<u8> {
+                let mut encoded = uvarint(value.len() as u64);
+                encoded.extend_from_slice(value);
+                encoded
+            }
+
+            let mut payload = uvarint(0);
+            payload.extend_from_slice(&string(b"Go Client"));
+            payload.extend_from_slice(&uvarint(1));
+            payload.extend_from_slice(&uvarint(10));
+            payload.extend_from_slice(&uvarint(54_451));
+            payload.extend_from_slice(&string(b"default"));
+            payload.extend_from_slice(&string(b"default"));
+            payload.extend_from_slice(&string(b""));
+            payload
+        }
+
         fn turn_allocate_request() -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&0x0003_u16.to_be_bytes());
@@ -7667,6 +7701,11 @@ mod tests {
                 AgentPacketFlowApplication::MongoDb,
                 TransportProtocol::Tcp,
                 mongodb_op_msg(),
+            ),
+            (
+                AgentPacketFlowApplication::ClickHouse,
+                TransportProtocol::Tcp,
+                clickhouse_client_hello(),
             ),
             (
                 AgentPacketFlowApplication::Vnc,
