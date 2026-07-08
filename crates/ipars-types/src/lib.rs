@@ -7743,7 +7743,7 @@ pub mod api {
     }
 
     fn mssql_tds_packet_type(packet_type: u8) -> bool {
-        matches!(packet_type, 0x01 | 0x10 | 0x12)
+        matches!(packet_type, 0x01 | 0x04 | 0x10 | 0x12)
     }
 
     fn mssql_tds_status(status: u8) -> bool {
@@ -7758,10 +7758,148 @@ pub mod api {
     ) -> bool {
         match packet_type {
             0x01 => mssql_sql_batch_body(body, incomplete),
+            0x04 => mssql_server_token_stream_body(body, incomplete),
             0x10 => mssql_login7_body(body, declared_body_len, incomplete),
             0x12 => mssql_prelogin_body(body, declared_body_len, incomplete),
             _ => false,
         }
+    }
+
+    fn mssql_server_token_stream_body(body: &[u8], incomplete: bool) -> bool {
+        let mut offset = 0_usize;
+        let mut token_count = 0_usize;
+        while offset < body.len() {
+            let Some(&token) = body.get(offset) else {
+                return incomplete && token_count > 0;
+            };
+            match token {
+                0xfd..=0xff => {
+                    let Some(token_end) = offset.checked_add(13) else {
+                        return false;
+                    };
+                    let Some(token_body) = body.get(offset..token_end) else {
+                        return incomplete && token_count > 0;
+                    };
+                    if !mssql_done_token_body(token_body) {
+                        return false;
+                    }
+                    offset = token_end;
+                }
+                0xaa | 0xab => {
+                    let Some(length_offset) = offset.checked_add(1) else {
+                        return false;
+                    };
+                    let Some(length) = read_u16_le(body, length_offset).map(|value| value as usize)
+                    else {
+                        return incomplete && token_count > 0;
+                    };
+                    if length > 8192 {
+                        return false;
+                    }
+                    let Some(token_body_offset) = offset.checked_add(3) else {
+                        return false;
+                    };
+                    let Some(token_end) = token_body_offset.checked_add(length) else {
+                        return false;
+                    };
+                    let Some(token_body) = body.get(token_body_offset..token_end) else {
+                        return incomplete && token_count > 0;
+                    };
+                    if !mssql_error_or_info_token_body(token, token_body) {
+                        return false;
+                    }
+                    offset = token_end;
+                }
+                _ => return false,
+            }
+            token_count += 1;
+            if token_count > 32 {
+                return false;
+            }
+        }
+        token_count > 0
+    }
+
+    fn mssql_done_token_body(token: &[u8]) -> bool {
+        if token.len() != 13 || !matches!(token[0], 0xfd..=0xff) {
+            return false;
+        }
+        let Some(status) = read_u16_le(token, 1) else {
+            return false;
+        };
+        status & !0x0137 == 0
+    }
+
+    fn mssql_error_or_info_token_body(token: u8, body: &[u8]) -> bool {
+        if body.len() < 12 {
+            return false;
+        }
+        let Some(number) = read_u32_le(body, 0) else {
+            return false;
+        };
+        if token == 0xaa && number == 0 {
+            return false;
+        }
+        let class = body[5];
+        if class > 25 {
+            return false;
+        }
+
+        let Some(message_chars) = read_u16_le(body, 6).map(|value| value as usize) else {
+            return false;
+        };
+        let Some(message_bytes) = message_chars.checked_mul(2) else {
+            return false;
+        };
+        if message_bytes == 0 || message_bytes > 4096 {
+            return false;
+        }
+        let Some(mut offset) = 8_usize.checked_add(message_bytes) else {
+            return false;
+        };
+        let Some(message) = body.get(8..offset) else {
+            return false;
+        };
+        if !mssql_utf16le_text_field(message, false) {
+            return false;
+        }
+
+        let Some(next_offset) = mssql_b_varchar_field(body, offset, 128, true) else {
+            return false;
+        };
+        offset = next_offset;
+        let Some(next_offset) = mssql_b_varchar_field(body, offset, 128, true) else {
+            return false;
+        };
+        offset = next_offset;
+        matches!(body.len().checked_sub(offset), Some(2 | 4))
+    }
+
+    fn mssql_b_varchar_field(
+        payload: &[u8],
+        offset: usize,
+        max_chars: usize,
+        allow_empty: bool,
+    ) -> Option<usize> {
+        let chars = *payload.get(offset)? as usize;
+        if chars > max_chars || (!allow_empty && chars == 0) {
+            return None;
+        }
+        let value_offset = offset.checked_add(1)?;
+        let value_bytes = chars.checked_mul(2)?;
+        let value_end = value_offset.checked_add(value_bytes)?;
+        let value = payload.get(value_offset..value_end)?;
+        mssql_utf16le_text_field(value, allow_empty).then_some(value_end)
+    }
+
+    fn mssql_utf16le_text_field(value: &[u8], allow_empty: bool) -> bool {
+        (allow_empty || !value.is_empty())
+            && value.len().is_multiple_of(2)
+            && value.chunks_exact(2).all(|chunk| {
+                chunk[1] == 0
+                    && (chunk[0].is_ascii_graphic()
+                        || matches!(chunk[0], b' ' | b'\t' | b'\n' | b'\r'))
+            })
     }
 
     fn mssql_prelogin_body(body: &[u8], declared_body_len: usize, incomplete: bool) -> bool {
@@ -12858,6 +12996,41 @@ mod tests {
             payload
         }
 
+        fn mssql_done_token(status: u16, cur_cmd: u16, row_count: u64) -> Vec<u8> {
+            let mut token = vec![0xfd];
+            token.extend_from_slice(&status.to_le_bytes());
+            token.extend_from_slice(&cur_cmd.to_le_bytes());
+            token.extend_from_slice(&row_count.to_le_bytes());
+            token
+        }
+
+        fn mssql_error_token(
+            number: u32,
+            state: u8,
+            class: u8,
+            message: &[u8],
+            server: &[u8],
+            procedure: &[u8],
+            line: u32,
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&number.to_le_bytes());
+            body.push(state);
+            body.push(class);
+            body.extend_from_slice(&(message.len() as u16).to_le_bytes());
+            body.extend_from_slice(&utf16le_ascii(message));
+            body.push(server.len() as u8);
+            body.extend_from_slice(&utf16le_ascii(server));
+            body.push(procedure.len() as u8);
+            body.extend_from_slice(&utf16le_ascii(procedure));
+            body.extend_from_slice(&line.to_le_bytes());
+
+            let mut token = vec![0xaa];
+            token.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            token.extend_from_slice(&body);
+            token
+        }
+
         fn utf16le_ascii(value: &[u8]) -> Vec<u8> {
             let mut payload = Vec::with_capacity(value.len() * 2);
             for byte in value {
@@ -15351,12 +15524,58 @@ mod tests {
             observation_for_payload(&mssql_sql_batch).application(),
             api::AgentPacketFlowApplication::MsSql
         );
+        let mssql_done = mssql_tds_packet(0x04, &mssql_done_token(0x0010, 0, 1));
+        assert_eq!(
+            observation_for_payload(&mssql_done).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
+        let mssql_error_done = mssql_tds_packet(
+            0x04,
+            &[
+                mssql_error_token(
+                    208,
+                    1,
+                    16,
+                    b"Invalid object name 'missing'.",
+                    b"sql-a",
+                    b"",
+                    1,
+                ),
+                mssql_done_token(0x0002, 0, 0),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            observation_for_payload(&mssql_error_done).application(),
+            api::AgentPacketFlowApplication::MsSql
+        );
         let invalid_mssql_status = vec![
             0x12, 0xe0, 0x00, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0xff,
             0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(
             observation_for_payload(&invalid_mssql_status).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_mssql_done = mssql_tds_packet(0x04, &mssql_done_token(0x8000, 0, 0));
+        assert_eq!(
+            observation_for_payload(&invalid_mssql_done).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let invalid_mssql_error = mssql_tds_packet(
+            0x04,
+            &mssql_error_token(
+                0,
+                1,
+                16,
+                b"Invalid object name 'missing'.",
+                b"sql-a",
+                b"",
+                1,
+            ),
+        );
+        assert_eq!(
+            observation_for_payload(&invalid_mssql_error).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let oracle_descriptor =
