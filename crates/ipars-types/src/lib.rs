@@ -4129,7 +4129,10 @@ pub mod api {
             35 => dns_naptr_rdata_payload(payload, rdata_offset, rdata_end),
             43 => dns_ds_rdata_payload(payload, rdata_offset, rdata_end),
             46 => dns_rrsig_rdata_payload(payload, rdata_offset, rdata_end),
+            47 => dns_nsec_rdata_payload(payload, rdata_offset, rdata_end),
             48 => dns_dnskey_rdata_payload(payload, rdata_offset, rdata_end),
+            50 => dns_nsec3_rdata_payload(payload, rdata_offset, rdata_end),
+            51 => dns_nsec3param_rdata_payload(payload, rdata_offset, rdata_end),
             257 => dns_caa_rdata_payload(payload, rdata_offset, rdata_end),
             _ => true,
         }
@@ -4253,6 +4256,93 @@ pub mod api {
             && payload
                 .get(rdata_offset + 3)
                 .is_some_and(|algorithm| *algorithm != 0)
+    }
+
+    fn dns_nsec_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        dns_name_payload_with_root(payload, rdata_offset, true).is_some_and(|bitmap_offset| {
+            dns_type_bit_maps_payload(payload, bitmap_offset, rdata_end)
+        })
+    }
+
+    fn dns_nsec3_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(salt_len_offset) = rdata_offset.checked_add(4) else {
+            return false;
+        };
+        if salt_len_offset >= rdata_end {
+            return false;
+        }
+        let algorithm = payload[rdata_offset];
+        let flags = payload[rdata_offset + 1];
+        let salt_len = payload[salt_len_offset] as usize;
+        let Some(salt_offset) = salt_len_offset.checked_add(1) else {
+            return false;
+        };
+        let Some(hash_len_offset) = salt_offset.checked_add(salt_len) else {
+            return false;
+        };
+        if hash_len_offset >= rdata_end {
+            return false;
+        }
+        let hash_len = payload[hash_len_offset] as usize;
+        let Some(hash_offset) = hash_len_offset.checked_add(1) else {
+            return false;
+        };
+        let Some(bitmap_offset) = hash_offset.checked_add(hash_len) else {
+            return false;
+        };
+        algorithm != 0
+            && flags & !0x01 == 0
+            && hash_len > 0
+            && bitmap_offset < rdata_end
+            && dns_type_bit_maps_payload(payload, bitmap_offset, rdata_end)
+    }
+
+    fn dns_nsec3param_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(salt_len_offset) = rdata_offset.checked_add(4) else {
+            return false;
+        };
+        if salt_len_offset >= rdata_end {
+            return false;
+        }
+        let algorithm = payload[rdata_offset];
+        let flags = payload[rdata_offset + 1];
+        let salt_len = payload[salt_len_offset] as usize;
+        let Some(salt_offset) = salt_len_offset.checked_add(1) else {
+            return false;
+        };
+        algorithm != 0 && flags & !0x01 == 0 && salt_offset.checked_add(salt_len) == Some(rdata_end)
+    }
+
+    fn dns_type_bit_maps_payload(payload: &[u8], mut offset: usize, end: usize) -> bool {
+        let mut previous_window = None;
+        let mut window_count = 0_usize;
+        while offset < end {
+            let Some(&window) = payload.get(offset) else {
+                return false;
+            };
+            let Some(&bitmap_len) = payload.get(offset + 1) else {
+                return false;
+            };
+            let bitmap_len = bitmap_len as usize;
+            if !(1..=32).contains(&bitmap_len)
+                || previous_window.is_some_and(|previous| window <= previous)
+            {
+                return false;
+            }
+            let Some(bitmap_offset) = offset.checked_add(2) else {
+                return false;
+            };
+            let Some(next_offset) = bitmap_offset.checked_add(bitmap_len) else {
+                return false;
+            };
+            if next_offset > end || payload.get(next_offset - 1) == Some(&0) {
+                return false;
+            }
+            previous_window = Some(window);
+            window_count += 1;
+            offset = next_offset;
+        }
+        window_count > 0
     }
 
     fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
@@ -16063,6 +16153,79 @@ mod tests {
         dns_response_with_empty_rrsig_signature[rrsig_answer_rdlength_offset + 1] = 0x14;
         assert_eq!(
             observation_for_udp_payload(&dns_response_with_empty_rrsig_signature).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut nsec_query = dns_query.clone();
+        nsec_query[qtype_offset] = 0x00;
+        nsec_query[qtype_offset + 1] = 0x2f;
+        let mut dns_response_with_nsec_answer = nsec_query.clone();
+        dns_response_with_nsec_answer[2] = 0x81;
+        dns_response_with_nsec_answer[3] = 0x80;
+        dns_response_with_nsec_answer[7] = 0x01;
+        dns_response_with_nsec_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x2f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x05, 0xc0, 0x0c,
+            0x00, 0x01, 0x40,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_nsec_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_nsec_bitmap = dns_response_with_nsec_answer.clone();
+        let nsec_bitmap_byte_offset = nsec_query.len() + 16;
+        dns_response_with_bad_nsec_bitmap[nsec_bitmap_byte_offset] = 0x00;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_nsec_bitmap).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut nsec3_query = dns_query.clone();
+        nsec3_query[qtype_offset] = 0x00;
+        nsec3_query[qtype_offset + 1] = 0x32;
+        let mut dns_response_with_nsec3_answer = nsec3_query.clone();
+        dns_response_with_nsec3_answer[2] = 0x81;
+        dns_response_with_nsec3_answer[3] = 0x80;
+        dns_response_with_nsec3_answer[7] = 0x01;
+        dns_response_with_nsec3_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x0f, 0x01, 0x00,
+            0x00, 0x02, 0x02, 0xaa, 0xbb, 0x04, 0x01, 0x02, 0x03, 0x04, 0x00, 0x01, 0x40,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_nsec3_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_nsec3_flags = dns_response_with_nsec3_answer.clone();
+        let nsec3_flags_offset = nsec3_query.len() + 13;
+        dns_response_with_bad_nsec3_flags[nsec3_flags_offset] = 0x02;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_nsec3_flags).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_with_bad_nsec3_hash = dns_response_with_nsec3_answer.clone();
+        let nsec3_hash_len_offset = nsec3_query.len() + 19;
+        dns_response_with_bad_nsec3_hash[nsec3_hash_len_offset] = 0x00;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_nsec3_hash).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut nsec3param_query = dns_query.clone();
+        nsec3param_query[qtype_offset] = 0x00;
+        nsec3param_query[qtype_offset + 1] = 0x33;
+        let mut dns_response_with_nsec3param_answer = nsec3param_query.clone();
+        dns_response_with_nsec3param_answer[2] = 0x81;
+        dns_response_with_nsec3param_answer[3] = 0x80;
+        dns_response_with_nsec3param_answer[7] = 0x01;
+        dns_response_with_nsec3param_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x33, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x07, 0x01, 0x00,
+            0x00, 0x02, 0x02, 0xaa, 0xbb,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_nsec3param_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_nsec3param_salt = dns_response_with_nsec3param_answer.clone();
+        let nsec3param_salt_len_offset = nsec3param_query.len() + 16;
+        dns_response_with_bad_nsec3param_salt[nsec3param_salt_len_offset] = 0x03;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_nsec3param_salt).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
