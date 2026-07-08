@@ -1989,6 +1989,11 @@ pub mod api {
     pub const PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES: usize = 128;
     const DNS_MAX_QUESTION_COUNT: u16 = 64;
 
+    enum DnsSectionParse {
+        Complete(usize),
+        Truncated,
+    }
+
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentPacketFlowObservation {
         #[serde(default)]
@@ -3847,18 +3852,29 @@ pub mod api {
         let flags = u16::from_be_bytes([payload[2], payload[3]]);
         let opcode = (flags >> 11) & 0x0f;
         let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+        let rr_count = u16::from_be_bytes([payload[6], payload[7]]) as usize
+            + u16::from_be_bytes([payload[8], payload[9]]) as usize
+            + u16::from_be_bytes([payload[10], payload[11]]) as usize;
         if opcode > 5 || flags & 0x0040 != 0 {
             return false;
         }
         if qdcount > 0 {
-            return dns_question_payload(payload, qdcount, allow_truncated);
+            return match dns_question_payload(payload, qdcount, allow_truncated) {
+                Some(DnsSectionParse::Complete(question_end)) => {
+                    flags & 0x8000 == 0
+                        || rr_count == 0
+                        || dns_resource_records_payload(
+                            payload,
+                            question_end,
+                            rr_count,
+                            allow_truncated,
+                        )
+                }
+                Some(DnsSectionParse::Truncated) => true,
+                None => false,
+            };
         }
-        let rr_count = u16::from_be_bytes([payload[6], payload[7]]) as usize
-            + u16::from_be_bytes([payload[8], payload[9]]) as usize
-            + u16::from_be_bytes([payload[10], payload[11]]) as usize;
-        flags & 0x8000 != 0
-            && (1..=4096).contains(&rr_count)
-            && dns_resource_record_payload(payload, 12, allow_truncated)
+        flags & 0x8000 != 0 && dns_resource_records_payload(payload, 12, rr_count, allow_truncated)
     }
 
     fn dhcp_payload(payload: &[u8]) -> bool {
@@ -3940,28 +3956,56 @@ pub mod api {
         option_count > 0 && (!require_relay_message || relay_message_seen)
     }
 
-    fn dns_question_payload(payload: &[u8], qdcount: u16, allow_truncated: bool) -> bool {
+    fn dns_question_payload(
+        payload: &[u8],
+        qdcount: u16,
+        allow_truncated: bool,
+    ) -> Option<DnsSectionParse> {
         if qdcount > DNS_MAX_QUESTION_COUNT {
-            return false;
+            return None;
         }
         let mut offset = 12_usize;
         for question_index in 0..qdcount {
             let Some(name_end) = dns_name_payload(payload, offset) else {
-                return question_index > 0 && allow_truncated;
+                return (question_index > 0 && allow_truncated)
+                    .then_some(DnsSectionParse::Truncated);
             };
             offset = name_end;
             let Some(question_end) = offset.checked_add(4) else {
-                return false;
+                return None;
             };
             let Some(question) = payload.get(offset..question_end) else {
-                return question_index > 0 && allow_truncated;
+                return (question_index > 0 && allow_truncated)
+                    .then_some(DnsSectionParse::Truncated);
             };
             let qtype = u16::from_be_bytes([question[0], question[1]]);
             let qclass = u16::from_be_bytes([question[2], question[3]]);
             if qtype == 0 || qclass == 0 {
-                return false;
+                return None;
             }
             offset = question_end;
+        }
+        Some(DnsSectionParse::Complete(offset))
+    }
+
+    fn dns_resource_records_payload(
+        payload: &[u8],
+        mut offset: usize,
+        rr_count: usize,
+        allow_truncated: bool,
+    ) -> bool {
+        if !(1..=4096).contains(&rr_count) {
+            return false;
+        }
+        for rr_index in 0..rr_count {
+            if offset >= payload.len() {
+                return rr_index > 0 && allow_truncated;
+            }
+            match dns_resource_record_payload(payload, offset, allow_truncated) {
+                Some(DnsSectionParse::Complete(rr_end)) => offset = rr_end,
+                Some(DnsSectionParse::Truncated) => return allow_truncated,
+                None => return false,
+            }
         }
         true
     }
@@ -3970,24 +4014,30 @@ pub mod api {
         payload: &[u8],
         mut offset: usize,
         allow_truncated: bool,
-    ) -> bool {
+    ) -> Option<DnsSectionParse> {
         let Some(name_end) = dns_name_payload(payload, offset) else {
-            return false;
+            return None;
         };
         offset = name_end;
         let Some(rr_header_end) = offset.checked_add(10) else {
-            return false;
+            return None;
         };
         let Some(rr_header) = payload.get(offset..rr_header_end) else {
-            return false;
+            return None;
         };
         let rr_type = u16::from_be_bytes([rr_header[0], rr_header[1]]);
         let rr_class = u16::from_be_bytes([rr_header[2], rr_header[3]]);
         let rdlength = u16::from_be_bytes([rr_header[8], rr_header[9]]) as usize;
         let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
-            return false;
+            return None;
         };
-        rr_type != 0 && rr_class & 0x7fff != 0 && (rr_end <= payload.len() || allow_truncated)
+        if rr_type == 0 || rr_class & 0x7fff == 0 {
+            return None;
+        }
+        if rr_end > payload.len() {
+            return allow_truncated.then_some(DnsSectionParse::Truncated);
+        }
+        Some(DnsSectionParse::Complete(rr_end))
     }
 
     fn dns_name_payload(payload: &[u8], mut offset: usize) -> Option<usize> {
@@ -15424,6 +15474,27 @@ mod tests {
             observation_for_payload(&long_declared_dns_tcp_payload).application(),
             api::AgentPacketFlowApplication::Unknown
         );
+        let mut dns_response_with_answer = dns_query.clone();
+        dns_response_with_answer[2] = 0x81;
+        dns_response_with_answer[3] = 0x80;
+        dns_response_with_answer[7] = 0x01;
+        dns_response_with_answer.extend_from_slice(&[
+            0x03, b'a', b'p', b'i', 0x07, b's', b'e', b'r', b'v', b'i', b'c', b'e', 0x05, b'l',
+            b'o', b'c', b'a', b'l', 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00,
+            0x04, 192, 0, 2, 20,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut missing_dns_answer = dns_query.clone();
+        missing_dns_answer[2] = 0x81;
+        missing_dns_answer[3] = 0x80;
+        missing_dns_answer[7] = 0x01;
+        assert_eq!(
+            observation_for_udp_payload(&missing_dns_answer).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mdns_response = vec![
             0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'p',
             b'r', b'i', b'n', b't', b'e', b'r', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00,
@@ -15432,6 +15503,22 @@ mod tests {
         assert_eq!(
             observation_for_udp_payload(&mdns_response).application(),
             api::AgentPacketFlowApplication::Dns
+        );
+        let mut mdns_two_answer_response = mdns_response.clone();
+        mdns_two_answer_response[7] = 0x02;
+        mdns_two_answer_response.extend_from_slice(&[
+            0x06, b'b', b'a', b'c', b'k', b'u', b'p', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00,
+            0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 192, 0, 2, 11,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&mdns_two_answer_response).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut mdns_missing_second_answer = mdns_response.clone();
+        mdns_missing_second_answer[7] = 0x02;
+        assert_eq!(
+            observation_for_udp_payload(&mdns_missing_second_answer).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut mdns_tcp_payload = (mdns_response.len() as u16).to_be_bytes().to_vec();
         mdns_tcp_payload.extend_from_slice(&mdns_response);
