@@ -4764,6 +4764,7 @@ pub mod api {
             return false;
         }
         let version = payload[0] >> 6;
+        let message_type = (payload[0] >> 4) & 0x03;
         let token_len = (payload[0] & 0x0f) as usize;
         if version != 1 || token_len > 8 {
             return false;
@@ -4776,10 +4777,77 @@ pub mod api {
         }
         let code_class = payload[1] >> 5;
         let code_detail = payload[1] & 0x1f;
-        matches!(
-            (code_class, code_detail),
-            (0, 1..=5) | (2, 1..=31) | (4, 0..=31) | (5, 0..=31)
-        )
+        if code_class == 0 && code_detail == 0 {
+            return token_len == 0 && payload.len() == 4 && matches!(message_type, 2 | 3);
+        }
+        let code_ok = match (code_class, code_detail) {
+            (0, 1..=5) => matches!(message_type, 0 | 1),
+            (2, 1..=31) | (4, 0..=31) | (5, 0..=31) => matches!(message_type, 0 | 1 | 2),
+            _ => false,
+        };
+        code_ok && coap_options_payload(payload, header_len)
+    }
+
+    fn coap_options_payload(payload: &[u8], mut offset: usize) -> bool {
+        let mut option_number = 0_u32;
+        let mut option_count = 0_usize;
+        while offset < payload.len() {
+            let option_header = payload[offset];
+            offset += 1;
+            if option_header == 0xff {
+                return offset < payload.len()
+                    || payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            }
+            let delta_nibble = option_header >> 4;
+            let length_nibble = option_header & 0x0f;
+            if delta_nibble == 15 || length_nibble == 15 {
+                return false;
+            }
+            let Some((delta, next_offset)) =
+                coap_option_nibble_value(payload, offset, delta_nibble)
+            else {
+                return payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            };
+            offset = next_offset;
+            let Some((option_len, next_offset)) =
+                coap_option_nibble_value(payload, offset, length_nibble)
+            else {
+                return payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            };
+            offset = next_offset;
+            option_number = match option_number.checked_add(delta as u32) {
+                Some(value) => value,
+                None => return false,
+            };
+            if option_count == 0 && option_number == 0 {
+                return false;
+            }
+            option_count += 1;
+            let Some(option_end) = offset.checked_add(option_len) else {
+                return false;
+            };
+            if option_end > payload.len() {
+                return payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+            }
+            offset = option_end;
+        }
+        true
+    }
+
+    fn coap_option_nibble_value(
+        payload: &[u8],
+        offset: usize,
+        nibble: u8,
+    ) -> Option<(usize, usize)> {
+        match nibble {
+            0..=12 => Some((nibble as usize, offset)),
+            13 => Some((13 + *payload.get(offset)? as usize, offset + 1)),
+            14 => {
+                let value = read_u16_be(payload, offset)? as usize;
+                Some((269 + value, offset + 2))
+            }
+            _ => None,
+        }
     }
 
     fn wireguard_observed_len_matches(payload_len: usize, wire_len: usize) -> bool {
@@ -13257,6 +13325,18 @@ mod tests {
             vec![0x40, 0x01, 0x12, 0x34]
         }
 
+        fn coap_get_uri_path_request(path: &[u8]) -> Vec<u8> {
+            let mut payload = vec![0x41, 0x01, 0x12, 0x34, 0xaa];
+            if path.len() <= 12 {
+                payload.push(0xb0 | path.len() as u8);
+            } else {
+                payload.push(0xbd);
+                payload.push((path.len() - 13) as u8);
+            }
+            payload.extend_from_slice(path);
+            payload
+        }
+
         fn ipars_relay_datagram() -> Vec<u8> {
             let session_id = b"session-a";
             let token = b"token-a";
@@ -14141,7 +14221,51 @@ mod tests {
             api::AgentPacketFlowApplication::Coap
         );
         assert_eq!(
+            observation_for_udp_payload(&coap_get_uri_path_request(b"status")).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_udp_payload(&coap_get_uri_path_request(b"temperature-c")).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x40, 0x02, 0x12, 0x34, 0xff, b'o', b'k']).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x60, 0x00, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x70, 0x00, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Coap
+        );
+        assert_eq!(
             observation_for_udp_payload(&[0x80, 0x01, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x60, 0x01, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x70, 0x45, 0x12, 0x34]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x40, 0x02, 0x12, 0x34, 0xff]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x40, 0x01, 0x12, 0x34, 0xf0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x40, 0x01, 0x12, 0x34, 0x0f]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_udp_payload(&[0x40, 0x01, 0x12, 0x34, 0xb5, b'a']).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut malformed_stun = stun_binding_request();
