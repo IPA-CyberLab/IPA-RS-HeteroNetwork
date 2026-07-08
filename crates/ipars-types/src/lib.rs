@@ -6638,18 +6638,246 @@ pub mod api {
         if line.is_empty() {
             return false;
         }
-        if line.len() >= 5
-            && line[0..3].iter().all(u8::is_ascii_digit)
-            && matches!(line[3], b' ' | b'-')
-            && (ascii_contains_ignore_case(line, b"FTP")
-                || ascii_contains_ignore_case(line, b"FTPS"))
-        {
+        if ftp_reply_line(line) {
             return true;
         }
         let Some((command, _)) = split_ascii_token(line) else {
             return false;
         };
         ftp_known_command(command)
+    }
+
+    fn ftp_reply_line(line: &[u8]) -> bool {
+        if line.len() < 4
+            || line.len() > 512
+            || !line[0..3].iter().all(u8::is_ascii_digit)
+            || !matches!(line[3], b' ' | b'-')
+        {
+            return false;
+        }
+        let Some(code) = decimal_usize(&line[0..3]) else {
+            return false;
+        };
+        if !ftp_known_reply_code(code) {
+            return false;
+        }
+        let text = trim_ascii_space(&line[4..]);
+        if !ftp_reply_text(text) {
+            return false;
+        }
+        if ascii_contains_ignore_case(text, b"FTP") || ascii_contains_ignore_case(text, b"FTPS") {
+            return true;
+        }
+        match code {
+            110 => ftp_restart_marker_text(text),
+            120 => {
+                ascii_contains_ignore_case(text, b"service ready")
+                    && ascii_contains_ignore_case(text, b"minute")
+            }
+            125 => {
+                ascii_contains_ignore_case(text, b"data connection")
+                    && (ascii_contains_ignore_case(text, b"open")
+                        || ascii_contains_ignore_case(text, b"starting"))
+            }
+            150 => {
+                ascii_contains_ignore_case(text, b"data connection")
+                    || ascii_contains_ignore_case(text, b"opening")
+                    || ascii_contains_ignore_case(text, b"file status")
+            }
+            200 => {
+                ascii_contains_ignore_case(text, b"command okay")
+                    || ascii_contains_ignore_case(text, b"type set")
+                    || ascii_contains_ignore_case(text, b"mode set")
+            }
+            202 => {
+                ascii_contains_ignore_case(text, b"command not implemented")
+                    || ascii_contains_ignore_case(text, b"superfluous")
+            }
+            211 => ascii_contains_ignore_case(text, b"system status"),
+            212 => ascii_contains_ignore_case(text, b"directory status"),
+            213 => ascii_contains_ignore_case(text, b"file status"),
+            214 => ascii_contains_ignore_case(text, b"help"),
+            215 => ascii_contains_ignore_case(text, b"system type"),
+            221 => {
+                ascii_contains_ignore_case(text, b"service closing")
+                    || ascii_contains_ignore_case(text, b"control connection")
+                    || ascii_contains_ignore_case(text, b"logged out")
+            }
+            225 => ascii_contains_ignore_case(text, b"data connection"),
+            226 => {
+                ascii_contains_ignore_case(text, b"data connection")
+                    || ascii_contains_ignore_case(text, b"transfer complete")
+                    || ascii_contains_ignore_case(text, b"file transfer")
+            }
+            227 => ftp_passive_mode_reply_text(text),
+            229 => ftp_extended_passive_mode_reply_text(text),
+            230 => ascii_contains_ignore_case(text, b"logged in"),
+            250 => {
+                (ascii_contains_ignore_case(text, b"requested file action")
+                    && (ascii_contains_ignore_case(text, b"okay")
+                        || ascii_contains_ignore_case(text, b"completed")))
+                    || ascii_contains_ignore_case(text, b"directory successfully changed")
+            }
+            257 => ftp_quoted_path_reply_text(text),
+            331 => ascii_contains_ignore_case(text, b"password"),
+            332 | 532 => ascii_contains_ignore_case(text, b"account"),
+            350 => {
+                ascii_contains_ignore_case(text, b"pending")
+                    || ascii_contains_ignore_case(text, b"further information")
+            }
+            421 => {
+                ascii_contains_ignore_case(text, b"service not available")
+                    || ascii_contains_ignore_case(text, b"closing control connection")
+            }
+            425 | 426 => ascii_contains_ignore_case(text, b"data connection"),
+            450 | 451 | 452 | 550 | 551 | 552 | 553 => {
+                ascii_contains_ignore_case(text, b"requested action")
+                    || ascii_contains_ignore_case(text, b"file")
+                    || ascii_contains_ignore_case(text, b"directory")
+                    || ascii_contains_ignore_case(text, b"storage")
+                    || ascii_contains_ignore_case(text, b"access")
+            }
+            500 | 501 | 502 | 503 | 504 => {
+                ascii_contains_ignore_case(text, b"syntax")
+                    || ascii_contains_ignore_case(text, b"command")
+                    || ascii_contains_ignore_case(text, b"parameter")
+                    || ascii_contains_ignore_case(text, b"argument")
+                    || ascii_contains_ignore_case(text, b"sequence")
+            }
+            530 => ascii_contains_ignore_case(text, b"logged in"),
+            _ => false,
+        }
+    }
+
+    fn ftp_known_reply_code(code: usize) -> bool {
+        matches!(
+            code,
+            110 | 120
+                | 125
+                | 150
+                | 200
+                | 202
+                | 211
+                | 212
+                | 213
+                | 214
+                | 215
+                | 220
+                | 221
+                | 225
+                | 226
+                | 227
+                | 229
+                | 230
+                | 250
+                | 257
+                | 331
+                | 332
+                | 350
+                | 421
+                | 425
+                | 426
+                | 450
+                | 451
+                | 452
+                | 500
+                | 501
+                | 502
+                | 503
+                | 504
+                | 530
+                | 532
+                | 550
+                | 551
+                | 552
+                | 553
+        )
+    }
+
+    fn ftp_reply_text(text: &[u8]) -> bool {
+        !text.is_empty()
+            && text
+                .iter()
+                .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
+    }
+
+    fn ftp_restart_marker_text(text: &[u8]) -> bool {
+        ascii_starts_with_ignore_case(text, b"MARK ")
+            && text.windows(3).any(|window| window == b" = ")
+    }
+
+    fn ftp_passive_mode_reply_text(text: &[u8]) -> bool {
+        if !ascii_contains_ignore_case(text, b"passive mode") {
+            return false;
+        }
+        let Some(open) = text.iter().position(|byte| *byte == b'(') else {
+            return false;
+        };
+        let Some(close_rel) = text[open + 1..].iter().position(|byte| *byte == b')') else {
+            return false;
+        };
+        let tuple = &text[open + 1..open + 1 + close_rel];
+        let mut count = 0_usize;
+        for part in tuple.split(|byte| *byte == b',') {
+            count += 1;
+            if count > 6 {
+                return false;
+            }
+            let Some(value) = decimal_usize(part) else {
+                return false;
+            };
+            if value > 255 {
+                return false;
+            }
+        }
+        count == 6
+    }
+
+    fn ftp_extended_passive_mode_reply_text(text: &[u8]) -> bool {
+        if !ascii_contains_ignore_case(text, b"extended passive mode") {
+            return false;
+        }
+        let Some(open) = text.iter().position(|byte| *byte == b'(') else {
+            return false;
+        };
+        let Some(close_rel) = text[open + 1..].iter().position(|byte| *byte == b')') else {
+            return false;
+        };
+        let fields = &text[open + 1..open + 1 + close_rel];
+        if fields.len() < 5 {
+            return false;
+        }
+        let delimiter = fields[0];
+        if !delimiter.is_ascii_graphic() || delimiter.is_ascii_digit() {
+            return false;
+        }
+        if fields.get(1) != Some(&delimiter) || fields.get(2) != Some(&delimiter) {
+            return false;
+        }
+        let port_end = fields[3..].iter().position(|byte| *byte == delimiter);
+        let Some(port_end) = port_end else {
+            return false;
+        };
+        if 3 + port_end + 1 != fields.len() {
+            return false;
+        }
+        let Some(port) = decimal_usize(&fields[3..3 + port_end]) else {
+            return false;
+        };
+        (1..=65_535).contains(&port)
+    }
+
+    fn ftp_quoted_path_reply_text(text: &[u8]) -> bool {
+        if text.first() != Some(&b'"') {
+            return false;
+        }
+        let Some(close) = text[1..].iter().position(|byte| *byte == b'"') else {
+            return false;
+        };
+        let tail = trim_ascii_space(&text[1 + close + 1..]);
+        !tail.is_empty()
+            && (ascii_contains_ignore_case(tail, b"created")
+                || ascii_contains_ignore_case(tail, b"current directory"))
     }
 
     fn ftp_known_command(command: &[u8]) -> bool {
@@ -16209,6 +16437,46 @@ mod tests {
             api::AgentPacketFlowApplication::Ftp
         );
         assert_eq!(
+            observation_for_payload(b"227 Entering Passive Mode (192,0,2,10,195,80)\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"229 Entering Extended Passive Mode (|||6446|)\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"150 Opening BINARY mode data connection for backup.tar\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"226 Transfer complete\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"331 Please specify the password.\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"530 Not logged in.\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"202 Command not implemented, superfluous at this site.\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"250 Directory successfully changed.\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
+            observation_for_payload(b"257 \"/var/ftp\" is current directory\r\n").application(),
+            api::AgentPacketFlowApplication::Ftp
+        );
+        assert_eq!(
             observation_for_payload(b"PASV\r\n").application(),
             api::AgentPacketFlowApplication::Ftp
         );
@@ -16218,6 +16486,15 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"220 service ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"227 Passive Mode\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"229 Entering Extended Passive Mode (|1|127.0.0.1|6446|)\r\n")
+                .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
@@ -16276,7 +16553,7 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"250 Directory successfully changed.\r\n").application(),
-            api::AgentPacketFlowApplication::Unknown
+            api::AgentPacketFlowApplication::Ftp
         );
         assert_eq!(
             observation_for_payload(b"500 Internal Server Error\r\n").application(),
