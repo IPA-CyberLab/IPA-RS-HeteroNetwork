@@ -506,7 +506,7 @@ mod tests {
     };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
-        NatTraversalStrategy, NodeRecord, Role, TokenPolicy, VpnIp,
+        NatTraversalStrategy, NodeRecord, Role, Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -538,6 +538,17 @@ mod tests {
             token_policy: TokenPolicy::default(),
             routes: Vec::new(),
             registered_at: Utc::now(),
+        }
+    }
+
+    fn advertised_route(id: &str, cidr: &str, advertised_by: &NodeId) -> Route {
+        Route {
+            id: id.to_string(),
+            cidr: cidr.parse().unwrap(),
+            advertised_by: advertised_by.clone(),
+            via: None,
+            metric: 100,
+            tags: BTreeSet::new(),
         }
     }
 
@@ -759,6 +770,43 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = std::str::from_utf8(&body)?;
         assert!(body.contains("IPv6 candidates must use an IPv6 socket address"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_signal_rejects_invalid_route_advertisement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let app = router(SignalHttpState::new(registry.clone()));
+        let mut node = node("node-a", Vec::new());
+        node.routes.push(advertised_route(
+            "unsafe-route",
+            "127.0.0.0/8",
+            &node.node_id,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
+                        node,
+                        nat_classification: None,
+                        health: None,
+                    })?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("route unsafe-route for node node-a is invalid"));
+        assert!(body.contains("route CIDR is restricted"));
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.node_count, 0);
+        assert_eq!(metrics.node_upsert_count, 0);
         Ok(())
     }
 
