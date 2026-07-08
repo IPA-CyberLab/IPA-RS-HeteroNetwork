@@ -7008,6 +7008,7 @@ pub mod api {
         mysql_initial_handshake_payload(payload)
             || mysql_client_handshake_payload(payload)
             || mysql_command_packet_payload(payload)
+            || mysql_server_response_packet_payload(payload)
     }
 
     const MYSQL_CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
@@ -7075,6 +7076,11 @@ pub mod api {
         IncompleteAfterCommand,
     }
 
+    enum MysqlServerResponsePacketParse {
+        Complete(usize),
+        Incomplete,
+    }
+
     fn mysql_command_packet(payload: &[u8], offset: usize) -> Option<MysqlCommandPacketParse> {
         if payload.len().saturating_sub(offset) < 4 {
             return Some(MysqlCommandPacketParse::IncompleteBeforeCommand);
@@ -7099,6 +7105,49 @@ pub mod api {
         } else {
             Some(MysqlCommandPacketParse::Complete(packet_end))
         }
+    }
+
+    fn mysql_server_response_packet_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut packet_count = 0_usize;
+        while offset < payload.len() {
+            match mysql_server_response_packet(payload, offset) {
+                Some(MysqlServerResponsePacketParse::Complete(next_offset)) => {
+                    packet_count += 1;
+                    if packet_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(MysqlServerResponsePacketParse::Incomplete) => {
+                    return packet_count > 0
+                        && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES;
+                }
+                None => return false,
+            }
+        }
+        packet_count > 0
+    }
+
+    fn mysql_server_response_packet(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<MysqlServerResponsePacketParse> {
+        if payload.len().saturating_sub(offset) < 4 {
+            return Some(MysqlServerResponsePacketParse::Incomplete);
+        }
+        let payload_len = mysql_packet_payload_len(payload, offset)?;
+        let sequence_id = *payload.get(offset.checked_add(3)?)?;
+        if sequence_id == 0 || sequence_id > MYSQL_MAX_PACKET_SEQUENCE_ID {
+            return None;
+        }
+        let body_offset = offset.checked_add(4)?;
+        let packet_end = body_offset.checked_add(payload_len)?;
+        let Some(body) = payload.get(body_offset..packet_end) else {
+            return Some(MysqlServerResponsePacketParse::Incomplete);
+        };
+        mysql_server_response_packet_body(payload_len, body)
+            .then_some(MysqlServerResponsePacketParse::Complete(packet_end))
     }
 
     fn mysql_packet_payload_len(payload: &[u8], offset: usize) -> Option<usize> {
@@ -7496,6 +7545,92 @@ pub mod api {
             0x1c => payload_len == 9 && args.len() == 8,
             _ => false,
         }
+    }
+
+    fn mysql_server_response_packet_body(payload_len: usize, body: &[u8]) -> bool {
+        if body.len() != payload_len {
+            return false;
+        }
+        match body.first().copied() {
+            Some(0x00) => mysql_ok_packet_body(body),
+            Some(0xff) => mysql_err_packet_body(body),
+            Some(0xfe) if payload_len == 5 => mysql_eof_packet_body(body),
+            Some(0xfe) => mysql_auth_switch_request_packet_body(body),
+            _ => false,
+        }
+    }
+
+    fn mysql_ok_packet_body(body: &[u8]) -> bool {
+        if body.len() < 7 {
+            return false;
+        }
+        let Some((_affected_rows, offset)) = mysql_length_encoded_integer(body, 1) else {
+            return false;
+        };
+        let Some((_last_insert_id, offset)) = mysql_length_encoded_integer(body, offset) else {
+            return false;
+        };
+        let Some(status_flags) = read_u16_le(body, offset) else {
+            return false;
+        };
+        if status_flags & !0x7fff != 0 {
+            return false;
+        }
+        let Some(info_offset) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(info) = body.get(info_offset..) else {
+            return false;
+        };
+        mysql_client_text_field(info, 4096, true)
+    }
+
+    fn mysql_err_packet_body(body: &[u8]) -> bool {
+        if body.len() < 10 {
+            return false;
+        }
+        let Some(error_code) = read_u16_le(body, 1) else {
+            return false;
+        };
+        error_code != 0
+            && body.get(3) == Some(&b'#')
+            && body
+                .get(4..9)
+                .is_some_and(|state| state.iter().all(|byte| byte.is_ascii_alphanumeric()))
+            && mysql_client_text_field(body.get(9..).unwrap_or_default(), 4096, false)
+    }
+
+    fn mysql_eof_packet_body(body: &[u8]) -> bool {
+        if body.len() != 5 {
+            return false;
+        }
+        read_u16_le(body, 3).is_some_and(|status_flags| status_flags & !0x7fff == 0)
+    }
+
+    fn mysql_auth_switch_request_packet_body(body: &[u8]) -> bool {
+        if body.len() < 4 || body[0] != 0xfe {
+            return false;
+        }
+        let Some(plugin_end) = mysql_client_null_terminated_field(body, 1, body.len()) else {
+            return false;
+        };
+        let plugin = &body[1..plugin_end - 1];
+        if !mysql_auth_plugin_name(plugin) {
+            return false;
+        }
+        let auth_data = &body[plugin_end..];
+        !auth_data.is_empty() && auth_data.len() <= 1024
+    }
+
+    fn mysql_auth_plugin_name(value: &[u8]) -> bool {
+        matches!(
+            value,
+            b"mysql_native_password"
+                | b"caching_sha2_password"
+                | b"sha256_password"
+                | b"mysql_clear_password"
+                | b"auth_socket"
+        )
     }
 
     fn mysql_sql_command_arg(args: &[u8]) -> bool {
@@ -12627,6 +12762,14 @@ mod tests {
             payload.extend_from_slice(value);
         }
 
+        fn mysql_lenenc_integer(payload: &mut Vec<u8>, value: u64) {
+            assert!(
+                value <= 250,
+                "test helper only encodes small length-encoded integers"
+            );
+            payload.push(value as u8);
+        }
+
         fn mysql_lenenc_string_length(payload: &mut Vec<u8>, len: usize) {
             assert!(
                 len <= 250,
@@ -12645,6 +12788,58 @@ mod tests {
             body.push(45);
             body.extend_from_slice(&[0; 23]);
             mysql_packet(1, &body)
+        }
+
+        fn mysql_ok_packet(
+            sequence_id: u8,
+            affected_rows: u64,
+            last_insert_id: u64,
+            status_flags: u16,
+            warnings: u16,
+            info: &[u8],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x00);
+            mysql_lenenc_integer(&mut body, affected_rows);
+            mysql_lenenc_integer(&mut body, last_insert_id);
+            body.extend_from_slice(&status_flags.to_le_bytes());
+            body.extend_from_slice(&warnings.to_le_bytes());
+            body.extend_from_slice(info);
+            mysql_packet(sequence_id, &body)
+        }
+
+        fn mysql_err_packet(
+            sequence_id: u8,
+            error_code: u16,
+            sql_state: &[u8; 5],
+            message: &[u8],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0xff);
+            body.extend_from_slice(&error_code.to_le_bytes());
+            body.push(b'#');
+            body.extend_from_slice(sql_state);
+            body.extend_from_slice(message);
+            mysql_packet(sequence_id, &body)
+        }
+
+        fn mysql_eof_packet(sequence_id: u8, warnings: u16, status_flags: u16) -> Vec<u8> {
+            let mut body = vec![0xfe];
+            body.extend_from_slice(&warnings.to_le_bytes());
+            body.extend_from_slice(&status_flags.to_le_bytes());
+            mysql_packet(sequence_id, &body)
+        }
+
+        fn mysql_auth_switch_request_packet(
+            sequence_id: u8,
+            plugin: &[u8],
+            auth_data: &[u8],
+        ) -> Vec<u8> {
+            let mut body = vec![0xfe];
+            body.extend_from_slice(plugin);
+            body.push(0);
+            body.extend_from_slice(auth_data);
+            mysql_packet(sequence_id, &body)
         }
 
         fn mssql_tds_packet(packet_type: u8, body: &[u8]) -> Vec<u8> {
@@ -14962,6 +15157,34 @@ mod tests {
             observation_for_payload(&mysql_ssl_request_packet()).application(),
             api::AgentPacketFlowApplication::Mysql
         );
+        assert_eq!(
+            observation_for_payload(&mysql_ok_packet(2, 1, 0, 0x0002, 0, b"Rows matched: 1"))
+                .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_err_packet(
+                1,
+                1_145,
+                b"42S02",
+                b"Table 'app.missing' doesn't exist",
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_eof_packet(3, 0, 0x0002)).application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_auth_switch_request_packet(
+                2,
+                b"caching_sha2_password",
+                b"01234567890123456789",
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mysql
+        );
         let mut invalid_mysql_client_filler = mysql_client_handshake_response_packet(
             1,
             mysql_client_flags,
@@ -14974,6 +15197,29 @@ mod tests {
         invalid_mysql_client_filler[4 + 9] = 1;
         assert_eq!(
             observation_for_payload(&invalid_mysql_client_filler).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_ok_packet(2, 0, 0, 0x8000, 0, b"")).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mysql_error = mysql_err_packet(1, 1_145, b"42S02", b"missing");
+        invalid_mysql_error[4 + 3] = b'!';
+        assert_eq!(
+            observation_for_payload(&invalid_mysql_error).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_eof_packet(0, 0, 0x0002)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mysql_auth_switch_request_packet(
+                2,
+                b"unknown_auth_plugin",
+                b"01234567890123456789",
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut unflagged_mysql_client_trailing = mysql_client_handshake_response_packet(
