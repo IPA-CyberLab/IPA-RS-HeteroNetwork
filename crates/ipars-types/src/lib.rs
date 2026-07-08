@@ -3003,7 +3003,10 @@ pub mod api {
         if let Some(application) = http_response_application(payload) {
             return Some(application);
         }
-        if let Some(path) = http_request_path(payload) {
+        if let Some((_, path, _)) = http_request_line(payload) {
+            if doh_http_request(payload) {
+                return Some(AgentPacketFlowApplication::Dns);
+            }
             if ipars_control_plane_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::IparsControlPlane);
             }
@@ -3132,6 +3135,9 @@ pub mod api {
     }
 
     fn http_response_header_application(headers: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if http_header_media_type_matches(headers, b"content-type", b"application/dns-message") {
+            return Some(AgentPacketFlowApplication::Dns);
+        }
         if http_header_contains(headers, b"x-kubernetes-pf-flowschema-uid")
             || http_header_contains(headers, b"x-kubernetes-pf-prioritylevel-uid")
             || http_header_contains(headers, b"audit-id")
@@ -3208,6 +3214,16 @@ pub mod api {
         })
     }
 
+    fn http_header_media_type_matches(headers: &[u8], name: &[u8], media_type: &[u8]) -> bool {
+        http_header_value_matches(headers, name, |value| {
+            let media_type_end = value
+                .iter()
+                .position(|byte| *byte == b';')
+                .unwrap_or(value.len());
+            trim_ascii_space(&value[..media_type_end]).eq_ignore_ascii_case(media_type)
+        })
+    }
+
     fn http_header_name_matches<F>(headers: &[u8], mut matches_name: F) -> bool
     where
         F: FnMut(&[u8]) -> bool,
@@ -3263,6 +3279,53 @@ pub mod api {
             offset = offset.saturating_add(line_end + 1);
         }
         false
+    }
+
+    fn doh_http_request(payload: &[u8]) -> bool {
+        let Some((method, path, line_end)) = http_request_line(payload) else {
+            return false;
+        };
+        let headers = payload.get(line_end + 1..).unwrap_or_default();
+        if method == b"GET" {
+            return doh_get_request_path(path);
+        }
+        method == b"POST"
+            && doh_endpoint_path(path)
+            && http_header_media_type_matches(headers, b"content-type", b"application/dns-message")
+    }
+
+    fn doh_get_request_path(path: &[u8]) -> bool {
+        let Some(query_offset) = doh_endpoint_path_query_offset(path) else {
+            return false;
+        };
+        let query = &path[query_offset + 1..];
+        query.split(|byte| *byte == b'&').any(|part| {
+            part.get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"dns="))
+                && doh_base64url_query_value(&part[4..])
+        })
+    }
+
+    fn doh_endpoint_path(path: &[u8]) -> bool {
+        matches!(
+            path.get(b"/dns-query".len()),
+            None | Some(b'?') | Some(b'/')
+        ) && path.starts_with(b"/dns-query")
+    }
+
+    fn doh_endpoint_path_query_offset(path: &[u8]) -> Option<usize> {
+        if !doh_endpoint_path(path) {
+            return None;
+        }
+        path.iter().position(|byte| *byte == b'?')
+    }
+
+    fn doh_base64url_query_value(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 512
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'='))
     }
 
     fn grpc_http_payload(payload: &[u8]) -> bool {
@@ -5221,7 +5284,11 @@ pub mod api {
             || (allow_truncated && payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
     }
 
-    fn http_request_path(payload: &[u8]) -> Option<&[u8]> {
+    fn http_request_line(payload: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+        let line_end = payload
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(payload.len());
         HTTP_REQUEST_METHODS.iter().find_map(|method| {
             let method_len = method.len();
             if payload.get(..method_len)? != *method || payload.get(method_len) != Some(&b' ') {
@@ -5233,7 +5300,7 @@ pub mod api {
                 .position(|byte| matches!(byte, b' ' | b'\r' | b'\n'))
                 .unwrap_or(rest.len());
             let tail = rest.get(end..)?;
-            (end > 0 && tail.starts_with(b" HTTP/")).then_some(&rest[..end])
+            (end > 0 && tail.starts_with(b" HTTP/")).then_some((*method, &rest[..end], line_end))
         })
     }
 
@@ -15856,6 +15923,45 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"GET /v1/jobber HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/2\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /dns-query HTTP/2\r\nContent-Type: application/dns-message\r\n\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message; charset=binary\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /dns-query?name=example.com HTTP/2\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"POST /dns-query HTTP/2\r\nContent-Type: application/dns-messageish\r\n\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /dns-querying?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/2\r\n"
+            )
+            .application(),
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
