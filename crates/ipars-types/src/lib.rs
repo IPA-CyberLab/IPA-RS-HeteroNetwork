@@ -4103,6 +4103,15 @@ pub mod api {
             2 | 5 | 12 => {
                 dns_name_payload_with_root(payload, rdata_offset, true) == Some(rdata_end)
             }
+            6 => {
+                let Some(rname_offset) = dns_name_payload_with_root(payload, rdata_offset, true)
+                else {
+                    return false;
+                };
+                dns_name_payload_with_root(payload, rname_offset, true)
+                    .and_then(|tail_offset| tail_offset.checked_add(20))
+                    == Some(rdata_end)
+            }
             15 => {
                 rdata_offset
                     .checked_add(2)
@@ -15723,6 +15732,38 @@ mod tests {
             observation_for_udp_payload(&dns_response_with_bad_cname_rdata).application(),
             api::AgentPacketFlowApplication::Unknown
         );
+        let qtype_offset = dns_query.len() - 4;
+        let mut soa_query = dns_query.clone();
+        soa_query[qtype_offset] = 0x00;
+        soa_query[qtype_offset + 1] = 0x06;
+        let mut dns_response_with_soa_answer = soa_query.clone();
+        dns_response_with_soa_answer[2] = 0x81;
+        dns_response_with_soa_answer[3] = 0x80;
+        dns_response_with_soa_answer[7] = 0x01;
+        dns_response_with_soa_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x18, 0xc0, 0x0c,
+            0xc0, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x00, 0x02, 0x58,
+            0x00, 0x09, 0x3a, 0x80, 0x00, 0x00, 0x00, 0x3c,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_soa_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_soa_length = dns_response_with_soa_answer.clone();
+        let soa_answer_rdlength_offset = soa_query.len() + 10;
+        dns_response_with_bad_soa_length[soa_answer_rdlength_offset] = 0x00;
+        dns_response_with_bad_soa_length[soa_answer_rdlength_offset + 1] = 0x17;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_soa_length).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_with_bad_soa_rname = dns_response_with_soa_answer.clone();
+        let soa_rname_pointer_offset = soa_query.len() + 14;
+        dns_response_with_bad_soa_rname[soa_rname_pointer_offset + 1] = 0xff;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_soa_rname).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
         let compressed_answer_class_offset = dns_query.len() + 4;
         dns_response_with_bad_class[compressed_answer_class_offset] = 0xff;
@@ -15793,7 +15834,6 @@ mod tests {
             observation_for_udp_payload(&dns_response_with_bad_ptr_rdata).application(),
             api::AgentPacketFlowApplication::Unknown
         );
-        let qtype_offset = dns_query.len() - 4;
         let mut mx_query = dns_query.clone();
         mx_query[qtype_offset] = 0x00;
         mx_query[qtype_offset + 1] = 0x0f;
