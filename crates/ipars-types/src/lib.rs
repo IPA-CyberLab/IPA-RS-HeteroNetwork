@@ -521,6 +521,18 @@ impl PathState {
             Self::DirectPublic | Self::DirectIpv6 | Self::DirectNatTraversal
         )
     }
+
+    pub fn allows_selected_candidate_kind(self, kind: EndpointCandidateKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::DirectPublic, EndpointCandidateKind::PublicUdp)
+                | (Self::DirectIpv6, EndpointCandidateKind::Ipv6)
+                | (
+                    Self::DirectNatTraversal,
+                    EndpointCandidateKind::StunReflexive
+                )
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -13837,6 +13849,47 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason == "stability=0.90"));
+    }
+
+    #[test]
+    fn path_state_allows_only_matching_selected_candidate_kinds() {
+        for (state, expected_kind) in [
+            (PathState::DirectPublic, EndpointCandidateKind::PublicUdp),
+            (PathState::DirectIpv6, EndpointCandidateKind::Ipv6),
+            (
+                PathState::DirectNatTraversal,
+                EndpointCandidateKind::StunReflexive,
+            ),
+        ] {
+            for kind in [
+                EndpointCandidateKind::PublicUdp,
+                EndpointCandidateKind::Ipv6,
+                EndpointCandidateKind::StunReflexive,
+                EndpointCandidateKind::LocalUdp,
+                EndpointCandidateKind::Relay,
+            ] {
+                assert_eq!(
+                    state.allows_selected_candidate_kind(kind),
+                    kind == expected_kind,
+                    "{state:?} candidate kind {kind:?}"
+                );
+            }
+        }
+
+        for state in [PathState::Relay, PathState::Unreachable] {
+            for kind in [
+                EndpointCandidateKind::PublicUdp,
+                EndpointCandidateKind::Ipv6,
+                EndpointCandidateKind::StunReflexive,
+                EndpointCandidateKind::LocalUdp,
+                EndpointCandidateKind::Relay,
+            ] {
+                assert!(
+                    !state.allows_selected_candidate_kind(kind),
+                    "{state:?} must not accept selected candidate kind {kind:?}"
+                );
+            }
+        }
     }
 
     #[test]

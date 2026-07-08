@@ -17,9 +17,7 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{
-    endpoint_addr_is_usable, EndpointCandidateKind, NodeId, PathMetricsValidationError, PathState,
-};
+use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -311,7 +309,9 @@ fn validate_path_probe_shape(
         )));
     }
     if request.selected_state.is_direct()
-        && !path_state_allows_candidate_kind(request.selected_state, candidate.kind)
+        && !request
+            .selected_state
+            .allows_selected_candidate_kind(candidate.kind)
     {
         return Err(ApiError::BadRequest(format!(
             "path probe selected state {:?} does not allow selected candidate kind {:?}",
@@ -319,18 +319,6 @@ fn validate_path_probe_shape(
         )));
     }
     Ok(())
-}
-
-fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
-    matches!(
-        (state, kind),
-        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
-            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
-            | (
-                PathState::DirectNatTraversal,
-                EndpointCandidateKind::StunReflexive
-            )
-    )
 }
 
 async fn stun_probe(

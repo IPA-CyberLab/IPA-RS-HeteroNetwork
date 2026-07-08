@@ -2334,7 +2334,9 @@ fn validate_path_probe_request_shape(request: &AgentPathProbeRequest) -> anyhow:
         return Ok(());
     };
     if request.selected_state.is_direct()
-        && !path_state_allows_candidate_kind(request.selected_state, candidate.kind)
+        && !request
+            .selected_state
+            .allows_selected_candidate_kind(candidate.kind)
     {
         anyhow::bail!(
             "path probe selected state {:?} does not allow selected candidate kind {:?}",
@@ -2343,18 +2345,6 @@ fn validate_path_probe_request_shape(request: &AgentPathProbeRequest) -> anyhow:
         );
     }
     Ok(())
-}
-
-fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
-    matches!(
-        (state, kind),
-        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
-            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
-            | (
-                PathState::DirectNatTraversal,
-                EndpointCandidateKind::StunReflexive
-            )
-    )
 }
 
 fn path_probe_candidate(

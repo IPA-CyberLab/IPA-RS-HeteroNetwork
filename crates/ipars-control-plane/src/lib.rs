@@ -17,9 +17,9 @@ use ipars_types::api::{
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
-    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
-    NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
+    NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -1090,8 +1090,10 @@ where
                         ),
                     });
                 }
-                if direct_path_state(path.selected_state)
-                    && !path_state_allows_candidate_kind(path.selected_state, candidate.kind)
+                if path.selected_state.is_direct()
+                    && !path
+                        .selected_state
+                        .allows_selected_candidate_kind(candidate.kind)
                 {
                     return Err(ControlPlaneError::NodeUpdateRejected {
                         node_id: request.node_id.clone(),
@@ -1665,25 +1667,6 @@ fn validate_path_score_shape(path: &PathRecord) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
-    matches!(
-        (state, kind),
-        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
-            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
-            | (
-                PathState::DirectNatTraversal,
-                EndpointCandidateKind::StunReflexive
-            )
-    )
-}
-
-fn direct_path_state(state: PathState) -> bool {
-    matches!(
-        state,
-        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal
-    )
 }
 
 fn relay_candidate_allowed(
