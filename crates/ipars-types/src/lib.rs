@@ -4055,6 +4055,7 @@ pub mod api {
         };
         if rr_type == 0
             || !dns_resource_record_header_payload(rr_type, rr_class, rr_ttl, name.labels)
+            || !dns_resource_record_rdata_payload(rr_type, rdlength)
         {
             return None;
         }
@@ -4079,6 +4080,14 @@ pub mod api {
                 && edns_flags & !0x8000 == 0;
         }
         dns_resource_record_class_payload(rr_type, rr_class)
+    }
+
+    fn dns_resource_record_rdata_payload(rr_type: u16, rdlength: usize) -> bool {
+        match rr_type {
+            1 => rdlength == 4,
+            28 => rdlength == 16,
+            _ => true,
+        }
     }
 
     fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
@@ -15653,12 +15662,39 @@ mod tests {
             observation_for_udp_payload(&dns_response_with_compressed_answer).application(),
             api::AgentPacketFlowApplication::Dns
         );
+        let mut dns_response_with_aaaa_answer = dns_query.clone();
+        dns_response_with_aaaa_answer[2] = 0x81;
+        dns_response_with_aaaa_answer[3] = 0x80;
+        dns_response_with_aaaa_answer[7] = 0x01;
+        dns_response_with_aaaa_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10, 0x20, 0x01,
+            0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_aaaa_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
         let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
         let compressed_answer_class_offset = dns_query.len() + 4;
         dns_response_with_bad_class[compressed_answer_class_offset] = 0xff;
         dns_response_with_bad_class[compressed_answer_class_offset + 1] = 0x00;
         assert_eq!(
             observation_for_udp_payload(&dns_response_with_bad_class).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let compressed_answer_rdlength_offset = dns_query.len() + 10;
+        let mut dns_response_with_bad_a_length = dns_response_with_compressed_answer.clone();
+        dns_response_with_bad_a_length[compressed_answer_rdlength_offset] = 0x00;
+        dns_response_with_bad_a_length[compressed_answer_rdlength_offset + 1] = 0x03;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_a_length).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_with_bad_aaaa_length = dns_response_with_aaaa_answer.clone();
+        dns_response_with_bad_aaaa_length[compressed_answer_rdlength_offset] = 0x00;
+        dns_response_with_bad_aaaa_length[compressed_answer_rdlength_offset + 1] = 0x04;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_aaaa_length).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut missing_dns_answer = dns_query.clone();
@@ -15724,6 +15760,8 @@ mod tests {
             api::AgentPacketFlowApplication::Dns
         );
         let mut long_mdns_response = mdns_response.clone();
+        long_mdns_response[27] = 0x00;
+        long_mdns_response[28] = 0x10;
         long_mdns_response[35] = 0x00;
         long_mdns_response[36] = 150;
         long_mdns_response.truncate(37);
