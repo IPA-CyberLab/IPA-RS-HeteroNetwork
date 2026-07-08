@@ -6917,16 +6917,78 @@ pub mod api {
 
     fn rsync_payload(payload: &[u8]) -> bool {
         let line = first_ascii_line(payload);
-        if line.len() < b"@RSYNCD: 1".len() || !ascii_starts_with_ignore_case(line, b"@RSYNCD:") {
+        if line.len() > 512 || !rsync_printable_line(line) {
             return false;
         }
-        let version = trim_ascii_space(&line[b"@RSYNCD:".len()..]);
-        !version.is_empty()
-            && version.len() <= 16
-            && version.iter().any(|byte| byte.is_ascii_digit())
-            && version
+        if ascii_starts_with_ignore_case(line, b"@ERROR:") {
+            let message = trim_ascii_space(&line[b"@ERROR:".len()..]);
+            return !message.is_empty();
+        }
+        if !ascii_starts_with_ignore_case(line, b"@RSYNCD:") {
+            return false;
+        }
+        let command = trim_ascii_space(&line[b"@RSYNCD:".len()..]);
+        if command.eq_ignore_ascii_case(b"OK") || command.eq_ignore_ascii_case(b"EXIT") {
+            return true;
+        }
+        if ascii_starts_with_ignore_case(command, b"AUTHREQD ") {
+            return rsync_auth_challenge(&command[b"AUTHREQD ".len()..]);
+        }
+        rsync_version_greeting(command)
+    }
+
+    fn rsync_version_greeting(version: &[u8]) -> bool {
+        let Some((protocol, tail)) = split_ascii_token(version) else {
+            return false;
+        };
+        if protocol.is_empty()
+            || protocol.len() > 16
+            || !protocol.iter().any(|byte| byte.is_ascii_digit())
+            || !protocol
                 .iter()
                 .all(|byte| byte.is_ascii_digit() || *byte == b'.')
+        {
+            return false;
+        }
+        let mut offset = version.len().saturating_sub(tail.len());
+        let mut digest_count = 0_usize;
+        while offset < version.len() {
+            let rest = trim_ascii_space(&version[offset..]);
+            if rest.is_empty() {
+                break;
+            }
+            let Some((digest, digest_tail)) = split_ascii_token(rest) else {
+                return false;
+            };
+            digest_count += 1;
+            if digest_count > 16 || !rsync_digest_token(digest) {
+                return false;
+            }
+            offset = version.len().saturating_sub(digest_tail.len());
+        }
+        true
+    }
+
+    fn rsync_auth_challenge(challenge: &[u8]) -> bool {
+        let challenge = trim_ascii_space(challenge);
+        !challenge.is_empty()
+            && challenge.len() <= 128
+            && challenge
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/' | b'='))
+    }
+
+    fn rsync_digest_token(digest: &[u8]) -> bool {
+        !digest.is_empty()
+            && digest.len() <= 32
+            && digest
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+    }
+
+    fn rsync_printable_line(line: &[u8]) -> bool {
+        line.iter()
+            .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
     }
 
     fn tftp_payload(payload: &[u8]) -> bool {
@@ -16502,7 +16564,40 @@ mod tests {
             api::AgentPacketFlowApplication::Rsync
         );
         assert_eq!(
+            observation_for_payload(b"@RSYNCD: 31.0 sha512 sha256 md5\n").application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: OK\n").application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: AUTHREQD QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n")
+                .application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: EXIT\n").application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
+            observation_for_payload(b"@ERROR: access denied to module\n").application(),
+            api::AgentPacketFlowApplication::Rsync
+        );
+        assert_eq!(
             observation_for_payload(b"@RSYNCD: beta\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: AUTHREQD not base64!\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"@RSYNCD: READY\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"@ERROR:\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
