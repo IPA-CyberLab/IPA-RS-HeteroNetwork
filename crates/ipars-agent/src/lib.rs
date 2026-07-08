@@ -91,6 +91,8 @@ pub enum AgentError {
     RelaySession(String),
     #[error("wireguard backend error: {0}")]
     WireGuard(String),
+    #[error("path probe rejected: {0}")]
+    PathProbeRejected(String),
     #[error("peer path does not exist: {0}")]
     MissingPeer(NodeId),
     #[error("peer map has not been synced for node {0}")]
@@ -1468,9 +1470,11 @@ impl AgentRuntime {
         &self,
         request: AgentPathProbeRequest,
         recorded_at: DateTime<Utc>,
-    ) -> PathRecord {
+    ) -> Result<PathRecord, AgentError> {
+        let local_node = self.state().node_id;
+        validate_path_probe_request(&request, &local_node)?;
         let path = PathRecord {
-            key: ipars_types::PeerPathKey::new(self.state().node_id, request.peer),
+            key: ipars_types::PeerPathKey::new(local_node, request.peer),
             selected_state: request.selected_state,
             selected_candidate: request.selected_candidate,
             relay_node: request.relay_node,
@@ -1485,7 +1489,7 @@ impl AgentRuntime {
         };
         self.path_probe_record_count.fetch_add(1, Ordering::Relaxed);
         self.upsert_path_state(path.clone()).await;
-        path
+        Ok(path)
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) {
@@ -2004,6 +2008,86 @@ impl AgentRuntime {
         }
         idle_peers
     }
+}
+
+fn validate_path_probe_request(
+    request: &AgentPathProbeRequest,
+    local_node: &NodeId,
+) -> Result<(), AgentError> {
+    request
+        .metrics
+        .validate()
+        .map_err(|error| AgentError::PathProbeRejected(error.to_string()))?;
+
+    match request.selected_state {
+        PathState::Relay => {
+            if request.selected_candidate.is_some() {
+                return Err(AgentError::PathProbeRejected(
+                    "relay path probe must not carry a direct selected candidate".to_string(),
+                ));
+            }
+            let relay_node = request.relay_node.as_ref().ok_or_else(|| {
+                AgentError::PathProbeRejected("relay path probe requires --relay-node".to_string())
+            })?;
+            if relay_node == local_node || relay_node == &request.peer {
+                return Err(AgentError::PathProbeRejected(format!(
+                    "relay path probe uses endpoint {relay_node} as relay"
+                )));
+            }
+        }
+        PathState::Unreachable => {
+            if request.selected_candidate.is_some() {
+                return Err(AgentError::PathProbeRejected(
+                    "unreachable path probe must not carry a selected candidate".to_string(),
+                ));
+            }
+            if request.relay_node.is_some() {
+                return Err(AgentError::PathProbeRejected(
+                    "unreachable path probe must not carry a relay node".to_string(),
+                ));
+            }
+        }
+        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
+            if request.relay_node.is_some() {
+                return Err(AgentError::PathProbeRejected(
+                    "direct path probe must not carry a relay node".to_string(),
+                ));
+            }
+        }
+    }
+
+    let Some(candidate) = request.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    if candidate.node_id != request.peer {
+        return Err(AgentError::PathProbeRejected(format!(
+            "selected candidate belongs to node {} instead of path peer {}",
+            candidate.node_id, request.peer
+        )));
+    }
+    if let Err(reason) = candidate.validate_kind_address() {
+        return Err(AgentError::PathProbeRejected(format!(
+            "selected candidate {:?} at {} is invalid: {reason}",
+            candidate.kind, candidate.addr
+        )));
+    }
+    if !endpoint_addr_is_usable(candidate.addr) {
+        return Err(AgentError::PathProbeRejected(format!(
+            "selected candidate {:?} at {} is unusable",
+            candidate.kind, candidate.addr
+        )));
+    }
+    if request.selected_state.is_direct()
+        && !request
+            .selected_state
+            .allows_selected_candidate_kind(candidate.kind)
+    {
+        return Err(AgentError::PathProbeRejected(format!(
+            "path probe selected state {:?} does not allow selected candidate kind {:?}",
+            request.selected_state, candidate.kind
+        )));
+    }
+    Ok(())
 }
 
 fn path_change_event(
@@ -4896,7 +4980,10 @@ mod tests {
             cost: 10,
             pin: true,
         };
-        let path = runtime.record_path_probe(request, Utc::now()).await;
+        let path = runtime
+            .record_path_probe(request, Utc::now())
+            .await
+            .expect("valid path probe should be recorded");
 
         assert_eq!(path.selected_state, PathState::DirectPublic);
         assert!(path
@@ -4925,6 +5012,46 @@ mod tests {
             runtime.path_record_for_peer(&peer.node_id).await,
             Some(path)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_inconsistent_path_probe_before_persistence() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let request = AgentPathProbeRequest {
+            peer: peer_id.clone(),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(EndpointCandidate {
+                node_id: peer_id,
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }),
+            relay_node: None,
+            metrics: PathMetrics::default(),
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+
+        let error = runtime
+            .record_path_probe(request, Utc::now())
+            .await
+            .expect_err("candidate kind mismatched to direct state should be rejected");
+
+        assert!(matches!(error, AgentError::PathProbeRejected(_)));
+        assert!(error.to_string().contains("selected state DirectPublic"));
+        assert!(error
+            .to_string()
+            .contains("selected candidate kind StunReflexive"));
+        assert!(runtime.path_state().await.is_empty());
+        assert_eq!(runtime.metrics().await.path_probe_record_count, 0);
     }
 
     #[tokio::test]

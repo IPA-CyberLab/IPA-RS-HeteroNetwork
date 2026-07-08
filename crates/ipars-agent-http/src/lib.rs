@@ -17,7 +17,7 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
+use ipars_types::{NodeId, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -235,90 +235,15 @@ async fn path_probe(
     State(state): State<AgentHttpState>,
     Json(request): Json<AgentPathProbeRequest>,
 ) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
-    request.metrics.validate()?;
-    let local_node = state.runtime.state().node_id;
-    validate_path_probe_shape(&request, &local_node)?;
     let recorded_at = chrono::Utc::now();
-    let path = state.runtime.record_path_probe(request, recorded_at).await;
+    let path = state
+        .runtime
+        .record_path_probe(request, recorded_at)
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(AgentPathProbeResponse { path, recorded_at }),
     ))
-}
-
-fn validate_path_probe_shape(
-    request: &AgentPathProbeRequest,
-    local_node: &NodeId,
-) -> Result<(), ApiError> {
-    match request.selected_state {
-        PathState::Relay => {
-            if request.selected_candidate.is_some() {
-                return Err(ApiError::BadRequest(
-                    "relay path probe must not carry a direct selected candidate".to_string(),
-                ));
-            }
-            let relay_node = request.relay_node.as_ref().ok_or_else(|| {
-                ApiError::BadRequest("relay path probe requires --relay-node".to_string())
-            })?;
-            if relay_node == local_node || relay_node == &request.peer {
-                return Err(ApiError::BadRequest(format!(
-                    "relay path probe uses endpoint {relay_node} as relay"
-                )));
-            }
-        }
-        PathState::Unreachable => {
-            if request.selected_candidate.is_some() {
-                return Err(ApiError::BadRequest(
-                    "unreachable path probe must not carry a selected candidate".to_string(),
-                ));
-            }
-            if request.relay_node.is_some() {
-                return Err(ApiError::BadRequest(
-                    "unreachable path probe must not carry a relay node".to_string(),
-                ));
-            }
-        }
-        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
-            if request.relay_node.is_some() {
-                return Err(ApiError::BadRequest(
-                    "direct path probe must not carry a relay node".to_string(),
-                ));
-            }
-        }
-    }
-
-    let Some(candidate) = request.selected_candidate.as_ref() else {
-        return Ok(());
-    };
-    if candidate.node_id != request.peer {
-        return Err(ApiError::BadRequest(format!(
-            "selected candidate belongs to node {} instead of path peer {}",
-            candidate.node_id, request.peer
-        )));
-    }
-    if let Err(reason) = candidate.validate_kind_address() {
-        return Err(ApiError::BadRequest(format!(
-            "selected candidate {:?} at {} is invalid: {reason}",
-            candidate.kind, candidate.addr
-        )));
-    }
-    if !endpoint_addr_is_usable(candidate.addr) {
-        return Err(ApiError::BadRequest(format!(
-            "selected candidate {:?} at {} is unusable",
-            candidate.kind, candidate.addr
-        )));
-    }
-    if request.selected_state.is_direct()
-        && !request
-            .selected_state
-            .allows_selected_candidate_kind(candidate.kind)
-    {
-        return Err(ApiError::BadRequest(format!(
-            "path probe selected state {:?} does not allow selected candidate kind {:?}",
-            request.selected_state, candidate.kind
-        )));
-    }
-    Ok(())
 }
 
 async fn stun_probe(
@@ -1253,12 +1178,6 @@ impl From<AgentError> for ApiError {
     }
 }
 
-impl From<PathMetricsValidationError> for ApiError {
-    fn from(error: PathMetricsValidationError) -> Self {
-        Self::BadRequest(error.to_string())
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let error = match self {
@@ -1279,6 +1198,7 @@ impl IntoResponse for ApiError {
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
             | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AgentError::PathProbeRejected(_) => StatusCode::BAD_REQUEST,
             AgentError::MissingPeer(_) | AgentError::PeerMapUnavailable(_) => StatusCode::NOT_FOUND,
         };
         (
