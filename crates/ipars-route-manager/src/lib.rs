@@ -602,8 +602,23 @@ pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
             )));
         }
     }
+    let mut seen_policy_rules = BTreeSet::new();
+    let mut seen_policy_priorities = BTreeSet::new();
     for rule in &plan.policy_rules {
         validate_policy_rule(rule)?;
+        let key = (rule.table, rule.priority, rule.from, rule.to, rule.fwmark);
+        if !seen_policy_rules.insert(key) {
+            return Err(invalid_route_plan(format!(
+                "route plan must not repeat policy rule priority {} for table {}",
+                rule.priority, rule.table
+            )));
+        }
+        if !seen_policy_priorities.insert(rule.priority) {
+            return Err(invalid_route_plan(format!(
+                "route plan must not reuse policy rule priority {}",
+                rule.priority
+            )));
+        }
     }
     Ok(())
 }
@@ -2641,6 +2656,38 @@ mod tests {
                 "expected {expected}, got {error}"
             );
         }
+
+        let mut duplicate_rule = route_plan()?;
+        duplicate_rule
+            .policy_rules
+            .push(duplicate_rule.policy_rules[0].clone());
+        let error = match manager.apply_routes(duplicate_rule).await {
+            Ok(()) => return Err("duplicate policy rule should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidRoutePlan(ref message)
+                if message.contains("must not repeat policy rule priority 10064 for table 10064")
+        ));
+
+        let mut duplicate_priority = route_plan()?;
+        duplicate_priority.policy_rules.push(PolicyRule {
+            table: 10_065,
+            priority: 10_064,
+            from: Some("10.1.0.0/16".parse()?),
+            to: None,
+            fwmark: Some(0x6474),
+        });
+        let error = match manager.apply_routes(duplicate_priority).await {
+            Ok(()) => return Err("duplicate policy rule priority should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidRoutePlan(ref message)
+                if message.contains("must not reuse policy rule priority 10064")
+        ));
 
         let mut invalid_rule = route_plan()?;
         invalid_rule.policy_rules[0].table = 0;
