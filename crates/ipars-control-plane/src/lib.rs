@@ -17,9 +17,9 @@ use ipars_types::api::{
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
-    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
-    NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
+    NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -1090,6 +1090,17 @@ where
                         ),
                     });
                 }
+                if direct_path_state(path.selected_state)
+                    && !path_state_allows_candidate_kind(path.selected_state, candidate.kind)
+                {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "path {} -> {} selected state {:?} does not allow selected candidate kind {:?}",
+                            path.key.local, path.key.remote, path.selected_state, candidate.kind
+                        ),
+                    });
+                }
                 if !timestamp_not_after_skew(
                     candidate.observed_at,
                     now,
@@ -1654,6 +1665,25 @@ fn validate_path_score_shape(path: &PathRecord) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
+    matches!(
+        (state, kind),
+        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
+            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
+            | (
+                PathState::DirectNatTraversal,
+                EndpointCandidateKind::StunReflexive
+            )
+    )
+}
+
+fn direct_path_state(state: PathState) -> bool {
+    matches!(
+        state,
+        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal
+    )
 }
 
 fn relay_candidate_allowed(
@@ -4080,6 +4110,54 @@ mod tests {
             .to_string()
             .contains("selected candidate belongs to node"));
         assert!(error.to_string().contains("instead of path peer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_direct_path_state_with_wrong_candidate_kind(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_state = PathState::DirectPublic;
+        reported_path.selected_candidate = Some(candidate("node-b"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("selected state DirectPublic")
+                    && reason.contains("selected candidate kind StunReflexive")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
     }
 
