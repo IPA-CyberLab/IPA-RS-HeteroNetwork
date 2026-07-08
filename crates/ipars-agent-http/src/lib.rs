@@ -17,7 +17,9 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{endpoint_addr_is_usable, NodeId, PathMetricsValidationError, PathState};
+use ipars_types::{
+    endpoint_addr_is_usable, EndpointCandidateKind, NodeId, PathMetricsValidationError, PathState,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -236,7 +238,8 @@ async fn path_probe(
     Json(request): Json<AgentPathProbeRequest>,
 ) -> Result<(StatusCode, Json<AgentPathProbeResponse>), ApiError> {
     request.metrics.validate()?;
-    validate_path_probe_selected_candidate(&request)?;
+    let local_node = state.runtime.state().node_id;
+    validate_path_probe_shape(&request, &local_node)?;
     let recorded_at = chrono::Utc::now();
     let path = state.runtime.record_path_probe(request, recorded_at).await;
     Ok((
@@ -245,7 +248,47 @@ async fn path_probe(
     ))
 }
 
-fn validate_path_probe_selected_candidate(request: &AgentPathProbeRequest) -> Result<(), ApiError> {
+fn validate_path_probe_shape(
+    request: &AgentPathProbeRequest,
+    local_node: &NodeId,
+) -> Result<(), ApiError> {
+    match request.selected_state {
+        PathState::Relay => {
+            if request.selected_candidate.is_some() {
+                return Err(ApiError::BadRequest(
+                    "relay path probe must not carry a direct selected candidate".to_string(),
+                ));
+            }
+            let relay_node = request.relay_node.as_ref().ok_or_else(|| {
+                ApiError::BadRequest("relay path probe requires --relay-node".to_string())
+            })?;
+            if relay_node == local_node || relay_node == &request.peer {
+                return Err(ApiError::BadRequest(format!(
+                    "relay path probe uses endpoint {relay_node} as relay"
+                )));
+            }
+        }
+        PathState::Unreachable => {
+            if request.selected_candidate.is_some() {
+                return Err(ApiError::BadRequest(
+                    "unreachable path probe must not carry a selected candidate".to_string(),
+                ));
+            }
+            if request.relay_node.is_some() {
+                return Err(ApiError::BadRequest(
+                    "unreachable path probe must not carry a relay node".to_string(),
+                ));
+            }
+        }
+        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
+            if request.relay_node.is_some() {
+                return Err(ApiError::BadRequest(
+                    "direct path probe must not carry a relay node".to_string(),
+                ));
+            }
+        }
+    }
+
     let Some(candidate) = request.selected_candidate.as_ref() else {
         return Ok(());
     };
@@ -267,7 +310,27 @@ fn validate_path_probe_selected_candidate(request: &AgentPathProbeRequest) -> Re
             candidate.kind, candidate.addr
         )));
     }
+    if request.selected_state.is_direct()
+        && !path_state_allows_candidate_kind(request.selected_state, candidate.kind)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "path probe selected state {:?} does not allow selected candidate kind {:?}",
+            request.selected_state, candidate.kind
+        )));
+    }
     Ok(())
+}
+
+fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
+    matches!(
+        (state, kind),
+        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
+            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
+            | (
+                PathState::DirectNatTraversal,
+                EndpointCandidateKind::StunReflexive
+            )
+    )
 }
 
 async fn stun_probe(
@@ -2362,6 +2425,103 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("is unusable"));
+        assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_rejects_inconsistent_path_probe_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let metrics_runtime = Arc::clone(&runtime);
+        let app = router(AgentHttpState::new(runtime));
+        let peer = NodeId::from_string("peer-probed");
+        let relay = NodeId::from_string("relay-a");
+        let candidate = EndpointCandidate {
+            node_id: peer.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: "203.0.113.10:51820".parse()?,
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::ControlPlane,
+        };
+
+        let direct_mismatch = AgentPathProbeRequest {
+            peer: peer.clone(),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(candidate.clone()),
+            relay_node: None,
+            metrics: PathMetrics::default(),
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&direct_mismatch)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("selected state DirectPublic"));
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("selected candidate kind StunReflexive"));
+
+        let relay_with_candidate = AgentPathProbeRequest {
+            peer,
+            selected_state: PathState::Relay,
+            selected_candidate: Some(candidate),
+            relay_node: Some(relay),
+            metrics: PathMetrics::default(),
+            policy_allowed: true,
+            cost: 0,
+            pin: false,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&relay_with_candidate)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let error: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("relay path probe must not carry"));
+
+        let paths_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/paths")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(paths_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(paths_response.into_body(), usize::MAX).await?;
+        let paths: AgentPathsResponse = serde_json::from_slice(&body)?;
+        assert!(paths.paths.is_empty());
         assert_eq!(metrics_runtime.metrics().await.path_probe_record_count, 0);
         Ok(())
     }

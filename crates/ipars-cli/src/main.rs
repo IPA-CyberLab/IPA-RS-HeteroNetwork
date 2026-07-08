@@ -2298,7 +2298,63 @@ fn path_probe_request(
         pin: args.pin,
     };
     request.metrics.validate()?;
+    validate_path_probe_request_shape(&request)?;
     Ok(request)
+}
+
+fn validate_path_probe_request_shape(request: &AgentPathProbeRequest) -> anyhow::Result<()> {
+    match request.selected_state {
+        PathState::Relay => {
+            if request.selected_candidate.is_some() {
+                anyhow::bail!("relay path probe must not carry a direct selected candidate");
+            }
+            let Some(relay_node) = request.relay_node.as_ref() else {
+                anyhow::bail!("relay path probe requires --relay-node");
+            };
+            if relay_node == &request.peer {
+                anyhow::bail!("relay path probe uses path peer {relay_node} as relay");
+            }
+        }
+        PathState::Unreachable => {
+            if request.selected_candidate.is_some() {
+                anyhow::bail!("unreachable path probe must not carry a selected candidate");
+            }
+            if request.relay_node.is_some() {
+                anyhow::bail!("unreachable path probe must not carry a relay node");
+            }
+        }
+        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
+            if request.relay_node.is_some() {
+                anyhow::bail!("direct path probe must not carry a relay node");
+            }
+        }
+    }
+
+    let Some(candidate) = request.selected_candidate.as_ref() else {
+        return Ok(());
+    };
+    if request.selected_state.is_direct()
+        && !path_state_allows_candidate_kind(request.selected_state, candidate.kind)
+    {
+        anyhow::bail!(
+            "path probe selected state {:?} does not allow selected candidate kind {:?}",
+            request.selected_state,
+            candidate.kind
+        );
+    }
+    Ok(())
+}
+
+fn path_state_allows_candidate_kind(state: PathState, kind: EndpointCandidateKind) -> bool {
+    matches!(
+        (state, kind),
+        (PathState::DirectPublic, EndpointCandidateKind::PublicUdp)
+            | (PathState::DirectIpv6, EndpointCandidateKind::Ipv6)
+            | (
+                PathState::DirectNatTraversal,
+                EndpointCandidateKind::StunReflexive
+            )
+    )
 }
 
 fn path_probe_candidate(
@@ -9239,8 +9295,6 @@ fi
             "25",
             "--policy-denied",
             "--pin",
-            "--relay-node",
-            "relay-a",
             "--candidate-addr",
             "198.51.100.10:51820",
             "--candidate-kind",
@@ -9264,7 +9318,7 @@ fi
         let request = path_probe_request(&args, observed_at)?;
         assert_eq!(request.peer, NodeId::from_string("peer-a"));
         assert_eq!(request.selected_state, PathState::DirectNatTraversal);
-        assert_eq!(request.relay_node, Some(NodeId::from_string("relay-a")));
+        assert_eq!(request.relay_node, None);
         assert_eq!(request.metrics.latency_ms, Some(23.5));
         assert_eq!(request.metrics.loss_ppm, 100);
         assert_eq!(request.metrics.jitter_ms, Some(3.25));
@@ -9419,6 +9473,135 @@ fi
         };
         assert!(error.to_string().contains("selected candidate"));
         assert!(error.to_string().contains("is unusable"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_candidate_kind_mismatched_to_direct_state() -> anyhow::Result<()> {
+        let path = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--candidate-kind",
+            "stun-reflexive",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(args),
+        } = path.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+
+        let error = match path_probe_request(&args, Utc::now()) {
+            Ok(_) => anyhow::bail!("candidate kind mismatched to direct state should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("selected state DirectPublic"));
+        assert!(error
+            .to_string()
+            .contains("selected candidate kind StunReflexive"));
+        Ok(())
+    }
+
+    #[test]
+    fn path_probe_rejects_inconsistent_relay_and_unreachable_shape() -> anyhow::Result<()> {
+        let relay_missing = Cli::try_parse_from([
+            "ipars", "path", "probe", "--peer", "peer-a", "--state", "relay",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(relay_missing_args),
+        } = relay_missing.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+        let error = match path_probe_request(&relay_missing_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("relay path without relay node should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires --relay-node"));
+
+        let direct_relay_node = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "DIRECT_PUBLIC",
+            "--relay-node",
+            "relay-a",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(direct_relay_node_args),
+        } = direct_relay_node.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+        let error = match path_probe_request(&direct_relay_node_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("direct path with relay node should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("direct path probe must not carry a relay node"));
+
+        let relay_candidate = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "relay",
+            "--relay-node",
+            "relay-a",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(relay_candidate_args),
+        } = relay_candidate.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+        let error = match path_probe_request(&relay_candidate_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("relay path with selected candidate should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("relay path probe must not carry a direct selected candidate"));
+
+        let unreachable_candidate = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "probe",
+            "--peer",
+            "peer-a",
+            "--state",
+            "unreachable",
+            "--candidate-addr",
+            "198.51.100.10:51820",
+        ])?;
+        let Command::Path {
+            command: PathCommand::Probe(unreachable_candidate_args),
+        } = unreachable_candidate.command
+        else {
+            anyhow::bail!("expected path probe command");
+        };
+        let error = match path_probe_request(&unreachable_candidate_args, Utc::now()) {
+            Ok(_) => anyhow::bail!("unreachable path with selected candidate should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unreachable path probe must not carry a selected candidate"));
         Ok(())
     }
 
