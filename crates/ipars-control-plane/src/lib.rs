@@ -33,6 +33,9 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::Relay,
     PathState::Unreachable,
 ];
+const MAX_PATH_SCORE_REASONS: usize = 16;
+const MAX_PATH_SCORE_REASON_BYTES: usize = 256;
+const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -1027,6 +1030,12 @@ where
                     ),
                 });
             }
+            validate_path_score_shape(path).map_err(|reason| {
+                ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                }
+            })?;
             if path.key.local != request.node_id {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
@@ -1521,6 +1530,57 @@ fn validate_node_health_shape(
         if !relay_load.is_finite() || !(0.0..=1.0).contains(&relay_load) {
             return Err("health relay_load must be a finite value between 0 and 1".to_string());
         }
+    }
+    Ok(())
+}
+
+fn validate_path_score_shape(path: &PathRecord) -> Result<(), String> {
+    if path.score.value.is_nan() || path.score.value == f32::INFINITY {
+        return Err(format!(
+            "path {} -> {} score value must not be NaN or positive infinity",
+            path.key.local, path.key.remote
+        ));
+    }
+    if path.score.value == f32::NEG_INFINITY
+        && !path
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "policy_denied")
+    {
+        return Err(format!(
+            "path {} -> {} negative-infinity score requires policy_denied reason",
+            path.key.local, path.key.remote
+        ));
+    }
+    if path.score.reasons.len() > MAX_PATH_SCORE_REASONS {
+        return Err(format!(
+            "path {} -> {} score reasons must not exceed {} entries",
+            path.key.local, path.key.remote, MAX_PATH_SCORE_REASONS
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for reason in &path.score.reasons {
+        let reason_bytes = reason.len();
+        total_bytes = total_bytes.saturating_add(reason_bytes);
+        if reason_bytes > MAX_PATH_SCORE_REASON_BYTES {
+            return Err(format!(
+                "path {} -> {} score reason must not exceed {} bytes",
+                path.key.local, path.key.remote, MAX_PATH_SCORE_REASON_BYTES
+            ));
+        }
+        if reason.chars().any(char::is_control) {
+            return Err(format!(
+                "path {} -> {} score reason must not contain control characters",
+                path.key.local, path.key.remote
+            ));
+        }
+    }
+    if total_bytes > MAX_PATH_SCORE_TOTAL_REASON_BYTES {
+        return Err(format!(
+            "path {} -> {} score reasons must not exceed {} total bytes",
+            path.key.local, path.key.remote, MAX_PATH_SCORE_TOTAL_REASON_BYTES
+        ));
     }
     Ok(())
 }
@@ -4039,6 +4099,80 @@ mod tests {
                     && reason.contains("too far in the future")
         ));
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_path_score_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let mut positive_infinity = path("node-a", "node-b");
+        positive_infinity.score = PathScore {
+            value: f32::INFINITY,
+            reasons: vec!["state=DirectNatTraversal".to_string()],
+        };
+        let mut unreasoned_negative_infinity = path("node-a", "node-b");
+        unreasoned_negative_infinity.score = PathScore {
+            value: f32::NEG_INFINITY,
+            reasons: Vec::new(),
+        };
+        let mut too_many_reasons = path("node-a", "node-b");
+        too_many_reasons.score.reasons = (0..=MAX_PATH_SCORE_REASONS)
+            .map(|index| format!("r{index}"))
+            .collect();
+        let mut oversized_reason = path("node-a", "node-b");
+        oversized_reason.score.reasons = vec!["x".repeat(MAX_PATH_SCORE_REASON_BYTES + 1)];
+        let mut control_character_reason = path("node-a", "node-b");
+        control_character_reason.score.reasons = vec!["bad\nreason".to_string()];
+        let cases = [
+            (positive_infinity, "positive infinity"),
+            (unreasoned_negative_infinity, "negative-infinity score"),
+            (too_many_reasons, "score reasons must not exceed"),
+            (oversized_reason, "score reason must not exceed"),
+            (control_character_reason, "control characters"),
+        ];
+
+        for (reported_path, expected) in cases {
+            let signed_at = Utc::now();
+            let result = plane
+                .heartbeat(signed_heartbeat_at(
+                    "node-a",
+                    HeartbeatRequest {
+                        node_id: node_id("node-a"),
+                        health: NodeHealth {
+                            state: HealthState::Healthy,
+                            last_seen_at: signed_at,
+                            latency_ms: None,
+                            relay_load: None,
+                            message: None,
+                        },
+                        candidates: Vec::new(),
+                        relay_capability: None,
+                        routes: None,
+                        path_state: vec![reported_path],
+                        node_signature: None,
+                    },
+                    signed_at,
+                ))
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                    if reason.contains(expected)
+            ));
+            assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        }
         Ok(())
     }
 
