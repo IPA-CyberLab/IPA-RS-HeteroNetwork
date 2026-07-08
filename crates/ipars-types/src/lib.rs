@@ -6057,12 +6057,7 @@ pub mod api {
         if line.is_empty() {
             return false;
         }
-        if line.len() >= 5
-            && line.starts_with(b"220")
-            && line.get(3).is_some_and(|byte| byte.is_ascii_whitespace())
-            && (ascii_contains_ignore_case(line, b"SMTP")
-                || ascii_contains_ignore_case(line, b"ESMTP"))
-        {
+        if smtp_reply_line(line) {
             return true;
         }
         ascii_starts_with_ignore_case(line, b"EHLO ")
@@ -6077,6 +6072,133 @@ pub mod api {
             || ascii_starts_with_ignore_case(line, b"AUTH ")
             || ascii_starts_with_ignore_case(line, b"VRFY ")
             || ascii_starts_with_ignore_case(line, b"EXPN ")
+    }
+
+    fn smtp_reply_line(line: &[u8]) -> bool {
+        if line.len() < 4
+            || !line[0..3].iter().all(u8::is_ascii_digit)
+            || !matches!(line[3], b' ' | b'-')
+        {
+            return false;
+        }
+        let Some(code) = decimal_usize(&line[0..3]) else {
+            return false;
+        };
+        if !smtp_known_reply_code(code) {
+            return false;
+        }
+        let text = trim_ascii_space(&line[4..]);
+        if text.len() > 512 || !smtp_reply_text(text) {
+            return false;
+        }
+        if code == 220 {
+            return ascii_contains_ignore_case(text, b"SMTP")
+                || ascii_contains_ignore_case(text, b"ESMTP");
+        }
+        if code == 354 {
+            return ascii_contains_ignore_case(text, b"mail input")
+                || ascii_contains_ignore_case(text, b"send message")
+                || ascii_contains_ignore_case(text, b"<CRLF>.<CRLF>")
+                || ascii_contains_ignore_case(text, b"CRLF.CRLF");
+        }
+        if smtp_enhanced_status_reply_text(code, text) {
+            return true;
+        }
+        code == 250 && smtp_ehlo_extension_reply_text(text)
+    }
+
+    fn smtp_known_reply_code(code: usize) -> bool {
+        matches!(
+            code,
+            211 | 214
+                | 220
+                | 221
+                | 235
+                | 250
+                | 251
+                | 252
+                | 334
+                | 354
+                | 421
+                | 432
+                | 450
+                | 451
+                | 452
+                | 454
+                | 455
+                | 500
+                | 501
+                | 502
+                | 503
+                | 504
+                | 530
+                | 534
+                | 535
+                | 538
+                | 550
+                | 551
+                | 552
+                | 553
+                | 554
+                | 555
+        )
+    }
+
+    fn smtp_reply_text(text: &[u8]) -> bool {
+        text.iter()
+            .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
+    }
+
+    fn smtp_enhanced_status_reply_text(code: usize, text: &[u8]) -> bool {
+        let expected_class = b'0' + (code / 100) as u8;
+        if !matches!(expected_class, b'2' | b'4' | b'5')
+            || text.first() != Some(&expected_class)
+            || text.get(1) != Some(&b'.')
+        {
+            return false;
+        }
+        let Some(subject_end) = smtp_enhanced_status_number_end(text, 2) else {
+            return false;
+        };
+        if text.get(subject_end) != Some(&b'.') {
+            return false;
+        }
+        let Some(detail_end) = smtp_enhanced_status_number_end(text, subject_end + 1) else {
+            return false;
+        };
+        text.get(detail_end)
+            .is_none_or(|byte| byte.is_ascii_whitespace())
+    }
+
+    fn smtp_enhanced_status_number_end(text: &[u8], mut offset: usize) -> Option<usize> {
+        let start = offset;
+        while offset < text.len() && text[offset].is_ascii_digit() {
+            offset += 1;
+            if offset - start > 3 {
+                return None;
+            }
+        }
+        (offset > start).then_some(offset)
+    }
+
+    fn smtp_ehlo_extension_reply_text(text: &[u8]) -> bool {
+        let Some((keyword, _)) = split_ascii_token(text) else {
+            return false;
+        };
+        keyword.eq_ignore_ascii_case(b"8BITMIME")
+            || keyword.eq_ignore_ascii_case(b"AUTH")
+            || keyword.eq_ignore_ascii_case(b"BINARYMIME")
+            || keyword.eq_ignore_ascii_case(b"CHUNKING")
+            || keyword.eq_ignore_ascii_case(b"DSN")
+            || keyword.eq_ignore_ascii_case(b"ENHANCEDSTATUSCODES")
+            || keyword.eq_ignore_ascii_case(b"ETRN")
+            || keyword.eq_ignore_ascii_case(b"EXPN")
+            || keyword.eq_ignore_ascii_case(b"HELP")
+            || keyword.eq_ignore_ascii_case(b"PIPELINING")
+            || keyword.eq_ignore_ascii_case(b"SIZE")
+            || keyword.eq_ignore_ascii_case(b"SMTPUTF8")
+            || keyword.eq_ignore_ascii_case(b"STARTTLS")
+            || keyword.eq_ignore_ascii_case(b"VRFY")
     }
 
     fn smtp_line_command(line: &[u8], command: &[u8]) -> bool {
@@ -15861,6 +15983,28 @@ mod tests {
             api::AgentPacketFlowApplication::Smtp
         );
         assert_eq!(
+            observation_for_payload(b"220-mx.example SMTP service ready\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"250-PIPELINING\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"250 2.1.0 Originator <agent@example.test> ok\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
+            observation_for_payload(b"550 5.1.1 Mailbox does not exist\r\n").application(),
+            api::AgentPacketFlowApplication::Smtp
+        );
+        assert_eq!(
             observation_for_payload(b"EHLO edge-node.example\r\n").application(),
             api::AgentPacketFlowApplication::Smtp
         );
@@ -15870,6 +16014,22 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"220 service ready\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"250 OK\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"250 Directory successfully changed.\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"500 Internal Server Error\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"550 No such user here\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
