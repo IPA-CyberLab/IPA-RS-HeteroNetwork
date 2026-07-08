@@ -4052,13 +4052,21 @@ pub mod api {
         let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
             return None;
         };
-        if rr_type == 0 || rr_class & 0x7fff == 0 {
+        if rr_type == 0 || !dns_resource_record_class_payload(rr_type, rr_class) {
             return None;
         }
         if rr_end > payload.len() {
             return allow_truncated.then_some(DnsSectionParse::Truncated);
         }
         Some(DnsSectionParse::Complete(rr_end))
+    }
+
+    fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
+        if rr_type == 41 {
+            return (512..=4096).contains(&rr_class);
+        }
+        let class = rr_class & 0x7fff;
+        matches!(class, 1..=4 | 254 | 255) && (rr_class & 0x8000 == 0 || class == 1)
     }
 
     fn dns_name_payload(payload: &[u8], offset: usize) -> Option<usize> {
@@ -15529,6 +15537,13 @@ mod tests {
             observation_for_udp_payload(&dns_query_with_bad_opt_type).application(),
             api::AgentPacketFlowApplication::Unknown
         );
+        let mut dns_query_with_bad_opt_size = dns_query_with_opt.clone();
+        dns_query_with_bad_opt_size[opt_type_offset + 2] = 0x00;
+        dns_query_with_bad_opt_size[opt_type_offset + 3] = 0x01;
+        assert_eq!(
+            observation_for_udp_payload(&dns_query_with_bad_opt_size).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mut dns_query_with_answer_section = dns_query.clone();
         dns_query_with_answer_section[7] = 1;
         dns_query_with_answer_section.extend_from_slice(&[
@@ -15590,6 +15605,14 @@ mod tests {
         assert_eq!(
             observation_for_udp_payload(&dns_response_with_compressed_answer).application(),
             api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
+        let compressed_answer_class_offset = dns_query.len() + 4;
+        dns_response_with_bad_class[compressed_answer_class_offset] = 0xff;
+        dns_response_with_bad_class[compressed_answer_class_offset + 1] = 0x00;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_class).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut missing_dns_answer = dns_query.clone();
         missing_dns_answer[2] = 0x81;
@@ -15686,6 +15709,13 @@ mod tests {
         mdns_response_bad_type[28] = 0;
         assert_eq!(
             observation_for_udp_payload(&mdns_response_bad_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mdns_response_bad_cache_flush_class = mdns_response.clone();
+        mdns_response_bad_cache_flush_class[29] = 0x80;
+        mdns_response_bad_cache_flush_class[30] = 0x03;
+        assert_eq!(
+            observation_for_udp_payload(&mdns_response_bad_cache_flush_class).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mdns_response_self_pointer = vec![
