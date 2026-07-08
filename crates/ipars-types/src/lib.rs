@@ -3830,10 +3830,18 @@ pub mod api {
         let flags = u16::from_be_bytes([payload[2], payload[3]]);
         let opcode = (flags >> 11) & 0x0f;
         let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-        if opcode > 5 || qdcount == 0 || flags & 0x0040 != 0 {
+        if opcode > 5 || flags & 0x0040 != 0 {
             return false;
         }
-        dns_question_payload(payload)
+        if qdcount > 0 {
+            return dns_question_payload(payload);
+        }
+        let rr_count = u16::from_be_bytes([payload[6], payload[7]]) as usize
+            + u16::from_be_bytes([payload[8], payload[9]]) as usize
+            + u16::from_be_bytes([payload[10], payload[11]]) as usize;
+        flags & 0x8000 != 0
+            && (1..=4096).contains(&rr_count)
+            && dns_resource_record_payload(payload, 12)
     }
 
     fn dhcp_payload(payload: &[u8]) -> bool {
@@ -3917,45 +3925,10 @@ pub mod api {
 
     fn dns_question_payload(payload: &[u8]) -> bool {
         let mut offset = 12_usize;
-        let mut labels = 0_usize;
-        let mut name_len = 0_usize;
-        loop {
-            let Some(&len) = payload.get(offset) else {
-                return false;
-            };
-            if len & 0xc0 != 0 {
-                return false;
-            }
-            offset += 1;
-            if len == 0 {
-                break;
-            }
-            if len > 63 {
-                return false;
-            }
-            let len = len as usize;
-            let Some(label_end) = offset.checked_add(len) else {
-                return false;
-            };
-            let Some(label) = payload.get(offset..label_end) else {
-                return false;
-            };
-            if !label
-                .iter()
-                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            {
-                return false;
-            }
-            labels += 1;
-            name_len += len + 1;
-            if labels > 32 || name_len > 255 {
-                return false;
-            }
-            offset = label_end;
-        }
-        if labels == 0 {
+        let Some(name_end) = dns_name_payload(payload, offset) else {
             return false;
-        }
+        };
+        offset = name_end;
         let Some(question_end) = offset.checked_add(4) else {
             return false;
         };
@@ -3965,6 +3938,80 @@ pub mod api {
         let qtype = u16::from_be_bytes([question[0], question[1]]);
         let qclass = u16::from_be_bytes([question[2], question[3]]);
         qtype != 0 && qclass != 0
+    }
+
+    fn dns_resource_record_payload(payload: &[u8], mut offset: usize) -> bool {
+        let Some(name_end) = dns_name_payload(payload, offset) else {
+            return false;
+        };
+        offset = name_end;
+        let Some(rr_header_end) = offset.checked_add(10) else {
+            return false;
+        };
+        let Some(rr_header) = payload.get(offset..rr_header_end) else {
+            return false;
+        };
+        let rr_type = u16::from_be_bytes([rr_header[0], rr_header[1]]);
+        let rr_class = u16::from_be_bytes([rr_header[2], rr_header[3]]);
+        let rdlength = u16::from_be_bytes([rr_header[8], rr_header[9]]) as usize;
+        let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
+            return false;
+        };
+        rr_type != 0
+            && rr_class & 0x7fff != 0
+            && (rr_end <= payload.len() || payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+    }
+
+    fn dns_name_payload(payload: &[u8], mut offset: usize) -> Option<usize> {
+        let mut labels = 0_usize;
+        let mut name_len = 0_usize;
+        loop {
+            let Some(&len) = payload.get(offset) else {
+                return None;
+            };
+            if len & 0xc0 == 0xc0 {
+                let pointer = read_u16_be(payload, offset)?;
+                let pointer_offset = (pointer & 0x3fff) as usize;
+                if pointer_offset >= offset {
+                    return None;
+                }
+                offset = offset.checked_add(2)?;
+                break;
+            }
+            if len & 0xc0 != 0 {
+                return None;
+            }
+            offset += 1;
+            if len == 0 {
+                break;
+            }
+            if len > 63 {
+                return None;
+            }
+            let len = len as usize;
+            let Some(label_end) = offset.checked_add(len) else {
+                return None;
+            };
+            let Some(label) = payload.get(offset..label_end) else {
+                return None;
+            };
+            if !label
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return None;
+            }
+            labels += 1;
+            name_len += len + 1;
+            if labels > 32 || name_len > 255 {
+                return None;
+            }
+            offset = label_end;
+        }
+        if labels == 0 {
+            return None;
+        }
+        Some(offset)
     }
 
     fn tls_handshake_payload(payload: &[u8]) -> bool {
@@ -15294,6 +15341,43 @@ mod tests {
         assert_eq!(
             observation_for_payload(&dns_tcp_payload).application(),
             api::AgentPacketFlowApplication::Dns
+        );
+        let mdns_response = vec![
+            0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'p',
+            b'r', b'i', b'n', b't', b'e', b'r', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00,
+            0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 192, 0, 2, 10,
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&mdns_response).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut mdns_tcp_payload = (mdns_response.len() as u16).to_be_bytes().to_vec();
+        mdns_tcp_payload.extend_from_slice(&mdns_response);
+        assert_eq!(
+            observation_for_payload(&mdns_tcp_payload).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut mdns_response_without_answers = mdns_response.clone();
+        mdns_response_without_answers[6] = 0;
+        mdns_response_without_answers[7] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&mdns_response_without_answers).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mdns_response_bad_type = mdns_response.clone();
+        mdns_response_bad_type[27] = 0;
+        mdns_response_bad_type[28] = 0;
+        assert_eq!(
+            observation_for_udp_payload(&mdns_response_bad_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mdns_response_self_pointer = vec![
+            0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0c,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 192, 0, 2, 10,
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&mdns_response_self_pointer).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let malformed_dns_like = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
