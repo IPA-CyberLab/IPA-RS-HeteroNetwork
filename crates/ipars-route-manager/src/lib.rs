@@ -656,6 +656,12 @@ fn validate_policy_rule(rule: &PolicyRule) -> Result<(), RouteManagerError> {
             "policy rule priority must be greater than zero".to_string(),
         ));
     }
+    if rule.fwmark == Some(0) {
+        return Err(RouteManagerError::InvalidPolicyRule(format!(
+            "rule priority {} fwmark selector must be nonzero when set",
+            rule.priority
+        )));
+    }
     validate_policy_rule_selector(rule.priority, "from", rule.from)?;
     validate_policy_rule_selector(rule.priority, "to", rule.to)?;
     policy_rule_address_family(rule)?;
@@ -2687,6 +2693,18 @@ mod tests {
             error,
             RouteManagerError::InvalidRoutePlan(ref message)
                 if message.contains("must not reuse policy rule priority 10064")
+        ));
+
+        let mut zero_fwmark = route_plan()?;
+        zero_fwmark.policy_rules[0].fwmark = Some(0);
+        let error = match manager.apply_routes(zero_fwmark).await {
+            Ok(()) => return Err("zero fwmark policy rule should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RouteManagerError::InvalidPolicyRule(ref message)
+                if message.contains("fwmark selector must be nonzero when set")
         ));
 
         let mut invalid_rule = route_plan()?;
