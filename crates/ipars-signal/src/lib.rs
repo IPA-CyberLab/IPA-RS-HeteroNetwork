@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
-    NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, TransportProtocol,
+    NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, Route, TransportProtocol,
 };
 use ipnet::IpNet;
 use thiserror::Error;
@@ -55,6 +56,12 @@ pub enum SignalError {
     DesiredRouteInvalid {
         node_id: NodeId,
         route: IpNet,
+        reason: &'static str,
+    },
+    #[error("route {route_id} for node {node_id} is invalid: {reason}")]
+    RouteInvalid {
+        node_id: NodeId,
+        route_id: String,
         reason: &'static str,
     },
 }
@@ -132,6 +139,7 @@ impl SignalRegistry {
         health: Option<NodeHealth>,
     ) -> Result<SignalNodeUpsertResponse, SignalError> {
         let registered_at = Utc::now();
+        validate_signal_routes(&node.node_id, &node.routes)?;
         validate_endpoint_candidates(&node.node_id, &node.endpoint_candidates, registered_at)?;
         if let Some(health) = health.as_ref() {
             validate_health_report(&node.node_id, health, registered_at)?;
@@ -966,6 +974,161 @@ fn validate_desired_routes(
         }
     }
     Ok(())
+}
+
+fn validate_signal_routes(node_id: &NodeId, routes: &[Route]) -> Result<(), SignalError> {
+    let mut seen_route_ids = BTreeSet::new();
+    let mut seen_route_cidrs = BTreeSet::new();
+    for route in routes {
+        validate_signal_route_id(node_id, &route.id)?;
+        if !seen_route_ids.insert(route.id.as_str()) {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "route ID is duplicated",
+            });
+        }
+        if route.advertised_by != *node_id {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "route must be advertised by the reporting node",
+            });
+        }
+        if route.metric == 0 {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "metric must be greater than zero",
+            });
+        }
+        if restricted_advertised_route_cidr_reason(&route.cidr).is_some() {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "route CIDR is restricted",
+            });
+        }
+        let canonical = route.cidr.trunc();
+        if route.cidr != canonical {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "route CIDR must be canonical",
+            });
+        }
+        if !seen_route_cidrs.insert(route.cidr) {
+            return Err(SignalError::RouteInvalid {
+                node_id: node_id.clone(),
+                route_id: route.id.clone(),
+                reason: "route CIDR is duplicated",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_signal_route_id(node_id: &NodeId, route_id: &str) -> Result<(), SignalError> {
+    let reason = if route_id.is_empty() {
+        Some("route ID cannot be empty")
+    } else if route_id.len() > 128 {
+        Some("route ID exceeds 128 bytes")
+    } else if matches!(route_id, "." | "..") {
+        Some("route ID must not be '.' or '..'")
+    } else if !route_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        Some("route ID contains invalid characters")
+    } else {
+        None
+    };
+
+    if let Some(reason) = reason {
+        Err(SignalError::RouteInvalid {
+            node_id: node_id.clone(),
+            route_id: route_id.to_string(),
+            reason,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn restricted_advertised_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        IpNet::V4(network) => restricted_advertised_ipv4_route_cidr_reason(network),
+        IpNet::V6(network) => restricted_advertised_ipv6_route_cidr_reason(network),
+    }
+}
+
+fn restricted_advertised_ipv4_route_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv4_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn restricted_advertised_ipv6_route_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted
+        .iter()
+        .find_map(|(restricted, reason)| ipv6_cidrs_overlap(network, restricted).then_some(*reason))
+}
+
+fn ipv4_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn ipv6_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 fn timestamp_not_after_skew(
@@ -2992,6 +3155,81 @@ mod tests {
             ));
             assert!(registry
                 .get_node(&NodeId::from_string("relay-a"))
+                .await
+                .is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_invalid_route_advertisements() -> Result<(), SignalError> {
+        let invalid_owner = {
+            let mut node = source(Vec::new());
+            node.routes.push(advertised_route(
+                "service-route",
+                "10.10.0.0/16",
+                &NodeId::from_string("other-node"),
+            ));
+            node
+        };
+        let metric_zero = {
+            let mut node = source(Vec::new());
+            let mut route = advertised_route("service-route", "10.10.0.0/16", &node.node_id);
+            route.metric = 0;
+            node.routes.push(route);
+            node
+        };
+        let restricted = {
+            let mut node = source(Vec::new());
+            node.routes.push(advertised_route(
+                "loopback-route",
+                "127.0.0.0/8",
+                &node.node_id,
+            ));
+            node
+        };
+        let duplicate_cidr = {
+            let mut node = source(Vec::new());
+            node.routes
+                .push(advertised_route("service-a", "10.10.0.0/16", &node.node_id));
+            node.routes
+                .push(advertised_route("service-b", "10.10.0.0/16", &node.node_id));
+            node
+        };
+        let invalid_id = {
+            let mut node = source(Vec::new());
+            node.routes
+                .push(advertised_route("../bad", "10.10.0.0/16", &node.node_id));
+            node
+        };
+        let cases = [
+            (
+                invalid_owner,
+                "service-route",
+                "route must be advertised by the reporting node",
+            ),
+            (
+                metric_zero,
+                "service-route",
+                "metric must be greater than zero",
+            ),
+            (restricted, "loopback-route", "route CIDR is restricted"),
+            (duplicate_cidr, "service-b", "route CIDR is duplicated"),
+            (invalid_id, "../bad", "route ID contains invalid characters"),
+        ];
+
+        for (node, expected_route_id, expected_reason) in cases {
+            let registry = SignalRegistry::new(ClusterPolicy::default());
+            assert!(matches!(
+                registry.upsert_node(node).await,
+                Err(SignalError::RouteInvalid {
+                    route_id,
+                    reason,
+                    ..
+                }) if route_id == expected_route_id && reason == expected_reason
+            ));
+            assert!(registry
+                .get_node(&NodeId::from_string("node-a"))
                 .await
                 .is_none());
         }

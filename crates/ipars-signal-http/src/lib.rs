@@ -474,6 +474,14 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 format!("desired route {route} for target node {node_id} is invalid: {reason}"),
             ),
+            Self::Signal(SignalError::RouteInvalid {
+                node_id,
+                route_id,
+                reason,
+            }) => (
+                StatusCode::BAD_REQUEST,
+                format!("route {route_id} for node {node_id} is invalid: {reason}"),
+            ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
         };
         (status, Json(ErrorResponse { error })).into_response()
