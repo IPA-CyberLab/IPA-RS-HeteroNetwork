@@ -2686,7 +2686,7 @@ pub mod api {
                     oracle_tns_payload(payload).then_some(AgentPacketFlowApplication::Oracle)
                 })
                 .or_else(|| {
-                    clickhouse_native_client_hello_payload(payload)
+                    clickhouse_native_payload(payload)
                         .then_some(AgentPacketFlowApplication::ClickHouse)
                 })
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
@@ -7678,6 +7678,12 @@ pub mod api {
         has_description && (has_connect_data || has_service || has_address)
     }
 
+    fn clickhouse_native_payload(payload: &[u8]) -> bool {
+        clickhouse_native_client_hello_payload(payload)
+            || clickhouse_native_server_hello_payload(payload)
+            || clickhouse_native_query_payload(payload)
+    }
+
     fn clickhouse_native_client_hello_payload(payload: &[u8]) -> bool {
         let Some((packet_type, mut offset)) = clickhouse_uvarint(payload, 0) else {
             return false;
@@ -7760,6 +7766,296 @@ pub mod api {
         false
     }
 
+    fn clickhouse_native_server_hello_payload(payload: &[u8]) -> bool {
+        let Some((packet_type, mut offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        if packet_type != 0 {
+            return false;
+        }
+
+        let Some((server_name, next_offset)) = clickhouse_string(payload, offset, 128) else {
+            return false;
+        };
+        if !clickhouse_text_field(server_name, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((major, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if major > 100 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((minor, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if minor > 1000 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((revision, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if !(54_000..=1_000_000).contains(&revision) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((timezone, next_offset)) = clickhouse_string(payload, offset, 128) else {
+            return false;
+        };
+        if !clickhouse_text_field(timezone, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((display_name, next_offset)) = clickhouse_string(payload, offset, 128) else {
+            return false;
+        };
+        if !clickhouse_text_field(display_name, false) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((patch, offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        patch <= 1000
+            && offset == payload.len()
+            && (ascii_contains_ignore_case(server_name, b"clickhouse")
+                || ascii_contains_ignore_case(display_name, b"clickhouse"))
+    }
+
+    fn clickhouse_native_query_payload(payload: &[u8]) -> bool {
+        let Some((packet_type, mut offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        if packet_type != 1 {
+            return false;
+        }
+
+        let Some((query_id, next_offset)) = clickhouse_string(payload, offset, 256) else {
+            return false;
+        };
+        if !clickhouse_text_field(query_id, true) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some(next_offset) = clickhouse_client_info(payload, offset) else {
+            return false;
+        };
+        offset = next_offset;
+
+        let Some(next_offset) = clickhouse_settings(payload, offset) else {
+            return false;
+        };
+        offset = next_offset;
+
+        let Some((secret, next_offset)) = clickhouse_string(payload, offset, 4096) else {
+            return false;
+        };
+        if !clickhouse_text_field(secret, true) {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((stage, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if stage > 2 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some((compression, next_offset)) = clickhouse_uvarint(payload, offset) else {
+            return false;
+        };
+        if compression > 1 {
+            return false;
+        }
+        offset = next_offset;
+
+        let Some(query) = clickhouse_string_prefix(payload, offset, 65_536) else {
+            return false;
+        };
+        clickhouse_sql_statement(query.value, query.complete)
+            && (!query.complete || query.next_offset == payload.len())
+    }
+
+    fn clickhouse_client_info(payload: &[u8], mut offset: usize) -> Option<usize> {
+        let query_kind = *payload.get(offset)?;
+        if query_kind > 2 {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+
+        let (initial_user, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(initial_user, true) {
+            return None;
+        }
+        offset = next;
+
+        let (initial_query_id, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(initial_query_id, true) {
+            return None;
+        }
+        offset = next;
+
+        let (initial_address, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(initial_address, true) {
+            return None;
+        }
+        offset = next;
+
+        offset = offset.checked_add(8)?;
+        payload.get(offset - 8..offset)?;
+
+        let interface = *payload.get(offset)?;
+        if !matches!(interface, 1 | 2) {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+
+        let (os_user, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(os_user, true) {
+            return None;
+        }
+        offset = next;
+
+        let (client_hostname, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(client_hostname, true) {
+            return None;
+        }
+        offset = next;
+
+        let (client_name, next) = clickhouse_string(payload, offset, 128)?;
+        if !clickhouse_text_field(client_name, false) {
+            return None;
+        }
+        offset = next;
+
+        let (major, next) = clickhouse_uvarint(payload, offset)?;
+        if major > 100 {
+            return None;
+        }
+        offset = next;
+
+        let (minor, next) = clickhouse_uvarint(payload, offset)?;
+        if minor > 1000 {
+            return None;
+        }
+        offset = next;
+
+        let (revision, next) = clickhouse_uvarint(payload, offset)?;
+        if !(54_000..=1_000_000).contains(&revision) {
+            return None;
+        }
+        offset = next;
+
+        let (quota_key, next) = clickhouse_string(payload, offset, 256)?;
+        if !clickhouse_text_field(quota_key, true) {
+            return None;
+        }
+        offset = next;
+
+        let (distributed_depth, next) = clickhouse_uvarint(payload, offset)?;
+        if distributed_depth > 1024 {
+            return None;
+        }
+        offset = next;
+
+        let (patch, next) = clickhouse_uvarint(payload, offset)?;
+        if patch > 1000 {
+            return None;
+        }
+        offset = next;
+
+        let otel = *payload.get(offset)?;
+        if otel > 1 {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+        if otel == 0 {
+            return Some(offset);
+        }
+
+        offset = offset.checked_add(24)?;
+        payload.get(offset - 24..offset)?;
+
+        let (trace_state, next) = clickhouse_string(payload, offset, 1024)?;
+        if !clickhouse_text_field(trace_state, true) {
+            return None;
+        }
+        offset = next;
+
+        payload.get(offset)?;
+        offset.checked_add(1)
+    }
+
+    fn clickhouse_settings(payload: &[u8], mut offset: usize) -> Option<usize> {
+        for _ in 0..64 {
+            let (key, next) = clickhouse_string(payload, offset, 256)?;
+            offset = next;
+            let (value, next) = clickhouse_string(payload, offset, 4096)?;
+            offset = next;
+            if key.is_empty() && value.is_empty() {
+                return Some(offset);
+            }
+            if key.is_empty()
+                || !clickhouse_text_field(key, false)
+                || !clickhouse_text_field(value, true)
+            {
+                return None;
+            }
+            let important = *payload.get(offset)?;
+            if important > 1 {
+                return None;
+            }
+            offset = offset.checked_add(1)?;
+        }
+        None
+    }
+
+    struct ClickHouseStringPrefix<'a> {
+        value: &'a [u8],
+        next_offset: usize,
+        complete: bool,
+    }
+
+    fn clickhouse_string_prefix(
+        payload: &[u8],
+        offset: usize,
+        max_len: usize,
+    ) -> Option<ClickHouseStringPrefix<'_>> {
+        let (len, value_offset) = clickhouse_uvarint(payload, offset)?;
+        let len = usize::try_from(len).ok()?;
+        if len > max_len {
+            return None;
+        }
+        let value_end = value_offset.checked_add(len)?;
+        if let Some(value) = payload.get(value_offset..value_end) {
+            return Some(ClickHouseStringPrefix {
+                value,
+                next_offset: value_end,
+                complete: true,
+            });
+        }
+        if payload.len() < PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES || value_offset >= payload.len() {
+            return None;
+        }
+        Some(ClickHouseStringPrefix {
+            value: payload.get(value_offset..)?,
+            next_offset: payload.len(),
+            complete: false,
+        })
+    }
+
     fn clickhouse_string(payload: &[u8], offset: usize, max_len: usize) -> Option<(&[u8], usize)> {
         let (len, value_offset) = clickhouse_uvarint(payload, offset)?;
         let len = usize::try_from(len).ok()?;
@@ -7786,6 +8082,52 @@ pub mod api {
             && value
                 .iter()
                 .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    }
+
+    fn clickhouse_sql_statement(statement: &[u8], _complete: bool) -> bool {
+        if statement.is_empty()
+            || statement.len() > 65_536
+            || !statement
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\t' | b'\n' | b'\r'))
+        {
+            return false;
+        }
+        let Some(statement) = postgres_sql_statement_start(statement) else {
+            return false;
+        };
+        const KEYWORDS: &[&[u8]] = &[
+            b"SELECT",
+            b"INSERT",
+            b"UPDATE",
+            b"DELETE",
+            b"CREATE",
+            b"ALTER",
+            b"DROP",
+            b"TRUNCATE",
+            b"RENAME",
+            b"ATTACH",
+            b"DETACH",
+            b"OPTIMIZE",
+            b"CHECK",
+            b"KILL",
+            b"SYSTEM",
+            b"SHOW",
+            b"DESCRIBE",
+            b"DESC",
+            b"EXPLAIN",
+            b"EXISTS",
+            b"USE",
+            b"SET",
+            b"WATCH",
+            b"GRANT",
+            b"REVOKE",
+            b"BACKUP",
+            b"RESTORE",
+        ];
+        KEYWORDS
+            .iter()
+            .any(|keyword| starts_ascii_keyword(statement, keyword))
     }
 
     fn redis_payload(payload: &[u8]) -> bool {
@@ -12057,6 +12399,60 @@ mod tests {
             payload
         }
 
+        fn clickhouse_server_hello(
+            server_name: &[u8],
+            revision: u64,
+            timezone: &[u8],
+            display_name: &[u8],
+            patch: u64,
+        ) -> Vec<u8> {
+            let mut payload = clickhouse_uvarint(0);
+            payload.extend_from_slice(&clickhouse_string(server_name));
+            payload.extend_from_slice(&clickhouse_uvarint(21));
+            payload.extend_from_slice(&clickhouse_uvarint(12));
+            payload.extend_from_slice(&clickhouse_uvarint(revision));
+            payload.extend_from_slice(&clickhouse_string(timezone));
+            payload.extend_from_slice(&clickhouse_string(display_name));
+            payload.extend_from_slice(&clickhouse_uvarint(patch));
+            payload
+        }
+
+        fn clickhouse_query_packet(query: &[u8], settings: &[(&[u8], &[u8], bool)]) -> Vec<u8> {
+            let mut payload = clickhouse_uvarint(1);
+            payload.extend_from_slice(&clickhouse_string(b"query-1"));
+
+            payload.push(1);
+            payload.extend_from_slice(&clickhouse_string(b"reader"));
+            payload.extend_from_slice(&clickhouse_string(b"query-1"));
+            payload.extend_from_slice(&clickhouse_string(b"127.0.0.1:9000"));
+            payload.extend_from_slice(&0_i64.to_le_bytes());
+            payload.push(1);
+            payload.extend_from_slice(&clickhouse_string(b"ipars"));
+            payload.extend_from_slice(&clickhouse_string(b"edge-a"));
+            payload.extend_from_slice(&clickhouse_string(b"Go Client"));
+            payload.extend_from_slice(&clickhouse_uvarint(1));
+            payload.extend_from_slice(&clickhouse_uvarint(10));
+            payload.extend_from_slice(&clickhouse_uvarint(54_451));
+            payload.extend_from_slice(&clickhouse_string(b""));
+            payload.extend_from_slice(&clickhouse_uvarint(0));
+            payload.extend_from_slice(&clickhouse_uvarint(3));
+            payload.push(0);
+
+            for (key, value, important) in settings {
+                payload.extend_from_slice(&clickhouse_string(key));
+                payload.extend_from_slice(&clickhouse_string(value));
+                payload.push(u8::from(*important));
+            }
+            payload.extend_from_slice(&clickhouse_string(b""));
+            payload.extend_from_slice(&clickhouse_string(b""));
+
+            payload.extend_from_slice(&clickhouse_string(b""));
+            payload.extend_from_slice(&clickhouse_uvarint(2));
+            payload.extend_from_slice(&clickhouse_uvarint(0));
+            payload.extend_from_slice(&clickhouse_string(query));
+            payload
+        }
+
         fn clickhouse_string(value: &[u8]) -> Vec<u8> {
             let mut encoded = clickhouse_uvarint(value.len() as u64);
             encoded.extend_from_slice(value);
@@ -14360,6 +14756,32 @@ mod tests {
             observation_for_payload(&clickhouse_hello_with_quota).application(),
             api::AgentPacketFlowApplication::ClickHouse
         );
+        let clickhouse_server =
+            clickhouse_server_hello(b"Clickhouse", 54_452, b"Europe/Moscow", b"Clickhouse", 3);
+        assert_eq!(
+            observation_for_payload(&clickhouse_server).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let clickhouse_query = clickhouse_query_packet(
+            b"SELECT count() FROM system.tables",
+            &[(b"send_logs_level".as_slice(), b"trace".as_slice(), true)],
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_query).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let long_clickhouse_query = clickhouse_query_packet(
+            b"SELECT event_time, trace_id, service_name FROM observability.events WHERE service_name = 'ipars-agent' ORDER BY event_time DESC LIMIT 1000",
+            &[],
+        );
+        assert!(long_clickhouse_query.len() > api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES);
+        assert_eq!(
+            observation_for_payload(
+                &long_clickhouse_query[..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES]
+            )
+            .application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
         let clickhouse_old_revision =
             clickhouse_client_hello(b"Go Client", 100, b"default", b"default", b"", &[]);
         assert_eq!(
@@ -14376,6 +14798,11 @@ mod tests {
         clickhouse_with_trailing_junk.extend_from_slice(b"junk");
         assert_eq!(
             observation_for_payload(&clickhouse_with_trailing_junk).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_non_sql_query = clickhouse_query_packet(b"hello clickhouse", &[]);
+        assert_eq!(
+            observation_for_payload(&clickhouse_non_sql_query).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
