@@ -3819,11 +3819,27 @@ pub mod api {
         if payload.len() < 14 {
             return false;
         }
-        let message_len = u16::from_be_bytes([payload[0], payload[1]]);
-        (12..=4096).contains(&message_len) && dns_message_payload(&payload[2..])
+        let message_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if !(12..=4096).contains(&message_len) {
+            return false;
+        }
+        let available = payload.len() - 2;
+        let truncated = available < message_len;
+        if truncated && payload.len() < PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return false;
+        }
+        let frame_len = available.min(message_len);
+        dns_message_payload_with_truncation(&payload[2..2 + frame_len], truncated)
     }
 
     fn dns_message_payload(payload: &[u8]) -> bool {
+        dns_message_payload_with_truncation(
+            payload,
+            payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
+        )
+    }
+
+    fn dns_message_payload_with_truncation(payload: &[u8], allow_truncated: bool) -> bool {
         if payload.len() < 12 {
             return false;
         }
@@ -3841,7 +3857,7 @@ pub mod api {
             + u16::from_be_bytes([payload[10], payload[11]]) as usize;
         flags & 0x8000 != 0
             && (1..=4096).contains(&rr_count)
-            && dns_resource_record_payload(payload, 12)
+            && dns_resource_record_payload(payload, 12, allow_truncated)
     }
 
     fn dhcp_payload(payload: &[u8]) -> bool {
@@ -3940,7 +3956,11 @@ pub mod api {
         qtype != 0 && qclass != 0
     }
 
-    fn dns_resource_record_payload(payload: &[u8], mut offset: usize) -> bool {
+    fn dns_resource_record_payload(
+        payload: &[u8],
+        mut offset: usize,
+        allow_truncated: bool,
+    ) -> bool {
         let Some(name_end) = dns_name_payload(payload, offset) else {
             return false;
         };
@@ -3957,9 +3977,7 @@ pub mod api {
         let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
             return false;
         };
-        rr_type != 0
-            && rr_class & 0x7fff != 0
-            && (rr_end <= payload.len() || payload.len() >= PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES)
+        rr_type != 0 && rr_class & 0x7fff != 0 && (rr_end <= payload.len() || allow_truncated)
     }
 
     fn dns_name_payload(payload: &[u8], mut offset: usize) -> Option<usize> {
@@ -15342,6 +15360,20 @@ mod tests {
             observation_for_payload(&dns_tcp_payload).application(),
             api::AgentPacketFlowApplication::Dns
         );
+        let mut short_declared_dns_tcp_payload =
+            ((dns_query.len() - 1) as u16).to_be_bytes().to_vec();
+        short_declared_dns_tcp_payload.extend_from_slice(&dns_query);
+        assert_eq!(
+            observation_for_payload(&short_declared_dns_tcp_payload).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut long_declared_dns_tcp_payload =
+            ((dns_query.len() + 1) as u16).to_be_bytes().to_vec();
+        long_declared_dns_tcp_payload.extend_from_slice(&dns_query);
+        assert_eq!(
+            observation_for_payload(&long_declared_dns_tcp_payload).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mdns_response = vec![
             0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'p',
             b'r', b'i', b'n', b't', b'e', b'r', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00,
@@ -15356,6 +15388,27 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mdns_tcp_payload).application(),
             api::AgentPacketFlowApplication::Dns
+        );
+        let mut long_mdns_response = mdns_response.clone();
+        long_mdns_response[35] = 0x00;
+        long_mdns_response[36] = 150;
+        long_mdns_response.truncate(37);
+        long_mdns_response.extend(std::iter::repeat_n(0xa5, 150));
+        let mut long_mdns_tcp_payload = (long_mdns_response.len() as u16).to_be_bytes().to_vec();
+        long_mdns_tcp_payload.extend_from_slice(&long_mdns_response);
+        assert_eq!(
+            observation_for_payload(
+                &long_mdns_tcp_payload[..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES]
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        assert_eq!(
+            observation_for_payload(
+                &long_mdns_tcp_payload[..api::PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES - 1]
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         let mut mdns_response_without_answers = mdns_response.clone();
         mdns_response_without_answers[6] = 0;
