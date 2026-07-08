@@ -10235,6 +10235,10 @@ pub mod api {
     }
 
     fn mqtt_payload(payload: &[u8]) -> bool {
+        mqtt_connect_packet_payload(payload) || mqtt_connack_packet_payload(payload)
+    }
+
+    fn mqtt_connect_packet_payload(payload: &[u8]) -> bool {
         if payload.len() < 8 || payload[0] != 0x10 {
             return false;
         }
@@ -10312,6 +10316,48 @@ pub mod api {
             )
     }
 
+    fn mqtt_connack_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 || payload[0] != 0x20 {
+            return false;
+        }
+        let Some((remaining_len, offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        if remaining_len < 2 || remaining_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+            return false;
+        }
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end != payload.len() {
+            return false;
+        }
+
+        let Some(&ack_flags) = payload.get(offset) else {
+            return false;
+        };
+        let Some(&reason_code) = payload.get(offset + 1) else {
+            return false;
+        };
+        if ack_flags & !0x01 != 0 || (reason_code != 0 && ack_flags != 0) {
+            return false;
+        }
+        if remaining_len == 2 {
+            return matches!(reason_code, 0..=5);
+        }
+
+        if !mqtt_v5_connack_reason_code(reason_code) {
+            return false;
+        }
+        let properties_offset = offset + 2;
+        let Some((properties_len, properties_start)) =
+            mqtt_variable_integer_until(payload, properties_offset, remaining_end)
+        else {
+            return false;
+        };
+        mqtt_v5_connack_properties(payload, properties_start, remaining_end, properties_len)
+    }
+
     fn mqtt_variable_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
         mqtt_variable_integer_until(payload, offset, payload.len())
     }
@@ -10349,6 +10395,131 @@ pub mod api {
             && (!password || username)
             && (will || (!will_retain && will_qos == 0))
             && will_qos != 0x03
+    }
+
+    fn mqtt_v5_connack_reason_code(reason_code: u8) -> bool {
+        matches!(
+            reason_code,
+            0x00 | 0x80
+                | 0x81
+                | 0x82
+                | 0x83
+                | 0x84
+                | 0x85
+                | 0x86
+                | 0x87
+                | 0x88
+                | 0x89
+                | 0x8a
+                | 0x8c
+                | 0x90
+                | 0x95
+                | 0x97
+                | 0x99
+                | 0x9a
+                | 0x9b
+                | 0x9c
+                | 0x9d
+                | 0x9f
+        )
+    }
+
+    fn mqtt_v5_connack_properties(
+        payload: &[u8],
+        mut offset: usize,
+        remaining_end: usize,
+        properties_len: usize,
+    ) -> bool {
+        let Some(properties_end) = offset.checked_add(properties_len) else {
+            return false;
+        };
+        if properties_end != remaining_end {
+            return false;
+        }
+        let mut property_count = 0_usize;
+        let mut seen_single = 0_u128;
+        while offset < properties_end {
+            property_count += 1;
+            if property_count > 64 {
+                return false;
+            }
+            let Some((property_id, value_offset)) =
+                mqtt_variable_integer_until(payload, offset, properties_end)
+            else {
+                return false;
+            };
+            offset = value_offset;
+            if property_id != 0x26 {
+                let Some(property_bit) = 1_u128.checked_shl(property_id as u32) else {
+                    return false;
+                };
+                if seen_single & property_bit != 0 {
+                    return false;
+                }
+                seen_single |= property_bit;
+            }
+            let Some(next_offset) =
+                mqtt_v5_connack_property(payload, offset, properties_end, property_id)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == properties_end
+    }
+
+    fn mqtt_v5_connack_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+        property_id: usize,
+    ) -> Option<usize> {
+        match property_id {
+            0x11 | 0x27 => {
+                let next_offset = offset.checked_add(4)?;
+                let value = read_u32_be(payload, offset)?;
+                (next_offset <= properties_end && (property_id != 0x27 || value != 0))
+                    .then_some(next_offset)
+            }
+            0x13 | 0x22 => {
+                let next_offset = offset.checked_add(2)?;
+                payload
+                    .get(offset..next_offset)
+                    .filter(|_| next_offset <= properties_end)
+                    .map(|_| next_offset)
+            }
+            0x21 => {
+                let next_offset = offset.checked_add(2)?;
+                let value = read_u16_be(payload, offset)?;
+                (next_offset <= properties_end && value != 0).then_some(next_offset)
+            }
+            0x24 | 0x25 | 0x28 | 0x29 | 0x2a => {
+                let value = *payload.get(offset)?;
+                let next_offset = offset.checked_add(1)?;
+                (next_offset <= properties_end
+                    && if property_id == 0x24 {
+                        value <= 1
+                    } else {
+                        matches!(value, 0 | 1)
+                    })
+                .then_some(next_offset)
+            }
+            0x12 | 0x15 | 0x1a | 0x1c | 0x1f => {
+                let (_value, next_offset) = mqtt_utf8_field(payload, offset, properties_end)?;
+                Some(next_offset)
+            }
+            0x16 => {
+                let (_value, next_offset) =
+                    mqtt_len_prefixed_field(payload, offset, properties_end)?;
+                Some(next_offset)
+            }
+            0x26 => {
+                let (_key, value_offset) = mqtt_utf8_field(payload, offset, properties_end)?;
+                let (_value, next_offset) = mqtt_utf8_field(payload, value_offset, properties_end)?;
+                Some(next_offset)
+            }
+            _ => None,
+        }
     }
 
     fn mqtt_connect_payload(
@@ -13703,6 +13874,22 @@ mod tests {
             payload
         }
 
+        fn mqtt_connack_packet(
+            ack_flags: u8,
+            reason_code: u8,
+            properties: Option<&[u8]>,
+        ) -> Vec<u8> {
+            let mut body = vec![ack_flags, reason_code];
+            if let Some(properties) = properties {
+                body.extend_from_slice(&mqtt_remaining_length(properties.len()));
+                body.extend_from_slice(properties);
+            }
+            let mut payload = vec![0x20];
+            payload.extend_from_slice(&mqtt_remaining_length(body.len()));
+            payload.extend_from_slice(&body);
+            payload
+        }
+
         fn mqtt_field(value: &[u8]) -> Vec<u8> {
             let mut field = (value.len() as u16).to_be_bytes().to_vec();
             field.extend_from_slice(value);
@@ -16570,6 +16757,34 @@ mod tests {
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x00, None)).application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x01, None)).application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x01, 0x00, Some(&[]))).application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x84, Some(&[]))).application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x00, Some(&[0x21, 0x00, 0x0a])))
+                .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        let mut mqtt_connack_reason = vec![0x1f];
+        mqtt_connack_reason.extend_from_slice(&mqtt_field(b"accepted"));
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x00, Some(&mqtt_connack_reason)))
+                .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
             observation_for_payload(&[
                 0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
                 b'a', b'g', b'e', b'n', b't',
@@ -16604,6 +16819,46 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mqtt_connect_packet(4, 0x02, &[mqtt_field(&[0xff])]))
                 .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[0x21, 0x02, 0x00, 0x00]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x02, 0x00, None)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x01, 0x01, None)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x06, None)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x00, Some(&[0x7f]))).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(
+                0x00,
+                0x00,
+                Some(&[0x25, 0x01, 0x25, 0x00])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_packet(0x00, 0x00, Some(&[0x21, 0x00, 0x00])))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_connack_trailing = mqtt_connack_packet(0x00, 0x00, None);
+        mqtt_connack_trailing.push(0);
+        assert_eq!(
+            observation_for_payload(&mqtt_connack_trailing).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
