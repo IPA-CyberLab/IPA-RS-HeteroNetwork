@@ -1175,6 +1175,15 @@ where
                     ),
                 });
             }
+            if path.selected_state == PathState::Unreachable && path.selected_candidate.is_some() {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "unreachable path {} -> {} must not carry a selected candidate",
+                        path.key.local, path.key.remote
+                    ),
+                });
+            }
             match (path.selected_state, path.relay_node.as_ref()) {
                 (PathState::Relay, Some(relay_node))
                     if relay_node == &path.key.local || relay_node == &path.key.remote =>
@@ -4660,6 +4669,61 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must not carry a direct selected candidate"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_unreachable_path_with_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_state = PathState::Unreachable;
+        reported_path.selected_candidate = Some(candidate("node-b"));
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        let error =
+            match result {
+                Ok(_) => return Err(
+                    "unexpected successful unreachable path-state update with selected candidate"
+                        .into(),
+                ),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("must not carry a selected candidate"));
         Ok(())
     }
 
