@@ -4135,6 +4135,7 @@ pub mod api {
             50 => dns_nsec3_rdata_payload(payload, rdata_offset, rdata_end),
             51 => dns_nsec3param_rdata_payload(payload, rdata_offset, rdata_end),
             52 | 53 => dns_certificate_association_rdata_payload(payload, rdata_offset, rdata_end),
+            64 | 65 => dns_svcb_rdata_payload(payload, rdata_offset, rdata_end),
             256 => dns_uri_rdata_payload(payload, rdata_offset, rdata_end),
             257 => dns_caa_rdata_payload(payload, rdata_offset, rdata_end),
             _ => true,
@@ -4401,6 +4402,121 @@ pub mod api {
             && payload[target_offset..rdata_end]
                 .iter()
                 .all(|byte| byte.is_ascii_graphic())
+    }
+
+    fn dns_svcb_rdata_payload(payload: &[u8], rdata_offset: usize, rdata_end: usize) -> bool {
+        let Some(target_offset) = rdata_offset.checked_add(2) else {
+            return false;
+        };
+        if target_offset >= rdata_end {
+            return false;
+        }
+        let priority = u16::from_be_bytes([payload[rdata_offset], payload[rdata_offset + 1]]);
+        let Some(params_offset) = dns_name_payload_with_root(payload, target_offset, true) else {
+            return false;
+        };
+        if priority == 0 {
+            return params_offset == rdata_end;
+        }
+        dns_svcb_params_payload(payload, params_offset, rdata_end)
+    }
+
+    fn dns_svcb_params_payload(payload: &[u8], mut offset: usize, end: usize) -> bool {
+        let mut previous_key = None;
+        while offset < end {
+            let Some(header_end) = offset.checked_add(4) else {
+                return false;
+            };
+            let Some(header) = payload.get(offset..header_end) else {
+                return false;
+            };
+            let key = u16::from_be_bytes([header[0], header[1]]);
+            let value_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+            if previous_key.is_some_and(|previous| key <= previous) {
+                return false;
+            }
+            let Some(value_end) = header_end.checked_add(value_len) else {
+                return false;
+            };
+            if value_end > end || !dns_svcb_param_value_payload(payload, header_end, value_end, key)
+            {
+                return false;
+            }
+            previous_key = Some(key);
+            offset = value_end;
+        }
+        offset == end
+    }
+
+    fn dns_svcb_param_value_payload(
+        payload: &[u8],
+        value_offset: usize,
+        value_end: usize,
+        key: u16,
+    ) -> bool {
+        let value_len = value_end - value_offset;
+        match key {
+            0 => dns_svcb_mandatory_payload(payload, value_offset, value_end),
+            1 => dns_svcb_alpn_payload(payload, value_offset, value_end),
+            2 => value_len == 0,
+            3 => {
+                value_len == 2
+                    && u16::from_be_bytes([payload[value_offset], payload[value_offset + 1]]) != 0
+            }
+            4 => value_len > 0 && value_len.is_multiple_of(4),
+            5 => value_len > 0,
+            6 => value_len > 0 && value_len.is_multiple_of(16),
+            7 => {
+                value_len > 0
+                    && payload[value_offset..value_end]
+                        .iter()
+                        .all(|byte| byte.is_ascii_graphic())
+            }
+            _ => true,
+        }
+    }
+
+    fn dns_svcb_mandatory_payload(payload: &[u8], mut offset: usize, end: usize) -> bool {
+        let Some(value_len) = end.checked_sub(offset) else {
+            return false;
+        };
+        if value_len == 0 || value_len % 2 != 0 {
+            return false;
+        }
+        let mut previous_key = None;
+        while offset < end {
+            let key = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+            if key == 0 || previous_key.is_some_and(|previous| key <= previous) {
+                return false;
+            }
+            previous_key = Some(key);
+            offset += 2;
+        }
+        true
+    }
+
+    fn dns_svcb_alpn_payload(payload: &[u8], mut offset: usize, end: usize) -> bool {
+        let mut alpn_count = 0_usize;
+        while offset < end {
+            let Some(&len) = payload.get(offset) else {
+                return false;
+            };
+            if len == 0 {
+                return false;
+            }
+            let Some(value_offset) = offset.checked_add(1) else {
+                return false;
+            };
+            let Some(next_offset) = value_offset.checked_add(len as usize) else {
+                return false;
+            };
+            if next_offset > end {
+                return false;
+            }
+            alpn_count += 1;
+            offset = next_offset;
+        }
+        alpn_count > 0
     }
 
     fn dns_resource_record_class_payload(rr_type: u16, rr_class: u16) -> bool {
@@ -16396,6 +16512,64 @@ mod tests {
         dns_response_with_bad_uri_target[uri_target_offset] = 0x00;
         assert_eq!(
             observation_for_udp_payload(&dns_response_with_bad_uri_target).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut svcb_query = dns_query.clone();
+        svcb_query[qtype_offset] = 0x00;
+        svcb_query[qtype_offset + 1] = 0x40;
+        let mut dns_response_with_svcb_answer = svcb_query.clone();
+        dns_response_with_svcb_answer[2] = 0x81;
+        dns_response_with_svcb_answer[3] = 0x80;
+        dns_response_with_svcb_answer[7] = 0x01;
+        dns_response_with_svcb_answer.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x1c, 0x00, 0x01,
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x06, 0x02, b'h', b'2', 0x02, b'h', b'3', 0x00, 0x03,
+            0x00, 0x02, 0x01, 0xbb, 0x00, 0x04, 0x00, 0x04, 192, 0, 2, 10,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_svcb_answer).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_duplicate_svcb_param = dns_response_with_svcb_answer.clone();
+        let svcb_second_param_key_offset = svcb_query.len() + 26;
+        dns_response_with_duplicate_svcb_param[svcb_second_param_key_offset] = 0x00;
+        dns_response_with_duplicate_svcb_param[svcb_second_param_key_offset + 1] = 0x01;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_duplicate_svcb_param).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut dns_response_with_bad_svcb_alpn = dns_response_with_svcb_answer.clone();
+        let svcb_first_alpn_len_offset = svcb_query.len() + 20;
+        dns_response_with_bad_svcb_alpn[svcb_first_alpn_len_offset] = 0x00;
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_svcb_alpn).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut https_query = dns_query.clone();
+        https_query[qtype_offset] = 0x00;
+        https_query[qtype_offset + 1] = 0x41;
+        let mut dns_response_with_https_alias = https_query.clone();
+        dns_response_with_https_alias[2] = 0x81;
+        dns_response_with_https_alias[3] = 0x80;
+        dns_response_with_https_alias[7] = 0x01;
+        dns_response_with_https_alias.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0x00, 0x00,
+            0xc0, 0x0c,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_https_alias).application(),
+            api::AgentPacketFlowApplication::Dns
+        );
+        let mut dns_response_with_bad_https_alias = https_query.clone();
+        dns_response_with_bad_https_alias[2] = 0x81;
+        dns_response_with_bad_https_alias[3] = 0x80;
+        dns_response_with_bad_https_alias[7] = 0x01;
+        dns_response_with_bad_https_alias.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x08, 0x00, 0x00,
+            0xc0, 0x0c, 0x00, 0x02, 0x00, 0x00,
+        ]);
+        assert_eq!(
+            observation_for_udp_payload(&dns_response_with_bad_https_alias).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut dns_response_with_bad_class = dns_response_with_compressed_answer.clone();
