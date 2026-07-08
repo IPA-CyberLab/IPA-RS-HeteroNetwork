@@ -3000,6 +3000,9 @@ pub mod api {
         if let Some(application) = http_payload_hint_application(payload) {
             return Some(application);
         }
+        if let Some(application) = http_response_application(payload) {
+            return Some(application);
+        }
         if let Some(path) = http_request_path(payload) {
             if ipars_control_plane_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::IparsControlPlane);
@@ -3093,6 +3096,173 @@ pub mod api {
             return http2_payload_application(payload).or(Some(AgentPacketFlowApplication::Http));
         }
         None
+    }
+
+    fn http_response_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
+        let line_end = payload.iter().position(|byte| *byte == b'\n')?;
+        let status_line = payload[..line_end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&payload[..line_end]);
+        if !http_response_status_line(status_line) {
+            return None;
+        }
+        http_response_header_application(payload.get(line_end + 1..).unwrap_or_default())
+    }
+
+    fn http_response_status_line(line: &[u8]) -> bool {
+        if line.len() < b"HTTP/1.1 200".len()
+            || !(line.starts_with(b"HTTP/1.0 ") || line.starts_with(b"HTTP/1.1 "))
+        {
+            return false;
+        }
+        let code = &line[9..12];
+        if !code.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let status_code = usize::from(code[0] - b'0') * 100
+            + usize::from(code[1] - b'0') * 10
+            + usize::from(code[2] - b'0');
+        (100..=599).contains(&status_code)
+            && line
+                .get(12)
+                .is_none_or(|byte| *byte == b' ' || *byte == b'\t')
+            && line
+                .iter()
+                .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
+    }
+
+    fn http_response_header_application(headers: &[u8]) -> Option<AgentPacketFlowApplication> {
+        if http_header_contains(headers, b"x-kubernetes-pf-flowschema-uid")
+            || http_header_contains(headers, b"x-kubernetes-pf-prioritylevel-uid")
+            || http_header_contains(headers, b"audit-id")
+            || http_header_value_contains(
+                headers,
+                b"content-type",
+                b"application/vnd.kubernetes.protobuf",
+            )
+        {
+            return Some(AgentPacketFlowApplication::KubernetesApi);
+        }
+        if http_header_contains(headers, b"docker-experimental")
+            || http_header_contains(headers, b"docker-api-version")
+        {
+            return Some(AgentPacketFlowApplication::DockerApi);
+        }
+        if http_header_contains(headers, b"x-etcd-index")
+            || http_header_contains(headers, b"x-raft-index")
+            || http_header_contains(headers, b"x-raft-term")
+        {
+            return Some(AgentPacketFlowApplication::Etcd);
+        }
+        if http_header_contains(headers, b"x-consul-index")
+            || http_header_contains(headers, b"x-consul-knownleader")
+            || http_header_contains(headers, b"x-consul-lastcontact")
+        {
+            return Some(AgentPacketFlowApplication::Consul);
+        }
+        if http_header_name_has_prefix(headers, b"x-vault-") {
+            return Some(AgentPacketFlowApplication::Vault);
+        }
+        if http_header_name_has_prefix(headers, b"x-nomad-") {
+            return Some(AgentPacketFlowApplication::Nomad);
+        }
+        if http_header_value_contains(headers, b"x-elastic-product", b"elasticsearch") {
+            return Some(AgentPacketFlowApplication::Elasticsearch);
+        }
+        if http_header_name_has_prefix(headers, b"x-clickhouse-") {
+            return Some(AgentPacketFlowApplication::ClickHouse);
+        }
+        if http_header_name_has_prefix(headers, b"x-influxdb-")
+            || http_header_name_has_prefix(headers, b"x-influx-")
+        {
+            return Some(AgentPacketFlowApplication::InfluxDb);
+        }
+        if http_header_value_contains(headers, b"content-type", b"application/openmetrics-text")
+            || http_header_value_contains(headers, b"content-type", b"text/plain; version=0.0.4")
+        {
+            return Some(AgentPacketFlowApplication::Prometheus);
+        }
+        if http_header_value_contains(headers, b"content-type", b"application/grpc")
+            || http_header_contains(headers, b"grpc-status")
+        {
+            return Some(AgentPacketFlowApplication::Grpc);
+        }
+        None
+    }
+
+    fn http_header_contains(headers: &[u8], name: &[u8]) -> bool {
+        http_header_name_matches(headers, |candidate| candidate.eq_ignore_ascii_case(name))
+    }
+
+    fn http_header_name_has_prefix(headers: &[u8], prefix: &[u8]) -> bool {
+        http_header_name_matches(headers, |candidate| {
+            candidate
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+    }
+
+    fn http_header_value_contains(headers: &[u8], name: &[u8], needle: &[u8]) -> bool {
+        http_header_value_matches(headers, name, |value| {
+            contains_ascii_case_insensitive(value, needle)
+        })
+    }
+
+    fn http_header_name_matches<F>(headers: &[u8], mut matches_name: F) -> bool
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        http_header_value_matches(headers, b"", |line| {
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                return false;
+            };
+            let name = trim_ascii_space(&line[..colon]);
+            !name.is_empty() && matches_name(name)
+        })
+    }
+
+    fn http_header_value_matches<F>(headers: &[u8], name: &[u8], mut matches_value: F) -> bool
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let mut offset = 0_usize;
+        while offset < headers.len() {
+            let remaining = &headers[offset..];
+            let line_end = remaining
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(remaining.len());
+            let line = remaining[..line_end]
+                .strip_suffix(b"\r")
+                .unwrap_or(&remaining[..line_end]);
+            if line.is_empty() {
+                break;
+            }
+            if line.len() > 512
+                || !line
+                    .iter()
+                    .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
+            {
+                return false;
+            }
+            if name.is_empty() {
+                if matches_value(line) {
+                    return true;
+                }
+            } else if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+                let candidate = trim_ascii_space(&line[..colon]);
+                if candidate.eq_ignore_ascii_case(name)
+                    && matches_value(trim_ascii_space(&line[colon + 1..]))
+                {
+                    return true;
+                }
+            }
+            if line_end == remaining.len() {
+                break;
+            }
+            offset = offset.saturating_add(line_end + 1);
+        }
+        false
     }
 
     fn grpc_http_payload(payload: &[u8]) -> bool {
@@ -15686,6 +15856,83 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"GET /v1/jobber HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HTTP/1.1 200 OK\r\nX-Kubernetes-Pf-Flowschema-Uid: flow-a\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.kubernetes.protobuf\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::KubernetesApi
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nDocker-Experimental: false\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::DockerApi
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Etcd-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Etcd
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Consul-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Consul
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Vault-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Vault
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Nomad-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Nomad
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Elastic-Product: Elasticsearch\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-ClickHouse-Summary: {}\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Influxdb-Version: 2.7\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::InfluxDb
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/openmetrics-text; version=1.0.0\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Prometheus
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nGrpc-Status: 0\r\n").application(),
+            api::AgentPacketFlowApplication::Grpc
+        );
+        assert_eq!(
+            observation_for_payload(b"GET / HTTP/1.1\r\nX-Consul-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Consulate-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/9.9 200 OK\r\nX-Consul-Index: 42\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 ABC OK\r\nX-Consul-Index: 42\r\n").application(),
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
