@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -2373,6 +2374,240 @@ fn validate_linux_command_program(program: &str) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn resolve_trusted_linux_command_paths(
+    mut command: LinuxCommand,
+) -> Result<LinuxCommand, AgentError> {
+    let original_program = command.program.clone();
+    let resolved_program = resolve_trusted_linux_command_program(&command.program)?;
+    command.program = command_path_to_string(&resolved_program)?;
+
+    if linux_command_program_name(&original_program) == Some("ip")
+        && command.args.len() >= 4
+        && command.args[0] == "netns"
+        && command.args[1] == "exec"
+    {
+        validate_linux_command_program(&command.args[3])?;
+        let resolved_inner = resolve_trusted_linux_command_program(&command.args[3])?;
+        command.args[3] = command_path_to_string(&resolved_inner)?;
+    }
+
+    Ok(command)
+}
+
+fn resolve_trusted_linux_command_program(program: &str) -> Result<PathBuf, AgentError> {
+    if program.contains('/') {
+        return ensure_trusted_linux_command_executable(
+            Path::new(program),
+            "linux command program",
+        );
+    }
+
+    for directory in std::env::split_paths(OsStr::new(SANITIZED_SYSTEM_COMMAND_PATH)) {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command PATH entry `{}`: expected an absolute directory",
+                directory.display()
+            )));
+        }
+        if command_path_has_special_component(&directory) {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command PATH entry `{}`: must not contain '.' or '..' components",
+                directory.display()
+            )));
+        }
+        if let Err(error) = ensure_trusted_linux_command_search_directory(&directory) {
+            if !matches!(&error, AgentError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
+                return Err(error);
+            }
+            continue;
+        }
+
+        let candidate = directory.join(program);
+        match candidate.symlink_metadata() {
+            Ok(_) => {
+                return ensure_trusted_linux_command_executable(
+                    &candidate,
+                    "linux command program",
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AgentError::Io(error)),
+        }
+    }
+
+    Err(AgentError::WireGuard(format!(
+        "missing linux command program `{program}` in sanitized PATH"
+    )))
+}
+
+fn command_path_to_string(path: &Path) -> Result<String, AgentError> {
+    path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        AgentError::WireGuard(format!(
+            "resolved linux command path {} is not UTF-8",
+            path.display()
+        ))
+    })
+}
+
+fn linux_command_program_name(program: &str) -> Option<&str> {
+    if program.contains('/') {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    } else {
+        Some(program)
+    }
+}
+
+fn command_path_has_special_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    })
+}
+
+#[cfg(unix)]
+fn ensure_trusted_linux_command_search_directory(directory: &Path) -> Result<(), AgentError> {
+    let canonical = std::fs::canonicalize(directory)?;
+    let metadata = std::fs::metadata(&canonical)?;
+    if !metadata.is_dir() {
+        return Err(AgentError::WireGuard(format!(
+            "linux command PATH entry {} must be a directory",
+            directory.display()
+        )));
+    }
+    ensure_trusted_linux_command_directory_chain(&canonical, "linux command PATH entry")
+}
+
+#[cfg(not(unix))]
+fn ensure_trusted_linux_command_search_directory(directory: &Path) -> Result<(), AgentError> {
+    let metadata = std::fs::metadata(directory)?;
+    if !metadata.is_dir() {
+        return Err(AgentError::WireGuard(format!(
+            "linux command PATH entry {} must be a directory",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_trusted_linux_command_executable(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, AgentError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let canonical = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&canonical)?;
+    let mode = metadata.permissions().mode();
+    if !metadata.is_file() || mode & 0o111 == 0 {
+        return Err(AgentError::WireGuard(format!(
+            "{label} at {} expected an executable regular file",
+            path.display()
+        )));
+    }
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    ensure_trusted_linux_command_owner(label, "at", &canonical, metadata.uid(), effective_uid)?;
+    if mode & 0o022 != 0 {
+        return Err(AgentError::WireGuard(format!(
+            "{label} at {} must not be group- or world-writable",
+            canonical.display()
+        )));
+    }
+    let parent = canonical.parent().ok_or_else(|| {
+        AgentError::WireGuard(format!(
+            "failed to locate parent directory for {label} at {}",
+            canonical.display()
+        ))
+    })?;
+    ensure_trusted_linux_command_directory_chain(parent, label)?;
+    Ok(canonical)
+}
+
+#[cfg(not(unix))]
+fn ensure_trusted_linux_command_executable(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, AgentError> {
+    let canonical = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&canonical)?;
+    if !metadata.is_file() {
+        return Err(AgentError::WireGuard(format!(
+            "{label} at {} expected an executable regular file",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn ensure_trusted_linux_command_directory_chain(
+    directory: &Path,
+    label: &str,
+) -> Result<(), AgentError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    let mut current = PathBuf::new();
+    for component in directory.components() {
+        match component {
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                let metadata = std::fs::metadata(&current)?;
+                if !metadata.is_dir() {
+                    return Err(AgentError::WireGuard(format!(
+                        "{label} parent {} must be a directory",
+                        current.display()
+                    )));
+                }
+                ensure_trusted_linux_command_owner(
+                    label,
+                    "parent",
+                    &current,
+                    metadata.uid(),
+                    effective_uid,
+                )?;
+                if metadata.permissions().mode() & 0o022 != 0 {
+                    return Err(AgentError::WireGuard(format!(
+                        "{label} parent {} must not be group- or world-writable",
+                        current.display()
+                    )));
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(AgentError::WireGuard(format!(
+                    "{label} parent {} must not contain '..' components",
+                    directory.display()
+                )));
+            }
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_trusted_linux_command_owner(
+    label: &str,
+    relationship: &str,
+    path: &Path,
+    owner_uid: u32,
+    effective_uid: u32,
+) -> Result<(), AgentError> {
+    if owner_uid != 0 && owner_uid != effective_uid {
+        return Err(AgentError::WireGuard(format!(
+            "{label} {relationship} {} must be owned by root or the current effective user",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 async fn run_command_output(
     command: LinuxCommand,
     timeout: Duration,
@@ -2388,6 +2623,7 @@ async fn collect_bounded_command_output(
     output_max_bytes: usize,
     command_label: &str,
 ) -> Result<BoundedCommandOutput, AgentError> {
+    let command = resolve_trusted_linux_command_paths(command)?;
     let mut child_command = Command::new(&command.program);
     child_command
         .args(&command.args)
@@ -3817,6 +4053,45 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("too many arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_rejects_untrusted_absolute_program_path(
+    ) -> Result<(), AgentError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ipars-agent-untrusted-command-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o777))?;
+        let program = temp_dir.join("fake-wg");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+
+        let runner = TimedSystemCommandRunner::new(Duration::from_secs(1));
+        let error = match runner
+            .run(LinuxCommand::new(
+                program.to_string_lossy().to_string(),
+                std::iter::empty::<&str>(),
+            ))
+            .await
+        {
+            Ok(()) => panic!("command should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not be group- or world-writable"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[cfg(unix)]
