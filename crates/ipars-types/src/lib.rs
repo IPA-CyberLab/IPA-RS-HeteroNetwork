@@ -2686,8 +2686,11 @@ pub mod api {
                     oracle_tns_payload(payload).then_some(AgentPacketFlowApplication::Oracle)
                 })
                 .or_else(|| {
-                    clickhouse_native_payload(payload)
-                        .then_some(AgentPacketFlowApplication::ClickHouse)
+                    clickhouse_native_payload(
+                        payload,
+                        self.involves_port(9000) || self.involves_port(9440),
+                    )
+                    .then_some(AgentPacketFlowApplication::ClickHouse)
                 })
                 .or_else(|| redis_payload(payload).then_some(AgentPacketFlowApplication::Redis))
                 .or_else(|| {
@@ -7678,10 +7681,13 @@ pub mod api {
         has_description && (has_connect_data || has_service || has_address)
     }
 
-    fn clickhouse_native_payload(payload: &[u8]) -> bool {
+    fn clickhouse_native_payload(payload: &[u8], native_port_hint: bool) -> bool {
         clickhouse_native_client_hello_payload(payload)
             || clickhouse_native_server_hello_payload(payload)
             || clickhouse_native_query_payload(payload)
+            || clickhouse_native_server_exception_payload(payload)
+            || clickhouse_native_server_progress_payload(payload, native_port_hint)
+            || (native_port_hint && clickhouse_native_empty_server_payload(payload))
     }
 
     fn clickhouse_native_client_hello_payload(payload: &[u8]) -> bool {
@@ -7888,6 +7894,96 @@ pub mod api {
             && (!query.complete || query.next_offset == payload.len())
     }
 
+    fn clickhouse_native_server_exception_payload(payload: &[u8]) -> bool {
+        let Some((packet_type, offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        if packet_type != 2 {
+            return false;
+        }
+        matches!(
+            clickhouse_server_exception_frame(payload, offset, 0),
+            Some(end) if end == payload.len()
+        )
+    }
+
+    fn clickhouse_server_exception_frame(
+        payload: &[u8],
+        mut offset: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if depth > 4 {
+            return None;
+        }
+
+        let code = read_u32_le(payload, offset)?;
+        if code == 0 || code > 1_000_000 {
+            return None;
+        }
+        offset = offset.checked_add(4)?;
+
+        let (name, next) = clickhouse_string(payload, offset, 512)?;
+        if !clickhouse_text_field(name, false) || !ascii_contains_ignore_case(name, b"exception") {
+            return None;
+        }
+        offset = next;
+
+        let (message, next) = clickhouse_string(payload, offset, 4096)?;
+        if !clickhouse_exception_text_field(message, false) {
+            return None;
+        }
+        offset = next;
+
+        let (stack_trace, next) = clickhouse_string(payload, offset, 16_384)?;
+        if !clickhouse_exception_text_field(stack_trace, true) {
+            return None;
+        }
+        offset = next;
+
+        let nested = *payload.get(offset)?;
+        if nested > 1 {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+        if nested == 0 {
+            Some(offset)
+        } else {
+            clickhouse_server_exception_frame(payload, offset, depth + 1)
+        }
+    }
+
+    fn clickhouse_native_server_progress_payload(payload: &[u8], native_port_hint: bool) -> bool {
+        let Some((packet_type, mut offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        if packet_type != 3 {
+            return false;
+        }
+
+        let mut counters = [0_u64; 5];
+        for index in 0..5 {
+            let Some((value, next)) = clickhouse_uvarint(payload, offset) else {
+                return false;
+            };
+            if value > 1_000_000_000_000_000 {
+                return false;
+            }
+            counters[index] = value;
+            offset = next;
+        }
+
+        let read_progress = counters[0] > 0 && counters[1] >= counters[0];
+        let write_progress = native_port_hint && (counters[3] > 0 || counters[4] > 0);
+        (read_progress || write_progress) && offset == payload.len()
+    }
+
+    fn clickhouse_native_empty_server_payload(payload: &[u8]) -> bool {
+        let Some((packet_type, offset)) = clickhouse_uvarint(payload, 0) else {
+            return false;
+        };
+        matches!(packet_type, 4 | 5) && offset == payload.len()
+    }
+
     fn clickhouse_client_info(payload: &[u8], mut offset: usize) -> Option<usize> {
         let query_kind = *payload.get(offset)?;
         if query_kind > 2 {
@@ -8082,6 +8178,13 @@ pub mod api {
             && value
                 .iter()
                 .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    }
+
+    fn clickhouse_exception_text_field(value: &[u8], allow_empty: bool) -> bool {
+        (allow_empty || !value.is_empty())
+            && value.iter().all(|byte| {
+                byte.is_ascii_graphic() || matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
+            })
     }
 
     fn clickhouse_sql_statement(statement: &[u8], _complete: bool) -> bool {
@@ -12417,6 +12520,41 @@ mod tests {
             payload
         }
 
+        fn clickhouse_server_exception(
+            code: u32,
+            name: &[u8],
+            message: &[u8],
+            stack_trace: &[u8],
+        ) -> Vec<u8> {
+            let mut payload = clickhouse_uvarint(2);
+            payload.extend_from_slice(&code.to_le_bytes());
+            payload.extend_from_slice(&clickhouse_string(name));
+            payload.extend_from_slice(&clickhouse_string(message));
+            payload.extend_from_slice(&clickhouse_string(stack_trace));
+            payload.push(0);
+            payload
+        }
+
+        fn clickhouse_server_progress(
+            rows: u64,
+            bytes: u64,
+            total_rows: u64,
+            wrote_rows: u64,
+            wrote_bytes: u64,
+        ) -> Vec<u8> {
+            let mut payload = clickhouse_uvarint(3);
+            payload.extend_from_slice(&clickhouse_uvarint(rows));
+            payload.extend_from_slice(&clickhouse_uvarint(bytes));
+            payload.extend_from_slice(&clickhouse_uvarint(total_rows));
+            payload.extend_from_slice(&clickhouse_uvarint(wrote_rows));
+            payload.extend_from_slice(&clickhouse_uvarint(wrote_bytes));
+            payload
+        }
+
+        fn clickhouse_empty_server_packet(packet_type: u64) -> Vec<u8> {
+            clickhouse_uvarint(packet_type)
+        }
+
         fn clickhouse_query_packet(query: &[u8], settings: &[(&[u8], &[u8], bool)]) -> Vec<u8> {
             let mut payload = clickhouse_uvarint(1);
             payload.extend_from_slice(&clickhouse_string(b"query-1"));
@@ -12696,6 +12834,13 @@ mod tests {
             payload_prefix: payload.to_vec(),
             ..Default::default()
         };
+        let observation_for_clickhouse_native_payload =
+            |payload: &[u8]| api::AgentPacketFlowObservation {
+                protocol: Some(TransportProtocol::Tcp),
+                destination_port: Some(9000),
+                payload_prefix: payload.to_vec(),
+                ..Default::default()
+            };
         let observation_for_udp_payload = |payload: &[u8]| api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             source_port: Some(30123),
@@ -14762,6 +14907,39 @@ mod tests {
             observation_for_payload(&clickhouse_server).application(),
             api::AgentPacketFlowApplication::ClickHouse
         );
+        let clickhouse_exception = clickhouse_server_exception(
+            60,
+            b"DB::Exception",
+            b"DB::Exception: Table X doesn't exist",
+            b"frame one\nframe two",
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_exception).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let clickhouse_progress = clickhouse_server_progress(65_535, 871_799, 0, 0, 0);
+        assert_eq!(
+            observation_for_payload(&clickhouse_progress).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        let clickhouse_pong = clickhouse_empty_server_packet(4);
+        assert_eq!(
+            observation_for_clickhouse_native_payload(&clickhouse_pong).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_pong).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_end_of_stream = clickhouse_empty_server_packet(5);
+        assert_eq!(
+            observation_for_clickhouse_native_payload(&clickhouse_end_of_stream).application(),
+            api::AgentPacketFlowApplication::ClickHouse
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_end_of_stream).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let clickhouse_query = clickhouse_query_packet(
             b"SELECT count() FROM system.tables",
             &[(b"send_logs_level".as_slice(), b"trace".as_slice(), true)],
@@ -14792,6 +14970,21 @@ mod tests {
             clickhouse_client_hello(b"Go\nClient", 54_451, b"default", b"default", b"", &[]);
         assert_eq!(
             observation_for_payload(&clickhouse_control_client).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_plain_error = clickhouse_server_exception(
+            60,
+            b"DB::Error",
+            b"DB::Exception: Table X doesn't exist",
+            b"",
+        );
+        assert_eq!(
+            observation_for_payload(&clickhouse_plain_error).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let clickhouse_idle_progress = clickhouse_server_progress(0, 0, 0, 0, 0);
+        assert_eq!(
+            observation_for_payload(&clickhouse_idle_progress).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut clickhouse_with_trailing_junk = clickhouse_hello.clone();
