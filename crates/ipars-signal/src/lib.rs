@@ -270,7 +270,7 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(target.clone()))?;
         let now = Utc::now();
-        if !acl_allows_peer(&source_node, &target_node, &self.coordinator.policy) {
+        if !acl_allows_hole_punch_plan(&source_node, &target_node, &self.coordinator.policy) {
             self.hole_punch_acl_denials.fetch_add(1, Ordering::Relaxed);
             return Ok(SignalHolePunchPlanResponse {
                 key: PeerPathKey::new(source, target),
@@ -1067,6 +1067,21 @@ fn acl_allows_path(
     desired_routes
         .iter()
         .all(|route| acl_decision(source, target, Some(route), policy).unwrap_or(false))
+}
+
+fn acl_allows_hole_punch_plan(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    policy: &ClusterPolicy,
+) -> bool {
+    if acl_allows_peer(source, target, policy) {
+        return true;
+    }
+
+    target.routes.iter().any(|route| {
+        route.advertised_by == target.node_id
+            && acl_decision(source, target, Some(&route.cidr), policy).unwrap_or(false)
+    })
 }
 
 fn acl_decision(
@@ -2722,6 +2737,70 @@ mod tests {
         assert_eq!(plan.start_after_millis, 0);
         let metrics = registry.metrics().await;
         assert_eq!(metrics.hole_punch_plan_count, 1);
+        assert_eq!(metrics.hole_punch_acl_denied_count, 1);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_allows_hole_punch_plan_for_route_specific_acl() -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![allow_route_acl("allow-service-routes", "10.10.0.0/16")],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut route_target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        route_target.routes.push(advertised_route(
+            "service-route",
+            "10.10.0.0/16",
+            &route_target.node_id,
+        ));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(route_target.clone()).await?;
+
+        let plan = registry
+            .hole_punch_plan(source.node_id.clone(), route_target.node_id.clone())
+            .await?;
+
+        assert!(plan.source_reflexive.is_some());
+        assert!(plan.target_reflexive.is_some());
+        assert_eq!(plan.start_after_millis, 50);
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_acl_denied_count, 0);
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_denies_hole_punch_plan_for_route_specific_acl_denial(
+    ) -> Result<(), SignalError> {
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                deny_route_acl("deny-admin-subnet", "10.10.5.0/24"),
+                allow_route_acl("allow-service-routes", "10.10.0.0/16"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let mut route_target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        route_target.routes.push(advertised_route(
+            "admin-route",
+            "10.10.5.0/24",
+            &route_target.node_id,
+        ));
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(route_target.clone()).await?;
+
+        let plan = registry
+            .hole_punch_plan(source.node_id.clone(), route_target.node_id.clone())
+            .await?;
+
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
+        assert_eq!(plan.start_after_millis, 0);
+        let metrics = registry.metrics().await;
         assert_eq!(metrics.hole_punch_acl_denied_count, 1);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         Ok(())
