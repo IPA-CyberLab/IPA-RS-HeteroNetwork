@@ -1103,6 +1103,19 @@ where
                         ),
                     });
                 }
+                if !endpoint_candidate_is_fresh(
+                    candidate,
+                    now,
+                    self.config.cluster_policy.endpoint_candidate_ttl_seconds,
+                ) {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "selected candidate {:?} at {} observed_at {} is stale",
+                            candidate.kind, candidate.addr, candidate.observed_at
+                        ),
+                    });
+                }
             }
         }
         if request.node_signature.is_none() {
@@ -4381,6 +4394,61 @@ mod tests {
                 if reason.contains("selected candidate")
                     && reason.contains("observed_at")
                     && reason.contains("too far in the future")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_path_state_with_stale_selected_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.endpoint_candidate_ttl_seconds = 30;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
+            .await?;
+        let signed_at = Utc::now();
+        let mut stale_candidate = candidate("node-b");
+        stale_candidate.observed_at = signed_at - Duration::seconds(31);
+        let mut reported_path = path("node-a", "node-b");
+        reported_path.selected_candidate = Some(stale_candidate);
+
+        let result = plane
+            .heartbeat(signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: signed_at,
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+                signed_at,
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("selected candidate")
+                    && reason.contains("is stale")
         ));
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
