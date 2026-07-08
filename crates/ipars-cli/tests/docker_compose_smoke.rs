@@ -910,6 +910,8 @@ fn assert_compose_agent_packet_flow(
     ensure_json_string_equals_at(&response, &["observation", "detector"], "compose-smoke")?;
     ensure_json_string_equals_at(&response, &["observation", "application"], "wire_guard")?;
 
+    assert_compose_agent_packet_flow_no_overlay_match(compose, service, port)?;
+
     wait_for_json(
         compose,
         &format!("{service} packet-flow lazy-connect metrics"),
@@ -917,8 +919,17 @@ fn assert_compose_agent_packet_flow(
         &format!("http://127.0.0.1:{port}/v1/metrics"),
         |value| {
             ensure_json_string_equals(value, "node_id", local)?;
-            ensure_json_u64_at_least(value, "packet_flow_observation_count", 1)?;
+            ensure_json_u64_at_least(value, "packet_flow_observation_count", 2)?;
             ensure_json_u64_at_least(value, "packet_flow_match_count", 1)?;
+            ensure_json_u64_at_least(value, "packet_flow_unmatched_count", 1)?;
+            ensure_json_u64_at_least(value, "packet_flow_filtered_count", 1)?;
+            ensure_json_count_array_entry_at_least(
+                value,
+                "packet_flow_filtered_reason_counts",
+                "reason",
+                "no_overlay_match",
+                1,
+            )?;
             ensure_json_u64_at_least_at(value, &["lazy_connect", "observed_peer_vpn_ip_count"], 1)?;
             ensure_json_u64_at_least_at(value, &["lazy_connect", "active_peer_count"], 1)?;
             ensure_json_u64_at_least_at(value, &["lazy_connect", "pinned_peer_count"], 1)?;
@@ -927,6 +938,41 @@ fn assert_compose_agent_packet_flow(
     )?;
     assert_compose_agent_packet_flow_prometheus_metrics(compose, service, port, local)?;
 
+    Ok(())
+}
+
+fn assert_compose_agent_packet_flow_no_overlay_match(
+    compose: &ComposeProject,
+    service: &str,
+    port: u16,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "destination": "198.51.100.10",
+        "source": "192.0.2.10",
+        "protocol": "udp",
+        "source_port": 50001,
+        "destination_port": 51820,
+        "detector": "compose-smoke-miss",
+        "application": "wire_guard",
+        "conntrack_status": ["assured"],
+        "pin": false,
+    })
+    .to_string();
+    let response = compose_exec_post_json(
+        compose,
+        service,
+        &format!("http://127.0.0.1:{port}/v1/packet-flow"),
+        &body,
+    )?;
+    ensure_json_string_equals(&response, "destination", "198.51.100.10")?;
+    ensure_json_string_equals(&response, "filtered_reason", "no_overlay_match")?;
+    ensure_json_field_absent_or_null(&response, &["matched"])?;
+    ensure_json_string_equals_at(
+        &response,
+        &["observation", "detector"],
+        "compose-smoke-miss",
+    )?;
+    ensure_json_string_equals_at(&response, &["observation", "application"], "wire_guard")?;
     Ok(())
 }
 
@@ -951,6 +997,24 @@ fn assert_compose_agent_packet_flow_prometheus_metrics(
         &metrics,
         "ipars_agent_packet_flow_matches_total",
         node_id,
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_unmatched_total",
+        node_id,
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_filtered_total",
+        node_id,
+        1.0,
+    )?;
+    ensure_prometheus_sample_with_labels_at_least(
+        &metrics,
+        "ipars_agent_packet_flow_filtered_by_reason_total",
+        &[("node_id", node_id), ("reason", "no_overlay_match")],
         1.0,
     )?;
     ensure_prometheus_sample_at_least(&metrics, "ipars_agent_observed_peer_vpn_ips", node_id, 1.0)?;
@@ -1565,6 +1629,32 @@ fn ensure_json_count_array_total_at_least(value: &Value, field: &str, minimum: u
         "expected JSON field {field} count total to be at least {minimum}, got {total}: {value}"
     );
     Ok(())
+}
+
+fn ensure_json_count_array_entry_at_least(
+    value: &Value,
+    field: &str,
+    key_field: &str,
+    expected_key: &str,
+    minimum: u64,
+) -> Result<()> {
+    let counts = value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("JSON field {field} was missing or not an array: {value}"))?;
+    for count in counts {
+        let key = json_string_required(count, key_field)?;
+        if key != expected_key {
+            continue;
+        }
+        let actual = json_u64_field(count, "count")?;
+        anyhow::ensure!(
+            actual >= minimum,
+            "expected JSON field {field} entry {key_field}={expected_key:?} count to be at least {minimum}, got {actual}: {value}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("JSON field {field} did not include {key_field}={expected_key:?}: {value}")
 }
 
 fn ensure_json_u64_at_least_at(value: &Value, path: &[&str], minimum: u64) -> Result<()> {
