@@ -641,7 +641,31 @@ fn validate_policy_rule(rule: &PolicyRule) -> Result<(), RouteManagerError> {
             "policy rule priority must be greater than zero".to_string(),
         ));
     }
+    validate_policy_rule_selector(rule.priority, "from", rule.from)?;
+    validate_policy_rule_selector(rule.priority, "to", rule.to)?;
     policy_rule_address_family(rule)?;
+    Ok(())
+}
+
+fn validate_policy_rule_selector(
+    priority: u32,
+    label: &'static str,
+    selector: Option<IpNet>,
+) -> Result<(), RouteManagerError> {
+    let Some(cidr) = selector else {
+        return Ok(());
+    };
+    if let Some(reason) = restricted_route_cidr_reason(&cidr) {
+        return Err(RouteManagerError::InvalidPolicyRule(format!(
+            "rule priority {priority} {label} selector must not include {reason} CIDR {cidr}"
+        )));
+    }
+    let canonical = cidr.trunc();
+    if cidr != canonical {
+        return Err(RouteManagerError::InvalidPolicyRule(format!(
+            "rule priority {priority} {label} selector must use canonical CIDR {canonical}, not {cidr}"
+        )));
+    }
     Ok(())
 }
 
@@ -2569,6 +2593,54 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("route ID exceeds 128 bytes"));
+
+        let selector_cases = [
+            (
+                "from",
+                "0.0.0.0/0",
+                "from selector must not include unrestricted CIDR 0.0.0.0/0",
+            ),
+            (
+                "from",
+                "127.0.0.0/8",
+                "from selector must not include loopback CIDR 127.0.0.0/8",
+            ),
+            (
+                "from",
+                "10.0.0.1/8",
+                "from selector must use canonical CIDR 10.0.0.0/8",
+            ),
+            (
+                "to",
+                "169.254.0.0/16",
+                "to selector must not include link-local CIDR 169.254.0.0/16",
+            ),
+            (
+                "to",
+                "10.42.0.1/16",
+                "to selector must use canonical CIDR 10.42.0.0/16",
+            ),
+        ];
+        for (selector, cidr, expected) in selector_cases {
+            let mut invalid_selector = route_plan()?;
+            match selector {
+                "from" => invalid_selector.policy_rules[0].from = Some(cidr.parse()?),
+                "to" => invalid_selector.policy_rules[0].to = Some(cidr.parse()?),
+                _ => unreachable!(),
+            }
+            let error = match manager.apply_routes(invalid_selector).await {
+                Ok(()) => return Err("invalid policy selector should be rejected".into()),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    RouteManagerError::InvalidPolicyRule(ref message)
+                        if message.contains(expected)
+                ),
+                "expected {expected}, got {error}"
+            );
+        }
 
         let mut invalid_rule = route_plan()?;
         invalid_rule.policy_rules[0].table = 0;
