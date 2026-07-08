@@ -779,7 +779,7 @@ where
             Some(self.store.list_nodes().await?)
         };
         if let Some(nodes) = path_nodes.as_ref() {
-            self.validate_heartbeat_path_peers_registered(&request, nodes)?;
+            self.validate_heartbeat_path_peers_visible(&request, &node, nodes)?;
             if request
                 .path_state
                 .iter()
@@ -1190,21 +1190,31 @@ where
         Ok(())
     }
 
-    fn validate_heartbeat_path_peers_registered(
+    fn validate_heartbeat_path_peers_visible(
         &self,
         request: &HeartbeatRequest,
+        reporter: &NodeRecord,
         nodes: &[NodeRecord],
     ) -> Result<(), ControlPlaneError> {
-        let node_ids = nodes
+        let nodes_by_id = nodes
             .iter()
-            .map(|node| node.node_id.clone())
-            .collect::<BTreeSet<_>>();
+            .map(|node| (node.node_id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
         for path in &request.path_state {
-            if !node_ids.contains(&path.key.remote) {
+            let Some(remote) = nodes_by_id.get(&path.key.remote) else {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!(
                         "path {} -> {} remote node is not registered",
+                        path.key.local, path.key.remote
+                    ),
+                });
+            };
+            if acl_filter_peer(reporter, remote, &self.config.cluster_policy).is_none() {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: format!(
+                        "path {} -> {} remote node is not visible to reporting node",
                         path.key.local, path.key.remote
                     ),
                 });
@@ -4131,6 +4141,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_rejects_path_state_hidden_by_acl_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.acl_rules = vec![
+            AclRule {
+                id: "deny-hidden-peer".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("hidden-peer")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Deny,
+            },
+            AclRule {
+                id: "allow-other-peers".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::new(),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+        ];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        let mut hidden_claims = claims(cluster_id);
+        hidden_claims.tags.insert(Tag::from_string("hidden-peer"));
+        plane
+            .register_with_claims(hidden_claims, registration_request("node-b"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![path("node-a", "node-b")],
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("remote node is not visible")
+        ));
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_rejects_future_path_state_before_persistence(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -4662,16 +4743,28 @@ mod tests {
             cluster_id.clone(),
             Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
         );
-        config.cluster_policy.acl_rules = vec![AclRule {
-            id: "allow-relay".to_string(),
-            from_roles: BTreeSet::new(),
-            from_tags: BTreeSet::new(),
-            to_roles: BTreeSet::new(),
-            to_tags: BTreeSet::from([Tag::from_string("relay-visible")]),
-            routes: Vec::new(),
-            protocol: TransportProtocol::Any,
-            action: AclAction::Allow,
-        }];
+        config.cluster_policy.acl_rules = vec![
+            AclRule {
+                id: "allow-relay".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("relay-visible")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+            AclRule {
+                id: "allow-edge-peer".to_string(),
+                from_roles: BTreeSet::new(),
+                from_tags: BTreeSet::new(),
+                to_roles: BTreeSet::new(),
+                to_tags: BTreeSet::from([Tag::from_string("edge")]),
+                routes: Vec::new(),
+                protocol: TransportProtocol::Any,
+                action: AclAction::Allow,
+            },
+        ];
         let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(config, store.clone());
         let mut relay_claims = claims(cluster_id.clone());
