@@ -6447,16 +6447,112 @@ pub mod api {
         if line.is_empty() {
             return false;
         }
-        if (ascii_starts_with_ignore_case(line, b"+OK")
-            || ascii_starts_with_ignore_case(line, b"-ERR"))
-            && ascii_contains_ignore_case(line, b"POP3")
-        {
+        if pop3_response_line(line) {
             return true;
         }
         let Some((command, rest)) = split_ascii_token(line) else {
             return false;
         };
         pop3_known_command(command, trim_ascii_space(rest))
+    }
+
+    fn pop3_response_line(line: &[u8]) -> bool {
+        if line.len() > 512 || !pop3_printable_text(line) {
+            return false;
+        }
+        let Some((status, rest)) = split_ascii_token(line) else {
+            return false;
+        };
+        if !matches!(status, b"+OK" | b"-ERR") {
+            return false;
+        }
+        let text = trim_ascii_space(rest);
+        if ascii_contains_ignore_case(text, b"POP3") {
+            return true;
+        }
+        if text.first() == Some(&b'[') && pop3_response_code_text(text) {
+            return true;
+        }
+        if status == b"+OK" {
+            return pop3_positive_response_text(text);
+        }
+        pop3_negative_response_text(text)
+    }
+
+    fn pop3_positive_response_text(text: &[u8]) -> bool {
+        if pop3_drop_listing_response_text(text) {
+            return true;
+        }
+        ascii_contains_ignore_case(text, b"capability list follows")
+            || ascii_contains_ignore_case(text, b"scan listing follows")
+            || ascii_contains_ignore_case(text, b"message follows")
+            || ascii_contains_ignore_case(text, b"maildrop has")
+            || ascii_contains_ignore_case(text, b"signing off")
+            || ascii_contains_ignore_case(text, b"message deleted")
+            || pop3_octets_response_text(text)
+    }
+
+    fn pop3_negative_response_text(text: &[u8]) -> bool {
+        ascii_contains_ignore_case(text, b"no such message")
+            || ascii_contains_ignore_case(text, b"already deleted")
+            || ascii_contains_ignore_case(text, b"maildrop")
+            || ascii_contains_ignore_case(text, b"authentication")
+            || ascii_contains_ignore_case(text, b"authorization")
+    }
+
+    fn pop3_response_code_text(text: &[u8]) -> bool {
+        let Some(close) = text.iter().position(|byte| *byte == b']') else {
+            return false;
+        };
+        let code = &text[1..close];
+        !code.is_empty()
+            && code.len() <= 64
+            && code
+                .split(|byte| *byte == b'/')
+                .all(pop3_response_code_atom)
+    }
+
+    fn pop3_response_code_atom(atom: &[u8]) -> bool {
+        atom.eq_ignore_ascii_case(b"LOGIN-DELAY")
+            || atom.eq_ignore_ascii_case(b"IN-USE")
+            || atom.eq_ignore_ascii_case(b"SYS")
+            || atom.eq_ignore_ascii_case(b"AUTH")
+            || atom.eq_ignore_ascii_case(b"EXPIRE")
+    }
+
+    fn pop3_drop_listing_response_text(text: &[u8]) -> bool {
+        let Some((messages, rest)) = split_ascii_token(text) else {
+            return false;
+        };
+        let Some((octets, tail)) = split_ascii_token(trim_ascii_space(rest)) else {
+            return false;
+        };
+        pop3_decimal_token(messages)
+            && pop3_decimal_token(octets)
+            && trim_ascii_space(tail)
+                .first()
+                .is_none_or(|byte| !byte.is_ascii_digit())
+    }
+
+    fn pop3_octets_response_text(text: &[u8]) -> bool {
+        let Some((octets, rest)) = split_ascii_token(text) else {
+            return false;
+        };
+        pop3_decimal_token(octets)
+            && split_ascii_token(trim_ascii_space(rest)).is_some_and(|(unit, _)| {
+                unit.eq_ignore_ascii_case(b"octets")
+                    || unit.eq_ignore_ascii_case(b"messages")
+                    || unit.eq_ignore_ascii_case(b"message")
+            })
+    }
+
+    fn pop3_decimal_token(token: &[u8]) -> bool {
+        !token.is_empty() && token.len() <= 10 && token.iter().all(u8::is_ascii_digit)
+    }
+
+    fn pop3_printable_text(text: &[u8]) -> bool {
+        text.iter()
+            .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
     }
 
     fn pop3_known_command(command: &[u8], rest: &[u8]) -> bool {
@@ -16241,8 +16337,41 @@ mod tests {
             api::AgentPacketFlowApplication::Pop3
         );
         assert_eq!(
+            observation_for_payload(b"+OK 2 320\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"+OK Capability list follows\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"+OK 120 octets\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"-ERR no such message, only 2 messages in maildrop\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"-ERR [IN-USE] maildrop locked\r\n").application(),
+            api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
             observation_for_payload(b"USER agent\r\n").application(),
             api::AgentPacketFlowApplication::Pop3
+        );
+        assert_eq!(
+            observation_for_payload(b"+OK success\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"+OK 2\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"-ERR failed\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
         );
         assert_eq!(
             observation_for_payload(b"INVITE sip:alice@example.com SIP/2.0\r\n").application(),
