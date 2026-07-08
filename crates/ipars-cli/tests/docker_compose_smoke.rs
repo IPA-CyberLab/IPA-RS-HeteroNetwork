@@ -1302,6 +1302,7 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
             "compose-right",
             "--payload",
             "compose-relay-dataplane-probe",
+            "--send-invalid-credential",
             "--timeout-ms",
             "5000",
         ],
@@ -1315,9 +1316,25 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
     )?;
     ensure_json_u64_at_least_at(
         &probe,
+        &["status_after_probe", "dataplane", "datagrams_dropped"],
+        1,
+    )?;
+    ensure_json_u64_at_least_at(
+        &probe,
+        &[
+            "status_after_probe",
+            "dataplane",
+            "drops_by_reason",
+            "invalid_session_credential",
+        ],
+        1,
+    )?;
+    ensure_json_u64_at_least_at(
+        &probe,
         &["status_after_probe", "dataplane", "payload_bytes_forwarded"],
         2,
     )?;
+    ensure_json_u64_at_least_at(&probe, &["invalid_credential_drop", "bytes_sent"], 1)?;
     ensure_json_u64_at_least_at(
         &probe,
         &["status_after_probe", "admission_success_count"],
@@ -1354,11 +1371,80 @@ fn assert_compose_relay_dataplane(compose: &ComposeProject) -> Result<()> {
             ensure_json_u64_at_least_at(value, &["capability", "active_sessions"], 1)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_received"], 2)?;
             ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_forwarded"], 2)?;
+            ensure_json_u64_at_least_at(value, &["dataplane", "datagrams_dropped"], 1)?;
+            ensure_json_u64_at_least_at(
+                value,
+                &["dataplane", "drops_by_reason", "invalid_session_credential"],
+                1,
+            )?;
             ensure_json_u64_at_least_at(value, &["dataplane", "payload_bytes_forwarded"], 2)?;
             Ok(())
         },
     )?;
+    assert_compose_relay_prometheus_metrics(compose)?;
 
+    Ok(())
+}
+
+fn assert_compose_relay_prometheus_metrics(compose: &ComposeProject) -> Result<()> {
+    let metrics = compose_exec_text(compose, "relay", "http://127.0.0.1:9580/metrics")?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_admission_attempts_total",
+        "relay_node",
+        "relay-dev",
+        2.0,
+    )?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_admission_success_total",
+        "relay_node",
+        "relay-dev",
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_admission_failures_total",
+        "relay_node",
+        "relay-dev",
+        1.0,
+    )?;
+    ensure_prometheus_sample_with_labels_at_least(
+        &metrics,
+        "ipars_relay_admission_failures_by_reason_total",
+        &[("relay_node", "relay-dev"), ("reason", "unauthorized")],
+        1.0,
+    )?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_datagrams_received_total",
+        "relay_node",
+        "relay-dev",
+        3.0,
+    )?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_datagrams_forwarded_total",
+        "relay_node",
+        "relay-dev",
+        2.0,
+    )?;
+    ensure_prometheus_sample_at_least_for_label(
+        &metrics,
+        "ipars_relay_datagrams_dropped_total",
+        "relay_node",
+        "relay-dev",
+        1.0,
+    )?;
+    ensure_prometheus_sample_with_labels_at_least(
+        &metrics,
+        "ipars_relay_datagrams_dropped_by_reason_total",
+        &[
+            ("relay_node", "relay-dev"),
+            ("reason", "invalid_session_credential"),
+        ],
+        1.0,
+    )?;
     Ok(())
 }
 
@@ -1733,7 +1819,22 @@ fn ensure_prometheus_sample_at_least(
     node_id: &str,
     minimum: f64,
 ) -> Result<()> {
-    ensure_prometheus_sample_with_labels_at_least(text, metric, &[("node_id", node_id)], minimum)
+    ensure_prometheus_sample_at_least_for_label(text, metric, "node_id", node_id, minimum)
+}
+
+fn ensure_prometheus_sample_at_least_for_label(
+    text: &str,
+    metric: &str,
+    label_name: &str,
+    label_value: &str,
+    minimum: f64,
+) -> Result<()> {
+    ensure_prometheus_sample_with_labels_at_least(
+        text,
+        metric,
+        &[(label_name, label_value)],
+        minimum,
+    )
 }
 
 fn ensure_prometheus_sample_with_labels_at_least(

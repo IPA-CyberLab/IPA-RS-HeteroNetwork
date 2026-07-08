@@ -172,7 +172,7 @@ ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root --role edge --tag edge --bootstrap https://203.0.113.10:8443 --signal-bootstrap https://203.0.113.10:9443 --stun-bootstrap udp://203.0.113.10:3478 --relay-bootstrap udp://203.0.113.10:51820 --allowed-route 10.42.0.0/16 --allow-relay --max-uses 7 --ttl-seconds 86400
 ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
 ipars relay status --relay-url http://127.0.0.1:9580
-ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret>
+ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret> --send-invalid-credential
 ipars stun probe --stun-server 127.0.0.1:3478
 ipars path status --agent-url http://127.0.0.1:9780
 ipars path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>

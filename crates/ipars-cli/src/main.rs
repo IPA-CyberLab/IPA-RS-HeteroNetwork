@@ -275,6 +275,8 @@ struct RelayProbeArgs {
     right_bind: SocketAddr,
     #[arg(long, default_value = "ipars-relay-probe")]
     payload: String,
+    #[arg(long)]
+    send_invalid_credential: bool,
     #[arg(long, default_value_t = DEFAULT_RELAY_PROBE_TIMEOUT_MS)]
     timeout_ms: u64,
 }
@@ -1934,9 +1936,18 @@ struct RelayProbeOutput {
     left_addr: SocketAddr,
     right_addr: SocketAddr,
     payload_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalid_credential_drop: Option<RelayProbeInvalidCredentialOutput>,
     left_to_right: RelayProbeDirectionOutput,
     right_to_left: RelayProbeDirectionOutput,
     status_after_probe: RelayStatusResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayProbeInvalidCredentialOutput {
+    source: NodeId,
+    destination: NodeId,
+    bytes_sent: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2003,6 +2014,19 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
     );
 
     let payload = args.payload.as_bytes();
+    let invalid_credential_drop = if args.send_invalid_credential {
+        Some(relay_probe_invalid_credential(
+            &left_socket,
+            args.relay_udp,
+            &admission.session_id,
+            &admission.session_token,
+            &left,
+            &right,
+            payload,
+        )?)
+    } else {
+        None
+    };
     let left_to_right = relay_probe_direction(
         &left_socket,
         &right_socket,
@@ -2037,6 +2061,19 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
         "relay dataplane forwarded-byte counter did not record the bidirectional probe: {:?}",
         status_after_probe.dataplane
     );
+    if args.send_invalid_credential {
+        let invalid_credential_drops = status_after_probe
+            .dataplane
+            .drops_by_reason
+            .get(&ipars_types::api::RelayDataplaneDropReason::InvalidSessionCredential)
+            .copied()
+            .unwrap_or_default();
+        anyhow::ensure!(
+            status_after_probe.dataplane.datagrams_dropped >= 1 && invalid_credential_drops >= 1,
+            "relay dataplane did not record invalid-credential drop after probe: {:?}",
+            status_after_probe.dataplane
+        );
+    }
 
     Ok(RelayProbeOutput {
         relay_node: admission.relay_node,
@@ -2047,6 +2084,7 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
         left_addr,
         right_addr,
         payload_bytes: payload.len(),
+        invalid_credential_drop,
         left_to_right,
         right_to_left,
         status_after_probe,
@@ -2087,6 +2125,40 @@ fn validate_relay_admission_bearer_token(value: &str, label: &str) -> anyhow::Re
         anyhow::bail!("{label} must not contain whitespace or control characters");
     }
     Ok(())
+}
+
+fn relay_probe_invalid_credential(
+    send_socket: &UdpSocket,
+    relay_udp: SocketAddr,
+    session_id: &str,
+    session_token: &str,
+    source: &NodeId,
+    destination: &NodeId,
+    payload: &[u8],
+) -> anyhow::Result<RelayProbeInvalidCredentialOutput> {
+    let invalid_session_token = format!("{session_token}-invalid");
+    let datagram = encode_relay_datagram_with_route(
+        session_id,
+        &invalid_session_token,
+        source,
+        destination,
+        payload,
+    )
+    .context("failed to encode invalid-credential relay probe datagram")?;
+    let bytes_sent = send_socket.send_to(&datagram, relay_udp).with_context(|| {
+        format!("failed to send invalid-credential relay probe datagram to {relay_udp}")
+    })?;
+    anyhow::ensure!(
+        bytes_sent == datagram.len(),
+        "invalid-credential relay probe sent {bytes_sent} of {} encoded bytes",
+        datagram.len()
+    );
+
+    Ok(RelayProbeInvalidCredentialOutput {
+        source: source.clone(),
+        destination: destination.clone(),
+        bytes_sent,
+    })
 }
 
 fn bind_probe_socket(
@@ -9501,6 +9573,7 @@ fi
             "127.0.0.1:0",
             "--payload",
             "opaque",
+            "--send-invalid-credential",
             "--timeout-ms",
             "1000",
         ])?;
@@ -9522,6 +9595,7 @@ fi
         assert_eq!(args.left_bind, "127.0.0.1:0".parse()?);
         assert_eq!(args.right_bind, "127.0.0.1:0".parse()?);
         assert_eq!(args.payload, "opaque");
+        assert!(args.send_invalid_credential);
         assert_eq!(args.timeout_ms, 1000);
         validate_relay_probe_args(&args)?;
         Ok(())
