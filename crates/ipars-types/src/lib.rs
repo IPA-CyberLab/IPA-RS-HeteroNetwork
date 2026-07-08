@@ -10646,11 +10646,70 @@ pub mod api {
         if frame_end_offset >= payload.len() || payload[frame_end_offset] != 0xce {
             return false;
         }
+        let Some(frame_body) = payload.get(7..frame_end_offset) else {
+            return false;
+        };
         match frame_type {
-            1 => (4..=131_072).contains(&frame_size),
+            1 => amqp_method_frame_payload(channel, frame_size, frame_body),
             2 => channel != 0 && (14..=131_072).contains(&frame_size),
             3 => channel != 0 && frame_size <= 16_777_216,
             8 => channel == 0 && frame_size == 0,
+            _ => false,
+        }
+    }
+
+    fn amqp_method_frame_payload(channel: u16, frame_size: usize, frame_body: &[u8]) -> bool {
+        if !(4..=131_072).contains(&frame_size) || frame_body.len() < 4 {
+            return false;
+        }
+        let class_id = u16::from_be_bytes([frame_body[0], frame_body[1]]);
+        let method_id = u16::from_be_bytes([frame_body[2], frame_body[3]]);
+        let channel_ok = if class_id == 10 {
+            channel == 0
+        } else {
+            channel != 0
+        };
+        channel_ok && amqp_known_method_id(class_id, method_id)
+    }
+
+    fn amqp_known_method_id(class_id: u16, method_id: u16) -> bool {
+        match class_id {
+            // connection
+            10 => matches!(
+                method_id,
+                10 | 11 | 20 | 21 | 30 | 31 | 40 | 41 | 50 | 51 | 60 | 61 | 70 | 71
+            ),
+            // channel
+            20 => matches!(method_id, 10 | 11 | 20 | 21 | 40 | 41),
+            // exchange
+            40 => matches!(method_id, 10 | 11 | 20 | 21 | 30 | 31 | 40 | 51),
+            // queue
+            50 => matches!(method_id, 10 | 11 | 20 | 21 | 30 | 31 | 40 | 41 | 50 | 51),
+            // basic
+            60 => matches!(
+                method_id,
+                10 | 11
+                    | 20
+                    | 21
+                    | 30
+                    | 31
+                    | 40
+                    | 50
+                    | 60
+                    | 70
+                    | 71
+                    | 72
+                    | 80
+                    | 90
+                    | 100
+                    | 110
+                    | 111
+                    | 120
+            ),
+            // confirm
+            85 => matches!(method_id, 10 | 11),
+            // tx
+            90 => matches!(method_id, 10 | 11 | 20 | 21 | 30 | 31),
             _ => false,
         }
     }
@@ -16866,7 +16925,15 @@ mod tests {
             api::AgentPacketFlowApplication::Amqp
         );
         assert_eq!(
-            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0xce]).application(),
+            observation_for_payload(&[1, 0, 0, 0, 0, 0, 4, 0, 10, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 20, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 85, 0, 10, 0xce]).application(),
             api::AgentPacketFlowApplication::Amqp
         );
         assert_eq!(
@@ -16879,6 +16946,22 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 0, 0, 0, 0, 4, 0, 20, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 60, 0, 12, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[1, 0, 1, 0, 0, 0, 4, 0, 70, 0, 10, 0xce]).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
