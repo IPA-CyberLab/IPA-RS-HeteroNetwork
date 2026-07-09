@@ -3864,6 +3864,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_listener_protocol(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3897,6 +3903,21 @@ fn kubernetes_service_annotation_controls_health_checks(key: &str) -> bool {
         || key.contains("health-check")
         || key.contains("health_probe")
         || key.contains("health-probe")
+}
+
+fn kubernetes_service_annotation_controls_listener_protocol(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("ssl-cert")
+        || key.contains("ssl-ports")
+        || key.contains("ssl-negotiation-policy")
+        || key.contains("tls-cert")
+        || key.contains("tls-ports")
+        || key.contains("certificate-arn")
+        || key.contains("certificate")
+        || key.contains("backend-protocol")
+        || key.contains("backend-protocol-version")
+        || key.contains("listener")
+        || key.contains("alpn-policy")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11701,6 +11722,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-healthcheck-port must not configure LoadBalancer health checks"
         ));
 
+        let mut agent_tls_listener_annotation = base_k8s_install_args();
+        agent_tls_listener_annotation.expose_agent_api = true;
+        agent_tls_listener_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-ssl-cert".to_string(),
+            value: "arn:aws:acm:us-east-1:123456789012:certificate/abcdef".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_tls_listener_annotation) {
+            Ok(_) => panic!("agent API TLS listener annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-ssl-cert must not configure LoadBalancer TLS, listeners, or backend protocols"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -11822,6 +11857,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path must not configure LoadBalancer health checks"
+        ));
+
+        let mut relay_backend_protocol_annotation = base_k8s_install_args();
+        relay_backend_protocol_annotation.expose_relay = true;
+        relay_backend_protocol_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_backend_protocol_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_backend_protocol_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-backend-protocol".to_string(),
+            value: "ssl".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_backend_protocol_annotation) {
+            Ok(_) => panic!("relay backend protocol annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-backend-protocol must not configure LoadBalancer TLS, listeners, or backend protocols"
         ));
 
         Ok(())
@@ -12641,6 +12694,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer health checks; use typed Service health-check controls instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));

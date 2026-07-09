@@ -577,6 +577,8 @@
 {{- fail (printf "%s annotation key %q must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers" $path .key) -}}
 {{- else if or (contains "healthcheck" $key) (contains "health-check" $key) (contains "health_probe" $key) (contains "health-probe" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer health checks; use typed Service health-check controls instead" $path .key) -}}
+{{- else if or (contains "ssl-cert" $key) (contains "ssl-ports" $key) (contains "ssl-negotiation-policy" $key) (contains "tls-cert" $key) (contains "tls-ports" $key) (contains "certificate-arn" $key) (contains "certificate" $key) (contains "backend-protocol" $key) (contains "backend-protocol-version" $key) (contains "listener" $key) (contains "alpn-policy" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 

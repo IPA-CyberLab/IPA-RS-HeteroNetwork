@@ -497,6 +497,14 @@ template_fails relay-health-check-annotation \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-healthcheck-port=traffic-port'
 
+template_fails agent-api-tls-listener-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-ssl-cert\" must not configure LoadBalancer TLS, listeners, or backend protocols" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-ssl-cert=arn:aws:acm:us-east-1:123456789012:certificate/abcdef'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \
