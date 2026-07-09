@@ -6797,33 +6797,50 @@ async fn wait_for_userspace_wireguard_ready(
     );
     let timeout = Duration::from_secs(args.userspace_wireguard_ready_timeout_seconds);
     let started = Instant::now();
+    let mut last_ready_error: Option<String>;
     loop {
-        if runner.run(ready_command.clone()).await.is_ok() {
-            tracing::info!(
-                command = %label,
-                interface = %args.wireguard_interface,
-                "userspace WireGuard interface is ready"
-            );
-            return Ok(());
+        match runner.run(ready_command.clone()).await {
+            Ok(()) => {
+                tracing::info!(
+                    command = %label,
+                    interface = %args.wireguard_interface,
+                    "userspace WireGuard interface is ready"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                last_ready_error = Some(error.to_string());
+            }
         }
         if let Some(status) = child
             .try_wait()
             .context("failed to inspect userspace WireGuard process readiness")?
         {
+            let readiness_context =
+                userspace_wireguard_readiness_context(last_ready_error.as_deref());
             anyhow::bail!(
-                "userspace WireGuard process `{label}` exited before interface {} became ready: {status}",
-                args.wireguard_interface
+                "userspace WireGuard process `{label}` exited before interface {} became ready: {status}{readiness_context}",
+                args.wireguard_interface,
             );
         }
         if started.elapsed() >= timeout {
+            let readiness_context =
+                userspace_wireguard_readiness_context(last_ready_error.as_deref());
             anyhow::bail!(
-                "userspace WireGuard process `{label}` did not expose interface {} within {} seconds",
+                "userspace WireGuard process `{label}` did not expose interface {} within {} seconds{readiness_context}",
                 args.wireguard_interface,
                 args.userspace_wireguard_ready_timeout_seconds
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn userspace_wireguard_readiness_context(last_ready_error: Option<&str>) -> String {
+    last_ready_error
+        .filter(|error| !error.is_empty())
+        .map(|error| format!("; last readiness check failed: {error}"))
+        .unwrap_or_default()
 }
 
 fn userspace_wireguard_launch_command(args: &AgentArgs) -> anyhow::Result<Option<LinuxCommand>> {
@@ -19011,6 +19028,10 @@ exec sleep 60
                     .contains("did not expose interface ipars0 within 1 seconds"),
                 "unexpected readiness error: {error}"
             );
+            assert!(
+                error.to_string().contains("last readiness check failed"),
+                "readiness error should include the last failed check: {error}"
+            );
             let pid = std::fs::read_to_string(&pid_path)?
                 .trim()
                 .parse::<u32>()
@@ -19030,6 +19051,11 @@ exec sleep 60
                 .as_deref()
                 .unwrap_or_default()
                 .contains("did not expose interface ipars0 within 1 seconds"));
+            assert!(status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("last readiness check failed"));
             let _ = std::fs::remove_dir_all(&temp_dir);
             return Ok(());
         }
