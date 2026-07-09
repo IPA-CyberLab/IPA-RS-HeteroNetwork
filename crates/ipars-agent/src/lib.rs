@@ -7834,11 +7834,11 @@ mod tests {
     #[tokio::test]
     async fn packet_flow_payload_prefix_metrics_cover_messaging_and_database_protocols(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        fn mqtt_connect_packet(client_id: &[u8]) -> Vec<u8> {
-            let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60];
-            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
-            body.extend_from_slice(client_id);
-            let mut payload = vec![0x10, body.len() as u8];
+        fn mqtt_publish_packet(topic: &[u8], value: &[u8]) -> Vec<u8> {
+            let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(topic);
+            body.extend_from_slice(value);
+            let mut payload = vec![0x30, body.len() as u8];
             payload.extend_from_slice(&body);
             payload
         }
@@ -7967,7 +7967,7 @@ mod tests {
             (
                 AgentPacketFlowApplication::Mqtt,
                 TransportProtocol::Tcp,
-                mqtt_connect_packet(b"agent-a"),
+                mqtt_publish_packet(b"sensors/temp", b"22.4"),
             ),
             (
                 AgentPacketFlowApplication::Amqp,

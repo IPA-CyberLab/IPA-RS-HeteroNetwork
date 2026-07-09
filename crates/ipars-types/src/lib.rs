@@ -12597,7 +12597,10 @@ pub mod api {
     }
 
     fn mqtt_payload(payload: &[u8]) -> bool {
-        mqtt_connect_packet_payload(payload) || mqtt_connack_packet_payload(payload)
+        mqtt_connect_packet_payload(payload)
+            || mqtt_connack_packet_payload(payload)
+            || mqtt_publish_packet_payload(payload)
+            || mqtt_subscribe_packet_payload(payload)
     }
 
     fn mqtt_connect_packet_payload(payload: &[u8]) -> bool {
@@ -12718,6 +12721,88 @@ pub mod api {
             return false;
         };
         mqtt_v5_connack_properties(payload, properties_start, remaining_end, properties_len)
+    }
+
+    fn mqtt_publish_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 5 || payload[0] & 0xf0 != 0x30 {
+            return false;
+        }
+        let qos = (payload[0] >> 1) & 0x03;
+        if qos == 0x03 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end != payload.len() || remaining_len < 3 {
+            return false;
+        }
+        let Some((topic, next_offset)) = mqtt_utf8_field(payload, offset, remaining_end) else {
+            return false;
+        };
+        if !mqtt_topic_name(topic) {
+            return false;
+        }
+        offset = next_offset;
+        if qos > 0 {
+            let Some(packet_id) = read_u16_be(payload, offset) else {
+                return false;
+            };
+            if packet_id == 0 {
+                return false;
+            }
+            offset += 2;
+        }
+        offset <= remaining_end
+    }
+
+    fn mqtt_subscribe_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 8 || payload[0] != 0x82 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end != payload.len() || remaining_len < 5 {
+            return false;
+        }
+        let Some(packet_id) = read_u16_be(payload, offset) else {
+            return false;
+        };
+        if packet_id == 0 {
+            return false;
+        }
+        offset += 2;
+
+        let mut filter_count = 0_usize;
+        while offset < remaining_end {
+            let Some((filter, options_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            let Some(&options) = payload.get(options_offset) else {
+                return false;
+            };
+            let next_offset = options_offset + 1;
+            if next_offset > remaining_end
+                || !mqtt_topic_filter(filter)
+                || !mqtt_subscription_options(options)
+            {
+                return false;
+            }
+            filter_count += 1;
+            if filter_count > 64 {
+                return false;
+            }
+            offset = next_offset;
+        }
+        filter_count > 0
     }
 
     fn mqtt_variable_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
@@ -12948,6 +13033,38 @@ pub mod api {
     fn mqtt_client_identifier(client_id: &[u8], connect_flags: u8) -> bool {
         let clean_start = connect_flags & 0x02 != 0;
         (!client_id.is_empty() || clean_start) && mqtt_utf8_string(client_id)
+    }
+
+    fn mqtt_topic_name(topic: &[u8]) -> bool {
+        !topic.is_empty()
+            && topic.len() <= 1024
+            && topic.contains(&b'/')
+            && mqtt_utf8_string(topic)
+            && !topic.iter().any(|byte| matches!(*byte, b'+' | b'#'))
+    }
+
+    fn mqtt_topic_filter(filter: &[u8]) -> bool {
+        if filter.is_empty() || filter.len() > 1024 || !mqtt_utf8_string(filter) {
+            return false;
+        }
+        let mut tokens = filter.split(|byte| *byte == b'/').peekable();
+        while let Some(token) = tokens.next() {
+            if token.contains(&b'#') {
+                if token != b"#" || tokens.peek().is_some() {
+                    return false;
+                }
+            }
+            if token.contains(&b'+') && token != b"+" {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mqtt_subscription_options(options: u8) -> bool {
+        let max_qos = options & 0x03;
+        let retain_handling = (options >> 4) & 0x03;
+        options & 0x80 == 0 && max_qos <= 2 && retain_handling <= 2
     }
 
     fn mqtt_utf8_field(
@@ -16466,6 +16583,35 @@ mod tests {
             payload.extend_from_slice(&mqtt_remaining_length(body.len()));
             payload.extend_from_slice(&body);
             payload
+        }
+
+        fn mqtt_publish_packet(
+            flags: u8,
+            topic: &[u8],
+            packet_id: Option<u16>,
+            payload: &[u8],
+        ) -> Vec<u8> {
+            let mut body = mqtt_field(topic);
+            if let Some(packet_id) = packet_id {
+                body.extend_from_slice(&packet_id.to_be_bytes());
+            }
+            body.extend_from_slice(payload);
+            let mut packet = vec![0x30 | flags];
+            packet.extend_from_slice(&mqtt_remaining_length(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+
+        fn mqtt_subscribe_packet(packet_id: u16, filters: &[(&[u8], u8)]) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            for (filter, options) in filters {
+                body.extend_from_slice(&mqtt_field(filter));
+                body.push(*options);
+            }
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&mqtt_remaining_length(body.len()));
+            packet.extend_from_slice(&body);
+            packet
         }
 
         fn mqtt_field(value: &[u8]) -> Vec<u8> {
@@ -21015,6 +21161,32 @@ mod tests {
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(0x00, b"sensors/temp", None, b"22.4"))
+                .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(
+                0x02,
+                b"devices/edge-1/state",
+                Some(7),
+                b"online"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_packet(
+                12,
+                &[
+                    (b"sensors/+/temp".as_slice(), 1),
+                    (b"$SYS/broker/#".as_slice(), 0)
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
             observation_for_payload(&[
                 0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
                 b'a', b'g', b'e', b'n', b't',
@@ -21053,6 +21225,60 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x21, 0x02, 0x00, 0x00]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(0x00, b"plain", None, b"value"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(0x00, b"sensors/+", None, b"value"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(
+                0x06,
+                b"sensors/temp",
+                Some(7),
+                b"value"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_publish_packet(
+                0x02,
+                b"sensors/temp",
+                Some(0),
+                b"value"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_packet(
+                0,
+                &[(b"sensors/+/temp".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_packet(
+                12,
+                &[(b"sensors/temp#".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_packet(
+                12,
+                &[(b"sensors/temp".as_slice(), 3)]
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
