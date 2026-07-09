@@ -593,6 +593,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead" $path .key) -}}
 {{- else if or (contains "azure-pls" $key) (contains "private-link" $key) (contains "privatelink" $key) (contains "private-service-connect" $key) (contains "endpoint-service" $key) (contains "service-attachment" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead" $path .key) -}}
+{{- else if or (contains "target-node-label" $key) (contains "target-node-selector" $key) (contains "backend-node-label" $key) (contains "backend-node-selector" $key) (contains "node-selector" $key) (contains "node-labels" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer backend target selection; use DaemonSet scheduling, externalTrafficPolicy values, and typed Service exposure controls instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 

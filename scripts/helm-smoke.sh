@@ -570,6 +570,14 @@ template_fails agent-api-private-link-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/azure-pls-create=true'
 
+template_fails agent-api-target-node-labels-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-target-node-labels\" must not configure LoadBalancer backend target selection" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-target-node-labels=ipars.io/edge=true'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

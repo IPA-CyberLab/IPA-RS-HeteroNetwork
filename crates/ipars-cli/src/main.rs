@@ -3912,6 +3912,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_backend_target_selection(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer backend target selection; use DaemonSet scheduling, externalTrafficPolicy, and typed Service exposure controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -4047,6 +4053,16 @@ fn kubernetes_service_annotation_controls_private_link(key: &str) -> bool {
         || key.contains("private-service-connect")
         || key.contains("endpoint-service")
         || key.contains("service-attachment")
+}
+
+fn kubernetes_service_annotation_controls_backend_target_selection(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("target-node-label")
+        || key.contains("target-node-selector")
+        || key.contains("backend-node-label")
+        || key.contains("backend-node-selector")
+        || key.contains("node-selector")
+        || key.contains("node-labels")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11963,6 +11979,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-pls-create must not configure LoadBalancer Private Link or endpoint-service publishing"
         ));
 
+        let mut agent_target_node_annotation = base_k8s_install_args();
+        agent_target_node_annotation.expose_agent_api = true;
+        agent_target_node_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-target-node-labels".to_string(),
+            value: "ipars.io/edge=true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_target_node_annotation) {
+            Ok(_) => panic!("agent API target-node annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-target-node-labels must not configure LoadBalancer backend target selection"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12225,6 +12255,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key networking.gke.io/service-attachment must not configure LoadBalancer Private Link or endpoint-service publishing"
+        ));
+
+        let mut relay_backend_node_selector_annotation = base_k8s_install_args();
+        relay_backend_node_selector_annotation.expose_relay = true;
+        relay_backend_node_selector_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_backend_node_selector_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_backend_node_selector_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "example.com/backend-node-selector".to_string(),
+            value: "role=relay".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_backend_node_selector_annotation) {
+            Ok(_) => panic!("relay backend node selector annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key example.com/backend-node-selector must not configure LoadBalancer backend target selection"
         ));
 
         Ok(())
@@ -13019,6 +13067,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer backend target selection; use DaemonSet scheduling, externalTrafficPolicy values, and typed Service exposure controls instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
