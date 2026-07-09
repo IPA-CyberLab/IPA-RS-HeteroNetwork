@@ -12418,7 +12418,7 @@ pub mod api {
             return (fields.len() == 1).then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"-ERR") {
-            return (fields.len() >= 2).then_some(NatsCommandKind::Line);
+            return nats_error_line(line, command.len()).then_some(NatsCommandKind::Line);
         }
         if command.eq_ignore_ascii_case(b"PUB") {
             let bytes =
@@ -12566,6 +12566,20 @@ pub mod api {
             serde_json::from_slice::<serde_json::Value>(json),
             Ok(serde_json::Value::Object(_))
         )
+    }
+
+    fn nats_error_line(line: &[u8], command_len: usize) -> bool {
+        let Some(rest) = line.get(command_len..) else {
+            return false;
+        };
+        let message = trim_ascii_space(rest);
+        message.len() >= 3
+            && message.len() <= 1024
+            && message.first() == Some(&b'\'')
+            && message.last() == Some(&b'\'')
+            && message[1..message.len() - 1]
+                .iter()
+                .all(|byte| !byte.is_ascii_control())
     }
 
     fn nats_subject(field: &[u8]) -> bool {
@@ -21863,6 +21877,10 @@ mod tests {
             api::AgentPacketFlowApplication::Nats
         );
         assert_eq!(
+            observation_for_payload(b"PING\r\n-ERR 'Authorization Violation'\r\n").application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
             observation_for_payload(
                 b"HPUB events.created 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
             )
@@ -21902,6 +21920,10 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"PING\r\njunk\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"PING\r\n-ERR Authorization Violation\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
