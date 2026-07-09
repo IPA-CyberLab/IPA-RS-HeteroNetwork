@@ -2346,9 +2346,18 @@ fn validate_kubernetes_underlay_route_cidrs(
         if cidr != &route {
             anyhow::bail!("{flag} must use canonical {label} route {route}, not {cidr}");
         }
-        if !seen.insert(route) {
+        if seen.contains(&route) {
             anyhow::bail!("{flag} must not repeat Kubernetes underlay route CIDR {route}");
         }
+        if let Some(overlap) = seen
+            .iter()
+            .find(|existing| ip_cidrs_overlap(existing, &route))
+        {
+            anyhow::bail!(
+                "{flag} must not include overlapping Kubernetes underlay route CIDRs {overlap} and {route}"
+            );
+        }
+        seen.insert(route);
     }
     Ok(())
 }
@@ -21953,6 +21962,32 @@ exec sleep 60
         ])?;
         assert!(duplicate.contains(
             "--kubernetes-service-cidr must not repeat Kubernetes underlay route CIDR 10.96.0.1/32"
+        ));
+
+        let overlapping = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-api-server-cidr",
+            "10.96.0.1/32",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+        ])?;
+        assert!(overlapping.contains(
+            "--kubernetes-service-cidr must not include overlapping Kubernetes underlay route CIDRs 10.96.0.1/32 and 10.96.0.0/12"
+        ));
+
+        let overlapping_same_flag = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-service-cidr",
+            "10.96.0.10/32",
+        ])?;
+        assert!(overlapping_same_flag.contains(
+            "--kubernetes-service-cidr must not include overlapping Kubernetes underlay route CIDRs 10.96.0.0/12 and 10.96.0.10/32"
         ));
 
         Ok(())
