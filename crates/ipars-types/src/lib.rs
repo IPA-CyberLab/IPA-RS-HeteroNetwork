@@ -13908,7 +13908,7 @@ pub mod api {
             0x09 => cassandra_cql_query_body(version, body_len, body_prefix, false),
             0x0a => cassandra_execute_body(version, body_len, body_prefix),
             0x0b => cassandra_string_list_body(body_len, body_prefix),
-            0x0d => body_len >= 6 && body_prefix.len() >= 6,
+            0x0d => cassandra_batch_body(version, body_len, body_prefix),
             0x0f => cassandra_auth_bytes_body(body_len, body_prefix),
             _ => false,
         }
@@ -14450,6 +14450,175 @@ pub mod api {
             && cassandra_query_parameters(version, body_len, body_prefix, 2 + prepared_id_len)
     }
 
+    fn cassandra_batch_body(version: u8, body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 6 || body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_batch_body_with_value_names(version, body_len, body_prefix, false)
+            || cassandra_batch_body_with_value_names(version, body_len, body_prefix, true)
+    }
+
+    fn cassandra_batch_body_with_value_names(
+        version: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+        with_value_names: bool,
+    ) -> bool {
+        let Some(batch_type) = body_prefix.first() else {
+            return false;
+        };
+        if !matches!(*batch_type, 0 | 1 | 2) {
+            return false;
+        }
+        let Some(statement_count) = read_u16_be(body_prefix, 1).map(|count| count as usize) else {
+            return false;
+        };
+        if statement_count == 0 || statement_count > 1024 {
+            return false;
+        }
+
+        let mut offset = 3_usize;
+        for _ in 0..statement_count {
+            let Some(next_offset) =
+                cassandra_batch_statement(body_prefix, offset, body_len, with_value_names)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        cassandra_batch_parameters(version, body_len, body_prefix, offset, with_value_names)
+    }
+
+    fn cassandra_batch_statement(
+        body_prefix: &[u8],
+        mut offset: usize,
+        body_len: usize,
+        with_value_names: bool,
+    ) -> Option<usize> {
+        let kind = *body_prefix.get(offset)?;
+        offset = offset.checked_add(1)?;
+        match kind {
+            0 => {
+                let (query, next_offset) =
+                    cassandra_long_string_field(body_prefix, offset, body_len)?;
+                if !cassandra_cql_batch_statement(trim_ascii_space(query)) {
+                    return None;
+                }
+                offset = next_offset;
+            }
+            1 => offset = cassandra_short_bytes_field(body_prefix, offset, body_len)?,
+            _ => return None,
+        }
+
+        let value_count = read_u16_be(body_prefix, offset)? as usize;
+        if value_count > 1024 {
+            return None;
+        }
+        offset = offset.checked_add(2)?;
+        for _ in 0..value_count {
+            if with_value_names {
+                let (_name, next_offset) = cassandra_string_field(body_prefix, offset)?;
+                offset = next_offset;
+            }
+            offset = cassandra_bytes_field(body_prefix, offset, body_len, true)?;
+        }
+        Some(offset)
+    }
+
+    fn cassandra_cql_batch_statement(query: &[u8]) -> bool {
+        let keywords: [&[u8]; 3] = [b"INSERT", b"UPDATE", b"DELETE"];
+        keywords
+            .iter()
+            .any(|keyword| starts_ascii_keyword(query, keyword))
+    }
+
+    fn cassandra_batch_parameters(
+        version: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+        mut offset: usize,
+        with_value_names: bool,
+    ) -> bool {
+        let Some(consistency) = read_u16_be(body_prefix, offset) else {
+            return false;
+        };
+        if !cassandra_consistency(consistency) {
+            return false;
+        }
+        let Some(next_offset) = offset.checked_add(2) else {
+            return false;
+        };
+        offset = next_offset;
+
+        let Some((flags, next_offset)) =
+            cassandra_query_parameter_flags(version, body_prefix, offset)
+        else {
+            return false;
+        };
+        if !cassandra_batch_parameter_flags_supported(version, flags)
+            || (flags & 0x40 != 0) != with_value_names
+        {
+            return false;
+        }
+        offset = next_offset;
+
+        if flags & 0x10 != 0 {
+            let Some(serial_consistency) = read_u16_be(body_prefix, offset) else {
+                return false;
+            };
+            if !matches!(serial_consistency, 0x0008 | 0x0009) {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(2) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if flags & 0x20 != 0 {
+            let Some(timestamp) = body_prefix.get(offset..offset.saturating_add(8)) else {
+                return false;
+            };
+            if timestamp.first().is_some_and(|byte| byte & 0x80 != 0) {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(8) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        if version == 5 {
+            if flags & 0x80 != 0 {
+                let Some((_keyspace, next_offset)) = cassandra_string_field(body_prefix, offset)
+                else {
+                    return false;
+                };
+                offset = next_offset;
+            }
+            if flags & 0x100 != 0 {
+                let Some(now) = read_u32_be(body_prefix, offset) else {
+                    return false;
+                };
+                if now & 0x8000_0000 != 0 {
+                    return false;
+                }
+                let Some(next_offset) = offset.checked_add(4) else {
+                    return false;
+                };
+                offset = next_offset;
+            }
+        }
+        offset == body_len
+    }
+
+    fn cassandra_batch_parameter_flags_supported(version: u8, flags: u32) -> bool {
+        let supported = match version {
+            3 | 4 => 0x70,
+            5 => 0x01f0,
+            _ => return false,
+        };
+        flags & !supported == 0 && flags & 0x0f == 0
+    }
+
     fn cassandra_query_parameter_header_len(version: u8) -> Option<usize> {
         match version {
             3 | 4 => Some(3),
@@ -14651,6 +14820,24 @@ pub mod api {
             return None;
         }
         Some(value_end)
+    }
+
+    fn cassandra_long_string_field(
+        payload: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> Option<(&[u8], usize)> {
+        let len = read_u32_be(payload, offset)? as usize;
+        if len == 0 || len > 1_048_576 {
+            return None;
+        }
+        let value_start = offset.checked_add(4)?;
+        let value_end = value_start.checked_add(len)?;
+        if value_end > body_len {
+            return None;
+        }
+        let value = payload.get(value_start..value_end)?;
+        Some((value, value_end))
     }
 
     fn cassandra_bytes_map_field(payload: &[u8], offset: usize, body_len: usize) -> Option<usize> {
@@ -17937,6 +18124,78 @@ mod tests {
                 }
             }
             encoded
+        }
+
+        fn cassandra_bytes_value(value: Option<&[u8]>) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            match value {
+                Some(value) => {
+                    encoded.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    encoded.extend_from_slice(value);
+                }
+                None => encoded.extend_from_slice(&(-1_i32).to_be_bytes()),
+            }
+            encoded
+        }
+
+        fn cassandra_batch_query(query: &[u8], values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut encoded = vec![0];
+            encoded.extend_from_slice(&(query.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(query);
+            encoded.extend_from_slice(&(values.len() as u16).to_be_bytes());
+            for value in values {
+                encoded.extend_from_slice(&cassandra_bytes_value(*value));
+            }
+            encoded
+        }
+
+        fn cassandra_batch_query_with_names(
+            query: &[u8],
+            values: &[(&[u8], Option<&[u8]>)],
+        ) -> Vec<u8> {
+            let mut encoded = vec![0];
+            encoded.extend_from_slice(&(query.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(query);
+            encoded.extend_from_slice(&(values.len() as u16).to_be_bytes());
+            for (name, value) in values {
+                encoded.extend_from_slice(&cassandra_string(name));
+                encoded.extend_from_slice(&cassandra_bytes_value(*value));
+            }
+            encoded
+        }
+
+        fn cassandra_batch_prepared(id: &[u8], values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut encoded = vec![1];
+            encoded.extend_from_slice(&(id.len() as u16).to_be_bytes());
+            encoded.extend_from_slice(id);
+            encoded.extend_from_slice(&(values.len() as u16).to_be_bytes());
+            for value in values {
+                encoded.extend_from_slice(&cassandra_bytes_value(*value));
+            }
+            encoded
+        }
+
+        fn cassandra_batch_frame(
+            version: u8,
+            batch_type: u8,
+            statements: &[Vec<u8>],
+            consistency: u16,
+            flags: u32,
+            tail: &[u8],
+        ) -> Vec<u8> {
+            let mut body = vec![batch_type];
+            body.extend_from_slice(&(statements.len() as u16).to_be_bytes());
+            for statement in statements {
+                body.extend_from_slice(statement);
+            }
+            body.extend_from_slice(&consistency.to_be_bytes());
+            if version & 0x7f == 5 {
+                body.extend_from_slice(&flags.to_be_bytes());
+            } else {
+                body.push(flags as u8);
+            }
+            body.extend_from_slice(tail);
+            cassandra_request_frame_with_flags(version, 0, 0x0d, &body)
         }
 
         fn cassandra_query_frame(
@@ -23329,6 +23588,170 @@ mod tests {
                 0x08,
                 0x08,
                 &cassandra_bad_warning_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query(
+                    b"INSERT INTO ks.tbl (id) VALUES (1)",
+                    &[]
+                )],
+                0x0001,
+                0,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                1,
+                &[cassandra_batch_prepared(
+                    b"pid",
+                    &[Some(&1234_i32.to_be_bytes())]
+                )],
+                0x0001,
+                0,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query_with_names(
+                    b"UPDATE ks.tbl SET value=:value WHERE id=:id",
+                    &[
+                        (b"value", Some(b"edge")),
+                        (b"id", Some(&1234_i32.to_be_bytes()))
+                    ]
+                )],
+                0x0001,
+                0x40,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_batch_serial_timestamp_tail = Vec::new();
+        cassandra_batch_serial_timestamp_tail.extend_from_slice(&0x0008_u16.to_be_bytes());
+        cassandra_batch_serial_timestamp_tail.extend_from_slice(&1_i64.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                2,
+                &[cassandra_batch_query(
+                    b"UPDATE ks.counter_tbl SET c=c+1 WHERE id=1",
+                    &[]
+                )],
+                0x0001,
+                0x30,
+                &cassandra_batch_serial_timestamp_tail
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_batch_v5_tail = cassandra_string(b"ks");
+        cassandra_batch_v5_tail.extend_from_slice(&42_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x05,
+                0,
+                &[cassandra_batch_query(b"DELETE FROM ks.tbl WHERE id=1", &[])],
+                0x0001,
+                0x0180,
+                &cassandra_batch_v5_tail
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&[0x04, 0, 0, 0, 0x0d, 0, 0, 0, 6, 0, 1, 0, 0, 1, 0])
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                3,
+                &[cassandra_batch_query(
+                    b"INSERT INTO ks.tbl (id) VALUES (1)",
+                    &[]
+                )],
+                0x0001,
+                0,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(0x04, 0, &[], 0x0001, 0, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query(b"SELECT * FROM ks.tbl", &[])],
+                0x0001,
+                0,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query(
+                    b"INSERT INTO ks.tbl (id) VALUES (1)",
+                    &[]
+                )],
+                0x0001,
+                0x01,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query(
+                    b"INSERT INTO ks.tbl (id) VALUES (?)",
+                    &[Some(b"1")]
+                )],
+                0x0001,
+                0x40,
+                &[]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_bad_batch_serial_tail = Vec::new();
+        cassandra_bad_batch_serial_tail.extend_from_slice(&0x0001_u16.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_batch_frame(
+                0x04,
+                0,
+                &[cassandra_batch_query(
+                    b"INSERT INTO ks.tbl (id) VALUES (1)",
+                    &[]
+                )],
+                0x0001,
+                0x10,
+                &cassandra_bad_batch_serial_tail
             ))
             .application(),
             api::AgentPacketFlowApplication::Unknown
