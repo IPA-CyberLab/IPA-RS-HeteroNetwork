@@ -11937,6 +11937,7 @@ pub mod api {
         let key_len = u16::from_be_bytes([header[2], header[3]]) as usize;
         let extras_len = header[4] as usize;
         let data_type = header[5];
+        let status = u16::from_be_bytes([header[6], header[7]]);
         let total_body_len =
             u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
         let frame_end = offset.checked_add(24)?.checked_add(total_body_len)?;
@@ -11945,7 +11946,14 @@ pub mod api {
             || key_len > 250
             || extras_len > 32
             || key_len.checked_add(extras_len)? > total_body_len
-            || !memcached_binary_opcode_shape(magic, opcode, key_len, extras_len, total_body_len)
+            || !memcached_binary_opcode_shape(
+                magic,
+                opcode,
+                status,
+                key_len,
+                extras_len,
+                total_body_len,
+            )
         {
             return None;
         }
@@ -11959,12 +11967,19 @@ pub mod api {
     fn memcached_binary_opcode_shape(
         magic: u8,
         opcode: u8,
+        status: u16,
         key_len: usize,
         extras_len: usize,
         total_body_len: usize,
     ) -> bool {
         if magic == 0x81 {
-            return opcode <= 0x22;
+            return memcached_binary_response_shape(
+                opcode,
+                status,
+                key_len,
+                extras_len,
+                total_body_len,
+            );
         }
         match opcode {
             0x00 | 0x09 | 0x0c | 0x0d => {
@@ -11984,6 +11999,63 @@ pub mod api {
             0x21 | 0x22 => extras_len == 0 && key_len > 0 && total_body_len >= key_len,
             _ => false,
         }
+    }
+
+    fn memcached_binary_response_shape(
+        opcode: u8,
+        status: u16,
+        key_len: usize,
+        extras_len: usize,
+        total_body_len: usize,
+    ) -> bool {
+        if opcode > 0x22 || !memcached_binary_response_status(status) {
+            return false;
+        }
+        if status != 0 {
+            return key_len == 0 && extras_len == 0 && total_body_len <= 4096;
+        }
+        match opcode {
+            0x00 | 0x09 | 0x1d | 0x1e => {
+                extras_len == 4 && key_len == 0 && total_body_len >= extras_len
+            }
+            0x0c | 0x0d => extras_len == 4 && key_len > 0 && total_body_len >= extras_len + key_len,
+            0x01..=0x04 | 0x07 | 0x08 | 0x0a | 0x0e | 0x0f | 0x11..=0x14 | 0x17..=0x1c => {
+                extras_len == 0 && key_len == 0 && total_body_len == 0
+            }
+            0x05 | 0x06 | 0x15 | 0x16 => extras_len == 0 && key_len == 0 && total_body_len == 8,
+            0x0b => extras_len == 0 && key_len == 0 && (1..=256).contains(&total_body_len),
+            0x10 => {
+                extras_len == 0
+                    && total_body_len >= key_len
+                    && (key_len == 0 && total_body_len == 0 || key_len > 0)
+            }
+            0x20..=0x22 => extras_len == 0 && key_len == 0 && total_body_len <= 4096,
+            _ => false,
+        }
+    }
+
+    fn memcached_binary_response_status(status: u16) -> bool {
+        matches!(
+            status,
+            0x0000
+                | 0x0001
+                | 0x0002
+                | 0x0003
+                | 0x0004
+                | 0x0005
+                | 0x0006
+                | 0x0007
+                | 0x0008
+                | 0x0020
+                | 0x0021
+                | 0x0081
+                | 0x0082
+                | 0x0083
+                | 0x0084
+                | 0x0085
+                | 0x0086
+                | 0x0087
+        )
     }
 
     fn kafka_payload(payload: &[u8]) -> bool {
@@ -16255,6 +16327,30 @@ mod tests {
             payload.push(extras.len() as u8);
             payload.push(0);
             payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&(total_body_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(extras);
+            payload.extend_from_slice(key);
+            payload.extend_from_slice(value);
+            payload
+        }
+
+        fn memcached_binary_response(
+            opcode: u8,
+            status: u16,
+            key: &[u8],
+            extras: &[u8],
+            value: &[u8],
+        ) -> Vec<u8> {
+            let total_body_len = extras.len() + key.len() + value.len();
+            let mut payload = Vec::with_capacity(24 + total_body_len);
+            payload.push(0x81);
+            payload.push(opcode);
+            payload.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            payload.push(extras.len() as u8);
+            payload.push(0);
+            payload.extend_from_slice(&status.to_be_bytes());
             payload.extend_from_slice(&(total_body_len as u32).to_be_bytes());
             payload.extend_from_slice(&0_u32.to_be_bytes());
             payload.extend_from_slice(&0_u64.to_be_bytes());
@@ -20581,6 +20677,82 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&memcached_binary_request(0x00, b"key", &[0, 0, 0, 0], b""))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(
+                0x00,
+                0,
+                b"",
+                &[0, 0, 0, 1],
+                b"value"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(
+                0x0c,
+                0,
+                b"key",
+                &[0, 0, 0, 1],
+                b"value"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(
+                0x05,
+                0,
+                b"",
+                b"",
+                &42_u64.to_be_bytes()
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(0x0b, 0, b"", b"", b"1.6.22"))
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(0x00, 1, b"", b"", b"not found"))
+                .application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        let mut partial_memcached_response =
+            memcached_binary_response(0x00, 0, b"", &[0, 0, 0, 1], b"value");
+        partial_memcached_response.truncate(24 + 4 + 2);
+        assert_eq!(
+            observation_for_payload(&partial_memcached_response).application(),
+            api::AgentPacketFlowApplication::Memcached
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(0x00, 0x9999, b"", b"", b"bad"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(0x00, 0, b"", b"", b"value"))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(
+                0x0c,
+                0,
+                b"",
+                &[0, 0, 0, 1],
+                b"value"
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&memcached_binary_response(0x00, 1, b"", &[0, 0, 0, 1], b""))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
         );

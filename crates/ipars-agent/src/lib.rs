@@ -7906,6 +7906,24 @@ mod tests {
             payload
         }
 
+        fn memcached_binary_get_response(value: &[u8]) -> Vec<u8> {
+            let extras = [0, 0, 0, 1];
+            let total_body_len = extras.len() + value.len();
+            let mut payload = Vec::with_capacity(24 + total_body_len);
+            payload.push(0x81);
+            payload.push(0x00);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.push(extras.len() as u8);
+            payload.push(0);
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&(total_body_len as u32).to_be_bytes());
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            payload.extend_from_slice(&0_u64.to_be_bytes());
+            payload.extend_from_slice(&extras);
+            payload.extend_from_slice(value);
+            payload
+        }
+
         fn turn_allocate_request() -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&0x0003_u16.to_be_bytes());
@@ -7975,6 +7993,11 @@ mod tests {
                 AgentPacketFlowApplication::Redis,
                 TransportProtocol::Tcp,
                 b"|1\r\n$3\r\nttl\r\n:60\r\n>2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Memcached,
+                TransportProtocol::Tcp,
+                memcached_binary_get_response(b"value"),
             ),
             (
                 AgentPacketFlowApplication::OpenSearch,
