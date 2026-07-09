@@ -15676,16 +15676,27 @@ pub mod api {
                 if len > 16_777_216 {
                     return None;
                 }
+                let subtype = *payload.get(offset.checked_add(4)?)?;
                 let data_offset = offset.checked_add(5)?;
                 let value_end = data_offset.checked_add(len)?;
-                (value_end <= document_end).then_some(value_end)
+                if value_end > document_end || !mongodb_bson_binary_subtype(subtype) {
+                    return None;
+                }
+                if subtype == 0x02 {
+                    let old_len = read_u32_le(payload, data_offset)? as usize;
+                    let old_value_end = data_offset.checked_add(4)?.checked_add(old_len)?;
+                    if old_value_end != value_end {
+                        return None;
+                    }
+                }
+                Some(value_end)
             }
             0x0b => {
                 let (_pattern, offset) =
                     mongodb_bson_cstring_field(payload, offset, document_end, true, 4096)?;
-                let (_options, offset) =
+                let (options, offset) =
                     mongodb_bson_cstring_field(payload, offset, document_end, true, 1024)?;
-                Some(offset)
+                mongodb_bson_regex_options(options).then_some(offset)
             }
             0x0c => {
                 let offset = mongodb_bson_string_field_end(payload, offset, document_end)?;
@@ -15738,6 +15749,24 @@ pub mod api {
             false,
         )?;
         (scope_end == value_end).then_some(value_end)
+    }
+
+    fn mongodb_bson_binary_subtype(subtype: u8) -> bool {
+        matches!(subtype, 0..=9 | 128..=255)
+    }
+
+    fn mongodb_bson_regex_options(options: &[u8]) -> bool {
+        let mut previous = None;
+        for option in options {
+            if !matches!(*option, b'i' | b'm' | b's' | b'u' | b'x') {
+                return false;
+            }
+            if previous.is_some_and(|previous| previous >= *option) {
+                return false;
+            }
+            previous = Some(*option);
+        }
+        true
     }
 
     fn mongodb_bson_document_sequence(
@@ -18911,6 +18940,36 @@ mod tests {
             body.extend_from_slice(name);
             body.push(0);
             body.extend_from_slice(array_document);
+            mongodb_bson_document_from_body(&body)
+        }
+
+        fn mongodb_binary_document(name: &[u8], subtype: u8, value: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x05);
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            body.push(subtype);
+            body.extend_from_slice(value);
+            mongodb_bson_document_from_body(&body)
+        }
+
+        fn mongodb_old_binary_document(name: &[u8], declared_len: u32, value: &[u8]) -> Vec<u8> {
+            let mut binary = Vec::new();
+            binary.extend_from_slice(&declared_len.to_le_bytes());
+            binary.extend_from_slice(value);
+            mongodb_binary_document(name, 0x02, &binary)
+        }
+
+        fn mongodb_regex_document(name: &[u8], pattern: &[u8], options: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x0b);
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(pattern);
+            body.push(0);
+            body.extend_from_slice(options);
+            body.push(0);
             mongodb_bson_document_from_body(&body)
         }
 
@@ -25076,6 +25135,8 @@ mod tests {
         let mongodb_ping_document = mongodb_i32_document(&[(b"ping", 1)]);
         let mongodb_array_document =
             mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"0", 1), (b"1", 2)]));
+        let mongodb_regex_binary_document = mongodb_regex_document(b"filter", b"^ipars", b"ims");
+        let mongodb_valid_old_binary_document = mongodb_old_binary_document(b"payload", 3, b"abc");
         let mut mongodb_op_msg = Vec::new();
         mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_msg.push(0);
@@ -25102,6 +25163,32 @@ mod tests {
                 &mongodb_op_msg_body(
                     0,
                     &[mongodb_op_msg_body_section(&mongodb_array_document)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_regex_binary_document)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_valid_old_binary_document,
+                    )],
                     None
                 )
             ))
@@ -25327,6 +25414,62 @@ mod tests {
                     0,
                     &[mongodb_op_msg_body_section(
                         &mongodb_array_with_leading_zero
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_unsorted_regex_options = mongodb_regex_document(b"filter", b"^ipars", b"mi");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_unsorted_regex_options)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_unknown_regex_option = mongodb_regex_document(b"filter", b"^ipars", b"z");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_unknown_regex_option)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_bad_old_binary_document = mongodb_old_binary_document(b"payload", 4, b"abc");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_bad_old_binary_document
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_reserved_binary_subtype = mongodb_binary_document(b"payload", 0x7f, b"abc");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_reserved_binary_subtype
                     )],
                     None
                 )
