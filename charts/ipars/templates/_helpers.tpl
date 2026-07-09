@@ -585,6 +585,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer firewall or security groups; use loadBalancerSourceRanges or NetworkPolicy values instead" $path .key) -}}
 {{- else if or (contains "subnet" $key) (contains "network-tier" $key) (contains "network-endpoint-group" $key) (contains "cloud.google.com/neg" $key) (contains "resource-group" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer network placement; use typed Service type, loadBalancerClass, source-range, and exposure controls instead" $path .key) -}}
+{{- else if or (contains "load-balancer-attributes" $key) (contains "loadbalancer-attributes" $key) (contains "target-group-attributes" $key) (contains "targetgroup-attributes" $key) (contains "access-log" $key) (contains "accesslog" $key) (contains "idle-timeout" $key) (contains "connection-draining" $key) (contains "deregistration-delay" $key) (contains "cross-zone" $key) (contains "preserve-client-ip" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 

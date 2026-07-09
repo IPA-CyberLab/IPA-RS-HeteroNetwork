@@ -3888,6 +3888,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_operational_attributes(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3971,6 +3977,21 @@ fn kubernetes_service_annotation_controls_network_placement(key: &str) -> bool {
         || key.contains("network-endpoint-group")
         || key.contains("cloud.google.com/neg")
         || key.contains("resource-group")
+}
+
+fn kubernetes_service_annotation_controls_operational_attributes(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("load-balancer-attributes")
+        || key.contains("loadbalancer-attributes")
+        || key.contains("target-group-attributes")
+        || key.contains("targetgroup-attributes")
+        || key.contains("access-log")
+        || key.contains("accesslog")
+        || key.contains("idle-timeout")
+        || key.contains("connection-draining")
+        || key.contains("deregistration-delay")
+        || key.contains("cross-zone")
+        || key.contains("preserve-client-ip")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11831,6 +11852,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-subnets must not configure LoadBalancer network placement"
         ));
 
+        let mut agent_lb_attributes_annotation = base_k8s_install_args();
+        agent_lb_attributes_annotation.expose_agent_api = true;
+        agent_lb_attributes_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-attributes".to_string(),
+            value: "deletion_protection.enabled=true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_lb_attributes_annotation) {
+            Ok(_) => panic!("agent API LoadBalancer attributes annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-attributes must not configure LoadBalancer operational attributes"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12021,6 +12056,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key cloud.google.com/network-tier must not configure LoadBalancer network placement"
+        ));
+
+        let mut relay_target_group_attributes_annotation = base_k8s_install_args();
+        relay_target_group_attributes_annotation.expose_relay = true;
+        relay_target_group_attributes_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_target_group_attributes_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_target_group_attributes_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes".to_string(),
+            value: "preserve_client_ip.enabled=true".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_target_group_attributes_annotation) {
+            Ok(_) => panic!("relay target group attributes annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-target-group-attributes must not configure LoadBalancer operational attributes"
         ));
 
         Ok(())
@@ -12852,6 +12905,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer network placement; use typed Service type, loadBalancerClass, source-range, and exposure controls instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
