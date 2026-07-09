@@ -551,6 +551,17 @@ template_fails agent-api-load-balancer-attribute-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-cross-zone-load-balancing-enabled=true'
 
+template_fails relay-tcp-reset-annotation \
+  "agent.relayService.annotations annotation key \"service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset\" must not configure LoadBalancer operational attributes" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.service\.beta\.kubernetes\.io/azure-load-balancer-disable-tcp-reset=true'
+
 template_fails agent-api-dns-publication-annotation \
   "agent.apiService.annotations annotation key \"external-dns.alpha.kubernetes.io/hostname\" must not publish LoadBalancer DNS names" \
   --set agent.apiService.enabled=true \

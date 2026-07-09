@@ -4018,6 +4018,7 @@ fn kubernetes_service_annotation_controls_operational_attributes(key: &str) -> b
         || key.contains("deregistration-delay")
         || key.contains("cross-zone")
         || key.contains("preserve-client-ip")
+        || key.contains("tcp-reset")
 }
 
 fn kubernetes_service_annotation_controls_dns_publication(key: &str) -> bool {
@@ -11953,6 +11954,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-attributes must not configure LoadBalancer operational attributes"
         ));
 
+        let mut agent_tcp_reset_annotation = base_k8s_install_args();
+        agent_tcp_reset_annotation.expose_agent_api = true;
+        agent_tcp_reset_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_tcp_reset_annotation) {
+            Ok(_) => panic!("agent API TCP reset annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset must not configure LoadBalancer operational attributes"
+        ));
+
         let mut agent_dns_publication_annotation = base_k8s_install_args();
         agent_dns_publication_annotation.expose_agent_api = true;
         agent_dns_publication_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -12235,6 +12250,23 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-target-group-attributes must not configure LoadBalancer operational attributes"
+        ));
+
+        let mut relay_tcp_reset_annotation = base_k8s_install_args();
+        relay_tcp_reset_annotation.expose_relay = true;
+        relay_tcp_reset_annotation.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        relay_tcp_reset_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_tcp_reset_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_tcp_reset_annotation) {
+            Ok(_) => panic!("relay TCP reset annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset must not configure LoadBalancer operational attributes"
         ));
 
         let mut relay_dns_publication_annotation = base_k8s_install_args();
