@@ -524,6 +524,17 @@ template_fails agent-api-security-group-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-security-groups=sg-0123456789abcdef0'
 
+template_fails relay-subnet-annotation \
+  "agent.relayService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-subnets\" must not configure LoadBalancer network placement" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-subnets=subnet-0123456789abcdef0'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

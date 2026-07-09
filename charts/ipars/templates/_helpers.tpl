@@ -583,6 +583,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead" $path .key) -}}
 {{- else if or (contains "security-group" $key) (contains "securitygroup" $key) (contains "firewall" $key) (contains "allowed-service-tags" $key) (contains "allowed-ip-ranges" $key) (contains "shared-securityrule" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer firewall or security groups; use loadBalancerSourceRanges or NetworkPolicy values instead" $path .key) -}}
+{{- else if or (contains "subnet" $key) (contains "network-tier" $key) (contains "network-endpoint-group" $key) (contains "cloud.google.com/neg" $key) (contains "resource-group" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer network placement; use typed Service type, loadBalancerClass, source-range, and exposure controls instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
