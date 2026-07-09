@@ -119,7 +119,7 @@ Prometheus-style metrics are exposed by control-plane, signal, relay, and agent 
 ## Failure Behavior
 
 - Existing WireGuard data-plane state and relay sessions continue when the control plane is unavailable.
-- New joins, peer-map refreshes, policy changes, route changes, and key rotations require a reachable control plane.
+- New joins, peer-map refreshes, policy changes, route changes, key rotations, and node removals require a reachable control plane.
 - Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop.
 - Signal failure prevents new path negotiation and hole-punch planning; existing selected paths remain in local runtime state until they expire or are replaced.
 - Relay failure causes affected relay paths to renew or renegotiate. If direct candidates are available, path scoring can promote back to direct.

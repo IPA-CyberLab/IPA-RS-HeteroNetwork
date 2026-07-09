@@ -11,11 +11,13 @@ use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
 use ipars_types::api::{
-    AgentPathEventsResponse, AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse,
-    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
+    AgentNodeRemovalRequest, AgentNodeRemovalResponse, AgentPathEventsResponse,
+    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentPeerActivityResponse, AgentStatusResponse, AgentWireGuardKeyRotationRequest,
+    AgentWireGuardKeyRotationResponse, ControlPlaneMetricsResponse, ControlPlanePathsResponse,
+    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse,
+    RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
@@ -87,6 +89,14 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
     },
     Relay {
         #[command(subcommand)]
@@ -205,6 +215,32 @@ struct RoutesArgs {
 enum TokenCommand {
     Create(Box<TokenCreateArgs>),
     Revoke(TokenRevokeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    Rotate(KeyRotateArgs),
+}
+
+#[derive(Debug, Args)]
+struct KeyRotateArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeCommand {
+    Remove(NodeRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct NodeRemoveArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1036,6 +1072,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Token { command } => match command {
             TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
+        },
+        Command::Key { command } => match command {
+            KeyCommand::Rotate(args) => {
+                let agent_url = defaulted_agent_url(args.agent_url.as_deref());
+                print_json(&rotate_wireguard_key(agent_url, &args).await?)?
+            }
+        },
+        Command::Node { command } => match command {
+            NodeCommand::Remove(args) => {
+                let agent_url = defaulted_agent_url(args.agent_url.as_deref());
+                print_json(&remove_node(agent_url, &args).await?)?
+            }
         },
         Command::Relay { command } => match command {
             RelayCommand::Status(args) => match args.relay_url.as_deref() {
@@ -1884,6 +1932,32 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
 
 async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
     get_json(agent_url, "/v1/status", "agent status").await
+}
+
+async fn rotate_wireguard_key(
+    agent_url: &str,
+    args: &KeyRotateArgs,
+) -> anyhow::Result<AgentWireGuardKeyRotationResponse> {
+    let request = AgentWireGuardKeyRotationRequest {
+        control_plane_url: args.control_plane_url.clone(),
+    };
+    post_json(
+        agent_url,
+        "/v1/wireguard-key/rotate",
+        "agent WireGuard key rotation",
+        &request,
+    )
+    .await
+}
+
+async fn remove_node(
+    agent_url: &str,
+    args: &NodeRemoveArgs,
+) -> anyhow::Result<AgentNodeRemovalResponse> {
+    let request = AgentNodeRemovalRequest {
+        control_plane_url: args.control_plane_url.clone(),
+    };
+    post_json(agent_url, "/v1/node/remove", "agent node removal", &request).await
 }
 
 fn defaulted_agent_url(agent_url: Option<&str>) -> &str {
@@ -8569,6 +8643,81 @@ mod tests {
         Ok((format!("http://{addr}"), task, request_rx))
     }
 
+    async fn spawn_raw_http_response_with_complete_request(
+        response: String,
+    ) -> anyhow::Result<(
+        String,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+    )> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if http_request_body_is_complete(&request) {
+                    break;
+                }
+            }
+            let _ = request_tx.send(request);
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), task, request_rx))
+    }
+
+    fn http_request_body_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        match content_length {
+            Some(content_length) => request.len() >= header_end + 4 + content_length,
+            None => true,
+        }
+    }
+
+    fn http_request_body(request: &[u8]) -> anyhow::Result<&[u8]> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .context("raw HTTP request did not include a header terminator")?;
+        Ok(&request[header_end + 4..])
+    }
+
+    fn cli_test_node_record(node_id: NodeId) -> ipars_types::NodeRecord {
+        ipars_types::NodeRecord {
+            node_id,
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: "identity-public".to_string(),
+            wireguard_public_key: "wireguard-public".to_string(),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn cli_bounded_json_response_rejects_oversized_responses() -> anyhow::Result<()> {
         let body = r#"{"ok":true}"#;
@@ -8669,6 +8818,101 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .context("timed out waiting for path events CLI test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn key_rotate_posts_agent_request() -> anyhow::Result<()> {
+        let node_id = NodeId::from_string("node-cli");
+        let body = serde_json::to_string(&AgentWireGuardKeyRotationResponse {
+            node_id: node_id.clone(),
+            previous_wireguard_public_key: "previous-wireguard".to_string(),
+            next_wireguard_public_key: "next-wireguard".to_string(),
+            control_plane_node: cli_test_node_record(node_id.clone()),
+            rotated_at: Utc::now(),
+            state_updated_at: Utc::now(),
+        })?;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server, request_rx) =
+            spawn_raw_http_response_with_complete_request(response).await?;
+
+        let output = rotate_wireguard_key(
+            &url,
+            &KeyRotateArgs {
+                agent_url: None,
+                control_plane_url: Some("http://127.0.0.1:8443".to_string()),
+            },
+        )
+        .await?;
+
+        assert_eq!(output.node_id, node_id);
+        assert_eq!(output.next_wireguard_public_key, "next-wireguard");
+        let request = request_rx.await?;
+        let request_line = String::from_utf8_lossy(&request);
+        assert!(
+            request_line.starts_with("POST /v1/wireguard-key/rotate HTTP/1.1\r\n"),
+            "unexpected request: {request_line}"
+        );
+        let posted: AgentWireGuardKeyRotationRequest =
+            serde_json::from_slice(http_request_body(&request)?)?;
+        assert_eq!(
+            posted.control_plane_url.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for key rotate CLI test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_remove_posts_agent_request() -> anyhow::Result<()> {
+        let node_id = NodeId::from_string("node-cli");
+        let body = serde_json::to_string(&AgentNodeRemovalResponse {
+            node_id: node_id.clone(),
+            control_plane_node: cli_test_node_record(node_id.clone()),
+            removed_path_count: 3,
+            removed_health: true,
+            removed_at: Utc::now(),
+        })?;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server, request_rx) =
+            spawn_raw_http_response_with_complete_request(response).await?;
+
+        let output = remove_node(
+            &url,
+            &NodeRemoveArgs {
+                agent_url: None,
+                control_plane_url: Some("http://127.0.0.1:8443".to_string()),
+            },
+        )
+        .await?;
+
+        assert_eq!(output.node_id, node_id);
+        assert_eq!(output.removed_path_count, 3);
+        assert!(output.removed_health);
+        let request = request_rx.await?;
+        let request_line = String::from_utf8_lossy(&request);
+        assert!(
+            request_line.starts_with("POST /v1/node/remove HTTP/1.1\r\n"),
+            "unexpected request: {request_line}"
+        );
+        let posted: AgentNodeRemovalRequest = serde_json::from_slice(http_request_body(&request)?)?;
+        assert_eq!(
+            posted.control_plane_url.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for node remove CLI test server")???;
         Ok(())
     }
 
@@ -9776,6 +10020,53 @@ fi
         }
 
         anyhow::bail!("expected path activity command")
+    }
+
+    #[test]
+    fn key_and_node_args_accept_agent_and_control_plane_urls() -> anyhow::Result<()> {
+        let key = Cli::try_parse_from([
+            "ipars",
+            "key",
+            "rotate",
+            "--agent-url",
+            "http://127.0.0.1:19780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+        ])?;
+        let Command::Key {
+            command: KeyCommand::Rotate(args),
+        } = key.command
+        else {
+            anyhow::bail!("expected key rotate command");
+        };
+        assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:19780"));
+        assert_eq!(
+            args.control_plane_url.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+
+        let node = Cli::try_parse_from([
+            "ipars",
+            "node",
+            "remove",
+            "--agent-url",
+            "http://127.0.0.1:19780",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+        ])?;
+        let Command::Node {
+            command: NodeCommand::Remove(args),
+        } = node.command
+        else {
+            anyhow::bail!("expected node remove command");
+        };
+        assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:19780"));
+        assert_eq!(
+            args.control_plane_url.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+
+        Ok(())
     }
 
     #[test]
