@@ -8116,9 +8116,11 @@ impl KubernetesApiRouteDiscovery {
             if let Some(api_server_cidr) = kubernetes_api_server_env_cidr(
                 std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
             )? {
-                api_server_cidrs.push(api_server_cidr);
-                api_server_cidrs.sort();
-                api_server_cidrs.dedup();
+                push_uncovered_kubernetes_api_server_cidr(
+                    &mut api_server_cidrs,
+                    &service_cidrs,
+                    api_server_cidr,
+                );
             }
         }
         if api_server_cidrs.is_empty() && service_cidrs.is_empty() {
@@ -8516,6 +8518,24 @@ fn kubernetes_api_server_env_cidr(
     )?))
 }
 
+fn push_uncovered_kubernetes_api_server_cidr(
+    api_server_cidrs: &mut Vec<ipnet::IpNet>,
+    service_cidrs: &[ipnet::IpNet],
+    api_server_cidr: ipnet::IpNet,
+) {
+    let already_covered = api_server_cidrs
+        .iter()
+        .chain(service_cidrs.iter())
+        .any(|existing| ip_cidrs_overlap(existing, &api_server_cidr));
+    if already_covered {
+        return;
+    }
+
+    api_server_cidrs.push(api_server_cidr);
+    api_server_cidrs.sort();
+    api_server_cidrs.dedup();
+}
+
 fn ip_addr_to_host_cidr(addr: IpAddr) -> anyhow::Result<ipnet::IpNet> {
     let prefix_len = match addr {
         IpAddr::V4(_) => 32,
@@ -8543,9 +8563,11 @@ fn kubernetes_underlay_intent_with_api_server_host(
     let mut api_server_cidrs = args.kubernetes_api_server_cidrs.clone();
     if args.kubernetes_discover_api_server {
         if let Some(api_server_cidr) = kubernetes_api_server_env_cidr(service_host)? {
-            api_server_cidrs.push(api_server_cidr);
-            api_server_cidrs.sort();
-            api_server_cidrs.dedup();
+            push_uncovered_kubernetes_api_server_cidr(
+                &mut api_server_cidrs,
+                &args.kubernetes_service_cidrs,
+                api_server_cidr,
+            );
         }
     }
 
@@ -20949,10 +20971,42 @@ exec sleep 60
 
         if let Command::Agent(args) = cli.command {
             let local = NodeId::from_string("local-node");
-            let intent = kubernetes_underlay_intent(&args, local.clone())?;
+            let intent =
+                kubernetes_underlay_intent_with_api_server_host(&args, local.clone(), None)?;
             assert_eq!(intent.node_name, "worker-a");
             assert_eq!(intent.overlay_interface, "ipars0");
             assert_eq!(intent.route_provider, local);
+            assert!(intent.api_server_cidrs.is_empty());
+            assert_eq!(
+                intent.service_cidrs,
+                vec!["10.96.0.0/12".parse::<ipnet::IpNet>()?]
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn kubernetes_underlay_intent_skips_api_server_host_route_covered_by_service_cidr(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-node-name",
+            "worker-a",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let intent = kubernetes_underlay_intent_with_api_server_host(
+                &args,
+                NodeId::from_string("local-node"),
+                Some(OsStr::new("10.96.0.1")),
+            )?;
+
             assert!(intent.api_server_cidrs.is_empty());
             assert_eq!(
                 intent.service_cidrs,
