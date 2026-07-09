@@ -13065,6 +13065,7 @@ pub mod api {
         properties_end: usize,
     ) -> bool {
         let mut property_count = 0_usize;
+        let mut seen_subscription_identifier = false;
         while offset < properties_end {
             property_count += 1;
             if property_count > 64 {
@@ -13076,6 +13077,12 @@ pub mod api {
                 return false;
             };
             offset = value_offset;
+            if property_id == 0x0b {
+                if seen_subscription_identifier {
+                    return false;
+                }
+                seen_subscription_identifier = true;
+            }
             let Some(next_offset) =
                 mqtt_v5_subscribe_property(payload, offset, properties_end, property_id)
             else {
@@ -21573,6 +21580,15 @@ mod tests {
             observation_for_payload(&mqtt_subscribe_v5_packet(
                 12,
                 &[0x0b, 0x00],
+                &[(b"sensors/+/temp".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                12,
+                &[0x0b, 0x2a, 0x0b, 0x2b],
                 &[(b"sensors/+/temp".as_slice(), 1)]
             ))
             .application(),
