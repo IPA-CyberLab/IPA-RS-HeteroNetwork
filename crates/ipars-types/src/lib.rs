@@ -13283,6 +13283,74 @@ pub mod api {
         Some(next_offset)
     }
 
+    fn mqtt_v5_will_properties(payload: &[u8], mut offset: usize, properties_end: usize) -> bool {
+        let mut property_count = 0_usize;
+        let mut seen_single = 0_u128;
+        while offset < properties_end {
+            property_count += 1;
+            if property_count > 64 {
+                return false;
+            }
+            let Some((property_id, value_offset)) =
+                mqtt_variable_integer_until(payload, offset, properties_end)
+            else {
+                return false;
+            };
+            offset = value_offset;
+            if property_id != 0x26 {
+                let Some(property_bit) = 1_u128.checked_shl(property_id as u32) else {
+                    return false;
+                };
+                if seen_single & property_bit != 0 {
+                    return false;
+                }
+                seen_single |= property_bit;
+            }
+            let Some(next_offset) =
+                mqtt_v5_will_property(payload, offset, properties_end, property_id)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == properties_end
+    }
+
+    fn mqtt_v5_will_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+        property_id: usize,
+    ) -> Option<usize> {
+        match property_id {
+            0x02 | 0x18 => {
+                let next_offset = offset.checked_add(4)?;
+                payload
+                    .get(offset..next_offset)
+                    .filter(|_| next_offset <= properties_end)
+                    .map(|_| next_offset)
+            }
+            0x01 => {
+                let value = *payload.get(offset)?;
+                let next_offset = offset.checked_add(1)?;
+                (next_offset <= properties_end && matches!(value, 0 | 1)).then_some(next_offset)
+            }
+            0x03 | 0x08 => {
+                let (value, next_offset) = mqtt_utf8_field(payload, offset, properties_end)?;
+                let valid =
+                    property_id != 0x08 || !value.iter().any(|byte| matches!(*byte, b'+' | b'#'));
+                valid.then_some(next_offset)
+            }
+            0x09 => {
+                let (_value, next_offset) =
+                    mqtt_len_prefixed_field(payload, offset, properties_end)?;
+                Some(next_offset)
+            }
+            0x26 => mqtt_v5_user_property(payload, offset, properties_end),
+            _ => None,
+        }
+    }
+
     fn mqtt_connect_payload(
         payload: &[u8],
         payload_start: usize,
@@ -13310,7 +13378,9 @@ pub mod api {
                 else {
                     return false;
                 };
-                if will_topic_offset > remaining_end {
+                if will_topic_offset > remaining_end
+                    || !mqtt_v5_will_properties(payload, will_properties_offset, will_topic_offset)
+                {
                     return false;
                 }
                 offset = will_topic_offset;
@@ -17373,6 +17443,12 @@ mod tests {
         fn mqtt_field(value: &[u8]) -> Vec<u8> {
             let mut field = (value.len() as u16).to_be_bytes().to_vec();
             field.extend_from_slice(value);
+            field
+        }
+
+        fn mqtt_properties_field(properties: &[u8]) -> Vec<u8> {
+            let mut field = mqtt_remaining_length(properties.len());
+            field.extend_from_slice(properties);
             field
         }
 
@@ -21938,6 +22014,30 @@ mod tests {
             .application(),
             api::AgentPacketFlowApplication::Mqtt
         );
+        let mut mqtt_v5_will_properties = vec![0x18];
+        mqtt_v5_will_properties.extend_from_slice(&5_u32.to_be_bytes());
+        mqtt_v5_will_properties.push(0x01);
+        mqtt_v5_will_properties.push(1);
+        mqtt_v5_will_properties.push(0x03);
+        mqtt_v5_will_properties.extend_from_slice(&mqtt_field(b"text/plain"));
+        mqtt_v5_will_properties.push(0x26);
+        mqtt_v5_will_properties.extend_from_slice(&mqtt_field(b"source"));
+        mqtt_v5_will_properties.extend_from_slice(&mqtt_field(b"agent"));
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x06,
+                &[],
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_properties_field(&mqtt_v5_will_properties),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
         assert_eq!(
             observation_for_payload(&mqtt_connack_packet(0x00, 0x00, None)).application(),
             api::AgentPacketFlowApplication::Mqtt
@@ -22109,6 +22209,55 @@ mod tests {
                 0x02,
                 &[0x17, 0x02],
                 &[mqtt_field(b"agent")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x06,
+                &[],
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_properties_field(&[0x11, 0, 0, 0, 30]),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_duplicate_will_property = vec![0x18];
+        mqtt_duplicate_will_property.extend_from_slice(&5_u32.to_be_bytes());
+        mqtt_duplicate_will_property.push(0x18);
+        mqtt_duplicate_will_property.extend_from_slice(&10_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x06,
+                &[],
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_properties_field(&mqtt_duplicate_will_property),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x06,
+                &[],
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_properties_field(&[0x01, 0x02]),
+                    mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
             ))
             .application(),
             api::AgentPacketFlowApplication::Unknown
