@@ -14260,7 +14260,7 @@ pub mod api {
         let Some(query_offset) = skip_offset.checked_add(8) else {
             return false;
         };
-        flags & !0x7f == 0
+        mongodb_op_query_flags(flags)
             && mongodb_collection_namespace(namespace)
             && query_offset <= message_len
             && payload.len() >= skip_offset.saturating_add(8)
@@ -14316,6 +14316,10 @@ pub mod api {
             return false;
         };
         expected_len == message_len && payload.len() >= expected_len
+    }
+
+    fn mongodb_op_query_flags(flags: u32) -> bool {
+        flags & !0xfe == 0
     }
 
     fn mongodb_op_msg_payload(payload: &[u8], message_len: usize) -> bool {
@@ -22439,6 +22443,17 @@ mod tests {
             observation_for_payload(&mongodb_message(2004, &mongodb_op_query)).application(),
             api::AgentPacketFlowApplication::MongoDb
         );
+        let mut mongodb_op_query_partial_flag = Vec::new();
+        mongodb_op_query_partial_flag.extend_from_slice(&0x80_u32.to_le_bytes());
+        mongodb_op_query_partial_flag.extend_from_slice(b"admin.$cmd\0");
+        mongodb_op_query_partial_flag.extend_from_slice(&0_i32.to_le_bytes());
+        mongodb_op_query_partial_flag.extend_from_slice(&1_i32.to_le_bytes());
+        mongodb_op_query_partial_flag.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &mongodb_op_query_partial_flag))
+                .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
         let mut mongodb_op_reply = Vec::new();
         mongodb_op_reply.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_reply.extend_from_slice(&0_u64.to_le_bytes());
@@ -22459,6 +22474,17 @@ mod tests {
         invalid_mongodb_query_trailing.extend_from_slice(b"junk");
         assert_eq!(
             observation_for_payload(&mongodb_message(2004, &invalid_mongodb_query_trailing))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_query_reserved_flag = Vec::new();
+        invalid_mongodb_query_reserved_flag.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_mongodb_query_reserved_flag.extend_from_slice(b"admin.$cmd\0");
+        invalid_mongodb_query_reserved_flag.extend_from_slice(&0_i32.to_le_bytes());
+        invalid_mongodb_query_reserved_flag.extend_from_slice(&1_i32.to_le_bytes());
+        invalid_mongodb_query_reserved_flag.extend_from_slice(&empty_bson);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2004, &invalid_mongodb_query_reserved_flag))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
         );
