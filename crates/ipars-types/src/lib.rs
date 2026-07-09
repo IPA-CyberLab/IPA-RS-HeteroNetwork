@@ -15531,7 +15531,7 @@ pub mod api {
         offset: usize,
         message_len: usize,
     ) -> Option<usize> {
-        mongodb_bson_document_prefix_with_depth(payload, offset, message_len, 0)
+        mongodb_bson_document_prefix_with_depth(payload, offset, message_len, 0, false)
     }
 
     fn mongodb_bson_document_prefix_with_depth(
@@ -15539,6 +15539,7 @@ pub mod api {
         offset: usize,
         message_len: usize,
         depth: usize,
+        is_array: bool,
     ) -> Option<usize> {
         if depth > 16 {
             return None;
@@ -15555,7 +15556,13 @@ pub mod api {
             return None;
         }
         if payload.len() >= document_end
-            && !mongodb_bson_document_fields(payload, offset.checked_add(4)?, document_end, depth)
+            && !mongodb_bson_document_fields(
+                payload,
+                offset.checked_add(4)?,
+                document_end,
+                depth,
+                is_array,
+            )
         {
             return None;
         }
@@ -15567,6 +15574,7 @@ pub mod api {
         mut offset: usize,
         document_end: usize,
         depth: usize,
+        is_array: bool,
     ) -> bool {
         let Some(fields_end) = document_end.checked_sub(1) else {
             return false;
@@ -15587,6 +15595,9 @@ pub mod api {
             else {
                 return false;
             };
+            if is_array && !mongodb_bson_array_index_name(field_name, field_names.len()) {
+                return false;
+            }
             if field_names.iter().any(|existing| *existing == field_name) {
                 return false;
             }
@@ -15602,6 +15613,26 @@ pub mod api {
             offset = next_offset;
         }
         offset == fields_end
+    }
+
+    fn mongodb_bson_array_index_name(name: &[u8], expected_index: usize) -> bool {
+        if name.is_empty() || (name.len() > 1 && name.first() == Some(&b'0')) {
+            return false;
+        }
+        let mut value = 0_usize;
+        for byte in name {
+            if !byte.is_ascii_digit() {
+                return false;
+            }
+            value = value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add((*byte - b'0') as usize))
+                .unwrap_or(usize::MAX);
+            if value > expected_index {
+                return false;
+            }
+        }
+        value == expected_index
     }
 
     fn mongodb_bson_value_end(
@@ -15638,6 +15669,7 @@ pub mod api {
                 offset,
                 document_end,
                 depth.checked_add(1)?,
+                element_type == 0x04,
             ),
             0x05 => {
                 let len = read_u32_le(payload, offset)? as usize;
@@ -15703,6 +15735,7 @@ pub mod api {
             scope_offset,
             value_end,
             depth.checked_add(1)?,
+            false,
         )?;
         (scope_end == value_end).then_some(value_end)
     }
@@ -18869,6 +18902,15 @@ mod tests {
                 body.push(0);
                 body.extend_from_slice(&value.to_le_bytes());
             }
+            mongodb_bson_document_from_body(&body)
+        }
+
+        fn mongodb_document_with_array(name: &[u8], array_document: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x04);
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(array_document);
             mongodb_bson_document_from_body(&body)
         }
 
@@ -25032,6 +25074,8 @@ mod tests {
         );
         let empty_bson = mongodb_empty_document();
         let mongodb_ping_document = mongodb_i32_document(&[(b"ping", 1)]);
+        let mongodb_array_document =
+            mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"0", 1), (b"1", 2)]));
         let mut mongodb_op_msg = Vec::new();
         mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_msg.push(0);
@@ -25046,6 +25090,18 @@ mod tests {
                 &mongodb_op_msg_body(
                     0,
                     &[mongodb_op_msg_body_section(&mongodb_ping_document)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_array_document)],
                     None
                 )
             ))
@@ -25242,6 +25298,36 @@ mod tests {
                 &mongodb_op_msg_body(
                     0,
                     &[mongodb_op_msg_body_section(&mongodb_invalid_bool_document)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_array_starts_at_one =
+            mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"1", 1)]));
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_array_starts_at_one)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_array_with_leading_zero =
+            mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"0", 1), (b"01", 2)]));
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_array_with_leading_zero
+                    )],
                     None
                 )
             ))
