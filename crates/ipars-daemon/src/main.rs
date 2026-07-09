@@ -8430,6 +8430,7 @@ fn kubernetes_service_cluster_ips(
     service: &KubernetesService,
     service_index: usize,
 ) -> anyhow::Result<Vec<IpAddr>> {
+    let primary_is_headless = service.spec.cluster_ip.as_deref() == Some("None");
     let primary_cluster_ip = service
         .spec
         .cluster_ip
@@ -8439,7 +8440,11 @@ fn kubernetes_service_cluster_ips(
         .flatten();
     let mut addresses = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut saw_headless_cluster_ips_marker = false;
     for value in &service.spec.cluster_ips {
+        if value == "None" {
+            saw_headless_cluster_ips_marker = true;
+        }
         let Some(addr) = kubernetes_parse_service_cluster_ip(value, service_index)? else {
             continue;
         };
@@ -8449,6 +8454,16 @@ fn kubernetes_service_cluster_ips(
             );
         }
         addresses.push(addr);
+    }
+    if primary_is_headless && !addresses.is_empty() {
+        anyhow::bail!(
+            "Kubernetes Service index {service_index} clusterIP `None` cannot be combined with assigned clusterIPs values"
+        );
+    }
+    if saw_headless_cluster_ips_marker && !addresses.is_empty() {
+        anyhow::bail!(
+            "Kubernetes Service index {service_index} clusterIPs `None` marker cannot be combined with assigned cluster IP values"
+        );
     }
     if let Some(primary) = primary_cluster_ip {
         if let Some(first_cluster_ip) = addresses.first() {
@@ -21413,6 +21428,40 @@ exec sleep 60
         };
         assert!(error
             .contains("clusterIP `10.96.0.10` does not match first clusterIPs value `10.96.0.11`"));
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_service_route_cidrs_reject_headless_ip_mixing() -> anyhow::Result<()> {
+        let headless_with_assigned_ips = KubernetesServiceList {
+            items: vec![kubernetes_service(Some("None"), &["10.96.0.10"])],
+        };
+        let error = match kubernetes_service_route_cidrs(&headless_with_assigned_ips) {
+            Ok(_) => anyhow::bail!("headless Kubernetes Service with assigned IPs should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("clusterIP `None` cannot be combined"));
+
+        let mixed_cluster_ips_marker = KubernetesServiceList {
+            items: vec![kubernetes_service(
+                Some("10.96.0.10"),
+                &["None", "10.96.0.10"],
+            )],
+        };
+        let error = match kubernetes_service_route_cidrs(&mixed_cluster_ips_marker) {
+            Ok(_) => anyhow::bail!("mixed headless marker clusterIPs should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("clusterIPs `None` marker cannot be combined"));
+
+        let missing_primary_with_mixed_marker = KubernetesServiceList {
+            items: vec![kubernetes_service(None, &["None", "10.96.0.10"])],
+        };
+        let error = match kubernetes_service_route_cidrs(&missing_primary_with_mixed_marker) {
+            Ok(_) => anyhow::bail!("mixed headless marker without primary should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("clusterIPs `None` marker cannot be combined"));
         Ok(())
     }
 
