@@ -842,6 +842,10 @@ struct K8sInstallArgs {
     relay_admission_url: Option<String>,
     #[arg(long, requires = "expose_relay")]
     relay_status_url: Option<String>,
+    #[arg(long = "relay-max-sessions", default_value_t = DEFAULT_RELAY_MAX_SESSIONS)]
+    relay_max_sessions: u32,
+    #[arg(long = "relay-max-mbps", default_value_t = DEFAULT_RELAY_MAX_MBPS)]
+    relay_max_mbps: u32,
     #[arg(long = "relay-forwarder-endpoint")]
     relay_forwarder_endpoint: Option<String>,
     #[arg(
@@ -5910,6 +5914,14 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 relay_status_url,
             );
         }
+        helm_command.push_str(&format!(
+            " --set agent.relayAdvertisement.maxSessions={}",
+            args.relay_max_sessions
+        ));
+        helm_command.push_str(&format!(
+            " --set agent.relayAdvertisement.maxMbps={}",
+            args.relay_max_mbps
+        ));
         for annotation in &args.relay_service_annotations {
             append_helm_set_string(
                 &mut helm_command,
@@ -6678,7 +6690,20 @@ fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()>
         if args.relay_status_url.is_some() {
             anyhow::bail!("--relay-status-url requires --expose-relay");
         }
+        if args.relay_max_sessions != DEFAULT_RELAY_MAX_SESSIONS {
+            anyhow::bail!("--relay-max-sessions requires --expose-relay");
+        }
+        if args.relay_max_mbps != DEFAULT_RELAY_MAX_MBPS {
+            anyhow::bail!("--relay-max-mbps requires --expose-relay");
+        }
         return Ok(());
+    }
+
+    if args.relay_max_sessions == 0 {
+        anyhow::bail!("--relay-max-sessions must be greater than zero");
+    }
+    if args.relay_max_mbps == 0 {
+        anyhow::bail!("--relay-max-mbps must be greater than zero");
     }
 
     let public_endpoint = args
@@ -12259,6 +12284,8 @@ fi
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: Some("http://203.0.113.10:9580".to_string()),
+            relay_max_sessions: 4321,
+            relay_max_mbps: 876,
             relay_forwarder_endpoint: Some("127.0.0.1:45182".to_string()),
             relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
             relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
@@ -12387,6 +12414,8 @@ fi
         ));
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdvertisement.statusUrl=http://203.0.113.10:9580"));
+        assert!(plan.commands[2].contains("--set agent.relayAdvertisement.maxSessions=4321"));
+        assert!(plan.commands[2].contains("--set agent.relayAdvertisement.maxMbps=876"));
         assert!(plan.commands[2].contains(
             "--set-string agent.relayAdmissionBearerTokenSecret.name=relay-admission-token"
         ));
@@ -13413,6 +13442,36 @@ fi
         };
         assert!(error
             .contains("--relay-status-url host must not use link-local address 169.254.169.254"));
+
+        let mut inactive_capacity = base_k8s_install_args();
+        inactive_capacity.relay_max_sessions = 4321;
+        let error = match k8s_install_plan(inactive_capacity) {
+            Ok(_) => panic!("inactive relay advertisement capacity should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-max-sessions requires --expose-relay"));
+
+        let mut zero_capacity = base_k8s_install_args();
+        zero_capacity.expose_relay = true;
+        zero_capacity.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        zero_capacity.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        zero_capacity.relay_max_sessions = 0;
+        let error = match k8s_install_plan(zero_capacity) {
+            Ok(_) => panic!("zero relay max sessions should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-max-sessions must be greater than zero"));
+
+        let mut zero_bandwidth = base_k8s_install_args();
+        zero_bandwidth.expose_relay = true;
+        zero_bandwidth.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        zero_bandwidth.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        zero_bandwidth.relay_max_mbps = 0;
+        let error = match k8s_install_plan(zero_bandwidth) {
+            Ok(_) => panic!("zero relay max Mbps should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-max-mbps must be greater than zero"));
 
         let mut valid_ipv6 = base_k8s_install_args();
         valid_ipv6.expose_relay = true;
@@ -14504,6 +14563,8 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -16519,6 +16580,8 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -16687,6 +16750,8 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -18154,6 +18219,8 @@ fi
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -18309,6 +18376,8 @@ fi
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -18598,6 +18667,8 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -18758,6 +18829,8 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -18913,6 +18986,8 @@ fi
             relay_public_endpoint: Some("203.0.113.10:51820".to_string()),
             relay_admission_url: Some("http://203.0.113.10:9580".to_string()),
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,

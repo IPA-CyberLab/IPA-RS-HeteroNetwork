@@ -82,7 +82,14 @@ ipars k8s install \
   --release ipars \
   --namespace ipars-system \
   --join-token-secret ipars-join-token \
-  --join-token-key token
+  --join-token-key token \
+  --expose-relay \
+  --relay-public-endpoint 203.0.113.10:51820 \
+  --relay-admission-url https://relay.example.com:9580 \
+  --relay-max-sessions 10000 \
+  --relay-max-mbps 1000 \
+  --allow-public-service-exposure \
+  --relay-allow-source-cidr 203.0.113.0/24
 ```
 
 Render and validate common chart modes with:
