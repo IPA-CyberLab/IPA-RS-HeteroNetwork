@@ -15414,6 +15414,8 @@ pub mod api {
         let Some(flags) = read_u32_le(payload, 16) else {
             return false;
         };
+        // Required bits 2-15 are reserved by the wire protocol. Optional bits
+        // 16-31 may be forwarded by newer peers and are ignored by parsers.
         if flags & 0x0000_fffc != 0 {
             return false;
         }
@@ -15427,33 +15429,76 @@ pub mod api {
         mongodb_op_msg_sections(payload, 20, section_limit)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MongodbOpMsgSectionKind {
+        Body,
+        DocumentSequence,
+    }
+
+    struct MongodbOpMsgSection<'a> {
+        kind: MongodbOpMsgSectionKind,
+        identifier: Option<&'a [u8]>,
+        next_offset: usize,
+    }
+
     fn mongodb_op_msg_sections(payload: &[u8], mut offset: usize, section_limit: usize) -> bool {
         let full_message = mongodb_full_message_observed(payload, section_limit);
         let mut section_count = 0_usize;
+        let mut body_count = 0_usize;
+        let mut sequence_identifiers: Vec<&[u8]> = Vec::new();
         while offset < section_limit {
-            let Some(next_offset) = mongodb_op_msg_section(payload, offset, section_limit) else {
+            let Some(section) = mongodb_op_msg_section(payload, offset, section_limit) else {
                 return false;
             };
             section_count += 1;
-            if next_offset > payload.len() {
+            if section_count > 64 {
+                return false;
+            }
+            match section.kind {
+                MongodbOpMsgSectionKind::Body => {
+                    body_count += 1;
+                    if body_count > 1 {
+                        return false;
+                    }
+                }
+                MongodbOpMsgSectionKind::DocumentSequence => {
+                    let Some(identifier) = section.identifier else {
+                        return false;
+                    };
+                    if sequence_identifiers
+                        .iter()
+                        .any(|existing| *existing == identifier)
+                    {
+                        return false;
+                    }
+                    sequence_identifiers.push(identifier);
+                }
+            }
+            if section.next_offset > payload.len() {
                 return !full_message;
             }
-            offset = next_offset;
+            offset = section.next_offset;
             if !full_message && offset >= payload.len() {
                 return true;
             }
         }
-        section_count > 0 && offset == section_limit
+        section_count > 0 && body_count == 1 && offset == section_limit
     }
 
-    fn mongodb_op_msg_section(
-        payload: &[u8],
+    fn mongodb_op_msg_section<'a>(
+        payload: &'a [u8],
         offset: usize,
         section_limit: usize,
-    ) -> Option<usize> {
+    ) -> Option<MongodbOpMsgSection<'a>> {
         let section_kind = *payload.get(offset)?;
         match section_kind {
-            0 => mongodb_bson_document_prefix(payload, offset.checked_add(1)?, section_limit),
+            0 => mongodb_bson_document_prefix(payload, offset.checked_add(1)?, section_limit).map(
+                |next_offset| MongodbOpMsgSection {
+                    kind: MongodbOpMsgSectionKind::Body,
+                    identifier: None,
+                    next_offset,
+                },
+            ),
             1 => {
                 let section_size = read_u32_le(payload, offset.checked_add(1)?)? as usize;
                 if !(6..=16_777_216).contains(&section_size) {
@@ -15471,7 +15516,11 @@ pub mod api {
                 }
                 mongodb_bson_document_sequence(payload, document_offset, section_end, 0, None)
                     .then_some(())?;
-                Some(section_end)
+                Some(MongodbOpMsgSection {
+                    kind: MongodbOpMsgSectionKind::DocumentSequence,
+                    identifier: Some(identifier),
+                    next_offset: section_end,
+                })
             }
             _ => None,
         }
@@ -18638,6 +18687,38 @@ mod tests {
 
         fn mongodb_empty_document() -> [u8; 5] {
             [5, 0, 0, 0, 0]
+        }
+
+        fn mongodb_op_msg_body(flags: u32, sections: &[Vec<u8>], checksum: Option<u32>) -> Vec<u8> {
+            let mut body = flags.to_le_bytes().to_vec();
+            for section in sections {
+                body.extend_from_slice(section);
+            }
+            if let Some(checksum) = checksum {
+                body.extend_from_slice(&checksum.to_le_bytes());
+            }
+            body
+        }
+
+        fn mongodb_op_msg_body_section(document: &[u8]) -> Vec<u8> {
+            let mut section = vec![0];
+            section.extend_from_slice(document);
+            section
+        }
+
+        fn mongodb_op_msg_document_sequence(identifier: &[u8], documents: &[&[u8]]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(identifier);
+            body.push(0);
+            for document in documents {
+                body.extend_from_slice(document);
+            }
+
+            let section_size = 4 + body.len();
+            let mut section = vec![1];
+            section.extend_from_slice(&(section_size as u32).to_le_bytes());
+            section.extend_from_slice(&body);
+            section
         }
 
         fn elasticsearch_transport_frame(
@@ -24773,6 +24854,30 @@ mod tests {
                 .application(),
             api::AgentPacketFlowApplication::MongoDb
         );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0x0001_0000,
+                    &[mongodb_op_msg_body_section(&empty_bson)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0x0000_0001,
+                    &[mongodb_op_msg_body_section(&empty_bson)],
+                    Some(0x1234_5678)
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
         let mut mongodb_compressed = Vec::new();
         mongodb_compressed.extend_from_slice(&2013_u32.to_le_bytes());
         mongodb_compressed.extend_from_slice(&(b"compressed".len() as u32).to_le_bytes());
@@ -24900,6 +25005,76 @@ mod tests {
         invalid_mongodb_op_msg.push(0);
         assert_eq!(
             observation_for_payload(&mongodb_message(2013, &invalid_mongodb_op_msg)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[
+                        mongodb_op_msg_body_section(&empty_bson),
+                        mongodb_op_msg_body_section(&empty_bson)
+                    ],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_document_sequence(
+                        b"documents",
+                        &[&empty_bson]
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[
+                        mongodb_op_msg_body_section(&empty_bson),
+                        mongodb_op_msg_document_sequence(b"documents", &[&empty_bson]),
+                        mongodb_op_msg_document_sequence(b"documents", &[&empty_bson])
+                    ],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0x0000_0004,
+                    &[mongodb_op_msg_body_section(&empty_bson)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0x0000_0001,
+                    &[mongodb_op_msg_body_section(&empty_bson)],
+                    None
+                )
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut invalid_mongodb_query = Vec::new();
