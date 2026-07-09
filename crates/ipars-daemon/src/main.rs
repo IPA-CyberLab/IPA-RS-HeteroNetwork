@@ -8383,8 +8383,8 @@ fn kubernetes_service_route_cidrs(
 ) -> anyhow::Result<Vec<ipnet::IpNet>> {
     validate_kubernetes_services_shape(services)?;
     let mut cidrs = Vec::new();
-    for service in &services.items {
-        for cluster_ip in kubernetes_service_cluster_ips(service) {
+    for (service_index, service) in services.items.iter().enumerate() {
+        for cluster_ip in kubernetes_service_cluster_ips(service, service_index)? {
             cidrs.push(ip_addr_to_host_cidr(cluster_ip)?);
         }
     }
@@ -8426,7 +8426,10 @@ fn validate_kubernetes_services_shape(services: &KubernetesServiceList) -> anyho
     Ok(())
 }
 
-fn kubernetes_service_cluster_ips(service: &KubernetesService) -> Vec<IpAddr> {
+fn kubernetes_service_cluster_ips(
+    service: &KubernetesService,
+    service_index: usize,
+) -> anyhow::Result<Vec<IpAddr>> {
     let mut addresses = Vec::new();
     for value in service
         .spec
@@ -8437,13 +8440,14 @@ fn kubernetes_service_cluster_ips(service: &KubernetesService) -> Vec<IpAddr> {
         if value == "None" || value.is_empty() {
             continue;
         }
-        if let Ok(addr) = value.parse::<IpAddr>() {
-            addresses.push(addr);
-        }
+        let addr = value.parse::<IpAddr>().with_context(|| {
+            format!("Kubernetes Service index {service_index} has invalid cluster IP `{value}`")
+        })?;
+        addresses.push(addr);
     }
     addresses.sort();
     addresses.dedup();
-    addresses
+    Ok(addresses)
 }
 
 fn kubernetes_api_server_env_cidr(
@@ -21324,6 +21328,35 @@ exec sleep 60
         };
         assert!(error.contains("cluster IP value longer than"));
         assert!(error.contains(&MAX_KUBERNETES_CLUSTER_IP_BYTES.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_service_route_cidrs_reject_invalid_cluster_ips() -> anyhow::Result<()> {
+        let headless_and_empty = KubernetesServiceList {
+            items: vec![kubernetes_service(Some("None"), &["", "None"])],
+        };
+        assert!(kubernetes_service_route_cidrs(&headless_and_empty)?.is_empty());
+
+        let invalid_cluster_ip = KubernetesServiceList {
+            items: vec![kubernetes_service(Some("not-an-ip"), &[])],
+        };
+        let error = match kubernetes_service_route_cidrs(&invalid_cluster_ip) {
+            Ok(_) => anyhow::bail!("invalid Kubernetes clusterIP should be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("Kubernetes Service index 0 has invalid cluster IP `not-an-ip`"));
+
+        let invalid_cluster_ips = KubernetesServiceList {
+            items: vec![kubernetes_service(None, &["10.96.0.10", "still-not-an-ip"])],
+        };
+        let error = match kubernetes_service_route_cidrs(&invalid_cluster_ips) {
+            Ok(_) => anyhow::bail!("invalid Kubernetes clusterIPs entry should be rejected"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("Kubernetes Service index 0 has invalid cluster IP `still-not-an-ip`")
+        );
         Ok(())
     }
 
