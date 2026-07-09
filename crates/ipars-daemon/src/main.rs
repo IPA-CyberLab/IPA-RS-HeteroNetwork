@@ -148,6 +148,7 @@ const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
+const MAX_USERSPACE_WIREGUARD_ARGV_BYTES: usize = 512 * 1024;
 const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -1679,11 +1680,12 @@ fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand,
         "--userspace-wireguard-command and --userspace-wireguard-arg require --wireguard-backend userspace-command"
     );
-    if let Some(command) = args.userspace_wireguard_command.as_deref() {
+    let mut argv_bytes = if let Some(command) = args.userspace_wireguard_command.as_deref() {
         validate_runtime_program_token(command, "--userspace-wireguard-command")?;
+        command.len()
     } else {
         anyhow::bail!("--userspace-wireguard-arg requires --userspace-wireguard-command");
-    }
+    };
     anyhow::ensure!(
         args.userspace_wireguard_args.len() <= MAX_USERSPACE_WIREGUARD_ARGS,
         "--userspace-wireguard-arg may be repeated at most {MAX_USERSPACE_WIREGUARD_ARGS} times"
@@ -1699,6 +1701,12 @@ fn validate_userspace_wireguard_config(args: &AgentArgs) -> anyhow::Result<()> {
         }
         if argument.chars().any(char::is_control) {
             anyhow::bail!("--userspace-wireguard-arg must not contain control characters");
+        }
+        argv_bytes = argv_bytes.saturating_add(argument.len());
+        if argv_bytes > MAX_USERSPACE_WIREGUARD_ARGV_BYTES {
+            anyhow::bail!(
+                "--userspace-wireguard-command and --userspace-wireguard-arg values exceed {MAX_USERSPACE_WIREGUARD_ARGV_BYTES} total bytes"
+            );
         }
     }
     Ok(())
@@ -6479,6 +6487,7 @@ fn validate_userspace_wireguard_spawn_command(command: &LinuxCommand) -> anyhow:
         "userspace WireGuard spawn command has too many arguments: {} > {MAX_USERSPACE_WIREGUARD_SPAWN_ARGS}",
         command.args.len()
     );
+    let mut argv_bytes = command.program.len();
     for (index, argument) in command.args.iter().enumerate() {
         anyhow::ensure!(
             argument.len() <= MAX_USERSPACE_WIREGUARD_ARG_BYTES,
@@ -6487,6 +6496,15 @@ fn validate_userspace_wireguard_spawn_command(command: &LinuxCommand) -> anyhow:
         anyhow::ensure!(
             !argument.as_bytes().contains(&0),
             "userspace WireGuard spawn command argument {index} must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            !argument.chars().any(char::is_control),
+            "userspace WireGuard spawn command argument {index} must not contain control characters"
+        );
+        argv_bytes = argv_bytes.saturating_add(argument.len());
+        anyhow::ensure!(
+            argv_bytes <= MAX_USERSPACE_WIREGUARD_ARGV_BYTES,
+            "userspace WireGuard spawn command argv exceeds {MAX_USERSPACE_WIREGUARD_ARGV_BYTES} bytes"
         );
     }
     Ok(())
@@ -18790,6 +18808,17 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .to_string()
             .contains("argument 1 must not contain NUL bytes"));
 
+        let control_error = match resolve_userspace_wireguard_spawn_command(&LinuxCommand::new(
+            command_path.display().to_string(),
+            ["ok".to_string(), "bad\narg".to_string()],
+        )) {
+            Ok(_) => anyhow::bail!("unexpected valid control-character userspace argv"),
+            Err(error) => error,
+        };
+        assert!(control_error
+            .to_string()
+            .contains("argument 1 must not contain control characters"));
+
         let too_many_error = match resolve_userspace_wireguard_spawn_command(&LinuxCommand::new(
             command_path.display().to_string(),
             std::iter::repeat_n("arg".to_string(), MAX_USERSPACE_WIREGUARD_SPAWN_ARGS + 1),
@@ -18800,6 +18829,21 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(too_many_error
             .to_string()
             .contains("userspace WireGuard spawn command has too many arguments"));
+
+        let oversized_argv_error =
+            match resolve_userspace_wireguard_spawn_command(&LinuxCommand::new(
+                command_path.display().to_string(),
+                std::iter::repeat_n(
+                    "x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES),
+                    MAX_USERSPACE_WIREGUARD_SPAWN_ARGS,
+                ),
+            )) {
+                Ok(_) => anyhow::bail!("unexpected valid oversized userspace argv bytes"),
+                Err(error) => error,
+            };
+        assert!(oversized_argv_error
+            .to_string()
+            .contains("userspace WireGuard spawn command argv exceeds"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
@@ -19031,6 +19075,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 "x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES + 1),
             ],
             "--userspace-wireguard-arg exceeds 4096 bytes",
+        )?;
+
+        let mut oversized_argv = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--wireguard-backend".to_string(),
+            "userspace-command".to_string(),
+            "--userspace-wireguard-command".to_string(),
+            "wireguard-go".to_string(),
+        ];
+        for _ in 0..MAX_USERSPACE_WIREGUARD_ARGS {
+            oversized_argv.push("--userspace-wireguard-arg".to_string());
+            oversized_argv.push("x".repeat(MAX_USERSPACE_WIREGUARD_ARG_BYTES));
+        }
+        validate(
+            oversized_argv,
+            "--userspace-wireguard-command and --userspace-wireguard-arg values exceed 524288 total bytes",
         )?;
 
         Ok(())
