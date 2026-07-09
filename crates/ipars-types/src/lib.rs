@@ -13911,7 +13911,7 @@ pub mod api {
             0x07 => cassandra_cql_query_body(version, body_len, body_prefix, true),
             0x09 => cassandra_cql_query_body(version, body_len, body_prefix, false),
             0x0a => cassandra_execute_body(version, body_len, body_prefix),
-            0x0b => cassandra_string_list_body(body_len, body_prefix),
+            0x0b => cassandra_register_body(body_len, body_prefix),
             0x0d => cassandra_batch_body(version, body_len, body_prefix),
             0x0f => cassandra_auth_bytes_body(body_len, body_prefix),
             _ => false,
@@ -14742,6 +14742,37 @@ pub mod api {
         flags & !supported == 0 && flags & 0x0f == 0
     }
 
+    fn cassandra_register_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 3 {
+            return false;
+        }
+
+        let mut offset = 2_usize;
+        let mut has_topology = false;
+        let mut has_status = false;
+        let mut has_schema = false;
+        for _ in 0..count {
+            let Some((event_type, next_offset)) = cassandra_string_field(body_prefix, offset)
+            else {
+                return false;
+            };
+            match event_type {
+                b"TOPOLOGY_CHANGE" if !has_topology => has_topology = true,
+                b"STATUS_CHANGE" if !has_status => has_status = true,
+                b"SCHEMA_CHANGE" if !has_schema => has_schema = true,
+                _ => return false,
+            }
+            offset = next_offset;
+        }
+        offset == body_len
+    }
+
     fn cassandra_query_parameter_header_len(version: u8) -> Option<usize> {
         match version {
             3 | 4 => Some(3),
@@ -14998,14 +15029,6 @@ pub mod api {
             offset = cassandra_bytes_field(payload, next_offset, body_len, false)?;
         }
         Some(offset)
-    }
-
-    fn cassandra_string_list_body(body_len: usize, body_prefix: &[u8]) -> bool {
-        if body_len < 2 || body_prefix.len() < body_len {
-            return false;
-        }
-        cassandra_string_list_field(body_prefix, 0, body_len)
-            .is_some_and(|offset| offset == body_len)
     }
 
     fn cassandra_string_list_field(
@@ -23485,6 +23508,22 @@ mod tests {
             api::AgentPacketFlowApplication::Cassandra
         );
         assert_eq!(
+            observation_for_payload(&cassandra_request_frame(
+                0x0b,
+                &cassandra_string_list(&[b"TOPOLOGY_CHANGE", b"STATUS_CHANGE"])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(
+                0x0b,
+                &cassandra_string_list(&[b"SCHEMA_CHANGE"])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
             observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
             api::AgentPacketFlowApplication::Cassandra
         );
@@ -23692,6 +23731,27 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(0x0b, &cassandra_string_list(&[])))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(
+                0x0b,
+                &cassandra_string_list(&[b"TOPOLOGY_CHANGE", b"TOPOLOGY_CHANGE"])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(
+                0x0b,
+                &cassandra_string_list(&[b"UNKNOWN_EVENT"])
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
