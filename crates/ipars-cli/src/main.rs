@@ -13569,6 +13569,7 @@ fi
         ));
         assert!(helpers.contains("must not be an unrestricted CIDR"));
         assert!(helpers.contains("must be a canonical IPv4 CIDR"));
+        assert!(helpers.contains("must be a canonical IPv6 CIDR"));
         assert!(helpers.contains("must not include unspecified CIDRs"));
         assert!(helpers.contains("must not include loopback CIDRs"));
         assert!(helpers.contains("must not include link-local CIDRs"));

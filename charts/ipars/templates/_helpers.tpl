@@ -50,9 +50,13 @@
 {{- $path := .path -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
 {{- $ipv4 := regexMatch (printf "^%s\\.%s\\.%s\\.%s/([0-9]|[1-2][0-9]|3[0-2])$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $value -}}
-{{- $ipv6 := regexMatch "^[0-9A-Fa-f:.]+/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$" $value -}}
+{{- $ipv6 := and (contains ":" $value) (regexMatch "^[0-9A-Fa-f:.]+/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$" $value) -}}
 {{- if not (or $ipv4 $ipv6) -}}
 {{- fail (printf "%s entry %q must be an IPv4 or IPv6 CIDR" $path $value) -}}
+{{- end -}}
+{{- if $ipv6 -}}
+{{- $parts := splitList "/" $value -}}
+{{- $_ := include "ipars.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -60,7 +64,7 @@
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- include "ipars.validateCidr" (dict "path" $path "value" $value) -}}
-{{- if or (eq $value "0.0.0.0/0") (regexMatch "^[0:]+/0$" $value) -}}
+{{- if or (eq $value "0.0.0.0/0") (and (contains ":" $value) (regexMatch "/0$" $value)) -}}
 {{- fail (printf "%s entry %q must not be an unrestricted CIDR" $path $value) -}}
 {{- end -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value -}}
@@ -91,6 +95,12 @@
 {{- fail (printf "%s entry %q must not include broadcast CIDRs" $path $value) -}}
 {{- end -}}
 {{- else if contains ":" $value -}}
+{{- $parts := splitList "/" $value -}}
+{{- $prefix := int (index $parts 1) -}}
+{{- $bits := include "ipars.ipv6CidrBits" (dict "path" $path "value" $value) -}}
+{{- if regexMatch "1" (substr $prefix 128 $bits) -}}
+{{- fail (printf "%s entry %q must be a canonical IPv6 CIDR" $path $value) -}}
+{{- end -}}
 {{- if regexMatch "^([0:]+|0*:)/" $value -}}
 {{- fail (printf "%s entry %q must not include unspecified CIDRs" $path $value) -}}
 {{- end -}}

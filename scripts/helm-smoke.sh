@@ -338,6 +338,13 @@ assert_rendered_contains load-balancer-source-ranges "loadBalancerSourceRanges:"
 assert_rendered_contains load-balancer-source-ranges "198.51.100.0/24"
 assert_rendered_contains load-balancer-source-ranges "203.0.113.0/24"
 
+template_fails load-balancer-ipv6-source-range-noncanonical \
+  "agent.apiService.loadBalancerSourceRanges entry \"2001:db8:10::1/48\" must be a canonical IPv6 CIDR" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set-string 'agent.apiService.loadBalancerSourceRanges[0]=2001:db8:10::1/48'
+
 template_ok unrestricted-load-balancer \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=LoadBalancer \
@@ -378,6 +385,15 @@ template_ok network-policy-ipv6-source-ranges \
   --set networkPolicy.acknowledgeHostNetwork=true \
   --set networkPolicy.agentApi.enabled=true \
   --set-string 'networkPolicy.agentApi.allowedCidrs[0]=2001:db8:10:1::/64'
+
+template_fails agent-api-ipv6-network-policy-noncanonical \
+  "networkPolicy.agentApi.allowedCidrs entry \"2001:db8:10::1/64\" must be a canonical IPv6 CIDR" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.acknowledgeHostNetwork=true \
+  --set networkPolicy.agentApi.enabled=true \
+  --set-string 'networkPolicy.agentApi.allowedCidrs[0]=2001:db8:10::1/64'
 
 template_fails agent-api-network-policy-broader-than-source-range \
   "networkPolicy.agentApi.allowedCidrs entry \"198.51.0.0/16\" must be contained by one of agent.apiService.loadBalancerSourceRanges values" \
