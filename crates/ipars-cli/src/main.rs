@@ -3876,6 +3876,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_firewall_policy(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer firewall or security groups; use --agent-api-allow-source-cidr, --relay-allow-source-cidr, or NetworkPolicy controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3940,6 +3946,16 @@ fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool
         || key.contains("load-balancer-class")
         || key.contains("loadbalancerclass")
         || key.contains("nlb-target-type")
+}
+
+fn kubernetes_service_annotation_controls_firewall_policy(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("security-group")
+        || key.contains("securitygroup")
+        || key.contains("firewall")
+        || key.contains("allowed-service-tags")
+        || key.contains("allowed-ip-ranges")
+        || key.contains("shared-securityrule")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11772,6 +11788,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-scheme must not configure LoadBalancer scope or implementation type"
         ));
 
+        let mut agent_security_group_annotation = base_k8s_install_args();
+        agent_security_group_annotation.expose_agent_api = true;
+        agent_security_group_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-security-groups".to_string(),
+            value: "sg-0123456789abcdef0".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_security_group_annotation) {
+            Ok(_) => panic!("agent API security group annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-security-groups must not configure LoadBalancer firewall or security groups"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -11927,6 +11957,23 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key cloud.google.com/load-balancer-type must not configure LoadBalancer scope or implementation type"
+        ));
+
+        let mut relay_firewall_annotation = base_k8s_install_args();
+        relay_firewall_annotation.expose_relay = true;
+        relay_firewall_annotation.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        relay_firewall_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_firewall_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-allowed-service-tags".to_string(),
+            value: "AzureCloud".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_firewall_annotation) {
+            Ok(_) => panic!("relay firewall annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-allowed-service-tags must not configure LoadBalancer firewall or security groups"
         ));
 
         Ok(())
@@ -12752,6 +12799,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer firewall or security groups; use loadBalancerSourceRanges or NetworkPolicy values instead"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));

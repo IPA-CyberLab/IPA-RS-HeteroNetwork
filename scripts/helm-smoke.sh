@@ -516,6 +516,14 @@ template_fails relay-load-balancer-type-annotation \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.cloud\.google\.com/load-balancer-type=Internal'
 
+template_fails agent-api-security-group-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-security-groups\" must not configure LoadBalancer firewall or security groups" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-security-groups=sg-0123456789abcdef0'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

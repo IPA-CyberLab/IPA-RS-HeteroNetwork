@@ -581,6 +581,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead" $path .key) -}}
 {{- else if or (contains "load-balancer-scheme" $key) (contains "loadbalancer-scheme" $key) (contains "load-balancer-internal" $key) (contains "loadbalancer-internal" $key) (contains "internal-load-balancer" $key) (contains "load-balancer-type" $key) (contains "loadbalancer-type" $key) (contains "load-balancer-address-type" $key) (contains "loadbalancer-address-type" $key) (contains "load-balancer-class" $key) (contains "loadbalancerclass" $key) (contains "nlb-target-type" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead" $path .key) -}}
+{{- else if or (contains "security-group" $key) (contains "securitygroup" $key) (contains "firewall" $key) (contains "allowed-service-tags" $key) (contains "allowed-ip-ranges" $key) (contains "shared-securityrule" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer firewall or security groups; use loadBalancerSourceRanges or NetworkPolicy values instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
