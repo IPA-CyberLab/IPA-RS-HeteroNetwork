@@ -7974,7 +7974,7 @@ mod tests {
             (
                 AgentPacketFlowApplication::Redis,
                 TransportProtocol::Tcp,
-                b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n".to_vec(),
+                b"|1\r\n$3\r\nttl\r\n:60\r\n>2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::OpenSearch,

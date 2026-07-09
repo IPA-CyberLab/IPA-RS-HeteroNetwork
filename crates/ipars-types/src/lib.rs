@@ -10831,8 +10831,11 @@ pub mod api {
             b'$' => redis_resp_bulk_string_frame(payload, offset),
             b'*' => redis_resp_null_array_frame(payload, offset),
             b'%' | b'~' | b'>' => redis_resp_aggregate_frame(payload, offset, depth),
+            b'|' => redis_resp_attribute_frame(payload, offset, depth),
             b'_' => redis_resp_null_frame(payload, offset),
             b'#' => redis_resp_bool_frame(payload, offset),
+            b',' => redis_resp_double_frame(payload, offset),
+            b'(' => redis_resp_big_number_frame(payload, offset),
             b'!' => redis_resp_blob_error_frame(payload, offset),
             b'=' => redis_resp_verbatim_string_frame(payload, offset),
             _ => None,
@@ -10942,6 +10945,38 @@ pub mod api {
         Some(RedisRespResponseParse::Complete(item_offset))
     }
 
+    fn redis_resp_attribute_frame(
+        payload: &[u8],
+        offset: usize,
+        depth: usize,
+    ) -> Option<RedisRespResponseParse> {
+        const MAX_ATTRIBUTE_LEN: usize = 128;
+        const MAX_AGGREGATE_DEPTH: usize = 4;
+
+        if depth >= MAX_AGGREGATE_DEPTH || payload.get(offset) != Some(&b'|') {
+            return None;
+        }
+
+        let len_offset = offset.checked_add(1)?;
+        let (len, mut item_offset) =
+            match redis_decimal_crlf(payload, len_offset, 1, MAX_ATTRIBUTE_LEN) {
+                Some(header) => header,
+                None if redis_decimal_crlf_incomplete(payload, len_offset, MAX_ATTRIBUTE_LEN) => {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+                None => return None,
+            };
+        for _ in 0..len.checked_mul(2)? {
+            match redis_resp_response_frame_with_depth(payload, item_offset, depth + 1)? {
+                RedisRespResponseParse::Complete(next_offset) => item_offset = next_offset,
+                RedisRespResponseParse::Incomplete => {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+            }
+        }
+        redis_resp_response_frame_with_depth(payload, item_offset, depth + 1)
+    }
+
     fn redis_resp_null_array_frame(
         payload: &[u8],
         offset: usize,
@@ -10971,6 +11006,34 @@ pub mod api {
         let frame = payload.get(offset..offset.checked_add(4)?)?;
         (frame == b"#t\r\n" || frame == b"#f\r\n")
             .then_some(RedisRespResponseParse::Complete(offset + 4))
+    }
+
+    fn redis_resp_double_frame(payload: &[u8], offset: usize) -> Option<RedisRespResponseParse> {
+        let line_offset = offset.checked_add(1)?;
+        match redis_resp_line(payload, line_offset, 128) {
+            Some((line, next_offset)) => {
+                redis_double_value(line).then_some(RedisRespResponseParse::Complete(next_offset))
+            }
+            None if redis_resp_line_incomplete(payload, line_offset, 128) => {
+                Some(RedisRespResponseParse::Incomplete)
+            }
+            None => None,
+        }
+    }
+
+    fn redis_resp_big_number_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<RedisRespResponseParse> {
+        let line_offset = offset.checked_add(1)?;
+        match redis_resp_line(payload, line_offset, 1024) {
+            Some((line, next_offset)) => redis_big_number_value(line)
+                .then_some(RedisRespResponseParse::Complete(next_offset)),
+            None if redis_resp_line_incomplete(payload, line_offset, 1024) => {
+                Some(RedisRespResponseParse::Incomplete)
+            }
+            None => None,
+        }
     }
 
     fn redis_resp_blob_error_frame(
@@ -11138,6 +11201,63 @@ pub mod api {
             && value
                 .iter()
                 .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    }
+
+    fn redis_double_value(value: &[u8]) -> bool {
+        if value.eq_ignore_ascii_case(b"inf")
+            || value.eq_ignore_ascii_case(b"-inf")
+            || value.eq_ignore_ascii_case(b"nan")
+        {
+            return true;
+        }
+
+        let mut offset = usize::from(value.first() == Some(&b'-'));
+        if offset == value.len() {
+            return false;
+        }
+        let integer_start = offset;
+        while value.get(offset).is_some_and(u8::is_ascii_digit) {
+            offset += 1;
+        }
+        let integer_digits = offset - integer_start;
+        let mut fraction_digits = 0_usize;
+        if value.get(offset) == Some(&b'.') {
+            offset += 1;
+            let fraction_start = offset;
+            while value.get(offset).is_some_and(u8::is_ascii_digit) {
+                offset += 1;
+            }
+            fraction_digits = offset - fraction_start;
+        }
+        if integer_digits + fraction_digits == 0 {
+            return false;
+        }
+        if matches!(value.get(offset), Some(b'e' | b'E')) {
+            offset += 1;
+            if matches!(value.get(offset), Some(b'+' | b'-')) {
+                offset += 1;
+            }
+            let exponent_start = offset;
+            while value.get(offset).is_some_and(u8::is_ascii_digit) {
+                offset += 1;
+            }
+            if offset == exponent_start {
+                return false;
+            }
+        }
+        offset == value.len()
+    }
+
+    fn redis_big_number_value(value: &[u8]) -> bool {
+        let mut offset = usize::from(value.first() == Some(&b'-'));
+        if offset == value.len() {
+            return false;
+        }
+        let digit_start = offset;
+        while value.get(offset).is_some_and(u8::is_ascii_digit) {
+            offset += 1;
+        }
+        offset > digit_start && offset == value.len()
     }
 
     fn redis_decimal_crlf(
@@ -20205,6 +20325,19 @@ mod tests {
             api::AgentPacketFlowApplication::Redis
         );
         assert_eq!(
+            observation_for_payload(b",1.25\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b",-inf\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"(3492890328409238509324850943850943825024385\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
             observation_for_payload(b"!3\r\nERR\r\n").application(),
             api::AgentPacketFlowApplication::Redis
         );
@@ -20222,6 +20355,10 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"|1\r\n$3\r\nttl\r\n:60\r\n$5\r\nvalue\r\n").application(),
             api::AgentPacketFlowApplication::Redis
         );
         assert_eq!(
@@ -20270,6 +20407,26 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"#x\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b",hello\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b",1e\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"(12x\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"|0\r\n$5\r\nvalue\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"|1\r\n$3\r\nttl\r\n:60\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
