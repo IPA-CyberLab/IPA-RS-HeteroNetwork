@@ -13839,7 +13839,7 @@ pub mod api {
             0x0a => cassandra_execute_body(version, body_len, body_prefix),
             0x0b => cassandra_string_list_body(body_len, body_prefix),
             0x0d => body_len >= 6 && body_prefix.len() >= 6,
-            0x0f => body_len >= 4 && body_prefix.len() >= 4,
+            0x0f => cassandra_auth_bytes_body(body_len, body_prefix),
             _ => false,
         }
     }
@@ -13852,9 +13852,17 @@ pub mod api {
             0x06 => body_len >= 2 && body_prefix.len() >= 2,
             0x08 => cassandra_result_body(body_len, body_prefix),
             0x0c => cassandra_string_prefix_body(body_len, body_prefix),
-            0x0e | 0x10 => body_len >= 4 && body_prefix.len() >= 4,
+            0x0e | 0x10 => cassandra_auth_bytes_body(body_len, body_prefix),
             _ => false,
         }
+    }
+
+    fn cassandra_auth_bytes_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 4 || body_prefix.len() < body_len {
+            return false;
+        }
+        cassandra_bytes_field(body_prefix, 0, body_len, false)
+            .is_some_and(|offset| offset == body_len)
     }
 
     fn cassandra_result_body(body_len: usize, body_prefix: &[u8]) -> bool {
@@ -22716,6 +22724,18 @@ mod tests {
             observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
             api::AgentPacketFlowApplication::Cassandra
         );
+        let mut cassandra_auth_response = 4_i32.to_be_bytes().to_vec();
+        cassandra_auth_response.extend_from_slice(b"auth");
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(0x0f, &cassandra_auth_response))
+                .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x10, &cassandra_auth_response))
+                .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
         assert_eq!(
             observation_for_payload(&cassandra_response_frame(0x08, &1_u32.to_be_bytes()))
                 .application(),
@@ -22843,6 +22863,21 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x04, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_bad_auth_response = 8_i32.to_be_bytes().to_vec();
+        cassandra_bad_auth_response.extend_from_slice(b"auth");
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame(0x0f, &cassandra_bad_auth_response))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x0e,
+                &cassandra_bad_auth_response
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
