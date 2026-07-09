@@ -19594,6 +19594,81 @@ exec sleep 60
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_route_only_passes_without_net_raw_capability() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert!(needs.ipv4_forwarding);
+            assert!(!needs.ipv6_forwarding);
+
+            let base = unique_trusted_test_dir("route-only-no-net-raw-preflight")?;
+            let bin = base.join("bin");
+            std::fs::create_dir(&bin)?;
+            write_trusted_test_executable(&bin.join("ip"), "#!/bin/sh\n")?;
+
+            let mut checks = test_preflight_checks_with_forwarding(preflight_noop, preflight_noop);
+            checks.cap_net_raw = preflight_fail_cap_net_raw;
+            preflight_agent_runtime_with_path_and_checks(&args, Some(bin.as_os_str()), checks)?;
+
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_preflight_userspace_wireguard_passes_without_net_raw_capability(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-command",
+            "--route-backend",
+            "kernel-netlink",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(!needs.ip_command);
+            assert!(needs.wg_command);
+            assert!(needs.route_netlink);
+            assert!(!needs.generic_netlink);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+
+            let base = unique_trusted_test_dir("userspace-wireguard-no-net-raw-preflight")?;
+            let bin = base.join("bin");
+            std::fs::create_dir(&bin)?;
+            write_trusted_test_executable(&bin.join("wg"), "#!/bin/sh\n")?;
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.cap_net_raw = preflight_fail_cap_net_raw;
+            preflight_agent_runtime_with_path_and_checks(&args, Some(bin.as_os_str()), checks)?;
+
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
     fn preflight_noop() -> anyhow::Result<()> {
         Ok(())
     }
