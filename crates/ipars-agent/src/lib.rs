@@ -7972,6 +7972,11 @@ mod tests {
                 clickhouse_client_hello(),
             ),
             (
+                AgentPacketFlowApplication::Redis,
+                TransportProtocol::Tcp,
+                b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n".to_vec(),
+            ),
+            (
                 AgentPacketFlowApplication::OpenSearch,
                 TransportProtocol::Tcp,
                 b"HTTP/1.1 200 OK\r\nX-OpenSearch-Product: OpenSearch\r\n".to_vec(),

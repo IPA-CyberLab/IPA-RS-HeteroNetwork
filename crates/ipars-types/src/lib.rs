@@ -10816,11 +10816,25 @@ pub mod api {
     }
 
     fn redis_resp_response_frame(payload: &[u8], offset: usize) -> Option<RedisRespResponseParse> {
+        redis_resp_response_frame_with_depth(payload, offset, 0)
+    }
+
+    fn redis_resp_response_frame_with_depth(
+        payload: &[u8],
+        offset: usize,
+        depth: usize,
+    ) -> Option<RedisRespResponseParse> {
         match *payload.get(offset)? {
             b'+' => redis_resp_simple_string_frame(payload, offset),
             b'-' => redis_resp_error_frame(payload, offset),
             b':' => redis_resp_integer_frame(payload, offset),
             b'$' => redis_resp_bulk_string_frame(payload, offset),
+            b'*' => redis_resp_null_array_frame(payload, offset),
+            b'%' | b'~' | b'>' => redis_resp_aggregate_frame(payload, offset, depth),
+            b'_' => redis_resp_null_frame(payload, offset),
+            b'#' => redis_resp_bool_frame(payload, offset),
+            b'!' => redis_resp_blob_error_frame(payload, offset),
+            b'=' => redis_resp_verbatim_string_frame(payload, offset),
             _ => None,
         }
     }
@@ -10887,6 +10901,161 @@ pub mod api {
             }
             RedisBulkStringParse::Incomplete => Some(RedisRespResponseParse::Incomplete),
         }
+    }
+
+    fn redis_resp_aggregate_frame(
+        payload: &[u8],
+        offset: usize,
+        depth: usize,
+    ) -> Option<RedisRespResponseParse> {
+        const MAX_AGGREGATE_LEN: usize = 1024;
+        const MAX_AGGREGATE_DEPTH: usize = 4;
+
+        if depth >= MAX_AGGREGATE_DEPTH {
+            return None;
+        }
+
+        let marker = *payload.get(offset)?;
+        let len_offset = offset.checked_add(1)?;
+
+        let (len, mut item_offset) =
+            match redis_decimal_crlf(payload, len_offset, 0, MAX_AGGREGATE_LEN) {
+                Some(header) => header,
+                None if redis_decimal_crlf_incomplete(payload, len_offset, MAX_AGGREGATE_LEN) => {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+                None => return None,
+            };
+        let item_count = if marker == b'%' {
+            len.checked_mul(2)?
+        } else {
+            len
+        };
+        for _ in 0..item_count {
+            match redis_resp_response_frame_with_depth(payload, item_offset, depth + 1)? {
+                RedisRespResponseParse::Complete(next_offset) => item_offset = next_offset,
+                RedisRespResponseParse::Incomplete => {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+            }
+        }
+        Some(RedisRespResponseParse::Complete(item_offset))
+    }
+
+    fn redis_resp_null_array_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<RedisRespResponseParse> {
+        if payload.get(offset) != Some(&b'*') {
+            return None;
+        }
+        let value_offset = offset.checked_add(2)?;
+        if payload.get(offset.checked_add(1)?) != Some(&b'-') {
+            return None;
+        }
+        match redis_decimal_crlf(payload, value_offset, 1, 1) {
+            Some((_len, next_offset)) => Some(RedisRespResponseParse::Complete(next_offset)),
+            None if redis_decimal_crlf_incomplete(payload, value_offset, 1) => {
+                Some(RedisRespResponseParse::Incomplete)
+            }
+            None => None,
+        }
+    }
+
+    fn redis_resp_null_frame(payload: &[u8], offset: usize) -> Option<RedisRespResponseParse> {
+        (payload.get(offset..offset.checked_add(3)?)? == b"_\r\n")
+            .then_some(RedisRespResponseParse::Complete(offset + 3))
+    }
+
+    fn redis_resp_bool_frame(payload: &[u8], offset: usize) -> Option<RedisRespResponseParse> {
+        let frame = payload.get(offset..offset.checked_add(4)?)?;
+        (frame == b"#t\r\n" || frame == b"#f\r\n")
+            .then_some(RedisRespResponseParse::Complete(offset + 4))
+    }
+
+    fn redis_resp_blob_error_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<RedisRespResponseParse> {
+        const MAX_BLOB_ERROR_LEN: usize = 4096;
+
+        if payload.get(offset) != Some(&b'!') {
+            return None;
+        }
+        let (len, data_offset) =
+            match redis_decimal_crlf(payload, offset.checked_add(1)?, 1, MAX_BLOB_ERROR_LEN) {
+                Some(header) => header,
+                None if redis_decimal_crlf_incomplete(
+                    payload,
+                    offset.checked_add(1)?,
+                    MAX_BLOB_ERROR_LEN,
+                ) =>
+                {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+                None => return None,
+            };
+        let data_end = data_offset.checked_add(len)?;
+        let crlf_end = data_end.checked_add(2)?;
+        if payload.len() < data_end {
+            return Some(RedisRespResponseParse::Incomplete);
+        }
+        if payload.len() < crlf_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(RedisRespResponseParse::Incomplete),
+                _ => None,
+            };
+        }
+        if payload.get(data_end..crlf_end)? != b"\r\n" {
+            return None;
+        }
+        let data = payload.get(data_offset..data_end)?;
+        redis_error_reply(data).then_some(RedisRespResponseParse::Complete(crlf_end))
+    }
+
+    fn redis_resp_verbatim_string_frame(
+        payload: &[u8],
+        offset: usize,
+    ) -> Option<RedisRespResponseParse> {
+        const MAX_VERBATIM_STRING_LEN: usize = 512 * 1024 * 1024;
+
+        if payload.get(offset) != Some(&b'=') {
+            return None;
+        }
+        let (len, data_offset) =
+            match redis_decimal_crlf(payload, offset.checked_add(1)?, 4, MAX_VERBATIM_STRING_LEN) {
+                Some(header) => header,
+                None if redis_decimal_crlf_incomplete(
+                    payload,
+                    offset.checked_add(1)?,
+                    MAX_VERBATIM_STRING_LEN,
+                ) =>
+                {
+                    return Some(RedisRespResponseParse::Incomplete);
+                }
+                None => return None,
+            };
+        let data_end = data_offset.checked_add(len)?;
+        let crlf_end = data_end.checked_add(2)?;
+        if payload.len() < data_end {
+            return Some(RedisRespResponseParse::Incomplete);
+        }
+        if payload.len() < crlf_end {
+            return match payload.get(data_end..) {
+                Some(b"") | Some(b"\r") => Some(RedisRespResponseParse::Incomplete),
+                _ => None,
+            };
+        }
+        if payload.get(data_end..crlf_end)? != b"\r\n" {
+            return None;
+        }
+        let data = payload.get(data_offset..data_end)?;
+        (data.get(3) == Some(&b':')
+            && data[..3]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && redis_resp_text(&data[4..]))
+        .then_some(RedisRespResponseParse::Complete(crlf_end))
     }
 
     fn redis_bulk_string(
@@ -20024,6 +20193,38 @@ mod tests {
             api::AgentPacketFlowApplication::Redis
         );
         assert_eq!(
+            observation_for_payload(b"*-1\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"_\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"#t\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"!3\r\nERR\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"=15\r\ntxt:Some string\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"%1\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b"~2\r\n:1\r\n:2\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
+            observation_for_payload(b">2\r\n$7\r\nmessage\r\n$5\r\nhello\r\n").application(),
+            api::AgentPacketFlowApplication::Redis
+        );
+        assert_eq!(
             observation_for_payload(b"*1\r\n$6\r\nNOTGET\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
@@ -20057,6 +20258,26 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"$3\r\nfoo").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"*2\r\n$5\r\nvalue\r\njunk").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"%1\r\n$4\r\nmode\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"#x\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"!3\r\nwat\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"=3\r\nbad\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
