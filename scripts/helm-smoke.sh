@@ -478,6 +478,14 @@ template_fails relay-eip-annotation \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-eip-allocations=eipalloc-0123456789abcdef0'
 
+template_fails agent-api-proxy-protocol-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-proxy-protocol\" must not enable PROXY protocol" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-proxy-protocol=*'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

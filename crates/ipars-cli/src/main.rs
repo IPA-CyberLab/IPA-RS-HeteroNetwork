@@ -3852,6 +3852,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_proxy_protocol(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3872,6 +3878,11 @@ fn kubernetes_service_annotation_controls_fixed_addresses(key: &str) -> bool {
         || key.contains("private-ipv4-address")
         || key.contains("pip-name")
         || key.contains("lb-ipam-ips")
+}
+
+fn kubernetes_service_annotation_controls_proxy_protocol(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("proxy-protocol") || key.contains("proxyprotocol")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11648,6 +11659,20 @@ fi
             "--agent-api-service-annotation annotation key metallb.io/loadBalancerIPs must not configure LoadBalancer fixed addresses"
         ));
 
+        let mut agent_proxy_protocol_annotation = base_k8s_install_args();
+        agent_proxy_protocol_annotation.expose_agent_api = true;
+        agent_proxy_protocol_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-proxy-protocol".to_string(),
+            value: "*".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_proxy_protocol_annotation) {
+            Ok(_) => panic!("agent API PROXY protocol annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-proxy-protocol must not enable PROXY protocol"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -11732,6 +11757,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-eip-allocations must not configure LoadBalancer fixed addresses"
+        ));
+
+        let mut relay_proxy_protocol_annotation = base_k8s_install_args();
+        relay_proxy_protocol_annotation.expose_relay = true;
+        relay_proxy_protocol_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_proxy_protocol_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_proxy_protocol_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "haproxy.org/proxy-protocol".to_string(),
+            value: "v2".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_proxy_protocol_annotation) {
+            Ok(_) => panic!("relay PROXY protocol annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key haproxy.org/proxy-protocol must not enable PROXY protocol"
         ));
 
         Ok(())
@@ -12545,6 +12588,9 @@ fi
         ));
         assert!(service_template.contains(
             "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
+        ));
+        assert!(helpers_template.contains(
+            "must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));

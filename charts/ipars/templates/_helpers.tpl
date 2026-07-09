@@ -573,6 +573,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer source ranges; use loadBalancerSourceRanges values instead" $path .key) -}}
 {{- else if or (contains "load-balancer-ip" $key) (contains "loadbalancerip" $key) (contains "load-balancer-eip" $key) (contains "eip-allocations" $key) (contains "static-ip" $key) (contains "ip-address" $key) (contains "private-ipv4-address" $key) (contains "pip-name" $key) (contains "lb-ipam-ips" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer fixed addresses; use loadBalancerIP or externalIPs values instead" $path .key) -}}
+{{- else if or (contains "proxy-protocol" $key) (contains "proxyprotocol" $key) -}}
+{{- fail (printf "%s annotation key %q must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
