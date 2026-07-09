@@ -55,6 +55,8 @@ For route discovery through Docker Engine bridge networks, use the install plan:
 ipars docker install \
   --project-name ipars \
   --compose-file docker/compose.yaml \
+  --relay-public-endpoint 203.0.113.10:51820 \
+  --relay-admission-url https://relay.example.com:9580 \
   --docker-discover-networks \
   --docker-network ipars_default
 ```

@@ -409,6 +409,12 @@ struct DockerInstallArgs {
         default_value_t = 5
     )]
     userspace_wireguard_shutdown_timeout_seconds: u64,
+    #[arg(long = "relay-public-endpoint")]
+    relay_public_endpoint: Option<String>,
+    #[arg(long = "relay-admission-url")]
+    relay_admission_url: Option<String>,
+    #[arg(long = "relay-status-url")]
+    relay_status_url: Option<String>,
     #[arg(long = "relay-forwarder-endpoint")]
     relay_forwarder_endpoint: Option<String>,
     #[arg(
@@ -4736,7 +4742,8 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
-        "The bundled Compose file passes the relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT and IPARS_RELAY_ADMISSION_URL, can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file passes relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT/IPARS_RELAY_ADMISSION_URL and agent relay capability advertisement through IPARS_AGENT_RELAY_PUBLIC_ENDPOINT/IPARS_AGENT_RELAY_ADMISSION_URL; ipars docker install --relay-public-endpoint and --relay-admission-url emit both sides together so advertised relay metadata stays consistent".to_string(),
+        "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
     ]);
     if !args.rootless {
@@ -4838,6 +4845,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         "--docker-route-interval-seconds",
     )?;
     validate_docker_userspace_wireguard_args(args)?;
+    validate_docker_relay_advertisement(args)?;
     validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
     validate_rootless_docker_install_args(args)?;
     if !args.docker_discover_networks && !args.docker_networks.is_empty() {
@@ -4850,6 +4858,33 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     }
     validate_docker_container_cidrs("--docker-container-cidr", &args.docker_container_cidrs)?;
     validate_docker_network_filters(&args.docker_networks)?;
+    Ok(())
+}
+
+fn validate_docker_relay_advertisement(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    let advertises_relay =
+        args.relay_public_endpoint.is_some() || args.relay_admission_url.is_some();
+    if args.relay_status_url.is_some() && !advertises_relay {
+        anyhow::bail!(
+            "--relay-status-url requires --relay-public-endpoint and --relay-admission-url"
+        );
+    }
+    if !advertises_relay {
+        return Ok(());
+    }
+    let public_endpoint = args
+        .relay_public_endpoint
+        .as_deref()
+        .context("--relay-public-endpoint and --relay-admission-url must be set together")?;
+    let admission_url = args
+        .relay_admission_url
+        .as_deref()
+        .context("--relay-public-endpoint and --relay-admission-url must be set together")?;
+    validate_relay_public_endpoint_arg(public_endpoint, "--relay-public-endpoint")?;
+    validate_relay_http_url_arg(admission_url, "--relay-admission-url")?;
+    if let Some(status_url) = args.relay_status_url.as_deref() {
+        validate_relay_http_url_arg(status_url, "--relay-status-url")?;
+    }
     Ok(())
 }
 
@@ -5330,8 +5365,41 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
                 .to_string(),
         });
     }
+    append_docker_relay_advertisement_environment(&mut environment, args);
     append_docker_relay_forwarder_environment(&mut environment, args);
     environment
+}
+
+fn append_docker_relay_advertisement_environment(
+    environment: &mut Vec<InstallEnvironment>,
+    args: &DockerInstallArgs,
+) {
+    if let Some(public_endpoint) = args.relay_public_endpoint.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_RELAY_PUBLIC_ENDPOINT".to_string(),
+            value: public_endpoint.to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT".to_string(),
+            value: public_endpoint.to_string(),
+        });
+    }
+    if let Some(admission_url) = args.relay_admission_url.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_RELAY_ADMISSION_URL".to_string(),
+            value: admission_url.to_string(),
+        });
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_ADMISSION_URL".to_string(),
+            value: admission_url.to_string(),
+        });
+    }
+    if let Some(status_url) = args.relay_status_url.as_deref() {
+        environment.push(InstallEnvironment {
+            name: "IPARS_AGENT_RELAY_STATUS_URL".to_string(),
+            value: status_url.to_string(),
+        });
+    }
 }
 
 fn append_docker_relay_forwarder_environment(
@@ -10265,6 +10333,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10297,6 +10368,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10380,7 +10454,11 @@ fi
         assert!(plan.notes.iter().any(|note| {
             note.contains("IPARS_RELAY_PUBLIC_ENDPOINT")
                 && note.contains("IPARS_RELAY_ADMISSION_URL")
-                && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
+                && note.contains("IPARS_AGENT_RELAY_PUBLIC_ENDPOINT")
+                && note.contains("IPARS_AGENT_RELAY_ADMISSION_URL")
+        }));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
                 && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
         }));
         assert!(plan
@@ -10409,6 +10487,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10473,6 +10554,69 @@ fi
             Cli::try_parse_from(["ipars", "docker", "install", "--route-backend", "invalid"])
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_relay_advertisement_consistently() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            relay_public_endpoint: Some("203.0.113.30:51820".to_string()),
+            relay_admission_url: Some("https://relay.example.com:9580".to_string()),
+            relay_status_url: Some("https://relay.example.com:9580".to_string()),
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_PUBLIC_ENDPOINT"),
+            Some("203.0.113.30:51820")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT"),
+            Some("203.0.113.30:51820")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_ADMISSION_URL"),
+            Some("https://relay.example.com:9580")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_ADMISSION_URL"),
+            Some("https://relay.example.com:9580")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_STATUS_URL"),
+            Some("https://relay.example.com:9580")
+        );
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("--relay-public-endpoint")
+                && note.contains("--relay-admission-url")
+                && note.contains("both sides")
+        }));
+
+        let missing_admission = match docker_install_plan(DockerInstallArgs {
+            relay_public_endpoint: Some("203.0.113.30:51820".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => {
+                anyhow::bail!("Docker relay public endpoint without admission URL should fail")
+            }
+            Err(error) => error,
+        };
+        assert!(missing_admission
+            .to_string()
+            .contains("--relay-public-endpoint and --relay-admission-url must be set together"));
+
+        let invalid_status = match docker_install_plan(DockerInstallArgs {
+            relay_public_endpoint: Some("203.0.113.30:51820".to_string()),
+            relay_admission_url: Some("https://relay.example.com:9580".to_string()),
+            relay_status_url: Some("ftp://relay.example.com:9580".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("Docker relay status URL with non-HTTP scheme should fail"),
+            Err(error) => error,
+        };
+        assert!(invalid_status
+            .to_string()
+            .contains("--relay-status-url must use http or https"));
         Ok(())
     }
 
@@ -10614,6 +10758,9 @@ fi
             userspace_wireguard_args: vec!["ipars0".to_string()],
             userspace_wireguard_ready_timeout_seconds: 30,
             userspace_wireguard_shutdown_timeout_seconds: 20,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10765,6 +10912,18 @@ fi
         assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
         assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
+        ));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_ADMISSION_URL=${IPARS_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
+        ));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_STATUS_URL=${IPARS_AGENT_RELAY_STATUS_URL:-http://127.0.0.1:9580}"
+        ));
+        assert!(compose
+            .contains("IPARS_AGENT_RELAY_MAX_SESSIONS=${IPARS_AGENT_RELAY_MAX_SESSIONS:-10000}"));
+        assert!(compose.contains("IPARS_AGENT_RELAY_MAX_MBPS=${IPARS_AGENT_RELAY_MAX_MBPS:-1000}"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
         assert!(compose
@@ -10806,6 +10965,12 @@ fi
         assert!(!rootless_compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(!rootless_compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
         assert!(!rootless_compose.contains("IPARS_DOCKER_API_SOCKET"));
+        assert!(rootless_compose.contains(
+            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
+        ));
+        assert!(rootless_compose.contains(
+            "IPARS_AGENT_RELAY_ADMISSION_URL=${IPARS_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
+        ));
         assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
         Ok(())
     }
@@ -10829,6 +10994,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10908,6 +11076,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10943,6 +11114,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10978,6 +11152,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11025,6 +11202,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11078,6 +11258,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11168,6 +11351,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 0,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11203,6 +11389,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 0,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11238,6 +11427,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 3601,
             userspace_wireguard_shutdown_timeout_seconds: 5,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11275,6 +11467,9 @@ fi
             userspace_wireguard_args: Vec::new(),
             userspace_wireguard_ready_timeout_seconds: 10,
             userspace_wireguard_shutdown_timeout_seconds: 3601,
+            relay_public_endpoint: None,
+            relay_admission_url: None,
+            relay_status_url: None,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
