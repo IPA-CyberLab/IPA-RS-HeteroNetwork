@@ -1817,6 +1817,8 @@ pub mod api {
         Cassandra,
         MongoDb,
         Elasticsearch,
+        #[serde(alias = "opensearch")]
+        OpenSearch,
         Ike,
         Ipsec,
         IpTunnel,
@@ -1830,7 +1832,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 74] = [
+        pub const ALL: [Self; 75] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1896,6 +1898,7 @@ pub mod api {
             Self::Cassandra,
             Self::MongoDb,
             Self::Elasticsearch,
+            Self::OpenSearch,
             Self::Ike,
             Self::Ipsec,
             Self::IpTunnel,
@@ -1974,6 +1977,7 @@ pub mod api {
                 Self::Cassandra => "cassandra",
                 Self::MongoDb => "mongodb",
                 Self::Elasticsearch => "elasticsearch",
+                Self::OpenSearch => "opensearch",
                 Self::Ike => "ike",
                 Self::Ipsec => "ipsec",
                 Self::IpTunnel => "ip_tunnel",
@@ -3103,6 +3107,9 @@ pub mod api {
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
             }
+            if opensearch_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::OpenSearch);
+            }
             if path_starts_with_any(
                 path,
                 &[
@@ -3196,6 +3203,11 @@ pub mod api {
         }
         if http_header_name_has_prefix(headers, b"x-nomad-") {
             return Some(AgentPacketFlowApplication::Nomad);
+        }
+        if http_header_name_has_prefix(headers, b"x-opensearch-")
+            || http_header_value_contains(headers, b"x-opensearch-product", b"opensearch")
+        {
+            return Some(AgentPacketFlowApplication::OpenSearch);
         }
         if http_header_value_contains(headers, b"x-elastic-product", b"elasticsearch") {
             return Some(AgentPacketFlowApplication::Elasticsearch);
@@ -3390,6 +3402,9 @@ pub mod api {
         if etcd_grpc_payload(payload) {
             return Some(AgentPacketFlowApplication::Etcd);
         }
+        if contains_ascii_case_insensitive(payload, b"\r\nx-opensearch-") {
+            return Some(AgentPacketFlowApplication::OpenSearch);
+        }
         if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
             return Some(AgentPacketFlowApplication::ClickHouse);
         }
@@ -3449,6 +3464,11 @@ pub mod api {
 
     fn ipars_relay_http_api_path(path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/v1/sessions")
+    }
+
+    fn opensearch_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/_plugins")
+            || path_starts_with_api_prefix(path, b"/_opendistro")
     }
 
     fn cri_grpc_path(path: &[u8]) -> bool {
@@ -4911,6 +4931,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::MongoDb);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"opensearch") {
+            return Some(AgentPacketFlowApplication::OpenSearch);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
             || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
         {
@@ -5266,6 +5289,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"mongodb") || protocol.eq_ignore_ascii_case(b"mongo") {
             return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"opensearch") {
+            return Some(AgentPacketFlowApplication::OpenSearch);
         }
         if protocol.eq_ignore_ascii_case(b"elasticsearch")
             || protocol.eq_ignore_ascii_case(b"elastic")
@@ -17559,6 +17585,20 @@ mod tests {
             api::AgentPacketFlowApplication::Elasticsearch
         );
         assert_eq!(
+            observation_for_payload(b"GET /_plugins/_security/api/roles HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::OpenSearch
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /_opendistro/_security/api/account HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::OpenSearch
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /_pluginsfoo HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(b"GET /v1/agent/self HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Consul
         );
@@ -17694,6 +17734,16 @@ mod tests {
             observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Elastic-Product: Elasticsearch\r\n")
                 .application(),
             api::AgentPacketFlowApplication::Elasticsearch
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-OpenSearch-Product: OpenSearch\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::OpenSearch
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-OpenSearch-Version: 2.15.0\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::OpenSearch
         );
         assert_eq!(
             observation_for_payload(b"HTTP/1.1 200 OK\r\nX-ClickHouse-Summary: {}\r\n")
@@ -18020,6 +18070,10 @@ mod tests {
                 api::AgentPacketFlowApplication::MongoDb,
             ),
             (
+                "opensearch-data.search.svc",
+                api::AgentPacketFlowApplication::OpenSearch,
+            ),
+            (
                 "postgres-primary.db.svc",
                 api::AgentPacketFlowApplication::Postgres,
             ),
@@ -18157,6 +18211,10 @@ mod tests {
             (
                 &[b"clickhouse-native".as_slice()][..],
                 api::AgentPacketFlowApplication::ClickHouse,
+            ),
+            (
+                &[b"opensearch".as_slice()][..],
+                api::AgentPacketFlowApplication::OpenSearch,
             ),
             (
                 &[b"influxdb-http".as_slice()][..],
