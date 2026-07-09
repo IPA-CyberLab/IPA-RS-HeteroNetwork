@@ -7,13 +7,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
-    verify_heartbeat_request_signature, verify_join_token, verify_wireguard_key_rotation_signature,
-    CryptoError,
+    verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
+    verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
     PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
-    RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
@@ -45,9 +45,9 @@ pub enum ControlPlaneError {
     NodeAlreadyExists(NodeId),
     #[error("VPN IP {0} is already allocated")]
     VpnIpAlreadyAllocated(VpnIp),
-    #[error("node {0} heartbeat signature is required")]
+    #[error("node {0} request signature is required")]
     NodeSignatureRequired(NodeId),
-    #[error("node {node_id} heartbeat signature rejected: {reason}")]
+    #[error("node {node_id} request signature rejected: {reason}")]
     NodeSignatureRejected { node_id: NodeId, reason: String },
     #[error("node {node_id} heartbeat update rejected: {reason}")]
     NodeUpdateRejected { node_id: NodeId, reason: String },
@@ -735,9 +735,15 @@ where
 
     pub async fn remove_node(
         &self,
-        node_id: &NodeId,
+        request: RemoveNodeRequest,
     ) -> Result<RemoveNodeResponse, ControlPlaneError> {
-        let removed = self.store.remove_node(node_id).await?;
+        let node = self
+            .store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        self.validate_remove_node_request(&request, &node, Utc::now())?;
+        let removed = self.store.remove_node(&request.node_id).await?;
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
         Ok(RemoveNodeResponse {
             node: removed.node,
@@ -745,6 +751,41 @@ where
             removed_health: removed.removed_health,
             removed_at: Utc::now(),
         })
+    }
+
+    fn validate_remove_node_request(
+        &self,
+        request: &RemoveNodeRequest,
+        node: &NodeRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        if request.node_signature.is_none() {
+            return Err(ControlPlaneError::NodeSignatureRequired(
+                request.node_id.clone(),
+            ));
+        }
+        verify_remove_node_signature(request, &node.identity_public_key).map_err(|error| {
+            ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let Some(signature) = request.node_signature.as_ref() else {
+            return Err(ControlPlaneError::NodeSignatureRequired(
+                request.node_id.clone(),
+            ));
+        };
+        let signed_at = signature.signed_at;
+        if !timestamp_within_skew(signed_at, now, self.config.heartbeat_signature_max_age) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "signed_at {signed_at} is outside the allowed {}s window",
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub async fn paths_for(
@@ -2197,7 +2238,9 @@ mod tests {
 
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
-    use ipars_types::api::{HeartbeatRequest, RegisterNodeRequest, RotateWireGuardKeyRequest};
+    use ipars_types::api::{
+        HeartbeatRequest, RegisterNodeRequest, RemoveNodeRequest, RotateWireGuardKeyRequest,
+    };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
         EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics,
@@ -2329,6 +2372,21 @@ mod tests {
             match identity.sign_wireguard_key_rotation_request(&request, Utc::now()) {
                 Ok(signature) => signature,
                 Err(error) => panic!("test identity should sign wireguard key rotation: {error}"),
+            },
+        );
+        request
+    }
+
+    fn signed_remove_node(label: &str) -> RemoveNodeRequest {
+        let identity = identity_for_node(label);
+        let mut request = RemoveNodeRequest {
+            node_id: identity.node_id(),
+            node_signature: None,
+        };
+        request.node_signature = Some(
+            match identity.sign_remove_node_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign node removal: {error}"),
             },
         );
         request
@@ -2745,7 +2803,22 @@ mod tests {
         store.upsert_path(path("node-a", "node-b")).await?;
         store.upsert_path(path("node-b", "node-a")).await?;
 
-        let removed = plane.remove_node(&first.node.node_id).await?;
+        let unsigned = RemoveNodeRequest {
+            node_id: first.node.node_id.clone(),
+            node_signature: None,
+        };
+        assert!(matches!(
+            plane.remove_node(unsigned).await,
+            Err(ControlPlaneError::NodeSignatureRequired(_))
+        ));
+        let mut tampered = signed_remove_node("node-a");
+        tampered.node_id = node_id("node-b");
+        assert!(matches!(
+            plane.remove_node(tampered).await,
+            Err(ControlPlaneError::NodeSignatureRejected { .. })
+        ));
+
+        let removed = plane.remove_node(signed_remove_node("node-a")).await?;
         assert_eq!(removed.node.node_id, first.node.node_id);
         assert_eq!(removed.removed_path_count, 2);
         assert!(removed.removed_health);

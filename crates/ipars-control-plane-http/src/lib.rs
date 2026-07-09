@@ -13,8 +13,8 @@ use ipars_control_plane::{
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
-    RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
@@ -210,15 +210,24 @@ where
 async fn remove_node<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Path(node_id): Path<String>,
+    Json(request): Json<RemoveNodeRequest>,
 ) -> Result<Json<RemoveNodeResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let response = state
-        .plane
-        .remove_node(&NodeId::from_string(node_id))
-        .await?;
+    let path_node_id = NodeId::from_string(node_id);
+    if request.node_id != path_node_id {
+        return Err(ControlPlaneError::NodeUpdateRejected {
+            node_id: request.node_id.clone(),
+            reason: format!(
+                "path node ID {path_node_id} does not match request node ID {}",
+                request.node_id
+            ),
+        }
+        .into());
+    }
+    let response = state.plane.remove_node(request).await?;
     Ok(Json(response))
 }
 
@@ -629,8 +638,8 @@ mod tests {
     use ipars_types::api::{
         ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
         HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-        RegisterNodeResponse, RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
-        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+        RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -764,6 +773,21 @@ mod tests {
             match identity.sign_wireguard_key_rotation_request(&request, Utc::now()) {
                 Ok(signature) => signature,
                 Err(error) => panic!("test identity should sign wireguard key rotation: {error}"),
+            },
+        );
+        request
+    }
+
+    fn signed_remove_node(label: &str) -> RemoveNodeRequest {
+        let identity = identity_for_node(label);
+        let mut request = RemoveNodeRequest {
+            node_id: identity.node_id(),
+            node_signature: None,
+        };
+        request.node_signature = Some(
+            match identity.sign_remove_node_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign node removal: {error}"),
             },
         );
         request
@@ -1163,7 +1187,25 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/v1/nodes/{}", node_id("node-http")))
-                    .body(Body::empty())?,
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&RemoveNodeRequest {
+                        node_id: node_id("node-http"),
+                        node_signature: None,
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/nodes/{}", node_id("node-http")))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_remove_node(
+                        "node-http",
+                    ))?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);

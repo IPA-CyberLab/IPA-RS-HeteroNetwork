@@ -1139,6 +1139,12 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RemoveNodeSignaturePayload {
+        pub node_id: NodeId,
+        pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatRequest {
         pub node_id: NodeId,
         pub health: NodeHealth,
@@ -1195,6 +1201,22 @@ pub mod api {
         pub peer_map: PeerMap,
         pub relay_map: RelayMap,
         pub rotated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RemoveNodeRequest {
+        pub node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_signature: Option<NodeRequestSignature>,
+    }
+
+    impl RemoveNodeRequest {
+        pub fn signature_payload(&self, signed_at: DateTime<Utc>) -> RemoveNodeSignaturePayload {
+            RemoveNodeSignaturePayload {
+                node_id: self.node_id.clone(),
+                signed_at,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

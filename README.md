@@ -10,11 +10,11 @@ The repository is being built toward a complete system rather than an MVP. The c
 - pair-scoped path state and scoring primitives
 - control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
 - SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards
-- control-plane node removal that reclaims durable VPN IP leases and clears stale health/path state
+- signed control-plane node removal that reclaims durable VPN IP leases and clears stale health/path state
 - token ledger primitives and control-plane revocation API for revocation and race-safe max-use enforcement
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, relay-capability policy, WireGuard public-key format, identity-derived node IDs, and candidate/route ownership before registration
 - replay-resistant signed node heartbeat updates for health, endpoint candidates, advertised routes, relay capacity, and pair-scoped path state
-- typed control-plane HTTP routes for health, join registration, node removal, signed WireGuard key rotation, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics including VPN pool and join-token ledger gauges
+- typed control-plane HTTP routes for health, join registration, signed node removal, signed WireGuard key rotation, policy inspection, ACL-filtered peer-map retrieval, and JSON/Prometheus metrics including VPN pool and join-token ledger gauges
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, typed signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
 - RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
