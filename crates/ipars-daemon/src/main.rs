@@ -2386,6 +2386,10 @@ fn validate_kubernetes_label_selector(selector: &str) -> anyhow::Result<()> {
 }
 
 fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    resolve_program_in_path(program, path).map(|_| ())
+}
+
+fn resolve_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<PathBuf> {
     ensure_runtime_command_path_is_absolute(path)?;
     let Some(path) = path else {
         anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
@@ -2401,7 +2405,7 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
                     &candidate,
                     &format!("required Linux runtime command `{program}`"),
                 )?;
-                return Ok(());
+                return Ok(candidate);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -2448,6 +2452,10 @@ fn path_has_special_component(path: &Path) -> bool {
 }
 
 fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<()> {
+    resolve_runtime_program_ready(program, path).map(|_| ())
+}
+
+fn resolve_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::Result<PathBuf> {
     validate_runtime_program_token(program, "configured userspace WireGuard command")?;
     if program.contains('/') {
         let program_path = Path::new(program);
@@ -2458,9 +2466,10 @@ fn ensure_runtime_program_ready(program: &str, path: Option<&OsStr>) -> anyhow::
         return ensure_runtime_executable_file(
             program_path,
             &format!("configured userspace WireGuard command `{program}`"),
-        );
+        )
+        .map(|()| program_path.to_path_buf());
     }
-    ensure_program_in_path(program, path)
+    resolve_program_in_path(program, path)
 }
 
 #[cfg(unix)]
@@ -6401,6 +6410,7 @@ async fn start_userspace_wireguard_process(
 fn spawn_userspace_wireguard_process(
     command: &LinuxCommand,
 ) -> anyhow::Result<tokio::process::Child> {
+    let command = resolve_userspace_wireguard_spawn_command(command)?;
     let mut child_command = tokio::process::Command::new(&command.program);
     child_command
         .args(&command.args)
@@ -6416,6 +6426,50 @@ fn spawn_userspace_wireguard_process(
 
     let child = child_command.spawn()?;
     Ok(child)
+}
+
+fn resolve_userspace_wireguard_spawn_command(
+    command: &LinuxCommand,
+) -> anyhow::Result<LinuxCommand> {
+    let path = Some(OsStr::new(SANITIZED_RUNTIME_COMMAND_PATH));
+    let original_program = command.program.clone();
+    let resolved_program = if runtime_command_program_name(&original_program) == Some("ip") {
+        resolve_program_in_path("ip", path)?
+    } else {
+        resolve_runtime_program_ready(&original_program, path)?
+    };
+    let mut resolved = LinuxCommand {
+        program: runtime_command_path_to_string(&resolved_program, "userspace WireGuard command")?,
+        args: command.args.clone(),
+    };
+
+    if runtime_command_program_name(&original_program) == Some("ip")
+        && resolved.args.len() >= 4
+        && resolved.args[0] == "netns"
+        && resolved.args[1] == "exec"
+    {
+        let inner_program = resolve_runtime_program_ready(&resolved.args[3], path)?;
+        resolved.args[3] =
+            runtime_command_path_to_string(&inner_program, "userspace WireGuard netns command")?;
+    }
+
+    Ok(resolved)
+}
+
+fn runtime_command_path_to_string(path: &Path, label: &str) -> anyhow::Result<String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("resolved {label} path {} is not UTF-8", path.display()))
+}
+
+fn runtime_command_program_name(program: &str) -> Option<&str> {
+    if program.contains('/') {
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+    } else {
+        Some(program)
+    }
 }
 
 fn configure_userspace_wireguard_process_group(_command: &mut tokio::process::Command) {
@@ -18713,14 +18767,16 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn userspace_wireguard_process_spawn_uses_sanitized_environment() -> anyhow::Result<()> {
-        let temp_dir = unique_test_dir("userspace-wg-env")?;
+        let temp_dir = unique_trusted_test_dir("userspace-wg-env")?;
         let status_path = temp_dir.join("env.status");
         let pid_path = temp_dir.join("child.pid");
+        let command_path = temp_dir.join("userspace-wg-env");
         let status_arg = status_path.display().to_string();
         let pid_arg = pid_path.display().to_string();
-        let shell_script = r#"
+        let shell_script = r#"#!/bin/sh
 if test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" &&
    test "${LANG:-}" = "C" &&
    test "${LC_ALL:-}" = "C" &&
@@ -18739,15 +18795,10 @@ fi
 printf '%s\n' "$$" > "$2"
 exec sleep 60
 "#;
+        write_trusted_test_executable(&command_path, shell_script)?;
         let command = LinuxCommand::new(
-            "/bin/sh",
-            vec![
-                "-c".to_string(),
-                shell_script.to_string(),
-                "ipars-userspace-wg-env".to_string(),
-                status_arg,
-                pid_arg,
-            ],
+            command_path.display().to_string(),
+            vec![status_arg, pid_arg],
         );
         let mut child = spawn_userspace_wireguard_process(&command)?;
         let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
@@ -18767,28 +18818,22 @@ exec sleep 60
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn userspace_wireguard_start_failure_stops_child_process() -> anyhow::Result<()> {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "iparsd-userspace-wg-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir(&temp_dir)?;
+        let temp_dir = unique_trusted_test_dir("userspace-wg-start-failure")?;
         let pid_path = temp_dir.join("child.pid");
+        let command_path = temp_dir.join("userspace-wg-start-failure");
         let pid_arg = pid_path.display().to_string();
-        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
+        let shell_script = "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\nexec sleep 60\n";
+        write_trusted_test_executable(&command_path, shell_script)?;
         let cli = Cli::try_parse_from(vec![
             "iparsd".to_string(),
             "agent".to_string(),
             "--wireguard-backend".to_string(),
             "userspace-command".to_string(),
             "--userspace-wireguard-command".to_string(),
-            "/bin/sh".to_string(),
-            "--userspace-wireguard-arg=-c".to_string(),
-            "--userspace-wireguard-arg".to_string(),
-            shell_script.to_string(),
-            "--userspace-wireguard-arg=ipars-test-wg".to_string(),
+            command_path.display().to_string(),
             "--userspace-wireguard-arg".to_string(),
             pid_arg,
             "--userspace-wireguard-ready-timeout-seconds".to_string(),
@@ -18848,21 +18893,17 @@ exec sleep 60
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn userspace_wireguard_shutdown_kills_process_group() -> anyhow::Result<()> {
-        let temp_dir = unique_test_dir("userspace-wg-process-group")?;
+        let temp_dir = unique_trusted_test_dir("userspace-wg-process-group")?;
         let pid_path = temp_dir.join("child.pid");
         let grandchild_pid_path = temp_dir.join("grandchild.pid");
-        let shell_script = format!(
-            "printf '%s\\n' $$ > {}; sleep 60 & printf '%s\\n' $! > {}; wait",
-            pid_path.display(),
-            grandchild_pid_path.display()
-        );
+        let command_path = temp_dir.join("userspace-wg-process-group");
+        let pid_arg = pid_path.display().to_string();
+        let grandchild_pid_arg = grandchild_pid_path.display().to_string();
+        let shell_script = "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\nsleep 60 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait\n";
+        write_trusted_test_executable(&command_path, shell_script)?;
         let command = LinuxCommand::new(
-            "/bin/sh",
-            vec![
-                "-c".to_string(),
-                shell_script,
-                "ipars-userspace-wg-group".to_string(),
-            ],
+            command_path.display().to_string(),
+            vec![pid_arg, grandchild_pid_arg],
         );
         let mut child = spawn_userspace_wireguard_process(&command)?;
 
@@ -20234,6 +20275,15 @@ exec sleep 60
         std::fs::create_dir_all(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_trusted_test_executable(path: &Path, contents: &str) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
     }
 
     fn env_flag_enabled(name: &str) -> bool {
