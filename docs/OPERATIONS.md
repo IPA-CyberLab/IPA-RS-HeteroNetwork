@@ -101,6 +101,7 @@ ipars status --control-plane-url http://127.0.0.1:8443
 ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path status --agent-url http://127.0.0.1:9780
+ipars path events --agent-url http://127.0.0.1:9780
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret> --send-invalid-credential
 ipars stun probe --stun-server 127.0.0.1:3478

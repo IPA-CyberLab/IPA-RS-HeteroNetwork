@@ -11,11 +11,11 @@ use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
 use ipars_types::api::{
-    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
-    AgentPeerActivityResponse, AgentStatusResponse, ControlPlaneMetricsResponse,
-    ControlPlanePathsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
+    AgentPathEventsResponse, AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse,
+    AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
+    ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
@@ -305,6 +305,7 @@ struct StunProbeArgs {
 #[derive(Debug, Subcommand)]
 enum PathCommand {
     Status(PathStatusArgs),
+    Events(PathEventsArgs),
     Activity(PathActivityArgs),
     Probe(PathProbeArgs),
 }
@@ -317,6 +318,12 @@ struct PathStatusArgs {
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_NODE_ID")]
     node_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PathEventsArgs {
+    #[arg(long, env = "IPARS_AGENT_URL")]
+    agent_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1047,6 +1054,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => print_json(&path_status(defaulted_agent_url(None)).await?)?,
             },
+            PathCommand::Events(args) => {
+                let agent_url = defaulted_agent_url(args.agent_url.as_deref());
+                print_json(&path_events(agent_url).await?)?
+            }
             PathCommand::Activity(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
                 print_json(&path_activity(agent_url, &args).await?)?
@@ -2250,6 +2261,10 @@ fn reversed_probe_payload(payload: &[u8]) -> Vec<u8> {
 
 async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
     get_json(agent_url, "/v1/paths", "agent path status").await
+}
+
+async fn path_events(agent_url: &str) -> anyhow::Result<AgentPathEventsResponse> {
+    get_json(agent_url, "/v1/path-events", "agent path events").await
 }
 
 async fn control_plane_path_status(
@@ -8496,6 +8511,39 @@ mod tests {
         Ok((format!("http://{addr}"), task))
     }
 
+    async fn spawn_raw_http_response_with_request(
+        response: String,
+    ) -> anyhow::Result<(
+        String,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+    )> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_tx.send(request);
+            stream.write_all(response.as_bytes()).await?;
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), task, request_rx))
+    }
+
     #[tokio::test]
     async fn cli_bounded_json_response_rejects_oversized_responses() -> anyhow::Result<()> {
         let body = r#"{"ok":true}"#;
@@ -8567,6 +8615,35 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .context("timed out waiting for oversized CLI get_json test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_events_reads_agent_endpoint() -> anyhow::Result<()> {
+        let body = r#"{"events":[],"generated_at":"2026-07-09T00:00:00Z"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server, request_rx) = spawn_raw_http_response_with_request(response).await?;
+
+        let events = path_events(&url).await?;
+
+        assert!(events.events.is_empty());
+        assert_eq!(
+            events.generated_at,
+            "2026-07-09T00:00:00Z".parse::<chrono::DateTime<Utc>>()?
+        );
+        let request = request_rx.await?;
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.starts_with("GET /v1/path-events HTTP/1.1\r\n"),
+            "unexpected request: {request}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for path events CLI test server")???;
         Ok(())
     }
 
@@ -9639,6 +9716,22 @@ fi
             "node-a",
         ])
         .is_err());
+
+        let events = Cli::try_parse_from([
+            "ipars",
+            "path",
+            "events",
+            "--agent-url",
+            "http://127.0.0.1:9780",
+        ])?;
+        if let Command::Path {
+            command: PathCommand::Events(args),
+        } = events.command
+        {
+            assert_eq!(args.agent_url.as_deref(), Some("http://127.0.0.1:9780"));
+        } else {
+            anyhow::bail!("expected path events command");
+        }
 
         let activity = Cli::try_parse_from([
             "ipars",
