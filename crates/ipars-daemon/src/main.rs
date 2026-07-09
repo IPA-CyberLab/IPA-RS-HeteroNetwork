@@ -6634,11 +6634,21 @@ fn userspace_wireguard_namespaced_command(
 }
 
 fn runtime_command_label(program: &str, args: &[String]) -> String {
+    let program = runtime_command_diagnostic_component(program);
     if args.is_empty() {
-        program.to_string()
+        program
     } else {
-        format!("{} {}", program, args.join(" "))
+        let args = args
+            .iter()
+            .map(|arg| runtime_command_diagnostic_component(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{program} {args}")
     }
+}
+
+fn runtime_command_diagnostic_component(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 async fn start_peer_map_sync(
@@ -18346,6 +18356,22 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_command_label_escapes_control_characters() {
+        let label = runtime_command_label(
+            "wireguard-go",
+            &[
+                "iface\nname".to_string(),
+                "arg\tvalue".to_string(),
+                r"path\part".to_string(),
+            ],
+        );
+
+        assert_eq!(label, r"wireguard-go iface\nname arg\tvalue path\\part");
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\t'));
     }
 
     #[test]
