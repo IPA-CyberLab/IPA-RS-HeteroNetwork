@@ -14206,11 +14206,19 @@ pub mod api {
         let Some(compressor_id) = payload.get(24) else {
             return false;
         };
+        let Some(compressed_message_len) = message_len.checked_sub(25) else {
+            return false;
+        };
+        if uncompressed_size == 0 || uncompressed_size > 100_000_000 || compressed_message_len == 0
+        {
+            return false;
+        }
+        if *compressor_id == 0 && compressed_message_len != uncompressed_size {
+            return false;
+        }
         mongodb_wire_opcode(original_opcode)
             && original_opcode != 2012
-            && uncompressed_size <= 100_000_000
             && matches!(*compressor_id, 0..=3)
-            && (!mongodb_full_message_observed(payload, message_len) || message_len > 25)
     }
 
     fn mongodb_op_update_payload(payload: &[u8], message_len: usize) -> bool {
@@ -22426,7 +22434,7 @@ mod tests {
         );
         let mut mongodb_compressed = Vec::new();
         mongodb_compressed.extend_from_slice(&2013_u32.to_le_bytes());
-        mongodb_compressed.extend_from_slice(&9_u32.to_le_bytes());
+        mongodb_compressed.extend_from_slice(&(b"compressed".len() as u32).to_le_bytes());
         mongodb_compressed.push(0);
         mongodb_compressed.extend_from_slice(b"compressed");
         assert_eq!(
@@ -22506,6 +22514,28 @@ mod tests {
         invalid_mongodb_compressed.extend_from_slice(b"compressed");
         assert_eq!(
             observation_for_payload(&mongodb_message(2012, &invalid_mongodb_compressed))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_compressed_noop_size = Vec::new();
+        invalid_mongodb_compressed_noop_size.extend_from_slice(&2013_u32.to_le_bytes());
+        invalid_mongodb_compressed_noop_size.extend_from_slice(&9_u32.to_le_bytes());
+        invalid_mongodb_compressed_noop_size.push(0);
+        invalid_mongodb_compressed_noop_size.extend_from_slice(b"compressed");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2012,
+                &invalid_mongodb_compressed_noop_size
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut invalid_mongodb_compressed_empty = Vec::new();
+        invalid_mongodb_compressed_empty.extend_from_slice(&2013_u32.to_le_bytes());
+        invalid_mongodb_compressed_empty.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_mongodb_compressed_empty.push(1);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(2012, &invalid_mongodb_compressed_empty))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
         );
