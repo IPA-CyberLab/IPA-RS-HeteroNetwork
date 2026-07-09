@@ -12601,6 +12601,7 @@ pub mod api {
             || mqtt_connack_packet_payload(payload)
             || mqtt_publish_packet_payload(payload)
             || mqtt_subscribe_packet_payload(payload)
+            || mqtt_unsubscribe_packet_payload(payload)
     }
 
     fn mqtt_connect_packet_payload(payload: &[u8]) -> bool {
@@ -12794,6 +12795,45 @@ pub mod api {
                 || !mqtt_topic_filter(filter)
                 || !mqtt_subscription_options(options)
             {
+                return false;
+            }
+            filter_count += 1;
+            if filter_count > 64 {
+                return false;
+            }
+            offset = next_offset;
+        }
+        filter_count > 0
+    }
+
+    fn mqtt_unsubscribe_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0xa2 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end != payload.len() || remaining_len < 5 {
+            return false;
+        }
+        let Some(packet_id) = read_u16_be(payload, offset) else {
+            return false;
+        };
+        if packet_id == 0 {
+            return false;
+        }
+        offset += 2;
+
+        let mut filter_count = 0_usize;
+        while offset < remaining_end {
+            let Some((filter, next_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
+            else {
+                return false;
+            };
+            if !mqtt_topic_filter(filter) {
                 return false;
             }
             filter_count += 1;
@@ -16609,6 +16649,17 @@ mod tests {
                 body.push(*options);
             }
             let mut packet = vec![0x82];
+            packet.extend_from_slice(&mqtt_remaining_length(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+
+        fn mqtt_unsubscribe_packet(packet_id: u16, filters: &[&[u8]]) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            for filter in filters {
+                body.extend_from_slice(&mqtt_field(filter));
+            }
+            let mut packet = vec![0xa2];
             packet.extend_from_slice(&mqtt_remaining_length(body.len()));
             packet.extend_from_slice(&body);
             packet
@@ -21187,6 +21238,14 @@ mod tests {
             api::AgentPacketFlowApplication::Mqtt
         );
         assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_packet(
+                13,
+                &[b"sensors/+/temp".as_slice(), b"$SYS/broker/#".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
             observation_for_payload(&[
                 0x10, 0x11, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x03, 0x00, 0x3c, 0x00, 0x05,
                 b'a', b'g', b'e', b'n', b't',
@@ -21279,6 +21338,23 @@ mod tests {
                 &[(b"sensors/temp".as_slice(), 3)]
             ))
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_packet(0, &[b"sensors/+/temp".as_slice()]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_packet(13, &[b"sensors/temp#".as_slice()]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_unsubscribe_wrong_flags =
+            mqtt_unsubscribe_packet(13, &[b"sensors/+/temp".as_slice()]);
+        mqtt_unsubscribe_wrong_flags[0] = 0xa0;
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_wrong_flags).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
