@@ -57,6 +57,12 @@ ipars docker install \
   --compose-file docker/compose.yaml \
   --relay-public-endpoint 203.0.113.10:51820 \
   --relay-admission-url https://relay.example.com:9580 \
+  --relay-max-sessions 10000 \
+  --relay-max-sessions-per-node 100 \
+  --relay-max-mbps 1000 \
+  --relay-session-ttl-seconds 300 \
+  --relay-admission-rate-limit 4096 \
+  --relay-admission-rate-limit-window-seconds 60 \
   --docker-discover-networks \
   --docker-network ipars_default
 ```

@@ -52,6 +52,14 @@ const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW: u32 = 3;
 const DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS: u64 = 60;
+const DEFAULT_RELAY_MAX_SESSIONS: u32 = 10_000;
+const DEFAULT_RELAY_MAX_SESSIONS_PER_NODE: u32 = 0;
+const DEFAULT_RELAY_MAX_MBPS: u32 = 1000;
+const DEFAULT_RELAY_SESSION_TTL_SECONDS: u64 = 300;
+const DEFAULT_RELAY_ADMISSION_RATE_LIMIT: u32 = 4096;
+const DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
+const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
 const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
 const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
@@ -415,6 +423,18 @@ struct DockerInstallArgs {
     relay_admission_url: Option<String>,
     #[arg(long = "relay-status-url")]
     relay_status_url: Option<String>,
+    #[arg(long = "relay-max-sessions", default_value_t = DEFAULT_RELAY_MAX_SESSIONS)]
+    relay_max_sessions: u32,
+    #[arg(long = "relay-max-sessions-per-node", default_value_t = DEFAULT_RELAY_MAX_SESSIONS_PER_NODE)]
+    relay_max_sessions_per_node: u32,
+    #[arg(long = "relay-max-mbps", default_value_t = DEFAULT_RELAY_MAX_MBPS)]
+    relay_max_mbps: u32,
+    #[arg(long = "relay-session-ttl-seconds", default_value_t = DEFAULT_RELAY_SESSION_TTL_SECONDS)]
+    relay_session_ttl_seconds: u64,
+    #[arg(long = "relay-admission-rate-limit", default_value_t = DEFAULT_RELAY_ADMISSION_RATE_LIMIT)]
+    relay_admission_rate_limit: u32,
+    #[arg(long = "relay-admission-rate-limit-window-seconds", default_value_t = DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS)]
+    relay_admission_rate_limit_window_seconds: u64,
     #[arg(long = "relay-forwarder-endpoint")]
     relay_forwarder_endpoint: Option<String>,
     #[arg(
@@ -4862,6 +4882,30 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
 }
 
 fn validate_docker_relay_advertisement(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    if args.relay_max_sessions == 0 {
+        anyhow::bail!("--relay-max-sessions must be greater than zero");
+    }
+    if args.relay_max_mbps == 0 {
+        anyhow::bail!("--relay-max-mbps must be greater than zero");
+    }
+    if args.relay_max_sessions_per_node > args.relay_max_sessions {
+        anyhow::bail!(
+            "--relay-max-sessions-per-node must be less than or equal to --relay-max-sessions"
+        );
+    }
+    validate_bounded_docker_seconds(
+        args.relay_session_ttl_seconds,
+        "--relay-session-ttl-seconds",
+        MAX_RELAY_SESSION_TTL_SECONDS,
+    )?;
+    if args.relay_admission_rate_limit > 0 {
+        validate_bounded_docker_seconds(
+            args.relay_admission_rate_limit_window_seconds,
+            "--relay-admission-rate-limit-window-seconds",
+            MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
+        )?;
+    }
+
     let advertises_relay =
         args.relay_public_endpoint.is_some() || args.relay_admission_url.is_some();
     if args.relay_status_url.is_some() && !advertises_relay {
@@ -5400,6 +5444,38 @@ fn append_docker_relay_advertisement_environment(
             value: status_url.to_string(),
         });
     }
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_MAX_SESSIONS".to_string(),
+        value: args.relay_max_sessions.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_MAX_SESSIONS".to_string(),
+        value: args.relay_max_sessions.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_MAX_SESSIONS_PER_NODE".to_string(),
+        value: args.relay_max_sessions_per_node.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_MAX_MBPS".to_string(),
+        value: args.relay_max_mbps.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_AGENT_RELAY_MAX_MBPS".to_string(),
+        value: args.relay_max_mbps.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_SESSION_TTL_SECONDS".to_string(),
+        value: args.relay_session_ttl_seconds.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_ADMISSION_RATE_LIMIT".to_string(),
+        value: args.relay_admission_rate_limit.to_string(),
+    });
+    environment.push(InstallEnvironment {
+        name: "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        value: args.relay_admission_rate_limit_window_seconds.to_string(),
+    });
 }
 
 fn append_docker_relay_forwarder_environment(
@@ -10336,6 +10412,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10371,6 +10454,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10490,6 +10580,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10563,6 +10660,12 @@ fi
             relay_public_endpoint: Some("203.0.113.30:51820".to_string()),
             relay_admission_url: Some("https://relay.example.com:9580".to_string()),
             relay_status_url: Some("https://relay.example.com:9580".to_string()),
+            relay_max_sessions: 250,
+            relay_max_sessions_per_node: 25,
+            relay_max_mbps: 750,
+            relay_session_ttl_seconds: 900,
+            relay_admission_rate_limit: 123,
+            relay_admission_rate_limit_window_seconds: 30,
             ..docker_install_test_args()
         })?;
 
@@ -10585,6 +10688,38 @@ fi
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_RELAY_STATUS_URL"),
             Some("https://relay.example.com:9580")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_MAX_SESSIONS"),
+            Some("250")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_MAX_SESSIONS"),
+            Some("250")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_MAX_SESSIONS_PER_NODE"),
+            Some("25")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_MAX_MBPS"),
+            Some("750")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RELAY_MAX_MBPS"),
+            Some("750")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_SESSION_TTL_SECONDS"),
+            Some("900")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_ADMISSION_RATE_LIMIT"),
+            Some("123")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"),
+            Some("30")
         );
         assert!(plan.notes.iter().any(|note| {
             note.contains("--relay-public-endpoint")
@@ -10617,6 +10752,63 @@ fi
         assert!(invalid_status
             .to_string()
             .contains("--relay-status-url must use http or https"));
+
+        let zero_sessions = match docker_install_plan(DockerInstallArgs {
+            relay_max_sessions: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero relay max sessions should be rejected"),
+            Err(error) => error,
+        };
+        assert!(zero_sessions
+            .to_string()
+            .contains("--relay-max-sessions must be greater than zero"));
+
+        let per_node_over_capacity = match docker_install_plan(DockerInstallArgs {
+            relay_max_sessions: 10,
+            relay_max_sessions_per_node: 11,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("per-node relay sessions above total capacity should fail"),
+            Err(error) => error,
+        };
+        assert!(per_node_over_capacity.to_string().contains(
+            "--relay-max-sessions-per-node must be less than or equal to --relay-max-sessions"
+        ));
+
+        let zero_mbps = match docker_install_plan(DockerInstallArgs {
+            relay_max_mbps: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero relay max Mbps should be rejected"),
+            Err(error) => error,
+        };
+        assert!(zero_mbps
+            .to_string()
+            .contains("--relay-max-mbps must be greater than zero"));
+
+        let zero_session_ttl = match docker_install_plan(DockerInstallArgs {
+            relay_session_ttl_seconds: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero relay session TTL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(zero_session_ttl
+            .to_string()
+            .contains("--relay-session-ttl-seconds must be greater than zero"));
+
+        let zero_rate_limit_window = match docker_install_plan(DockerInstallArgs {
+            relay_admission_rate_limit: 1,
+            relay_admission_rate_limit_window_seconds: 0,
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("zero relay admission rate-limit window should be rejected"),
+            Err(error) => error,
+        };
+        assert!(zero_rate_limit_window
+            .to_string()
+            .contains("--relay-admission-rate-limit-window-seconds must be greater than zero"));
         Ok(())
     }
 
@@ -10761,6 +10953,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -10921,11 +11120,16 @@ fi
         assert!(compose.contains(
             "IPARS_AGENT_RELAY_STATUS_URL=${IPARS_AGENT_RELAY_STATUS_URL:-http://127.0.0.1:9580}"
         ));
+        assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS=${IPARS_RELAY_MAX_SESSIONS:-10000}"));
         assert!(compose
             .contains("IPARS_AGENT_RELAY_MAX_SESSIONS=${IPARS_AGENT_RELAY_MAX_SESSIONS:-10000}"));
+        assert!(compose.contains("IPARS_RELAY_MAX_MBPS=${IPARS_RELAY_MAX_MBPS:-1000}"));
         assert!(compose.contains("IPARS_AGENT_RELAY_MAX_MBPS=${IPARS_AGENT_RELAY_MAX_MBPS:-1000}"));
         assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
+        assert!(compose
+            .contains("IPARS_RELAY_SESSION_TTL_SECONDS=${IPARS_RELAY_SESSION_TTL_SECONDS:-300}"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"));
         assert!(compose
             .contains("IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"));
         assert!(compose.contains("\"3480:3480/udp\""));
@@ -10997,6 +11201,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11079,6 +11290,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11117,6 +11335,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11155,6 +11380,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11205,6 +11437,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11261,6 +11500,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11354,6 +11600,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11392,6 +11645,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11430,6 +11690,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
@@ -11470,6 +11737,13 @@ fi
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
+            relay_max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            relay_max_sessions_per_node: DEFAULT_RELAY_MAX_SESSIONS_PER_NODE,
+            relay_max_mbps: DEFAULT_RELAY_MAX_MBPS,
+            relay_session_ttl_seconds: DEFAULT_RELAY_SESSION_TTL_SECONDS,
+            relay_admission_rate_limit: DEFAULT_RELAY_ADMISSION_RATE_LIMIT,
+            relay_admission_rate_limit_window_seconds:
+                DEFAULT_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
             relay_forwarder_endpoint: None,
             relay_forwarder_bind: None,
             relay_forwarder_wireguard_endpoint: None,
