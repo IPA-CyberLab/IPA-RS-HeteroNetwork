@@ -13811,7 +13811,7 @@ pub mod api {
 
         if !matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
             || !(3..=5).contains(&version)
-            || flags & !0x1f != 0
+            || flags != 0
             || body_len > 16_777_216
         {
             return false;
@@ -23082,6 +23082,12 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0xe0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_tracing_flag_query = cassandra_query_frame(b"SELECT 1", 0x0001, 0, &[]);
+        cassandra_tracing_flag_query[1] = 0x02;
+        assert_eq!(
+            observation_for_payload(&cassandra_tracing_flag_query).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
