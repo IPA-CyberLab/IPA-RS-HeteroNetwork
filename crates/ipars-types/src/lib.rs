@@ -15531,6 +15531,18 @@ pub mod api {
         offset: usize,
         message_len: usize,
     ) -> Option<usize> {
+        mongodb_bson_document_prefix_with_depth(payload, offset, message_len, 0)
+    }
+
+    fn mongodb_bson_document_prefix_with_depth(
+        payload: &[u8],
+        offset: usize,
+        message_len: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if depth > 16 {
+            return None;
+        }
         let document_len = read_u32_le(payload, offset)? as usize;
         if !(5..=16_777_216).contains(&document_len) {
             return None;
@@ -15542,7 +15554,157 @@ pub mod api {
         if payload.len() >= document_end && payload.get(document_end - 1) != Some(&0) {
             return None;
         }
+        if payload.len() >= document_end
+            && !mongodb_bson_document_fields(payload, offset.checked_add(4)?, document_end, depth)
+        {
+            return None;
+        }
         Some(document_end)
+    }
+
+    fn mongodb_bson_document_fields(
+        payload: &[u8],
+        mut offset: usize,
+        document_end: usize,
+        depth: usize,
+    ) -> bool {
+        let Some(fields_end) = document_end.checked_sub(1) else {
+            return false;
+        };
+        let mut field_names: Vec<&[u8]> = Vec::new();
+        while offset < fields_end {
+            let Some(element_type) = payload.get(offset).copied() else {
+                return false;
+            };
+            if element_type == 0 {
+                return false;
+            }
+            let Some(name_offset) = offset.checked_add(1) else {
+                return false;
+            };
+            let Some((field_name, value_offset)) =
+                mongodb_bson_cstring_field(payload, name_offset, fields_end, true, 512)
+            else {
+                return false;
+            };
+            if field_names.iter().any(|existing| *existing == field_name) {
+                return false;
+            }
+            field_names.push(field_name);
+            if field_names.len() > 1024 {
+                return false;
+            }
+            let Some(next_offset) =
+                mongodb_bson_value_end(payload, value_offset, fields_end, element_type, depth)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == fields_end
+    }
+
+    fn mongodb_bson_value_end(
+        payload: &[u8],
+        offset: usize,
+        document_end: usize,
+        element_type: u8,
+        depth: usize,
+    ) -> Option<usize> {
+        let fixed_len = match element_type {
+            0x01 | 0x09 | 0x11 | 0x12 => Some(8),
+            0x07 => Some(12),
+            0x08 => {
+                let value = *payload.get(offset)?;
+                if !matches!(value, 0 | 1) {
+                    return None;
+                }
+                Some(1)
+            }
+            0x06 | 0x0a | 0x7f | 0xff => Some(0),
+            0x10 => Some(4),
+            0x13 => Some(16),
+            _ => None,
+        };
+        if let Some(fixed_len) = fixed_len {
+            let value_end = offset.checked_add(fixed_len)?;
+            return (value_end <= document_end).then_some(value_end);
+        }
+
+        match element_type {
+            0x02 | 0x0d | 0x0e => mongodb_bson_string_field_end(payload, offset, document_end),
+            0x03 | 0x04 => mongodb_bson_document_prefix_with_depth(
+                payload,
+                offset,
+                document_end,
+                depth.checked_add(1)?,
+            ),
+            0x05 => {
+                let len = read_u32_le(payload, offset)? as usize;
+                if len > 16_777_216 {
+                    return None;
+                }
+                let data_offset = offset.checked_add(5)?;
+                let value_end = data_offset.checked_add(len)?;
+                (value_end <= document_end).then_some(value_end)
+            }
+            0x0b => {
+                let (_pattern, offset) =
+                    mongodb_bson_cstring_field(payload, offset, document_end, true, 4096)?;
+                let (_options, offset) =
+                    mongodb_bson_cstring_field(payload, offset, document_end, true, 1024)?;
+                Some(offset)
+            }
+            0x0c => {
+                let offset = mongodb_bson_string_field_end(payload, offset, document_end)?;
+                let value_end = offset.checked_add(12)?;
+                (value_end <= document_end).then_some(value_end)
+            }
+            0x0f => mongodb_bson_code_with_scope_end(payload, offset, document_end, depth),
+            _ => None,
+        }
+    }
+
+    fn mongodb_bson_string_field_end(
+        payload: &[u8],
+        offset: usize,
+        document_end: usize,
+    ) -> Option<usize> {
+        let len = read_u32_le(payload, offset)? as usize;
+        if len == 0 || len > 16_777_216 {
+            return None;
+        }
+        let value_offset = offset.checked_add(4)?;
+        let value_end = value_offset.checked_add(len)?;
+        if value_end > document_end || payload.get(value_end.checked_sub(1)?) != Some(&0) {
+            return None;
+        }
+        Some(value_end)
+    }
+
+    fn mongodb_bson_code_with_scope_end(
+        payload: &[u8],
+        offset: usize,
+        document_end: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        let total_len = read_u32_le(payload, offset)? as usize;
+        if total_len < 14 || total_len > 16_777_216 {
+            return None;
+        }
+        let value_end = offset.checked_add(total_len)?;
+        if value_end > document_end {
+            return None;
+        }
+        let code_offset = offset.checked_add(4)?;
+        let scope_offset = mongodb_bson_string_field_end(payload, code_offset, value_end)?;
+        let scope_end = mongodb_bson_document_prefix_with_depth(
+            payload,
+            scope_offset,
+            value_end,
+            depth.checked_add(1)?,
+        )?;
+        (scope_end == value_end).then_some(value_end)
     }
 
     fn mongodb_bson_document_sequence(
@@ -15589,10 +15751,20 @@ pub mod api {
         offset: usize,
         message_len: usize,
     ) -> Option<(&[u8], usize)> {
+        mongodb_bson_cstring_field(payload, offset, message_len, false, 512)
+    }
+
+    fn mongodb_bson_cstring_field(
+        payload: &[u8],
+        offset: usize,
+        message_len: usize,
+        allow_empty: bool,
+        max_len: usize,
+    ) -> Option<(&[u8], usize)> {
         let limit = payload.len().min(message_len);
         let tail = payload.get(offset..limit)?;
         let terminator = tail.iter().position(|byte| *byte == 0)?;
-        if terminator == 0 || terminator > 512 {
+        if (!allow_empty && terminator == 0) || terminator > max_len {
             return None;
         }
         let end = offset.checked_add(terminator)?;
@@ -18687,6 +18859,34 @@ mod tests {
 
         fn mongodb_empty_document() -> [u8; 5] {
             [5, 0, 0, 0, 0]
+        }
+
+        fn mongodb_i32_document(fields: &[(&[u8], i32)]) -> Vec<u8> {
+            let mut body = Vec::new();
+            for (name, value) in fields {
+                body.push(0x10);
+                body.extend_from_slice(name);
+                body.push(0);
+                body.extend_from_slice(&value.to_le_bytes());
+            }
+            mongodb_bson_document_from_body(&body)
+        }
+
+        fn mongodb_bool_document_raw(name: &[u8], value: u8) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x08);
+            body.extend_from_slice(name);
+            body.push(0);
+            body.push(value);
+            mongodb_bson_document_from_body(&body)
+        }
+
+        fn mongodb_bson_document_from_body(body: &[u8]) -> Vec<u8> {
+            let len = 4 + body.len() + 1;
+            let mut document = (len as u32).to_le_bytes().to_vec();
+            document.extend_from_slice(body);
+            document.push(0);
+            document
         }
 
         fn mongodb_op_msg_body(flags: u32, sections: &[Vec<u8>], checksum: Option<u32>) -> Vec<u8> {
@@ -24831,12 +25031,25 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         let empty_bson = mongodb_empty_document();
+        let mongodb_ping_document = mongodb_i32_document(&[(b"ping", 1)]);
         let mut mongodb_op_msg = Vec::new();
         mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_msg.push(0);
         mongodb_op_msg.extend_from_slice(&empty_bson);
         assert_eq!(
             observation_for_payload(&mongodb_message(2013, &mongodb_op_msg)).application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_ping_document)],
+                    None
+                )
+            ))
+            .application(),
             api::AgentPacketFlowApplication::MongoDb
         );
         let mut mongodb_op_msg_with_sequence = Vec::new();
@@ -25005,6 +25218,34 @@ mod tests {
         invalid_mongodb_op_msg.push(0);
         assert_eq!(
             observation_for_payload(&mongodb_message(2013, &invalid_mongodb_op_msg)).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_duplicate_field_document = mongodb_i32_document(&[(b"ok", 1), (b"ok", 2)]);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_duplicate_field_document
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_invalid_bool_document = mongodb_bool_document_raw(b"ok", 2);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_invalid_bool_document)],
+                    None
+                )
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
