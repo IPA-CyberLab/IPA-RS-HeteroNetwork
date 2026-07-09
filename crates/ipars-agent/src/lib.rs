@@ -28,7 +28,7 @@ use ipars_types::api::{
     AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
     AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayAdmissionFailureReason,
     AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, AgentStatusResponse,
-    LazyConnectMetrics, PathStateCount, PeerMap, RotateWireGuardKeyRequest,
+    LazyConnectMetrics, PathStateCount, PeerMap, RemoveNodeRequest, RotateWireGuardKeyRequest,
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
@@ -1259,6 +1259,20 @@ impl AgentRuntime {
         };
         request.node_signature =
             Some(identity.sign_wireguard_key_rotation_request(&request, signed_at)?);
+        Ok(request)
+    }
+
+    pub fn remove_node_request(
+        &self,
+        signed_at: DateTime<Utc>,
+    ) -> Result<RemoveNodeRequest, AgentError> {
+        let state = self.state();
+        let identity = state.identity_key_pair()?;
+        let mut request = RemoveNodeRequest {
+            node_id: state.node_id,
+            node_signature: None,
+        };
+        request.node_signature = Some(identity.sign_remove_node_request(&request, signed_at)?);
         Ok(request)
     }
 

@@ -1588,6 +1588,21 @@ pub mod api {
         pub state_updated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub struct AgentNodeRemovalRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub control_plane_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentNodeRemovalResponse {
+        pub node_id: NodeId,
+        pub control_plane_node: NodeRecord,
+        pub removed_path_count: usize,
+        pub removed_health: bool,
+        pub removed_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentStunProbeRequest {
         pub local_bind: SocketAddr,
@@ -3082,14 +3097,14 @@ pub mod api {
         if let Some(application) = http_response_application(payload) {
             return Some(application);
         }
-        if let Some((_, path, _)) = http_request_line(payload) {
+        if let Some((method, path, _)) = http_request_line(payload) {
             if doh_http_request(payload) {
                 return Some(AgentPacketFlowApplication::Dns);
             }
-            if ipars_control_plane_http_api_path(path) {
+            if ipars_control_plane_http_api_path(method, path) {
                 return Some(AgentPacketFlowApplication::IparsControlPlane);
             }
-            if ipars_signal_http_api_path(path) {
+            if ipars_signal_http_api_path(method, path) {
                 return Some(AgentPacketFlowApplication::IparsSignal);
             }
             if ipars_agent_http_api_path(path) {
@@ -3494,11 +3509,12 @@ pub mod api {
         )
     }
 
-    fn ipars_control_plane_http_api_path(path: &[u8]) -> bool {
+    fn ipars_control_plane_http_api_path(method: &[u8], path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/v1/join")
             || path_starts_with_api_prefix(path, b"/v1/heartbeat")
             || path_starts_with_api_prefix(path, b"/v1/policy")
             || path_starts_with_api_prefix(path, b"/v1/tokens/revoke")
+            || (method == b"DELETE" && path_is_ipars_node_record_api(path))
             || (path.starts_with(b"/v1/nodes/") && path_contains_any(path, &[b"/wireguard-key"]))
             || (path.starts_with(b"/v1/peers/") && path.len() > b"/v1/peers/".len())
             || (path.starts_with(b"/v1/paths/")
@@ -3506,10 +3522,17 @@ pub mod api {
                 && !path_starts_with_api_prefix(path, b"/v1/paths/negotiate"))
     }
 
-    fn ipars_signal_http_api_path(path: &[u8]) -> bool {
+    fn path_is_ipars_node_record_api(path: &[u8]) -> bool {
+        const PREFIX: &[u8] = b"/v1/nodes/";
+        path.starts_with(PREFIX)
+            && path.len() > PREFIX.len()
+            && !path[PREFIX.len()..].contains(&b'/')
+    }
+
+    fn ipars_signal_http_api_path(method: &[u8], path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/v1/paths/negotiate")
             || path.starts_with(b"/v1/hole-punch/")
-            || (path.starts_with(b"/v1/nodes/") && path.len() > b"/v1/nodes/".len())
+            || (method == b"PUT" && path_is_ipars_node_record_api(path))
     }
 
     fn ipars_agent_http_api_path(path: &[u8]) -> bool {
@@ -3520,6 +3543,7 @@ pub mod api {
             || path_starts_with_api_prefix(path, b"/v1/peer-activity")
             || path_starts_with_api_prefix(path, b"/v1/packet-flow")
             || path_starts_with_api_prefix(path, b"/v1/wireguard-key/rotate")
+            || path_starts_with_api_prefix(path, b"/v1/node/remove")
             || path == b"/v1/peers"
             || path == b"/v1/paths"
     }
@@ -20576,11 +20600,23 @@ mod tests {
             api::AgentPacketFlowApplication::IparsControlPlane
         );
         assert_eq!(
+            observation_for_payload(b"DELETE /v1/nodes/node-a HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsControlPlane
+        );
+        assert_eq!(
             observation_for_payload(b"POST /v1/paths/negotiate HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::IparsSignal
         );
         assert_eq!(
+            observation_for_payload(b"PUT /v1/nodes/node-a HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsSignal
+        );
+        assert_eq!(
             observation_for_payload(b"POST /v1/packet-flow HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::IparsAgent
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /v1/node/remove HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::IparsAgent
         );
         assert_eq!(

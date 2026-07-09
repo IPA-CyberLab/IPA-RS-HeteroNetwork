@@ -9,13 +9,14 @@ use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
-    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentPacketFlowApplication,
-    AgentPacketFlowClassification, AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource,
-    AgentPacketFlowRequest, AgentPacketFlowResponse, AgentPathEventsResponse,
-    AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
+    AgentNatClassifyRequest, AgentNatClassifyResponse, AgentNodeRemovalRequest,
+    AgentNodeRemovalResponse, AgentPacketFlowApplication, AgentPacketFlowClassification,
+    AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowRequest,
+    AgentPacketFlowResponse, AgentPathEventsResponse, AgentPathProbeRequest,
+    AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentStunProbeRequest, AgentStunProbeResponse,
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -41,6 +42,17 @@ impl AgentHttpState {
             runtime,
             state_store: None,
             control_plane_urls: Vec::new(),
+        }
+    }
+
+    pub fn with_control_plane_urls(
+        runtime: Arc<AgentRuntime>,
+        control_plane_urls: Vec<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            state_store: None,
+            control_plane_urls,
         }
     }
 
@@ -72,6 +84,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/peer-activity", post(peer_activity))
         .route("/v1/packet-flow", post(packet_flow))
         .route("/v1/wireguard-key/rotate", post(rotate_wireguard_key))
+        .route("/v1/node/remove", post(remove_node))
         .with_state(state)
 }
 
@@ -126,6 +139,38 @@ async fn rotate_wireguard_key(
     }))
 }
 
+async fn remove_node(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<AgentNodeRemovalRequest>,
+) -> Result<Json<AgentNodeRemovalResponse>, ApiError> {
+    let control_plane_urls = request
+        .control_plane_url
+        .map(|url| vec![url])
+        .unwrap_or_else(|| state.control_plane_urls.clone());
+    if control_plane_urls.is_empty() {
+        return Err(AgentError::ControlPlaneClient(
+            "control-plane URL is required for node removal".to_string(),
+        )
+        .into());
+    }
+
+    let remove_request = state.runtime.remove_node_request(chrono::Utc::now())?;
+    let control_plane_response = send_node_removal_to_control_planes(
+        &reqwest::Client::new(),
+        &control_plane_urls,
+        remove_request,
+    )
+    .await?;
+
+    Ok(Json(AgentNodeRemovalResponse {
+        node_id: control_plane_response.node.node_id.clone(),
+        control_plane_node: control_plane_response.node,
+        removed_path_count: control_plane_response.removed_path_count,
+        removed_health: control_plane_response.removed_health,
+        removed_at: control_plane_response.removed_at,
+    }))
+}
+
 async fn send_wireguard_key_rotation_to_control_planes(
     client: &reqwest::Client,
     control_plane_urls: &[String],
@@ -153,6 +198,37 @@ async fn send_wireguard_key_rotation_to_control_planes(
     }
     Err(AgentError::ControlPlaneClient(format!(
         "all control-plane WireGuard key rotation endpoints failed: {}",
+        failures.join("; ")
+    )))
+}
+
+async fn send_node_removal_to_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    request: RemoveNodeRequest,
+) -> Result<RemoveNodeResponse, AgentError> {
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let url = node_removal_url(control_plane_url, &request.node_id);
+        match client.delete(&url).json(&request).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match read_bounded_json_response(
+                    response,
+                    MAX_CONTROL_PLANE_RESPONSE_BYTES,
+                    "control-plane node removal",
+                )
+                .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(error) => failures.push(format!("{url}: decode failed: {error}")),
+                },
+                Err(error) => failures.push(format!("{url}: rejected: {error}")),
+            },
+            Err(error) => failures.push(format!("{url}: send failed: {error}")),
+        }
+    }
+    Err(AgentError::ControlPlaneClient(format!(
+        "all control-plane node removal endpoints failed: {}",
         failures.join("; ")
     )))
 }
@@ -193,6 +269,14 @@ fn ensure_http_response_size(size: u64, max_bytes: u64, context: &str) -> Result
 fn wireguard_key_rotation_url(control_plane_url: &str, node_id: &NodeId) -> String {
     format!(
         "{}/v1/nodes/{}/wireguard-key",
+        control_plane_url.trim_end_matches('/'),
+        node_id
+    )
+}
+
+fn node_removal_url(control_plane_url: &str, node_id: &NodeId) -> String {
+    format!(
+        "{}/v1/nodes/{}",
         control_plane_url.trim_end_matches('/'),
         node_id
     )
@@ -1258,11 +1342,13 @@ mod tests {
     use chrono::Utc;
     use ipars_agent::{AgentNodeState, AgentRuntime, FileAgentStateStore, RelayForwarderStats};
     use ipars_types::api::{
-        AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
-        AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowMatchKind,
-        AgentPacketFlowObservation, AgentRelayAdmissionFailureReason,
-        AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, LazyConnectMetrics,
-        PeerMap, RelayMap, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        AgentNodeRemovalRequest, AgentNodeRemovalResponse, AgentPacketFlowApplication,
+        AgentPacketFlowClassification, AgentPacketFlowConntrackStatus, AgentPacketFlowDropReason,
+        AgentPacketFlowDuplicateSource, AgentPacketFlowMatchKind, AgentPacketFlowObservation,
+        AgentRelayAdmissionFailureReason, AgentWireGuardKeyRotationRequest,
+        AgentWireGuardKeyRotationResponse, LazyConnectMetrics, PeerMap, RelayMap,
+        RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
@@ -1440,6 +1526,58 @@ mod tests {
             .route(
                 "/v1/nodes/{node_id}/wireguard-key",
                 axum::routing::put(control_plane_rotation_handler),
+            )
+            .with_state(capture);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    #[derive(Clone)]
+    struct RemovalCapture {
+        request: Arc<tokio::sync::Mutex<Option<RemoveNodeRequest>>>,
+    }
+
+    async fn control_plane_removal_handler(
+        axum::extract::State(capture): axum::extract::State<RemovalCapture>,
+        axum::extract::Path(node_id): axum::extract::Path<String>,
+        Json(request): Json<RemoveNodeRequest>,
+    ) -> Json<RemoveNodeResponse> {
+        assert_eq!(node_id, request.node_id.as_str());
+        assert!(request.node_signature.is_some());
+        *capture.request.lock().await = Some(request.clone());
+        let node = NodeRecord {
+            node_id: request.node_id.clone(),
+            cluster_id: ClusterId::from_string("cluster-a"),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            identity_public_key: "identity-public".to_string(),
+            wireguard_public_key: "wireguard-public".to_string(),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        };
+        Json(RemoveNodeResponse {
+            node,
+            removed_path_count: 2,
+            removed_health: true,
+            removed_at: Utc::now(),
+        })
+    }
+
+    async fn spawn_removal_control_plane(
+        capture: RemovalCapture,
+    ) -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = Router::new()
+            .route(
+                "/v1/nodes/{node_id}",
+                axum::routing::delete(control_plane_removal_handler),
             )
             .with_state(capture);
         let task = tokio::spawn(async move {
@@ -1705,6 +1843,54 @@ mod tests {
 
         control_plane_task.abort();
         let _ = std::fs::remove_dir_all(state_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_removes_node_with_control_plane() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let state = AgentNodeState::generate(Utc::now());
+        let runtime = Arc::new(AgentRuntime::new(state.clone(), ClusterPolicy::default()));
+        let capture = RemovalCapture {
+            request: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let (control_plane_url, control_plane_task) =
+            spawn_removal_control_plane(capture.clone()).await?;
+        let app = router(AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![control_plane_url],
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/node/remove")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &AgentNodeRemovalRequest::default(),
+                    )?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response: AgentNodeRemovalResponse = serde_json::from_slice(&body)?;
+        assert_eq!(response.node_id, state.node_id);
+        assert_eq!(response.control_plane_node.node_id, response.node_id);
+        assert_eq!(response.removed_path_count, 2);
+        assert!(response.removed_health);
+
+        let sent_request = capture
+            .request
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| std::io::Error::other("control-plane did not receive removal"))?;
+        assert_eq!(sent_request.node_id, response.node_id);
+        assert!(sent_request.node_signature.is_some());
+
+        control_plane_task.abort();
         Ok(())
     }
 
