@@ -3894,6 +3894,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_dns_publication(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not publish LoadBalancer DNS names; use typed relay advertisement and explicit Service exposure controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3992,6 +3998,18 @@ fn kubernetes_service_annotation_controls_operational_attributes(key: &str) -> b
         || key.contains("deregistration-delay")
         || key.contains("cross-zone")
         || key.contains("preserve-client-ip")
+}
+
+fn kubernetes_service_annotation_controls_dns_publication(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("external-dns")
+        || key.contains("dns-name")
+        || key.contains("dns-label")
+        || key.contains("load-balancer-hostname")
+        || key.contains("loadbalancer-hostname")
+        || key.contains("domain-name")
+        || key.contains("domainname")
+        || key.contains("fqdn")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11866,6 +11884,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-attributes must not configure LoadBalancer operational attributes"
         ));
 
+        let mut agent_dns_publication_annotation = base_k8s_install_args();
+        agent_dns_publication_annotation.expose_agent_api = true;
+        agent_dns_publication_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "external-dns.alpha.kubernetes.io/hostname".to_string(),
+            value: "api.example.com".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_dns_publication_annotation) {
+            Ok(_) => panic!("agent API DNS publication annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key external-dns.alpha.kubernetes.io/hostname must not publish LoadBalancer DNS names"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12074,6 +12106,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-target-group-attributes must not configure LoadBalancer operational attributes"
+        ));
+
+        let mut relay_dns_publication_annotation = base_k8s_install_args();
+        relay_dns_publication_annotation.expose_relay = true;
+        relay_dns_publication_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_dns_publication_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_dns_publication_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-dns-label-name".to_string(),
+            value: "relay-edge".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_dns_publication_annotation) {
+            Ok(_) => panic!("relay DNS publication annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-dns-label-name must not publish LoadBalancer DNS names"
         ));
 
         Ok(())
@@ -12859,6 +12909,9 @@ fi
         ));
         assert!(service_template.contains(
             ".Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged"
+        ));
+        assert!(helpers_template.contains(
+            "must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));

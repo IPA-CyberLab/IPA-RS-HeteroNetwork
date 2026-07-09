@@ -543,6 +543,14 @@ template_fails agent-api-load-balancer-attribute-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-cross-zone-load-balancing-enabled=true'
 
+template_fails agent-api-dns-publication-annotation \
+  "agent.apiService.annotations annotation key \"external-dns.alpha.kubernetes.io/hostname\" must not publish LoadBalancer DNS names" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.external-dns\.alpha\.kubernetes\.io/hostname=api.example.com'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \
