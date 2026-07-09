@@ -12092,6 +12092,12 @@ pub mod api {
         Incomplete,
     }
 
+    enum KafkaHeaderEncoding {
+        NullableClientId,
+        CompactClientId,
+        Either,
+    }
+
     enum KafkaVarintParse {
         Complete(u64, usize),
         Incomplete,
@@ -12110,7 +12116,11 @@ pub mod api {
         if payload.len() < correlation_id_end {
             return Some(KafkaFrameParse::Incomplete);
         }
+        let header_encoding = kafka_request_header_encoding(api_key, api_version);
         if frame_len == 8 {
+            if matches!(header_encoding, KafkaHeaderEncoding::CompactClientId) {
+                return None;
+            }
             return if payload.len() < frame_end {
                 Some(KafkaFrameParse::Incomplete)
             } else {
@@ -12119,7 +12129,8 @@ pub mod api {
         }
         let header_tail = payload.get(correlation_id_end..)?;
         let remaining_frame_len = frame_len - 8;
-        let header_parse = kafka_request_header_payload(header_tail, remaining_frame_len)?;
+        let header_parse =
+            kafka_request_header_payload(header_encoding, header_tail, remaining_frame_len)?;
         match header_parse {
             KafkaHeaderParse::Complete => {
                 if payload.len() < frame_end {
@@ -12133,11 +12144,35 @@ pub mod api {
     }
 
     fn kafka_request_header_payload(
+        encoding: KafkaHeaderEncoding,
         payload: &[u8],
         remaining_frame_len: usize,
     ) -> Option<KafkaHeaderParse> {
-        kafka_nullable_client_id_header_payload(payload, remaining_frame_len)
-            .or_else(|| kafka_compact_client_id_header_payload(payload, remaining_frame_len))
+        match encoding {
+            KafkaHeaderEncoding::NullableClientId => {
+                kafka_nullable_client_id_header_payload(payload, remaining_frame_len)
+            }
+            KafkaHeaderEncoding::CompactClientId => {
+                kafka_compact_client_id_header_payload(payload, remaining_frame_len)
+            }
+            KafkaHeaderEncoding::Either => {
+                kafka_nullable_client_id_header_payload(payload, remaining_frame_len).or_else(
+                    || kafka_compact_client_id_header_payload(payload, remaining_frame_len),
+                )
+            }
+        }
+    }
+
+    fn kafka_request_header_encoding(api_key: u16, api_version: u16) -> KafkaHeaderEncoding {
+        if api_key == 18 {
+            if api_version >= 3 {
+                KafkaHeaderEncoding::CompactClientId
+            } else {
+                KafkaHeaderEncoding::NullableClientId
+            }
+        } else {
+            KafkaHeaderEncoding::Either
+        }
     }
 
     fn kafka_nullable_client_id_header_payload(
@@ -21547,8 +21582,12 @@ mod tests {
             api::AgentPacketFlowApplication::Kafka
         );
         assert_eq!(
-            observation_for_payload(&kafka_request(18, 3, None, b"body")).application(),
+            observation_for_payload(&kafka_request(18, 2, None, b"body")).application(),
             api::AgentPacketFlowApplication::Kafka
+        );
+        assert_eq!(
+            observation_for_payload(&kafka_request(18, 3, None, b"body")).application(),
+            api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&kafka_flexible_request(
@@ -21560,7 +21599,7 @@ mod tests {
             .application(),
             api::AgentPacketFlowApplication::Kafka
         );
-        let mut kafka_pipelined = kafka_request(18, 3, None, b"");
+        let mut kafka_pipelined = kafka_flexible_request(18, 3, None, b"");
         kafka_pipelined.extend_from_slice(&kafka_request(3, 9, Some(b"rust-client"), b""));
         assert_eq!(
             observation_for_payload(&kafka_pipelined).application(),
@@ -21572,20 +21611,28 @@ mod tests {
             observation_for_payload(&kafka_partial_body).application(),
             api::AgentPacketFlowApplication::Kafka
         );
-        let mut kafka_with_trailing_junk = kafka_request(18, 3, None, b"");
+        let mut kafka_with_trailing_junk = kafka_flexible_request(18, 3, None, b"");
         kafka_with_trailing_junk.extend_from_slice(b"junk");
         assert_eq!(
             observation_for_payload(&kafka_with_trailing_junk).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
-            observation_for_payload(&kafka_request(18, 3, Some(b"bad\0client"), b"")).application(),
+            observation_for_payload(&kafka_request(18, 2, Some(b"bad\0client"), b"")).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
             observation_for_payload(&[
                 0, 0, 0, 21, 0, 18, 0, 3, 0, 0, 0, 1, 0, 11, b'r', b'u', b's', b't', b'-', b'c',
                 b'l', b'i', b'e', b'n', b't',
+            ])
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&[
+                0, 0, 0, 21, 0, 18, 0, 3, 0, 0, 0, 1, 12, b'r', b'u', b's', b't', b'-', b'c', b'l',
+                b'i', b'e', b'n', b't', 0,
             ])
             .application(),
             api::AgentPacketFlowApplication::Kafka
