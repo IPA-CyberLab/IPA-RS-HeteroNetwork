@@ -13846,7 +13846,7 @@ pub mod api {
 
     fn cassandra_response_body(opcode: u8, body_len: usize, body_prefix: &[u8]) -> bool {
         match opcode {
-            0x00 => body_len >= 8 && body_prefix.len() >= 8,
+            0x00 => cassandra_error_body(body_len, body_prefix),
             0x02 => body_len == 0,
             0x03 => cassandra_string_body(body_len, body_prefix),
             0x06 => body_len >= 2 && body_prefix.len() >= 2,
@@ -13863,6 +13863,203 @@ pub mod api {
         }
         cassandra_bytes_field(body_prefix, 0, body_len, false)
             .is_some_and(|offset| offset == body_len)
+    }
+
+    fn cassandra_error_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 6 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(error_code) = read_u32_be(body_prefix, 0) else {
+            return false;
+        };
+        let Some((_message, offset)) = cassandra_string_field(body_prefix, 4) else {
+            return false;
+        };
+        if !cassandra_error_code(error_code) {
+            return false;
+        }
+        cassandra_error_details(error_code, body_prefix, offset, body_len)
+    }
+
+    fn cassandra_error_code(error_code: u32) -> bool {
+        matches!(
+            error_code,
+            0x0000
+                | 0x000a
+                | 0x0100
+                | 0x1000
+                | 0x1001
+                | 0x1002
+                | 0x1003
+                | 0x1100
+                | 0x1200
+                | 0x1300
+                | 0x1400
+                | 0x1500
+                | 0x2000
+                | 0x2100
+                | 0x2200
+                | 0x2300
+                | 0x2400
+                | 0x2500
+        )
+    }
+
+    fn cassandra_error_details(
+        error_code: u32,
+        body_prefix: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> bool {
+        match error_code {
+            0x1000 => cassandra_unavailable_error_details(body_prefix, offset, body_len),
+            0x1100 => cassandra_write_timeout_or_failure_error_details(
+                body_prefix,
+                offset,
+                body_len,
+                false,
+            ),
+            0x1200 => cassandra_read_timeout_or_failure_error_details(
+                body_prefix,
+                offset,
+                body_len,
+                false,
+            ),
+            0x1300 => {
+                cassandra_read_timeout_or_failure_error_details(body_prefix, offset, body_len, true)
+            }
+            0x1400 => cassandra_function_failure_error_details(body_prefix, offset, body_len),
+            0x1500 => cassandra_write_timeout_or_failure_error_details(
+                body_prefix,
+                offset,
+                body_len,
+                true,
+            ),
+            0x2400 => cassandra_already_exists_error_details(body_prefix, offset, body_len),
+            0x2500 => cassandra_short_bytes_field(body_prefix, offset, body_len)
+                .is_some_and(|next_offset| next_offset == body_len),
+            _ => offset == body_len,
+        }
+    }
+
+    fn cassandra_unavailable_error_details(
+        body_prefix: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> bool {
+        if offset.checked_add(10) != Some(body_len) {
+            return false;
+        }
+        read_u16_be(body_prefix, offset).is_some_and(cassandra_consistency)
+            && read_u32_be(body_prefix, offset + 2).is_some()
+            && read_u32_be(body_prefix, offset + 6).is_some()
+    }
+
+    fn cassandra_write_timeout_or_failure_error_details(
+        body_prefix: &[u8],
+        mut offset: usize,
+        body_len: usize,
+        has_failures: bool,
+    ) -> bool {
+        if body_len < offset.saturating_add(if has_failures { 14 } else { 10 }) {
+            return false;
+        }
+        let Some(consistency) = read_u16_be(body_prefix, offset) else {
+            return false;
+        };
+        if !cassandra_consistency(consistency) {
+            return false;
+        }
+        offset += 2;
+        if read_u32_be(body_prefix, offset).is_none()
+            || read_u32_be(body_prefix, offset + 4).is_none()
+        {
+            return false;
+        }
+        offset += 8;
+        if has_failures {
+            if read_u32_be(body_prefix, offset).is_none() {
+                return false;
+            }
+            offset += 4;
+        }
+        cassandra_string_field(body_prefix, offset)
+            .is_some_and(|(_write_type, next_offset)| next_offset == body_len)
+    }
+
+    fn cassandra_read_timeout_or_failure_error_details(
+        body_prefix: &[u8],
+        mut offset: usize,
+        body_len: usize,
+        has_failures: bool,
+    ) -> bool {
+        let required = if has_failures { 15 } else { 11 };
+        if offset.checked_add(required) != Some(body_len) {
+            return false;
+        }
+        let Some(consistency) = read_u16_be(body_prefix, offset) else {
+            return false;
+        };
+        if !cassandra_consistency(consistency) {
+            return false;
+        }
+        offset += 2;
+        if read_u32_be(body_prefix, offset).is_none()
+            || read_u32_be(body_prefix, offset + 4).is_none()
+        {
+            return false;
+        }
+        offset += 8;
+        if has_failures {
+            if read_u32_be(body_prefix, offset).is_none() {
+                return false;
+            }
+            offset += 4;
+        }
+        body_prefix
+            .get(offset)
+            .is_some_and(|value| matches!(*value, 0 | 1))
+    }
+
+    fn cassandra_function_failure_error_details(
+        body_prefix: &[u8],
+        mut offset: usize,
+        body_len: usize,
+    ) -> bool {
+        let Some((_keyspace, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+            return false;
+        };
+        let Some((_function, next_offset)) = cassandra_string_field(body_prefix, next_offset)
+        else {
+            return false;
+        };
+        offset = next_offset;
+        let Some(count) = read_u16_be(body_prefix, offset).map(|count| count as usize) else {
+            return false;
+        };
+        if count > 64 {
+            return false;
+        }
+        offset += 2;
+        for _ in 0..count {
+            let Some((_arg_type, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == body_len
+    }
+
+    fn cassandra_already_exists_error_details(
+        body_prefix: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> bool {
+        cassandra_string_field_allow_empty(body_prefix, offset)
+            .and_then(|(_keyspace, next_offset)| {
+                cassandra_string_field_allow_empty(body_prefix, next_offset)
+            })
+            .is_some_and(|(_table, next_offset)| next_offset == body_len)
     }
 
     fn cassandra_result_body(body_len: usize, body_prefix: &[u8]) -> bool {
@@ -14421,8 +14618,13 @@ pub mod api {
     }
 
     fn cassandra_string_field(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        let (value, value_end) = cassandra_string_field_allow_empty(payload, offset)?;
+        (!value.is_empty()).then_some((value, value_end))
+    }
+
+    fn cassandra_string_field_allow_empty(payload: &[u8], offset: usize) -> Option<(&[u8], usize)> {
         let len = read_u16_be(payload, offset)? as usize;
-        if len == 0 || len > 4096 {
+        if len > 4096 {
             return None;
         }
         let value_start = offset.checked_add(2)?;
@@ -22724,6 +22926,27 @@ mod tests {
             observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
             api::AgentPacketFlowApplication::Cassandra
         );
+        let mut cassandra_error = 0_u32.to_be_bytes().to_vec();
+        cassandra_error.extend_from_slice(&cassandra_string(b"server unavailable"));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x00, &cassandra_error))
+                .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_write_timeout_error = 0x1100_u32.to_be_bytes().to_vec();
+        cassandra_write_timeout_error.extend_from_slice(&cassandra_string(b"write timed out"));
+        cassandra_write_timeout_error.extend_from_slice(&0x0001_u16.to_be_bytes());
+        cassandra_write_timeout_error.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_write_timeout_error.extend_from_slice(&2_u32.to_be_bytes());
+        cassandra_write_timeout_error.extend_from_slice(&cassandra_string(b"SIMPLE"));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x00,
+                &cassandra_write_timeout_error
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
         let mut cassandra_auth_response = 4_i32.to_be_bytes().to_vec();
         cassandra_auth_response.extend_from_slice(b"auth");
         assert_eq!(
@@ -22863,6 +23086,24 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x04, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_unknown_error = 0x9999_u32.to_be_bytes().to_vec();
+        cassandra_unknown_error.extend_from_slice(&cassandra_string(b"unknown"));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x00, &cassandra_unknown_error))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_bad_error_message = 0_u32.to_be_bytes().to_vec();
+        cassandra_bad_error_message.extend_from_slice(&10_u16.to_be_bytes());
+        cassandra_bad_error_message.extend_from_slice(b"short");
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x00,
+                &cassandra_bad_error_message
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut cassandra_bad_auth_response = 8_i32.to_be_bytes().to_vec();
