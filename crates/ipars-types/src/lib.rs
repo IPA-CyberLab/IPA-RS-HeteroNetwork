@@ -1198,6 +1198,14 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RemoveNodeResponse {
+        pub node: NodeRecord,
+        pub removed_path_count: usize,
+        pub removed_health: bool,
+        pub removed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct HeartbeatResponse {
         pub accepted: bool,
         pub policy_version: u64,

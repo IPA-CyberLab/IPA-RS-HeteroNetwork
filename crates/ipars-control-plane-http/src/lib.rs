@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use ipars_control_plane::{
@@ -13,7 +13,8 @@ use ipars_control_plane::{
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
-    RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse,
 };
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
@@ -65,6 +66,7 @@ where
         .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
         .route("/v1/paths/{node_id}", get(paths::<S, L>))
+        .route("/v1/nodes/{node_id}", delete(remove_node::<S, L>))
         .route(
             "/v1/nodes/{node_id}/wireguard-key",
             put(rotate_wireguard_key::<S, L>),
@@ -202,6 +204,21 @@ where
 {
     let node_id = NodeId::from_string(node_id);
     let response = state.plane.paths_for(&node_id).await?;
+    Ok(Json(response))
+}
+
+async fn remove_node<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(node_id): Path<String>,
+) -> Result<Json<RemoveNodeResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let response = state
+        .plane
+        .remove_node(&NodeId::from_string(node_id))
+        .await?;
     Ok(Json(response))
 }
 
@@ -600,6 +617,7 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use axum::body::Body;
     use axum::http::{header, Request};
@@ -611,8 +629,8 @@ mod tests {
     use ipars_types::api::{
         ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
         HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-        RegisterNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse,
+        RegisterNodeResponse, RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
+        RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -820,6 +838,7 @@ mod tests {
         assert!(body.contains("selected candidate kind StunReflexive"));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1091,6 +1110,7 @@ mod tests {
         assert_eq!(paths.path_state_ttl_seconds, 600);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1136,6 +1156,51 @@ mod tests {
         assert!(body.contains(&format!(
             "ipars_control_plane_path_state_count{{cluster_id=\"{prometheus_cluster_id}\",state=\"RELAY\"}} 0"
         )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/nodes/{}", node_id("node-http")))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let removed: RemoveNodeResponse = serde_json::from_slice(&body)?;
+        assert_eq!(removed.node.node_id, node_id("node-http"));
+        assert_eq!(removed.removed_path_count, 1);
+        assert!(removed.removed_health);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/paths/{}", node_id("node-http")))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.node_count, 1);
+        assert_eq!(metrics.path_count, 0);
+        assert_eq!(metrics.vpn_pool_allocated_count, 1);
+        let mut reclaim_claims = claims(
+            cluster_id.clone(),
+            issuer.node_id(),
+            KeyId::from_string("root"),
+        );
+        reclaim_claims.nonce = "http-reclaim".to_string();
+        let reclaimed = plane
+            .register_with_claims(reclaim_claims, registration("node-reclaim"))
+            .await?;
+        assert_eq!(
+            reclaimed.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+        );
         Ok(())
     }
 }

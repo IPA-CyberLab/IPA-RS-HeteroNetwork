@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, TokenLedger};
+use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, RemovedNode, TokenLedger};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
     Route, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
@@ -118,6 +118,41 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .into_iter()
             .map(row_to_node)
             .collect()
+    }
+
+    async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let health_result = sqlx::query("DELETE FROM health WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let path_result =
+            sqlx::query("DELETE FROM paths WHERE local_node_id = ?1 OR remote_node_id = ?1")
+                .bind(node_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(RemovedNode {
+            node,
+            removed_path_count: path_result.rows_affected() as usize,
+            removed_health: health_result.rows_affected() > 0,
+        })
     }
 
     async fn update_node_candidates(
@@ -538,6 +573,41 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .into_iter()
             .map(pg_row_to_node)
             .collect()
+    }
+
+    async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let path_result =
+            sqlx::query("DELETE FROM paths WHERE local_node_id = $1 OR remote_node_id = $1")
+                .bind(node_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nodes WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(RemovedNode {
+            node,
+            removed_path_count: path_result.rows_affected() as usize,
+            removed_health: health_result.rows_affected() > 0,
+        })
     }
 
     async fn update_node_candidates(
@@ -1122,6 +1192,18 @@ mod tests {
             .upsert_health(local.node_id.clone(), health.clone())
             .await?;
         assert_eq!(store.get_health(&local.node_id).await?, Some(health));
+
+        let removed = store.remove_node(&local.node_id).await?;
+        assert_eq!(removed.node.node_id, local.node_id);
+        assert_eq!(removed.removed_path_count, 1);
+        assert!(removed.removed_health);
+        assert_eq!(store.get_node(&local.node_id).await?, None);
+        assert_eq!(store.get_health(&local.node_id).await?, None);
+        assert!(store.list_paths_for(&remote.node_id).await?.is_empty());
+        assert!(matches!(
+            store.remove_node(&local.node_id).await,
+            Err(ControlPlaneError::NodeNotFound(_))
+        ));
 
         let admission = TokenAdmission::new(std::sync::Arc::new(store.clone()));
         let token_claims = claims(local.cluster_id.clone());

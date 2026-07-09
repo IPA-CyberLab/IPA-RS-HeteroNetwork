@@ -13,7 +13,7 @@ use ipars_crypto::{
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
     PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
@@ -105,6 +105,7 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError>;
     async fn get_node(&self, node_id: &NodeId) -> Result<Option<NodeRecord>, ControlPlaneError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError>;
+    async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError>;
     async fn update_node_candidates(
         &self,
         node_id: &NodeId,
@@ -139,6 +140,13 @@ pub trait ControlPlaneStore: Send + Sync {
         paths: Vec<PathRecord>,
     ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedNode {
+    pub node: NodeRecord,
+    pub removed_path_count: usize,
+    pub removed_health: bool,
 }
 
 #[async_trait]
@@ -192,6 +200,29 @@ impl ControlPlaneStore for InMemoryStore {
 
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
         Ok(self.nodes.read().await.values().cloned().collect())
+    }
+
+    async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
+        let node = self
+            .nodes
+            .write()
+            .await
+            .remove(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let removed_health = self.health.write().await.remove(node_id).is_some();
+        let mut removed_path_count = 0;
+        self.paths.write().await.retain(|path| {
+            let keep = &path.key.local != node_id && &path.key.remote != node_id;
+            if !keep {
+                removed_path_count += 1;
+            }
+            keep
+        });
+        Ok(RemovedNode {
+            node,
+            removed_path_count,
+            removed_health,
+        })
     }
 
     async fn update_node_candidates(
@@ -700,6 +731,20 @@ where
             .collect::<Vec<_>>();
 
         Ok(self.filtered_peer_map_for_node(&source, &peers, Utc::now()))
+    }
+
+    pub async fn remove_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RemoveNodeResponse, ControlPlaneError> {
+        let removed = self.store.remove_node(node_id).await?;
+        *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
+        Ok(RemoveNodeResponse {
+            node: removed.node,
+            removed_path_count: removed.removed_path_count,
+            removed_health: removed.removed_health,
+            removed_at: Utc::now(),
+        })
     }
 
     pub async fn paths_for(
@@ -2333,6 +2378,10 @@ mod tests {
             self.inner.list_nodes().await
         }
 
+        async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
+            self.inner.remove_node(node_id).await
+        }
+
         async fn update_node_candidates(
             &self,
             node_id: &NodeId,
@@ -2653,6 +2702,72 @@ mod tests {
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_removal_reclaims_vpn_ip_and_clears_runtime_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store.clone());
+        let first = plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        let second = plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-b"))
+            .await?;
+        assert_eq!(
+            first.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+        );
+        assert_eq!(
+            second.node.vpn_ip.0,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))
+        );
+
+        store
+            .upsert_health(
+                first.node.node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        store.upsert_path(path("node-a", "node-b")).await?;
+        store.upsert_path(path("node-b", "node-a")).await?;
+
+        let removed = plane.remove_node(&first.node.node_id).await?;
+        assert_eq!(removed.node.node_id, first.node.node_id);
+        assert_eq!(removed.removed_path_count, 2);
+        assert!(removed.removed_health);
+        assert!(matches!(
+            plane.peer_map_for(&first.node.node_id).await,
+            Err(ControlPlaneError::NodeNotFound(_))
+        ));
+        assert!(plane
+            .paths_for(&second.node.node_id)
+            .await?
+            .paths
+            .is_empty());
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.node_count, 1);
+        assert_eq!(metrics.path_count, 0);
+        assert_eq!(metrics.vpn_pool_allocated_count, 1);
+        assert_eq!(metrics.vpn_pool_available_count, 5);
+
+        let replacement = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-c"))
+            .await?;
+        assert_eq!(replacement.node.vpn_ip, first.node.vpn_ip);
         Ok(())
     }
 
