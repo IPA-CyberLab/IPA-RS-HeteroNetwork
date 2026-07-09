@@ -2926,7 +2926,7 @@ where
 }
 
 fn command_stderr_message(stderr: &LimitedCommandOutput) -> String {
-    let text = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+    let text = command_diagnostic_component(String::from_utf8_lossy(&stderr.bytes).trim());
     if !stderr.truncated {
         return text;
     }
@@ -2948,20 +2948,20 @@ fn command_timeout_label(timeout: Duration) -> String {
 }
 
 fn command_label(program: &str, args: &[String]) -> String {
-    let program = command_label_component(program);
+    let program = command_diagnostic_component(program);
     if args.is_empty() {
         program
     } else {
         let args = args
             .iter()
-            .map(|arg| command_label_component(arg))
+            .map(|arg| command_diagnostic_component(arg))
             .collect::<Vec<_>>()
             .join(" ");
         format!("{program} {args}")
     }
 }
 
-fn command_label_component(value: &str) -> String {
+fn command_diagnostic_component(value: &str) -> String {
     value.chars().flat_map(char::escape_default).collect()
 }
 
@@ -4174,6 +4174,21 @@ mod tests {
         assert_eq!(label, r"wg set\npeer tab\targ slash\\arg");
         assert!(!label.contains('\n'));
         assert!(!label.contains('\t'));
+    }
+
+    #[test]
+    fn command_stderr_message_escapes_control_characters() {
+        let stderr = LimitedCommandOutput {
+            bytes: b"failed\nstderr\tfield".to_vec(),
+            truncated: false,
+            limit: 64,
+        };
+
+        let message = command_stderr_message(&stderr);
+
+        assert_eq!(message, r"failed\nstderr\tfield");
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\t'));
     }
 
     #[cfg(unix)]
