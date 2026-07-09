@@ -3982,6 +3982,8 @@ fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool
         || key.contains("load-balancer-class")
         || key.contains("loadbalancerclass")
         || key.contains("nlb-target-type")
+        || key.contains("global-access")
+        || key.contains("allow-global-access")
 }
 
 fn kubernetes_service_annotation_controls_firewall_policy(key: &str) -> bool {
@@ -11895,6 +11897,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-scheme must not configure LoadBalancer scope or implementation type"
         ));
 
+        let mut agent_global_access_annotation = base_k8s_install_args();
+        agent_global_access_annotation.expose_agent_api = true;
+        agent_global_access_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "networking.gke.io/load-balancer-allow-global-access".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_global_access_annotation) {
+            Ok(_) => panic!("agent API LoadBalancer global access annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key networking.gke.io/load-balancer-allow-global-access must not configure LoadBalancer scope or implementation type"
+        ));
+
         let mut agent_security_group_annotation = base_k8s_install_args();
         agent_security_group_annotation.expose_agent_api = true;
         agent_security_group_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -12148,6 +12164,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key cloud.google.com/load-balancer-type must not configure LoadBalancer scope or implementation type"
+        ));
+
+        let mut relay_global_access_annotation = base_k8s_install_args();
+        relay_global_access_annotation.expose_relay = true;
+        relay_global_access_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_global_access_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_global_access_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "networking.gke.io/load-balancer-global-access".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_global_access_annotation) {
+            Ok(_) => panic!("relay LoadBalancer global access annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key networking.gke.io/load-balancer-global-access must not configure LoadBalancer scope or implementation type"
         ));
 
         let mut relay_firewall_annotation = base_k8s_install_args();

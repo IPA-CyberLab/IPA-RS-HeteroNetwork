@@ -516,6 +516,14 @@ template_fails relay-load-balancer-type-annotation \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.cloud\.google\.com/load-balancer-type=Internal'
 
+template_fails agent-api-global-access-annotation \
+  "agent.apiService.annotations annotation key \"networking.gke.io/load-balancer-allow-global-access\" must not configure LoadBalancer scope or implementation type" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.networking\.gke\.io/load-balancer-allow-global-access=true'
+
 template_fails agent-api-security-group-annotation \
   "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-security-groups\" must not configure LoadBalancer firewall or security groups" \
   --set agent.apiService.enabled=true \
