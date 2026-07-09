@@ -13705,16 +13705,33 @@ pub mod api {
     }
 
     fn cassandra_type_option(body_prefix: &[u8], offset: usize, body_len: usize) -> Option<usize> {
+        cassandra_type_option_with_depth(body_prefix, offset, body_len, 0)
+    }
+
+    fn cassandra_type_option_with_depth(
+        body_prefix: &[u8],
+        offset: usize,
+        body_len: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        if depth > 16 {
+            return None;
+        }
         let option_id = read_u16_be(body_prefix, offset)?;
         let mut offset = offset.checked_add(2)?;
         match option_id {
-            0x0000 | 0x0001 | 0x0002 | 0x0003 | 0x0004 | 0x0005 | 0x0006 | 0x0007 | 0x0008
-            | 0x0009 | 0x000a | 0x000b | 0x000c | 0x000d | 0x000e | 0x000f | 0x0010 | 0x0011
-            | 0x0012 | 0x0013 | 0x0014 | 0x0015 => Some(offset),
-            0x0020 | 0x0022 => cassandra_type_option(body_prefix, offset, body_len),
+            0x0000 => cassandra_string_field(body_prefix, offset)
+                .map(|(_custom_type, next_offset)| next_offset),
+            0x0001 | 0x0002 | 0x0003 | 0x0004 | 0x0005 | 0x0006 | 0x0007 | 0x0008 | 0x0009
+            | 0x000a | 0x000b | 0x000c | 0x000d | 0x000e | 0x000f | 0x0010 | 0x0011 | 0x0012
+            | 0x0013 | 0x0014 | 0x0015 => Some(offset),
+            0x0020 | 0x0022 => {
+                cassandra_type_option_with_depth(body_prefix, offset, body_len, depth + 1)
+            }
             0x0021 => {
-                offset = cassandra_type_option(body_prefix, offset, body_len)?;
-                cassandra_type_option(body_prefix, offset, body_len)
+                offset =
+                    cassandra_type_option_with_depth(body_prefix, offset, body_len, depth + 1)?;
+                cassandra_type_option_with_depth(body_prefix, offset, body_len, depth + 1)
             }
             0x0030 => {
                 let (_keyspace, next_offset) = cassandra_string_field(body_prefix, offset)?;
@@ -13726,7 +13743,12 @@ pub mod api {
                 offset = next_offset.checked_add(2)?;
                 for _ in 0..fields_count {
                     let (_field_name, next_offset) = cassandra_string_field(body_prefix, offset)?;
-                    offset = cassandra_type_option(body_prefix, next_offset, body_len)?;
+                    offset = cassandra_type_option_with_depth(
+                        body_prefix,
+                        next_offset,
+                        body_len,
+                        depth + 1,
+                    )?;
                 }
                 Some(offset)
             }
@@ -13737,7 +13759,8 @@ pub mod api {
                 }
                 offset = offset.checked_add(2)?;
                 for _ in 0..count {
-                    offset = cassandra_type_option(body_prefix, offset, body_len)?;
+                    offset =
+                        cassandra_type_option_with_depth(body_prefix, offset, body_len, depth + 1)?;
                 }
                 Some(offset)
             }
@@ -22205,6 +22228,40 @@ mod tests {
                 .application(),
             api::AgentPacketFlowApplication::Cassandra
         );
+        let mut cassandra_rows_collection_result = 2_u32.to_be_bytes().to_vec();
+        cassandra_rows_collection_result.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_collection_result.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_collection_result.extend_from_slice(&cassandra_string(b"ks"));
+        cassandra_rows_collection_result.extend_from_slice(&cassandra_string(b"tbl"));
+        cassandra_rows_collection_result.extend_from_slice(&cassandra_string(b"items"));
+        cassandra_rows_collection_result.extend_from_slice(&0x0020_u16.to_be_bytes());
+        cassandra_rows_collection_result.extend_from_slice(&0x0009_u16.to_be_bytes());
+        cassandra_rows_collection_result.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x08,
+                &cassandra_rows_collection_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_rows_custom_result = 2_u32.to_be_bytes().to_vec();
+        cassandra_rows_custom_result.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_custom_result.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_custom_result.extend_from_slice(&cassandra_string(b"ks"));
+        cassandra_rows_custom_result.extend_from_slice(&cassandra_string(b"tbl"));
+        cassandra_rows_custom_result.extend_from_slice(&cassandra_string(b"custom_value"));
+        cassandra_rows_custom_result.extend_from_slice(&0x0000_u16.to_be_bytes());
+        cassandra_rows_custom_result.extend_from_slice(&cassandra_string(b"org.example.Type"));
+        cassandra_rows_custom_result.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x08,
+                &cassandra_rows_custom_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
         let mut cassandra_prepared_result = 4_u32.to_be_bytes().to_vec();
         cassandra_prepared_result.extend_from_slice(&3_u16.to_be_bytes());
         cassandra_prepared_result.extend_from_slice(b"pid");
@@ -22245,6 +22302,22 @@ mod tests {
         cassandra_rows_bad_flags.extend_from_slice(&0_u32.to_be_bytes());
         assert_eq!(
             observation_for_payload(&cassandra_response_frame(0x08, &cassandra_rows_bad_flags))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_rows_deep_type = 2_u32.to_be_bytes().to_vec();
+        cassandra_rows_deep_type.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_deep_type.extend_from_slice(&1_u32.to_be_bytes());
+        cassandra_rows_deep_type.extend_from_slice(&cassandra_string(b"ks"));
+        cassandra_rows_deep_type.extend_from_slice(&cassandra_string(b"tbl"));
+        cassandra_rows_deep_type.extend_from_slice(&cassandra_string(b"deep"));
+        for _ in 0..18 {
+            cassandra_rows_deep_type.extend_from_slice(&0x0020_u16.to_be_bytes());
+        }
+        cassandra_rows_deep_type.extend_from_slice(&0x0009_u16.to_be_bytes());
+        cassandra_rows_deep_type.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x08, &cassandra_rows_deep_type))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
         );
