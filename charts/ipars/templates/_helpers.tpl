@@ -106,6 +106,48 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.ipv4CidrRange" -}}
+{{- $value := printf "%v" .value -}}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value -}}
+{{- $parts := splitList "/" $value -}}
+{{- $octets := splitList "." (index $parts 0) -}}
+{{- $prefix := int (index $parts 1) -}}
+{{- $ip := add (mul (int (index $octets 0)) 16777216) (mul (int (index $octets 1)) 65536) (mul (int (index $octets 2)) 256) (int (index $octets 3)) -}}
+{{- $blockSizes := list 4294967296 2147483648 1073741824 536870912 268435456 134217728 67108864 33554432 16777216 8388608 4194304 2097152 1048576 524288 262144 131072 65536 32768 16384 8192 4096 2048 1024 512 256 128 64 32 16 8 4 2 1 -}}
+{{- $size := int (index $blockSizes $prefix) -}}
+{{- $start := mul (div $ip $size) $size -}}
+{{- $end := add $start (sub $size 1) -}}
+{{- printf "%d:%d" $start $end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateIpv4CidrContainedBySourceRanges" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- $sourcePath := .sourcePath -}}
+{{- $sourceRanges := .sourceRanges -}}
+{{- if and $sourceRanges (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value) -}}
+{{- $bounds := splitList ":" (include "ipars.ipv4CidrRange" (dict "value" $value)) -}}
+{{- $start := int (index $bounds 0) -}}
+{{- $end := int (index $bounds 1) -}}
+{{- $contained := dict "ok" false -}}
+{{- range $source := $sourceRanges -}}
+{{- $sourceValue := printf "%v" $source -}}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $sourceValue -}}
+{{- $sourceBounds := splitList ":" (include "ipars.ipv4CidrRange" (dict "value" $sourceValue)) -}}
+{{- $sourceStart := int (index $sourceBounds 0) -}}
+{{- $sourceEnd := int (index $sourceBounds 1) -}}
+{{- if and (le $sourceStart $start) (le $end $sourceEnd) -}}
+{{- $_ := set $contained "ok" true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (get $contained "ok") -}}
+{{- fail (printf "%s entry %q must be contained by one of %s values because NetworkPolicy must not allow sources broader than the LoadBalancer source ranges" $path $value $sourcePath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateKubernetesRouteCidr" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}

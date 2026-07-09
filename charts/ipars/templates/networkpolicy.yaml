@@ -1,4 +1,5 @@
 {{- include "ipars.validateBoolean" (dict "path" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
+{{- $root := . -}}
 {{- include "ipars.validateBoolean" (dict "path" "networkPolicy.acknowledgeHostNetwork" "value" .Values.networkPolicy.acknowledgeHostNetwork) -}}
 {{- include "ipars.validateBoolean" (dict "path" "networkPolicy.agentApi.enabled" "value" .Values.networkPolicy.agentApi.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "networkPolicy.relay.enabled" "value" .Values.networkPolicy.relay.enabled) -}}
@@ -48,6 +49,7 @@
 {{- range $cidr := .Values.networkPolicy.agentApi.allowedCidrs -}}
 {{- $cidrValue := printf "%v" $cidr -}}
 {{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue) -}}
+{{- include "ipars.validateIpv4CidrContainedBySourceRanges" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue "sourcePath" "agent.apiService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.apiService.loadBalancerSourceRanges) -}}
 {{- if hasKey $agentApiNetworkPolicyCidrSet $cidrValue -}}
 {{- fail (printf "networkPolicy.agentApi.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
 {{- end -}}
@@ -86,6 +88,7 @@ spec:
 {{- range $cidr := .Values.networkPolicy.relay.allowedCidrs -}}
 {{- $cidrValue := printf "%v" $cidr -}}
 {{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue) -}}
+{{- include "ipars.validateIpv4CidrContainedBySourceRanges" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue "sourcePath" "agent.relayService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.relayService.loadBalancerSourceRanges) -}}
 {{- if hasKey $relayNetworkPolicyCidrSet $cidrValue -}}
 {{- fail (printf "networkPolicy.relay.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
 {{- end -}}

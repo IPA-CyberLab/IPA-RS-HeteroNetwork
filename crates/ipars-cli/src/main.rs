@@ -12815,6 +12815,10 @@ fi
         let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
 
         assert!(helpers.contains("ipars.validateRestrictedCidr"));
+        assert!(helpers.contains("define \"ipars.validateIpv4CidrContainedBySourceRanges\""));
+        assert!(helpers.contains(
+            "NetworkPolicy must not allow sources broader than the LoadBalancer source ranges"
+        ));
         assert!(helpers.contains("must not be an unrestricted CIDR"));
         assert!(helpers.contains("must be a canonical IPv4 CIDR"));
         assert!(helpers.contains("must not include unspecified CIDRs"));
@@ -12835,6 +12839,11 @@ fi
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
+        assert!(network_policy_template.contains(
+            "ipars.validateIpv4CidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+        ));
+        assert!(network_policy_template
+            .contains("\"sourcePath\" \"agent.apiService.loadBalancerSourceRanges\""));
         assert!(network_policy_template.contains(
             "networkPolicy.acknowledgeHostNetwork=true requires networkPolicy.enabled=true"
         ));
@@ -12863,6 +12872,11 @@ fi
         assert!(network_policy_template.contains(
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
+        assert!(network_policy_template.contains(
+            "ipars.validateIpv4CidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+        ));
+        assert!(network_policy_template
+            .contains("\"sourcePath\" \"agent.relayService.loadBalancerSourceRanges\""));
         assert!(network_policy_template
             .contains("networkPolicy.relay.allowedCidrs entry %q must not be repeated"));
         Ok(())
