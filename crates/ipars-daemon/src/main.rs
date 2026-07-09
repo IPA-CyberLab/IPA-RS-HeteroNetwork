@@ -6610,7 +6610,10 @@ async fn stop_userspace_wireguard_child(
         }
     }
 
-    match signal_userspace_wireguard_child_shutdown(child) {
+    match signal_userspace_wireguard_child_shutdown(
+        child,
+        UserspaceWireGuardShutdownSignal::Terminate,
+    ) {
         Ok(Some(warning)) => {
             tracing::warn!(
                 command = %label,
@@ -6649,24 +6652,83 @@ async fn stop_userspace_wireguard_child(
             tracing::warn!(
                 command = %label,
                 timeout_seconds = shutdown_timeout.as_secs(),
-                "timed out waiting for userspace WireGuard process shutdown"
+                "timed out waiting for graceful userspace WireGuard process shutdown"
+            );
+            force_stop_userspace_wireguard_child(child, label, shutdown_timeout).await
+        }
+    }
+}
+
+async fn force_stop_userspace_wireguard_child(
+    child: &mut tokio::process::Child,
+    label: &str,
+    shutdown_timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    match signal_userspace_wireguard_child_shutdown(child, UserspaceWireGuardShutdownSignal::Kill) {
+        Ok(Some(warning)) => {
+            tracing::warn!(
+                command = %label,
+                warning = %warning,
+                "fell back while force-stopping userspace WireGuard process"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed to force-stop userspace WireGuard process"
+            );
+            return None;
+        }
+    }
+
+    match tokio::time::timeout(shutdown_timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            tracing::info!(
+                command = %label,
+                %status,
+                "userspace WireGuard process force-stopped"
+            );
+            Some(status)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                command = %label,
+                %error,
+                "failed waiting for force-stopped userspace WireGuard process"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                command = %label,
+                timeout_seconds = shutdown_timeout.as_secs(),
+                "timed out waiting for force-stopped userspace WireGuard process"
             );
             None
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserspaceWireGuardShutdownSignal {
+    Terminate,
+    Kill,
+}
+
 fn signal_userspace_wireguard_child_shutdown(
     child: &mut tokio::process::Child,
+    signal: UserspaceWireGuardShutdownSignal,
 ) -> Result<Option<String>, std::io::Error> {
     #[cfg(target_os = "linux")]
     if let Some(pid) = child.id() {
-        match kill_userspace_wireguard_process_group(pid) {
+        match signal_userspace_wireguard_process_group(pid, signal) {
             Ok(()) => return Ok(None),
             Err(group_error) => {
-                return match child.start_kill() {
+                return match signal_userspace_wireguard_direct_child(pid, signal) {
                     Ok(()) => Ok(Some(format!(
-                        "process group {pid}: {group_error}; direct child kill succeeded"
+                        "process group {pid}: {group_error}; direct child signal succeeded"
                     ))),
                     Err(child_error) => Err(std::io::Error::other(format!(
                         "process group {pid}: {group_error}; direct child: {child_error}"
@@ -6676,19 +6738,51 @@ fn signal_userspace_wireguard_child_shutdown(
         }
     }
 
-    child.start_kill().map(|()| None)
+    match signal {
+        UserspaceWireGuardShutdownSignal::Terminate | UserspaceWireGuardShutdownSignal::Kill => {
+            child.start_kill().map(|()| None)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn kill_userspace_wireguard_process_group(pid: u32) -> std::io::Result<()> {
+fn signal_userspace_wireguard_process_group(
+    pid: u32,
+    signal: UserspaceWireGuardShutdownSignal,
+) -> std::io::Result<()> {
     let pgid: i32 = pid
         .try_into()
         .map_err(|_| std::io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
     nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pgid),
-        nix::sys::signal::Signal::SIGKILL,
+        userspace_wireguard_shutdown_signal(signal),
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_userspace_wireguard_direct_child(
+    pid: u32,
+    signal: UserspaceWireGuardShutdownSignal,
+) -> std::io::Result<()> {
+    let pid: i32 = pid
+        .try_into()
+        .map_err(|_| std::io::Error::other(format!("child pid {pid} exceeds pid_t range")))?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        userspace_wireguard_shutdown_signal(signal),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(target_os = "linux")]
+fn userspace_wireguard_shutdown_signal(
+    signal: UserspaceWireGuardShutdownSignal,
+) -> nix::sys::signal::Signal {
+    match signal {
+        UserspaceWireGuardShutdownSignal::Terminate => nix::sys::signal::Signal::SIGTERM,
+        UserspaceWireGuardShutdownSignal::Kill => nix::sys::signal::Signal::SIGKILL,
+    }
 }
 
 async fn wait_for_userspace_wireguard_ready(
@@ -18978,6 +19072,42 @@ exec sleep 60
         assert!(
             wait_for_process_absent(grandchild_pid, Duration::from_secs(2)).await,
             "userspace WireGuard process group grandchild {grandchild_pid} was left running"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn userspace_wireguard_shutdown_uses_sigterm_before_sigkill() -> anyhow::Result<()> {
+        let temp_dir = unique_trusted_test_dir("userspace-wg-graceful-stop")?;
+        let pid_path = temp_dir.join("child.pid");
+        let marker_path = temp_dir.join("terminated.marker");
+        let command_path = temp_dir.join("userspace-wg-graceful-stop");
+        let pid_arg = pid_path.display().to_string();
+        let marker_arg = marker_path.display().to_string();
+        let shell_script = "#!/bin/sh\ntrap 'printf term > \"$2\"; exit 0' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\nwhile :; do sleep 1; done\n";
+        write_trusted_test_executable(&command_path, shell_script)?;
+        let command = LinuxCommand::new(
+            command_path.display().to_string(),
+            vec![pid_arg, marker_arg],
+        );
+        let mut child = spawn_userspace_wireguard_process(&command)?;
+
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
+        let status =
+            stop_userspace_wireguard_child(&mut child, "graceful-test", Duration::from_secs(2))
+                .await
+                .context("userspace WireGuard graceful test process was not reaped")?;
+
+        assert!(
+            status.success(),
+            "SIGTERM-aware userspace WireGuard process should exit cleanly: {status}"
+        );
+        assert_eq!(std::fs::read_to_string(&marker_path)?.trim(), "term");
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "userspace WireGuard graceful test child {pid} was left running"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
