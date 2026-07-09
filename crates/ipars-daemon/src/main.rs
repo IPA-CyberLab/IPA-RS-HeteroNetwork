@@ -4884,6 +4884,8 @@ struct AgentOtelSnapshot {
     packet_flow_duplicate_suppression_counts: BTreeMap<AgentPacketFlowDuplicateSource, u64>,
     packet_flow_classification_counts: BTreeMap<AgentPacketFlowClassification, u64>,
     packet_flow_application_counts: BTreeMap<AgentPacketFlowApplication, u64>,
+    path_change_event_total_count: u64,
+    path_change_event_dropped_count: u64,
 }
 
 impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
@@ -4936,6 +4938,8 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                 .iter()
                 .map(|entry| (entry.application, entry.count))
                 .collect(),
+            path_change_event_total_count: metrics.path_change_event_total_count,
+            path_change_event_dropped_count: metrics.path_change_event_dropped_count,
         }
     }
 }
@@ -4953,6 +4957,8 @@ struct AgentOtelMetrics {
     relay_forwarders: Gauge<u64>,
     userspace_wireguard_process_state: Gauge<u64>,
     path_change_events: Gauge<u64>,
+    path_change_events_total: Counter<u64>,
+    path_change_events_dropped: Counter<u64>,
     metrics_generated_timestamp_seconds: Gauge<u64>,
     lazy_active_peers: Gauge<u64>,
     lazy_pinned_peers: Gauge<u64>,
@@ -5055,6 +5061,16 @@ impl AgentOtelMetrics {
             path_change_events: meter
                 .u64_gauge("ipars.agent.path_change_events")
                 .with_description("Retained path change events.")
+                .build(),
+            path_change_events_total: meter
+                .u64_counter("ipars.agent.path_change_events.total")
+                .with_description("Total path change events recorded by the agent.")
+                .build(),
+            path_change_events_dropped: meter
+                .u64_counter("ipars.agent.path_change_events.dropped")
+                .with_description(
+                    "Path change events dropped from the bounded retention buffer.",
+                )
                 .build(),
             metrics_generated_timestamp_seconds: meter
                 .u64_gauge("ipars.agent.metrics.generated_timestamp_seconds")
@@ -5393,6 +5409,22 @@ impl AgentOtelMetrics {
         }
         self.path_change_events
             .record(metrics.path_change_event_count as u64, &node_attrs);
+        let path_change_total_delta = counter_delta(
+            metrics.path_change_event_total_count,
+            previous.map(|previous| previous.path_change_event_total_count),
+        );
+        if path_change_total_delta > 0 {
+            self.path_change_events_total
+                .add(path_change_total_delta, &node_attrs);
+        }
+        let path_change_dropped_delta = counter_delta(
+            metrics.path_change_event_dropped_count,
+            previous.map(|previous| previous.path_change_event_dropped_count),
+        );
+        if path_change_dropped_delta > 0 {
+            self.path_change_events_dropped
+                .add(path_change_dropped_delta, &node_attrs);
+        }
         self.lazy_active_peers
             .record(metrics.lazy_connect.active_peer_count as u64, &node_attrs);
         self.lazy_pinned_peers
@@ -14369,6 +14401,8 @@ mod tests {
             relay_forwarder_count: 1,
             relay_forwarders: vec![forwarder],
             path_change_event_count: 1,
+            path_change_event_total_count: 2,
+            path_change_event_dropped_count: 1,
             path_state_counts: vec![PathStateCount {
                 state: PathState::Relay,
                 count: 1,

@@ -16308,6 +16308,10 @@ pub mod api {
         pub relay_forwarder_count: usize,
         pub relay_forwarders: Vec<AgentRelayForwarderMetrics>,
         pub path_change_event_count: usize,
+        #[serde(default)]
+        pub path_change_event_total_count: u64,
+        #[serde(default)]
+        pub path_change_event_dropped_count: u64,
         pub path_state_counts: Vec<PathStateCount>,
         pub lazy_connect: LazyConnectMetrics,
         pub path_probe_record_count: u64,
@@ -16333,6 +16337,10 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct AgentPathEventsResponse {
         pub events: Vec<PathChangeEvent>,
+        #[serde(default)]
+        pub total_count: u64,
+        #[serde(default)]
+        pub dropped_count: u64,
         pub generated_at: DateTime<Utc>,
     }
 

@@ -214,8 +214,11 @@ async fn prometheus_metrics(State(state): State<AgentHttpState>) -> impl IntoRes
 }
 
 async fn path_events(State(state): State<AgentHttpState>) -> Json<AgentPathEventsResponse> {
+    let (events, total_count, dropped_count) = state.runtime.path_change_events_with_counts().await;
     Json(AgentPathEventsResponse {
-        events: state.runtime.path_change_events().await,
+        events,
+        total_count,
+        dropped_count,
         generated_at: chrono::Utc::now(),
     })
 }
@@ -867,6 +870,32 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_path_change_events_total Total path change events recorded by the agent."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_path_change_events_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_path_change_events_total{{node_id=\"{node_id}\"}} {}",
+        metrics.path_change_event_total_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_path_change_events_dropped_total Total path change events dropped from the bounded retention buffer."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_path_change_events_dropped_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_path_change_events_dropped_total{{node_id=\"{node_id}\"}} {}",
+        metrics.path_change_event_dropped_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_active_peers Number of peers with recent lazy-connect activity."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_active_peers gauge");
@@ -1288,6 +1317,8 @@ mod tests {
             relay_forwarder_count: 0,
             relay_forwarders: Vec::new(),
             path_change_event_count: 0,
+            path_change_event_total_count: 0,
+            path_change_event_dropped_count: 0,
             path_state_counts: Vec::new(),
             lazy_connect: LazyConnectMetrics {
                 active_peer_count: 0,
@@ -1312,6 +1343,12 @@ mod tests {
         };
         let body = render_prometheus_metrics(&metrics);
         let prometheus_node_id = prometheus_label(node_id.as_str());
+        assert!(body.contains(&format!(
+            "ipars_agent_path_change_events_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_path_change_events_dropped_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
 
         for source in AgentPacketFlowDuplicateSource::ALL {
             assert!(body.contains(&format!(
@@ -1798,6 +1835,8 @@ mod tests {
             .any(|entry| entry.state == PathState::DirectPublic && entry.count == 0));
         assert_eq!(metrics.relay_forwarder_count, 1);
         assert_eq!(metrics.path_change_event_count, 1);
+        assert_eq!(metrics.path_change_event_total_count, 1);
+        assert_eq!(metrics.path_change_event_dropped_count, 0);
         assert_eq!(metrics.relay_forwarders.len(), 1);
         assert_eq!(metrics.relay_forwarders[0].socket_receive_errors, 1);
         assert_eq!(metrics.relay_forwarders[0].outbound_packets, 1);
@@ -2156,6 +2195,8 @@ mod tests {
         let body = axum::body::to_bytes(events_response.into_body(), usize::MAX).await?;
         let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
         assert_eq!(events.events.len(), 1);
+        assert_eq!(events.total_count, 1);
+        assert_eq!(events.dropped_count, 0);
         assert_eq!(events.events[0].new_state, PathState::Relay);
         Ok(())
     }
@@ -2238,6 +2279,8 @@ mod tests {
         let body = axum::body::to_bytes(events_response.into_body(), usize::MAX).await?;
         let events: AgentPathEventsResponse = serde_json::from_slice(&body)?;
         assert_eq!(events.events.len(), 1);
+        assert_eq!(events.total_count, 1);
+        assert_eq!(events.dropped_count, 0);
         assert_eq!(events.events[0].new_state, PathState::DirectNatTraversal);
         Ok(())
     }

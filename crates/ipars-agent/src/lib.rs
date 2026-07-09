@@ -441,6 +441,8 @@ pub struct AgentRuntime {
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
+    path_change_event_total_count: AtomicU64,
+    path_change_event_dropped_count: AtomicU64,
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
@@ -1090,6 +1092,8 @@ impl AgentRuntime {
             latest_peer_map: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
+            path_change_event_total_count: AtomicU64::new(0),
+            path_change_event_dropped_count: AtomicU64::new(0),
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1382,6 +1386,21 @@ impl AgentRuntime {
             .collect()
     }
 
+    pub async fn path_change_events_with_counts(&self) -> (Vec<PathChangeEvent>, u64, u64) {
+        let events = self
+            .path_change_events
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        (
+            events,
+            self.path_change_event_total_count.load(Ordering::Relaxed),
+            self.path_change_event_dropped_count.load(Ordering::Relaxed),
+        )
+    }
+
     pub async fn metrics(&self) -> AgentMetricsResponse {
         self.purge_expired_relay_sessions(Utc::now()).await;
         let candidates = self.candidates.read().await;
@@ -1437,6 +1456,12 @@ impl AgentRuntime {
                 .map(|metrics| metrics.snapshot())
                 .collect(),
             path_change_event_count: path_change_events.len(),
+            path_change_event_total_count: self
+                .path_change_event_total_count
+                .load(Ordering::Relaxed),
+            path_change_event_dropped_count: self
+                .path_change_event_dropped_count
+                .load(Ordering::Relaxed),
             path_state_counts: PATH_STATE_METRIC_ORDER
                 .into_iter()
                 .map(|state| PathStateCount {
@@ -1519,8 +1544,12 @@ impl AgentRuntime {
             let mut events = self.path_change_events.write().await;
             if events.len() >= MAX_PATH_CHANGE_EVENTS {
                 events.pop_front();
+                self.path_change_event_dropped_count
+                    .fetch_add(1, Ordering::Relaxed);
             }
             events.push_back(event);
+            self.path_change_event_total_count
+                .fetch_add(1, Ordering::Relaxed);
         }
         if selected_state != PathState::Relay {
             self.remove_relay_session(&remote).await;
@@ -5044,6 +5073,8 @@ mod tests {
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.path_count, 1);
         assert_eq!(metrics.path_change_event_count, 2);
+        assert_eq!(metrics.path_change_event_total_count, 2);
+        assert_eq!(metrics.path_change_event_dropped_count, 0);
         assert_eq!(metrics.relay_session_count, 0);
         assert_eq!(metrics.relay_admission_attempt_count, 0);
         assert_eq!(metrics.relay_admission_success_count, 0);
@@ -5074,6 +5105,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_counts_dropped_path_change_events() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        for index in 0..(MAX_PATH_CHANGE_EVENTS + 3) {
+            let mut record = path(&format!("peer-{index}"), PathState::Relay, 70.0);
+            record.key.local = local.clone();
+            runtime
+                .upsert_path_state(record)
+                .await
+                .expect("valid path state should be stored");
+        }
+
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.path_change_event_count, MAX_PATH_CHANGE_EVENTS);
+        assert_eq!(
+            metrics.path_change_event_total_count,
+            (MAX_PATH_CHANGE_EVENTS + 3) as u64
+        );
+        assert_eq!(metrics.path_change_event_dropped_count, 3);
+        let (events, total_count, dropped_count) = runtime.path_change_events_with_counts().await;
+        assert_eq!(events.len(), MAX_PATH_CHANGE_EVENTS);
+        assert_eq!(total_count, (MAX_PATH_CHANGE_EVENTS + 3) as u64);
+        assert_eq!(dropped_count, 3);
+        assert_eq!(events[0].key.remote, NodeId::from_string("peer-3"));
     }
 
     #[tokio::test]
