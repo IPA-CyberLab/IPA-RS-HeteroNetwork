@@ -3945,6 +3945,8 @@ fn kubernetes_service_annotation_controls_fixed_addresses(key: &str) -> bool {
         || key.contains("loadbalancerip")
         || key.contains("load-balancer-eip")
         || key.contains("eip-allocations")
+        || key.ends_with("/load-balancer-address")
+        || key.ends_with("/loadbalancer-address")
         || key.contains("static-ip")
         || key.contains("ip-address")
         || key.contains("private-ipv4-address")
@@ -3977,10 +3979,15 @@ fn kubernetes_service_annotation_controls_listener_protocol(key: &str) -> bool {
         || key.contains("tls-ports")
         || key.contains("certificate-arn")
         || key.contains("certificate")
+        || key.contains("load-balancer-protocol")
+        || key.contains("loadbalancer-protocol")
         || key.contains("backend-protocol")
         || key.contains("backend-protocol-version")
         || key.contains("app-protocol")
         || key.contains("app_protocol")
+        || key.contains("http2-ports")
+        || key.contains("http3-ports")
+        || key.contains("redirect-http")
         || key.contains("listener")
         || key.contains("alpn-policy")
         || key.contains("high-availability-ports")
@@ -4001,6 +4008,9 @@ fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool
         || key.contains("loadbalancer-address-type")
         || key.contains("load-balancer-class")
         || key.contains("loadbalancerclass")
+        || key.contains("load-balancer-shape")
+        || key.contains("loadbalancer-shape")
+        || key.contains("load-balancer-cloud-provider-ip-type")
         || key.contains("nlb-target-type")
         || key.contains("l4-rbs")
         || key.contains("global-access")
@@ -4012,6 +4022,7 @@ fn kubernetes_service_annotation_controls_firewall_policy(key: &str) -> bool {
     key.contains("security-group")
         || key.contains("securitygroup")
         || key.contains("firewall")
+        || key.contains("security-list")
         || key.contains("allowed-service-tags")
         || key.contains("allowed-ip-ranges")
         || key.contains("shared-securityrule")
@@ -4020,26 +4031,33 @@ fn kubernetes_service_annotation_controls_firewall_policy(key: &str) -> bool {
 fn kubernetes_service_annotation_controls_network_placement(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("subnet")
+        || key.contains("vlan")
         || key.contains("network-tier")
         || key.contains("network-endpoint-group")
         || key.contains("cloud.google.com/neg")
         || key.contains("resource-group")
+        || key.contains("availability-zone")
+        || key.contains("cloud-provider-zone")
 }
 
 fn kubernetes_service_annotation_controls_operational_attributes(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("load-balancer-attributes")
         || key.contains("loadbalancer-attributes")
+        || key.contains("backend-config")
         || key.contains("target-group-attributes")
         || key.contains("targetgroup-attributes")
         || key.contains("access-log")
         || key.contains("accesslog")
+        || key.contains("enable-features")
         || key.contains("idle-timeout")
         || key.contains("connection-draining")
         || key.contains("deregistration-delay")
         || key.contains("cross-zone")
         || key.contains("preserve-client-ip")
         || key.contains("tcp-reset")
+        || key.contains("size-unit")
+        || key.contains("flavor-id")
 }
 
 fn kubernetes_service_annotation_controls_dns_publication(key: &str) -> bool {
@@ -4047,6 +4065,7 @@ fn kubernetes_service_annotation_controls_dns_publication(key: &str) -> bool {
     key.contains("external-dns")
         || key.contains("dns-name")
         || key.contains("dns-label")
+        || key.contains("dns-record")
         || key.contains("load-balancer-hostname")
         || key.contains("loadbalancer-hostname")
         || key.contains("domain-name")
@@ -4064,6 +4083,8 @@ fn kubernetes_service_annotation_controls_resource_selection(key: &str) -> bool 
         || key.contains("load-balancer-mode")
         || key.contains("resource-tags")
         || key.contains("additional-resource-tags")
+        || key.contains("defined-tags")
+        || key.contains("freeform-tags")
         || key.contains("pip-ip-tags")
         || key.contains("pip-tags")
         || key.contains("address-pool")
@@ -4098,6 +4119,7 @@ fn kubernetes_service_annotation_controls_source_nat(key: &str) -> bool {
         || key.contains("disable-load-balancer-snat")
         || key.contains("disable-snat")
         || key.contains("outbound-snat")
+        || key.contains("enable-prefix-for-ipv6-source-nat")
 }
 
 fn kubernetes_service_annotation_controls_traffic_distribution(key: &str) -> bool {
@@ -4107,9 +4129,13 @@ fn kubernetes_service_annotation_controls_traffic_distribution(key: &str) -> boo
         || key.contains("weighted-load-balancing")
         || key.contains("load-balancing-policy")
         || key.contains("loadbalancing-policy")
+        || key.contains("load-balancer-policy")
+        || key.contains("loadbalancer-policy")
         || key.contains("load-balancing-algorithm")
         || key.contains("traffic-policy")
         || key.contains("traffic_policy")
+        || key.contains("topology-mode")
+        || key.contains("topology-aware")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11895,6 +11921,20 @@ fi
             "--agent-api-service-annotation annotation key metallb.io/loadBalancerIPs must not configure LoadBalancer fixed addresses"
         ));
 
+        let mut agent_openstack_address_annotation = base_k8s_install_args();
+        agent_openstack_address_annotation.expose_agent_api = true;
+        agent_openstack_address_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "loadbalancer.openstack.org/load-balancer-address".to_string(),
+            value: "198.51.100.15".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_openstack_address_annotation) {
+            Ok(_) => panic!("agent API OpenStack address annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key loadbalancer.openstack.org/load-balancer-address must not configure LoadBalancer fixed addresses"
+        ));
+
         let mut agent_pip_prefix_annotation = base_k8s_install_args();
         agent_pip_prefix_annotation.expose_agent_api = true;
         agent_pip_prefix_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -11951,6 +11991,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-ssl-cert must not configure LoadBalancer TLS, listeners, or backend protocols"
         ));
 
+        let mut agent_do_protocol_annotation = base_k8s_install_args();
+        agent_do_protocol_annotation.expose_agent_api = true;
+        agent_do_protocol_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/do-loadbalancer-protocol".to_string(),
+            value: "http".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_do_protocol_annotation) {
+            Ok(_) => panic!("agent API DigitalOcean protocol annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/do-loadbalancer-protocol must not configure LoadBalancer TLS, listeners, or backend protocols"
+        ));
+
         let mut agent_ha_ports_annotation = base_k8s_install_args();
         agent_ha_ports_annotation.expose_agent_api = true;
         agent_ha_ports_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -11978,6 +12032,20 @@ fi
         };
         assert!(error.contains(
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-scheme must not configure LoadBalancer scope or implementation type"
+        ));
+
+        let mut agent_oci_shape_annotation = base_k8s_install_args();
+        agent_oci_shape_annotation.expose_agent_api = true;
+        agent_oci_shape_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "oci.oraclecloud.com/load-balancer-shape".to_string(),
+            value: "flexible".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_oci_shape_annotation) {
+            Ok(_) => panic!("agent API OCI shape annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key oci.oraclecloud.com/load-balancer-shape must not configure LoadBalancer scope or implementation type"
         ));
 
         let mut agent_global_access_annotation = base_k8s_install_args();
@@ -12048,6 +12116,20 @@ fi
         };
         assert!(error.contains(
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-attributes must not configure LoadBalancer operational attributes"
+        ));
+
+        let mut agent_backend_config_annotation = base_k8s_install_args();
+        agent_backend_config_annotation.expose_agent_api = true;
+        agent_backend_config_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "cloud.google.com/backend-config".to_string(),
+            value: "{\"default\":\"ipars-backend\"}".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_backend_config_annotation) {
+            Ok(_) => panic!("agent API backend config annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key cloud.google.com/backend-config must not configure LoadBalancer operational attributes"
         ));
 
         let mut agent_tcp_reset_annotation = base_k8s_install_args();
@@ -12535,6 +12617,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key networking.gke.io/weighted-load-balancing must not configure LoadBalancer traffic distribution"
+        ));
+
+        let mut relay_topology_mode_annotation = base_k8s_install_args();
+        relay_topology_mode_annotation.expose_relay = true;
+        relay_topology_mode_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_topology_mode_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_topology_mode_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.kubernetes.io/topology-mode".to_string(),
+            value: "auto".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_topology_mode_annotation) {
+            Ok(_) => panic!("relay topology mode annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.kubernetes.io/topology-mode must not configure LoadBalancer traffic distribution"
         ));
 
         Ok(())

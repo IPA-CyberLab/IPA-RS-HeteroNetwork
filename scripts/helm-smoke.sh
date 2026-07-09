@@ -586,6 +586,14 @@ template_fails agent-api-load-balancer-attribute-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-cross-zone-load-balancing-enabled=true'
 
+template_fails agent-api-backend-config-annotation \
+  "agent.apiService.annotations annotation key \"cloud.google.com/backend-config\" must not configure LoadBalancer operational attributes" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.cloud\.google\.com/backend-config=ipars-backend'
+
 template_fails relay-tcp-reset-annotation \
   "agent.relayService.annotations annotation key \"service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset\" must not configure LoadBalancer operational attributes" \
   --set agent.relayAdvertisement.enabled=true \
@@ -669,6 +677,17 @@ template_fails relay-traffic-distribution-annotation \
   --set agent.relayService.exposureAcknowledged=true \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.networking\.gke\.io/weighted-load-balancing=pods-per-node'
+
+template_fails relay-topology-mode-annotation \
+  "agent.relayService.annotations annotation key \"service.kubernetes.io/topology-mode\" must not configure LoadBalancer traffic distribution" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.service\.kubernetes\.io/topology-mode=auto'
 
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
