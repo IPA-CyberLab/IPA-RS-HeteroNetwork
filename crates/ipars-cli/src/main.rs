@@ -4022,6 +4022,11 @@ fn kubernetes_service_annotation_controls_firewall_policy(key: &str) -> bool {
     key.contains("security-group")
         || key.contains("securitygroup")
         || key.contains("firewall")
+        || key.contains("waf")
+        || key.contains("web-acl")
+        || key.contains("webacl")
+        || key.contains("security-policy")
+        || key.contains("securitypolicy")
         || key.contains("security-list")
         || key.contains("allowed-service-tags")
         || key.contains("allowed-ip-ranges")
@@ -12090,6 +12095,34 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-security-groups must not configure LoadBalancer firewall or security groups"
         ));
 
+        let mut agent_waf_annotation = base_k8s_install_args();
+        agent_waf_annotation.expose_agent_api = true;
+        agent_waf_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-enable-waf".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_waf_annotation) {
+            Ok(_) => panic!("agent API WAF annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-enable-waf must not configure LoadBalancer firewall or security groups"
+        ));
+
+        let mut agent_web_acl_annotation = base_k8s_install_args();
+        agent_web_acl_annotation.expose_agent_api = true;
+        agent_web_acl_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "example.com/load-balancer-web-acl".to_string(),
+            value: "web-acl-0123456789abcdef0".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_web_acl_annotation) {
+            Ok(_) => panic!("agent API Web ACL annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key example.com/load-balancer-web-acl must not configure LoadBalancer firewall or security groups"
+        ));
+
         let mut agent_subnet_annotation = base_k8s_install_args();
         agent_subnet_annotation.expose_agent_api = true;
         agent_subnet_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -12438,6 +12471,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-allowed-service-tags must not configure LoadBalancer firewall or security groups"
+        ));
+
+        let mut relay_security_policy_annotation = base_k8s_install_args();
+        relay_security_policy_annotation.expose_relay = true;
+        relay_security_policy_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_security_policy_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_security_policy_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "networking.gke.io/security-policy".to_string(),
+            value: "edge-armor-policy".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_security_policy_annotation) {
+            Ok(_) => panic!("relay security policy annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key networking.gke.io/security-policy must not configure LoadBalancer firewall or security groups"
         ));
 
         let mut relay_network_tier_annotation = base_k8s_install_args();

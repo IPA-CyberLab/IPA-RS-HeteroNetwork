@@ -592,6 +592,25 @@ template_fails agent-api-security-group-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-security-groups=sg-0123456789abcdef0'
 
+template_fails agent-api-waf-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-enable-waf\" must not configure LoadBalancer firewall or security groups" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-enable-waf=true'
+
+template_fails relay-security-policy-annotation \
+  "agent.relayService.annotations annotation key \"networking.gke.io/security-policy\" must not configure LoadBalancer firewall or security groups" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.networking\.gke\.io/security-policy=edge-armor-policy'
+
 template_fails relay-subnet-annotation \
   "agent.relayService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-subnets\" must not configure LoadBalancer network placement" \
   --set agent.relayAdvertisement.enabled=true \
