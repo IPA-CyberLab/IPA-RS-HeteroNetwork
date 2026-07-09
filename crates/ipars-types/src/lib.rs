@@ -15688,6 +15688,10 @@ pub mod api {
                     if old_value_end != value_end {
                         return None;
                     }
+                } else if subtype == 0x09
+                    && !mongodb_bson_binary_vector_payload(payload.get(data_offset..value_end)?)
+                {
+                    return None;
                 }
                 Some(value_end)
             }
@@ -15755,6 +15759,21 @@ pub mod api {
 
     fn mongodb_bson_binary_subtype(subtype: u8) -> bool {
         matches!(subtype, 0..=9 | 128..=255)
+    }
+
+    fn mongodb_bson_binary_vector_payload(value: &[u8]) -> bool {
+        let Some((&dtype, tail)) = value.split_first() else {
+            return false;
+        };
+        let Some((&padding, data)) = tail.split_first() else {
+            return false;
+        };
+        match dtype {
+            0x03 => padding == 0,
+            0x10 => padding <= 7 && (padding == 0 || !data.is_empty()),
+            0x27 => padding == 0 && data.len() % 4 == 0,
+            _ => false,
+        }
     }
 
     fn mongodb_bson_regex_options(options: &[u8]) -> bool {
@@ -18961,6 +18980,19 @@ mod tests {
             binary.extend_from_slice(&declared_len.to_le_bytes());
             binary.extend_from_slice(value);
             mongodb_binary_document(name, 0x02, &binary)
+        }
+
+        fn mongodb_vector_binary_document(
+            name: &[u8],
+            dtype: u8,
+            padding: u8,
+            value: &[u8],
+        ) -> Vec<u8> {
+            let mut binary = Vec::new();
+            binary.push(dtype);
+            binary.push(padding);
+            binary.extend_from_slice(value);
+            mongodb_binary_document(name, 0x09, &binary)
         }
 
         fn mongodb_string_document(name: &[u8], value: &[u8]) -> Vec<u8> {
@@ -25150,6 +25182,8 @@ mod tests {
             mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"0", 1), (b"1", 2)]));
         let mongodb_regex_binary_document = mongodb_regex_document(b"filter", b"^ipars", b"ims");
         let mongodb_valid_old_binary_document = mongodb_old_binary_document(b"payload", 3, b"abc");
+        let mongodb_valid_vector_binary_document =
+            mongodb_vector_binary_document(b"embedding", 0x27, 0, &[0, 0, 0x80, 0x3f]);
         let mongodb_string_value_document = mongodb_string_document(b"name", b"ipars");
         let mut mongodb_op_msg = Vec::new();
         mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
@@ -25202,6 +25236,20 @@ mod tests {
                     0,
                     &[mongodb_op_msg_body_section(
                         &mongodb_valid_old_binary_document,
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_valid_vector_binary_document,
                     )],
                     None
                 )
@@ -25509,6 +25557,64 @@ mod tests {
                     0,
                     &[mongodb_op_msg_body_section(
                         &mongodb_reserved_binary_subtype
+                    )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_unknown_vector_dtype =
+            mongodb_vector_binary_document(b"embedding", 0x99, 0, b"");
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_unknown_vector_dtype)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_float_vector_bad_len =
+            mongodb_vector_binary_document(b"embedding", 0x27, 0, &[1, 2, 3]);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_float_vector_bad_len)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_int_vector_bad_padding =
+            mongodb_vector_binary_document(b"embedding", 0x03, 1, &[1, 2, 3]);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_int_vector_bad_padding)],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_packed_bit_vector_bad_padding =
+            mongodb_vector_binary_document(b"embedding", 0x10, 8, &[0xff]);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(
+                        &mongodb_packed_bit_vector_bad_padding
                     )],
                     None
                 )
