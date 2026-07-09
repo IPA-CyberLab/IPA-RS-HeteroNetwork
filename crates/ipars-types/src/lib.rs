@@ -12551,7 +12551,89 @@ pub mod api {
     }
 
     fn nats_header_block(header: &[u8]) -> bool {
-        header.starts_with(b"NATS/1.0\r\n") && header.ends_with(b"\r\n\r\n")
+        if !header.ends_with(b"\r\n\r\n") {
+            return false;
+        }
+        let Some(header) = header.strip_suffix(b"\r\n") else {
+            return false;
+        };
+        let Some((preamble, mut offset)) = nats_header_line(header, 0) else {
+            return false;
+        };
+        if !nats_header_preamble(preamble) {
+            return false;
+        }
+        while offset < header.len() {
+            let Some((line, next_offset)) = nats_header_line(header, offset) else {
+                return false;
+            };
+            if !nats_header_field(line) {
+                return false;
+            }
+            offset = next_offset;
+        }
+        true
+    }
+
+    fn nats_header_line(header: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+        let tail = header.get(offset..)?;
+        let newline = tail.windows(2).position(|window| window == b"\r\n")?;
+        let line = tail.get(..newline)?;
+        (!line.is_empty()).then_some((line, offset + newline + 2))
+    }
+
+    fn nats_header_preamble(line: &[u8]) -> bool {
+        if line == b"NATS/1.0" {
+            return true;
+        }
+        let Some(rest) = line.strip_prefix(b"NATS/1.0 ") else {
+            return false;
+        };
+        if rest.len() < 3 || !rest[..3].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        if rest.len() == 3 {
+            return true;
+        }
+        rest.get(3) == Some(&b' ')
+            && rest[4..]
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
+    }
+
+    fn nats_header_field(line: &[u8]) -> bool {
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let name = &line[..colon];
+        let value = &line[colon + 1..];
+        !name.is_empty()
+            && name.len() <= 128
+            && name.iter().all(|byte| nats_header_field_name_byte(*byte))
+            && value
+                .iter()
+                .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
+    }
+
+    fn nats_header_field_name_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
     }
 
     fn nats_json_object_after_command(line: &[u8], command_len: usize) -> bool {
@@ -21889,6 +21971,13 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(
+                b"HPUB events.created 21 26\r\nNATS/1.0 100 Idle\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Nats
+        );
+        assert_eq!(
+            observation_for_payload(
                 b"HMSG events.created sid-1 22 27\r\nNATS/1.0\r\nBar: Baz\r\n\r\nhello\r\n"
             )
             .application(),
@@ -21940,6 +22029,13 @@ mod tests {
         assert_eq!(
             observation_for_payload(
                 b"HPUB events.created 22 27\r\nNOTNATS\r\nBar: Baz\r\n\r\nhello\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"HPUB events.created 23 28\r\nNATS/1.0\r\nBadHeader\r\n\r\nhello\r\n"
             )
             .application(),
             api::AgentPacketFlowApplication::Unknown
