@@ -8430,24 +8430,51 @@ fn kubernetes_service_cluster_ips(
     service: &KubernetesService,
     service_index: usize,
 ) -> anyhow::Result<Vec<IpAddr>> {
-    let mut addresses = Vec::new();
-    for value in service
+    let primary_cluster_ip = service
         .spec
-        .cluster_ips
-        .iter()
-        .chain(service.spec.cluster_ip.iter())
-    {
-        if value == "None" || value.is_empty() {
+        .cluster_ip
+        .as_deref()
+        .map(|value| kubernetes_parse_service_cluster_ip(value, service_index))
+        .transpose()?
+        .flatten();
+    let mut addresses = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in &service.spec.cluster_ips {
+        let Some(addr) = kubernetes_parse_service_cluster_ip(value, service_index)? else {
             continue;
+        };
+        if !seen.insert(addr) {
+            anyhow::bail!(
+                "Kubernetes Service index {service_index} returned duplicate cluster IP `{addr}`"
+            );
         }
-        let addr = value.parse::<IpAddr>().with_context(|| {
-            format!("Kubernetes Service index {service_index} has invalid cluster IP `{value}`")
-        })?;
         addresses.push(addr);
     }
+    if let Some(primary) = primary_cluster_ip {
+        if let Some(first_cluster_ip) = addresses.first() {
+            if *first_cluster_ip != primary {
+                anyhow::bail!(
+                    "Kubernetes Service index {service_index} clusterIP `{primary}` does not match first clusterIPs value `{first_cluster_ip}`"
+                );
+            }
+        } else {
+            addresses.push(primary);
+        }
+    }
     addresses.sort();
-    addresses.dedup();
     Ok(addresses)
+}
+
+fn kubernetes_parse_service_cluster_ip(
+    value: &str,
+    service_index: usize,
+) -> anyhow::Result<Option<IpAddr>> {
+    if value == "None" || value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<IpAddr>().map(Some).with_context(|| {
+        format!("Kubernetes Service index {service_index} has invalid cluster IP `{value}`")
+    })
 }
 
 fn kubernetes_api_server_env_cidr(
@@ -21174,7 +21201,8 @@ exec sleep 60
         let services = KubernetesServiceList {
             items: vec![
                 kubernetes_service(Some("10.96.0.1"), &[]),
-                kubernetes_service(None, &["10.96.0.20", "10.96.0.20", "fd00::20"]),
+                kubernetes_service(None, &["10.96.0.20", "fd00::20"]),
+                kubernetes_service(Some("10.96.0.30"), &["10.96.0.30", "fd00::30"]),
                 kubernetes_service(Some("None"), &[]),
             ],
         };
@@ -21184,7 +21212,9 @@ exec sleep 60
             vec![
                 "10.96.0.1/32".parse::<ipnet::IpNet>()?,
                 "10.96.0.20/32".parse::<ipnet::IpNet>()?,
+                "10.96.0.30/32".parse::<ipnet::IpNet>()?,
                 "fd00::20/128".parse::<ipnet::IpNet>()?,
+                "fd00::30/128".parse::<ipnet::IpNet>()?,
             ]
         );
         Ok(())
@@ -21357,6 +21387,32 @@ exec sleep 60
         assert!(
             error.contains("Kubernetes Service index 0 has invalid cluster IP `still-not-an-ip`")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_service_route_cidrs_reject_inconsistent_cluster_ips() -> anyhow::Result<()> {
+        let duplicate_cluster_ips = KubernetesServiceList {
+            items: vec![kubernetes_service(None, &["10.96.0.10", "10.96.0.10"])],
+        };
+        let error = match kubernetes_service_route_cidrs(&duplicate_cluster_ips) {
+            Ok(_) => anyhow::bail!("duplicate Kubernetes clusterIPs should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate cluster IP `10.96.0.10`"));
+
+        let primary_mismatch = KubernetesServiceList {
+            items: vec![kubernetes_service(
+                Some("10.96.0.10"),
+                &["10.96.0.11", "fd00::11"],
+            )],
+        };
+        let error = match kubernetes_service_route_cidrs(&primary_mismatch) {
+            Ok(_) => anyhow::bail!("mismatched Kubernetes clusterIP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error
+            .contains("clusterIP `10.96.0.10` does not match first clusterIPs value `10.96.0.11`"));
         Ok(())
     }
 
