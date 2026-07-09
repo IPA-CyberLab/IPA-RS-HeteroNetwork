@@ -13561,7 +13561,9 @@ fi
         let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
 
         assert!(helpers.contains("ipars.validateRestrictedCidr"));
-        assert!(helpers.contains("define \"ipars.validateIpv4CidrContainedBySourceRanges\""));
+        assert!(helpers.contains("define \"ipars.validateCidrContainedBySourceRanges\""));
+        assert!(helpers.contains("define \"ipars.ipv6AddressNibbles\""));
+        assert!(helpers.contains("define \"ipars.ipv6CidrBits\""));
         assert!(helpers.contains(
             "NetworkPolicy must not allow sources broader than the LoadBalancer source ranges"
         ));
@@ -13586,7 +13588,7 @@ fi
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
         assert!(network_policy_template.contains(
-            "ipars.validateIpv4CidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+            "ipars.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
         assert!(network_policy_template
             .contains("\"sourcePath\" \"agent.apiService.loadBalancerSourceRanges\""));
@@ -13619,7 +13621,7 @@ fi
             "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
         assert!(network_policy_template.contains(
-            "ipars.validateIpv4CidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+            "ipars.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
         assert!(network_policy_template
             .contains("\"sourcePath\" \"agent.relayService.loadBalancerSourceRanges\""));
@@ -17801,6 +17803,37 @@ fi
             "--agent-api-network-policy-cidr 198.51.0.0/16 must be contained by one of --agent-api-allow-source-cidr values"
         ));
 
+        let mut valid_ipv6_agent_policy = base_k8s_install_args();
+        valid_ipv6_agent_policy.enable_network_policy = true;
+        valid_ipv6_agent_policy.network_policy_acknowledge_host_network = true;
+        valid_ipv6_agent_policy.expose_agent_api = true;
+        valid_ipv6_agent_policy.allow_public_service_exposure = true;
+        valid_ipv6_agent_policy.agent_api_service_type = "LoadBalancer".to_string();
+        valid_ipv6_agent_policy.agent_api_allow_source_cidrs = vec!["2001:db8:10::/48".parse()?];
+        valid_ipv6_agent_policy.agent_api_network_policy_cidrs =
+            vec!["2001:db8:10:1::/64".parse()?];
+        let plan = k8s_install_plan(valid_ipv6_agent_policy)?;
+        assert!(plan.commands[2]
+            .contains("--set-string 'networkPolicy.agentApi.allowedCidrs[0]=2001:db8:10:1::/64'"));
+
+        let mut broad_ipv6_agent_policy = base_k8s_install_args();
+        broad_ipv6_agent_policy.enable_network_policy = true;
+        broad_ipv6_agent_policy.network_policy_acknowledge_host_network = true;
+        broad_ipv6_agent_policy.expose_agent_api = true;
+        broad_ipv6_agent_policy.allow_public_service_exposure = true;
+        broad_ipv6_agent_policy.agent_api_service_type = "LoadBalancer".to_string();
+        broad_ipv6_agent_policy.agent_api_allow_source_cidrs = vec!["2001:db8:10::/48".parse()?];
+        broad_ipv6_agent_policy.agent_api_network_policy_cidrs = vec!["2001:db8::/32".parse()?];
+        let error = match k8s_install_plan(broad_ipv6_agent_policy) {
+            Ok(_) => {
+                panic!("agent API IPv6 NetworkPolicy should not exceed LoadBalancer source ranges")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-network-policy-cidr 2001:db8::/32 must be contained by one of --agent-api-allow-source-cidr values"
+        ));
+
         let mut broad_relay_policy = base_k8s_install_args();
         broad_relay_policy.enable_network_policy = true;
         broad_relay_policy.network_policy_acknowledge_host_network = true;
@@ -17817,6 +17850,26 @@ fi
         };
         assert!(error.contains(
             "--relay-network-policy-cidr 203.0.0.0/16 must be contained by one of --relay-allow-source-cidr values"
+        ));
+
+        let mut broad_ipv6_relay_policy = base_k8s_install_args();
+        broad_ipv6_relay_policy.enable_network_policy = true;
+        broad_ipv6_relay_policy.network_policy_acknowledge_host_network = true;
+        broad_ipv6_relay_policy.expose_relay = true;
+        broad_ipv6_relay_policy.allow_public_service_exposure = true;
+        broad_ipv6_relay_policy.relay_service_type = "LoadBalancer".to_string();
+        broad_ipv6_relay_policy.relay_allow_source_cidrs = vec!["2001:db8:20::/48".parse()?];
+        broad_ipv6_relay_policy.relay_network_policy_cidrs = vec!["2001:db8::/32".parse()?];
+        broad_ipv6_relay_policy.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        broad_ipv6_relay_policy.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(broad_ipv6_relay_policy) {
+            Ok(_) => {
+                panic!("relay IPv6 NetworkPolicy should not exceed LoadBalancer source ranges")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-network-policy-cidr 2001:db8::/32 must be contained by one of --relay-allow-source-cidr values"
         ));
 
         Ok(())

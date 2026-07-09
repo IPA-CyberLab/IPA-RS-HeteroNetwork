@@ -369,6 +369,16 @@ template_ok network-policy \
   --set networkPolicy.relay.enabled=true \
   --set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'
 
+template_ok network-policy-ipv6-source-ranges \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set-string 'agent.apiService.loadBalancerSourceRanges[0]=2001:db8:10::/48' \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.acknowledgeHostNetwork=true \
+  --set networkPolicy.agentApi.enabled=true \
+  --set-string 'networkPolicy.agentApi.allowedCidrs[0]=2001:db8:10:1::/64'
+
 template_fails agent-api-network-policy-broader-than-source-range \
   "networkPolicy.agentApi.allowedCidrs entry \"198.51.0.0/16\" must be contained by one of agent.apiService.loadBalancerSourceRanges values" \
   --set agent.apiService.enabled=true \
@@ -379,6 +389,17 @@ template_fails agent-api-network-policy-broader-than-source-range \
   --set networkPolicy.acknowledgeHostNetwork=true \
   --set networkPolicy.agentApi.enabled=true \
   --set-string 'networkPolicy.agentApi.allowedCidrs[0]=198.51.0.0/16'
+
+template_fails agent-api-ipv6-network-policy-broader-than-source-range \
+  "networkPolicy.agentApi.allowedCidrs entry \"2001:db8::/32\" must be contained by one of agent.apiService.loadBalancerSourceRanges values" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set-string 'agent.apiService.loadBalancerSourceRanges[0]=2001:db8:10::/48' \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.acknowledgeHostNetwork=true \
+  --set networkPolicy.agentApi.enabled=true \
+  --set-string 'networkPolicy.agentApi.allowedCidrs[0]=2001:db8::/32'
 
 template_fails relay-network-policy-broader-than-source-range \
   "networkPolicy.relay.allowedCidrs entry \"203.0.0.0/16\" must be contained by one of agent.relayService.loadBalancerSourceRanges values" \
@@ -393,6 +414,20 @@ template_fails relay-network-policy-broader-than-source-range \
   --set networkPolicy.acknowledgeHostNetwork=true \
   --set networkPolicy.relay.enabled=true \
   --set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.0.0/16'
+
+template_fails relay-ipv6-network-policy-broader-than-source-range \
+  "networkPolicy.relay.allowedCidrs entry \"2001:db8::/32\" must be contained by one of agent.relayService.loadBalancerSourceRanges values" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set-string 'agent.relayService.loadBalancerSourceRanges[0]=2001:db8:20::/48' \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.acknowledgeHostNetwork=true \
+  --set networkPolicy.relay.enabled=true \
+  --set-string 'networkPolicy.relay.allowedCidrs[0]=2001:db8::/32'
 
 template_ok route-disabled \
   --set serviceExposure.enabled=false \

@@ -121,7 +121,92 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateIpv4CidrContainedBySourceRanges" -}}
+{{- define "ipars.hexNibbleBits" -}}
+{{- $value := lower (printf "%v" .value) -}}
+{{- $path := default "IPv6 address" .path -}}
+{{- $bitsByNibble := dict "0" "0000" "1" "0001" "2" "0010" "3" "0011" "4" "0100" "5" "0101" "6" "0110" "7" "0111" "8" "1000" "9" "1001" "a" "1010" "b" "1011" "c" "1100" "d" "1101" "e" "1110" "f" "1111" -}}
+{{- if not (hasKey $bitsByNibble $value) -}}
+{{- fail (printf "%s contains invalid IPv6 hex nibble %q" $path $value) -}}
+{{- end -}}
+{{- get $bitsByNibble $value -}}
+{{- end -}}
+
+{{- define "ipars.ipv6AddressNibbles" -}}
+{{- $address := printf "%v" .value -}}
+{{- $path := default "IPv6 address" .path -}}
+{{- if contains "." $address -}}
+{{- fail (printf "%s value %q must not use embedded IPv4 notation" $path $address) -}}
+{{- end -}}
+{{- $compressedParts := splitList "::" $address -}}
+{{- if gt (len $compressedParts) 2 -}}
+{{- fail (printf "%s value %q must contain at most one '::' compression" $path $address) -}}
+{{- end -}}
+{{- $hasCompression := contains "::" $address -}}
+{{- $headRaw := index $compressedParts 0 -}}
+{{- $tailRaw := "" -}}
+{{- if eq (len $compressedParts) 2 -}}
+{{- $tailRaw = index $compressedParts 1 -}}
+{{- end -}}
+{{- $hextets := list -}}
+{{- if ne $headRaw "" -}}
+{{- range $part := splitList ":" $headRaw -}}
+{{- if or (eq $part "") (not (regexMatch "^[0-9A-Fa-f]{1,4}$" $part)) -}}
+{{- fail (printf "%s value %q contains invalid IPv6 hextet %q" $path $address $part) -}}
+{{- end -}}
+{{- $hextets = append $hextets $part -}}
+{{- end -}}
+{{- end -}}
+{{- $tailHextets := list -}}
+{{- if and $hasCompression (ne $tailRaw "") -}}
+{{- range $part := splitList ":" $tailRaw -}}
+{{- if or (eq $part "") (not (regexMatch "^[0-9A-Fa-f]{1,4}$" $part)) -}}
+{{- fail (printf "%s value %q contains invalid IPv6 hextet %q" $path $address $part) -}}
+{{- end -}}
+{{- $tailHextets = append $tailHextets $part -}}
+{{- end -}}
+{{- end -}}
+{{- if $hasCompression -}}
+{{- $missing := sub 8 (add (len $hextets) (len $tailHextets)) -}}
+{{- if lt $missing 1 -}}
+{{- fail (printf "%s value %q has too many IPv6 hextets" $path $address) -}}
+{{- end -}}
+{{- range until (int $missing) -}}
+{{- $hextets = append $hextets "0" -}}
+{{- end -}}
+{{- range $part := $tailHextets -}}
+{{- $hextets = append $hextets $part -}}
+{{- end -}}
+{{- else if ne (len $hextets) 8 -}}
+{{- fail (printf "%s value %q must contain exactly eight IPv6 hextets or use '::' compression" $path $address) -}}
+{{- end -}}
+{{- if ne (len $hextets) 8 -}}
+{{- fail (printf "%s value %q must expand to exactly eight IPv6 hextets" $path $address) -}}
+{{- end -}}
+{{- $out := dict "value" "" -}}
+{{- range $part := $hextets -}}
+{{- $lowerPart := lower (printf "%v" $part) -}}
+{{- $_ := set $out "value" (printf "%s%s%s" (get $out "value") (repeat (int (sub 4 (len $lowerPart))) "0") $lowerPart) -}}
+{{- end -}}
+{{- get $out "value" -}}
+{{- end -}}
+
+{{- define "ipars.ipv6CidrBits" -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- $parts := splitList "/" $value -}}
+{{- if ne (len $parts) 2 -}}
+{{- fail (printf "%s entry %q must be an IPv6 CIDR" $path $value) -}}
+{{- end -}}
+{{- $nibbles := include "ipars.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
+{{- $out := dict "value" "" -}}
+{{- range $idx := until (len $nibbles) -}}
+{{- $nibble := substr $idx (int (add $idx 1)) $nibbles -}}
+{{- $_ := set $out "value" (printf "%s%s" (get $out "value") (include "ipars.hexNibbleBits" (dict "path" $path "value" $nibble))) -}}
+{{- end -}}
+{{- get $out "value" -}}
+{{- end -}}
+
+{{- define "ipars.validateCidrContainedBySourceRanges" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $sourcePath := .sourcePath -}}
@@ -133,12 +218,35 @@
 {{- $contained := dict "ok" false -}}
 {{- range $source := $sourceRanges -}}
 {{- $sourceValue := printf "%v" $source -}}
+{{- include "ipars.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $sourceValue -}}
 {{- $sourceBounds := splitList ":" (include "ipars.ipv4CidrRange" (dict "value" $sourceValue)) -}}
 {{- $sourceStart := int (index $sourceBounds 0) -}}
 {{- $sourceEnd := int (index $sourceBounds 1) -}}
 {{- if and (le $sourceStart $start) (le $end $sourceEnd) -}}
 {{- $_ := set $contained "ok" true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (get $contained "ok") -}}
+{{- fail (printf "%s entry %q must be contained by one of %s values because NetworkPolicy must not allow sources broader than the LoadBalancer source ranges" $path $value $sourcePath) -}}
+{{- end -}}
+{{- else if and $sourceRanges (contains ":" $value) -}}
+{{- $parts := splitList "/" $value -}}
+{{- $prefix := int (index $parts 1) -}}
+{{- $bits := include "ipars.ipv6CidrBits" (dict "path" $path "value" $value) -}}
+{{- $contained := dict "ok" false -}}
+{{- range $source := $sourceRanges -}}
+{{- $sourceValue := printf "%v" $source -}}
+{{- include "ipars.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
+{{- if contains ":" $sourceValue -}}
+{{- $sourceParts := splitList "/" $sourceValue -}}
+{{- $sourcePrefix := int (index $sourceParts 1) -}}
+{{- if le $sourcePrefix $prefix -}}
+{{- $sourceBits := include "ipars.ipv6CidrBits" (dict "path" $sourcePath "value" $sourceValue) -}}
+{{- if eq (substr 0 $sourcePrefix $bits) (substr 0 $sourcePrefix $sourceBits) -}}
+{{- $_ := set $contained "ok" true -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
