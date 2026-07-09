@@ -13385,10 +13385,14 @@ pub mod api {
                 }
                 offset = will_topic_offset;
             }
-            let Some((_, will_payload_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
+            let Some((will_topic, will_payload_offset)) =
+                mqtt_utf8_field(payload, offset, remaining_end)
             else {
                 return false;
             };
+            if !mqtt_topic_name(will_topic) {
+                return false;
+            }
             let Some((_, next_offset)) =
                 mqtt_len_prefixed_field(payload, will_payload_offset, remaining_end)
             else {
@@ -22168,6 +22172,19 @@ mod tests {
                 .application(),
             api::AgentPacketFlowApplication::Unknown
         );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet(
+                4,
+                0x06,
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_field(b"offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         let mut mqtt_overstated_remaining = mqtt_connect_packet(4, 0x02, &[mqtt_field(b"agent")]);
         mqtt_overstated_remaining[1] += 1;
         assert_eq!(
@@ -22256,6 +22273,21 @@ mod tests {
                     mqtt_field(b"agent"),
                     mqtt_properties_field(&[0x01, 0x02]),
                     mqtt_field(b"status/offline"),
+                    mqtt_field(b"offline")
+                ]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x06,
+                &[],
+                &[
+                    mqtt_field(b"agent"),
+                    mqtt_properties_field(&[]),
+                    mqtt_field(b"status/+"),
                     mqtt_field(b"offline")
                 ]
             ))
